@@ -610,3 +610,20 @@ def get_locality_domain_mempool(locality_domain_id: int) -> torch.cuda.MemPool:
         )
 
     return manager.mempools[pool_key]
+
+
+def _copy_to_new_cuda_allocation(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy ``tensor`` into a fresh contiguous allocation on the current CUDA device.
+
+    The allocation follows the allocator selected by the surrounding context,
+    including ``torch.cuda.use_mem_pool``. Unlike ``contiguous().cuda()``, this
+    always allocates new storage when ``tensor`` is already contiguous and on
+    the current CUDA device.
+    """
+    copied = torch.empty_like(
+        tensor,
+        device="cuda",
+        memory_format=torch.contiguous_format,
+    )
+    copied.copy_(tensor)
+    return copied

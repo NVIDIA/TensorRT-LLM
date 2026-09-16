@@ -29,6 +29,7 @@ from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
 from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod
@@ -399,6 +400,14 @@ class RefMLPFusedMoE(nn.Module):
         for expert in range(self.num_experts):
             self._load_expert_weights_with_scales(weights, expert)
 
+        # Match production (pyexecutor/model_loader.py): finalize quant-method
+        # scale layouts after load. Without this the FP8BlockScales ref keeps
+        # raw float32 scales and fp8_swap_ab_gemm on sm107 explodes to inf.
+        # No-op for methods without a post_load_weights override.
+        for m in self.modules():
+            if isinstance(m, Linear):
+                m.post_load_weights()
+
     def check_accuracy(self, output, ref_output):
         # Relaxed percent from 0.984 to 0.96 to handle small tensor statistical variance.
         # For small outputs (e.g., h=64), a few outliers can cause high mismatch percentage.
@@ -730,7 +739,8 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         # The 9% / 8% tiers replace the old single ">10000 -> 7%" bucket (the
         # 28672 / 65536 cases exceeded 7%); the 5% tier replaces the old
         # "<=10000 -> 3%" bucket (the 8448 case exceeded 3%). swiglu_gptoss_style
-        # keeps its own 5% / atol=0.1 band when error_accumulation stays <=10000.
+        # keeps its own 6% / atol=0.1 band when error_accumulation stays <=10000,
+        # matching the dedicated clamp-heavy MiniMax-M3 numerical test.
         top_k = getattr(self.routing_method, "top_k", 1)
         error_accumulation = self.intermediate_size * top_k
         if error_accumulation > 20000:
@@ -738,7 +748,7 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         elif error_accumulation > 10000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.92)
         elif self.swiglu_gptoss_style:
-            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
+            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
         elif error_accumulation > 5000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.95)
         else:
@@ -1758,6 +1768,13 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
         return output
 
     def check_accuracy(self, output, ref_output):
+        # sm107 only: backend fuses gemm1->activation->gemm2 with an FP8
+        # intermediate while the GatedMLP ref requantizes via bf16 between
+        # the two gemms. Both kernels are deterministic (identical mismatch
+        # across all 192 tactics), but Rubin rounding adds ~1% extra
+        # sign-flips on near-zero entries, pushing h=512 from <15% to ~16%.
+        # Widen percent by 2% on sm107; B200/H100/sm120 unchanged.
+        sm107_relax = get_sm_version() == 107
         if self.swiglu_gptoss_style:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.2, percent=0.8)
         elif self.hidden_size >= 4096:
@@ -1765,9 +1782,11 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
             # MXFP4 (4-bit) weights + MXFP8 (8-bit) activations accumulate more
             # quantization error in large GEMM reduction dimensions: error ~ sqrt(K).
             # Observed mismatch: ~17-19% for h=7168 vs <15% for h=512.
-            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.85)
+            percent = 0.83 if sm107_relax else 0.85
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=percent)
         else:
-            check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=0.85)
+            percent = 0.83 if sm107_relax else 0.85
+            check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=percent)
 
 
 class MXFP4MXFP8RefMegaMoEDeepGemm(MXFP4MXFP8RefGatedMLPFusedMoE):

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import copy
 import inspect
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
@@ -11,18 +12,19 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...functional import PositionEmbeddingType
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.mla import MLA
 from ..model_config import ModelConfig, TConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
-from ..modules.mla import MLA
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -1192,6 +1194,9 @@ class PARDForCausalLM(nn.Module):
         draft_config_no_spec = replace(draft_config,
                                        spec_config=None,
                                        lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -1272,6 +1277,9 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+            case "qwen4_exp_text":
+                from .modeling_qwen4_exp import Qwen4ExpMTP
+                mtp_layer = Qwen4ExpMTP
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP
@@ -1304,142 +1312,73 @@ class MTPForCausalLM(nn.Module):
         self.embed_tokens = model.embed_tokens
 
 
-class MTPDraftModel(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
-                                                       torch.cuda.Stream]):
-        super().__init__()
-        # Import here to avoid circular import
-        model_type = model_config.pretrained_config.model_type
-        if model_type == "glm4_moe":
-            from .modeling_glm import Glm4MTP
-            mtp_layer = Glm4MTP(model_config,
-                                layer_idx,
-                                aux_stream_dict,
-                                is_separate_draft_engine=True)
-        elif model_type in ["deepseek_v3", "deepseek_v32", "glm_moe_dsa"]:
-            from .modeling_deepseekv3 import DeepseekV3MTP
-            mtp_layer = DeepseekV3MTP(model_config,
-                                      layer_idx,
-                                      aux_stream_dict,
-                                      is_separate_draft_engine=True)
-        elif model_type in ["exaone_moe"]:
-            from .modeling_exaone_moe import ExaoneMoeMTP
-            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
-        else:
-            raise ValueError(
-                f"MTPDraftModel does not support model_type: {model_type}")
-        setattr(self, f"layers.{layer_idx}", mtp_layer)
-        self.layers = mtp_layer
-        self.layer_idx = layer_idx
-        self.config = model_config.pretrained_config
-        self.embed_tokens = Embedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            dtype=self.config.torch_dtype,
-        )
-
-    def __repr__(self):
-        """Custom string representation to display layer index"""
-        return f"(layers): ({self.layer_idx}): {repr(self.layers)}"
-
-    def forward(
-        self,
-        input_ids: torch.IntTensor,
-        position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self.layers(
-            input_ids,
-            position_ids,
-            hidden_states,
-            embed_tokens=self.embed_tokens,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-        )
-
-        return hidden_states
+def _get_requested_draft_moe_backend(model_config: ModelConfig,
+                                     spec_config: object) -> str:
+    """Return the draft MoE backend request, preserving target inheritance."""
+    requested_backend = getattr(spec_config, "moe_backend", None)
+    return (model_config.moe_backend
+            if requested_backend is None else requested_backend)
 
 
-@register_auto_model("MTPDraftModelForCausalLM")
-class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
-                                                       PretrainedConfig]):
+def _copy_model_config_with_moe_backend(
+        model_config: ModelConfig,
+        requested_moe_backend: str,
+        quant_config: Optional[QuantConfig] = None) -> ModelConfig:
+    """Copy a ModelConfig and resolve its MoE backend against its own weights."""
+    architectures = getattr(model_config.pretrained_config, "architectures",
+                            None) or []
+    architecture = architectures[0] if architectures else ""
+    resolved_moe_backend = ModelConfig.resolve_moe_backend(
+        requested_moe_backend,
+        architecture,
+        quant_config=(model_config.quant_config
+                      if quant_config is None else quant_config))
+    draft_config = copy.copy(model_config)
+    # ModelConfig is frozen after loading. Temporarily thaw only the isolated
+    # draft copy so the target config remains unchanged.
+    was_frozen = draft_config._frozen
+    draft_config._frozen = False
+    try:
+        draft_config.moe_backend = resolved_moe_backend
+    finally:
+        draft_config._frozen = was_frozen
+    return draft_config
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        self.model_config = model_config
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
-        self.aux_stream_dict = {
-            AuxStreamType.Attention: aux_stream_list[0],
-            AuxStreamType.MoeShared: aux_stream_list[0],
-            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
-            AuxStreamType.MoeBalancer: aux_stream_list[2],
-            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
-        }
-        super().__init__(
-            MTPDraftModel(self.model_config,
-                          self.model_config.pretrained_config.num_hidden_layers,
-                          self.aux_stream_dict),
-            config=self.model_config,
-            hidden_size=self.model_config.pretrained_config.hidden_size,
-            vocab_size=self.model_config.pretrained_config.vocab_size)
 
-    def load_weights(self, weights: Dict):
-        # Import here to avoid circular import
-        model_type = self.model_config.pretrained_config.model_type
-        match model_type:
-            case "glm4_moe":
-                from .modeling_glm import Glm4WeightLoader
-                weight_loader = Glm4WeightLoader(self, is_draft_model=True)
-            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
-                from .modeling_deepseekv3 import DeepseekV3WeightLoader
-                weight_loader = DeepseekV3WeightLoader(self,
-                                                       is_draft_model=True)
-            case "exaone_moe":
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP for two engine mode. Please use one engine mode instead."
-                )
-            case _:
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP")
-        weight_loader.load_weights(weights)
+def _get_mtp_moe_quant_config(model_config: ModelConfig,
+                              layer_idx: int) -> QuantConfig:
+    """Return the routed-expert quant config for an embedded MTP layer.
 
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        if self.model.embed_tokens is None:
-            self.model.embed_tokens = target_model.model.embed_tokens
-        self.lm_head = target_model.lm_head
+    The first constructed MTP layer represents all MTP layers when resolving
+    AUTO because they share one backend setting.
+    """
+    layer_quant_configs = model_config.quant_config_dict or {}
+    prefixes = [f"model.layers.{layer_idx}."]
+    num_hidden_layers = getattr(model_config.pretrained_config,
+                                "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+        prefixes.append(f"mtp.layers.{layer_idx - num_hidden_layers}.")
 
-    def forward(self,
-                attn_metadata: AttentionMetadata,
-                input_ids: torch.IntTensor = None,
-                position_ids: torch.IntTensor = None,
-                inputs_embeds: Optional[torch.FloatTensor] = None,
-                return_context_logits: bool = False,
-                spec_metadata: Optional[SpecMetadata] = None,
-                hidden_states: torch.Tensor = None,
-                **kwargs) -> torch.Tensor:
+    for prefix in prefixes:
+        quant_config = layer_quant_configs.get(f"{prefix}mlp.experts")
+        if quant_config is not None:
+            return quant_config
+    for prefix in prefixes:
+        for name, quant_config in layer_quant_configs.items():
+            if name.startswith(prefix) and ".experts" in name:
+                return quant_config
+    return model_config.quant_config
 
-        hidden_states = spec_metadata.get_hidden_states()
-        output = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-            **kwargs)
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
+
+def _enable_trtllm_moe_preload_for_draft(model: nn.Module,
+                                         moe_backend: str) -> None:
+    """Preserve TRTLLM-Gen's serial weight-loading order for draft-only use."""
+    preload_weight_modules = getattr(model, "preload_weight_modules", None)
+    if moe_backend != "TRTLLM" or preload_weight_modules is None:
+        return
+    for module_name in ("experts", "routing_method", "all_reduce"):
+        if module_name not in preload_weight_modules:
+            preload_weight_modules.append(module_name)
 
 
 def external_drafter_config_kwargs(model_config, spec_config) -> dict:
@@ -1461,7 +1400,7 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     kwargs = dict(
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=model_config.moe_backend,
+        moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
         mapping=model_config.mapping,
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
@@ -1498,15 +1437,28 @@ def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
 @register_draft_model(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
 def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
     """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
-    return MTPForCausalLM(model_config,
+    mtp_model_config = model_config
+    requested_moe_backend = getattr(model_config.spec_config, "moe_backend",
+                                    None)
+    if requested_moe_backend is not None:
+        start_layer_idx = model_config.pretrained_config.num_hidden_layers
+        mtp_model_config = _copy_model_config_with_moe_backend(
+            model_config,
+            requested_moe_backend,
+            quant_config=_get_mtp_moe_quant_config(model_config,
+                                                   start_layer_idx))
+        model_type = model_config.pretrained_config.model_type
+        if (model_type in {"nemotron_h", "nemotron_h_puzzle"}
+                and mtp_model_config.moe_backend != model_config.moe_backend):
+            raise ValueError(
+                "Nemotron-H embedded MTP layers cannot use a different MoE "
+                "backend from the target model because their checkpoint "
+                "weight mapper uses one shared backend-dependent layout.")
+        _enable_trtllm_moe_preload_for_draft(model,
+                                             mtp_model_config.moe_backend)
+    return MTPForCausalLM(mtp_model_config,
                           model_config.pretrained_config.num_hidden_layers,
                           lm_head, model)
-
-
-@register_draft_model(SpeculativeDecodingMode.MTP_EAGLE)
-def _build_mtp_eagle_draft(model_config, draft_config, lm_head, model):
-    """Build the two-model MTP-Eagle drafter."""
-    return MTPDraftModelForCausalLM(model_config)
 
 
 @register_draft_model(SpeculativeDecodingMode.PARD)
@@ -1601,6 +1553,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
+                requested_draft_moe_backend = _get_requested_draft_moe_backend(
+                    model_config, spec_config)
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
@@ -1608,18 +1562,26 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
                             mapping=model_config.mapping,
-                            moe_backend=model_config.moe_backend,
+                            moe_backend=requested_draft_moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
+                        if getattr(spec_config, "moe_backend",
+                                   None) is not None:
+                            # Unlike ModelConfig.from_pretrained, the Mistral
+                            # loader does not resolve AUTO after loading quant
+                            # metadata. Resolve it against the draft config now,
+                            # before constructing any draft modules.
+                            self.draft_config = _copy_model_config_with_moe_backend(
+                                self.draft_config, requested_draft_moe_backend)
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
-                            moe_backend=model_config.moe_backend,
+                            moe_backend=requested_draft_moe_backend,
                             mapping=model_config.mapping,
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
@@ -1637,15 +1599,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
+                        moe_backend=requested_draft_moe_backend,
                         mapping=model_config.mapping,
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
-                    self.draft_config.extra_attrs = dict(
-                        model_config.extra_attrs)
+                    self.draft_config.extra_attrs = model_config.extra_attrs
                     self.draft_config.extra_attrs[
                         _SPECULATIVE_POSITION_HEADROOM] = (
                             2 * spec_config.tokens_per_gen_step)

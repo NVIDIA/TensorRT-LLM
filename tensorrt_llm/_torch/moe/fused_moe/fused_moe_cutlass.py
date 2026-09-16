@@ -32,7 +32,9 @@ from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
-                            MoEStaticCapability, require_comm_plan)
+                            MoEStaticCapability,
+                            nvfp4_fc1_row_alignment_rejection,
+                            require_comm_plan)
 from .interface import _reject
 from .quantization import UnquantizedFusedMoEMethod
 
@@ -292,6 +294,14 @@ class CutlassFusedMoE(MoEImplBase):
                 f"fp16/bf16 or per-tensor FP8 (qdq); got quant_algo={quant_algo}"
             )
 
+        # The loader bottom-pads the concatenated [w3; w1] FC1 buffer while the
+        # kernel splits gate/up at half the padded size, so an unaligned shard
+        # runs and returns garbage (all zeros once the pad covers a whole half)
+        # instead of failing. Turn the layer down instead.
+        rejection = nvfp4_fc1_row_alignment_rejection(p, d)
+        if rejection is not None:
+            return rejection
+
         return MoEEligibility.ok()
 
     def __init__(
@@ -452,8 +462,8 @@ class CutlassFusedMoE(MoEImplBase):
         CudaGraphLoraManager does this automatically.
 
         Args:
-            max_num_tokens: Worst-case tokens in a captured forward
-                (max_batch_size * max_tokens_per_seq).
+            max_num_tokens: Larger of the captured-decode capacity
+                (max_batch_size * max_tokens_per_seq) and the engine-wide token limit.
             max_lora_rank: Largest LoRA rank across adapters.
             max_lora_size: Adapter-slot pool size for the slot-indexed device tables.
         """

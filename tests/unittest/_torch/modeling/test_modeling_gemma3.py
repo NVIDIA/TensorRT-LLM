@@ -10,9 +10,9 @@ from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
 from transformers import Gemma3TextConfig
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (AttentionMetadata,
-                                                   FlashInferAttentionMetadata)
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends import (AttentionMetadata,
+                                                    FlashInferAttentionMetadata)
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \

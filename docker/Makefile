@@ -40,7 +40,13 @@ DOCKER_PROGRESS    ?= auto
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
 CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
-BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
+# The DLFW base image ships no libnvrtc_static.a, so cmake fails on a missing
+# CUDA::nvrtc_static target unless NVRTC is linked dynamically. Only the wheel and
+# release stages read BUILD_WHEEL_ARGS, and those always build FROM the DLFW devel
+# image; the rockylinux8/ubuntu24 targets stop at tritondevel and never see it, so
+# this needs no condition. Kept out of Dockerfile.multi's ARG default because the
+# `tr -d '="'` below would strip the '=' out of NVRTC_DYNAMIC_LINKING=ON.
+BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="') --extra-cmake-vars NVRTC_DYNAMIC_LINKING=ON$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 BUILD_WHEEL_SCRIPT ?=
 TORCH_INSTALL_TYPE ?= skip
 CUDA_VERSION       ?=
@@ -50,6 +56,13 @@ CUBLAS_VERSION     ?=
 GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
+# Optional GitHub token used to authenticate the github.com clones performed
+# during the build (see docker/common/github_auth.sh). Usually inherited from the
+# environment, never passed as a build arg -- build-arg values stay readable in
+# `docker history`. Empty means anonymous, rate-limited access.
+GITHUB_CLONE_TOKEN ?=
+COMMA              := ,
+GITHUB_SECRET_ARG  := $(if $(GITHUB_CLONE_TOKEN),--secret id=github_clone_token$(COMMA)env=GITHUB_CLONE_TOKEN)
 PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
@@ -87,6 +100,7 @@ base_pull:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
+		$(GITHUB_SECRET_ARG) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
 		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
@@ -200,21 +214,21 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 13.2.1-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 13.3.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-rockylinux8_%: BASE_TAG = 13.2.1-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 13.3.1-devel-rockylinux8
 
 # For x86_64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu22_%: BASE_TAG = 13.2.1-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 13.3.1-devel-ubuntu22.04
 
 # For x86_64 and aarch64
 ubuntu24_%: STAGE = tritondevel
 ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu24_%: BASE_TAG = 13.2.1-devel-ubuntu24.04
+ubuntu24_%: BASE_TAG = 13.3.1-devel-ubuntu24.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

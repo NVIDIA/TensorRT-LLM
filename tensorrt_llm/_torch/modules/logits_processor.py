@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from tensorrt_llm._utils import nvtx_range
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from .linear import Linear
 
 

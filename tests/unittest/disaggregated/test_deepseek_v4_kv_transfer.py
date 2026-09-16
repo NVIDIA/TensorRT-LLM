@@ -35,8 +35,8 @@ from kv_transfer_harness import (
 )
 
 from tensorrt_llm import Mapping
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO,
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,

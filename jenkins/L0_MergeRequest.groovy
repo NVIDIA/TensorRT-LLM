@@ -112,6 +112,33 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
+def normalizeReleaseTargets(rawReleaseTarget)
+{
+    def supportedTargets = ["wheel", "container"]
+    def releaseTarget = rawReleaseTarget?.toString()?.trim()
+    if (!releaseTarget || releaseTarget.equalsIgnoreCase("all")) {
+        return supportedTargets
+    }
+
+    def requestedTargets = releaseTarget.split(",", -1).collect {
+        it.trim().toLowerCase()
+    }
+    if (requestedTargets.any { !it }) {
+        error "Invalid release_target '${rawReleaseTarget}': empty entries are not allowed"
+    }
+    if (requestedTargets.contains("all")) {
+        error "Invalid release_target '${rawReleaseTarget}': all cannot be combined with other targets"
+    }
+
+    def invalidTargets = requestedTargets.findAll {
+        !supportedTargets.contains(it)
+    }.unique()
+    if (invalidTargets) {
+        error "Invalid release_target '${rawReleaseTarget}': supported values are all, wheel, and container"
+    }
+    return supportedTargets.findAll { requestedTargets.contains(it) }
+}
+
 @Field
 def REUSE_TEST = "reuse_test"   // Determine if the pipeline should reuse test results in a stage from the previous pipelines.
 @Field
@@ -179,6 +206,16 @@ def CBTS_COVERAGE_PILOT_USERS = [
 ] as Set
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
+// `/bot run` key that opts a single run into BOLT consume.
+@Field
+def BOLT_CONSUME = "bolt_consume"
+// Version-controlled rollout switch for BOLT premerge consume. Kept in the
+// infra-owned Groovy boundary like ENABLE_CBTS_COVERAGE above, so turning consume
+// on for every eligible build is a reviewed code change; a `/bot run` with
+// `"bolt_consume": true` opts in a single run without one. Either way
+// resolveBoltConsume() still applies the post-merge and branch restrictions.
+@Field
+def ENABLE_BOLT_PREMERGE_CONSUME = false
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -221,6 +258,10 @@ def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def RUN_MODE = "run_mode"
 @Field
 def BUILD_BRANCH = "build_branch"
+@Field
+def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def RELEASE_TARGET = "release_target"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -229,8 +270,15 @@ def globalVars = [
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
+    (RELEASE_TARGET): runMode == "nightly_release" ?
+        normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
+// Compare against "true" rather than relying on Groovy truthiness: the bot phrase
+// is free-form JSON, and a quoted "false" would otherwise read as opt-in.
+globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
+    ENABLE_BOLT_PREMERGE_CONSUME || gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    globalVars[TARGET_BRANCH])
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
 }
@@ -562,11 +610,15 @@ def launchReleaseCheck(pipeline, globalVars)
                     "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz",
                     "*/triton_kernels/*.py"
                 ]
-                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
-                def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
-                if (lastLine.toLowerCase().contains("error")) {
-                    error "GUARDWORDS_WARN: Guardwords Scan Failed."
-                }
+                sh """#!/bin/bash
+                    set -eo pipefail
+                    cd ${LLM_ROOT}
+                    # Batch files below ARG_MAX; pipefail propagates scan failures to prevent false greens.
+                    find . -type f \\
+                        ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')} \\
+                        -not -path "./scan.log" \\
+                        -exec confidentiality-scan {} + 2>&1 | tee scan.log
+                """.stripIndent()
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -732,7 +784,7 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 }
                 rawDataList.find { rawData ->
                     if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
-                        result = rawData.get("patch")
+                        result = rawData.get("patch") ?: ""
                         return true
                     }
                     return false
@@ -752,13 +804,97 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 rawDataList.each { rawData ->
                     [rawData.get("filename"), rawData.get("previous_filename")]
                         .findAll { it }
-                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") ?: "" }
                 }
             }
             if (!rawDataList) { break }
         }
     }
     return result
+}
+
+def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
+    def headCommit = env.gitlabCommit?.toString()
+    def baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
+    pipeline.withEnv(["GIT_DIFF_BASE_REF=${baseRef}"]) {
+        withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
+            pipeline.sh "git -C ${LLM_ROOT} fetch --no-tags --depth=1 origin \"\${GIT_DIFF_BASE_REF}\""
+        }
+    }
+    def baseCommit = pipeline.sh(script: "git -C ${LLM_ROOT} rev-parse FETCH_HEAD", returnStdout: true).trim()
+    pipeline.echo("Using internal Git mirror diff: ${baseCommit}...${headCommit}")
+
+    def nameStatus = pipeline.sh(
+        script: "git -C ${LLM_ROOT} -c core.quotepath=false diff --name-status --find-renames ${baseCommit} ${headCommit}",
+        returnStdout: true
+    )
+    def changedFiles = nameStatus.readLines().collect { line ->
+        def fields = line.split('\t', -1)
+        def paths = []
+        for (int index = 1; index < fields.length; index++) {
+            if (fields[index]) {
+                paths.add(fields[index])
+            }
+        }
+        [status: fields[0], paths: paths]
+    }
+    if (function == "getChangedFileList") {
+        return changedFiles.collectMany { changedFile ->
+            changedFile.status.startsWith("R") || changedFile.status.startsWith("C")? changedFile.paths.reverse(): changedFile.paths
+        }
+    }
+
+    def renamePaths = [:]
+    changedFiles.findAll { changedFile ->
+        changedFile.status.startsWith("R") || changedFile.status.startsWith("C")
+    }.each { changedFile ->
+        changedFile.paths.each { changedFilePath -> renamePaths[changedFilePath] = changedFile.paths }
+    }
+    def cachedDiffs = [:]
+    def getFileDiff = { changedFilePath ->
+        if (cachedDiffs.containsKey(changedFilePath)) {
+            return cachedDiffs[changedFilePath]
+        }
+        def diffPaths = renamePaths.get(changedFilePath, [changedFilePath])
+        def rawDiff = ""
+        pipeline.withEnv([
+            "GIT_DIFF_PATH=${diffPaths[0]}",
+            "GIT_DIFF_RENAME_PATH=${diffPaths.size() > 1 ? diffPaths[1] : diffPaths[0]}",
+        ]) {
+            rawDiff = pipeline.sh(
+                script: "git -C ${LLM_ROOT} diff --unified=3 --inter-hunk-context=1 --find-renames ${baseCommit} ${headCommit} -- \":(literal)\${GIT_DIFF_PATH}\" \":(literal)\${GIT_DIFF_RENAME_PATH}\"",
+                returnStdout: true
+            )
+        }
+        def lines = rawDiff.readLines()
+        def firstHunk = lines.findIndexOf { it.startsWith("@@") }
+        def diff = firstHunk < 0 ? "" : lines.drop(firstHunk).join("\n")
+        diffPaths.each { diffPath -> cachedDiffs[diffPath] = diff }
+        return diff
+    }
+
+    if (function == "getOneFileChanges") {
+        return getFileDiff(filePath)
+    }
+    if (function == "getFileChanges") {
+        return filePaths.unique().collectEntries { changedFilePath -> [(changedFilePath): getFileDiff(changedFilePath)] }
+    }
+    pipeline.error("Unsupported PR diff operation: ${function}")
+}
+
+def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    try {
+        return getGithubMRChangedFile(pipeline, globalVars[GITHUB_PR_API_URL], function, filePath)
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] GitHub PR files API failed for ${function}; " +
+                      "trying the internal Git mirror. Error: ${e.toString()}")
+        def result = getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] Internal Git mirror fallback succeeded for ${function}.")
+        return result
+    }
 }
 
 // Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
@@ -826,7 +962,7 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
     try {
         def changedFileList = []
         if (githubPrApiUrl != null) {
-            changedFileList = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
+            changedFileList = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getChangedFileList")
         } else {
             changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
         }
@@ -859,7 +995,7 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     def diff = ""
 
     if (githubPrApiUrl != null) {
-        diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
+        diff = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getOneFileChanges", filePath)
     } else {
         diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
     }
@@ -960,7 +1096,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (filesNeedingDiff) {
             def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
             def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+                ? getGithubMRChangedFileWithFallback(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
                 : getGitlabMRChangedFile(pipeline, "getFileChanges")
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
@@ -1256,7 +1392,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     def relatedFileList = [
         "cpp/include/tensorrt_llm/batch_manager/",
         "cpp/include/tensorrt_llm/executor/",
-        "cpp/include/tensorrt_llm/runtime/gptJsonConfig.h",
         "cpp/include/tensorrt_llm/runtime/utils/mpiUtils.h",
         "cpp/include/tensorrt_llm/runtime/utils/multiDeviceUtils.h",
         "cpp/include/tensorrt_llm/runtime/worldConfig.h",
@@ -1754,6 +1889,42 @@ def resolveBuildBranch(globalVars)
     return env.gitlabBranch ? env.gitlabBranch : "main"
 }
 
+// Decide whether the build helper jobs should re-BOLT their packed tarball with
+// the target branch's promoted profile bundle (Build.groovy's `boltConsume`).
+// Two restrictions narrow this well below the raw opt-in:
+//
+//  1. Pre-merge only. Post-merge builds the SBSA tarball that the
+//     BOLT-Profile-Gen stage below profiles later in the same run, so BOLTing it
+//     would feed already-BOLTed binaries back into profile generation and yield
+//     circular, meaningless profiles. Post-merge consumers are served instead by
+//     the container overlay (boltOverlayEnabled on the image build) and by
+//     BoltProfileGen applying its own freshly generated bundle in-run.
+//  2. `main` only. scripts/bolt/internal/apply_latest.sh resolves exactly one
+//     branch with no fallback and exits non-zero when that branch has nothing
+//     promoted, so pointing consume at a branch that has never promoted a bundle
+//     hard-fails the build on its first run. `main` is the only branch the
+//     post-merge producer keeps fresh, so stay there until apply_latest.sh grows
+//     a documented fallback.
+//
+// Skips are announced rather than silent: a run that asked for BOLTed binaries
+// and did not get them should say so in the log.
+def resolveBoltConsume(boolean requested, String targetBranch)
+{
+    if (!requested) {
+        return false
+    }
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        echo "BOLT consume requested but disabled: the post-merge build is the un-BOLTed input BoltProfileGen profiles."
+        return false
+    }
+    if (targetBranch != "main") {
+        echo "BOLT consume requested but disabled: no promoted bundle is guaranteed for target branch '${targetBranch}' (main only for now)."
+        return false
+    }
+    echo "BOLT consume enabled: build helpers will re-BOLT their tarball with main's promoted profile bundle."
+    return true
+}
+
 def getCommonParameters()
 {
     return [
@@ -1849,6 +2020,9 @@ def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, i
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
+    def releaseTargets = globalVars[RELEASE_TARGET] ?: []
+    def wheelSelected = releaseTargets.contains("wheel")
+    def containerSelected = releaseTargets.contains("container")
     stages = [
         "Release-Check": {
             script {
@@ -1919,7 +2093,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "x86_64-Linux": {
             script {
                 // CBTS deliberately does NOT short-circuit at the arch / Build
-                // layer. Build always runs so a wheel exists for sanity checks
+                // layer. Build normally runs so a wheel exists for sanity checks
                 // and post-merge consumers; case-level narrowing happens later
                 // in L0_Test.groovy::launchTestJobs (Layer 2) and renderTestDB
                 // (Layer 3).
@@ -1932,6 +2106,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        // Re-BOLT the packed tarball with the target branch's promoted
+                        // profile bundle so the tests below exercise bolted binaries.
+                        // Off unless resolveBoltConsume() allowed it (pre-merge, main).
+                        'boltConsume': globalVars[BOLT_CONSUME_BUILD],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2113,6 +2291,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 stage(testStageName) {
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        // Off unless resolveBoltConsume() allowed it. Post-merge is
+                        // excluded there precisely because this tarball is what the
+                        // BOLT-Profile-Gen stage below profiles.
+                        'boltConsume': globalVars[BOLT_CONSUME_BUILD],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2319,9 +2501,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'triggerType': runMode == "nightly_release" ?
                                 "nightly-release" :
                                 (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
-                            'runSanityCheck':
-                                runMode == "nightly_release" ||
-                                env.JOB_NAME ==~ /.*PostMerge.*/,
+                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
                             // Canonical images carry BOLT profiles: the raw build is
@@ -2339,6 +2519,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
+                                'useWheelFromBuildStage': false,
                                 'wait_success_seconds': "",
                             ]
                         }
@@ -2364,20 +2545,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         }
     ]
-
-    if ((env.JOB_NAME ==~ /.*PostMerge.*/) &&
-        !GEN_POST_MERGE_BUILDS_ONLY) {
-        stages += dockerBuildJob
-    }
-    if (!GEN_POST_MERGE_BUILDS_ONLY && (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
-        stages += dockerBuildJob
-        testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
-        testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
-        echo "Will run Build-Docker-Images job"
-        stages.remove("x86_64-Linux")
-        stages.remove("SBSA-Linux")
-        echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
-    }
 
     def plcContainerScanningJob = [
         "PLC Container Scanning": {
@@ -2479,13 +2646,39 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         }
     ]
-    if (runMode == "nightly_release" && !GEN_POST_MERGE_BUILDS_ONLY) {
-        stages += plcContainerScanningJob
-    }
-    if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
-        stages += plcContainerScanningJob
-        testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
-        echo "Will run job to build ngc containers and running in-pipeline scanning for them"
+    if (runMode == "nightly_release") {
+        testFilter[TEST_STAGE_LIST] = null
+        testFilter[EXTRA_STAGE_LIST] = null
+        stages.remove("Release-Check")
+        stages.remove("OSS-Compliance-Check")
+        if (!wheelSelected) {
+            stages.remove("x86_64-Linux")
+            stages.remove("SBSA-Linux")
+        }
+        if (containerSelected) {
+            stages += plcContainerScanningJob
+        }
+    } else {
+        if ((env.JOB_NAME ==~ /.*PostMerge.*/) &&
+            !GEN_POST_MERGE_BUILDS_ONLY) {
+            stages += dockerBuildJob
+        }
+        if (!GEN_POST_MERGE_BUILDS_ONLY &&
+            (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") ||
+             testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
+            stages += dockerBuildJob
+            testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
+            testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
+            echo "Will run Build-Docker-Images job"
+            stages.remove("x86_64-Linux")
+            stages.remove("SBSA-Linux")
+            echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
+        }
+        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+            stages += plcContainerScanningJob
+            testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
+            echo "Will run job to build ngc containers and running in-pipeline scanning for them"
+        }
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
@@ -2548,7 +2741,9 @@ pipeline {
         }
         always {
             script {
-                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!isReleaseCheckMode &&
+                    !GEN_POST_MERGE_BUILDS_ONLY &&
+                    runMode != "nightly_release") {
                     collectTestResults(this, testFilter, globalVars)
                 }
             }

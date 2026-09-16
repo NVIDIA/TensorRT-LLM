@@ -19,7 +19,11 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_T2I_PARAMS,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
+from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+    Cosmos3OmniMoTPipeline,
+    _resolve_use_system_prompt,
+    _validate_request_compatibility,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     DISTILLED_GUIDANCE_SCALE,
     Cosmos3SamplingPolicy,
@@ -423,6 +427,20 @@ class TestInferModeResolution:
         for field in ("height", "width", "num_inference_steps", "guidance_scale", "frame_rate"):
             assert got[field] is None, field
 
+    def test_deprecated_view_point_warns_and_is_not_forwarded(self):
+        req = _fake_request(
+            "video",
+            extra_params={"action_mode": "policy", "view_point": "ego_view"},
+        )
+        with patch(
+            "tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3.logger.warning"
+        ) as warning:
+            got = self._captured_forward_kwargs(_bare_pipeline(), req)
+
+        warning.assert_called_once()
+        assert "deprecated and ignored" in warning.call_args.args[0]
+        assert "view_point" not in got
+
     def test_video_keeps_its_materialised_frame_rate(self):
         """Only action drops it: the serve layer derives num_frames from
         seconds x frame_rate, so the video default has to stay materialised."""
@@ -671,7 +689,7 @@ class TestWarmupAndForwardValidation:
                 prompt="x",
                 seed=0,
                 use_guardrails=False,
-                image="frame.png",
+                image=torch.zeros(3, 32, 32),
                 **sampling_kwargs,
             )
 
@@ -984,6 +1002,28 @@ class TestForwardConditioningWiring:
         self._forward(pipeline, image=None)
         assert captured["post_step_fn"] is None
 
+    def test_resolved_guidance_interval_reaches_denoise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pipeline, captured = self._wiring_pipeline()
+        original_resolver = pipeline._resolve_generation_params
+        expected_interval = (123.0, 456.0)
+
+        def resolve_with_interval(
+            mode: str, **values: int | float | None
+        ) -> dict[str, int | float | tuple[float, float] | None]:
+            assert values["guidance_interval"] is None
+            return {
+                **original_resolver(mode, **values),
+                "guidance_interval": expected_interval,
+            }
+
+        monkeypatch.setattr(pipeline, "_resolve_generation_params", resolve_with_interval)
+
+        self._forward(pipeline, image=None)
+
+        assert captured["guidance_interval"] == expected_interval
+
 
 class TestSystemPromptDefault:
     """use_system_prompt defaults are checkpoint-declared via model_index.json."""
@@ -1092,6 +1132,128 @@ class TestSystemPromptDefault:
         pipeline._run_warmup(height=720, width=1280, num_frames=9, steps=4)
 
         assert captured.get("use_system_prompt") is None
+
+
+class TestSystemPromptResolution:
+    @pytest.mark.parametrize(
+        "requested,checkpoint_default,is_v2v,is_transfer,expected",
+        [
+            (None, False, False, False, False),
+            (None, True, False, False, True),
+            (None, False, True, False, True),
+            (None, True, True, True, False),
+            (True, False, False, True, True),
+            (False, True, True, False, False),
+        ],
+    )
+    def test_resolution_precedence(
+        self, requested, checkpoint_default, is_v2v, is_transfer, expected
+    ):
+        assert (
+            _resolve_use_system_prompt(
+                requested,
+                checkpoint_default=checkpoint_default,
+                is_v2v=is_v2v,
+                is_transfer=is_transfer,
+            )
+            is expected
+        )
+
+
+class TestRequestCompatibility:
+    DEFAULTS = {
+        "output_type": "video",
+        "image": None,
+        "video": None,
+        "action_mode": None,
+        "action_gen": False,
+        "audio_gen": False,
+        "enable_audio": False,
+        "transfer_config": None,
+    }
+
+    @pytest.mark.parametrize(
+        "overrides,error",
+        [
+            ({"action_mode": "policy"}, "does not enable action_gen"),
+            (
+                {"action_mode": "policy", "action_gen": True, "enable_audio": True},
+                "joint action and audio",
+            ),
+            ({"image": object(), "video": b"video"}, "not both image and video"),
+            ({"output_type": "image", "video": b"video"}, "supported only for video outputs"),
+            (
+                {"action_mode": "policy", "action_gen": True, "transfer_config": object()},
+                "cannot be combined with transfer inference",
+            ),
+            (
+                {"output_type": "image", "transfer_config": object()},
+                "supported only for video outputs",
+            ),
+            (
+                {"enable_audio": True, "transfer_config": object()},
+                "cannot be combined with sound generation",
+            ),
+            (
+                {"image": object(), "transfer_config": object()},
+                "cannot be combined with an image reference",
+            ),
+            (
+                {"output_type": "image", "image": object()},
+                "does not accept an image input",
+            ),
+            (
+                {"output_type": "image", "action_mode": "policy", "action_gen": True},
+                "does not support output_type='image'",
+            ),
+            ({"enable_audio": True}, "no audio tower"),
+            (
+                {"image": torch.zeros(1), "action_mode": "policy", "action_gen": True},
+                "does not support tensor image/video inputs",
+            ),
+            (
+                {"video": torch.zeros(1), "action_mode": "policy", "action_gen": True},
+                "does not support tensor image/video inputs",
+            ),
+            (
+                {"video": "video.mp4", "action_mode": "inverse_dynamics", "action_gen": True},
+                "inverse_dynamics requires encoded MP4/AVI bytes",
+            ),
+            ({"video": "video.mp4"}, "V2V reference must be encoded MP4/AVI bytes"),
+            ({"image": object()}, "image.*must be a PIL.Image"),
+        ],
+    )
+    def test_rejects_incompatible_workflows(self, overrides, error):
+        values = {**self.DEFAULTS, **overrides}
+        with pytest.raises(ValueError, match=error):
+            _validate_request_compatibility(**values)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"image": b"image"},
+            {"image": torch.zeros(1)},
+            {"video": b"video"},
+            {"output_type": "image", "enable_audio": True},
+            {"enable_audio": True, "audio_gen": True},
+            {"image": b"image", "action_mode": "policy", "action_gen": True},
+            {"video": b"video", "transfer_config": object()},
+        ],
+    )
+    def test_accepts_supported_workflows(self, overrides):
+        _validate_request_compatibility(**{**self.DEFAULTS, **overrides})
+
+    def test_forward_rejects_action_with_transfer_before_preparation(self):
+        pipeline = _bare_pipeline(action_gen=True)
+
+        with pytest.raises(ValueError, match="cannot be combined with transfer inference"):
+            pipeline.forward(
+                prompt="x",
+                action_mode="policy",
+                transfer_config=object(),
+                use_guardrails=False,
+            )
 
 
 class TestAudioWeightPresenceGuard:

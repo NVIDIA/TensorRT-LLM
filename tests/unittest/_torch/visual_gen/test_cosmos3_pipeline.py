@@ -18,10 +18,6 @@ Run audio only:
 
 Run prompt metadata unit tests (no GPU):
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -k FormatPromptWithMetadata
-
-Override checkpoint:
-    DIFFUSION_MODEL_PATH_COSMOS3=/path/to/Cosmos3-Nano \\
-        pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -s
 """
 
 import gc
@@ -37,8 +33,10 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import PIL.Image
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import resolve_action_content_size
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_ACTION_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
@@ -63,6 +61,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFF
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.media.decoding import video_stream_info
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
@@ -84,24 +83,6 @@ def _cleanup_gpu():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
-def _llm_models_root() -> str:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-COSMOS3_NANO_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
 
 PROMPT = "A serene mountain lake at sunrise with mist rising from the water."
 NUM_STEPS = 4
@@ -126,11 +107,9 @@ COSMOS3_FP8_QUANT_CONFIG = {
 
 
 def _require_checkpoint() -> str:
-    if not COSMOS3_NANO_PATH or not os.path.exists(COSMOS3_NANO_PATH):
-        pytest.skip(f"Checkpoint not found: {COSMOS3_NANO_PATH}")
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    return COSMOS3_NANO_PATH
+    return get_checkpoint("Cosmos3-Nano")
 
 
 def _load_pipeline(checkpoint_path: str, **visual_gen_kwargs):
@@ -230,14 +209,14 @@ def _assert_valid_audio(
 
 def _require_audio_pipeline(pipeline) -> None:
     if not getattr(pipeline, "audio_gen", False):
-        pytest.skip("Checkpoint does not enable audio generation")
+        pytest.fail("Checkpoint does not enable audio generation")
     if not hasattr(pipeline, "audio_tokenizer"):
-        pytest.skip("Audio tokenizer was not loaded for this pipeline")
+        pytest.fail("Audio tokenizer was not loaded for this pipeline")
 
 
 def _require_action_pipeline(pipeline) -> None:
     if not getattr(pipeline, "action_gen", False):
-        pytest.skip("Checkpoint does not enable action generation")
+        pytest.fail("Checkpoint does not enable action generation")
 
 
 def _assert_valid_action(action: torch.Tensor, *, raw_action_dim: int, chunk_size: int):
@@ -350,7 +329,7 @@ class TestFormatPromptWithMetadataPlainText:
             duration_template=None,
             resolution_template=None,
         )
-        assert result == "Plain prompt."
+        assert result == "Plain prompt"
 
     def test_empty_prompt_with_templates(self, cosmos3_format_pipeline):
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, "")
@@ -431,6 +410,27 @@ class TestTokenizePrompt:
 
 
 class TestFormatPromptWithMetadataJson:
+    def test_templates_disabled_preserves_structured_prompt_byte_for_byte(
+        self, cosmos3_format_pipeline
+    ):
+        """Disabling templates makes a structured prompt an exact pass-through."""
+        prompt = (
+            ' \n{"aspect_ratio":"16,9", "actions": ['
+            '{"description":"A full backflip","time":"0:03-0:05"}],'
+            ' "duration":"7s", "fps":24, "resolution":{"W":1280,"H":720}} \n'
+        )
+
+        result = _format_prompt_with_metadata(
+            cosmos3_format_pipeline,
+            prompt,
+            duration_template=None,
+            resolution_template=None,
+        )
+
+        assert result == prompt
+        assert json.loads(result)["duration"] == "7s"
+        assert json.loads(result)["fps"] == 24
+
     def test_injects_metadata_fields(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "A foundry pour", "subjects": []})
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
@@ -445,7 +445,7 @@ class TestFormatPromptWithMetadataJson:
         assert data["aspect_ratio"] == "16,9"
         assert '"resolution": {"H": 720, "W": 1280}' in result
 
-    def test_overwrites_existing_metadata_fields(self, cosmos3_format_pipeline):
+    def test_preserves_existing_metadata_fields(self, cosmos3_format_pipeline):
         prompt = json.dumps(
             {
                 "prompt": "test",
@@ -455,10 +455,22 @@ class TestFormatPromptWithMetadataJson:
                 "aspect_ratio": "3,4",
             }
         )
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
+        assert result == prompt
+        assert json.loads(result) == json.loads(prompt)
+
+    def test_fills_only_missing_metadata_fields(self, cosmos3_format_pipeline):
+        prompt = json.dumps(
+            {
+                "prompt": "test",
+                "duration": "5s",
+                "resolution": {"W": 640, "H": 480},
+            }
+        )
         data = json.loads(_format_prompt_with_metadata(cosmos3_format_pipeline, prompt))
-        assert data["duration"] == "7s"
+        assert data["duration"] == "5s"
         assert data["fps"] == 24.0
-        assert data["resolution"] == {"H": 720, "W": 1280}
+        assert data["resolution"] == {"W": 640, "H": 480}
         assert data["aspect_ratio"] == "16,9"
 
     def test_single_frame_skips_duration_by_default(self, cosmos3_format_pipeline):
@@ -486,8 +498,7 @@ class TestFormatPromptWithMetadataJson:
         )
         assert data["duration"] == "0s"
 
-    def test_still_drops_stale_duration_and_fps(self, cosmos3_format_pipeline):
-        """A caller's JSON may already declare a duration; a still must not keep it."""
+    def test_single_frame_preserves_user_duration_and_fps(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "still life", "duration": "7s", "fps": 24.0})
         data = json.loads(
             _format_prompt_with_metadata(
@@ -497,8 +508,9 @@ class TestFormatPromptWithMetadataJson:
                 resolution_template=COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
             )
         )
-        assert "duration" not in data
-        assert "fps" not in data
+        assert data["duration"] == "7s"
+        assert data["fps"] == 24.0
+        assert data["resolution"] == {"W": 1280, "H": 720}
 
     def test_non_ascii_is_escaped(self, cosmos3_format_pipeline):
         """The reference serializes with the json default (``ensure_ascii=True``)."""
@@ -566,7 +578,14 @@ class TestNegativePromptMetadata:
 
     NEGATIVE = json.dumps({"subjects": [{"description": "Blurry, poorly defined subjects."}]})
 
-    def _negative(self, pipeline, **kwargs):
+    def _negative(
+        self,
+        pipeline,
+        *,
+        duration_template=COSMOS3_DURATION_TEMPLATE,
+        resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+        **kwargs,
+    ):
         """Format a negative prompt the way ``forward`` does."""
         return pipeline._apply_metadata_templates(
             self.NEGATIVE,
@@ -574,10 +593,20 @@ class TestNegativePromptMetadata:
             width=WIDTH,
             num_frames=189,
             frame_rate=FRAME_RATE,
-            duration_template=COSMOS3_DURATION_TEMPLATE,
-            resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+            duration_template=duration_template,
+            resolution_template=resolution_template,
             **kwargs,
         )
+
+    def test_templates_disabled_preserves_negative_prompt_byte_for_byte(
+        self, cosmos3_format_pipeline
+    ):
+        result = self._negative(
+            cosmos3_format_pipeline,
+            duration_template=None,
+            resolution_template=None,
+        )
+        assert result == self.NEGATIVE
 
     def test_json_negative_keeps_object_and_appends_sentences(self, cosmos3_format_pipeline):
         result = self._negative(cosmos3_format_pipeline)
@@ -1402,6 +1431,7 @@ class TestCosmos3Action:
 
     def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
+        video = _V2V_FIXTURE_MP4.read_bytes()
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
@@ -1414,13 +1444,22 @@ class TestCosmos3Action:
             raw_action_dim=self.RAW_ACTION_DIM,
             # The clip is chunk + 1 frames, and the fixture holds NUM_FRAMES.
             action_chunk_size=NUM_FRAMES - 1,
-            video=_V2V_FIXTURE_MP4.read_bytes(),
+            video=video,
         )
+        source_info = video_stream_info(video)
+        assert source_info is not None
+        content_h, content_w = resolve_action_content_size(
+            source_info.height,
+            source_info.width,
+            self.ACTION_HEIGHT,
+            self.ACTION_WIDTH,
+        )
+        spatial_factor = cosmos3_pipeline.vae_scale_factor_spatial
         _assert_valid_video(
             result.video,
             num_frames=NUM_FRAMES,
-            height=self.ACTION_HEIGHT,
-            width=self.ACTION_WIDTH,
+            height=max(content_h // spatial_factor, 1) * spatial_factor,
+            width=max(content_w // spatial_factor, 1) * spatial_factor,
         )
         _assert_valid_action(
             result.action,
@@ -1499,7 +1538,7 @@ class TestCosmos3Action:
         with pytest.raises(Exception):
             _run_forward(
                 cosmos3_pipeline,
-                image="/nonexistent/action_reference_frame.png",
+                image=b"not an encoded image",
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=self.ACTION_FRAMES,

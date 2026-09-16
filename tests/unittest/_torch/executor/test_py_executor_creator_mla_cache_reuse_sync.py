@@ -126,6 +126,7 @@ class _DummyModelEngine:
         *,
         attn_runtime_features,
         kv_cache_quant_algo,
+        sparse_algorithm=None,
         enable_flash_mla=False,
         max_seq_len=128,
     ):
@@ -134,13 +135,16 @@ class _DummyModelEngine:
         Args:
             attn_runtime_features: AttentionRuntimeFeatures instance.
             kv_cache_quant_algo: Quantization algorithm for KV cache.
+            sparse_algorithm: Optional sparse-attention algorithm name.
             enable_flash_mla: Whether to emulate the FlashMLA block-size override.
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.attn_runtime_features = attn_runtime_features
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
-        self.sparse_attention_config = None
+        self.sparse_attention_config = (
+            SimpleNamespace(algorithm=sparse_algorithm) if sparse_algorithm is not None else None
+        )
         self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -211,6 +215,7 @@ def _run_create_py_executor(
     *,
     sm_version,
     kv_cache_quant_algo,
+    sparse_algorithm=None,
     attn_backend="TRTLLM",
     cache_transceiver_config=None,
     enable_flash_mla=False,
@@ -229,6 +234,7 @@ def _run_create_py_executor(
         monkeypatch: pytest fixture for mocking.
         sm_version: CUDA SM version to simulate (e.g., 89, 90).
         kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        sparse_algorithm: Optional sparse-attention algorithm name.
         attn_backend: Attention backend to configure.
         cache_transceiver_config: Optional transceiver configuration to mutate.
         enable_flash_mla: Whether to emulate the FlashMLA block-size override.
@@ -297,6 +303,7 @@ def _run_create_py_executor(
         return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
+            sparse_algorithm=sparse_algorithm,
             enable_flash_mla=enable_flash_mla,
             max_seq_len=model_max_seq_len,
         )

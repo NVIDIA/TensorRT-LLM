@@ -49,7 +49,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import install_activation_params
-from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
+from .communication import (
+    AllGatherReduceScatter,
+    Communication,
+    CommunicationFactory,
+    NVLinkTwoSided,
+)
+from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -442,6 +448,11 @@ class ConfigurableMoE(MoE):
         if not self.backend.capabilities.supports_dwdp:
             return False
 
+        # DWDP rebinds the backend parameters, which would strand the localized
+        # weight shards. Not enabling it is the correct outcome, not an error.
+        if self.backend.uses_locality_domain:
+            return False
+
         quant_config = getattr(self.backend, "quant_config", None)
         if quant_config is None:
             quant_config = getattr(self.model_config, "quant_config", None)
@@ -458,10 +469,13 @@ class ConfigurableMoE(MoE):
         Extract quantization configuration from model_config
 
         """
-        if model_config.quant_config is None:
+        # Prefer the resolved per-module override (e.g. W4A8_AWQ for experts)
+        # over the global config which may be MIXED_PRECISION.
+        quant_config = getattr(self, "_override_quant_config", None) or model_config.quant_config
+        if quant_config is None:
             return None
 
-        quant_mode = model_config.quant_config.layer_quant_mode
+        quant_mode = quant_config.layer_quant_mode
         return {
             "has_fp8_qdq": quant_mode.has_fp8_qdq()
             if hasattr(quant_mode, "has_fp8_qdq")
@@ -734,7 +748,40 @@ class ConfigurableMoE(MoE):
         # NVFP4TRTLLMGenFusedMoEBaseMethod applies to beta and clamp.
         if not self.backend._weights_created:
             install_activation_params(self.backend)
-        return self.backend.create_weights()
+        result = self.backend.create_weights()
+        self._resync_op_provider()
+        return result
+
+    def _resync_op_provider(self):
+        """Refresh the provider mirror after the backend saw its final config.
+
+        A backend may re-resolve which op provider it runs on from the quant
+        config installed just above (TRTLLMGenFusedMoE must: only FlashInfer
+        implements its BF16 kernels, so a layer left unquantized by layerwise
+        quantization moves providers here). The mirror taken in ``__init__``
+        feeds communication-strategy selection.
+
+        Only the mirror is updated. Rebuilding the strategy here would run a
+        collective -- NVLink strategies allocate MNNVL memory, and destroy() is
+        collective too -- in the middle of per-layer weight creation, which
+        deadlocked every rank. Provider and strategy can only actually disagree
+        for the NVLink two-sided pair; that combination is rejected loudly
+        rather than repaired silently, because a wrong alltoall kernel would be
+        a numerical error rather than a crash.
+        """
+        provider = getattr(self.backend, "use_flashinfer", False)
+        if provider == self.use_flashinfer:
+            return
+        self.use_flashinfer = provider
+        if isinstance(self.comm, (NVLinkTwoSided, NVLinkTwoSidedFlashinfer)):
+            raise NotImplementedError(
+                f"layer {self.layer_idx}: layerwise quantization moved this MoE "
+                f"onto the {'FlashInfer' if provider else 'native'} op provider "
+                f"after {type(self.comm).__name__} was selected for the other "
+                "one. The NVLink two-sided strategies are provider-specific, "
+                "and re-selecting one here would deadlock; choose the "
+                "communication method explicitly for this model instead."
+            )
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """

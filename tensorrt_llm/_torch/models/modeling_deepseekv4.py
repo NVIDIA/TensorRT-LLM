@@ -52,8 +52,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention.mla import MLA
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -70,7 +71,6 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
-from ..modules.mla import MLA
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import (
@@ -848,7 +848,6 @@ class DeepseekV4WeightLoader:
         has_shared_mtp_weights = (
             model_nextn_predict_layers > (ckpt_num_nextn_predict_layers or 0) > 0
         )
-        pageout_eplb_weights = getattr(self.model_config, "moe_load_balancer", None) is not None
 
         def pageout_previous_moe_layer() -> None:
             """Release file-backed pages after the previous MoE layer load."""
@@ -879,11 +878,18 @@ class DeepseekV4WeightLoader:
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if name.startswith("draft_model"):
                 continue
-            if pageout_eplb_weights and name.endswith("experts.backend"):
-                # Static EPLB permutes experts across the checkpoint, causing
-                # every EP rank to fault pages from many safetensors shards.
+            if name.endswith("experts.backend"):
                 # Bound the resident file cache at one MoE layer instead of
                 # allowing it to accumulate for the entire checkpoint.
+                #
+                # Static EPLB makes this worse -- it permutes experts across the
+                # checkpoint, so every EP rank faults pages from many safetensors
+                # shards -- but it is not what makes the page-out necessary. The
+                # mmap'd shards are never released on any path, so on a node whose
+                # RAM is close to the checkpoint size the resident file cache grows
+                # until the cgroup OOM-killer fires, EPLB or not. Releasing the
+                # consumed mapping (``mark_consumed`` below) is not sufficient on
+                # its own: it frees the dict entries, not the file-backed pages.
                 pageout_previous_moe_layer()
             names = name.split(".")
             parent_module_name = ".".join(names[:-1])

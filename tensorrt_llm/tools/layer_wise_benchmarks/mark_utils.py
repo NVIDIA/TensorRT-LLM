@@ -3,6 +3,8 @@
 
 import nvtx
 
+from tensorrt_llm._torch.attention.attention import Attention
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate, Deepseekv3MoE
 from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4Gate, DeepseekV4MoE
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
@@ -15,12 +17,10 @@ from tensorrt_llm._torch.models.modeling_qwen3_next import (
     Qwen3NextGatedDeltaNet,
     Qwen3NextSparseMoeBlock,
 )
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.mamba.mamba2_mixer import Mamba2Mixer
 from tensorrt_llm._torch.modules.mhc.hyper_connection import mHC
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE
 
 

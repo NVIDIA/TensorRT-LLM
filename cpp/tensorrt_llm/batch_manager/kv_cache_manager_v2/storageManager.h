@@ -190,8 +190,7 @@ public:
     // ---- Migration ---------------------------------------------------------
 
     // Migrate a batch of pages to GPU (used by batchedLockToGpu).
-    void batchedMigrateToGpu(
-        std::vector<BatchedLockTarget> const& targets, KvCache& kvCache, MigrationRecorder const& migrationRecorder);
+    void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder);
 
     // Best-effort migration of grouped pages to a destination cache level.
     void prefetch(
@@ -251,9 +250,23 @@ public:
     PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
 
+    // Describe every hot-tier pool group: slot count, slot descriptor and per-pool base
+    // addresses. Used to configure the cold-page codec and exposed through KvCacheManager.
+    TypedVec<PoolGroupIndex, PoolGroupDesc> poolGroupDescs() const;
+
     // Return the byte size of each pool in a pool group.
-    TypedVec<PoolIndex, size_t> slotSize(CacheLevel level, PoolGroupIndex pgIdx) const;
-    TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const;
+    // Precomputed at construction and returned by reference: slot sizes derive from the
+    // immutable slot descriptors, so this needs no invalidation and allocates nothing. It is
+    // called once per migrated/dropped page by the statistics recorders.
+    TypedVec<PoolIndex, size_t> const& slotSize(CacheLevel level, PoolGroupIndex pgIdx) const
+    {
+        return mSlotSizes.at(level).at(pgIdx);
+    }
+
+    TypedVec<PoolIndex, size_t> const& slotSize(PoolGroupIndex pgIdx) const
+    {
+        return slotSize(kHotLevel, pgIdx);
+    }
 
     // Current ratio list for a cache level (proportional to byte usage per pool group).
     TypedVec<PoolGroupIndex, float> getRatioList(CacheLevel level) const;
@@ -347,6 +360,12 @@ private:
         size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
     // Internal helpers.
+    // Register the slot descriptors for the next cache level and derive its slot-size table.
+    // This is the only mutator of mSlotDescLists/mSlotSizes, so the two cannot go out of sync.
+    // Levels must be appended in order -- the hot tier first, then the cold tiers once the codec
+    // has been queried -- and the returned level lets callers assert that ordering.
+    CacheLevel appendLevelSlotDescList(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescs);
+
     [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
 
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
@@ -383,7 +402,6 @@ private:
     // Codec-selected PageIndexPair memory location for each lifecycle.
     TypedVec<LifeCycleId, PageIndexLocation> mPageIndexLocations;
     std::unordered_map<LayerId, LifeCycleId> mLayerToLifeCycleIds;
-    StorageConfig mStorageConfig;
 
     // slot-to-page-index scale factors: [lcId][poolIdx]
     TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> mSlotToPageIndices;
@@ -418,6 +436,8 @@ private:
     std::map<BufferId, BufferAttr> mBufferAttr;
 
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
+    // Slot sizes per (level, pool group), built from mSlotDescLists.
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;

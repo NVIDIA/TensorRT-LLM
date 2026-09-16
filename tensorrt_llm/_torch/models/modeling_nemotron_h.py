@@ -35,10 +35,10 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
 
-from ..attention_backend import AttentionMetadata
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
@@ -888,6 +888,13 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 re.sub(r"(model\.layers\.)?backbone", "model", k)
                 for k in model_config.quant_config.exclude_modules
             ]
+        else:
+            model_config.quant_config.exclude_modules = []
+        # Depthwise conv1d is stored in a Linear for TP, but it is not a GEMM.
+        # NVFP4 groups along in_features (d_conv, typically 4), which is not
+        # divisible by the block size of 16, so keep this Linear unquantized.
+        if "*.mixer.conv1d" not in model_config.quant_config.exclude_modules:
+            model_config.quant_config.exclude_modules.append("*.mixer.conv1d")
 
         # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
         # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use

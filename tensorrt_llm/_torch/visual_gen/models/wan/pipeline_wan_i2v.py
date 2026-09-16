@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retriev
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 # Supported Wan I2V 14B models:
@@ -103,6 +103,7 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     ],
     doc="Wan 2.1 & 2.2 image-to-video family.",
+    supports_nvfp4_vae=True,
 )
 class WanImageToVideoPipeline(BasePipeline):
     def __init__(self, pipeline_config):
@@ -253,6 +254,9 @@ class WanImageToVideoPipeline(BasePipeline):
                 checkpoint_dir,
                 device,
                 dtype=self.pipeline_config.torch_dtype,
+                quant_config=self.pipeline_config.vae_conv_quant_config,
+                dynamic_weight_quant=self.pipeline_config.vae_conv_dynamic_weight_quant,
+                dynamic_activation_quant=self.pipeline_config.vae_conv_dynamic_activation_quant,
             )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
@@ -487,7 +491,7 @@ class WanImageToVideoPipeline(BasePipeline):
                 "All videos will be conditioned on the same image."
             )
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
         boundary_ratio = boundary_ratio if boundary_ratio is not None else self.boundary_ratio

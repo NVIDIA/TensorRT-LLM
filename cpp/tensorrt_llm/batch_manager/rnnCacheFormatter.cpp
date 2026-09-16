@@ -52,7 +52,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start sending unified pool RNN state for request ID: %ld.",
         llmRequest.mRequestId);
-    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
+    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.getBeamWidth() == 1, "Currently, only beam width 1 is supported.");
 
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
@@ -258,7 +258,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start receiving unified pool RNN state for request ID: %ld.",
         llmRequest.mRequestId);
-    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
+    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.getBeamWidth() == 1, "Currently, only beam width 1 is supported.");
 
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();

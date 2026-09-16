@@ -22,18 +22,15 @@ JSON parameter against ground truth values from torch.cuda, platform, etc.
 import json
 import os
 import platform
-import sys
 import threading
 from unittest.mock import patch
 
 import pytest
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.usage import schemas
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from utils.llm_data import llm_models_root  # noqa: E402
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 

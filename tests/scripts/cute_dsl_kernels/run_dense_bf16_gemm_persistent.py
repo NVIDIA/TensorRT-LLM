@@ -52,14 +52,15 @@ import cutlass.torch as cutlass_torch
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-# TODO: runnable once the quantized-dense PR in this series adds the imported kernel.
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin import dense_gemm_persistent as kernel_module
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin import (
+        dense_bf16_gemm_persistent as kernel_module,
+    )
 except (ModuleNotFoundError, ImportError):
     sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from rubin import dense_gemm_persistent as kernel_module
+    from rubin import dense_bf16_gemm_persistent as kernel_module
 
-PersistentDenseGemmKernel = kernel_module.SM107PersistentDenseGemmKernel
+PersistentDenseGemmKernel = kernel_module.PersistentDenseGemmKernel
 
 try:
     from .testing import benchmark
@@ -213,15 +214,10 @@ def run(
     )
 
     # Configure gemm kernel
-    # SM107 kernel requires mma_tiler (M, N, K) and mma_inst_shape (M, N, K)
-    mma_k = 32  # K dimension for BF16/FP16 MMA on SM107
-    mma_tiler = (*mma_tiler_mn, mma_k)
-    mma_inst_shape = (*mma_tiler_mn, mma_k)
     gemm = PersistentDenseGemmKernel(
         acc_dtype,
         use_2cta_instrs,
-        mma_tiler,
-        mma_inst_shape,
+        mma_tiler_mn,
         cluster_shape_mn,
         use_tma_store=True,
     )

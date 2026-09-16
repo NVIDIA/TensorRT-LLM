@@ -906,6 +906,16 @@ class TestRequestValidation:
         req = self._make_request(extra_params={"stg_scale": 0.5})
         self._merge_and_validate(executor, req)  # should not raise
 
+    def test_deprecated_cosmos3_view_point_remains_accepted(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        validate_visual_gen_params(
+            VisualGenParams(extra_params={"view_point": "ego_view"}),
+            declared_defaults={},
+            extra_param_specs=COSMOS3_EXTRA_SPECS,
+        )
+
     def test_spec_validator_runs_at_preflight(self):
         """Per-param validators turn deterministic client errors into 400s at
         the boundary instead of worker-side failures (Cosmos3 conditioning)."""

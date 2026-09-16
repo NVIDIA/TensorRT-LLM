@@ -7,7 +7,8 @@ perf-optimize consumes the same base spec as perf-analyze (required
 one-shot SOL projector stage here too, on by default) plus two blocks of
 its own:
 
-- ``optimize`` — the loop knobs: round/item/attempt budgets, the allowed
+- ``optimize`` — the loop knobs: round/item/attempt budgets, serial or
+  parallel execution of one preselected batch per round, the allowed
   optimization ``approaches`` (any non-empty subset of the roadmap's
   ``config`` / ``code``), the evaluator's acceptance gate
   (``accept_fraction`` × the item's expected gain, with a
@@ -36,11 +37,12 @@ block (the base validator preserves unknown ``profile`` keys):
 - ``profile.kernel_coverage`` — optional; when present (an empty mapping
   is valid — all defaults) it activates the **per-kernel coverage
   contract**: the analyzer's ncu deep dive must cover every kernel
-  at/above ``min_share_pct`` of GPU time (extending down the kern_sum
-  until ``coverage_target_pct`` is reached), and every covered kernel
-  gets both of its questions — faster? fusible? — answered in a
-  schema-validated ``kernel_ledger.yaml`` each round (a roadmap item or
-  an evidence-backed dismissal per question). Requires ``nsys`` (the
+  at/above ``min_share_pct`` of in-window GPU time (extending down the
+  nsys timeline decomposition until ``coverage_target_pct`` is reached),
+  and every covered kernel gets all four of its questions — eliminable?
+  faster? fusible? overlappable? — answered in a schema-validated
+  ``kernel_ledger.yaml`` each round (a roadmap item or an
+  evidence-backed dismissal per question). Requires ``nsys`` (the
   enumeration source) and ``ncu`` (the per-kernel metrics) in
   ``profile.methods``.
 
@@ -59,6 +61,7 @@ from typing import Any, Mapping
 
 from agent_flow.workflows.perf_analyze.task_schema import (
     EXTRA_LLM_API_OPTIONS_FIELD,
+    REMOTE_RUN_ROOT_FIELD,
     TaskSchemaError,
     cluster_ssh,
     concurrency_points,
@@ -66,6 +69,8 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     has_slurm_environment,
     is_curve_mode,
     num_prompts_per_point,
+    profile_ranks,
+    remote_run_root,
     sol_enabled,
 )
 from agent_flow.workflows.perf_analyze.task_schema import (
@@ -90,18 +95,15 @@ from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 OPTIMIZE_DEFAULTS: dict[str, Any] = {
     # The loop runs exactly this many rounds unless the optional
     # improvement target is met or an analyzer turn finds no actionable
-    # item. Each round is
-    # one analyzer turn plus up to ``max_items_per_round`` gated items —
-    # and only a round with stale/unproven runtime evidence pays to
-    # re-profile. Accepts stale it; so can a reverted code attempt whose
-    # gitignored build output survives.
+    # item. Each round is one analyzer turn plus a preselected batch of up
+    # to ``max_items_per_round`` gated items, and only a round with stale
+    # or unproven runtime evidence pays to re-profile.
     "max_rounds": 5,
     "max_attempts_per_item": 3,
-    # Items applied (one at a time, each with its own evaluator gate)
-    # before the round closes and the analyzer runs again. 1 reproduces
-    # the original one-item-per-round loop; raising it amortizes the
-    # analyzer profile across more items.
+    # Terminal items (approved or rejected) consume this round budget in
+    # both serial and parallel execution modes.
     "max_items_per_round": 3,
+    "item_execution": "parallel",
     # Which roadmap ``approach`` values the run may plan/apply. Restrict
     # to ["code"] to forbid tuning-YAML knob changes (code-only campaign)
     # or to ["config"] to leave the TRT-LLM checkout untouched.
@@ -110,6 +112,8 @@ OPTIMIZE_DEFAULTS: dict[str, Any] = {
     "noise_floor_pct": 1.0,
     "target_metric": "output_throughput",
 }
+
+ITEM_EXECUTIONS = ("serial", "parallel")
 
 ACCURACY_DEFAULTS: dict[str, Any] = {
     "max_drop_pct": 1.0,
@@ -148,12 +152,13 @@ KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "covera
 # present (its presence is the opt-in; absent ⇒ the bounded top-kernel
 # ncu dive, the historical behavior).
 KERNEL_COVERAGE_DEFAULTS: dict[str, Any] = {
-    # Every kernel at/above this share of profiled GPU time gets its own
-    # ledger row (and ncu coverage).
+    # Every kernel at/above this share of in-window GPU time gets its
+    # own ledger row (and ncu coverage).
     "min_share_pct": 0.5,
-    # The enumerated rows must cover at least this much of GPU time —
-    # when the >= min_share_pct rows fall short, enumeration extends
-    # down the kern_sum (grouping related kernels is fine) until met.
+    # The enumerated rows must cover at least this much of in-window GPU
+    # time — when the >= min_share_pct rows fall short, enumeration
+    # extends down the timeline decomposition (grouping related kernels
+    # is fine) until met.
     "coverage_target_pct": 95.0,
 }
 
@@ -175,11 +180,22 @@ def _mapping_block(data: Mapping[str, Any], key: str, errors: list[str]) -> dict
 
 
 def _validate_optimize_block(optimize: Mapping[str, Any], errors: list[str]) -> None:
-    for field in ("max_rounds", "max_attempts_per_item", "max_items_per_round"):
+    for field in (
+        "max_rounds",
+        "max_attempts_per_item",
+        "max_items_per_round",
+    ):
         if field in optimize and optimize[field] is not None:
             value = optimize[field]
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 errors.append(f"'optimize.{field}' must be an integer >= 1, got {value!r}")
+
+    if "item_execution" in optimize and optimize["item_execution"] is not None:
+        value = optimize["item_execution"]
+        if value not in ITEM_EXECUTIONS:
+            errors.append(
+                f"'optimize.item_execution' must be one of {list(ITEM_EXECUTIONS)}, got {value!r}"
+            )
 
     if "accept_fraction" in optimize and optimize["accept_fraction"] is not None:
         value = optimize["accept_fraction"]
@@ -319,8 +335,8 @@ def _validate_kernel_coverage(data: Mapping[str, Any], errors: list[str]) -> dic
     if missing:
         errors.append(
             f"'profile.kernel_coverage' requires {missing} in 'profile.methods' — "
-            f"the kernel enumeration comes from the nsys kern_sum and the "
-            f"per-kernel metrics from ncu"
+            f"the kernel enumeration comes from the nsys timeline "
+            f"decomposition and the per-kernel metrics from ncu"
         )
         return None
     return merged
@@ -520,7 +536,9 @@ __all__ = [
     "KNOWN_ACCURACY_KEYS",
     "KNOWN_KERNEL_COVERAGE_KEYS",
     "KNOWN_OPTIMIZE_KEYS",
+    "ITEM_EXECUTIONS",
     "OPTIMIZE_DEFAULTS",
+    "REMOTE_RUN_ROOT_FIELD",
     "VALID_METRICS",
     "TaskSchemaError",
     "concurrency_points",
@@ -534,5 +552,7 @@ __all__ = [
     "load_and_validate_task_yaml",
     "max_regression_pct",
     "num_prompts_per_point",
+    "profile_ranks",
+    "remote_run_root",
     "sol_enabled",
 ]

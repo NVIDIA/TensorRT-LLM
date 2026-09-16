@@ -10,7 +10,7 @@ TensorRT LLM
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-13.2.1-green)](https://developer.nvidia.com/cuda-downloads)
 [![torch](https://img.shields.io/badge/torch-2.12.0-green)](https://pytorch.org)
-[![version](https://img.shields.io/badge/release-1.3.0rc26-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
+[![version](https://img.shields.io/badge/release-1.3.0rc27-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/LICENSE)
 
 [Architecture](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](https://nvidia.github.io/TensorRT-LLM/developer-guide/perf-overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://nvidia.github.io/TensorRT-LLM/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap)
@@ -318,7 +318,9 @@ deployment, and not linked to users. The data we collect includes:
 - Ingress point (e.g., LLM API, CLI, serve command)
 - Deployment duration (via periodic heartbeats)
 - GPU SKUs, count, memory, and CUDA version
-- Model architecture class name (e.g., `LlamaForCausalLM`)
+- Public model architecture class name (e.g., `LlamaForCausalLM`); architectures
+  outside the checked-in public allowlist are sent only as a deterministic
+  SHA-256 hash, never as the original free-form name
 - Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
 - System information (OS platform, Python version, CPU architecture, CPU count)
 - TRT-LLM version and backend

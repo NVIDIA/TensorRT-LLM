@@ -48,6 +48,10 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
+# tensors plus target-only receiver finalization. Mistral shares the dense
+# decoder base class with Llama but is a distinct root with its own contract.
+MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-mistral-dense-target-layout-v1"
 _MISSING = object()
 
 
@@ -80,6 +84,34 @@ def _realized_rope_fusion(model: nn.Module) -> bool | None:
             return None
         realized_values.add(canonical_value)
     return realized_values.pop() if len(realized_values) == 1 else None
+
+
+def _realized_sliding_window(model: nn.Module) -> str | None:
+    """Summarize the sliding-window attention realized by a constructed model.
+
+    Attention modules that can apply a window expose `attention_window_size`.
+    The result is `none` when every exposing module applies full attention,
+    `uniform` when all exposing modules share one positive window, `mixed` when
+    windowed and full-attention layers coexist or windows differ, and `None`
+    when no module exposes the attribute or a value is not a positive `int`.
+    """
+    realized_values: set[int | None] = set()
+    for module in model.modules():
+        value = getattr(module, "attention_window_size", _MISSING)
+        if value is _MISSING:
+            continue
+        if value is None:
+            realized_values.add(None)
+            continue
+        window_size = _canonical_int(value)
+        if window_size is None or window_size <= 0:
+            return None
+        realized_values.add(window_size)
+    if not realized_values:
+        return None
+    if realized_values == {None}:
+        return "none"
+    return "uniform" if len(realized_values) == 1 else "mixed"
 
 
 def _canonical_optional_string(container: object, attribute: str) -> str | None:
@@ -139,6 +171,9 @@ class PostTransformRuntimeConfig:
     tied_word_embeddings: bool | None
     rope_type: str | None
     rope_fusion: bool | None
+    # Realized sliding-window attention: `none`, `uniform`, `mixed`, or `None`
+    # when the constructed model does not determine it.
+    sliding_window: str | None
 
     @classmethod
     def from_model_config(
@@ -172,6 +207,7 @@ class PostTransformRuntimeConfig:
             rope_type = None
 
         rope_fusion = _realized_rope_fusion(model) if model is not None else None
+        sliding_window = _realized_sliding_window(model) if model is not None else None
 
         return cls(
             dtype=_canonical_string(getattr(model_config, "torch_dtype", None)),
@@ -203,6 +239,7 @@ class PostTransformRuntimeConfig:
             ),
             rope_type=rope_type,
             rope_fusion=rope_fusion,
+            sliding_window=sliding_window,
         )
 
 
@@ -232,6 +269,7 @@ class PostTransformRuntimeConstraints:
         ("tied_word_embeddings", "tied_word_embeddings"),
         ("rope_types", "rope_type"),
         ("rope_fusion", "rope_fusion"),
+        ("sliding_windows", "sliding_window"),
     )
 
     dtypes: frozenset[str | None] | None = None
@@ -255,6 +293,7 @@ class PostTransformRuntimeConstraints:
     tied_word_embeddings: frozenset[bool | None] | None = None
     rope_types: frozenset[str | None] | None = None
     rope_fusion: frozenset[bool | None] | None = None
+    sliding_windows: frozenset[str | None] | None = None
 
     def __post_init__(self) -> None:
         for constraint_name, _runtime_name in self._DIMENSIONS:

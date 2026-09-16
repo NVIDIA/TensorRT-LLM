@@ -1,18 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import math
 import random
+import types
 from dataclasses import dataclass
 from typing import List
+from unittest import mock
 
 import pytest
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention import mla as mla_module
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.trtllm import \
+    TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
@@ -395,7 +402,7 @@ accuracy_dict = {
 @pytest.mark.cpu_only
 def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
                                             monkeypatch):
-    import tensorrt_llm._torch.modules.mla as mla_module
+    import tensorrt_llm._torch.attention.mla as mla_module
 
     class FakeTrtllmAttention:
 
@@ -1431,3 +1438,121 @@ def test_context_prefix_counts_tokens_not_rows():
         torch.tensor([2, 3, 7], dtype=torch.int32, device="cuda"))
     state.on_update_kv_lens()
     assert state.mla_prepare_ctx_cu_seqlens().tolist() == [0, 2, 5, 12]
+
+
+def _context_projection(device: str,
+                        dtype: torch.dtype,
+                        bias: bool = False) -> types.SimpleNamespace:
+    model = types.SimpleNamespace(
+        num_heads_tp=4,
+        qk_nope_head_dim=16,
+        qk_rope_head_dim=8,
+        qk_head_dim=24,
+        v_head_dim=16,
+        kv_lora_rank=32,
+        kv_b_proj=torch.nn.Linear(32,
+                                  128,
+                                  bias=bias,
+                                  dtype=dtype,
+                                  device=device),
+        apply_rotary_emb=True,
+        out_scale=None,
+    )
+    model._use_kvbproj_strided_out = types.MethodType(
+        mla_module.MLA._use_kvbproj_strided_out, model)
+    model._get_kvbproj_head_weights = types.MethodType(
+        mla_module.MLA._get_kvbproj_head_weights, model)
+    return model
+
+
+@pytest.mark.cpu_only
+def test_kvb_weight_views_follow_weight_replacement() -> None:
+    """Replacing projection weights must invalidate the cached per-head views."""
+    model = _context_projection("cpu", torch.bfloat16)
+    first_k, first_v = model._get_kvbproj_head_weights()
+    cached_k, cached_v = model._get_kvbproj_head_weights()
+    assert cached_k is first_k and cached_v is first_v
+    model.kv_b_proj.weight = torch.nn.Parameter(
+        torch.randn_like(model.kv_b_proj.weight))
+    new_k, new_v = model._get_kvbproj_head_weights()
+    assert new_k is not first_k and new_v is not first_v
+    torch.testing.assert_close(new_k.flatten(0, 1), model.kv_b_proj.weight[:64])
+    torch.testing.assert_close(new_v.flatten(0, 1), model.kv_b_proj.weight[64:])
+
+
+@pytest.mark.parametrize(
+    "device", [pytest.param("cpu", marks=pytest.mark.cpu_only), "cuda"])
+@pytest.mark.parametrize("num_tokens", [1, 17])
+@pytest.mark.parametrize("case",
+                         ["eligible", "architecture", "dtype", "shape", "bias"])
+@pytest.mark.parametrize("apply_rope", [False, True])
+def test_kvb_context_layout(monkeypatch, device, num_tokens, case,
+                            apply_rope) -> None:
+    """Check expansion parity, K/V strides, and dispatch for every eligibility gate."""
+    torch.manual_seed(42)
+    use_strided = case == "eligible"
+    dtype = torch.float16 if case == "dtype" else torch.bfloat16
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    monkeypatch.setattr(mla_module, "is_sm_100f",
+                        lambda: case != "architecture")
+    if device == "cpu":
+        monkeypatch.setattr(torch.ops.trtllm, "bmm_out",
+                            lambda a, b, out: out.copy_(torch.bmm(a, b)))
+    monkeypatch.setattr(mla_module, "maybe_compiled_copy_",
+                        lambda dst, src: dst.copy_(src))
+    model = _context_projection(device, dtype, bias=case == "bias")
+    if case == "shape":
+        # Model a projection whose packed weight has the same numel but a
+        # different shape; its own forward still produces the wide KV result.
+        model.kv_b_proj.weight = torch.nn.Parameter(
+            model.kv_b_proj.weight.flatten())
+        monkeypatch.setattr(
+            model.kv_b_proj,
+            "forward",
+            lambda x: torch.nn.functional.linear(
+                x, model.kv_b_proj.weight.view(128, 32)),
+        )
+    assert model._use_kvbproj_strided_out() == use_strided
+    model.apply_rotary_emb = apply_rope
+    captured = {}
+
+    def attention(q, k, v, metadata, forward_args):
+        captured.update(k=k, v=v, latent=forward_args.latent_cache)
+        return forward_args.output
+
+    model.mha = types.SimpleNamespace(forward=attention)
+    # Compressed KV is a slice of the latent cache and need not be contiguous.
+    ckv = torch.randn(num_tokens, 40, dtype=dtype, device=device)[:, :32]
+    q = torch.empty(num_tokens, 96, dtype=dtype, device=device)
+    k_pe = torch.randn(num_tokens, 8, dtype=dtype, device=device)
+    output = torch.empty(num_tokens, 64, dtype=dtype, device=device)
+    latent_cache = torch.empty(0, device=device)
+    reference = model.kv_b_proj(ckv)
+    projection = mock.Mock(wraps=model.kv_b_proj.forward)
+    monkeypatch.setattr(model.kv_b_proj, "forward", projection)
+    result = mla_module.MLA.forward_context_default(model, q, ckv, k_pe, None,
+                                                    None, output, latent_cache)
+    k = captured["k"].view(num_tokens, 4, 24)
+    torch.testing.assert_close(k[..., :16].flatten(1),
+                               reference[:, :64],
+                               atol=0.0625,
+                               rtol=0.01)
+    torch.testing.assert_close(captured["v"],
+                               reference[:, 64:],
+                               atol=0.0625,
+                               rtol=0.01)
+    if apply_rope:
+        torch.testing.assert_close(k[..., 16:], k_pe[:,
+                                                     None, :].expand(-1, 4, -1))
+    # The FP8 consumer assumes the original KV token stride, including the unused K half.
+    assert captured["k"].stride() == (96, 1)
+    assert k[..., :16].transpose(0, 1).stride() == (24, 96, 1)
+    assert captured["v"].stride() == (128, 1)
+    # Unflatten may normalize the stride of a singleton token dimension.
+    v_out_token_stride = 64 if num_tokens == 1 else 128
+    v_out = captured["v"].unflatten(-1, (4, 16)).transpose(0, 1)
+    assert v_out.stride() == (16, v_out_token_stride, 1)
+    assert captured["latent"] is latent_cache
+    assert result is output
+    assert projection.call_count == (0 if use_strided else 1)

@@ -16,13 +16,15 @@
 
 import pytest
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
     _GlobalFlashInferPlanner,
 )
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
 
 # When a run uses FP8 GEMM on a GPU that doesn't support it, skip only that run.
 _FP8_BLOCK_SCALING_GEMM_ERR = "Unsupported SM version for FP8 block scaling GEMM"

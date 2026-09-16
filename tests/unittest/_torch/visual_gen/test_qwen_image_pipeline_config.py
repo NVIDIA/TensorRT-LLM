@@ -201,6 +201,13 @@ def test_qwen_pipeline_feature_args(args, expected):
             True,
             id="dynamic-fp4",
         ),
+        pytest.param(
+            {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True},
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            None,
+            True,
+            id="dynamic-fp8-rowwise",
+        ),
     ],
 )
 def test_qwen_pipeline_quant_config_parses_from_args(

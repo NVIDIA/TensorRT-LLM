@@ -446,6 +446,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "deepseek_v4": "deepseek_v4",
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",
+    "nemotron_h_omni": "nemotron-v3",
     "gemma4": "gemma4",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",

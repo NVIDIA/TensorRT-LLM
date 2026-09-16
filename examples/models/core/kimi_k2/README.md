@@ -65,8 +65,7 @@ cuda_graph_config:
 enable_attention_dp: False
 EOF
 
-trtllm-serve  \
-    --model /path_to_model/Kimi-K2-Instruct/ \
+trtllm-serve /path_to_model/Kimi-K2-Instruct/ \
     --backend pytorch \
     --tp_size 8 \
     --ep_size 8 \

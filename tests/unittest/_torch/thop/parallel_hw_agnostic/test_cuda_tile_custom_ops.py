@@ -18,6 +18,7 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+from utils.util import skip_rubin
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
@@ -98,6 +99,47 @@ def reference_rms_norm(
         return hidden_states
 
 
+def test_cuda_tile_rms_norm_rejects_sm107(monkeypatch: pytest.MonkeyPatch) -> None:
+    """cuda_tile_rms_norm has no SM107 kernels; it must raise instead of launching one."""
+    import tensorrt_llm._torch.custom_ops.cuda_tile_custom_ops as cuda_tile_custom_ops
+
+    monkeypatch.setattr(cuda_tile_custom_ops, "get_sm_version", lambda: 107)
+    x = torch.randn(4, 16, device="cuda")
+    weight = torch.randn(16, device="cuda")
+    with pytest.raises(RuntimeError, match="not supported on SM 107"):
+        torch.ops.trtllm.cuda_tile_rms_norm(
+            x=x,
+            weight=weight,
+            eps=1e-5,
+            static_persistent=False,
+            gather=False,
+            use_gemma=False,
+        )
+
+
+def test_cuda_tile_rms_norm_fuse_residual_rejects_sm107(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cuda_tile_rms_norm_fuse_residual_ has no SM107 kernels; it must raise instead of launching one."""
+    import tensorrt_llm._torch.custom_ops.cuda_tile_custom_ops as cuda_tile_custom_ops
+
+    monkeypatch.setattr(cuda_tile_custom_ops, "get_sm_version", lambda: 107)
+    x = torch.randn(4, 16, device="cuda").contiguous()
+    residual = torch.randn(4, 16, device="cuda").contiguous()
+    weight = torch.randn(16, device="cuda")
+    with pytest.raises(RuntimeError, match="not supported on SM 107"):
+        torch.ops.trtllm.cuda_tile_rms_norm_fuse_residual_(
+            x=x,
+            residual=residual,
+            weight=weight,
+            eps=1e-5,
+            static_persistent=False,
+            gather=False,
+            use_gemma=False,
+        )
+
+
+@skip_rubin
 @pytest.mark.parametrize(
     "M,N",
     [
@@ -155,6 +197,7 @@ def test_cuda_tile_rms_norm(M, N, use_gemma, static_persistent, gather, dtype):
     )
 
 
+@skip_rubin
 @pytest.mark.parametrize(
     "M,N",
     [
@@ -235,6 +278,7 @@ def test_cuda_tile_rms_norm_fuse_residual(M, N, use_gemma, static_persistent, ga
     )
 
 
+@skip_rubin
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cuda_tile_rms_norm_fuse_residual_inplace(dtype):
     """Test that fuse_residual operator truly modifies tensors in-place."""
@@ -265,6 +309,7 @@ def test_cuda_tile_rms_norm_fuse_residual_inplace(dtype):
     assert residual.data_ptr() == residual_data_ptr, "residual tensor was not modified in-place"
 
 
+@skip_rubin
 def test_cuda_tile_rms_norm_fuse_residual_requires_contiguous():
     """Test that fuse_residual operator requires contiguous tensors."""
     eps = 1e-5

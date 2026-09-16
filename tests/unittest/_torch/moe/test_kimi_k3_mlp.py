@@ -26,8 +26,19 @@ from torch import nn
 
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.situ import SituAndMul
+from tensorrt_llm._torch.utils import AuxStreamType
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+
+
+def _make_aux_stream_dict() -> dict[AuxStreamType, object]:
+    return {
+        AuxStreamType.Attention: object(),
+        AuxStreamType.MoeShared: object(),
+        AuxStreamType.MoeChunkingOverlap: object(),
+        AuxStreamType.MoeBalancer: object(),
+        AuxStreamType.MoeOutputMemset: object(),
+    }
 
 
 class _UnfusedKimiMLP(nn.Module):
@@ -224,8 +235,13 @@ def test_kimi_k3_shared_expert_parallel_construction(
 
     fake_moe = _FakeMoE()
 
+    create_moe_kwargs = {}
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
-    monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **_: fake_moe)
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "create_moe",
+        lambda **kwargs: create_moe_kwargs.update(kwargs) or fake_moe,
+    )
     monkeypatch.setattr(distributed, "AllReduce", _FakeAllReduce)
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
 
@@ -241,9 +257,18 @@ def test_kimi_k3_shared_expert_parallel_construction(
         moe_backend="TRTLLM",
     )
     config = _runtime_config()
-    runtime = modeling_kimi_linear.KimiK3MoERuntime(model_config, config, layer_idx=1)
+    aux_stream_dict = _make_aux_stream_dict()
+    runtime = modeling_kimi_linear.KimiK3MoERuntime(
+        model_config,
+        config,
+        layer_idx=1,
+        aux_stream_dict=aux_stream_dict,
+    )
 
     shared = runtime.shared_experts
+    assert create_moe_kwargs["aux_stream_dict"] is aux_stream_dict
+    assert AuxStreamType.MoeBalancer in create_moe_kwargs["aux_stream_dict"]
+    assert runtime.shared_expert_stream is aux_stream_dict[AuxStreamType.MoeShared]
     assert isinstance(shared, GatedMLP)
     assert shared.gate_up_proj.tp_size == expected_shared_tp
     assert shared.gate_up_proj.tp_rank == expected_shared_rank
@@ -288,6 +313,7 @@ def test_kimi_k3_dense_layer_uses_gated_mlp(
     class _IdentityAttention(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
+            self.aux_stream = kwargs["aux_stream"]
 
         def forward(self, hidden_states, attn_metadata):
             return hidden_states
@@ -322,9 +348,16 @@ def test_kimi_k3_dense_layer_uses_gated_mlp(
         activation_situ_beta=4.0,
         activation_situ_linear_beta=25.0,
     )
-    layer = modeling_kimi_linear.KimiLinearDecoderLayer(model_config, config, layer_idx=0)
+    aux_stream_dict = _make_aux_stream_dict()
+    layer = modeling_kimi_linear.KimiLinearDecoderLayer(
+        model_config,
+        config,
+        layer_idx=0,
+        aux_stream_dict=aux_stream_dict,
+    )
 
     assert not layer.is_moe
+    assert layer.linear_attn.aux_stream is aux_stream_dict[AuxStreamType.Attention]
     assert isinstance(layer.mlp, GatedMLP)
     assert layer.mlp_tp_size == expected_tp_size
     assert layer.mlp.gate_up_proj.tp_size == expected_tp_size
