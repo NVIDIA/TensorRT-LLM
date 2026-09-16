@@ -253,3 +253,115 @@ def test_build_dead_end_isolates_the_failing_request(monkeypatch):
     assert decoder.token_mask_host[1].item() == 1
     assert decoder.num_guided_tokens[1] == 1
     assert decoder.num_advanced_tokens[1] == 1
+
+
+class _RejectingMatcher(_ScriptedMatcher):
+    def accept_token(self, token_id: int) -> bool:
+        if token_id == 999:
+            return False
+        return super().accept_token(token_id)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_recomputed_context_replays_committed_output(monkeypatch):
+    """Recomputed context steps must replay previously committed output tokens."""
+    created_matchers = []
+
+    def fake_factory(*args, **kwargs):
+        class _Factory:
+            def create(self, params):
+                m = _ScriptedMatcher([True])
+                created_matchers.append(m)
+                return m
+        return _Factory()
+
+    monkeypatch.setattr(guided_decoder_module, "XGrammarMatcherFactory", fake_factory)
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
+
+    req = GuidedRequest(
+        guided_decoding_params=_GUIDED_PARAMS,
+        request_id=42,
+        seq_slot=_SLOT,
+        is_context_init_state=True,
+        is_last_context_chunk=True,
+        committed_output=(10, 20, 30),
+    )
+    requests = GuidedRequests(
+        [req],
+        num_contexts=1,
+        num_generations=0,
+        max_num_draft_tokens=0,
+    )
+
+    failed_requests = decoder._build(requests)
+    assert failed_requests == []
+    assert len(created_matchers) == 1
+    # Matcher must have accepted the committed prefix (10, 20, 30)
+    assert created_matchers[0].accepted == [10, 20, 30]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_recomputed_context_raises_on_invalid_committed_token(monkeypatch):
+    """If a committed token cannot be accepted, _build must raise ValueError."""
+    def fake_factory(*args, **kwargs):
+        class _Factory:
+            def create(self, params):
+                return _RejectingMatcher([True])
+        return _Factory()
+
+    monkeypatch.setattr(guided_decoder_module, "XGrammarMatcherFactory", fake_factory)
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
+
+    req = GuidedRequest(
+        guided_decoding_params=_GUIDED_PARAMS,
+        request_id=42,
+        seq_slot=_SLOT,
+        is_context_init_state=True,
+        is_last_context_chunk=True,
+        committed_output=(10, 999, 30),
+    )
+    requests = GuidedRequests(
+        [req],
+        num_contexts=1,
+        num_generations=0,
+        max_num_draft_tokens=0,
+    )
+
+    with pytest.raises(ValueError, match="failed to accept committed output token: 999"):
+        decoder._build(requests)
+
+
+def test_from_llm_request_extracts_committed_output():
+    """GuidedRequest.from_llm_request extracts committed tokens on context init."""
+    class MockLlmRequest:
+        def __init__(self, prompt_tokens, output_tokens):
+            self.guided_decoding_params = _GUIDED_PARAMS
+            self.py_request_id = 123
+            self.py_target_seq_slot = None
+            self.py_seq_slot = 1
+            self.py_batch_idx = None
+            self.is_context_init_state = True
+            self.is_last_context_chunk = True
+            self.is_generation_in_progress_state = False
+            self.llm_request_type = None
+            self.py_decoding_iter = 0
+            self.py_is_draft = False
+            self.py_draft_tokens = None
+            self.py_num_accepted_draft_tokens = None
+            self.orig_prompt_len = len(prompt_tokens)
+            self._tokens = prompt_tokens + output_tokens
+
+        def get_last_tokens(self, seq_idx):
+            return self._tokens[-1] if self._tokens else None
+
+        def get_num_tokens(self, seq_idx):
+            return len(self._tokens)
+
+        def get_tokens_range(self, seq_idx, begin, end):
+            return self._tokens[begin:end]
+
+    req = MockLlmRequest(prompt_tokens=[1, 2, 3], output_tokens=[10, 20, 30])
+    snapshot = GuidedRequest.from_llm_request(req)
+    assert snapshot.require_matcher_init()
+    assert snapshot.committed_output == (10, 20, 30)
+
