@@ -31,6 +31,16 @@ _COMM_PATTERN_NAMES: Tuple[str, ...] = (
 
 _EXPERT_PATTERN_NAMES: Tuple[str, ...] = ("random", "balanced", "hotspot", "powerlaw")
 
+# Keys each expert_pattern accepts. Validated up front so a key that only
+# applies to one pattern (or a typo'd key) is rejected instead of being
+# silently parsed and then ignored by the patterns that do not read it.
+_EXPERT_PATTERN_KNOWN_KEYS: Dict[str, Tuple[str, ...]] = {
+    "balanced": (),
+    "random": (),
+    "hotspot": ("hotness", "active_experts"),
+    "powerlaw": ("alpha",),
+}
+
 
 def _parse_pattern_spec(spec: str) -> Tuple[str, Dict[str, str]]:
     """Parse ``name,k1=v1,k2=v2`` into ``(name, {k1: v1, k2: v2})``.
@@ -103,6 +113,13 @@ def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
     name, raw = _parse_typed_pattern(
         spec, label="expert_pattern", valid_names=_EXPERT_PATTERN_NAMES
     )
+    unknown = sorted(set(raw) - set(_EXPERT_PATTERN_KNOWN_KEYS[name]))
+    if unknown:
+        allowed = _EXPERT_PATTERN_KNOWN_KEYS[name]
+        raise ValueError(
+            f"expert_pattern {name!r} does not accept {unknown}; "
+            f"valid keys: {list(allowed) if allowed else '(none)'}"
+        )
     kwargs: Dict[str, Any] = {}
     _pop_hotness_kwarg(raw, kwargs, label="expert_pattern")
     if "active_experts" in raw:
@@ -113,7 +130,7 @@ def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
         raise ValueError(
             "expert_pattern hotspot requires hotness=<ratio> or active_experts=<count>"
         )
-    if "alpha" in raw:
+    if name == "powerlaw" and "alpha" in raw:
         kwargs["alpha"] = float(raw["alpha"])
         # NaN/inf silently pass a plain ``< 0.0`` check (NaN compares False to
         # everything; +inf collapses _powerlaw_weights to a degenerate all-on-
