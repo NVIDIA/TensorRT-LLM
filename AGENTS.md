@@ -173,6 +173,21 @@ CI is triggered by posting comments on the PR. Basic commands:
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 
+### Advisory semantic conflict review
+
+CodeRabbit's `Semantic conflict with target branch` pre-merge check in
+`.coderabbit.yaml` looks for behavioral incompatibilities across branches. It is
+best-effort and warning-only; missing revision/history evidence is Inconclusive.
+
+For a non-draft PR targeting `main`, maintainers can add the
+`ai: semantic-conflict` label to opt into automatic rechecks on PR and main
+updates. The `CodeRabbit Semantic Conflict Review` workflow only posts requests;
+its success is not an AI verdict. Read CodeRabbit's result and verify its head
+and target SHAs still match the live branches. Use workflow dispatch with the
+PR number to retry a request, or comment `@coderabbitai run pre-merge checks`.
+The custom check requires CodeRabbit Custom Pre-Merge Checks access. This
+advisory pilot does not provide a merge-queue check or block merges.
+
 ### Trouble Shooting
 
 - Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.

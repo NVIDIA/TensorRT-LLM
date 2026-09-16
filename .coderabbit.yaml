@@ -77,6 +77,41 @@ reviews:
     drafts: false
     base_branches: ["main", "release/.+"]
 
+  # Best-effort semantic compatibility; rerun when the target branch advances.
+  # @coderabbitai run pre-merge checks
+  pre_merge_checks:
+    custom_checks:
+      - name: "Semantic conflict with target branch"
+        mode: warning
+        instructions: |
+          Detect behavioral incompatibilities when this PR is combined with its
+          current target branch, even when Git can merge without text conflicts.
+          Use repository and Git evidence, not claims in the PR description.
+          Resolve and report the PR head SHA, current target branch SHA, and
+          merge-base SHA. Verify the live target and PR head; a cached local ref
+          or the target SHA from an earlier review is not sufficient. If these
+          revisions or necessary code/history are unavailable, return Inconclusive
+          and explain the missing evidence. Never invent a SHA or claim freshness.
+
+          Compare merge-base..PR-head and merge-base..target, then inspect their
+          combined behavior. Follow affected callers, callees, configuration,
+          bindings, and tests across files, including unchanged dependencies.
+          Prioritize API/return-value contracts, changed defaults, tensor shapes
+          and dtypes, resource lifetimes, and distributed synchronization.
+          Example: the target changes a function's return units while this PR
+          adds a caller expecting the old units in another file.
+
+          Fail only for a concrete incompatibility between the PR changes and
+          the target code. Cite both relevant code locations, the violated
+          contract, a triggering scenario, confidence, and a minimal regression
+          test. Exclude unrelated pre-existing bugs and style suggestions.
+          Do not execute repository code or claim tests were run.
+          Pass only if the required context was inspected and no supported
+          conflict was found; this is not proof of semantic compatibility.
+          If either branch changes during analysis, return Inconclusive.
+          State that the result applies only to the reported SHA pair and must
+          be rerun after either branch changes.
+
   path_filters:
     # Vendored/adapted FlashInfer kernels; excluded from review.
     - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"
