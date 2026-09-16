@@ -1007,9 +1007,18 @@ class ModelingV2Core(DecoderModel):
         # generation token's from sequence_length - 1. Checked anyway so a
         # layout change upstream is loud rather than silent.
         assert position_ids.dtype == torch.int32, position_ids.dtype
+        # Narrower than the gpt-oss target's bound on purpose. That one reaches
+        # its KV cache through thop_attention, which is certified at one pool
+        # and two; this one goes through the MLA family --
+        # load_paged_kv_cache_for_mla, mla_rope_generation,
+        # mla_rope_append_paged_kv_assign_q -- and none of those entries has a
+        # multi-pool cell. Every layer here is the same attention-window class,
+        # so a manager gives them one group and this holds; if that ever
+        # changes, certify the MLA entries before widening it.
         pools = {row[0] for row in md.host_kv_cache_pool_mapping.tolist()}
         assert pools == {0}, (
-            f"multi-pool KV addressing is not certified; layer->pool ids {sorted(pools)}"
+            f"multi-pool KV addressing is not certified for the MLA entries; "
+            f"layer->pool ids {sorted(pools)}"
         )
         # Every MLA entry's fp8-e4m3 column is page 32 only (the bf16 columns
         # also carry 64). 32 is what a default KvCacheConfig produces.

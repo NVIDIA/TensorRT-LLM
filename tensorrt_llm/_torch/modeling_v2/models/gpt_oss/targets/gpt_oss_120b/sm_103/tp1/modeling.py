@@ -496,16 +496,24 @@ class ModelingV2Core(DecoderModel):
 
     def _check_step_contract(self, md, position_ids) -> None:
         """First-forward fail-fast: the metadata fields this target consumes
-        must exist (they are private trtllm surface, pinned by version), and
-        the KV pool must be the single shared pool the sliding-window
-        surface is certified over. Everything checked is fixed at engine
-        construction — once per model instance is sound."""
+        must exist (they are private trtllm surface), and the KV pool layout
+        must be one `thop_attention` is certified over. Everything checked is
+        fixed at engine construction — once per model instance is sound.
+
+        This checkpoint alternates sliding-window and full attention, and
+        KVCacheManagerV2 gives each attention-window class its own layer
+        group, so its mapping carries two pool ids rather than one. The bound
+        is the catalog's: `thop_attention.md` certifies one pool and two, and
+        this forward passes the mapping through untouched -- the op reads the
+        pool column itself. A third pool would be outside what was measured.
+        """
         missing = [name for name in _STEP_FIELDS if not hasattr(md, name)]
         assert not missing, f"metadata fields missing: {missing}"
         assert position_ids.dtype == torch.int32
         pools = {row[0] for row in md.host_kv_cache_pool_mapping.tolist()}
-        assert pools == {0}, (
-            f"multi-pool KV addressing is not certified; layer->pool ids {sorted(pools)}"
+        assert pools <= {0, 1}, (
+            f"KV addressing over {len(pools)} pools is not certified "
+            f"(thop_attention.md certifies one and two); layer->pool ids {sorted(pools)}"
         )
         self._step_contract_checked = True
 
