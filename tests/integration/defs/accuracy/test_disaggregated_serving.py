@@ -25,7 +25,7 @@ import socket
 import subprocess
 import tempfile
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
 
@@ -231,6 +231,7 @@ def launch_disaggregated_llm(
     gen_extra_env: Optional[Dict[str, str]] = None,
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
     request_max_retries: Optional[int] = None,
+    assert_worker_log_contains: str | None = None,
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -438,6 +439,8 @@ def launch_disaggregated_llm(
 
         gen_servers.append((env, gen_server_args))
 
+    worker_log_paths = []
+
     @contextlib.contextmanager
     def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
@@ -445,9 +448,12 @@ def launch_disaggregated_llm(
         try:
             for i, (env, args) in enumerate(server_configs):
                 if enable_redirect_log:
-                    f = open(f"output_{server_name}_{i}.log", "w+")
-                    proc = popen(args, env=env, stdout=f, stderr=f)
+                    log_path = os.path.join(temp_dir.name,
+                                            f"output_{server_name}_{i}.log")
+                    f = open(log_path, "w+")
                     log_files.append(f)
+                    worker_log_paths.append(log_path)
+                    proc = popen(args, env=env, stdout=f, stderr=f)
                 else:
                     proc = popen(args, env=env)
                 processes.append(proc)
@@ -457,13 +463,17 @@ def launch_disaggregated_llm(
                     stack.enter_context(proc) for proc in processes
                 ]
                 yield opened_processes
-            for f in log_files:
-                f.close()
         except Exception as e:
             print(
                 f"Failed to start disaggregated server processes in multi_popen: {e}"
             )
             raise
+        finally:
+            for f in log_files:
+                f.seek(0)
+                print(f"Worker log tail ({f.name}):")
+                print("".join(deque(f, maxlen=100)))
+                f.close()
 
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
@@ -487,9 +497,15 @@ def launch_disaggregated_llm(
         write_worker_configs(f"http://localhost:{serve_port}")
 
         ctx_processes = server_stack.enter_context(
-            multi_popen(ctx_servers, "ctx"))
+            multi_popen(ctx_servers,
+                        "ctx",
+                        enable_redirect_log=assert_worker_log_contains
+                        is not None))
         gen_processes = server_stack.enter_context(
-            multi_popen(gen_servers, "gen"))
+            multi_popen(gen_servers,
+                        "gen",
+                        enable_redirect_log=assert_worker_log_contains
+                        is not None))
 
         start_time = time.time()
         server_is_ready = False
@@ -598,9 +614,11 @@ def launch_disaggregated_llm(
                         print(line.strip())
 
         tokenizer = load_hf_tokenizer(model_name)
+        body_succeeded = False
         try:
             yield DuckLLM(args, tokenizer, generate_async,
                           f"http://localhost:{serve_port}")
+            body_succeeded = True
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
@@ -628,6 +646,21 @@ def launch_disaggregated_llm(
                         pass  # already exited between timeout and kill
                 except OSError:
                     pass  # process already gone
+
+            # Finish process-tree cleanup before reading logs, while the
+            # temporary directory still exists. Preserve any workload failure.
+            if assert_worker_log_contains is not None:
+                server_stack.close()
+                if body_succeeded:
+                    marker_found = False
+                    for log_path in worker_log_paths:
+                        with open(log_path) as log_file:
+                            marker_found |= any(
+                                assert_worker_log_contains in line
+                                for line in log_file)
+                    assert marker_found, (
+                        f"No worker logged {assert_worker_log_contains!r}; "
+                        "the required transfer path was not exercised")
 
 
 def run_parallel_test(model_name: str,

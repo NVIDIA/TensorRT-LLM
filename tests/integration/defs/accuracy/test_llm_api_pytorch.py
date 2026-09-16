@@ -7355,6 +7355,201 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(6)
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_nvfp4_eagle3_disagg_head_mismatched_bounce(self) -> None:
+        """Check M3 Eagle3 accuracy and acceptance over C++ NIXL bounce."""
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
+            msa_package_available
+
+        from .test_disaggregated_serving import launch_disaggregated_llm
+
+        assert msa_package_available(), "MSA kernels are required for this test"
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        max_draft_len = 3
+        # CTX TP2/EP2 -> GEN TP4/EP1: two versus one KV heads per rank.
+        # Both workers use the Python V2 transceiver with the C++ NIXL agent.
+        speculative_config = {
+            "decoding_type": "Eagle3",
+            "max_draft_len": max_draft_len,
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+        }
+        common_config = {
+            "speculative_config": speculative_config,
+            "sparse_attention_config": {
+                "algorithm": "minimax_m3",
+                "implementation": "msa",
+                "indexer_kv_dtype": "fp8",
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "agent_bounce_buffer_enable": True,
+                "kv_cache_bounce_size_mb": 512,
+                # Relax the admission gates for this short CI workload.
+                # The production defaults remain 1024 descriptors / 16 KiB.
+                "agent_bounce_params": {
+                    "min_descriptor_count": "1",
+                    "max_average_descriptor_size": "1MB",
+                },
+                "kv_transfer_timeout_ms": 600000,
+            },
+            "moe_config": {
+                "backend": "CUTLASS"
+            },
+            "scheduler_config": {
+                "capacity_scheduler_policy": "MAX_UTILIZATION"
+            },
+            "enable_autotuner": True,
+            # InferenceX thinking output needs a 16K sequence budget.
+            "max_seq_len": 16384,
+            "trust_remote_code": True,
+        }
+        kv_cache_common = {
+            "dtype": "fp8",
+            "tokens_per_block": 128,
+            "use_kv_cache_manager_v2": True,
+            "event_buffer_max_size": 0,
+            # Leave headroom for the graphs and bounce arena on B200.
+            "free_gpu_memory_fraction": 0.7,
+        }
+        ctx_server_config = {
+            **common_config,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": False,
+            "enable_attention_dp": False,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": True
+            },
+            "max_batch_size": 4,
+            "max_num_tokens": 32768,
+            "cuda_graph_config": None,
+            "torch_compile_config": {
+                "enable_fullgraph": True,
+                "enable_inductor": False,
+                "enable_piecewise_cuda_graph": True,
+                "capture_num_tokens": [1, 2048],
+                "enable_userbuffers": True,
+                "max_num_streams": 3,
+            },
+        }
+        gen_server_config = {
+            **common_config,
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 1,
+            "disable_overlap_scheduler": False,
+            "enable_attention_dp": False,
+            "enable_lm_head_tp_in_adp": False,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": False
+            },
+            "max_batch_size": 16,
+            # Decode-only token budget: (1 + draft_len) verify tokens per
+            # request x max_batch_size (the production sweep's value is
+            # its no-spec arm's).
+            "max_num_tokens": (1 + max_draft_len) * 16,
+            "num_postprocess_workers": 4,
+            "stream_interval": 100,
+            "enable_iter_perf_stats": True,
+            # Keep the entire acceptance probe if a metrics collector is enabled.
+            "iter_stats_max_iterations": -1,
+            "max_stats_len": -1,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16],
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                model_path,
+                extra_env={
+                    "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+                    "TLLM_LOG_LEVEL_BY_MODULE": "debug:executor",
+                },
+                assert_worker_log_contains="bounce path engaged",
+                server_waiting_timeout=1800) as llm:
+            # The launcher stamps quant_algo=NVFP4 from the model name; the
+            # checkpoint's hf_quant_config is MIXED_PRECISION (which is what
+            # the in-process arm asserts and the accuracy references key on).
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            task = GSM8KInferenceX(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs={
+                              "chat_template_kwargs": {
+                                  "thinking_mode": "enabled"
+                              }
+                          })
+
+            # Match main's aggregated acceptance probe: 200 chat GSM8K
+            # questions, greedy decoding, 512 output tokens. Accuracy alone
+            # cannot detect a corrupted drafter cache: verification rejects it.
+            import requests
+            info = requests.get(f"{llm.serve_url}/cluster_info", timeout=30)
+            info.raise_for_status()
+            info = info.json()
+            gen_worker = info["current_workers"]["generation_servers"][0]
+            gen_url = f'{gen_worker["host"]}:{gen_worker["port"]}'
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            # Drain the accuracy workload before starting the probe.
+            response = requests.get(f"http://{gen_url}/metrics", timeout=30)
+            response.raise_for_status()
+            probe_params = SamplingParams(max_tokens=512, temperature=0)
+            for future in [
+                    llm.generate_async(prompt, probe_params)
+                    for prompt in chat_prompts
+            ]:
+                future.result()
+            response = requests.get(f"http://{gen_url}/metrics", timeout=30)
+            response.raise_for_status()
+            records = response.json()
+            drafted = accepted = steps = 0
+            for record in records:
+                stats = record.get("specDecodingStats") or {}
+                drafted += stats.get("numDraftTokens", 0)
+                accepted += stats.get("numAcceptedTokens", 0)
+                steps += stats.get("numRequestsWithDraftTokens", 0)
+            assert drafted > 0 and steps > 0, "no speculative iterations in /metrics"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            print(f"MiniMax-M3 Eagle3 disagg chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.80, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: " \
+                f"{chat_rate:.3f} (threshold 0.80, reference 0.839 from " \
+                f"the drafter card)"
+            assert chat_length > 3.4, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
+                f"the drafter card)"
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("eval_mode", ["default", "inferencex"])
