@@ -20,7 +20,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute import runtime
 
-from . import gvr_topk_decode_self_sampling_bf16 as primitives
+from . import gvr_topk_decode_self_sampling as primitives
 
 __all__ = ["get_compiled"]
 

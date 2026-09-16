@@ -51,15 +51,9 @@ _COMPILE_LOCK = threading.RLock()
 
 
 def _device() -> ModuleType:
-    from . import gvr_topk_decode_self_sampling_bf16
+    from . import gvr_topk_decode_self_sampling
 
-    return gvr_topk_decode_self_sampling_bf16
-
-
-def _device_v4() -> ModuleType:
-    from . import gvr_topk_decode_self_sampling_bf16_vec4
-
-    return gvr_topk_decode_self_sampling_bf16_vec4
+    return gvr_topk_decode_self_sampling
 
 
 def _bf16_halve_u(plan: dict) -> dict:
@@ -395,8 +389,7 @@ def _varlen_launcher_bf16(
             and (65536 <= n_kernel <= 132096)
             and (tuple(plan_free["tpl"]) in ((1024, 1, 8), (1024, 2, 8)))
         ):
-            from . import gvr_topk_decode_self_sampling_bf16_hybrid as dev
-
+            cluster_options["hybrid"] = True
             cluster_options["oneq_enabled"] = True
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
@@ -459,8 +452,11 @@ def _varlen_launcher_bf16(
     rt = plan["rt"]
     r_const = rt["R"]
     if plan.get("vec4"):
-        fn = _device_v4().get_compiled(
-            tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True, dtype="bf16"
+        fn = dev.get_compiled(
+            tpl[:6] + (False,) + (next_n, cr_shift, r_const),
+            hint_free=True,
+            dtype="bf16",
+            vector_elems=4,
         )
     else:
         v16 = not tpl[5] and int(tpl[0]) < 512 and (npad <= 65536)
@@ -612,8 +608,8 @@ def run_varlen_bf16(
             raise RuntimeError(
                 "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
             )
-        # First-time compilation temporarily specializes shared-memory layouts.
-        # Serialize it across BF16 families; warmed launches never take the lock.
+        # Serialize cold compilation across BF16 families. Shared-memory layouts
+        # are instance constants; warmed launches never take the lock.
         with _COMPILE_LOCK, torch.cuda.device(d):
             lc = _varlen_launcher_bf16(num_rows, npad, k, n_env, nn, cr, d, profile)
     idx = indices

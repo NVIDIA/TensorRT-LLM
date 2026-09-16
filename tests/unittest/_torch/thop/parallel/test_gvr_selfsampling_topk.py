@@ -2025,3 +2025,52 @@ def test_selfsampling_topk_varlen_bf16_cache_device_isolation(
     monkeypatch.setattr(bf16_host, "_VARLEN_CACHE_BF16", launchers)
     for key, launcher in launchers.items():
         assert bf16_host._varlen_launcher_bf16(*key) is launcher
+
+
+def test_selfsampling_topk_regclus_mixed_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Interleaved specializations preserve FP32 defaults and immutable layouts."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling as device,
+    )
+
+    constants = {
+        name: value
+        for name, value in vars(device).items()
+        if isinstance(value, int) and (name.isupper() or name.endswith("__regclus"))
+    }
+    compile_kernel = device.cute.compile
+
+    def guarded_compile(*args: object, **kwargs: object) -> object:
+        assert {name: getattr(device, name) for name in constants} == constants
+        compiled = compile_kernel(*args, **kwargs)
+        assert {name: getattr(device, name) for name in constants} == constants
+        return compiled
+
+    monkeypatch.setattr(device, "_COMPILE_CACHE__regclus", {})
+    monkeypatch.setattr(device.cute, "compile", guarded_compile)
+    tpl = (1024, 2, 4)
+    options = {"varlen": True, "next_n": 1, "cr_shift": 0, "hint_free": True}
+    fp32 = device.get_compiled__regclus(tpl, **options)
+    bf16_512 = device.get_compiled__regclus(tpl, dtype="bf16", nbh=512, **options)
+    bf16_1024 = device.get_compiled__regclus(tpl, dtype="bf16", nbh=1024, **options)
+    assert fp32 is not bf16_512 and fp32 is not bf16_1024
+    assert bf16_512 is not bf16_1024
+    assert device.get_compiled__regclus(tpl, **options) is fp32
+
+    rows, n_valid, top_k = 2, 32768, 1024
+    generator = torch.Generator(device=_DEV).manual_seed(32768)
+    logits_fp32 = torch.randn((rows, n_valid), generator=generator, device=_DEV)
+    logits_bf16 = logits_fp32.to(torch.bfloat16)
+    lengths = torch.full((rows,), n_valid, dtype=torch.int32, device=_DEV)
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    for compiled, logits in (
+        (fp32, logits_fp32),
+        (bf16_512, logits_bf16),
+        (bf16_1024, logits_bf16),
+        (fp32, logits_fp32),
+    ):
+        indices.fill_(-7)
+        compiled(logits, indices, lengths, indices, n_valid)
+        torch.cuda.synchronize()
+        reference = torch.topk(logits, top_k, dim=1).values
+        _check_exact(logits, indices, n_valid, reference)
