@@ -1,0 +1,788 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Regenerate the blog's figures and statistics from the bundled timing data.
+
+Requires matplotlib and numpy. Run from any directory; outputs stay beside this file.
+"""
+
+import csv
+import gzip
+import json
+from pathlib import Path
+from statistics import geometric_mean, mean, median
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.lines import Line2D
+from matplotlib.patches import FancyBboxPatch, Rectangle
+from matplotlib.ticker import FuncFormatter
+
+ROOT = Path(__file__).resolve().parent
+COPYRIGHT = (
+    "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. SPDX-License-Identifier: Apache-2.0"
+)
+ARMS = ["sglang", "flashinfer", "radix_cuda", "deepselect", "hpc_ops"]
+MODELS = {
+    "flash": "DeepSeek-V4 Flash · K=512",
+    "pro": "DeepSeek-V4 Pro · K=1024",
+    "v32": "DeepSeek-V3.2 · K=2048",
+}
+LABELS = {
+    "gvr_v2": "GVR V2",
+    "sglang": "SGLang v2 (plan + transform)",
+    "flashinfer": "FlashInfer 0.6.14",
+    "radix_cuda": "TensorRT-LLM radix CUDA",
+    "deepselect": "DeepSelect FP32",
+    "hpc_ops": "HPC-ops FP32",
+}
+COLORS = {
+    "gvr_v2": "#579600",
+    "temporal_r0": "#7395ab",
+    "temporal_tiered": "#386781",
+    "sglang": "#7557a6",
+    "flashinfer": "#007e91",
+    "radix_cuda": "#64748b",
+    "deepselect": "#d97416",
+    "hpc_ops": "#bd426b",
+}
+CROSS_CAMPAIGN = {"sglang", "flashinfer", "radix_cuda"}
+REACHABLE_BW = 6.912116
+TEMPORAL = ["temporal_r0", "temporal_tiered"]
+COMPARISON_ARMS = ["gvr_v2", *TEMPORAL, *ARMS]
+
+
+def _load() -> list[dict]:
+    rows = []
+    for path in sorted(ROOT.glob("*_timings.csv.gz")):
+        with gzip.open(path, "rt") as handle:
+            for row in csv.DictReader(line for line in handle if not line.startswith("#")):
+                for name in ("batch", "n", "k", "layer"):
+                    row[name] = int(row[name])
+                for name in list(row):
+                    if name.endswith("_us"):
+                        row[name] = float(row[name]) if row[name] else None
+                rows.append(row)
+    if len(rows) != 9746 or len({(r["cell"], r["batch"]) for r in rows}) != 9746:
+        raise ValueError("Expected exactly 9,746 unique cases")
+    with gzip.open(ROOT / "temporal_comparison.csv.gz", "rt") as handle:
+        historical = list(csv.DictReader(line for line in handle if not line.startswith("#")))
+    lookup = {(r["cell"], int(r["batch"])): r for r in historical}
+    if len(lookup) != len(rows) or len(historical) != len(rows):
+        raise ValueError("Temporal observations must cover the same 9,746 unique cases")
+    for row in rows:
+        old = lookup[(row["cell"], row["batch"])]
+        for arm in TEMPORAL:
+            row[arm + "_us"] = float(old[arm + "_us"])
+    return rows
+
+
+def _stats(rows: list[dict], arm: str, reference: str = "gvr_v2") -> dict:
+    valid = [r for r in rows if r[arm + "_us"] is not None]
+    ratios = [r[arm + "_us"] / r[reference + "_us"] for r in valid]
+    if not valid:
+        return {"cases": 0}
+    return {
+        "cases": len(valid),
+        "geomean": geometric_mean(ratios),
+        "minimum": min(ratios),
+        "p5": float(np.percentile(ratios, 5)),
+        "p95": float(np.percentile(ratios, 95)),
+        "wins": sum(x > 1 for x in ratios),
+        "win_percent": 100 * mean(x > 1 for x in ratios),
+        "baseline_median_us": median(r[arm + "_us"] for r in valid),
+        "gvr_median_us": median(r[reference + "_us"] for r in valid),
+    }
+
+
+def _save(fig: plt.Figure, name: str) -> None:
+    path = ROOT / (name + ".svg")
+    fig.savefig(
+        path,
+        bbox_inches="tight",
+        metadata={"Date": None, "Description": COPYRIGHT},
+    )
+    path.write_text("\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n")
+    plt.close(fig)
+
+
+def _comparison(rows: list[dict]) -> dict:
+    """Normalize every bar to V2 over one common case set per model."""
+    result = {}
+    for model in MODELS:
+        matched = _matching(rows, model)
+        result[model] = {
+            "cases": len(matched),
+            "layers": len({r["layer"] for r in matched}),
+            "latency_relative_to_v2": {
+                arm: _stats(matched, arm)["geomean"]
+                for arm in COMPARISON_ARMS
+                if not (model == "pro" and arm == "hpc_ops")
+            },
+        }
+    return result
+
+
+def _overview(rows: list[dict]) -> None:
+    data = _comparison(rows)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 6.3), sharey=True)
+    fig.subplots_adjust(left=0.185, right=0.97, bottom=0.23, top=0.78, wspace=0.14)
+    labels = [
+        "GVR V2",
+        "Temporal GVR · R0",
+        "Temporal GVR · tiered",
+        "SGLang v2",
+        "FlashInfer",
+        "TRT-LLM radix CUDA",
+        "DeepSelect FP32",
+        "HPC-ops FP32",
+    ]
+    positions = [8.1, 6.8, 5.8, 4.5, 3.5, 2.5, 1.5, 0.5]
+    for ax, (model, title) in zip(axes, MODELS.items()):
+        panel = data[model]
+        ax.axhspan(7.55, 8.65, color="#edf5df", zorder=0)
+        ax.axvline(1, color="#579600", alpha=0.55, linewidth=1, linestyle=(0, (2, 3)))
+        for y, arm in zip(positions, COMPARISON_ARMS):
+            value = panel["latency_relative_to_v2"].get(arm)
+            if value is None:
+                ax.text(0.15, y, "Not supported", fontsize=10, color="#88939f", va="center")
+                continue
+            ax.barh(y, value, height=0.63, color=COLORS[arm], zorder=3)
+            ax.text(
+                value + 0.10,
+                y,
+                f"{value:.2f}×",
+                va="center",
+                fontsize=10.5,
+                weight="bold" if arm == "gvr_v2" else "normal",
+                color="#447a00" if arm == "gvr_v2" else "#334155",
+            )
+        name, kval = title.split(" · ")
+        ax.set_title(name, loc="left", fontsize=12.5, weight="bold", pad=28)
+        ax.text(
+            0,
+            1.025,
+            kval,
+            transform=ax.transAxes,
+            fontsize=9.5,
+            color="#52616f",
+        )
+        ax.set(xlim=(0, 5.95), ylim=(-0.1, 8.7), xticks=[0, 1, 2, 3, 4, 5])
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}×"))
+        ax.set_yticks(positions, labels, fontsize=10.5)
+        ax.tick_params(axis="both", length=0, pad=8)
+        ax.spines["left"].set_visible(False)
+        ax.spines["bottom"].set_color("#d5dce3")
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", color="#e9edf1", linewidth=0.7)
+    axes[0].get_yticklabels()[0].set(color="#447a00", weight="bold")
+    fig.text(
+        0.035,
+        0.935,
+        "One view of the competition — and the GVR evolution",
+        fontsize=20,
+        weight="bold",
+        color="#17202b",
+    )
+    fig.text(
+        0.035,
+        0.875,
+        "Geometric-mean kernel time relative to GVR V2  ·  shorter is faster  ·  B200 / FP32",
+        fontsize=11,
+        color="#52616f",
+    )
+    fig.text(
+        0.185,
+        0.13,
+        "Same workloads within each panel. GVR V2 = 1.00×.",
+        fontsize=10,
+        color="#334155",
+    )
+    fig.text(
+        0.035,
+        0.067,
+        "Temporal GVR: R0 threshold ladder and tiered execution. V2: current-row self-sampling.",
+        fontsize=9,
+        color="#52616f",
+    )
+    fig.text(
+        0.035,
+        0.032,
+        "SGLang includes plan + transform. HPC-ops supports K=512 and K=2048.",
+        fontsize=9,
+        color="#52616f",
+    )
+    _save(fig, "speedup")
+
+
+def _box(
+    ax: plt.Axes,
+    xy: tuple[float, float],
+    size: tuple[float, float],
+    text: str,
+    color: str = "#edf5df",
+    fontsize: float = 11,
+) -> None:
+    ax.add_patch(
+        FancyBboxPatch(
+            xy,
+            *size,
+            boxstyle="round,pad=0.08,rounding_size=0.08",
+            facecolor=color,
+            edgecolor="#ccd5dd",
+            linewidth=0.8,
+        )
+    )
+    ax.text(
+        xy[0] + size[0] / 2,
+        xy[1] + size[1] / 2,
+        text,
+        ha="center",
+        va="center",
+        fontsize=fontsize,
+        color="#17202b",
+        linespacing=1.5,
+    )
+
+
+def _evolution(rows: list[dict]) -> None:
+    fig = plt.figure(figsize=(14, 5.6))
+    ax = fig.add_axes((0.02, 0.16, 0.61, 0.69))
+    ax.set(xlim=(0, 10), ylim=(0, 6))
+    ax.axis("off")
+    ax.text(
+        0.2,
+        5.55,
+        "Original GVR V1: temporal warm start + scalar threshold search",
+        fontsize=11,
+        weight="bold",
+        color="#7557a6",
+    )
+    for x, label in [
+        (0.2, "Previous indices\n→ current-score gather"),
+        (3.6, "Guess T → full-row count\n→ adjust T if needed"),
+        (7.0, "Collect candidates\n→ exact refinement"),
+    ]:
+        _box(ax, (x, 3.8), (2.8, 1.2), label, "#f2eef9", 10)
+    ax.text(
+        0.2,
+        3.25,
+        "Two dependent reads; threshold quality follows temporal overlap.",
+        fontsize=10,
+        color="#475569",
+    )
+    ax.text(
+        0.2,
+        2.55,
+        "GVR V2 streaming: self-sampling + multi-thresholding",
+        fontsize=11,
+        weight="bold",
+        color="#447a00",
+    )
+    for x, label in [
+        (0.2, "Coalesced current-row\nsample → tail bracket"),
+        (3.6, "Full-row classification\n→ many exact counts"),
+        (7.0, "Emit certain winners\n→ refine crossing bin"),
+    ]:
+        _box(ax, (x, 0.8), (2.8, 1.2), label, fontsize=10)
+    for y in (4.4, 1.4):
+        for x in (3.02, 6.42):
+            ax.annotate(
+                "",
+                (x + 0.5, y),
+                (x, y),
+                arrowprops={"arrowstyle": "->", "color": "#64748b", "lw": 1.5},
+            )
+    ax.text(
+        0.2,
+        0.23,
+        "Current-row information; no previous-step Top-K state.",
+        fontsize=10,
+        color="#447a00",
+    )
+    bars = fig.add_axes((0.76, 0.25, 0.21, 0.5))
+    arms = [*TEMPORAL, "gvr_v2"]
+    for i, arm in enumerate(arms):
+        ratios = [r["radix_cuda_us"] / r[arm + "_us"] for r in rows]
+        value = geometric_mean(ratios)
+        bars.barh(i, value, height=0.52, color=["#baa6d3", "#7557a6", "#579600"][i])
+        bars.text(value + 0.1, i, f"{value:.2f}×", va="center", weight="bold", fontsize=12)
+    bars.set_yticks(
+        range(3),
+        ["Temporal R0", "Temporal tiered", "GVR V2"],
+        fontsize=10,
+    )
+    bars.invert_yaxis()
+    bars.set_xlim(0, 6)
+    bars.set_xticks([0, 1, 2, 3, 4, 5])
+    bars.set_xlabel("Speedup over radix CUDA", fontsize=10)
+    bars.set_title("Measured evolution", fontsize=12, loc="left", weight="bold", pad=18)
+    bars.grid(axis="x", alpha=0.12)
+    bars.set_axisbelow(True)
+    fig.suptitle(
+        "From temporal prediction to current-row calibration",
+        x=0.03,
+        ha="left",
+        fontsize=20,
+        weight="bold",
+        y=0.98,
+    )
+    fig.text(
+        0.035,
+        0.06,
+        "R0 already introduced a hint-derived threshold ladder. "
+        "V2 combines that direction with current-row sampling and execution specialization.",
+        fontsize=10,
+        color="#475569",
+    )
+    fig.text(
+        0.035,
+        0.005,
+        "Bars compare the temporal R0, temporal tiered, and self-sampling V2 implementations.",
+        fontsize=9,
+        color="#475569",
+    )
+    _save(fig, "evolution")
+
+
+def _algorithm() -> None:
+    fig, ax = plt.subplots(figsize=(14, 6.8))
+    ax.set(xlim=(0, 14), ylim=(0, 7))
+    ax.axis("off")
+    headings = [
+        (0.2, "1  SELF-SAMPLE", "Place the bracket near the current tail"),
+        (4.9, "2  MULTI-THRESHOLD", "Get many exact counts from one classification"),
+        (9.65, "3  REFINE", "Finish only the uncertain boundary"),
+    ]
+    for x, heading, subtitle in headings:
+        ax.text(x, 6.5, heading, fontsize=14, weight="bold", color="#447a00")
+        ax.text(x, 6.04, subtitle, fontsize=9.3, color="#475569")
+    ax.text(0.2, 5.5, "Current row: sparse, regularly spaced vector loads", fontsize=9)
+    for i in range(32):
+        sampled = i % 8 < 2
+        ax.add_patch(
+            Rectangle(
+                (0.2 + i * 0.126, 4.85), 0.112, 0.36, facecolor="#76b900" if sampled else "#dfe5eb"
+            )
+        )
+    ax.text(0.2, 4.46, "Sample histogram ≈ current score distribution", fontsize=9)
+    sample = [1, 3, 5, 8, 11, 14, 12, 9, 6, 3, 2, 1]
+    for i, h in enumerate(sample):
+        ax.add_patch(Rectangle((0.25 + i * 0.32, 2.7), 0.28, h * 0.085, facecolor="#a7c976"))
+    for x, label, y in [(2.37, "T_floor", 2.16), (2.69, "T", 2.45), (3.33, "T_K", 2.16)]:
+        ax.plot([x, x], [2.66, 3.9], color="#7557a6", linestyle="--", linewidth=1)
+        ax.text(x, y, label, ha="center", fontsize=10, color="#7557a6")
+    ax.text(
+        0.2,
+        1.45,
+        "Ranks ≈ 2AS/N, AS/N, KS/N\n→ safety floor, admission threshold, upper anchor",
+        fontsize=9.3,
+        linespacing=1.5,
+    )
+    ax.annotate(
+        "", (4.7, 3.6), (4.2, 3.6), arrowprops={"arrowstyle": "->", "lw": 2, "color": "#64748b"}
+    )
+    _box(ax, (4.95, 4.8), (4.05, 0.65), "Every valid score is examined", "#e9eff5", 11)
+    ax.text(4.9, 4.25, "Exact histogram → suffix counts at all bin boundaries", fontsize=9)
+    counts = [1000, 700, 400, 250, 150, 100, 80, 73, 380, 330, 270]
+    for i, count in enumerate(counts):
+        color = "#f5b642" if i == 7 else ("#579600" if i > 7 else "#cbd5e1")
+        ax.add_patch(Rectangle((5.0 + i * 0.36, 2.7), 0.31, 0.18 + count / 800, facecolor=color))
+    ax.text(5.0, 2.35, "T", fontsize=10)
+    ax.text(8.9, 2.35, "H", fontsize=10)
+    ax.annotate(
+        "73 in crossing bin",
+        (7.7, 3.02),
+        (6.0, 3.65),
+        fontsize=9,
+        arrowprops={"arrowstyle": "->", "color": "#8c661c"},
+        color="#8c661c",
+    )
+    ax.text(8.43, 3.82, "980\nabove", fontsize=10, ha="center", color="#447a00")
+    ax.text(
+        4.9,
+        1.45,
+        "256 verification bins (shown schematically)\nOne bin assignment per survivor, then an on-chip scan",
+        fontsize=9.3,
+        linespacing=1.5,
+    )
+    ax.annotate(
+        "", (9.5, 3.6), (9.05, 3.6), arrowprops={"arrowstyle": "->", "lw": 2, "color": "#64748b"}
+    )
+    _box(ax, (9.75, 4.45), (3.75, 0.85), "980 certain winners", fontsize=13)
+    _box(ax, (9.75, 3.0), (3.75, 0.85), "Select 44 of 73 boundary candidates", "#fff3d9", 10.5)
+    _box(ax, (9.75, 1.55), (3.75, 0.85), "1,024 exact output indices", fontsize=12)
+    for y in (4.05, 2.6):
+        ax.annotate(
+            "",
+            (11.6, y - 0.1),
+            (11.6, y + 0.25),
+            arrowprops={"arrowstyle": "->", "color": "#64748b"},
+        )
+    _box(
+        ax,
+        (0.25, 0.12),
+        (13.2, 0.64),
+        "If the sample misses: lower the admission threshold or invoke exact recovery. "
+        "An incomplete candidate buffer never proves correctness.",
+        "#f1f4f7",
+        10,
+    )
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.03, top=0.98)
+    _save(fig, "algorithm")
+
+
+def _matching(rows: list[dict], model: str) -> list[dict]:
+    required = ["gvr_v2", *ARMS] if model != "pro" else ["gvr_v2", *ARMS[:-1]]
+    return [
+        r for r in rows if r["model"] == model and all(r[a + "_us"] is not None for a in required)
+    ]
+
+
+def _line_data(rows: list[dict], arm: str, batch: int) -> tuple[list[float], list[float]]:
+    selected = [r for r in rows if r["batch"] == batch]
+    buckets = sorted({r["isl_bucket"] for r in selected}, key=lambda x: int(x[:-1]))
+    groups = [[r for r in selected if r["isl_bucket"] == bucket] for bucket in buckets]
+    return (
+        [median(r["n"] for r in group) for group in groups],
+        [mean(r[arm + "_us"] for r in group) for group in groups],
+    )
+
+
+def _legend(fig: plt.Figure) -> None:
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=COLORS[a],
+            linewidth=2.5,
+            linestyle="--" if a in CROSS_CAMPAIGN else "-",
+            label=LABELS[a],
+        )
+        for a in ["gvr_v2", *ARMS]
+    ]
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.01),
+        fontsize=10,
+    )
+
+
+def _latency(rows: list[dict]) -> None:
+    fig, axes = plt.subplots(3, 2, figsize=(13, 11))
+    for i, (model, title) in enumerate(MODELS.items()):
+        matched = _matching(rows, model)
+        for j, batch in enumerate((1, 1024)):
+            ax = axes[i, j]
+            for arm in ["gvr_v2", *ARMS]:
+                if model == "pro" and arm == "hpc_ops":
+                    continue
+                x, y = _line_data(matched, arm, batch)
+                ax.plot(
+                    x,
+                    y,
+                    marker="o",
+                    markersize=3,
+                    color=COLORS[arm],
+                    linewidth=2.3 if arm == "gvr_v2" else 1.6,
+                    linestyle="--" if arm in CROSS_CAMPAIGN else "-",
+                )
+            ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
+            ax.set_xticks(
+                [2**n for n in ((10, 12, 14, 16, 18) if model != "v32" else (12, 14, 16, 18))]
+            )
+            ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value / 1024:g}K"))
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+            ax.set_title(f"{title}  |  B={batch}", fontsize=12, loc="left")
+            ax.set_ylabel("Mean kernel time (µs)")
+            ax.set_xlabel("Valid indexer row length N")
+            ax.grid(which="major", alpha=0.18)
+    fig.suptitle("Latency across row lengths and batch sizes", fontsize=18, weight="bold", y=0.995)
+    fig.subplots_adjust(hspace=0.52, wspace=0.2, bottom=0.14, top=0.94)
+    _legend(fig)
+    _save(fig, "latency")
+
+
+def _roofline(rows: list[dict]) -> None:
+    model_data = json.loads((ROOT / "provenance.json").read_text())["roofline_model"]
+    bw = model_data["measured_bandwidth_tb_s"]
+    compare = model_data["measured_compare_t_s"]
+    fig = plt.figure(figsize=(14, 9.4), facecolor="white")
+    top = fig.add_axes((0.075, 0.61, 0.875, 0.245))
+    intensity = np.geomspace(0.05, 24, 400)
+    top.axvspan(0.125, 0.25, color="#edf5df", zorder=0)
+    top.plot(
+        intensity,
+        np.minimum(
+            model_data["theoretical_bandwidth_tb_s"] * intensity,
+            model_data["theoretical_compare_t_s"],
+        ),
+        color="#94a3b8",
+        linestyle=(0, (5, 3)),
+        linewidth=1.8,
+    )
+    top.plot(intensity, np.minimum(bw * intensity, compare), color="#273746", linewidth=2.4)
+    top.plot([0.125, 0.25], [bw * 0.125, bw * 0.25], color=COLORS["gvr_v2"], linewidth=5)
+    top.annotate(
+        "Ideal Top-K band\n0.125–0.25 compare/byte",
+        xy=(0.18, bw * 0.18),
+        xytext=(0.055, 12),
+        fontsize=10.5,
+        color="#447a00",
+        arrowprops={"arrowstyle": "->", "color": "#579600", "connectionstyle": "arc3,rad=.15"},
+    )
+    top.text(0.85, 2.0, "Bandwidth slope\n6.912 TB/s × intensity", fontsize=10.5, color="#334155")
+    top.annotate(
+        "Compare ceiling\n37.047 Tcompare/s",
+        xy=(12, compare),
+        xytext=(7, 4.5),
+        fontsize=10.5,
+        color="#334155",
+        arrowprops={"arrowstyle": "->", "color": "#64748b"},
+    )
+    top.plot(compare / bw, compare, "o", color="#273746", markersize=5)
+    top.text(5.0, 63, "Knee: 5.36", fontsize=10, ha="center", color="#52616f")
+    top.set(xscale="log", yscale="log", xlim=(0.05, 24), ylim=(0.2, 100))
+    top.set_xticks([0.125, 0.25, 1, 4, 16], ["0.125", "0.25", "1", "4", "16"])
+    top.set_yticks([1, 10, 100], ["1", "10", "100"])
+    top.minorticks_off()
+    top.set_xlabel("Operational intensity  ·  compare/byte", fontsize=10.5, labelpad=8)
+    top.set_ylabel("Tcompare/s", fontsize=10.5)
+    top.grid(axis="y", color="#e9edf1", linewidth=0.7)
+    top.tick_params(length=0, pad=7)
+    for spine in ("left", "bottom"):
+        top.spines[spine].set_color("#d5dce3")
+    top.legend(
+        handles=[
+            Line2D([0], [0], color="#273746", lw=2.4, label="Measured calibration"),
+            Line2D(
+                [0],
+                [0],
+                color="#94a3b8",
+                lw=1.8,
+                linestyle=(0, (5, 3)),
+                label="Theoretical reference",
+            ),
+        ],
+        loc="upper left",
+        bbox_to_anchor=(0.015, 1.21),
+        ncol=2,
+        fontsize=9.5,
+        frameon=False,
+    )
+    for i, (model, title) in enumerate(MODELS.items()):
+        ax = fig.add_axes((0.075 + i * 0.305, 0.205, 0.26, 0.23))
+        matched = _matching(rows, model)
+        k = matched[0]["k"]
+        xroof = np.linspace(0.125, 0.25, 100)
+        ax.fill_between(xroof, xroof * bw, 1.95, color="#f2f5f7", zorder=0)
+        ax.plot(xroof, xroof * bw, color="#273746", linestyle=(0, (2, 2)), linewidth=1.5)
+        for arm in [*ARMS, "gvr_v2"]:
+            if model == "pro" and arm == "hpc_ops":
+                continue
+            widths, times = _line_data(matched, arm, 1024)
+            x = [n / (4 * (n + k)) for n in widths]
+            y = [1024 * n / (us * 1e6) for n, us in zip(widths, times)]
+            ax.plot(
+                x,
+                y,
+                color=COLORS[arm],
+                linewidth=2.8 if arm == "gvr_v2" else 1.5,
+                linestyle="--" if arm in CROSS_CAMPAIGN else "-",
+                marker="o" if arm == "gvr_v2" else ".",
+                markersize=4.5,
+                alpha=1 if arm == "gvr_v2" else 0.8,
+                zorder=5 if arm == "gvr_v2" else 3,
+            )
+        ax.set(xlim=(0.123, 0.253), ylim=(0, 1.95))
+        ax.set_xticks([0.125, 0.175, 0.225, 0.25], [".125", ".175", ".225", ".250"])
+        ax.set_yticks([0, 0.5, 1, 1.5], ["0", "0.5", "1.0", "1.5"])
+        ax.set_xlabel("Intensity (compare/byte)", fontsize=10, labelpad=8)
+        ax.set_title(title, fontsize=11, loc="left", pad=12, weight="bold")
+        if i == 0:
+            ax.set_ylabel("Work throughput (Tcompare/s)", fontsize=10)
+            ax.text(0.133, 1.73, "Calibrated roof", fontsize=9, color="#52616f")
+        ax.grid(axis="y", color="#e9edf1", linewidth=0.7)
+        ax.tick_params(length=0, labelsize=9, pad=7)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_color("#d5dce3")
+    fig.text(
+        0.035,
+        0.96,
+        "Top-K lives on the bandwidth slope",
+        fontsize=21,
+        weight="bold",
+        color="#17202b",
+    )
+    fig.text(
+        0.035,
+        0.92,
+        "A. The full B200 roofline  ·  Top-K intensity stays far below the compute knee",
+        fontsize=11.5,
+        color="#52616f",
+    )
+    fig.text(
+        0.075,
+        0.515,
+        "B. Zoom in: how close do measured kernels get?",
+        fontsize=13,
+        weight="bold",
+        color="#17202b",
+    )
+    fig.text(
+        0.075,
+        0.482,
+        "B = 1024  ·  identical layers per model  ·  higher is faster",
+        fontsize=10.5,
+        color="#52616f",
+    )
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=COLORS[a],
+            linewidth=2.5,
+            linestyle="--" if a in CROSS_CAMPAIGN else "-",
+            label=LABELS[a],
+        )
+        for a in ["gvr_v2", *ARMS]
+    ]
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.53, 0.077),
+        fontsize=10,
+    )
+    fig.text(
+        0.075,
+        0.046,
+        "Shared ideal work: BN comparisons. Minimum traffic: 4B(N + K) bytes. "
+        "Extra passes and output work remain in measured time.",
+        fontsize=9,
+        color="#52616f",
+    )
+    fig.text(
+        0.075,
+        0.018,
+        "Line styles distinguish benchmark runs. Work throughput uses the same logical task for every kernel.",
+        fontsize=9,
+        color="#52616f",
+    )
+    _save(fig, "roofline")
+
+
+def _speedup_map(rows: list[dict]) -> None:
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5.8))
+    batches = sorted({r["batch"] for r in rows})
+    for ax, (model, title) in zip(axes, MODELS.items()):
+        selected = [r for r in rows if r["model"] == model and r["sglang_us"] is not None]
+        buckets = sorted({r["isl_bucket"] for r in selected}, key=lambda s: int(s[:-1]))
+        values = []
+        widths = []
+        for bucket in buckets:
+            group = [r for r in selected if r["isl_bucket"] == bucket]
+            widths.append(median(r["n"] for r in group) / 1024)
+            values.append(
+                [
+                    geometric_mean(
+                        r["sglang_us"] / r["gvr_v2_us"] for r in group if r["batch"] == b
+                    )
+                    for b in batches
+                ]
+            )
+        data = np.asarray(values)
+        graphic = ax.imshow(
+            data, aspect="auto", cmap="BrBG", norm=TwoSlopeNorm(vmin=0.8, vcenter=1, vmax=5)
+        )
+        for y in range(len(buckets)):
+            for x in range(len(batches)):
+                ax.text(
+                    x,
+                    y,
+                    f"{data[y, x]:.1f}",
+                    ha="center",
+                    va="center",
+                    fontsize=7.1,
+                    color="white" if data[y, x] > 3.3 else "#17202b",
+                )
+        ax.set_xticks(range(len(batches)), batches, rotation=60, fontsize=9)
+        ax.set_yticks(range(len(widths)), [f"{n:.0f}K" for n in widths], fontsize=9)
+        ax.set_xlabel("Batch size B")
+        ax.set_ylabel("Valid row length N (rounded)")
+        ax.set_title(title, loc="left", fontsize=11, pad=12)
+    fig.suptitle(
+        "GVR V2 vs SGLang: gains across the full length–batch grid",
+        fontsize=18,
+        x=0.035,
+        ha="left",
+        weight="bold",
+        y=1.02,
+    )
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.87, bottom=0.34, wspace=0.27)
+    cax = fig.add_axes((0.34, 0.09, 0.32, 0.026))
+    bar = fig.colorbar(graphic, cax=cax, orientation="horizontal", ticks=[0.8, 1, 2, 3, 4, 5])
+    bar.set_label("SGLang time / GVR V2 time · geometric mean across layers", fontsize=9)
+    fig.text(
+        0.06,
+        0.17,
+        "SGLang plan + transform · 1.0× is parity · each tile averages the layer-level speedups at that shape.",
+        fontsize=9,
+    )
+    _save(fig, "sglang_map")
+
+
+def main() -> None:
+    """Validate the frozen dataset, then regenerate statistics and six figures."""
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 11,
+            "svg.fonttype": "none",
+            "svg.hashsalt": "gvr-v2-blog",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+        }
+    )
+    rows = _load()
+    summary = {
+        "copyright": COPYRIGHT,
+        "overall": {a: _stats(rows, a) for a in ARMS},
+        "comparison_common_cases": _comparison(rows),
+        "by_model": {
+            m: {a: _stats([r for r in rows if r["model"] == m], a) for a in ARMS} for m in MODELS
+        },
+        "sglang_transform_only": _stats(rows, "sglang_transform"),
+        "deepselect_bf16": _stats(rows, "deepselect_bf16", "gvr_bf16_run"),
+        "temporal_vs_v2": {a: _stats(rows, a) for a in TEMPORAL},
+        "evolution_vs_radix": {
+            a: {
+                "geomean": geometric_mean(r["radix_cuda_us"] / r[a + "_us"] for r in rows),
+                "wins_percent": 100 * mean(r["radix_cuda_us"] > r[a + "_us"] for r in rows),
+            }
+            for a in [*TEMPORAL, "gvr_v2"]
+        },
+    }
+    (ROOT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    for name, result in summary["overall"].items():
+        print(
+            name, f"{result['geomean']:.6f}×", result["cases"], f"wins {result['win_percent']:.3f}%"
+        )
+    _overview(rows)
+    _evolution(rows)
+    _algorithm()
+    _speedup_map(rows)
+    _latency(rows)
+    _roofline(rows)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,328 @@
+{
+  "copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. SPDX-License-Identifier: Apache-2.0",
+  "overall": {
+    "sglang": {
+      "cases": 9515,
+      "geomean": 1.659919912625496,
+      "minimum": 0.9452784089288601,
+      "p5": 1.284137593467646,
+      "p95": 2.294301211085517,
+      "wins": 9506,
+      "win_percent": 99.90541250656858,
+      "baseline_median_us": 14.365,
+      "gvr_median_us": 9.626
+    },
+    "flashinfer": {
+      "cases": 9515,
+      "geomean": 2.0126556370686415,
+      "minimum": 1.2048796877826886,
+      "p5": 1.4221216647629091,
+      "p95": 3.1066784765052313,
+      "wins": 9515,
+      "win_percent": 100,
+      "baseline_median_us": 16.902,
+      "gvr_median_us": 9.626
+    },
+    "radix_cuda": {
+      "cases": 9746,
+      "geomean": 4.92914283450788,
+      "minimum": 1.34452479338843,
+      "p5": 1.7330116321841083,
+      "p95": 9.409458499113798,
+      "wins": 9746,
+      "win_percent": 100,
+      "baseline_median_us": 46.3535,
+      "gvr_median_us": 9.651
+    },
+    "deepselect": {
+      "cases": 9746,
+      "geomean": 2.365726126886252,
+      "minimum": 0.8387043554773427,
+      "p5": 1.1323672895555466,
+      "p95": 5.269908377259912,
+      "wins": 9707,
+      "win_percent": 99.59983583008413,
+      "baseline_median_us": 26.854,
+      "gvr_median_us": 9.651
+    },
+    "hpc_ops": {
+      "cases": 6776,
+      "geomean": 1.5503113358686176,
+      "minimum": 0.707073853570024,
+      "p5": 1.0617866160873248,
+      "p95": 3.411471833093196,
+      "wins": 6666,
+      "win_percent": 98.37662337662337,
+      "baseline_median_us": 15.2865,
+      "gvr_median_us": 10.058
+    }
+  },
+  "comparison_common_cases": {
+    "flash": {
+      "cases": 2079,
+      "layers": 21,
+      "latency_relative_to_v2": {
+        "gvr_v2": 1.0,
+        "temporal_r0": 2.0293725740894857,
+        "temporal_tiered": 1.4841922688442863,
+        "sglang": 1.7813879012416804,
+        "flashinfer": 2.1168284413867866,
+        "radix_cuda": 4.738848498350794,
+        "deepselect": 1.9762668821010982,
+        "hpc_ops": 2.3022651105074425
+      }
+    },
+    "pro": {
+      "cases": 2970,
+      "layers": 30,
+      "latency_relative_to_v2": {
+        "gvr_v2": 1.0,
+        "temporal_r0": 2.092569227440768,
+        "temporal_tiered": 1.4982771524645222,
+        "sglang": 1.7583326591453858,
+        "flashinfer": 2.1380735012445657,
+        "radix_cuda": 4.730141753655872,
+        "deepselect": 2.0652926786843926
+      }
+    },
+    "v32": {
+      "cases": 4466,
+      "layers": 58,
+      "latency_relative_to_v2": {
+        "gvr_v2": 1.0,
+        "temporal_r0": 1.7452692400246128,
+        "temporal_tiered": 1.343629605500426,
+        "sglang": 1.5458744575710972,
+        "flashinfer": 1.8884614097529644,
+        "radix_cuda": 5.14935336398433,
+        "deepselect": 2.7938491864507595,
+        "hpc_ops": 1.3017841898865732
+      }
+    }
+  },
+  "by_model": {
+    "flash": {
+      "sglang": {
+        "cases": 2079,
+        "geomean": 1.7813879012416804,
+        "minimum": 0.9634314231629667,
+        "p5": 1.3783206714743743,
+        "p95": 2.633179873020246,
+        "wins": 2078,
+        "win_percent": 99.95189995189995,
+        "baseline_median_us": 11.911,
+        "gvr_median_us": 6.586
+      },
+      "flashinfer": {
+        "cases": 2079,
+        "geomean": 2.1168284413867866,
+        "minimum": 1.327138186198589,
+        "p5": 1.741738976670898,
+        "p95": 2.9409341645629477,
+        "wins": 2079,
+        "win_percent": 100,
+        "baseline_median_us": 15.267,
+        "gvr_median_us": 6.586
+      },
+      "radix_cuda": {
+        "cases": 2079,
+        "geomean": 4.738848498350794,
+        "minimum": 1.4393757503001199,
+        "p5": 1.6352899884566188,
+        "p95": 11.130091581813774,
+        "wins": 2079,
+        "win_percent": 100,
+        "baseline_median_us": 39.606,
+        "gvr_median_us": 6.586
+      },
+      "deepselect": {
+        "cases": 2079,
+        "geomean": 1.9762668821010982,
+        "minimum": 0.8387043554773427,
+        "p5": 1.2575985736118185,
+        "p95": 3.530044018339831,
+        "wins": 2057,
+        "win_percent": 98.94179894179894,
+        "baseline_median_us": 16.634,
+        "gvr_median_us": 6.586
+      },
+      "hpc_ops": {
+        "cases": 2079,
+        "geomean": 2.3022651105074425,
+        "minimum": 1.092841163310962,
+        "p5": 1.5165886364171397,
+        "p95": 5.3384128691328945,
+        "wins": 2079,
+        "win_percent": 100,
+        "baseline_median_us": 16.144,
+        "gvr_median_us": 6.586
+      }
+    },
+    "pro": {
+      "sglang": {
+        "cases": 2970,
+        "geomean": 1.7583326591453858,
+        "minimum": 0.9452784089288601,
+        "p5": 1.3523156478223413,
+        "p95": 2.6234948351553213,
+        "wins": 2963,
+        "win_percent": 99.76430976430977,
+        "baseline_median_us": 12.790500000000002,
+        "gvr_median_us": 7.0035
+      },
+      "flashinfer": {
+        "cases": 2970,
+        "geomean": 2.1380735012445657,
+        "minimum": 1.2048796877826886,
+        "p5": 1.7583690358151742,
+        "p95": 2.989261325105112,
+        "wins": 2970,
+        "win_percent": 100,
+        "baseline_median_us": 15.795,
+        "gvr_median_us": 7.0035
+      },
+      "radix_cuda": {
+        "cases": 2970,
+        "geomean": 4.730141753655872,
+        "minimum": 1.34452479338843,
+        "p5": 1.6644194770141632,
+        "p95": 10.492732386881801,
+        "wins": 2970,
+        "win_percent": 100,
+        "baseline_median_us": 42.3375,
+        "gvr_median_us": 7.0035
+      },
+      "deepselect": {
+        "cases": 2970,
+        "geomean": 2.0652926786843926,
+        "minimum": 0.8633132859486058,
+        "p5": 1.300981064323937,
+        "p95": 3.7401871934801103,
+        "wins": 2953,
+        "win_percent": 99.42760942760943,
+        "baseline_median_us": 18.569499999999998,
+        "gvr_median_us": 7.0035
+      },
+      "hpc_ops": {
+        "cases": 0
+      }
+    },
+    "v32": {
+      "sglang": {
+        "cases": 4466,
+        "geomean": 1.5458744575710972,
+        "minimum": 0.995505617977528,
+        "p5": 1.2471306665615176,
+        "p95": 2.0331705513657594,
+        "wins": 4465,
+        "win_percent": 99.97760859829825,
+        "baseline_median_us": 17.1005,
+        "gvr_median_us": 10.7935
+      },
+      "flashinfer": {
+        "cases": 4466,
+        "geomean": 1.8884614097529644,
+        "minimum": 1.2740702479338843,
+        "p5": 1.3864284809219347,
+        "p95": 3.336226127023025,
+        "wins": 4466,
+        "win_percent": 100,
+        "baseline_median_us": 18.2675,
+        "gvr_median_us": 10.7935
+      },
+      "radix_cuda": {
+        "cases": 4697,
+        "geomean": 5.1482115783067535,
+        "minimum": 2.146239180122966,
+        "p5": 3.609013753424199,
+        "p95": 8.883631207549637,
+        "wins": 4697,
+        "win_percent": 100,
+        "baseline_median_us": 49.974,
+        "gvr_median_us": 10.787
+      },
+      "deepselect": {
+        "cases": 4697,
+        "geomean": 2.791499963621508,
+        "minimum": 1.0073976656255137,
+        "p5": 1.1201868693909796,
+        "p95": 6.159466538766953,
+        "wins": 4697,
+        "win_percent": 100,
+        "baseline_median_us": 45.325,
+        "gvr_median_us": 10.787
+      },
+      "hpc_ops": {
+        "cases": 4697,
+        "geomean": 1.301380953511156,
+        "minimum": 0.707073853570024,
+        "p5": 1.040466706447916,
+        "p95": 1.6382505329224384,
+        "wins": 4587,
+        "win_percent": 97.65807962529274,
+        "baseline_median_us": 14.95,
+        "gvr_median_us": 10.787
+      }
+    }
+  },
+  "sglang_transform_only": {
+    "cases": 9515,
+    "geomean": 1.4216305273775935,
+    "minimum": 0.8034761658922732,
+    "p5": 1.0769350221910845,
+    "p95": 2.127197724856214,
+    "wins": 9399,
+    "win_percent": 98.78087230688386,
+    "baseline_median_us": 12.397,
+    "gvr_median_us": 9.626
+  },
+  "deepselect_bf16": {
+    "cases": 9746,
+    "geomean": 1.4046594964449852,
+    "minimum": 0.5546046749265552,
+    "p5": 0.9265655269109043,
+    "p95": 2.7501870173571765,
+    "wins": 8384,
+    "win_percent": 86.02503591216909,
+    "baseline_median_us": 14.144,
+    "gvr_median_us": 9.661
+  },
+  "temporal_vs_v2": {
+    "temporal_r0": {
+      "cases": 9746,
+      "geomean": 1.9056854507699208,
+      "minimum": 0.9918327259569409,
+      "p5": 1.3440862636763187,
+      "p95": 2.8577032051156213,
+      "wins": 9745,
+      "win_percent": 99.98973938025857,
+      "baseline_median_us": 16.9455,
+      "gvr_median_us": 9.651
+    },
+    "temporal_tiered": {
+      "cases": 9746,
+      "geomean": 1.4197420853024663,
+      "minimum": 0.6822172253667951,
+      "p5": 1.042921280424682,
+      "p95": 2.1030143856993346,
+      "wins": 9525,
+      "win_percent": 97.73240303714344,
+      "baseline_median_us": 12.232,
+      "gvr_median_us": 9.651
+    }
+  },
+  "evolution_vs_radix": {
+    "temporal_r0": {
+      "geomean": 2.5865458712068374,
+      "wins_percent": 88.7235789041658
+    },
+    "temporal_tiered": {
+      "geomean": 3.4718579420414657,
+      "wins_percent": 98.38908270059513
+    },
+    "gvr_v2": {
+      "geomean": 4.92914283450788,
+      "wins_percent": 100
+    }
+  }
+}

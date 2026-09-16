@@ -1,0 +1,46 @@
+{
+  "copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0",
+  "reference": {
+    "repository": "NVIDIA/TensorRT-LLM",
+    "implementation": "GVR V2 self-sampling",
+    "entry": "run_varlen",
+    "mode": "hint-free"
+  },
+  "hardware": "NVIDIA B200 (SM100)",
+  "baseline_versions": {
+    "deepselect": "v1.0.0, 8e70df71d2",
+    "hpc_ops": "2a2e265624",
+    "flashinfer": "0.6.14",
+    "sglang": "Top-K v2",
+    "radix_cuda": "Production insertion/radix/split-work dispatcher",
+    "temporal_r0": "Temporal R0 ladder implementation, public PR #16457",
+    "temporal_tiered": "Tiered temporal implementation, public PR #16877"
+  },
+  "pairing": {
+    "deepselect": "same process as reference",
+    "hpc_ops": "same process as reference",
+    "radix_cuda": "cross-campaign",
+    "sglang": "cross-campaign; plan + transform",
+    "sglang_transform": "cross-campaign; transform only",
+    "flashinfer": "cross-campaign; values FP32 + indices INT64 API",
+    "deepselect_bf16": "same process as gvr_bf16_run_us; input conversion excluded",
+    "temporal_r0": "cross-campaign, same (cell, batch), not an isolated algorithm ablation",
+    "temporal_tiered": "cross-campaign, same (cell, batch), not an isolated algorithm ablation"
+  },
+  "published_files": {
+    "flash_timings.csv.gz": "2a34d4a9baeb6b46522851b11af51b7885f8f01c4227232efd24e9fb9080d8e2",
+    "pro_timings.csv.gz": "e99b97ce0075bd84d4d8713e628cdd37ea84b2e96690db1b97541a14164d6d27",
+    "v32_timings.csv.gz": "02e80a2298bb278ee28e3314c97ceb56b0cc62018ebbc821ce7da933ed927f70",
+    "temporal_comparison.csv.gz": "0a0973e218209d1f2e4db89e9539a3736753073ad72dc16a30288e79fa9309bb"
+  },
+  "scope": "Frozen per-case cold kernel means, not raw repetition traces or captured logits. Blank entries are missing/unsupported; never zero latency.",
+  "roofline_model": {
+    "theoretical_bandwidth_tb_s": 8.0,
+    "measured_bandwidth_tb_s": 6.912116,
+    "theoretical_compare_t_s": 37.22496,
+    "measured_compare_t_s": 37.04749,
+    "work_definition": "One abstract comparison per input score; W=B*N, Qmin=4*B*(N+K).",
+    "compare_calibration": "Study counts two semantic binary comparisons per FMNMX3 result.",
+    "scope": "Single-GPU read-dominated ceiling; actual Top-K instruction count and extra traffic are excluded."
+  }
+}
