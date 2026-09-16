@@ -43,7 +43,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..conftest import llm_models_root
 
 MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-# Provision a host tier so the cold-pool field checks cannot pass vacuously.
+# Pin the host tier for all scenarios so cold-pool field coverage is deterministic.
 HOST_CACHE_SIZE = 64 << 20
 
 ALL_FIELDS = [
@@ -149,7 +149,7 @@ def find_kv_entries(stats_list):
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def llm_instance():
-    """Create a shared LLM instance for all tests in this module."""
+    """Share one V2 LLM with a fixed host tier across all eight scenarios."""
     llm = LLM(
         model=MODEL,
         kv_cache_config=KvCacheConfig(
@@ -427,7 +427,9 @@ class TestKvCacheIterationStats:
                         f"Missing kvCacheIterationStatsByColdPoolGroup fields for group {group}: "
                         f"{sorted(missing_fields)}"
                     )
-                    assert v["secondaryMaxNumBlocks"] > 0
+                    assert v["secondaryMaxNumBlocks"] > 0, (
+                        f"Cold group {group} reports no secondary capacity: {v}"
+                    )
 
         print(f"  Entries with kvCacheIterationStats: {entries_with_kv}/{len(all_collected)}")
         assert entries_with_kv > 0, "no entries contain kvCacheIterationStats"
