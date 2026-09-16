@@ -145,29 +145,6 @@ def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
 
 
-#: Sentinel for "this layer is not SiTU". A torch custom op schema cannot carry
-#: ``Optional[float]`` here the way a Python signature can, and 0.0 is not
-#: available as the neutral value: the SiTU epilogue divides by both betas, so
-#: zero is a division by zero rather than a no-op. A negative value is
-#: impossible for a real soft-cap -- ``SiTuActivation`` rejects it at
-#: construction -- which makes it safe to reserve.
-SITU_BETA_DISABLED = -1.0
-
-
-def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
-    """Map the op-boundary sentinel back to ``None`` for the kernel.
-
-    Only the sentinel becomes ``None``. Every other value is forwarded so the
-    kernel's own validation sees it: mapping the whole ``<= 0`` range here
-    would turn ``situ_beta=0.0`` on a SwiGLU layer into "no soft-caps
-    supplied", silently accepting an argument that combination has no meaning
-    for, instead of raising.
-    """
-    if situ_beta is None or situ_beta == SITU_BETA_DISABLED:
-        return None
-    return float(situ_beta)
-
-
 def _get_cute_dsl_swap_ab_candidates(
     m: int,
     output_aligned: bool,
@@ -4083,8 +4060,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
-        situ_beta: float = SITU_BETA_DISABLED,
-        situ_linear_beta: float = SITU_BETA_DISABLED,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4092,10 +4069,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         (non-gated) and ``ActivationType.SiTu`` (gated) epilogues; other
         ``ActivationType`` values raise an assertion in the runner.
 
-        ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps.
-        They default to ``SITU_BETA_DISABLED`` rather than ``None`` because the
-        op schema takes plain floats; the runner maps the sentinel back to
-        ``None`` and then rejects a mismatch against ``activation_type``.
+        ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps, and
+        are ``None`` for every other activation. The runner rejects a mismatch
+        against ``activation_type`` in either direction.
         """
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
@@ -4122,8 +4098,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type=ActivationType(activation_type),
             swiglu_limit_scalar=swiglu_limit_scalar,
             use_expert_counts=expert_counts is not None,
-            situ_beta=_canonicalize_situ_beta(situ_beta),
-            situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta))
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4162,8 +4138,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
-        situ_beta: float = SITU_BETA_DISABLED,
-        situ_linear_beta: float = SITU_BETA_DISABLED,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Meta-device shapes for the FC1 output and its block scales.
 
