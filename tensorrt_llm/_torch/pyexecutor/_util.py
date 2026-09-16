@@ -1027,14 +1027,22 @@ class KvCacheCreator:
     def _get_mla_chunked_profile_length(self, input_seq_len: int) -> int | None:
         """Length needed to profile a full cached-KV chunk and another loop."""
         model_config = self._model_engine.model.model_config
+        # Skip-softmax preserves dense MLA. DSA-style hooks can switch to
+        # absorption before this request reaches a full cached-KV chunk.
         if (not is_mla(model_config.pretrained_config)
                 or model_config.attn_backend != "TRTLLM"
-                or model_config.sparse_attention_config is not None
-                or self._max_beam_width != 1
-                or self._speculative_config is not None):
+                or getattr(model_config.sparse_attention_config, "algorithm",
+                           None) not in (None, "skip_softmax")):
             return None
+        # Beam search and speculative decoding use this same dense context
+        # path. Their extra KV capacity is accounted for by
+        # _get_token_num_for_estimation; neither needs a separate exclusion.
         features = self._model_engine.attn_runtime_features
         if not features.chunked_prefill or features.chunk_size <= 0:
+            return None
+        # MLA.forward_context uses full-gather on Hopper even when scheduler
+        # chunking is enabled. Only the SM100+ path bounds cached-KV staging.
+        if get_sm_version() < 100:
             return None
 
         kv_chunk_tokens = (features.chunk_size *
