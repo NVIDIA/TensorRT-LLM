@@ -1070,12 +1070,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     def dockerArgs = null
     Throwable primaryError = null
 
-    // The in-flight stage failure (test/bring-up/interrupt), if any. Recorded so the
-    // cleanup finally below can tell "cleanup is the only failure" (throw a retryable
-    // typed InfraFailure) from "a stage failure is already pending" (preserve it, since
-    // a throw from the finally would supersede the real failure per JVM semantics).
-    Throwable pendingStageFailure = null
-
     try {
         // Run ssh command to start node in desired cluster via SLURM
         CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
@@ -1475,7 +1469,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         try {
             executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
         } catch (InterruptedException e) {
-            pendingStageFailure = e
             throw e
         } catch (Exception e) {
             // A test-execution failure was already labeled inside the task runner, so
@@ -1484,7 +1477,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             // (image pull, node/agent bring-up, etc.) were never labeled, so classify
             // them here on the agent.
             Throwable classified = (slurmFailureClassified || e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
-            pendingStageFailure = classified
             throw classified
         }
     } catch (InterruptedException e) {
@@ -1499,47 +1491,26 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         try {
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
         } finally {
-            boolean cleanupFailed = false
             stage("Clean Up Slurm Resource") {
-                // Workaround to handle the interruption during clean up SLURM resources
+                // Retry transient cleanup failures before leaving recovery to the sweep.
                 retry(3) {
                     try {
                         cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
+                    } catch (InterruptedException e) {
+                        throw e
                     } catch (Exception e) {
-                        if (pendingStageFailure != null) {
-                            // A stage failure (test/bring-up/interrupt) is already in flight.
-                            // Throwing the cleanup error from this finally would supersede it
-                            // (JVM finally semantics), dropping the real failure and letting
-                            // runLLMTestlistOnSlurm reclassify the stage as retryable SLURM
-                            // infra -- masking a genuine test failure as an infra retry. Swallow
-                            // the cleanup error (keep it in the console for diagnostics) so the
-                            // pending failure propagates unchanged.
-                            cleanupFailed = true
-                            echo "Clean Up SLURM resources failed while a stage failure was already " +
-                                 "pending; preserving the pending failure and leaving the resource " +
-                                 "ledger entry for the post-build sweep. Cleanup error: ${e.toString()}"
-                        } else {
-                            // Cleanup is the only failure. Throw it typed (chaining the cause)
-                            // instead of error(...): error(...) flattens the exception to a bare
-                            // string, dropping the cause chain and the ssh transport signature,
-                            // which is how a cleanup ssh drop (exit 255) reaches FailureClassifier
-                            // as an unmatched UserFailure and fail-fast-kills sibling stages. A
-                            // typed throw still de-interrupts into a retryable throw for the
-                            // retry(3) workaround, and keeps any pod-death signal in the cause
-                            // chain for isDispatcherPodFailure() upstream.
-                            throw new InfraFailure(
-                                "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
-                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
-                        }
+                        // retry(3) retries any exception. Keep the cleanup failure typed
+                        // so its cause and scope survive if all attempts fail; the outer
+                        // preservePrimaryFailure then retains any original stage failure.
+                        throw new InfraFailure(
+                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                            e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                     }
                 }
             }
-            // Cleanup ran on the live pod; drop the registry entry so the off-pod
-            // finalizer/sweep does not reconcile already-freed resources. If cleanup was
-            // skipped under a pending stage failure, leave the entry live for the sweep.
-            if (!cleanupFailed) {
-                deregisterSlurmResource(stageName)
-            }
+            // Reaching here means cleanup succeeded within its retry budget. If all
+            // attempts fail, the throw skips deregistration and leaves the entry for sweep.
+            deregisterSlurmResource(stageName)
         }
         }
     }
@@ -1778,7 +1749,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
-    def stageIsInterrupted = false
     // Captured so the finally can suppress this attempt's junit when the failure is
     // a retryable infra failure (a retry follows) -- otherwise a stage that fails
     // an intermediate attempt and passes on retry leaves the build UNSTABLE.
@@ -2682,7 +2652,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         }  // end withCredentials
     } catch (InterruptedException e) {
         primaryError = e
-        stageIsInterrupted = true
         throw e
     } catch (Exception e) {
         primaryError = e
@@ -2702,50 +2671,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, postTag, suppressTestReporting)
             deleteProgressArtifact(stageName, postTag)
         } finally {
-            // A stage failure (test/bring-up) or interruption already in flight; recorded
-            // above as caughtStageError / stageIsInterrupted. If either is set, a throw from
-            // this cleanup finally would supersede it.
-            boolean stageFailurePending = (caughtStageError != null || stageIsInterrupted)
-            boolean cleanupFailed = false
             stage("Clean Up Slurm Resource") {
-                // Workaround to handle the interruption during clean up SLURM resources
+                // Retry transient cleanup failures before leaving recovery to the sweep.
                 retry(3) {
                     try {
                         cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
+                    } catch (InterruptedException e) {
+                        throw e
                     } catch (Exception e) {
-                        if (stageFailurePending) {
-                            // Throwing the cleanup error from this finally would supersede the
-                            // pending failure (JVM finally semantics), dropping the real failure
-                            // and letting runLLMTestlistOnSlurm reclassify the stage as retryable
-                            // SLURM infra -- masking a genuine test failure (or an interrupt) as
-                            // an infra retry. Swallow the cleanup error (keep it in the console
-                            // for diagnostics) so the pending failure propagates unchanged.
-                            cleanupFailed = true
-                            echo "Clean Up SLURM resources failed while a stage failure was already " +
-                                 "pending; preserving the pending failure and leaving the resource " +
-                                 "ledger entry for the post-build sweep. Cleanup error: ${e.toString()}"
-                        } else {
-                            // Cleanup is the only failure. Throw it typed (chaining the cause)
-                            // instead of error(...): error(...) flattens the exception to a bare
-                            // string, dropping the cause chain and the ssh transport signature,
-                            // which is how a cleanup ssh drop (exit 255) reaches FailureClassifier
-                            // as an unmatched UserFailure and fail-fast-kills sibling stages. A
-                            // typed throw still de-interrupts into a retryable throw for the
-                            // retry(3) workaround, and keeps any pod-death signal in the cause
-                            // chain for isDispatcherPodFailure() upstream.
-                            throw new InfraFailure(
-                                "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
-                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
-                        }
+                        // retry(3) retries any exception. Keep the cleanup failure typed
+                        // so its cause and scope survive if all attempts fail; the outer
+                        // preservePrimaryFailure then retains any original stage failure.
+                        throw new InfraFailure(
+                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                            e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                     }
                 }
             }
-            // Cleanup ran on the live pod; drop the registry entry so the off-pod
-            // finalizer/sweep does not reconcile already-freed resources. If cleanup was
-            // skipped under a pending stage failure, leave the entry live for the sweep.
-            if (!cleanupFailed) {
-                deregisterSlurmResource(stageName)
-            }
+            // Reaching here means cleanup succeeded within its retry budget. If all
+            // attempts fail, the throw skips deregistration and leaves the entry for sweep.
+            deregisterSlurmResource(stageName)
         }
         }
     }
@@ -2877,6 +2822,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       stageName: stageName,
       attempt: attempt,
       backoffMs: 60L * 1000L,
+      infraRetryMax: slurmInfraRetryMax,
     ]
     try {
       if (attempt > 1) {
