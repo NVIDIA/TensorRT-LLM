@@ -893,6 +893,9 @@ class _MultiLayerPagedAttnEnv:
         attention_window_size: Optional[int] = None,
         use_paged_context_fmha: bool = False,
         ctx_lens: Optional[List[int]] = None,
+        pool_pointers: Optional[torch.Tensor] = None,
+        block_offsets: Optional[torch.Tensor] = None,
+        local_layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """One thop_attention call for one layer of the shared pool.
 
@@ -904,6 +907,18 @@ class _MultiLayerPagedAttnEnv:
         use_paged_context_fmha=True selects the paged-context execution path;
         ctx_lens then carries this call's per-context-row new-token count,
         which a cached prefix makes differ from the registered prompt length.
+
+        pool_pointers and block_offsets override the manager's, which is what
+        lets one env stand in for one *pool* of a several-pool layout: the
+        caller composes the tables across envs and this call addresses its own
+        rows through them. A single manager cannot produce that -- it owns one
+        pool -- and the pool-index column of the mapping is unexercised
+        without it.
+
+        local_layer_idx defaults to layer_idx and separates the two meanings
+        that coincide in a single-pool layout: layer_idx is this env's own
+        layer (its K/V history and buffer view), while local_layer_idx is the
+        row of the composed mapping. Across pools they differ.
         """
         ns = len(request_ids)
         kv_lens = [self.cached_len(layer_idx, rid) + new for rid, new in zip(request_ids, seq_lens)]
@@ -913,6 +928,12 @@ class _MultiLayerPagedAttnEnv:
         num_ctx_tokens = sum(seq_lens[:num_contexts])
         if pool_mapping is None:
             pool_mapping = self.pool_mapping
+        if pool_pointers is None:
+            pool_pointers = self.mgr.kv_cache_pool_pointers
+        if block_offsets is None:
+            block_offsets = self.block_offsets
+        if local_layer_idx is None:
+            local_layer_idx = layer_idx
 
         output = torch.empty(
             sum(seq_lens),
@@ -937,8 +958,8 @@ class _MultiLayerPagedAttnEnv:
             host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
             host_request_types=torch.tensor(req_types, dtype=torch.int32),
             max_context_q_len_override=None,
-            kv_cache_block_offsets=self.block_offsets,
-            host_kv_cache_pool_pointers=self.mgr.kv_cache_pool_pointers,
+            kv_cache_block_offsets=block_offsets,
+            host_kv_cache_pool_pointers=pool_pointers,
             host_kv_cache_pool_mapping=pool_mapping,
             cache_indirection=None,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
@@ -953,7 +974,7 @@ class _MultiLayerPagedAttnEnv:
             is_fused_qkv=True,
             update_kv_cache=True,
             predicted_tokens_per_seq=1,
-            local_layer_idx=layer_idx,
+            local_layer_idx=local_layer_idx,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -1169,6 +1190,113 @@ def test_bf16_multilayer_shared_pool_gqa_d128() -> None:
     assert not torch.equal(env.layer_views[3], views_before[3])
     assert torch.equal(env.layer_views[0], views_before[0])
     assert torch.equal(env.layer_views[2], views_before[2])
+
+
+def _compose_two_pools(env_a, env_b):
+    """Pool pointers, layer->pool mapping and block offsets for two pools.
+
+    Row i of the mapping is what `local_layer_idx=i` selects. Rows 0..La-1
+    address pool 0 (env_a), rows La.. address pool 1 (env_b), each with its
+    own layer-in-pool column. This is the shape a KVCacheManagerV2 produces
+    when a checkpoint's layers fall into more than one attention-window class
+    -- gpt-oss alternates sliding-window and full attention, so its layers
+    land in two groups and its mapping carries pool ids {0, 1}.
+    """
+    ptr_a = env_a.mgr.kv_cache_pool_pointers
+    ptr_b = env_b.mgr.kv_cache_pool_pointers
+    pool_pointers = torch.zeros(2, 2, dtype=torch.int64, device="cpu")
+    pool_pointers[0] = ptr_a[0]
+    pool_pointers[1] = ptr_b[0]
+
+    rows = [[0, i] for i in range(env_a.num_layers)]
+    rows += [[1, i] for i in range(env_b.num_layers)]
+    pool_mapping = torch.tensor(rows, dtype=torch.int32, device="cpu")
+
+    assert env_a.block_offsets.shape == env_b.block_offsets.shape
+    block_offsets = torch.cat([env_a.block_offsets, env_b.block_offsets], dim=0)
+    return pool_pointers, pool_mapping, block_offsets
+
+
+def test_bf16_two_pool_layer_routing_gqa_d128() -> None:
+    """Two paged pools, layers routed between them by the mapping's pool column.
+
+    Everything above this point certifies pool id 0 only: one manager owns one
+    pool, so the first column of every mapping row is 0 and the op's pool
+    selection is never exercised. A checkpoint whose layers differ in
+    attention-window class does not get that layout -- KVCacheManagerV2 puts
+    each class in its own group, and the mapping then carries ids {0, 1}.
+
+    Two managers stand in for the two pools. Each layer is driven through the
+    composed tables, and the check that matters is the negative one: a call
+    for a layer in pool 1 must leave pool 0 bitwise untouched and vice versa.
+    Collapsing pool selection to 0 -- the failure this cell exists to catch --
+    would still produce plausible outputs, because both pools hold validly
+    shaped pages; only the sibling-pool comparison sees it.
+    """
+    torch.manual_seed(11)
+    kw = dict(num_heads=8, num_kv_heads=2, head_dim=128)
+    env_a = _MultiLayerPagedAttnEnv(num_layers=2, **kw)
+    env_b = _MultiLayerPagedAttnEnv(num_layers=2, **kw)
+    envs = [(env_a, 0), (env_a, 1), (env_b, 0), (env_b, 1)]  # (env, layer in that env)
+
+    for env in (env_a, env_b):
+        env.add_request(0, 64)  # two whole pages; decode crosses into a third
+        env.add_request(1, 17)
+        env.refresh_offsets([0, 1], num_contexts=2)
+    ptrs, mapping, offsets = _compose_two_pools(env_a, env_b)
+    assert mapping.tolist() == [[0, 0], [0, 1], [1, 0], [1, 1]]
+    assert len({int(ptrs[0, 0]), int(ptrs[1, 0])}) == 2, "the two pools must have distinct bases"
+
+    def other(env):
+        return env_b if env is env_a else env_a
+
+    for row, (env, layer) in enumerate(envs):
+        qkv = env.random_qkv(81)
+        foreign_before = [v.clone() for v in other(env).layer_views]
+        out = env.call_op(
+            layer,
+            qkv,
+            [64, 17],
+            2,
+            [0, 1],
+            pool_mapping=mapping,
+            pool_pointers=ptrs,
+            block_offsets=offsets,
+            local_layer_idx=row,
+        )
+        ref = env.reference(layer, qkv, [64, 17], [0, 1], [0, 0])
+        torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+        for before, after in zip(foreign_before, other(env).layer_views):
+            assert torch.equal(before, after), (
+                f"row {row} addressed pool {mapping[row, 0].item()} but wrote the other pool"
+            )
+    for env in (env_a, env_b):
+        env.check_caches([0, 1])
+
+    for _ in range(2):  # decode, so the routing holds past the prefill pages
+        for env in (env_a, env_b):
+            env.add_decode_token(0)
+            env.add_decode_token(1)
+            env.refresh_offsets([0, 1], num_contexts=0)
+        _, _, offsets = _compose_two_pools(env_a, env_b)
+        for row, (env, layer) in enumerate(envs):
+            cached = [env.cached_len(layer, 0), env.cached_len(layer, 1)]
+            qkv = env.random_qkv(2)
+            out = env.call_op(
+                layer,
+                qkv,
+                [1, 1],
+                0,
+                [0, 1],
+                pool_mapping=mapping,
+                pool_pointers=ptrs,
+                block_offsets=offsets,
+                local_layer_idx=row,
+            )
+            ref = env.reference(layer, qkv, [1, 1], [0, 1], cached)
+            torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+    for env in (env_a, env_b):
+        env.check_caches([0, 1])
 
 
 # ─── Standard configuration, fp8-e4m3 paged KV pool (quant_mode 128) ───
