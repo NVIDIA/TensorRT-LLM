@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -195,9 +196,9 @@ BlockKey Hasher::digest() const
 std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
 {
-    TLLM_CHECK_DEBUG(numTokens > 0);
-    TLLM_CHECK_DEBUG(tokenOffset >= 0);
-    TLLM_CHECK_DEBUG(multiModalDataDigest.size() == kDIGEST_LEN);
+    TLLM_CHECK(numTokens > 0);
+    TLLM_CHECK(tokenOffset >= 0);
+    TLLM_CHECK(multiModalDataDigest.size() == kDIGEST_LEN);
     std::vector<TokenIdExt> result;
     result.reserve(static_cast<size_t>(numTokens));
     for (int i = 0; i < numTokens; ++i)
@@ -365,12 +366,12 @@ void Block::releasePages()
 
 Block::~Block()
 {
-    releasePages();
+    KVCM2_POISON_ON_EXCEPT([this]() { releasePages(); });
 }
 
 bool Block::isOrphan() const noexcept
 {
-    TLLM_CHECK_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
+    KVCM2_CHECK_FATAL_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
     return prev == nullptr;
 }
 
@@ -684,8 +685,9 @@ BlockRadixTree::BlockRadixTree(
 
 BlockRadixTree::~BlockRadixTree()
 {
-    // Clear all roots (which will drop all blocks without external owners).
-    mRoots.clear();
+    // Detach blocks leaf-first in O(1) extra space. Dropping mRoots directly would instead
+    // destroy each chain recursively, one frame per block.
+    KVCM2_POISON_ON_EXCEPT([this]() { clear(); });
 }
 
 LifeCycleId BlockRadixTree::numLifeCycles() const noexcept
