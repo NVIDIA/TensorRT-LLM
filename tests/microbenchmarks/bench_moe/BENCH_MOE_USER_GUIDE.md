@@ -443,7 +443,7 @@ experts of each target rank.
 | `balanced` | Slots are approximately balanced across local experts. | `--expert_pattern balanced` |
 | `hotspot,hotness=...` | A chosen fraction of slots goes to one local expert on each target rank. | `--expert_pattern hotspot,hotness=0.5` |
 | `hotspot,active_experts=...` | Only a chosen number of local experts receive all slots. | `--expert_pattern hotspot,active_experts=2` |
-| `powerlaw,alpha=...` | Slots follow a Zipf-style power law over local experts, `p_i = (i+1)^-alpha / sum_j (j+1)^-alpha`. Hotness ranking is shuffled onto local expert ids with a seeded RNG so hot experts are not pinned to low ids. `alpha` defaults to `0.8`; higher `alpha` concentrates more slots on fewer experts. | `--expert_pattern powerlaw,alpha=0.8` |
+| `powerlaw,alpha=...` | Slots follow a Zipf-style power law over hotness ranks `i=0,1,...` (rank 0 = hottest): `p_i = (i+1)^-alpha / sum_j (j+1)^-alpha`. This ranking is then shuffled onto local expert ids with a seeded RNG controlled by `--routing_seed`, so the hottest rank is not pinned to expert id 0. `alpha` defaults to `0.8`; higher `alpha` concentrates more slots on fewer experts. | `--expert_pattern powerlaw,alpha=0.8` |
 | `random` | Generate deterministic pseudo-random local expert histograms with `--routing_seed`. | `--expert_pattern random --routing_seed 42` |
 
 Common routing-control combinations:
