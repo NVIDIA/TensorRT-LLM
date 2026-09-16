@@ -494,11 +494,11 @@ class StorageManager:
                 if fallen_held_cnt > old_free_cnt + evictable_cnt:
                     # Do we need to revert the eviction we did before? Maybe not.
                     raise OutOfPagesError(
-                        "Too many held pages are being evicted to the last-level cache for group {pg_idx}"
+                        f"Too many held pages are being evicted to the last-level cache for group {pg_idx}"
                     )
             if old_free_cnt + evictable_cnt - fallen_held_cnt < goal:
                 raise OutOfPagesError(
-                    "Impossible to meet the goal ({goal} free slots) for group {pg_idx}"
+                    f"Impossible to meet the goal ({goal} free slots) for group {pg_idx}"
                 )
         evicted = ctrl.evict(num_to_evict)
         accepted_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
