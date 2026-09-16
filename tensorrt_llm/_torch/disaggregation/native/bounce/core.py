@@ -69,6 +69,8 @@ class TransferContext:
     base_addr: int
     per_writer_bytes: int
     num_writers: int
+    # Set only when writers contribute unequally; None keeps the uniform per_writer_bytes split.
+    writer_sizes: Optional[List[int]] = None
     on_done: Optional[Callable[[bool], None]] = None
 
     # Whether each writer that reported succeeded, keyed by rank; presence means it reported.
@@ -84,7 +86,15 @@ class TransferContext:
 
     def writer_base(self, writer_index: int) -> int:
         """Where this fan-in writer writes in the region."""
-        return self.base_addr + writer_index * self.per_writer_bytes
+        if self.writer_sizes is None:
+            return self.base_addr + writer_index * self.per_writer_bytes
+        return self.base_addr + sum(self.writer_sizes[:writer_index])
+
+    def writer_bytes(self, writer_index: int) -> int:
+        """How many bytes this fan-in writer may write, i.e. its sub-region size."""
+        if self.writer_sizes is None:
+            return self.per_writer_bytes
+        return self.writer_sizes[writer_index]
 
     def _writers_final(self) -> bool:
         return self.settled or self.state in (
@@ -235,14 +245,20 @@ class BounceTransport(ABC):
         *,
         timeout: Optional[float] = None,
         extra_bytes: int = 0,
+        frags_per_block: Optional[Dict[int, int]] = None,
+        writer_owns_replicated: Optional[List[bool]] = None,
     ) -> bool:
         """Reserve a region and record its address for the senders. False falls back to per-fragment.
-        ``extra_bytes`` sizes the sender's non-paged payload (mamba/KDA recurrent state) that rides
-        the same coalesced write as the KV blocks."""
+
+        ``extra_bytes`` sizes recurrent state appended to the coalesced write.
+        ``frags_per_block`` gives, per layer group, how many fragments one block expands into, so
+        the size gate can weigh descriptor pressure instead of block count.
+        ``writer_owns_replicated`` says, per fan-in writer, whether it is the elected sender of the
+        replicated pools, so their bytes are charged to that writer alone."""
 
     @abstractmethod
-    def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:
-        """Where the given fan-in writer writes in the region."""
+    def writer_region(self, rid_slice, writer_index: int) -> Tuple[Optional[int], Optional[int]]:
+        """Where the given fan-in writer writes and how much it may write: (base, bytes)."""
 
     @abstractmethod
     def is_bounced(self, rid_slice) -> bool:
