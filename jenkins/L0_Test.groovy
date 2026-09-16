@@ -6237,6 +6237,10 @@ def loadStageConfigSpecs(pipeline, testFilter) {
     // a full checkoutSource() on that pod.
     trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/test_stage_configs.json", "${LLM_ROOT}/jenkins/scripts")
     def specText = pipeline.readFile(file: "${LLM_ROOT}/jenkins/scripts/test_stage_configs.json")
+    // Only "configs" is loaded here; "disabled_configs" holds stage families
+    // that are intentionally turned off (e.g. offline nodes, an open nvbug)
+    // and is documentation only -- neither this loader nor
+    // scripts/test_to_stage_mapping.py reads it.
     def specs = (pipeline.readJSON(text: specText, returnPojo: true)).configs
     return applyDynamicSplitCounts(specs, testFilter)
 }

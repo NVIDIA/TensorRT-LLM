@@ -900,5 +900,55 @@
       "gpuCount": 40,
       "nodeCount": 10
     }
+  ],
+  "disabled_configs": [
+    {
+      "name": "A30-Triton-Post-Merge",
+      "arch": "x86",
+      "slurm": false,
+      "platform": "a30",
+      "testDB": "l0_a30",
+      "splits": 2
+    },
+    {
+      "name": "RTXPro6000-PyTorch-Post-Merge",
+      "arch": "x86",
+      "slurm": false,
+      "platform": "rtx-pro-6000",
+      "testDB": "l0_rtx_pro_6000",
+      "splits": 1,
+      "reason": "Disabled: RTXPro6000 nodes offline temporarily. [TODO] Split tests between RTXPro6000 and RTXPro6000D and move reasonable amount of tests to pre-merge."
+    },
+    {
+      "name": "RTXPro6000-4_GPUs-PyTorch-Post-Merge",
+      "arch": "x86",
+      "slurm": false,
+      "platform": "rtx-pro-6000-x4",
+      "testDB": "l0_rtx_pro_6000",
+      "splits": 2,
+      "gpuCount": 4,
+      "reason": "Disabled: RTXPro6000 nodes offline temporarily. [TODO] Split tests between RTXPro6000 and RTXPro6000D and move reasonable amount of tests to pre-merge."
+    },
+    {
+      "name": "RTXPro6000D-4_GPUs-PyTorch-Post-Merge",
+      "arch": "x86",
+      "slurm": false,
+      "platform": "rtx-pro-6000d-x4",
+      "testDB": "l0_rtx_pro_6000",
+      "splits": 2,
+      "gpuCount": 4,
+      "reason": "Disabled: some RTXPro6000D nodes are offline temporarily."
+    },
+    {
+      "name": "DGX_B200-4_GPUs-Verl-Post-Merge",
+      "arch": "x86",
+      "slurm": true,
+      "platform": "auto:dgx-b200-flex",
+      "testDB": "l0_verl",
+      "splits": 1,
+      "gpuCount": 4,
+      "runWithSbatch": true,
+      "reason": "Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the numpy>=2.0.0 TensorRT-LLM asks for, so the install downgrades numpy out from under the interpreter. Importing tensorrt_llm then fails and every test in the stage goes with it, which makes the whole stage noise rather than signal."
+    }
   ]
 }
