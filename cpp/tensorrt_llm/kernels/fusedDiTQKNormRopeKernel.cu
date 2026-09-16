@@ -272,8 +272,9 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
     constexpr int WARPS_PER_ROW = THREADS_PER_ROW / 32;          // 4
     constexpr int CHUNK_ELEMS = 8;                               // uint4 = 8 bf16
     // MAX_N = max(num_heads_q) * HEAD_DIM. 64 covers WAN-14B (40 heads) and
-    // future ≤64-head models. SMEM budget at 64h × 128 = 128 KB (bf16 cos) / 192 KB
-    // (fp32 cos), both within B200's 227 KB dynamic SMEM cap.
+    // future <=64-head models. Per-head cos/sin require N elements per row;
+    // head-shared cos/sin (WAN) require only HEAD_DIM and must not be replicated
+    // num_heads_q times in SMEM.
     constexpr int MAX_N = 64 * HEAD_DIM;
     constexpr int MAX_CHUNKS = (MAX_N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
 
@@ -292,6 +293,7 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
         return;
 
     int const N = num_heads_q * HEAD_DIM; // num_heads_q == num_heads_k (enforced by launcher)
+    int const cos_elements_per_row = PER_HEAD_COS ? N : HEAD_DIM;
     int const chunks_per_row = (N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
     int const num_heads_total = num_heads_q + num_heads_k + num_heads_v;
     int64_t const tokenBaseQ = static_cast<int64_t>(tokenIdx) * num_heads_total * HEAD_DIM;
@@ -300,14 +302,18 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
     int64_t const embBase = PER_HEAD_COS ? static_cast<int64_t>(cos_tokenIdx) * num_heads_q * HEAD_DIM
                                          : static_cast<int64_t>(cos_tokenIdx) * HEAD_DIM;
 
-    // SMEM layout: [Q row0][Q row1][K row0][K row1] bf16, [cos row0..1][sin row0..1] CosT, warp_sums.
+    // SMEM layout: [Q row0][Q row1][K row0][K row1] bf16,
+    // [cos row0..1][sin row0..1] CosT, warp_sums. Head-shared RoPE
+    // stores one HEAD_DIM vector per row instead of one copy per head.
+    // Keep this layout in sync with cfg.dynamicSmemBytes and
+    // validate_dynamic_smem in launchFusedDiTQKNormRopeFullDim below.
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* smem_k = smem_q + ROWS_PER_BLOCK * N;
     CosT* smem_cos = reinterpret_cast<CosT*>(smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16));
-    CosT* smem_sin = smem_cos + ROWS_PER_BLOCK * N;
-    float* warp_sums = reinterpret_cast<float*>(
-        smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + 2 * ROWS_PER_BLOCK * N * sizeof(CosT));
+    CosT* smem_sin = smem_cos + ROWS_PER_BLOCK * cos_elements_per_row;
+    float* warp_sums = reinterpret_cast<float*>(smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16)
+        + 2 * ROWS_PER_BLOCK * cos_elements_per_row * sizeof(CosT));
 
     // Phase 0a: cp.async Q + K + cos + sin -> SMEM (all in one commit group).
 #pragma unroll
@@ -323,23 +329,29 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
         int const headIdx = elemBase / HEAD_DIM;
         int const baseDim = elemBase - headIdx * HEAD_DIM;
         int const cosHeadOff = PER_HEAD_COS ? headIdx * HEAD_DIM : 0;
-        if constexpr (std::is_same_v<CosT, float>)
+        // For shared RoPE, only the threads covering the first head load the
+        // common vector. All heads reuse it during Phase 2.
+        if (PER_HEAD_COS || elemBase < HEAD_DIM)
         {
-            __pipeline_memcpy_async(
-                smem_cos + row_in_block * N + elemBase, cos_emb + embBase + cosHeadOff + baseDim, 16);
-            __pipeline_memcpy_async(
-                smem_cos + row_in_block * N + elemBase + 4, cos_emb + embBase + cosHeadOff + baseDim + 4, 16);
-            __pipeline_memcpy_async(
-                smem_sin + row_in_block * N + elemBase, sin_emb + embBase + cosHeadOff + baseDim, 16);
-            __pipeline_memcpy_async(
-                smem_sin + row_in_block * N + elemBase + 4, sin_emb + embBase + cosHeadOff + baseDim + 4, 16);
-        }
-        else
-        {
-            __pipeline_memcpy_async(
-                smem_cos + row_in_block * N + elemBase, cos_emb + embBase + cosHeadOff + baseDim, 16);
-            __pipeline_memcpy_async(
-                smem_sin + row_in_block * N + elemBase, sin_emb + embBase + cosHeadOff + baseDim, 16);
+            int const cosElemBase = PER_HEAD_COS ? elemBase : baseDim;
+            if constexpr (std::is_same_v<CosT, float>)
+            {
+                __pipeline_memcpy_async(smem_cos + row_in_block * cos_elements_per_row + cosElemBase,
+                    cos_emb + embBase + cosHeadOff + baseDim, 16);
+                __pipeline_memcpy_async(smem_cos + row_in_block * cos_elements_per_row + cosElemBase + 4,
+                    cos_emb + embBase + cosHeadOff + baseDim + 4, 16);
+                __pipeline_memcpy_async(smem_sin + row_in_block * cos_elements_per_row + cosElemBase,
+                    sin_emb + embBase + cosHeadOff + baseDim, 16);
+                __pipeline_memcpy_async(smem_sin + row_in_block * cos_elements_per_row + cosElemBase + 4,
+                    sin_emb + embBase + cosHeadOff + baseDim + 4, 16);
+            }
+            else
+            {
+                __pipeline_memcpy_async(smem_cos + row_in_block * cos_elements_per_row + cosElemBase,
+                    cos_emb + embBase + cosHeadOff + baseDim, 16);
+                __pipeline_memcpy_async(smem_sin + row_in_block * cos_elements_per_row + cosElemBase,
+                    sin_emb + embBase + cosHeadOff + baseDim, 16);
+            }
         }
     }
     __pipeline_commit();
@@ -421,10 +433,15 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
 
         float cos_vals[CHUNK_ELEMS];
         float sin_vals[CHUNK_ELEMS];
+        int const headIdx = elemBase / HEAD_DIM;
+        int const baseDim = elemBase - headIdx * HEAD_DIM;
+        int const cosElemBase = PER_HEAD_COS ? elemBase : baseDim;
         if constexpr (std::is_same_v<CosT, float>)
         {
-            float4 const* cs = reinterpret_cast<float4 const*>(&smem_cos[row_in_block * N + elemBase]);
-            float4 const* ss = reinterpret_cast<float4 const*>(&smem_sin[row_in_block * N + elemBase]);
+            float4 const* cs
+                = reinterpret_cast<float4 const*>(&smem_cos[row_in_block * cos_elements_per_row + cosElemBase]);
+            float4 const* ss
+                = reinterpret_cast<float4 const*>(&smem_sin[row_in_block * cos_elements_per_row + cosElemBase]);
             float4 c0 = cs[0], c1 = cs[1];
             float4 s0 = ss[0], s1 = ss[1];
             cos_vals[0] = c0.x;
@@ -446,8 +463,10 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
         }
         else
         {
-            uint4 const cp = *reinterpret_cast<uint4 const*>(&smem_cos[row_in_block * N + elemBase]);
-            uint4 const sp = *reinterpret_cast<uint4 const*>(&smem_sin[row_in_block * N + elemBase]);
+            uint4 const cp
+                = *reinterpret_cast<uint4 const*>(&smem_cos[row_in_block * cos_elements_per_row + cosElemBase]);
+            uint4 const sp
+                = *reinterpret_cast<uint4 const*>(&smem_sin[row_in_block * cos_elements_per_row + cosElemBase]);
             uint const* cu = reinterpret_cast<uint const*>(&cp);
             uint const* su = reinterpret_cast<uint const*>(&sp);
 #pragma unroll
@@ -556,23 +575,50 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q,
     cfg.gridDim = dim3((num_tokens + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
     cfg.blockDim = dim3(256);
     // SMEM = Q+K stage (bf16) + cos+sin stage (CosT) + warp_sums.
+    // Head-shared RoPE stores one head_dim vector per row; per-head RoPE
+    // stores num_heads_q * head_dim elements per row.
+    // Keep this accounting in sync with the kernel's SMEM layout above.
+    int const cos_elements_per_row = per_head_cos ? N : head_dim;
     size_t const cos_elem_size = cos_is_bf16 ? sizeof(__nv_bfloat16) : sizeof(float);
-    cfg.dynamicSmemBytes = 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + 2 * ROWS_PER_BLOCK * N * cos_elem_size
+    cfg.dynamicSmemBytes = 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16)
+        + 2 * ROWS_PER_BLOCK * cos_elements_per_row * cos_elem_size
         + ROWS_PER_BLOCK * 2 * 4 /*WARPS_PER_ROW*/ * sizeof(float);
     cfg.stream = stream;
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
+
+    int device = 0;
+    int max_smem_per_block_optin = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    auto validate_dynamic_smem = [&](void const* kernel_ptr)
+    {
+        cudaFuncAttributes kernel_attrs{};
+        TLLM_CUDA_CHECK(cudaFuncGetAttributes(&kernel_attrs, kernel_ptr));
+        size_t const static_smem = kernel_attrs.sharedSizeBytes;
+        size_t const optin_smem = static_cast<size_t>(max_smem_per_block_optin);
+        size_t const actual_dynamic_smem = static_smem <= optin_smem ? optin_smem - static_smem : 0;
+        TLLM_CHECK_WITH_INFO(cfg.dynamicSmemBytes <= actual_dynamic_smem,
+            "fusedDiTQKNormRopeFullDim requires %zu bytes of dynamic shared memory, but the selected kernel on "
+            "device %d supports %zu bytes (%zu-byte opt-in limit minus %zu bytes static; num_heads=%d, "
+            "head_dim=%d, per_head_cos=%d, cos_is_bf16=%d). Disable fuse_qk_norm_rope.",
+            cfg.dynamicSmemBytes, device, actual_dynamic_smem, optin_smem, static_smem, num_heads_q, head_dim,
+            static_cast<int>(per_head_cos), static_cast<int>(cos_is_bf16));
+    };
+
     // Default per-CTA dynamic SMEM cap is 48 KB; raise it per kernel specialization.
 #define LAUNCH(HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T)                                                                  \
     do                                                                                                                 \
     {                                                                                                                  \
         auto* kptr = fusedDiTQKNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T>;                           \
-        cudaFuncSetAttribute(                                                                                          \
-            reinterpret_cast<void const*>(kptr), cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.dynamicSmemBytes);   \
-        cudaLaunchKernelEx(&cfg, kptr, reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v,   \
-            eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),   \
-            reinterpret_cast<COS_T const*>(cos_emb), reinterpret_cast<COS_T const*>(sin_emb), num_tokens,              \
-            cos_seq_per_batch);                                                                                        \
+        void const* kernel_ptr = reinterpret_cast<void const*>(kptr);                                                  \
+        validate_dynamic_smem(kernel_ptr);                                                                             \
+        TLLM_CUDA_CHECK(                                                                                               \
+            cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.dynamicSmemBytes));      \
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kptr, reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q,             \
+            num_heads_k, num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),                           \
+            reinterpret_cast<__nv_bfloat16 const*>(k_weight), reinterpret_cast<COS_T const*>(cos_emb),                 \
+            reinterpret_cast<COS_T const*>(sin_emb), num_tokens, cos_seq_per_batch));                                  \
     } while (0)
 #define DISPATCH(INTERLEAVE, PER_HEAD, COS_T)                                                                          \
     do                                                                                                                 \
