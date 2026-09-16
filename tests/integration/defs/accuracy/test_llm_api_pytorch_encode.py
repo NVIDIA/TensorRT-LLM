@@ -239,8 +239,15 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 # classification scoring on a causal LM backbone.
 #
 # One representative per distinct TRT-LLM architecture class:
+#   LlamaForCausalLM   — Llama-3.2-1B (also covers Mistral, which aliases LlamaModel)
 #   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm)
 DECODER_MODELS = [
+    # -- LlamaForCausalLM (covers Llama + Mistral family) --
+    pytest.param(
+        "meta-llama/Llama-3.2-1B",
+        f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B",
+        id="llama-3.2-1b",
+    ),
     # -- Qwen3ForCausalLM --
     pytest.param(
         "Qwen/Qwen3-0.6B",

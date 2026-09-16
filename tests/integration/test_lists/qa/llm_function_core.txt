@@ -644,6 +644,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_t
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_guided_decoding TIMEOUT (60)
 accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_step3p7_mtp TIMEOUT (60)
+accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[llama-3.2-1b]
+accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[llama-3.2-1b]
 accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen3-0.6b]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
