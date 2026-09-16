@@ -12,6 +12,7 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -630,6 +631,29 @@ def _new_media_dir(root: Path) -> Path:
             n += 1
 
 
+def _resolve_media_dir() -> Path:
+    """Create and return the directory to store generated media in.
+
+    ``TRTLLM_MEDIA_STORAGE_PATH`` names the directory outright, empty meaning
+    unset. Otherwise it goes beside the working directory, and where that
+    cannot be written it goes to a private temporary one: a shared ``/tmp``
+    holds directories owned by other users, so the fallback takes a name
+    nobody else can hold rather than a fixed one.
+    """
+    explicit = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
+    if explicit:
+        path = Path(explicit)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    try:
+        return _new_media_dir(Path.cwd() / "trtllm_generated")
+    except OSError:
+        # OSError rather than PermissionError: a read-only mount raises
+        # EROFS, which is not one.
+        stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+        return Path(tempfile.mkdtemp(prefix=f"trtllm_generated-{stamp}-"))
+
+
 def _normalize_image_output(image) -> list:
     """Normalize image output to a list of individual images.
 
@@ -943,26 +967,22 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        # Without an explicit path, take a timestamped directory beside the
-        # working directory, so concurrent servers keep their media apart and
-        # it outlives a reboot.
-        explicit_storage_path = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
-        if explicit_storage_path:
-            self.media_storage_path = Path(explicit_storage_path)
-            self.media_storage_path.mkdir(parents=True, exist_ok=True)
-        else:
-            try:
-                self.media_storage_path = _new_media_dir(Path.cwd() /
-                                                         "trtllm_generated")
-            except OSError:
-                # A deployment may start the server from a directory it cannot
-                # write to, and that must not stop a server whose caller never
-                # asks for media. OSError rather than PermissionError: a
-                # read-only mount raises EROFS, which is not one.
-                self.media_storage_path = _new_media_dir(
-                    Path("/tmp/trtllm_generated"))  # nosec B108
-        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
+        self._media_storage_path: Optional[Path] = None
         self.video_gen_tasks = {}
+
+    @property
+    def media_storage_path(self) -> Path:
+        """The directory generated media is stored in, created on first use.
+
+        Resolving it lazily keeps a server that is never asked for media from
+        leaving a directory behind on every restart, and lets such a server
+        start from a working directory it could not have written.
+        """
+        if self._media_storage_path is None:
+            self._media_storage_path = _resolve_media_dir()
+            logger.info(
+                f"VisualGen media storage path: {self._media_storage_path}")
+        return self._media_storage_path
 
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
