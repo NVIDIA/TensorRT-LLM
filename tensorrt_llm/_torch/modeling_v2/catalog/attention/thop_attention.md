@@ -1048,18 +1048,26 @@ exactly the geometry above.
 | Argument | Shape / value | Dtype | Device |
 |---|---|---|---|
 | `kv_cache_block_offsets` | `[1, max_num_requests, 2, max_blocks_per_seq]`; row `[0, s, 0, j]` = K-slab offset of sequence `s`'s `j`-th page, `[0, s, 1, j]` = V-slab offset. Offsets count slabs and are **layer-agnostic** — every layer of the pool shares one offsets row per sequence; layer selection comes from the pool mapping, not the offsets. Standard `L`-layer pool → page `p` has K `p * 2L`, V `p * 2L + 1` (single layer: K `2p`, V `2p + 1`); MLA pool → raw block id `p` in **both** rows. Only the first `ceil(kv_s / tokens_per_block)` entries per row are read | int32 | CUDA |
-| `host_kv_cache_pool_pointers` | `[1, 2]`: `[0, 0]` = pool base address (`pool.data_ptr()`), `[0, 1]` = secondary-pool address (0 = none) | int64 | CPU |
-| `host_kv_cache_pool_mapping` | `[num_layers, 2]`, one row per layer: row `local_layer_idx` = (pool index, layer index within pool). The row's **layer column drives the pool-base shift** — the call addresses slabs starting `layer_in_pool * kv_factor` slabs from the pool base (see *Notes*). Certified: the identity rows a real manager produces — `[[0, 0] .. [0, 3]]` for the 4-layer standard pool; `[1, 2]` zeros for single-layer pools | int32 | CPU |
-| `local_layer_idx` (int) | row of `host_kv_cache_pool_mapping` for this layer (production: the layer's index among the rank's local layers); 0-3 certified (standard), 0 (MLA) | — | — |
+| `host_kv_cache_pool_pointers` | `[num_pools, 2]`: row `p` is pool `p`'s (base address = `pool.data_ptr()`, secondary-pool address; 0 = none). Certified at `num_pools` 1 and 2 | int64 | CPU |
+| `host_kv_cache_pool_mapping` | `[num_layers, 2]`, one row per layer: row `local_layer_idx` = (pool index, layer index within pool). The row's **layer column drives the pool-base shift** — the call addresses slabs starting `layer_in_pool * kv_factor` slabs from the pool base (see *Notes*). The **pool column selects which base** to shift from. Certified: the identity rows a real manager produces — `[[0, 0] .. [0, 3]]` for the 4-layer standard pool, `[1, 2]` zeros for single-layer pools, and `[[0, 0], [0, 1], [1, 0], [1, 1]]` for two pools of two layers each, which is the shape KVCacheManagerV2 produces when a checkpoint's layers fall into more than one attention-window class | int32 | CPU |
+| `local_layer_idx` (int) | row of `host_kv_cache_pool_mapping` for this layer (production: the layer's index among the rank's local layers); 0-3 certified (standard, one pool and two), 0 (MLA) | — | — |
 | `tokens_per_block` (int) | pool page size; must be a power of two; 32 certified (standard), 32 and 64 certified (MLA — see *MLA page size*) | — | — |
 | `update_kv_cache` (bool) | `True` (also for the MLA generation and no-append context calls, which nevertheless write nothing) | — | — |
 | `cache_indirection` | `None` (beam search only) | — | — |
 | `block_ids_per_seq` | `None` (FlashMLA path only) | — | — |
 
-A sequence's page set is shared by every layer of the pool: the per-layer
-calls of one batch pass identical offsets and pool pointers and differ
-only in `local_layer_idx`. Multiple pools (`num_pools > 1`: extra
-offsets/pointer rows, mapping rows with pool index > 0) are not certified.
+A sequence's page set is shared by every layer of *its own* pool: the
+per-layer calls of one batch pass identical offsets and pool pointers and
+differ only in `local_layer_idx`.
+
+Two pools are certified. A layer's pool comes from the mapping row's pool
+column, which selects both the pointer row and the offsets slot; layers in
+different pools share nothing. The certified case drives every layer of a
+two-pool, two-layers-each layout through prefill and decode and asserts that
+each call leaves the *other* pool bitwise untouched -- collapsing the pool
+selection to 0 still produces plausible outputs, since both pools hold validly
+shaped pages, so only that comparison detects it. `num_pools > 2` is
+uncertified, as are pools that differ from each other in geometry.
 
 ### Paged KV cache addressing under a sliding window
 
