@@ -1081,12 +1081,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Evaluate Tier 2 for every eligible PR. The pilot gate below controls
-        // application only; non-pilot coverage hits remain shadow decisions.
-        def coverageContext = _cbtsCoverageAudit(pipeline)
-        def coverageDb = coverageContext?.db
-        def coveragePilotEligible = coverageContext?.pilotEligible ?: false
-
+        def coveragePilotEligible = false
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
@@ -1119,12 +1114,34 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         writeFile file: inputPath, text: inputJson
 
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
-        if (coverageDb) {
-            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
-        }
         def output = sh(script: mainCmd, returnStdout: true)
-
         def result = _cbtsParseSelectionResult(output)
+
+        // Tier 1 owns the definition of handled files. Only prepare a coverage DB when
+        // its residual is eligible for Tier 2, and scope the compatibility check to it.
+        if (result.scope == null && result.coverage_residual_files &&
+                !result.coverage_decline_reason) {
+            def residualPath = "${LLM_ROOT}/cbts_coverage_residual.json"
+            writeFile file: residualPath,
+                      text: groovy.json.JsonOutput.toJson(result.coverage_residual_files)
+            def coverageContext = _cbtsCoverageAudit(pipeline, residualPath)
+            def coverageDb = coverageContext?.db
+            coveragePilotEligible = coverageContext?.pilotEligible ?: false
+            if (coverageDb?.meta) {
+                def coverageCmd = mainCmd + " --coverage-db-meta ${coverageDb.meta}"
+                if (coverageDb.path) {
+                    coverageCmd += " --coverage-db ${coverageDb.path}"
+                }
+                output = sh(script: coverageCmd, returnStdout: true)
+                result = _cbtsParseSelectionResult(output)
+            } else if (coverageDb?.compatibility) {
+                result.coverage_compatibility = coverageDb.compatibility
+                result.coverage_decline_reason = coverageDb.decline_reason ?: ""
+                result.coverage_decline_category = "coverage_unavailable"
+                output = groovy.json.JsonOutput.toJson(result)
+            }
+        }
+
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
                           "Reasons: ${result.reasons.join('; ')}")
@@ -1197,9 +1214,9 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 }
 
 // Resolve pilot application eligibility, then fetch and audit the touch DB for
-// every PR. Returns {db, pilotEligible}; db contains artifact.py's prepared paths
-// and compatibility-diff metadata, or is null on a non-fatal preparation failure.
-def _cbtsCoverageAudit(pipeline)
+// every Tier-2 residual. Returns {db, pilotEligible}; a compatibility decline
+// remains in db without a path so it is observable in shadow and pilot modes.
+def _cbtsCoverageAudit(pipeline, String residualPath)
 {
     def pilotEligible = false
     try {
@@ -1224,16 +1241,27 @@ def _cbtsCoverageAudit(pipeline)
             pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
             readyJson = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                        "--prepare cbts_cov --paths-json ${residualPath}" +
+                        "${prHead ? " --pr-head ${prHead}" : ""} || true",
                 returnStdout: true,
             ).trim()
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — Tier 2 decision unavailable")
-            return [db: null, pilotEligible: pilotEligible]
+            return [
+                db: [
+                    compatibility: "unknown",
+                    decline_reason: "coverage tier declined: coverage DB could not be prepared",
+                ],
+                pilotEligible: pilotEligible,
+            ]
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
-        pipeline.echo("CBTS audit: PR diff applies cleanly to the latest coverage DB")
+        if (!ready.path) {
+            pipeline.echo("CBTS audit: Tier-2 residual conflicts with the latest coverage DB")
+            return [db: ready, pilotEligible: pilotEligible]
+        }
+        pipeline.echo("CBTS audit: Tier-2 residual applies cleanly to the latest coverage DB")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
         return [db: ready, pilotEligible: pilotEligible]
     } catch (InterruptedException e) {
