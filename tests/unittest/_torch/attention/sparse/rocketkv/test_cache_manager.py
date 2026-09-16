@@ -11,10 +11,11 @@ pytestmark = pytest.mark.cpu_only
 
 
 def test_kt_pool_uses_local_heads():
+    """Match KT allocation and budget for distinct per-layer heads with TP=4."""
     from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module
 
-    global_heads = 8
-    local_heads = [2, 2]
+    global_heads = [8, 12]
+    local_heads = [2, 3]
 
     # Supply the parent manager's resolved layout without allocating a GPU KV pool.
     def init_parent(self, *args, **kwargs):
