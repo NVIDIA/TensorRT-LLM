@@ -82,7 +82,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
-    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
@@ -908,39 +907,6 @@ def _augment_tokens_with_contiguous_mm_metadata(
         )
 
     return result
-
-
-def _first_new_block_key(
-    tokens: Sequence[TokenIdExt],
-    tokens_per_block: int,
-    reuse_scope: ReuseScope,
-    num_reusable_tokens: int,
-) -> bytes | None:
-    """Key of the first block *tokens* would commit past its reusable prefix.
-
-    *num_reusable_tokens* is what ``probe_reuse`` reports for the same
-    ``(reuse_scope, tokens)``, i.e. the window-aware, pruned prefix length.
-    Returns None when that block would be partial: a partial block is never
-    committed, so it has no key yet.
-
-    Split out from ``KVCacheManagerV2.probe_first_new_block_key`` so the key math
-    can be exercised against a real radix tree without a full model runtime.
-    """
-    # Integer division also covers a partial (mid-block) match: that block is
-    # still the first one this sequence completes and commits.
-    block_index = num_reusable_tokens // tokens_per_block
-    num_tokens_needed = (block_index + 1) * tokens_per_block
-    if num_tokens_needed > len(tokens):
-        return None
-    # A block key depends only on the tokens preceding it, so hashing the
-    # truncated prefix is exact -- and keeps both the token marshalling and the
-    # hash chain proportional to the block we want, not to the whole prompt.
-    key = None
-    for _, key in sequence_to_blockchain_keys(
-        tokens_per_block, reuse_scope, tokens[:num_tokens_needed]
-    ):
-        pass
-    return key
 
 
 def _locate_accepted_draft_tokens(requests: List[LlmRequest]):
@@ -5663,8 +5629,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # excluded, so there is nothing to look up and nothing to contribute.
             return None
         scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
-        num_reusable = self.impl.probe_reuse(scope, tokens)
-        return _first_new_block_key(tokens, self.tokens_per_block, scope, num_reusable)
+        return self.impl.probe_first_new_block_key(scope, tokens)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
         """Prefetch radix-tree blocks from disk→host for upcoming context requests.
