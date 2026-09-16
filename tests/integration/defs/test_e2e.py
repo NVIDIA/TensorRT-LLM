@@ -244,6 +244,9 @@ class BenchRunner:
 def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv):
     model_name = "Qwen3-0.6B"
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     # Prepare dataset with invalid tokens
     _, dataset_path = trtllm_bench_prolog(llm_root,
                                           llm_venv,

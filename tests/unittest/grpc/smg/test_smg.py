@@ -654,7 +654,7 @@ def get_model_path(model_name):
 def grpc_service():
     """Create a real LLM, request manager, and servicer for e2e testing.
 
-    Uses TinyLlama-1.1B for minimal GPU resource usage.
+    Uses Qwen3-0.6B for minimal GPU resource usage.
     Shared across all tests in the class; class scope (not module) so the
     LLM is shut down and its GPU memory released before the multimodal
     class below creates its own LLM — with module scope both models are
@@ -705,7 +705,7 @@ class TestGrpcServiceEndToEnd:
     """End-to-end tests for the gRPC service flow.
 
     Tests the full pipeline: gRPC request -> servicer -> request manager -> LLM -> response.
-    Uses TinyLlama-1.1B for minimal GPU resource usage.
+    Uses Qwen3-0.6B for minimal GPU resource usage.
     """
 
     def test_generate_non_streaming(self, grpc_service):

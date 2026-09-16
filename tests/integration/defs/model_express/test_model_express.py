@@ -100,7 +100,7 @@ _MX_CASES = (
             repository_cache_prefix="models--trtllm-mx-e2e--llama-tp1",
             tp_size=1,
         ),
-        id="llama-bf16-tp1",
+        id="qwen3-0.6b-bf16-tp1",
         marks=pytest.mark.skip_less_device(2),
     ),
     pytest.param(
@@ -110,7 +110,7 @@ _MX_CASES = (
             repository_cache_prefix="models--trtllm-mx-e2e--llama-tp2",
             tp_size=2,
         ),
-        id="llama-bf16-tp2",
+        id="qwen3-0.6b-bf16-tp2",
         marks=pytest.mark.skip_less_device(4),
     ),
     pytest.param(

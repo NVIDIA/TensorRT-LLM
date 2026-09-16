@@ -552,7 +552,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             assert info["matches"][0] < first_match
 
 
-def prepare_llama_model(qwen_model_root: str, llm_venv):
+def prepare_qwen_model(qwen_model_root: str, llm_venv):
     src_dst_dict = {
         qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
@@ -682,7 +682,10 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
-    prepare_llama_model(qwen_model_root, llm_venv)
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    prepare_qwen_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -728,7 +731,10 @@ def test_workers_kv_cache_events(disaggregated_test_root,
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
-    prepare_llama_model(qwen_model_root, llm_venv)
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    prepare_qwen_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -747,7 +753,10 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
         disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
-    prepare_llama_model(qwen_model_root, llm_venv)
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    prepare_qwen_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -797,7 +806,10 @@ def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
-    prepare_llama_model(qwen_model_root, llm_venv)
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    prepare_qwen_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -1002,7 +1014,10 @@ def test_workers_conversation_router(disaggregated_test_root,
         disaggregated_test_root,
         'test_configs/disagg_config_conversation_workers.yaml')
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
-    prepare_llama_model(qwen_model_root, llm_venv)
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    prepare_qwen_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers,

@@ -1110,6 +1110,9 @@ def run_disaggregated_test(example_dir,
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
                                        disaggregated_example_root, llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1123,6 +1126,9 @@ def test_disaggregated_diff_max_tokens(disaggregated_test_root,
 def test_disaggregated_single_gpu(disaggregated_test_root,
                                   disaggregated_example_root, llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1194,10 +1200,13 @@ def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
     )
 
 
-def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
-                                                    disaggregated_example_root,
-                                                    llm_venv):
+def test_disaggregated_qwen3_multi_orchestrator(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1213,6 +1222,9 @@ def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
 def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
                                           disaggregated_example_root, llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1230,6 +1242,9 @@ def test_disaggregated_router(disaggregated_test_root,
                               disaggregated_example_root, llm_venv,
                               router_type):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1245,6 +1260,9 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     import openai
 
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1301,6 +1319,9 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
 def test_disaggregated_genbs1(disaggregated_test_root,
                               disaggregated_example_root, llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1316,6 +1337,9 @@ def test_disaggregated_genbs1(disaggregated_test_root,
 def test_disaggregated_multi_gpu(disaggregated_test_root,
                                  disaggregated_example_root, llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1328,6 +1352,9 @@ def test_disaggregated_multi_gpu(disaggregated_test_root,
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
                                   disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1340,6 +1367,9 @@ def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
 def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
                              disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1352,6 +1382,9 @@ def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
 def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
                                disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     def post_client_test(server_url: str):
@@ -1372,6 +1405,9 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
                                          disaggregated_example_root, llm_venv,
                                          ctx_pp):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     src_dst_dict = {
         qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
@@ -1396,6 +1432,9 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
 def test_disaggregated_overlap_transceiver_runtime_python(
         disaggregated_test_root, llm_venv, disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1416,6 +1455,9 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
         disaggregated_test_root, llm_venv, disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1444,6 +1486,9 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 def test_disaggregated_overlap_transceiver_runtime_python_bounce(
         disaggregated_test_root, llm_venv, disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1478,7 +1523,7 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
          succeeds; without it, the sender either crashes on a primary
          assertion or returns nonsense tokens.
 
-    Assertions are deliberately content-agnostic (TinyLlama outputs vary
+    Assertions are deliberately content-agnostic (Qwen3-0.6B outputs vary
     run-to-run): we check that responses are non-empty, the server stays
     up across the eviction/onboard cycle, and `cached_tokens > 0` on
     repeats so we know reuse actually fired.
@@ -1596,6 +1641,9 @@ def test_disaggregated_python_transceiver_host_offload(
     each KV transfer.
     """
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
@@ -1615,6 +1663,9 @@ def test_disaggregated_python_transceiver_host_offload(
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root, tmp_path):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     perf_metrics_output_dir = str(tmp_path / "perf_metrics")
@@ -1644,6 +1695,9 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                                                   llm_venv,
                                                   disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1658,6 +1712,9 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
@@ -1712,6 +1769,9 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1724,6 +1784,9 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
 def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
                                            disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1736,6 +1799,9 @@ def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
 def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
                                    disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1748,6 +1814,9 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
 def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
                              disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
@@ -1759,6 +1828,9 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
 def test_disaggregated_sa(disaggregated_test_root, llm_venv,
                           disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "sa",
@@ -1775,6 +1847,9 @@ def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
     covers this split only on the C++ DEFAULT backend.
     """
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "sa_python",
@@ -1787,6 +1862,9 @@ def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
 def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_genpp2",
@@ -1799,6 +1877,9 @@ def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
 def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2_genpp2",
@@ -1811,6 +1892,9 @@ def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
 def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_gentp2",
@@ -1823,6 +1907,9 @@ def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
 def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
                                            disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
@@ -1835,6 +1922,9 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
 def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
@@ -1843,11 +1933,13 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
-#tiny llama pp4 will have uneven layer per pp. pp4
 @pytest.mark.skip_less_device(8)
 def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_gentp4",

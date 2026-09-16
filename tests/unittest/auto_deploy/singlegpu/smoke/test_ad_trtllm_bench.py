@@ -95,7 +95,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
 
 
 @pytest.mark.parametrize("compile_backend", ["torch-compile", "torch-opt", "torch-cudagraph"])
-@pytest.mark.parametrize("model_name", ["Qwen3/Qwen3-0.6B"])
+@pytest.mark.parametrize("model_name", ["Qwen/Qwen3-0.6B"])
 def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
     args = get_small_model_config(model_name)["args"]
     # remove kv_cache_config and max_batch_size to avoid conflicts with trtllm-bench

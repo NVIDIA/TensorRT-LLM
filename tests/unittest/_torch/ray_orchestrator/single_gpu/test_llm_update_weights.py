@@ -175,7 +175,6 @@ def run_generate(
     "model_dir",
     [
         "Qwen3/Qwen3-0.6B",
-        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",
@@ -229,7 +228,6 @@ def test_llm_update_weights(model_dir):
 @pytest.mark.parametrize(
     "model_dir",
     [
-        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",

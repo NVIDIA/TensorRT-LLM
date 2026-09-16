@@ -753,7 +753,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen
 disaggregated/test_disaggregated.py::test_disaggregated_sa
 disaggregated/test_disaggregated.py::test_disaggregated_sa_python
 disaggregated/test_disaggregated.py::test_disaggregated_single_gpu
-disaggregated/test_disaggregated.py::test_disaggregated_tinyllama_multi_orchestrator
+disaggregated/test_disaggregated.py::test_disaggregated_qwen3_multi_orchestrator
 disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-Qwen3-0.6B]
 disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-Qwen3-0.6B]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[Qwen3-0.6B]

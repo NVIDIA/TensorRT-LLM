@@ -579,7 +579,7 @@ def test_disaggregated_logits(model):
 
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.timeout(600)
-def test_tinyllama_batch_handoff_semantic_slots():
+def test_qwen3_batch_handoff_semantic_slots():
     prompts = capital_completion_prompts()
     expected_capitals = ["Berlin", "Paris", "Rome", "Madrid"]
     sampling_params_kwargs = {

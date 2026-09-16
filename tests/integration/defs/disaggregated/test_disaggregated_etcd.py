@@ -436,6 +436,9 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
 def test_automated_disaggregated_complete(disaggregated_test_root,
                                           disaggregated_example_root, llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     src_dst_dict = {
         qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
