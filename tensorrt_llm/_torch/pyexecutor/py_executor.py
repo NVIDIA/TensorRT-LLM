@@ -58,9 +58,8 @@ from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
 from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
-    DisaggLoopDelegates, DisaggTransferCoordinator, NoopDisaggCoordinator,
-    attach_ctx_usage, is_gen_only_no_context_benchmark,
-    transfer_window_bypass_eligible, uses_async_gen_transfer)
+    DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
+    transfer_window_bypass_eligible)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -3704,16 +3703,7 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
-            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False),
-            delegates=DisaggLoopDelegates())
-
-    @staticmethod
-    def _is_disagg_gen_only_no_context_benchmark() -> bool:
-        return is_gen_only_no_context_benchmark()
-
-    @staticmethod
-    def _uses_async_disagg_gen_transfer() -> bool:
-        return uses_async_gen_transfer()
+            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False))
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:

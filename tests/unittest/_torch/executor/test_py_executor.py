@@ -729,7 +729,6 @@ def _make_transfer_coordinator(
         ),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
-        delegates=Mock(),
     )
     return coordinator, transceiver, effects
 

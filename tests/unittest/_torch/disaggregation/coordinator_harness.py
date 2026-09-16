@@ -100,7 +100,6 @@ class CoordinatorHarness:
             if dist is not None
             else Mock(rank=0, tp_size=tp_size, world_size=world_size, pp_size=pp_size)
         )
-        self.delegates = Mock()
         self.coordinator = DisaggTransferCoordinator(
             transceiver=self.transceiver,
             transfer_manager=self.transfers,
@@ -110,7 +109,6 @@ class CoordinatorHarness:
             registry=self.registry,
             enable_attention_dp=enable_attention_dp,
             force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
-            delegates=self.delegates,
             draft_kv_cache_manager=draft_kv_cache_manager,
             admission_controller=admission_controller,
             is_kv_manager_v2=is_kv_manager_v2,

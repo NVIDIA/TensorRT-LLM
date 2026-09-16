@@ -1376,7 +1376,6 @@ def _make_send_kv_coordinator(canceled_req_ids, active_requests=()):
         ),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=MagicMock(),
     )
     return coordinator, transceiver, transfer_manager
 

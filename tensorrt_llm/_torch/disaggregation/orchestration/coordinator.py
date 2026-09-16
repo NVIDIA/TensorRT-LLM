@@ -10,7 +10,6 @@ reached through the ``interfaces`` Protocols.
 
 import os
 import time
-from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
@@ -68,14 +67,6 @@ def attach_ctx_usage(request: LlmRequest, response) -> None:
         response.result.ctx_usage = disagg_params.ctx_usage
 
 
-@dataclass(frozen=True)
-class DisaggLoopDelegates:
-    """Transitional table of executor callables the coordinator forwards to.
-
-    Every entry point now lives in the coordinator, so the table is empty.
-    """
-
-
 class DisaggTransferCoordinator:
     """Disagg transfer entry points used by every executor loop variant.
 
@@ -97,7 +88,6 @@ class DisaggTransferCoordinator:
         registry: ActiveRequestRegistry,
         enable_attention_dp: bool,
         force_terminate_ctx_for_partial_reuse: bool,
-        delegates: DisaggLoopDelegates,
         draft_kv_cache_manager=None,
         admission_controller: Optional[DisaggTransferAdmissionController] = None,
         is_kv_manager_v2: bool = False,
@@ -114,7 +104,6 @@ class DisaggTransferCoordinator:
         # Transfer-window budget; None or a disabled controller means no window.
         self._admission_controller = admission_controller
         self._is_kv_manager_v2 = is_kv_manager_v2
-        self._d = delegates
         # Context sends that failed after leaving the transfer manager; applied
         # at the next rank-synchronized error pass.
         self._pending_ctx_transfer_failures: Set[int] = set()
@@ -806,7 +795,6 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             registry=None,
             enable_attention_dp=False,
             force_terminate_ctx_for_partial_reuse=False,
-            delegates=DisaggLoopDelegates(**{f.name: _noop for f in fields(DisaggLoopDelegates)}),
         )
 
     def handle_errors_synced(self) -> None:
@@ -877,7 +865,3 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def pace_idle(self) -> None:
         return None
-
-
-def _noop(*_args, **_kwargs) -> None:
-    return None

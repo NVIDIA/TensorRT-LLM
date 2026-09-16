@@ -15,8 +15,8 @@ covered by the FakeDist tests (test_disagg_coordinator_progress.py); real
 multi-process blocking semantics only by multi-GPU E2E. Regular disagg PP
 termination advances from executed-batch handling; a recompute-pause fallback
 can call the same termination handler from an idle iteration. Neither path is
-covered here (nothing is pending in these iterations); both belong to the
-executed-batch/lifecycle transcripts of PR-5.
+covered here (nothing is pending in these iterations); both belong to
+executed-batch and lifecycle transcripts, which do not exist yet.
 """
 
 import inspect
@@ -31,7 +31,6 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    DisaggLoopDelegates,
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
@@ -47,8 +46,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 
 pytestmark = pytest.mark.cpu_only
 
-# Coordinator entry points that run a rank-consensus collective, in the
-# coordinator itself or in a delegate. Maintained by hand as entry points move.
+# Coordinator entry points that run a rank-consensus collective. Maintained by
+# hand as entry points move.
 _COLLECTIVE_COORDINATOR_CALLS = {
     "handle_errors_synced",  # dist.allreduce / tp_allgather under ADP
     "prepare_context_schedulable",  # transceiver.prepare_context_requests consensus
@@ -338,7 +337,6 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
             force_terminate_ctx_for_partial_reuse=False,
-            delegates=DisaggLoopDelegates(),
         )
     return executor
 
