@@ -144,9 +144,12 @@ There are some known limitations when you pip install the pre-built TensorRT LLM
 2. Prevent Open MPI 5 from rejecting a long hostname when spawning workers
 
     Where the MPI implementation is Open MPI 5 -- which the release container now provides, since
-    its base image ships it -- PMIx refuses the handshake behind `MPI_Comm_spawn` if the hostname
-    is 31 characters or longer. TensorRT LLM spawns its workers that way, so on a host with a long
-    name, a Kubernetes pod for instance, startup fails with:
+    its base image ships it -- a singleton `MPI_Comm_spawn` fails when the hostname PMIx is handed
+    is too long for MPI, despite being a perfectly valid hostname: the generated singleton ID,
+    `singleton.{hostname}.{pid}`, has to fit a 50-byte buffer, so how long a hostname is too long
+    depends on the system-assigned pid. Open MPI 4 left the hostname out of that ID, which is why
+    this surfaces only now. TensorRT LLM spawns one such worker per `MpiPoolSession`, so on a host
+    with a long name, a Kubernetes pod for instance, startup fails with:
 
     ```text
     mpi4py.MPI.Exception: MPI_ERR_UNKNOWN: unknown error
@@ -154,23 +157,11 @@ There are some known limitations when you pip install the pre-built TensorRT LLM
 
     Export a shorter `PMIX_HOSTNAME` in the environment TensorRT LLM starts from. PMIx only uses
     the value to identify the node during the handshake, so it does not have to resolve; any short
-    string will do. On a single node, for example:
+    string will do:
 
     ```bash
     export PMIX_HOSTNAME=trtllm-node
     ```
-
-    Across several nodes the name has to stay **distinct per node**. A single constant would make
-    PMIx treat every rank as co-located and its locality decisions would be wrong, so derive the
-    name from the real hostname instead of hard-coding one:
-
-    ```bash
-    export PMIX_HOSTNAME="n-$(hostname | sha1sum | cut -c1-12)"
-    ```
-
-    Set it in the environment of the process that spawns the workers. Passing it through
-    `mpirun -x PMIX_HOSTNAME` does not reach them, because Open MPI rebuilds the `PMIX_*`
-    variables in every process it launches.
 
 3. Prevent `pip` from replacing existing PyTorch installation
 
