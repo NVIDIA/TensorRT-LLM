@@ -97,6 +97,11 @@ def main(
             assert all(
                 Path(workspace).parent == workspace_root
                 for workspace in nested_workspaces)
+            nested_cubin_dirs = {
+                cubin_dir
+                for _, cubin_dir in nested_worker_envs
+            }
+            assert nested_cubin_dirs == {None}
 
 
 if __name__ == "__main__":
