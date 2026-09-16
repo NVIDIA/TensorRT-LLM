@@ -602,7 +602,7 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
