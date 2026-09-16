@@ -478,6 +478,30 @@ def test_zero_size_filter_rejects_empty_local_cache() -> None:
         manager._remove_zero_size_buffers(config)
 
 
+def test_event_window_sizes_filter_attention_without_backend_internals() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = MAX_SEQ_LEN
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=128)],
+                sliding_window_size=8,
+            ),
+            SsmLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=DataRole("ssm_state"), size=128)],
+            ),
+        ]
+    )
+    # Match the C++ binding surface: layer_grouping is public, while the
+    # Python implementation's private _life_cycles registry is absent.
+    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]])
+
+    assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {0: 8}
+    assert manager._get_event_window_sizes_by_layer_group() == {0: 8, 1: MAX_SEQ_LEN}
+
+
 def test_draft_token_relocation_uses_local_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     request = SimpleNamespace(
         state=LlmRequestState.GENERATION_IN_PROGRESS,
