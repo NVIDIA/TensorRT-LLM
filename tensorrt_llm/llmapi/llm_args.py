@@ -3120,16 +3120,21 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft, which "
         "uses its own captured-context attention. This is independent of the "
         "backend used to construct the drafter's standard attention modules. "
-        "AUTO picks per drafter family and degrades when a kernel is "
-        "unavailable: TRTLLM for a GQA-backboned drafter, CUTEDSL for an "
-        "MLA-backboned one. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
+        "AUTO picks per drafter family: TRTLLM for both a GQA- and an "
+        "MLA-backboned drafter, though the two resolve that name to different "
+        "kernels. A GQA drafter degrades to VANILLA when its kernel is "
+        "unavailable; an MLA drafter raises instead, since a build that cannot "
+        "run its kernel cannot hold the target either. "
+        "TRTLLM requires FlashInfer and an NVIDIA Blackwell "
         "GPU with SM100 or SM103; for a GQA backbone it uses generated FMHA "
         "kernels with a private paged context cache, and for an MLA backbone "
         "the absorbed-MLA paged decode plus a block-local fixup. VANILLA uses "
         "FlashAttention with a contiguous cache on a GQA backbone and the eager "
         "torch reference on an MLA one. CUTEDSL is MLA-only: one cute-dsl pass "
-        "over context and block that replaces the fixup; it does not degrade, "
-        "and a build that cannot run it raises with the reason.")
+        "over context and block that replaces the fixup. It is selectable but "
+        "not a default, because it needs a cute-dsl MLA decode taking per-token "
+        "kv_bounds that is not upstream yet; requesting it on a build without "
+        "that kernel raises with the reason.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

@@ -2726,6 +2726,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # reason rather than hiding a slower path behind the name.
     _default_attention_backend = "TRTLLM"
     _supported_attention_backends = ("VANILLA", "TRTLLM", "CUTEDSL")
+    # No AUTO degrade. This drafter needs a 288 GB Blackwell part to hold the
+    # target at all, so a build that cannot run its kernels cannot run the
+    # model either; falling back to the eager reference would hide that behind
+    # a path orders slower at identical output.
+    _auto_fallback_attention_backend = None
 
     # The whole point of the MLA drafter: its context KV comes out of the
     # manager's pool (5760 B/token/rank) instead of an arena dense in
@@ -2774,16 +2779,6 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self.softmax_scale = (mscale * mscale) / math.sqrt(
             self.qk_nope_head_dim + self.qk_rope_head_dim
         )
-        # Raise here rather than five layers into the first draft step, and name
-        # the reason. Reached for an explicit CUTEDSL and for the AUTO default
-        # alike -- neither degrades.
-        if self.dflash_attention_backend == "CUTEDSL":
-            reason = cute_dsl_mla_decode_unavailability_reason()
-            if reason is not None:
-                raise ValueError(
-                    f"attention_backend='CUTEDSL' was requested but the cute-dsl "
-                    f"MLA decode is unavailable: {reason}."
-                )
 
     # -- shape / buffers ---------------------------------------------------
 
@@ -2832,6 +2827,22 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
         except (ImportError, AttributeError):
             return None
+
+    @classmethod
+    def _attention_backend_unavailability_reason(cls, backend: str) -> Optional[str]:
+        """Probe THIS family's kernels, not the base's GQA op set.
+
+        ``_uses_worker_attention_backend`` is False here, so neither worker op
+        set is ever loaded and the base's trtllm-gen probe would answer about
+        kernels this drafter does not call.
+        """
+        if backend == "TRTLLM":
+            if cls._mla_decode_op() is None:
+                return "flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla is not importable"
+            return None
+        if backend == "CUTEDSL":
+            return cute_dsl_mla_decode_unavailability_reason()
+        return None
 
     def _mla_block_decode_variant(self, paged: bool) -> str:
         """Which of the three block-decode implementations this step runs.
