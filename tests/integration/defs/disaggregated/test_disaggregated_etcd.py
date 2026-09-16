@@ -55,7 +55,9 @@ PROMPTS_FILE = f"{CLIENTS_DIR}/prompts.json"
 def kill_automated_disaggregated_processes():
     """Kill any existing automated disaggregated processes."""
     try:
-        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'], check=False)
+        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'],
+                       check=False,
+                       timeout=30)
     except Exception:
         pass
 
@@ -175,7 +177,8 @@ def run_client_test(config, env=None) -> bool:
                             env=env,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True)
+                            text=True,
+                            timeout=600)
 
     if result.returncode == 0:
         logger.info("Client test succeeded")
@@ -193,7 +196,10 @@ def kill_server_by_port(port: int) -> bool:
     try:
         # Find PID using port
         cmd = ["lsof", "-t", f"-i:{port}"]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        result = subprocess.run(cmd,
+                                stdout=subprocess.PIPE,
+                                text=True,
+                                timeout=30)
 
         if result.stdout.strip():
             pid = int(result.stdout.strip())
@@ -250,7 +256,8 @@ def cleanup_etcd_data(env=None):
                             env=env,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True)
+                            text=True,
+                            timeout=30)
 
     if result.returncode == 0:
         logger.info("Successfully cleaned etcd data")

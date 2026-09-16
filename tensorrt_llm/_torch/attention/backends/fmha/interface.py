@@ -41,6 +41,7 @@ class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
     supports_skip_correction: ClassVar[bool] = False
+    supports_block_sparse_inputs: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -108,6 +109,12 @@ class Fmha(ABC):
         must also preserve the same result throughout each FMHA cache grid
         cell or add the relevant boundary to the grid's candidate list.
         """
+        if (
+            forward_args.sparse_runtime_params.block_sparse_inputs is not None
+            and not self.supports_block_sparse_inputs
+        ):
+            logger.debug(f"{type(self).__name__} does not support block-sparse inputs.")
+            return False
         return self._is_supported(q, k, v, metadata, forward_args, phase=phase)
 
     def _is_supported(

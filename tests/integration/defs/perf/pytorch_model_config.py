@@ -14,7 +14,7 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model pytorch/TRT yaml config for trtllm-bench perf tests
+Model PyTorch YAML config for trtllm-bench performance tests.
 """
 
 from ..conftest import llm_models_root
@@ -61,17 +61,12 @@ def get_model_yaml_config(model_label: str,
         Returns:
             dict: yaml config
         """
-    if 'pytorch' in model_label:
-        # Pytorch backend config
-        base_config = {
-            'print_iter_log': True,
-            'cuda_graph_config': {
-                'enable_padding': True,
-            },
-        }
-    else:
-        # TRT backend config
-        base_config = {}
+    base_config = {
+        'print_iter_log': True,
+        'cuda_graph_config': {
+            'enable_padding': True,
+        },
+    }
 
     if 'kv_cache_dtype' in model_label:
         base_config.update({
@@ -82,6 +77,61 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        # MAX NVFP4 TP8/MTP3 follows accuracy PR #18071.
+        {
+            'patterns': ['qwen3.8_max_fp4_mtp-serve-pytorch'],
+            'config': {
+                'max_seq_len': 8192,
+                'cuda_graph_config': {
+                    'max_batch_size': 32,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'bfloat16',
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        # Flash-Next single-GPU MTP3 with PLE host offload follows PR #18585.
+        {
+            'patterns': ['qwen3.8_flash_next_'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'max_batch_size': 16,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'bfloat16',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp8_mtp'],
+            'config': {
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp4_mtp'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
         # Deepseek default cases
         {
             'patterns': ['deepseek_r1'],
@@ -135,6 +185,75 @@ def get_model_yaml_config(model_label: str,
                 'max_seq_len': 10240,
             }
         },
+        # DeepSeek V4 Pro-Base FP8 throughput settings for single-node 8xB300.
+        {
+            'patterns': [
+                'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_lm_head_tp_in_adp': True,
+                'attention_dp_config': {
+                    'enable_balance': True,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 24, 32],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # DeepSeek V4 Pro-Base FP8 latency settings for single-node 8xB300.
+        {
+            'patterns': [
+                'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'enable_lm_head_tp_in_adp': False,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.9,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding':
+                    True,
+                    'batch_sizes': [
+                        1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,
+                        104, 112, 120, 128
+                    ],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
         # DeepSeek V4 Pro DSpark mirrors the upstream 8-GPU accuracy configuration.
         {
             'patterns': ['deepseek_v4_pro_dspark'],
@@ -160,6 +279,42 @@ def get_model_yaml_config(model_label: str,
                     5,
                     'speculative_model':
                     f'{llm_models_root()}/DeepSeek-V4-Pro-DSpark',
+                },
+            }
+        },
+        # Single-node experimental adaptation of the NVFP4 DSpark generation
+        # recipe in tests/scripts/perf/disaggregated/
+        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
+        # The blog does not provide a tuned single-node NVFP4 DSpark config.
+        {
+            'patterns': ['deepseek_v4_pro_nvfp4_dspark'],
+            'config': {
+                'attn_backend': 'TRTLLM',
+                'enable_attention_dp': True,
+                'enable_lm_head_tp_in_adp': True,
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 10240,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'tokens_per_block': 128,
+                    'enable_block_reuse': False,
+                },
+                'enable_chunked_prefill': False,
+                'disable_overlap_scheduler': True,
+                'custom_tokenizer': 'deepseek_v4',
+                'speculative_config': {
+                    'decoding_type':
+                    'DSpark',
+                    'max_draft_len':
+                    3,
+                    'block_size':
+                    3,
+                    'speculative_model':
+                    f'{llm_models_root()}/DeepSeek-V4-Pro-nvfp4-DSpark',
                 },
             }
         },

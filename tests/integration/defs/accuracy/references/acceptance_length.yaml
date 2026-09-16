@@ -15,6 +15,9 @@ TestGPTOSS::test_dflash:
 TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
   ref_al: 4.448784989234082
   min_al: 4.226345739772378
+TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4:
+  ref_al: 4.0738
+  min_al: 3.8701
 TestQwen3_5_4B::test_dflash:
   ref_al: 3.96417002949639
   min_al: 3.7659615280215704

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Attention Data Parallelism (ADP) abstractions.
 
@@ -798,9 +813,9 @@ class KVCacheAwareADPRouter(ADPRouter):
 
 class ConversationAwareADPRouter(ADPRouter):
     """Pins each conversation to a single attention-DP rank: the first request
-    of a conversation is placed by ``new_conv_placement`` (round-robin by
-    default, or least-queued), and every later request with the same
-    ``conversation_id`` returns to that rank, keeping the conversation's
+    of a conversation is placed by ``new_conv_placement`` (``round_robin`` by
+    default, ``least_queued``, or ``least_tokens``), and every later request with
+    the same ``conversation_id`` returns to that rank, keeping the conversation's
     KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
     back to the same ``new_conv_placement`` policy.
     """
@@ -821,7 +836,9 @@ class ConversationAwareADPRouter(ADPRouter):
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
-            "least_queued" if new_conv_placement == "least_queued" else "round_robin"
+            new_conv_placement
+            if new_conv_placement in ("round_robin", "least_queued", "least_tokens")
+            else "round_robin"
         )
         self._round_robin_cursor = 0
 
@@ -842,9 +859,14 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
+        # Read routing affinity before ExecutorRequest is merged into LlmRequest.
         req = req_item.request
         if req is None:
             return None
+        scheduling_params = getattr(req, "py_scheduling_params", None)
+        affinity_id = getattr(scheduling_params, "subagent_affinity_id", None)
+        if affinity_id:
+            return affinity_id
         conversation_params = req.py_conversation_params
         if conversation_params is None:
             return None
@@ -922,6 +944,16 @@ class ConversationAwareADPRouter(ADPRouter):
             max_num_active_requests,
         )
 
+        # Only allgathered state and broadcast requests enter the estimate;
+        # local KV statistics would make ranks disagree on placement.
+        token_load: list[int] = []
+        if self._new_conv_placement == "least_tokens":
+            token_load = [0] * tp_size
+            for state in all_rank_states:
+                token_load[state.rank] = state.num_active_tokens + sum(
+                    _num_input_tokens(item.request) for item in all_ranks_new_requests[state.rank]
+                )
+
         # 2) Soft cap for spreading new conversations across ranks, clamped to
         #    per-rank slot capacity so no placement path can overfill a rank.
         #    Sticky returns gate on the hard cap and may still exceed this cap,
@@ -950,6 +982,20 @@ class ConversationAwareADPRouter(ADPRouter):
                     return r
             return _least_loaded(soft_cap)
 
+        def _least_active_tokens(soft_cap: int) -> int:
+            """Shared active prompt load plus this call's admissions."""
+            cands = [r for r in range(tp_size) if all_ranks_num_active_requests[r] < soft_cap]
+            rank = min(
+                cands or range(tp_size),
+                key=lambda r: (
+                    token_load[r],
+                    all_ranks_num_active_requests[r],
+                    (r - self._round_robin_cursor) % tp_size,
+                ),
+            )
+            self._round_robin_cursor = (rank + 1) % tp_size
+            return rank
+
         for req_item in remaining_unscheduled:
             conv_id = self._conversation_id(req_item)
             rank = None
@@ -969,10 +1015,11 @@ class ConversationAwareADPRouter(ADPRouter):
 
             if rank is None:
                 # First turn of a new conversation, sticky-overflow, or no
-                # conversation_id -> spread under the soft cap: round-robin
-                # (count-uniform) or least-queued (steers away from ranks kept
-                # busy by heavy pinned conversations).
-                if self._new_conv_placement == "least_queued":
+                # conversation_id -> spread under the soft cap using the
+                # configured count- or token-based placement strategy.
+                if self._new_conv_placement == "least_tokens":
+                    rank = _least_active_tokens(expected_num_active_requests)
+                elif self._new_conv_placement == "least_queued":
                     rank = _least_loaded(expected_num_active_requests)
                 else:
                     rank = _next_rr(expected_num_active_requests)
@@ -982,6 +1029,8 @@ class ConversationAwareADPRouter(ADPRouter):
 
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
+            if self._new_conv_placement == "least_tokens":
+                token_load[rank] += _num_input_tokens(req_item.request)
 
         # Sticky returns use the hard cap, so a rank may now exceed the pre-loop
         # soft `expected`. Re-bump so the returned value covers the actual

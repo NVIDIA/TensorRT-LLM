@@ -11,21 +11,17 @@ Models:
 
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan_vsa_pipeline.py -v -s
-
-Override checkpoint path:
-    DIFFUSION_MODEL_PATH_WAN21_VSA=/path/to/vsa \\
-        pytest tests/unittest/_torch/visual_gen/test_wan_vsa_pipeline.py -v -s
 """
 
 import gc
 import os
-from pathlib import Path
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import pytest
 import torch
 import torch.nn.functional as F
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -45,29 +41,7 @@ def _cleanup_mpi_env():
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
-# ============================================================================
-# Path helpers
-# ============================================================================
-
-
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path if set in env, assert when it's set but not a valid path."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-WAN21_VSA_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_VSA", "Wan2.1-VSA-T2V-14B-720P-Diffusers")
+WAN21_VSA_SUBDIR = "Wan2.1-VSA-T2V-14B-720P-Diffusers"
 
 # ============================================================================
 # Test constants
@@ -85,14 +59,12 @@ COS_SIM_THRESHOLD = 0.95
 # ============================================================================
 
 
-def _load_vsa_pipeline(checkpoint_path: str, vsa_sparsity: float = 0.0):
+def _load_vsa_pipeline(checkpoint_subdir: str, vsa_sparsity: float = 0.0):
     """Load TRTLLM WanPipeline with CUTEDSL + VSA backend."""
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     if not _cute_dsl_available:
         pytest.skip(f"CUTEDSL not available (requires Blackwell GPU): {_cute_dsl_import_error}")
     args = VisualGenArgs(
-        model=checkpoint_path,
+        model=get_checkpoint(checkpoint_subdir),
         attention_config=AttentionConfig(
             backend="CUTEDSL",
             sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=vsa_sparsity),
@@ -137,7 +109,7 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _assert_vsa_matches_dense(
-    checkpoint_path: str,
+    checkpoint_subdir: str,
     height: int,
     width: int,
     num_frames: int,
@@ -162,14 +134,14 @@ def _assert_vsa_matches_dense(
     )
 
     # --- CuTe-DSL path ---
-    vsa_pipe = _load_vsa_pipeline(checkpoint_path, vsa_sparsity=vsa_sparsity)
+    vsa_pipe = _load_vsa_pipeline(checkpoint_subdir, vsa_sparsity=vsa_sparsity)
     vsa_video = _capture_trtllm_video(vsa_pipe, **common_kwargs)
     del vsa_pipe
     gc.collect()
     torch.cuda.empty_cache()
 
     # --- SDPA fallback reference (same VSA formulation, fine attn via SDPA) ---
-    sdpa_pipe = _load_vsa_pipeline(checkpoint_path, vsa_sparsity=vsa_sparsity)
+    sdpa_pipe = _load_vsa_pipeline(checkpoint_subdir, vsa_sparsity=vsa_sparsity)
     with patch.object(_vsa_module, "is_cute_supported", return_value=False):
         sdpa_video = _capture_trtllm_video(sdpa_pipe, **common_kwargs)
     del sdpa_pipe
@@ -207,7 +179,7 @@ class TestWanVsa14B_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_vsa_matches_dense(
-            checkpoint_path=WAN21_VSA_PATH,
+            checkpoint_subdir=WAN21_VSA_SUBDIR,
             height=720,
             width=1280,
             num_frames=9,
@@ -223,7 +195,7 @@ class TestWanVsaSparse:
     """VSA at sparsity=0.9: config propagates, output is correctly shaped and finite."""
 
     def test_sparse_vsa(self):
-        pipeline = _load_vsa_pipeline(WAN21_VSA_PATH, vsa_sparsity=0.9)
+        pipeline = _load_vsa_pipeline(WAN21_VSA_SUBDIR, vsa_sparsity=0.9)
         try:
             attn_cfg = pipeline.pipeline_config.primary_model_config.attention
             assert attn_cfg.backend == "CUTEDSL"

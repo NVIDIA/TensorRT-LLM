@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import inspect
@@ -6,7 +9,7 @@ import os
 import weakref
 from dataclasses import replace
 from enum import IntEnum
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -887,6 +890,7 @@ class Runner:
         enable_swa_scratch_reuse=False,
         spec_config: Optional[DecodingBaseConfig] = None,
         vision_config: Optional[str] = None,
+        use_kv_cache_manager_v2: bool | Literal["auto"] = "auto",
     ) -> KVCacheManager:
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         with Runner.vision_config_ctx(vision_config):
@@ -909,6 +913,9 @@ class Runner:
             * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            # Every dummy request uses max_seq_len tokens, so this is the actual average.
+            avg_seq_len=max_seq_len,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
