@@ -251,6 +251,9 @@ def _run_mixed_lora_cuda_graph_test(
             )
             base_outputs = llm.generate(prompts, sampling)
 
+        # Keep both calls on full prefill: partial reuse can select a different
+        # attention kernel, whose numerical drift can fail this strict token and
+        # logprob comparison even when LoRA correctly leaves base rows unchanged.
         assert all(output.cached_tokens == 0 for output in mixed_outputs)
         assert all(output.cached_tokens == 0 for output in base_outputs)
         for index in (1, 3):
