@@ -133,7 +133,7 @@ def _support_result(
     mla_fp8_inputs: dict | None = None,
     tokens_per_block: int = 32,
     is_mla: bool = False,
-    is_fused_qkv: bool = True,
+    is_fused_qkv: bool | None = None,
     has_separate_kv: bool = False,
     has_paged_cache: bool = True,
     is_cross: bool = False,
@@ -163,6 +163,8 @@ def _support_result(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
     )
+    if is_fused_qkv is None:
+        is_fused_qkv = not is_mla
     attn.position_embedding_type = position_embedding_type
     attn.quant_mode = quant_mode
     attn.attention_chunk_size = attention_chunk_size
@@ -1001,7 +1003,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
             (3, (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim),
             dtype=torch.bfloat16,
         ),
-        context_buf=output,
+        output=output,
         sequence_lengths=torch.tensor([33, 64], dtype=torch.int32),
         context_lengths=torch.tensor([1, 2], dtype=torch.int32),
         input_seq_length=2,
@@ -1208,7 +1210,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
             (2, (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim),
             dtype=torch.bfloat16,
         ),
-        context_buf=output,
+        output=output,
         sequence_lengths=sequence_lengths,
         input_seq_length=1,
         max_past_kv_length=64,
@@ -1536,7 +1538,6 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
-        is_fused_qkv=True,
         quant_q_buffer=torch.zeros(2 * attn.num_heads * 576 + 16, dtype=torch.uint8)
         if fp8
         else None,
@@ -1550,8 +1551,8 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(64, dtype=torch.uint8),
-        qkv_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
-        context_buf=output,
+        query_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        output=output,
         sequence_lengths=sequence_lengths,
         input_seq_length=1,
         max_past_kv_length=64,
@@ -1596,7 +1597,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
     assert run_args[0].shape == (2, 1, attn.num_heads, 576)
-    query_buffer = forward_args.quant_q_buffer if fp8 else params.qkv_input
+    query_buffer = forward_args.quant_q_buffer if fp8 else params.query_input
     assert run_args[0].data_ptr() == query_buffer.data_ptr()
     assert run_args[0].dtype == kernel_dtype
     assert run_args[1] is kv_cache
@@ -1848,7 +1849,6 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
-        is_fused_qkv=True,
     )
     sequence_lengths = torch.tensor([0, 33, 64], dtype=torch.int32)[1:]
     assert sequence_lengths.data_ptr() % 16 != 0
@@ -1857,8 +1857,8 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(96, dtype=torch.uint8),
-        qkv_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
-        context_buf=output,
+        query_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        output=output,
         sequence_lengths=sequence_lengths,
         input_seq_length=1,
         max_past_kv_length=64,
@@ -1895,7 +1895,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
     assert run_args[0].shape == (2, 1, attn.num_heads, 576)
-    assert run_args[0].data_ptr() == params.qkv_input.data_ptr()
+    assert run_args[0].data_ptr() == params.query_input.data_ptr()
     assert run_args[1] is kv_cache
     torch.testing.assert_close(
         run_kwargs["block_tables"],
@@ -2212,21 +2212,54 @@ def test_workspace_cannot_grow_during_capture(monkeypatch: pytest.MonkeyPatch) -
         )
 
 
-def test_phased_forward_routes_mixed_batch_to_context_and_generation(
+@pytest.mark.parametrize(
+    "input_type,is_mla,is_fused_qkv,has_kv",
+    [
+        (input_type, False, is_fused_qkv, has_kv)
+        for input_type in AttentionInputType
+        for is_fused_qkv, has_kv in [(True, False), (False, True), (False, False)]
+    ]
+    + [
+        (AttentionInputType.context_only, True, False, True),
+        (AttentionInputType.context_only, True, False, False),
+        (AttentionInputType.generation_only, True, False, False),
+    ],
+)
+def test_phased_forward_routes_query_and_qkv_by_phase(
     monkeypatch: pytest.MonkeyPatch,
+    input_type: AttentionInputType,
+    is_mla: bool,
+    is_fused_qkv: bool,
+    has_kv: bool,
 ) -> None:
-    attn = _Attention()
+    attn = _Attention(is_mla=is_mla)
     fmha = PrimsTSFmha(attn)
     context_calls = []
     generation_calls = []
     run_context = Mock(side_effect=lambda params: context_calls.append(replace(params)))
     run_generation = Mock(side_effect=lambda params: generation_calls.append(replace(params)))
     monkeypatch.setattr(fmha, "prepare_workspace", Mock())
-    monkeypatch.setattr(fmha, "run_context", run_context)
-    monkeypatch.setattr(fmha, "run_generation", run_generation)
+    monkeypatch.setattr(fmha, "run_mla_context" if is_mla else "run_context", run_context)
+    monkeypatch.setattr(fmha, "run_mla_generation" if is_mla else "run_generation", run_generation)
 
-    q = torch.empty((5, 128), dtype=torch.bfloat16)
-    output = torch.empty((5, attn.num_heads * attn.head_dim), dtype=torch.bfloat16)
+    num_tokens = {
+        AttentionInputType.mixed: 5,
+        AttentionInputType.context_only: 3,
+        AttentionInputType.generation_only: 2,
+    }[input_type]
+    if is_mla:
+        q_size = attn.num_heads * (192 if has_kv else 576)
+    else:
+        q_size = (attn.num_heads + (2 * attn.num_kv_heads if is_fused_qkv else 0)) * attn.head_dim
+    q = torch.arange(num_tokens * q_size, dtype=torch.float32).view(num_tokens, q_size)
+    k = torch.randn((num_tokens, attn.num_kv_heads * attn.head_dim)) if has_kv else None
+    v = torch.randn_like(k) if k is not None else None
+    out_head_size = (
+        fmha.generation_out_head_size
+        if input_type == AttentionInputType.generation_only
+        else fmha.context_out_head_size
+    )
+    output = torch.empty((num_tokens, attn.num_heads * out_head_size))
     metadata = SimpleNamespace(
         kv_cache_block_offsets=torch.empty(1),
         effective_workspace=torch.empty(0, dtype=torch.int8),
@@ -2246,30 +2279,53 @@ def test_phased_forward_routes_mixed_batch_to_context_and_generation(
     )
     forward_args = AttentionForwardArgs(
         output=output,
-        attention_input_type=AttentionInputType.mixed,
+        attention_input_type=input_type,
         attention_window_size=128,
+        is_fused_qkv=is_fused_qkv,
+        update_kv_cache=is_mla or is_fused_qkv or has_kv,
     )
 
-    fmha.forward(q, None, None, metadata, forward_args)
+    fmha.forward(q, k, v, metadata, forward_args)
 
-    run_context.assert_called_once()
-    context_params = context_calls[0]
-    assert context_params.num_tokens == 3
-    assert context_params.seq_offset == 0
-    assert context_params.batch_size == 1
-    assert context_params.num_requests == 1
-    assert context_params.attention_input is not None
-    assert context_params.attention_input.shape[0] == 3
-    assert context_params.context_buf is not None
-    assert context_params.context_buf.shape == (3, attn.num_heads, attn.head_dim)
+    if input_type == AttentionInputType.generation_only:
+        run_context.assert_not_called()
+    else:
+        run_context.assert_called_once()
+        context_params = context_calls[0]
+        assert context_params.num_tokens == 3
+        assert context_params.seq_offset == 0
+        assert context_params.token_offset == 0
+        assert context_params.batch_size == 1
+        assert context_params.num_requests == 1
 
-    run_generation.assert_called_once()
-    generation_params = generation_calls[0]
-    assert generation_params.num_tokens == 2
-    assert generation_params.seq_offset == 1
-    assert generation_params.batch_size == 2
-    assert generation_params.num_requests == 2
-    assert generation_params.attention_input is not None
-    assert generation_params.attention_input.shape[0] == 2
-    assert generation_params.context_buf is not None
-    assert generation_params.context_buf.shape == (2, attn.num_heads, attn.head_dim)
+    if input_type == AttentionInputType.context_only:
+        run_generation.assert_not_called()
+    else:
+        run_generation.assert_called_once()
+        generation_params = generation_calls[0]
+        assert generation_params.num_tokens == 2
+        assert generation_params.seq_offset == 1
+        assert generation_params.token_offset == (
+            3 if input_type == AttentionInputType.mixed else 0
+        )
+        assert generation_params.batch_size == 2
+        assert generation_params.num_requests == 2
+
+    for params in context_calls + generation_calls:
+        token_slice = slice(params.token_offset, params.token_offset + params.num_tokens)
+        if is_fused_qkv:
+            phase_input = params.qkv_input
+            assert params.query_input is None
+        else:
+            phase_input = params.query_input
+            assert params.qkv_input is None
+        torch.testing.assert_close(phase_input, q[token_slice])
+        assert phase_input.data_ptr() == q[token_slice].data_ptr()
+        if has_kv:
+            torch.testing.assert_close(params.key_input, k[token_slice])
+            torch.testing.assert_close(params.value_input, v[token_slice])
+        else:
+            assert params.key_input is None
+            assert params.value_input is None
+        assert params.output.shape == (params.num_tokens, attn.num_heads, out_head_size)
+        assert params.output.data_ptr() == output[token_slice].data_ptr()

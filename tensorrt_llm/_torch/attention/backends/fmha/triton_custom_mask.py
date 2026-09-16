@@ -260,7 +260,7 @@ class TritonCustomMaskFmha(PhasedFmha):
 
         if block_tables is None:
             raise RuntimeError("Custom-mask TRT-LLM attention requires paged KV metadata.")
-        if params.qkv_input is None or params.context_buf is None:
+        if params.qkv_input is None or params.output is None:
             raise RuntimeError(
                 "Custom-mask TRT-LLM attention requires context QKV and output buffers."
             )
@@ -320,7 +320,7 @@ class TritonCustomMaskFmha(PhasedFmha):
             q=q_processed,
             k=k_processed,
             v=v_processed,
-            output=params.context_buf,
+            output=params.output,
             qo_indptr=cu_q_seqlens,
             kv_cache=kv_cache,
             prefix_lens=prefix_lens,

@@ -290,7 +290,7 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the fused attention input must be contiguous."
         if k is not None or v is not None:
             return False, "only fused QKV input is supported."
-        if not fwd.is_fused_qkv:
+        if not attn.is_mla_enable and not fwd.is_fused_qkv:
             return False, "only fused QKV input is supported."
         if meta.is_cross:
             return False, "cross attention is not supported."
@@ -913,7 +913,7 @@ class PrimsTSFmha(PhasedFmha):
         )
 
     def run_context(self, params: FmhaParams) -> None:
-        if params.qkv_input is None or params.context_buf is None:
+        if params.qkv_input is None or params.output is None:
             raise RuntimeError("PrimTS context requires QKV input and an output buffer.")
         if params.sequence_lengths is None or params.context_lengths is None:
             raise RuntimeError("PrimTS context requires sequence and context lengths.")
@@ -1018,7 +1018,7 @@ class PrimsTSFmha(PhasedFmha):
             mask_type=mask_type,
             window_left=window_left,
             sm_scale=self._get_bmm1_scale(attn),
-            output_dtype=params.context_buf.dtype,
+            output_dtype=params.output.dtype,
         )
         wrapper.run(
             q_processed,
@@ -1027,7 +1027,7 @@ class PrimsTSFmha(PhasedFmha):
             cu_q_seqlens,
             block_tables=fixed_block_tables,
             seq_lens_kv=seq_lens_kv,
-            out=params.context_buf,
+            out=params.output,
             validate=False,
         )
 
@@ -1130,7 +1130,7 @@ class PrimsTSFmha(PhasedFmha):
         )
 
     def run_generation(self, params: FmhaParams) -> None:
-        if params.qkv_input is None or params.context_buf is None:
+        if params.qkv_input is None or params.output is None:
             raise RuntimeError("PrimTS decode requires QKV input and an output buffer.")
         if params.sequence_lengths is None:
             raise RuntimeError("PrimTS decode requires sequence lengths.")
@@ -1180,7 +1180,7 @@ class PrimsTSFmha(PhasedFmha):
             attn.num_heads,
             attn.head_dim,
         )
-        output = params.context_buf.view_as(query)
+        output = params.output.view_as(query)
         if params.input_seq_length == 1:
             query = query[:, 0]
             output = output[:, 0]
@@ -1240,7 +1240,7 @@ class PrimsTSFmha(PhasedFmha):
         return root_bytes[byte_offset:byte_end]
 
     def run_mla_generation(self, params: FmhaParams) -> None:
-        if params.qkv_input is None or params.context_buf is None:
+        if params.query_input is None or params.output is None:
             raise RuntimeError("PrimTS MLA decode requires query input and an output buffer.")
         if params.sequence_lengths is None:
             raise RuntimeError("PrimTS MLA decode requires sequence lengths.")
@@ -1261,7 +1261,7 @@ class PrimsTSFmha(PhasedFmha):
             attn.quant_mode,
             params.seq_offset,
             batch_size,
-            params.qkv_input.dtype,
+            params.query_input.dtype,
         )
         # The returned pool and block table share the THOP flat-page index ABI.
         if kv_cache is None or block_tables is None:
@@ -1269,9 +1269,9 @@ class PrimsTSFmha(PhasedFmha):
         fixed_block_tables = self._get_fixed_block_tables(block_tables, batch_size)
         seq_len_q = params.input_seq_length
         if QuantMode(attn.quant_mode).has_fp8_kv_cache():
-            query, bmm1_scale, bmm2_scale = self._get_mla_fp8_inputs(params.qkv_input, params.fwd)
+            query, bmm1_scale, bmm2_scale = self._get_mla_fp8_inputs(params.query_input, params.fwd)
         else:
-            query = params.qkv_input
+            query = params.query_input
             bmm1_scale = 1.0 / (
                 attn.q_scaling * math.sqrt(int(attn.qk_nope_head_dim) + int(attn.qk_rope_head_dim))
             )
@@ -1282,7 +1282,7 @@ class PrimsTSFmha(PhasedFmha):
             attn.num_heads,
             int(attn.kv_lora_rank) + int(attn.qk_rope_head_dim),
         )
-        output = params.context_buf.view(
+        output = params.output.view(
             batch_size,
             seq_len_q,
             attn.num_heads,

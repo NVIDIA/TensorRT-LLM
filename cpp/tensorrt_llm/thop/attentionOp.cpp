@@ -1202,12 +1202,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     TLLM_CHECK_WITH_INFO(
         update_kv_cache || is_cross, "KV cache update cannot be disabled now (except for cross attention).");
     auto qkv_or_q = q;
-    if (is_fused_qkv)
+    // MLA validates its separate Q/K/V or latent-cache inputs in Runner::run.
+    if (!is_mla_enable && is_fused_qkv)
     {
         TLLM_CHECK_WITH_INFO(!k.has_value(), "The k tensor should be null if using fused QKV");
         TLLM_CHECK_WITH_INFO(!v.has_value(), "The v tensor should be null if using fused QKV");
     }
-    if (!is_fused_qkv && update_kv_cache && !is_cross)
+    if (!is_mla_enable && !is_fused_qkv && update_kv_cache && !is_cross)
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
