@@ -237,7 +237,7 @@ std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
     int const blockSize = tokensPerBlock();
     int const blockIndex = match.numTokens / blockSize;
     size_t const begin = static_cast<size_t>(blockIndex) * static_cast<size_t>(blockSize);
-    if (begin + static_cast<size_t>(blockSize) > inputTokens.size())
+    if (begin + static_cast<size_t>(blockSize) > static_cast<size_t>(inputTokens.size()))
     {
         return std::nullopt;
     }
