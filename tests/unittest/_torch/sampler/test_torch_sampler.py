@@ -928,6 +928,39 @@ class TestFinishReasons:
     END_ID = FinishReason.END_ID
     LENGTH = FinishReason.LENGTH
 
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize("new_token", [5, 7, 9, 11])
+    def test_single_step_greedy_checks_all_stop_tokens(self, new_token):
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        request = LlmRequest(
+            request_id=0,
+            seq_slot=0,
+            input_tokens=[2, 0],
+            max_new_tokens=10,
+            end_id=2,
+            stop_words_list=[[5], [7], [9]],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        state = SampleStateTorch(
+            requests=[request],
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=torch.tensor([new_token], dtype=torch.int32),
+                finish_reasons=None,
+                first_finish_reasons=None,
+                single_step_greedy=True,
+            ),
+        )
+
+        sampler.update_requests(state)
+
+        assert request.is_finished == (new_token in (5, 7, 9))
+        assert not request.is_finished_due_to_length
+        assert request.get_tokens(0) == [2, 0, new_token]
+
     def test_single_step_greedy_updates_finish_reasons_and_filters_completed_requests(self):
         sampler = object.__new__(TorchSampler)
         sampler.max_seq_len = 20

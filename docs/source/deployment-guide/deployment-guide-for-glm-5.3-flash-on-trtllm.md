@@ -20,6 +20,7 @@ The following features have been tested on B200 with four GPUs per worker. Disag
 * Disaggregated serving with MTP
 * KV cache block reuse (with periodic Mamba state snapshots, see [`kv_cache_config`](#kv_cache_config))
 * Image and video inputs (see [Multimodal Inputs](#multimodal-inputs))
+* Automatic tool calling and JSON structured output (see [Tool Calling and Structured Output](#tool-calling-and-structured-output))
 
 ### Limitations
 
@@ -211,7 +212,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 * **Options**:
   * `enable_block_reuse`: Enables prefix reuse. Requires `mamba_state_config.periodic_snapshot_interval` (for example `256`); without this policy, reuse is disabled.
   * `free_gpu_memory_fraction`: Fraction of free GPU memory reserved for caches after loading the model. **Recommendation**: `0.5`; reduce it if you encounter OOM errors.
-  * `dtype`: Attention KV-cache data type. **Default**: `auto` (BF16). Set to `fp8` to reduce latent KV storage; this also works with MTP and attention data parallelism.
+  * `dtype`: Attention KV-cache data type. **Default**: `auto`, which follows the checkpoint's KV-cache quantization metadata. Set to `fp8` to reduce latent KV storage; this also works with MTP and attention data parallelism.
 
 #### `cuda_graph_config`
 
@@ -297,6 +298,14 @@ For `/v1/chat/completions`, pass reasoning controls through `chat_template_kwarg
 ### Multimodal Inputs
 
 Send images and videos to `/v1/chat/completions` using the OpenAI-compatible `image_url` and `video_url` content types. Video decoding requires `opencv-python-headless` in the container.
+
+### Tool Calling and Structured Output
+
+For tool calling, add `--tool_parser glm47 --reasoning_parser deepseek-r1` to the server command and use `tool_choice: "auto"` (streaming/non-streaming and MTP all supported). Limitations: `tool_choice: "required"` and named-function choice are not supported, and `parallel_tool_calls` should be omitted (the model can still return multiple tool calls under `auto`).
+
+### Long Context
+
+The checkpoint supports a total sequence length of 1,048,576 tokens. Set `--max_seq_len 1048576` and keep chunked prefill enabled; input + output must fit within this limit. On 4×B200 (TP4/EP4, BF16 KV), a validated config is `--max_batch_size 16`, `--max_num_tokens 8192`, CUDA graph batch limit 16, and `kv_cache_config.free_gpu_memory_fraction: 0.6`. This was smoke-tested up to the exact limit (≈1.04M-token multi-needle retrieval and a full 1,048,576-token run) — validating execution and basic retrieval, not comprehensive long-context quality.
 
 ### Troubleshooting Tips
 
