@@ -35,10 +35,10 @@ See the [Model-Feature Support Matrix](../models/supported-models.md#model-featu
 * Drivers: CUDA Driver 575 or later
 * Docker with NVIDIA Container Toolkit installed
 * Minimum TensorRT LLM version: 1.3.0rc26
-* Install Transformers commit `49995e1a8c76de9158cf4f4e4995ac7454b8f141` in the GLM deployment environment for model configuration and image/video processing:
+* Install `transformers==5.17.0` in the GLM deployment environment for model configuration and image/video processing:
 
   ```bash
-  pip install "git+https://github.com/huggingface/transformers.git@49995e1a8c76de9158cf4f4e4995ac7454b8f141"
+  pip install "transformers==5.17.0"
   ```
 * Install `fla-core` and `einops` in the container: `pip install fla-core einops`.
 
@@ -310,7 +310,7 @@ The checkpoint supports a total sequence length of 1,048,576 tokens. Set `--max_
 ### Troubleshooting Tips
 
 * **CUDA OOM errors:** Reduce `--max_batch_size`, `--max_num_tokens`, or `kv_cache_config.free_gpu_memory_fraction`. Keep `cuda_graph_config.max_batch_size` consistent with the server batch limit.
-* **Configuration or processor errors:** Check that the Transformers revision in [Prerequisites](#prerequisites) is installed in the serving environment.
+* **Configuration or processor errors:** Check that the Transformers version in [Prerequisites](#prerequisites) is installed in the serving environment.
 * **Block reuse disabled:** Configure the periodic snapshot policy described in [`kv_cache_config`](#kv_cache_config).
 
 ## Benchmarking Performance
