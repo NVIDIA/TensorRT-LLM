@@ -16,7 +16,7 @@ The KV Cache Connector is designed to support a variety of advanced serving scen
 
 The connector architecture is split into two main components:
 
-* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. It runs only on the leader rank (rank 0).
+* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. With tensor parallelism it runs on rank 0. With attention data parallelism (ADP), each rank runs an owner-local scheduler adapter.
 * **Worker**: Responsible for execution. It receives metadata from the scheduler and performs the actual data transfers (loading/saving) on the KV cache tensors. It runs on all ranks.
 
 ### API Reference
@@ -25,12 +25,12 @@ To implement a custom connector, you must subclass `KvCacheConnectorScheduler` a
 
 #### 1. Scheduler (Leader) Interface (`KvCacheConnectorScheduler`)
 
-These methods run on the leader process and drive the connector's behavior.
+These methods run on the leader process for TP, or on each request-owning rank for ADP.
 
 * **`build_connector_meta(self, scheduler_output: SchedulerOutput) -> object`**
   * **Description**: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.
   * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full -- the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
-  * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
+  * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. Under TP it is broadcast to all workers. Under ADP it is bound only to the local worker; `scheduler_output.attention_dp_rank` identifies the owner of its block IDs.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**
   * **Description**: Called when a new request arrives. It checks to see if any KV cache can be loaded from an external KV store.
@@ -68,6 +68,54 @@ These methods run on all workers (GPU processes) and interact with the actual GP
   * **Description**: Polled by the runtime to check the status of asynchronous operations.
   * **Returns**: Two lists of request IDs: those that have finished saving, and those that have finished loading.
 
+## Attention data parallelism
+
+Set `enable_attention_dp=True` with a connector whose **scheduler and worker
+classes both declare `supports_attention_dp = True`**. Existing connectors that
+have not opted in are rejected before construction. No extra scheduler adapter
+configuration is required: the executor creates a scheduler and worker on each
+ADP rank, including rank 0.
+
+Each adapter owns its request lookup, allocation feedback and worker metadata.
+Connector callbacks and completion polling do not perform collectives between
+ADP owners. The current ADP mapping has one attention worker per owner (model TP
+ranks still cooperate for the non-attention computation). TP without ADP keeps
+the rank-0 scheduler and waits for all attention shards to finish a transfer.
+
+Adapters can use **one shared logical storage pool**. They must use distinct
+worker endpoints and owner-scoped request/transfer IDs, while using common,
+representation-compatible content keys for reusable KV. A local block ID is an
+index into the registered local tensor, not a globally addressable page.
+Do not partition the content namespace by ADP rank: distinguish model revision,
+KV layout/dtype, block size, complete preceding prefix and cache salt instead.
+Pool capacity and placement remain the backend's responsibility; enabling ADP
+does not turn unused peer HBM into directly usable local attention memory.
+
+The capability flag commits an implementation to these requirements:
+
+* Scheduler constructors and callbacks work on nonzero ranks and never require
+  all ADP owners to issue the same requests or call sequence.
+* Workers consume only local metadata. Dummy requests do not appear in storage
+  lookup, allocation feedback, metadata or request-finished callbacks. Empty
+  metadata is valid, including during a dummy-only forward.
+* `get_finished` reports only IDs previously provided to that worker and only
+  after all transfers touching the corresponding local blocks have completed.
+  Cancellation is deferred until those DMA users drain; the generic API does
+  not provide a transport abort operation.
+* Independently arriving writes/readers share content safely, with complete
+  publication, compatible representations and backend pinning during reads.
+
+Async loading may remove every real request from an owner's scheduled batch.
+The executor attempts to add a compute dummy so other owners can advance while
+the transfer proceeds. If the owner has no dummy capacity or sequence slot,
+the existing ADP forward gate still defers the batch.
+
+Initial support retains the V1, single-primary-pool contract and existing
+restrictions: PP=1, CP=1, beam width 1, guaranteed-no-evict scheduling, no VSWA,
+no internal host offload and no Mamba/hybrid state. V2 and heterogeneous
+attention shard layouts require separate integration work. Third-party
+connector presets are not automatically opted in by this change.
+
 ## Example Implementation
 
 The file `examples/llm-api/llm_kv_cache_connector.py` provides a reference implementation of a **Persistent KV Cache**.
@@ -82,11 +130,20 @@ This example implements a file-system based KV cache.
 
 * **Metadata**: The example defines a `PersistentKvCacheConnectorMetadata` dataclass containing lists of `(file_path, block_id)` tuples for both loading and saving. This simple structure allows the Scheduler to tell the Worker exactly which file corresponds to which GPU block index.
 
-* **Hashing Strategy**: The `PersistentKvCacheConnectorLeader` hashes the token sequence of a block to generate a unique filename (e.g., `hash_value.pt`). This acts as the lookup key.
+* **Hashing Strategy**: The `PersistentKvCacheConnectorLeader` uses SHA-256 over the complete prefix through each block and its cache salt. Keys are stable across independently started ADP processes.
 
 * **Worker Logic**:
   * `start_load_kv`: Iterates through the load list provided in the metadata, loads the `.pt` file to CPU, and copies it to the specific `block_id` in the GPU tensor.
   * `wait_for_save`: Performs the reverse. It copies data from the GPU `block_id` to CPU and saves it to disk using `torch.save`.
+    It writes a temporary file in the same directory and atomically publishes
+    the completed file so concurrent owners cannot read a partial write.
+
+For an ADP demonstration, point `CONNECTOR_CACHE_FOLDER` at the same shared
+filesystem directory on every rank. Use a dedicated directory for each model
+revision and KV representation. The example supports unsharded attention KV
+(single rank or ADP); it does not support sharded attention TP or chunked prefill.
+This filesystem example demonstrates sharing, not elastic HBM placement or
+production performance.
 
 ### Limitations & Patterns
 
