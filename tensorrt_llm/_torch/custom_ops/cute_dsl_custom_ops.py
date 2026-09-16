@@ -11773,10 +11773,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
         """
-        if kv_bounds is not None:
-            raise ValueError(
-                "trtllm::cute_dsl_mla_decode_fp8_blackwell does not support "
-                "helix per-token kv_bounds (bf16/fp16 kernel only).")
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100 or "

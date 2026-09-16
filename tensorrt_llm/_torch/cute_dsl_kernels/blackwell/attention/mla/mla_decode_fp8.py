@@ -309,9 +309,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
-        # Signature parity with the fp16 kernel (helix speculative verify
-        # groups); the fp8 kernel does not implement per-token bounds and the
-        # wrapper gate never selects fp8 KV under helix.
         kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
@@ -330,6 +327,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             workspace,
             split_kv,
             cache_seqs,
+            kv_bounds,
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -350,9 +348,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
-        # Signature parity with the fp16 kernel; the fp8 kernel does not
-        # implement per-token bounds, so the value is accepted and dropped
-        # (the custom op rejects a non-None kv_bounds for fp8 upstream).
         kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
@@ -371,6 +366,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             workspace,
             split_kv,
             cache_seqs,
+            kv_bounds,
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -391,12 +387,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
+
+        kv_bounds (helix speculative verify groups): optional int32 tensor of
+        shape [batch_size * seq_len_q]; entry b*seq_len_q + q gives the number
+        of this rank's local KV entries query token q of sequence b may attend
+        to. When present it replaces the implicit causal bound
+        K - (seq_len_q - 1) + q_tok.
 
         The method handles:
         1. Initialization of workspace for temporary split KV buffers
@@ -852,6 +855,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 acc_lse,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 block_split_kvs,
                 softmax_scale_log2,
                 output_scale,
@@ -889,6 +893,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 acc_lse,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 block_split_kvs,
                 softmax_scale_log2,
                 output_scale,
@@ -923,6 +928,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     split_kv,
                     cache_seqs,
                     block_split_kvs,
+                    kv_bounds,
                 )
             else:
                 reduction_kernel = self.reduction_kernel(
@@ -1002,6 +1008,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mAccLSE: Optional[cute.Tensor],
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -1422,6 +1429,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        kv_bounds=kv_bounds,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
@@ -1524,6 +1532,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor] = None,
     ):
         """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
         from multiple split_kv blocks into final outputs.
@@ -1594,7 +1603,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if tidx == 0:
                 mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
                 if cutlass.const_expr(self.emit_softmax_stats):
-                    if cache_seqs[blk_coord[2]] > 0:
+                    # A rank joins the CP merge only for tokens with at least
+                    # one visible local KV entry; with verify groups that is
+                    # per-token. blk_coord runs over the folded grid
+                    # (H*F, S_q/F, B): true token = chunk * F + row // H.
+                    if cutlass.const_expr(kv_bounds is not None):
+                        if cutlass.const_expr(self.fold_sq):
+                            q_tok = (blk_coord[1] * self.fold_sq_ratio +
+                                     blk_coord[0] // self.num_heads)
+                        else:
+                            q_tok = blk_coord[1]
+                        has_local_kv = kv_bounds[blk_coord[2] * self.seq_len_q +
+                                                 q_tok] > 0
+                    else:
+                        has_local_kv = cache_seqs[blk_coord[2]] > 0
+                    if has_local_kv:
                         mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
                                       0] = global_lse / LOG2_E
                         mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
@@ -2432,7 +2455,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
         # S_q=1 this reduces to 1 tile -- identical to a plain K-bound check.
         tile_n = self.mma_qk_tiler[1]
-        mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
+        # With helix per-token bounds the minimum bound is K - S_q (a rank
+        # owning none of the group's tokens), one position deeper than the
+        # causal minimum, so widen the masked span by one.
+        if cutlass.const_expr(common_params.kv_bounds is not None):
+            mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
+        else:
+            mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
 
         # first_mask_tile_idx is the global index of the first tile that may
         # need masking. Runtime because it depends on K (per-batch in
@@ -2759,7 +2788,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                              cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Per-token rank-local bound; subsumes the causal
+                        # offset and non-owner ranks. fold_sq M-tile padding
+                        # rows derive q_tok >= S_q; their results are
+                        # discarded but the read must stay in bounds.
+                        q_tok_c = (q_tok if cute.elem_less(
+                            q_tok, self.seq_len_q) else self.seq_len_q - 1)
+                        k_bound = common_params.kv_bounds[
+                            common_params.blk_coord[2] * self.seq_len_q +
+                            q_tok_c]
+                    else:
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,
@@ -2805,7 +2845,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                              cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Per-token rank-local bound; subsumes the causal
+                        # offset and non-owner ranks. fold_sq M-tile padding
+                        # rows derive q_tok >= S_q; their results are
+                        # discarded but the read must stay in bounds.
+                        q_tok_c = (q_tok if cute.elem_less(
+                            q_tok, self.seq_len_q) else self.seq_len_q - 1)
+                        k_bound = common_params.kv_bounds[
+                            common_params.blk_coord[2] * self.seq_len_q +
+                            q_tok_c]
+                    else:
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,
