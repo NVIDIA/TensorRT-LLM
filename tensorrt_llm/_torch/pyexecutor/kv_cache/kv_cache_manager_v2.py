@@ -2691,32 +2691,33 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
-                generation_capacity = self.max_seq_len
-                if (
-                    type(self) is KVCacheManagerV2
-                    and self.kv_cache_type == CacheTypeCpp.SELF
-                    and all(window is None for window in self.max_attention_window_vec)
-                ):
-                    # Full self attention has one lifecycle, so its pool receives
-                    # the available quota. A max_seq_len floor would silently grow
-                    # that quota when the model's context limit cannot fit in memory.
-                    # Keep the minimum batch floor; CUDA graph warmup queries the
-                    # allocated pool after reserving its short decode requests to
-                    # determine how long the remaining request can actually be.
-                    generation_capacity = min_decode_capacity
-                # Preserve the full-length constraint for other cache types and
-                # layouts. Cross attention sizes encoder warmup independently.
-                constraints.append(
-                    BatchDesc(
-                        [
-                            KVCacheDesc(
-                                capacity=generation_capacity,
-                                history_length=generation_capacity - 1,
-                            )
-                        ]
-                        + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (self.max_batch_size - 1)
-                    )
+                gpu_quota = next(
+                    tier.quota for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)
+                )
+                # Native minimum slot counts are divided by the resume watermark.
+                # Normalize the quota before estimating a feasible long request.
+                estimate = self._get_max_tokens_from_quota(
+                    int(gpu_quota * kv_cache_config.max_util_for_resume)
+                )
+                generation_capacity = int(min(self.max_seq_len, max(min_decode_capacity, estimate)))
+                # These are independent workloads. Graph warmup shortens its long
+                # request after allocating the short requests; requiring both at
+                # this estimated length would count their memory twice.
+                constraints.extend(
+                    [
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=generation_capacity,
+                                    history_length=generation_capacity - 1,
+                                )
+                            ]
+                        ),
+                        BatchDesc(
+                            [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                            * self.max_batch_size
+                        ),
+                    ]
                 )
 
                 # General and chunked-prefill warmup uses one fresh context request
@@ -3135,6 +3136,75 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._gpu_max_tokens is not None:
             clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
+
+    def get_warmup_token_capacity(
+        self,
+        *,
+        token_num_upper_bound: int,
+        max_num_draft_tokens: int = 0,
+        draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
+    ) -> int:
+        """Return an input length that fits one additional generation dummy.
+
+        Other dummies must already be resident. This query is for exclusive
+        warmup, not concurrent request admission, and never grows the pool.
+        The descriptors match both resize calls in ``add_dummy_requests``:
+        the target keeps generation history, while a coupled draft cache
+        materializes the entire input. All sequence/position limits must be
+        applied to the upper bound before calling this method.
+        """
+        managers = [self]
+        if draft_kv_cache_manager is not None:
+            managers.append(draft_kv_cache_manager)
+        available_slots = []
+        overhead = self.num_extra_kv_tokens + max_num_draft_tokens + 1
+        upper = token_num_upper_bound
+        for manager in managers:
+            statistics = manager._get_storage_statistics(GPU_LEVEL)
+            max_util = manager.kv_cache_manager_py_config.max_util_for_resume
+            if any(stat.total and stat.unavailable / stat.total > max_util for stat in statistics):
+                return 0
+            available_slots.append([stat.available for stat in statistics])
+            if manager._gpu_max_tokens is not None:
+                upper = min(upper, manager._gpu_max_tokens - overhead)
+        minimum_tokens = 2 if self._has_cp_helix else 1
+        if upper < minimum_tokens:
+            return 0
+
+        def fits(tokens: int) -> bool:
+            for index, (manager, available) in enumerate(zip(managers, available_slots)):
+                materialize_history = index != 0
+                descriptor = KVCacheDesc(
+                    capacity=tokens + overhead,
+                    history_length=0 if materialize_history else tokens - 1,
+                )
+                needed = _introspection.compute_slots_for_batch(
+                    manager.impl,
+                    BatchDesc([descriptor]),
+                    manager._ledger_tokens_per_block,
+                    manager.kv_cache_manager_py_config.swa_scratch_reuse
+                    if materialize_history
+                    else None,
+                )
+                if any(required > free for required, free in zip(needed, available)):
+                    return False
+            return True
+
+        if fits(upper):
+            return upper
+        if not fits(minimum_tokens):
+            return 0
+        # SWA retention can oscillate by one slot within a page. Search one
+        # common page phase, checking target and draft at the same input length.
+        page = math.lcm(*(manager._ledger_tokens_per_block for manager in managers))
+        lo, hi = 0, upper // page + 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if fits(mid * page):
+                lo = mid
+            else:
+                hi = mid
+        return max(minimum_tokens, lo * page)
 
     def get_num_free_blocks(self) -> int:
         # NOTE This method is used to get the number of blocks in the primary pool not the FREE blocks.
