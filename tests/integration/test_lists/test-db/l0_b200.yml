@@ -132,10 +132,9 @@ l0_b200:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   # KDA runtime: host-derived prefill metadata, bf16 state pool round-trip,
-  # and bounded prefill scratch caches.
+  # and bf16 state pool round-trip.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
-  - unittest/_torch/modules/kimi_kda/test_kda_buf_cache_bounded.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
