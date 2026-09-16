@@ -225,7 +225,7 @@ function resultHarness(body = resultBody()) {
       return {data: {merge_base_commit: {sha: mergeBase}}};
     },
   };
-  const core = {warning: text => warnings.push(text), setFailed: text => failures.push(text),
+  const core = {info: () => {}, warning: text => warnings.push(text), setFailed: text => failures.push(text),
     summary: {addRaw(text) {summaries.push(text); return this;}, async write() {}}};
   return {comment, comments, checks, updated, warnings, failures, summaries, pr: request.pr,
     setMergeBase: sha => {mergeBase = sha;},
