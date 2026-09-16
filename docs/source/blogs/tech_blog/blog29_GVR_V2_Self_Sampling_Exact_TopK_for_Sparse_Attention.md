@@ -163,9 +163,17 @@ GVR V2 is faster in every tested radix and FlashInfer comparison and in **99.91%
 
 ![Three heatmaps of GVR V2 speedup over SGLang for every captured row-length bucket and all eleven batch sizes, averaged geometrically across layers.](../media/gvr_v2/sglang_map.svg)
 
-*Figure 4. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Row lengths are rounded in the axis labels.*
+*Figure 4. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 4 and 5 share the same color scale; row lengths are rounded in the axis labels.*
 
 Long rows at intermediate batch sizes show particularly strong gains: **V4 Pro reaches 4.67× at $N=262{,}127$, $B=64$**. This is the strongest shape-average result in the grid; most regions are around 1.3–2.0×.
+
+DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long rows at small batch sizes, especially for V3.2.
+
+![Three heatmaps of GVR V2 speedup over DeepSelect FP32 across row lengths and all eleven batch sizes, using the same color scale as the SGLang comparison.](../media/gvr_v2/deepselect_map.svg)
+
+*Figure 5. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 4: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
+
+For **V3.2, the gain reaches 7.66× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.23×** and **4.34×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.996×). The map shows where the FP32 advantage concentrates; the separate BF16 comparison below addresses DeepSelect's faster reduced-precision path.
 
 Two details determine how these gains carry into an application: the actual row-length and batch distribution, and the work each API returns. The next sections make both explicit.
 
@@ -219,11 +227,11 @@ The minimum column exposes individual regressions that a geometric mean can hide
 
 ![Cold kernel latency for all six implementations versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
-*Figure 5. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. Solid and dashed lines distinguish benchmark runs. Both axes are logarithmic; 1K means 1,024.*
+*Figure 6. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. Solid and dashed lines distinguish benchmark runs. Both axes are logarithmic; 1K means 1,024.*
 
 At $B=1$, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At $B=1024$, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.
 
-For a concrete large-batch slice, the following times are at $B=1024$ and $N\approx131{,}072$, averaged over the same layers as Figure 5:
+For a concrete large-batch slice, the following times are at $B=1024$ and $N\approx131{,}072$, averaged over the same layers as Figure 6:
 
 | Model | GVR V2 | SGLang | FlashInfer | Radix CUDA | DeepSelect FP32 | HPC-ops FP32 |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -261,17 +269,17 @@ P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
 P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
 $$
 
-The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 6A.
+The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 7A.
 
 ![A clean two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale zoom panels compare GVR V2 and five baselines at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
-*Figure 6.* A: the full theoretical and calibrated roofs. B: the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
+*Figure 7.* A: the full theoretical and calibrated roofs. B: the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
 
 ### Compare Useful Work at the Same Intensity
 
-At fixed $N$ and $K$, every implementation has the same horizontal position. A faster kernel moves **upward**, toward the bandwidth roof. Figure 6B fixes the batch at 1,024 so the curves expose throughput with substantial parallel work available; Figure 5 retains the contrasting single-row view, and Figure 4 covers all 11 batch sizes. The linear vertical scale makes the remaining distance to the roof directly visible.
+At fixed $N$ and $K$, every implementation has the same horizontal position. A faster kernel moves **upward**, toward the bandwidth roof. Figure 7B fixes the batch at 1,024 so the curves expose throughput with substantial parallel work available; Figure 6 retains the contrasting single-row view, and Figures 4 and 5 cover all 11 batch sizes. The linear vertical scale makes the remaining distance to the roof directly visible.
 
-For the Flash slice in Figure 5, $B=1024$, $N=131{,}075$, and $K=512$ give an optimistic minimum time of **78.0 µs**. GVR V2 takes **113.1 µs**, reaching about **69%** of the calibrated roof under this shared-work normalization. SGLang takes 196.8 µs, or about **40%** of that roof; radix CUDA takes 461.3 µs, or about **17%**. All three solve the same logical selection problem. Their different vertical positions reflect how much elapsed time they spend beyond its minimum traffic requirement.
+For the Flash slice in Figure 6, $B=1024$, $N=131{,}075$, and $K=512$ give an optimistic minimum time of **78.0 µs**. GVR V2 takes **113.1 µs**, reaching about **69%** of the calibrated roof under this shared-work normalization. SGLang takes 196.8 µs, or about **40%** of that roof; radix CUDA takes 461.3 µs, or about **17%**. All three solve the same logical selection problem. Their different vertical positions reflect how much elapsed time they spend beyond its minimum traffic requirement.
 
 ### Interpret the Remaining Gap
 

@@ -19,7 +19,7 @@ With NumPy and Matplotlib installed, run from the repository root:
 python docs/source/blogs/media/gvr_v2/plot_results.py
 ```
 
-The script regenerates `summary.json` and six SVGs: `speedup.svg`, `evolution.svg`, `algorithm.svg`, `sglang_map.svg`, `latency.svg`, and `roofline.svg`. It requires no GPU. The algorithm diagrams are schematic; every performance panel uses the bundled timing observations.
+The script regenerates `summary.json` and seven SVGs: `speedup.svg`, `evolution.svg`, `algorithm.svg`, `sglang_map.svg`, `deepselect_map.svg`, `latency.svg`, and `roofline.svg`. It requires no GPU. The algorithm diagrams are schematic; every performance panel uses the bundled timing observations.
 
 ## Published Data
 
@@ -70,7 +70,7 @@ Figure 1 intersects all supported implementations within each model: 2,079 Flash
 
 SGLang and FlashInfer lack V3.2 layers 0–2 and cover 9,515 cases in total. HPC-ops covers 6,776 Flash/V3.2 cases. GVR, radix, and DeepSelect cover all 9,746 cases. Missing coverage is never filled with estimated timings.
 
-The latency and roofline curves use arithmetic-mean durations over matching layers at each row-length/batch point: 21 layers for Flash, 30 for Pro, and 58 for V3.2. All layers at each plotted point have the same valid width. The SGLang heatmap instead geometrically averages per-layer speedups at each shape. A shape average can hide individual regressions.
+The latency and roofline curves use arithmetic-mean durations over matching layers at each row-length/batch point: 21 layers for Flash, 30 for Pro, and 58 for V3.2. All layers at each plotted point have the same valid width. The SGLang and DeepSelect FP32 heatmaps (Figures 4 and 5) instead geometrically average per-layer speedups at each shape, using each baseline's full paired coverage. DeepSelect therefore includes all 61 V3.2 layers; SGLang includes 58. Both maps share a 0.8–8.0 scale with parity at 1.0, and cell labels round to one decimal place. A shape average can hide individual regressions.
 
 Correctness compares selected value multisets with `torch.topk`, allowing tied indices to differ. The capture-grid checks do not establish NaN ordering parity or a universal tie order. The linked implementation PRs additionally cover padding, variable lengths, exceptional values, and graph replay.
 
@@ -80,7 +80,7 @@ The logical work is `W = B*N` abstract comparisons and the minimum traffic is `Q
 
 The full model is `min(R, BW*I)`. The theoretical parameters are `R=37.224960 Tcompare/s` and `BW=8 TB/s`; calibrated parameters are `R=37.047490 Tcompare/s` and `BW=6.912116 TB/s`. Their knees are 4.65312 and approximately 5.35979 compare/byte, above Top-K's ideal `[0.125, 0.25)` intensity range. The semantic comparison convention counts two binary comparisons per FMNMX3 result; it is not FP32 FLOPS.
 
-The zoom panels fix B=1024 and use linear axes. They show a throughput-oriented slice rather than a fitted upper envelope. Figure 5 also shows B=1, and the SGLang heatmap covers all 11 batches. The illustrative Flash fractions of the calibrated roof are minimum time divided by measured mean kernel time: approximately 69% for V2, 40% for SGLang, and 17% for radix CUDA. The read-dominated roof is optimistic; mixed read/write behavior and additional kernel work can lower achievable throughput.
+The zoom panels fix B=1024 and use linear axes. They show a throughput-oriented slice rather than a fitted upper envelope. Figure 6 also shows B=1, and both heatmaps cover all 11 batches. The illustrative Flash fractions of the calibrated roof are minimum time divided by measured mean kernel time: approximately 69% for V2, 40% for SGLang, and 17% for radix CUDA. The read-dominated roof is optimistic; mixed read/write behavior and additional kernel work can lower achievable throughput.
 
 ## Serving Results
 

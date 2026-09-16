@@ -680,11 +680,13 @@ def _roofline(rows: list[dict]) -> None:
     _save(fig, "roofline")
 
 
-def _speedup_map(rows: list[dict]) -> None:
+def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(14, 5.8))
     batches = sorted({r["batch"] for r in rows})
+    norm = TwoSlopeNorm(vmin=0.8, vcenter=1, vmax=8)
+    cmap = plt.get_cmap("BrBG")
     for ax, (model, title) in zip(axes, MODELS.items()):
-        selected = [r for r in rows if r["model"] == model and r["sglang_us"] is not None]
+        selected = [r for r in rows if r["model"] == model and r[arm + "_us"] is not None]
         buckets = sorted({r["isl_bucket"] for r in selected}, key=lambda s: int(s[:-1]))
         values = []
         widths = []
@@ -694,17 +696,17 @@ def _speedup_map(rows: list[dict]) -> None:
             values.append(
                 [
                     geometric_mean(
-                        r["sglang_us"] / r["gvr_v2_us"] for r in group if r["batch"] == b
+                        r[arm + "_us"] / r["gvr_v2_us"] for r in group if r["batch"] == b
                     )
                     for b in batches
                 ]
             )
         data = np.asarray(values)
-        graphic = ax.imshow(
-            data, aspect="auto", cmap="BrBG", norm=TwoSlopeNorm(vmin=0.8, vcenter=1, vmax=5)
-        )
+        graphic = ax.imshow(data, aspect="auto", cmap=cmap, norm=norm)
         for y in range(len(buckets)):
             for x in range(len(batches)):
+                red, green, blue, _ = cmap(norm(data[y, x]))
+                brightness = 0.299 * red + 0.587 * green + 0.114 * blue
                 ax.text(
                     x,
                     y,
@@ -712,7 +714,7 @@ def _speedup_map(rows: list[dict]) -> None:
                     ha="center",
                     va="center",
                     fontsize=7.1,
-                    color="white" if data[y, x] > 3.3 else "#17202b",
+                    color="white" if brightness < 0.5 else "#17202b",
                 )
         ax.set_xticks(range(len(batches)), batches, rotation=60, fontsize=9)
         ax.set_yticks(range(len(widths)), [f"{n:.0f}K" for n in widths], fontsize=9)
@@ -720,7 +722,7 @@ def _speedup_map(rows: list[dict]) -> None:
         ax.set_ylabel("Valid row length N (rounded)")
         ax.set_title(title, loc="left", fontsize=11, pad=12)
     fig.suptitle(
-        "GVR V2 vs SGLang: gains across the full length–batch grid",
+        f"GVR V2 vs {label}: gains across the full length–batch grid",
         fontsize=18,
         x=0.035,
         ha="left",
@@ -729,19 +731,19 @@ def _speedup_map(rows: list[dict]) -> None:
     )
     fig.subplots_adjust(left=0.06, right=0.99, top=0.87, bottom=0.34, wspace=0.27)
     cax = fig.add_axes((0.34, 0.09, 0.32, 0.026))
-    bar = fig.colorbar(graphic, cax=cax, orientation="horizontal", ticks=[0.8, 1, 2, 3, 4, 5])
-    bar.set_label("SGLang time / GVR V2 time · geometric mean across layers", fontsize=9)
+    bar = fig.colorbar(graphic, cax=cax, orientation="horizontal", ticks=[0.8, 1, 2, 4, 6, 8])
+    bar.set_label(f"{label} time / GVR V2 time · geometric mean across layers", fontsize=9)
     fig.text(
         0.06,
         0.17,
-        "SGLang plan + transform · 1.0× is parity · each tile averages the layer-level speedups at that shape.",
+        f"{scope} · 1.0× is parity · shared color scale across both baseline maps.",
         fontsize=9,
     )
-    _save(fig, "sglang_map")
+    _save(fig, arm + "_map")
 
 
 def main() -> None:
-    """Validate the frozen dataset, then regenerate statistics and six figures."""
+    """Validate the frozen dataset, then regenerate statistics and seven figures."""
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
@@ -779,7 +781,8 @@ def main() -> None:
     _overview(rows)
     _evolution(rows)
     _algorithm()
-    _speedup_map(rows)
+    _speedup_map(rows, "sglang", "SGLang", "SGLang plan + transform")
+    _speedup_map(rows, "deepselect", "DeepSelect FP32", "DeepSelect FP32 · unsorted indices")
     _latency(rows)
     _roofline(rows)
 
