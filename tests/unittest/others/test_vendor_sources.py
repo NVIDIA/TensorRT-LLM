@@ -24,7 +24,7 @@ import stat
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import ModuleType
 
 import pytest
@@ -224,6 +224,115 @@ def _load_vendor_sources_module() -> ModuleType:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize(
+    "pattern, path, expected",
+    [
+        ("*.py", "a.py", True),
+        ("*.py", "sub/a.py", False),
+        ("./*.py", "a.py", True),
+        ("./*.py", "sub/a.py", False),
+        ("a.py", "a.py", True),
+        ("a.py", "sub/a.py", False),
+        ("**/*.py", "a.py", True),
+        ("**/*.py", "sub/a.py", True),
+        ("**/*.py", "sub/deep/a.py", True),
+        ("**/*.py", "sub/a.txt", False),
+        ("*/*.py", "a.py", False),
+        ("*/*.py", "sub/a.py", True),
+        ("*/*.py", "sub/deep/a.py", False),
+        ("*/**/*.py", "a.py", False),
+        ("*/**/*.py", "sub/a.py", True),
+        ("*/**/*.py", "sub/deep/a.py", True),
+        ("sub/*.py", "sub/a.py", True),
+        ("sub/*.py", "sub/deep/a.py", False),
+        ("sub/*.py", "other/sub/a.py", False),
+        ("sub/**/*.py", "sub/a.py", True),
+        ("sub/**/*.py", "sub/deep/a.py", True),
+        ("sub/**/*.py", "other/sub/a.py", False),
+        ("**/sub/**/*.py", "other/sub/deep/a.py", True),
+        ("**/sub/a.py", "sub/sub/a.py", True),
+        ("**/sub/a.py", "sub/deep/a.py", False),
+        ("**/**/a.py", "a.py", True),
+        ("**/**/a.py", "sub/deep/a.py", True),
+        ("**/*", "README", True),
+        ("**/*", "sub/deep/README", True),
+        ("sub/**", "sub/deep/a.py", True),
+        ("a?.py", "ab.py", True),
+        ("a?.py", "abc.py", False),
+        ("[ab].py", "a.py", True),
+        ("[!a].py", "a.py", False),
+        ("[!a].py", "b.py", True),
+        ("[ab].py", "sub/a.py", False),
+        ("file[[]1].py", "file[1].py", True),
+        ("*.py", ".hidden.py", True),
+        ("**/*.py", ".hidden/a.py", True),
+        ("**/*.py", "sub/.hidden/a.py", True),
+        ("*.py", "a.PY", False),
+        ("sub/*.py", "Sub/a.py", False),
+        ("sub**/*.py", "subdir/a.py", True),
+        ("sub**/*.py", "sub/deep/a.py", False),
+    ],
+)
+def test_include_patterns_match_complete_paths(pattern: str, path: str, expected: bool) -> None:
+    module = _load_vendor_sources_module()
+    assert module._matches(path, [pattern]) is expected
+
+
+def test_include_patterns_accept_any_matching_pattern() -> None:
+    module = _load_vendor_sources_module()
+    patterns = ["*.py", "sub/**/*.txt"]
+    assert module._matches("a.py", patterns)
+    assert module._matches("sub/deep/a.txt", patterns)
+    assert not module._matches("sub/a.py", patterns)
+    assert not module._matches("a.txt", patterns)
+    assert not module._matches("a.py", [])
+
+
+def test_include_patterns_use_posix_normalized_windows_paths() -> None:
+    module = _load_vendor_sources_module()
+    relative = PureWindowsPath(r"sub\deep\a.py").as_posix()
+    assert module._matches(relative, ["sub/**/*.py"])
+    assert not module._matches(relative, ["sub/*.py"])
+    assert not module._matches(relative, ["Sub/**/*.py"])
+
+
+def test_current_level_include_preserves_unselected_files_on_sync(tmp_path: Path) -> None:
+    upstream, commit = _make_upstream(
+        tmp_path,
+        {"a.py": "VALUE = 1\n", "sub/a.py": "VALUE = 2\n", "README.md": "upstream\n"},
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _vendor(
+        consumer,
+        lock,
+        "create",
+        _VENDOR_NAME,
+        "--url",
+        upstream.as_uri(),
+        "--commit",
+        commit,
+        "--source",
+        _SOURCE,
+        "--destination",
+        _DESTINATION,
+        "--include",
+        "*.py",
+        "--repo",
+        upstream,
+    )
+    destination = consumer / _DESTINATION
+    assert set(_tree_snapshot(destination)) == {"a.py"}
+    _write_files(destination, {"sub/a.py": "local nested file\n", "README.md": "local docs\n"})
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+    (destination / "a.py").write_text("VALUE = 99\n", encoding="utf-8")
+    _vendor(consumer, lock, "sync", _VENDOR_NAME, "--repo", upstream)
+    assert (destination / "a.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert (destination / "sub/a.py").read_text(encoding="utf-8") == "local nested file\n"
+    assert (destination / "README.md").read_text(encoding="utf-8") == "local docs\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME)
 
 
 def test_atomic_write_syncs_file_before_replacement(
