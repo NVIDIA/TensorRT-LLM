@@ -26,30 +26,34 @@ from dataclasses import dataclass
 # Namespaced so the native schema metadata cannot collide with other users of
 # dataclasses.field(metadata=...).
 CPP_METADATA_KEY = "fmha.cpp"
-_UNSET = object()
 
 
 @dataclass(frozen=True)
 class CppMetadata:
-    """Marks a field as part of the native FmhaParams struct.
+    """Controls a field's representation in the native FmhaParams struct.
 
     The generator reads the schema's source, not this object, so the value here is
-    kept only for introspection. See cpp_metadata() for what ``ctype`` means.
+    kept only for introspection. See cpp_metadata() for what ``dtype`` means.
     """
 
-    ctype: object = _UNSET
+    dtype: object
 
 
-def cpp_metadata(*, default: object, ctype: object = _UNSET) -> dataclasses.Field[object]:
-    """Mark a dataclass field as part of the native FmhaParams struct.
+def cpp_metadata(*, dtype: object, default: object = None) -> dataclasses.Field[object]:
+    """Customize a dataclass field's representation in the native struct.
 
     The annotation gives the shape -- tensor, optional, set, scalar, or a named
-    type -- and ``ctype`` gives the element type within it:
+    type -- and ``dtype`` gives its fixed element type as a ``torch`` dtype.
 
-    * a ``torch`` dtype: a tensor's or a set's element type;
-    * omitted: read the type off the annotation. On a tensor this means the element
-      type is whatever dtype the op runs at, so the getter is templated;
-    * ``None``: generate no getter. Use it where the native view differs from the
-      tensor's dtype, and hand-write the getter in attentionOp.h.
+    The default is ``None`` unless explicitly supplied. Scalars annotated as
+    bool, int, float, or their Optional forms do not need this helper: their
+    native types are bool, std::int64_t, and double, respectively.
+
+    A tensor without this helper is a native field with no generated getter,
+    for example when its pointer type is supplied by C++ dtype dispatch or its
+    view needs offsets. These getters are handwritten in attentionOp.h.
+    Registered native structs and supported named types are recognized by their
+    annotations and need no marker either. Defaults and default factories remain
+    Python-owned.
     """
-    return dataclasses.field(default=default, metadata={CPP_METADATA_KEY: CppMetadata(ctype)})
+    return dataclasses.field(default=default, metadata={CPP_METADATA_KEY: CppMetadata(dtype)})

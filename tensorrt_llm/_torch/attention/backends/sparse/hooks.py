@@ -12,6 +12,7 @@ from dataclasses import replace
 from importlib import import_module
 from typing import TYPE_CHECKING, Optional
 
+from .params import SparseRuntimeParams
 from .skip_softmax import SkipSoftmaxParams
 
 if TYPE_CHECKING:
@@ -22,7 +23,6 @@ if TYPE_CHECKING:
     from ...mla import MLA
     from ..interface import AttentionForwardArgs, AttentionMask, AttentionMetadata
     from ..trtllm import TrtllmAttention
-    from .params import SparseRuntimeParams
 
 __all__ = [
     "AttentionSparseHooks",
@@ -237,22 +237,28 @@ def prepare_sparse_runtime_params(
     ``SparseRuntimeParams`` built from ``forward_args.sparse_runtime_params``
     plus the hook results. Fields a backend writes into that carrier outside
     the hooks, such as an auxiliary pool pointer, are carried over. SkipSoftmax
-    backends receive their threshold schedule last.
+    backends receive their threshold schedule last. The per-call carrier is
+    available before the hooks run so they can also populate auxiliary fields.
     """
+    runtime_params = (
+        SparseRuntimeParams()
+        if forward_args.sparse_runtime_params is None
+        else replace(forward_args.sparse_runtime_params)
+    )
+    forward_args.sparse_runtime_params = runtime_params
     kv_indices, kv_offsets = backend.sparse_kv_predict(q, k, metadata, forward_args)
     attn_indices, attn_offsets = backend.sparse_attn_predict(q, k, metadata, forward_args)
     block_sparse_inputs = backend.block_sparse_attn_predict(q, k, v, metadata, forward_args)
     has_attn_indices = attn_indices is not None or attn_offsets is not None
     sparse_params = backend.sparse_params
-    runtime_params = replace(
-        forward_args.sparse_runtime_params,
-        sparse_kv_indices=kv_indices,
-        sparse_kv_offsets=kv_offsets,
-        sparse_attn_indices=attn_indices,
-        sparse_attn_offsets=attn_offsets,
-        sparse_attn_indices_block_size=sparse_params.indices_block_size if has_attn_indices else 0,
-        block_sparse_inputs=block_sparse_inputs,
+    runtime_params.sparse_kv_indices = kv_indices
+    runtime_params.sparse_kv_offsets = kv_offsets
+    runtime_params.sparse_attn_indices = attn_indices
+    runtime_params.sparse_attn_offsets = attn_offsets
+    runtime_params.sparse_attn_indices_block_size = (
+        sparse_params.indices_block_size if has_attn_indices else 0
     )
+    runtime_params.block_sparse_inputs = block_sparse_inputs
     if isinstance(sparse_params, SkipSoftmaxParams):
         runtime_params = sparse_params.scheduler.get_runtime_params(
             runtime_params=runtime_params,

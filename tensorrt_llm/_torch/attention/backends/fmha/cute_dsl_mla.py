@@ -15,7 +15,7 @@
 """CuTe DSL MLA decode FMHA library."""
 
 import math
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -560,11 +560,13 @@ class CuteDslMlaFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        params: FmhaParams,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
     ) -> None:
-        q = cast(torch.Tensor, params.qkv_or_q)
-        workspace = cast(torch.Tensor, params.workspace)
         required_workspace_size = self._required_workspace_size(
             self.attn.num_heads,
             q.shape[0] // metadata.num_generations,

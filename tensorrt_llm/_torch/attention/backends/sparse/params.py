@@ -37,7 +37,7 @@ class SparseBackendForwardArgs:
     """Sparse inputs passed from an attention module to its backend."""
 
     # Shared by algorithms that accept precomputed top-k indices.
-    topk_indices: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
+    topk_indices: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
     # Complete block-sparse routing payload predicted by the module before the
     # core forward; the default backend hook hands it through unchanged.
     block_sparse_inputs: Optional["BlockSparseForwardInputs"] = None
@@ -90,20 +90,20 @@ class SparseRuntimeParams:
     """Complete per-attention sparse runtime state consumed by FMHA/``AttentionOp``."""
 
     # Sparse index inputs shared by multiple algorithms.
-    sparse_kv_indices: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
-    sparse_kv_offsets: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
-    sparse_attn_indices: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
+    sparse_kv_indices: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    sparse_kv_offsets: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    sparse_attn_indices: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
     # Per-query offsets, or backend-specific secondary sparse indices
     # (DeepSeek-V4 fp8_ds_mla compressed-pool indices).
-    sparse_attn_offsets: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
-    sparse_attn_indices_block_size: int = cpp_metadata(default=0)
-    sparse_attn_kv_lens: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
-    aux_kv_cache_pool_ptr: Optional[int] = cpp_metadata(default=None)
+    sparse_attn_offsets: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    sparse_attn_indices_block_size: int = 0
+    sparse_attn_kv_lens: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    aux_kv_cache_pool_ptr: Optional[int] = None
 
     # SkipSoftmax prefill threshold; kernels divide it by context length.
-    threshold_scale_factor_prefill: float = cpp_metadata(default=0.0)
+    threshold_scale_factor_prefill: float = 0.0
     # SkipSoftmax decode threshold; diffusion models leave it at zero.
-    threshold_scale_factor_decode: float = cpp_metadata(default=0.0)
+    threshold_scale_factor_decode: float = 0.0
     block_sparse_inputs: Optional[BlockSparseForwardInputs] = None
 
 

@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from fmha_test_utils import make_fmha_forward_args
 
 from tensorrt_llm._torch.attention.backends.fmha import (
     flashinfer_trtllm_gen as flashinfer_trtllm_gen_module,
@@ -17,10 +18,7 @@ from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
 )
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-)
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -175,12 +173,12 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
     with pytest.raises(RuntimeError, match="counter size arguments observed"):
         FlashInferTrtllmGenFmha.prepare_workspace(
             fmha,
-            params=SimpleNamespace(
-                qkv_or_q=SimpleNamespace(device=torch.device("cuda", 0)),
-                fwd=SimpleNamespace(),
-                workspace=SimpleNamespace(),
-            ),
+            q=SimpleNamespace(device=torch.device("cuda", 0)),
+            k=None,
+            v=None,
             metadata=metadata,
+            forward_args=SimpleNamespace(),
+            workspace=SimpleNamespace(),
         )
 
 
@@ -206,13 +204,9 @@ def test_prepare_workspace_sizes_generation_for_max_num_sequences(
         _multi_ctas_kv_counter=torch.empty(0, dtype=torch.uint8),
         _use_fp8_context_fmha=lambda *args: False,
     )
-    params = FmhaParams(
-        qkv_or_q=q,
-        workspace=workspace,
-        fwd=AttentionForwardArgs(
-            output=torch.empty_like(q),
-            attention_input_type=AttentionInputType.generation_only,
-        ),
+    forward_args = make_fmha_forward_args(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.generation_only,
     )
     metadata = SimpleNamespace(
         max_num_sequences=max_num_sequences,
@@ -221,7 +215,9 @@ def test_prepare_workspace_sizes_generation_for_max_num_sequences(
         is_cuda_graph=False,
     )
 
-    FlashInferTrtllmGenFmha.prepare_workspace(fmha, params, metadata)
+    FlashInferTrtllmGenFmha.prepare_workspace(
+        fmha, q, None, None, metadata, forward_args, workspace
+    )
 
     workspace_size.assert_called_once_with(
         dtype=q.dtype,
@@ -300,7 +296,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         num_contexts=2,
     )
     output = torch.empty((batch_size, 2, 4))
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.mixed,
     )
@@ -350,7 +346,7 @@ def test_flashinfer_mla_generation_uses_phase_sequence_length(
 ) -> None:
     sequence_length = torch.tensor([99, 7, 19], dtype=torch.int32)[1:]
     params = FmhaParams(
-        fwd=AttentionForwardArgs(),
+        fwd=make_fmha_forward_args(),
         qkv_or_q=torch.empty((2, 2, 576), dtype=torch.bfloat16),
         output=torch.empty((2, 2, 512), dtype=torch.bfloat16),
         workspace=torch.empty(4, dtype=torch.uint8),
@@ -421,7 +417,7 @@ def _cute_dsl_mla_helix_support(
         ),
         tokens_per_block=64,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         softmax_stats_tensor=softmax_stats,

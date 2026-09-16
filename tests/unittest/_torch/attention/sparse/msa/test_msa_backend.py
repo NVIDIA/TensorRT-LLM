@@ -1221,6 +1221,7 @@ def test_the_pair_takes_one_phase_each_and_a_mixed_step_together(
         AttentionForwardArgs,
         AttentionInputType,
     )
+    from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
 
     attention, libraries = _phase_libraries()
     # CombinedFmha's PhasedFmha.__init__ reads the layer's head geometry.
@@ -1238,7 +1239,10 @@ def test_the_pair_takes_one_phase_each_and_a_mixed_step_together(
         num_ctx_tokens=num_contexts,
         use_spec_decoding=False,
     )
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.mixed)
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.mixed,
+        sparse_runtime_params=SparseRuntimeParams(),
+    )
 
     # The whole-step query, which the manager asks first.
     assert not any(

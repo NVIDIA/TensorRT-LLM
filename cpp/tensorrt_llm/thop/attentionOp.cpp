@@ -1282,7 +1282,7 @@ int AttentionOp::mlaGeneration(MlaParams<T>& params, FmhaParams const& p, cudaSt
                 tllmRunnerParams.kvPtr = p.sparse_params.sparse_kv_cache_pool;
             }
 
-            if (mUseNvfp4MlaKvCache)
+            if (!useDynamicSparseMLA && mUseNvfp4MlaKvCache)
             {
                 // Static sparse MLA indexes a compact KV pool containing at most
                 // mSparseTopK rows per query. Do not let the original dense KV

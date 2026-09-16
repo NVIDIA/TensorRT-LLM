@@ -20,7 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from fmha_test_utils import make_fake_metadata
+from fmha_test_utils import make_fake_metadata, make_fmha_forward_args
 from packaging.version import Version
 
 import tensorrt_llm._torch.attention.backends.fmha.prims_ts as prims_ts_module
@@ -35,7 +35,6 @@ from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
     AttentionInputType,
     PredefinedAttentionMask,
 )
@@ -46,20 +45,8 @@ from tensorrt_llm.bindings import DataType
 
 
 def _prepare_workspace(fmha, q, metadata, forward_args, workspace) -> None:
-    """Call ``prepare_workspace`` the way ``PhasedFmha.forward`` does.
-
-    Sizing happens before the phase split, so the params carry the whole batch.
-    """
-    fmha.prepare_workspace(
-        FmhaParams(
-            attn=fmha.attn,
-            meta=metadata,
-            fwd=forward_args,
-            workspace=workspace,
-            qkv_or_q=q,
-        ),
-        metadata,
-    )
+    """Prepare the whole batch's workspace before splitting it into phases."""
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
 
 
 class _TensorSpec:
@@ -149,7 +136,7 @@ def test_mla_fixture_generation_output_size(rope_append: bool, expected_head_siz
         None,
         None,
         make_fake_metadata(),
-        AttentionForwardArgs(
+        make_fmha_forward_args(
             output=output,
             attention_input_type=AttentionInputType.generation_only,
         ),
@@ -232,7 +219,7 @@ def _support_result(
         q_width += 2 * attn.num_kv_heads * head_dim
     q = _TensorSpec((4, q_width), dtype)
     output_width = attn.num_heads * (512 if is_mla else head_dim)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=_TensorSpec((4, output_width), output_dtype) if has_output else None,
         attention_input_type=attention_input_type,
         attention_mask=PredefinedAttentionMask.CAUSAL,
@@ -377,7 +364,7 @@ def test_is_supported_accepts_and_forwards_phase_keyword(
     monkeypatch.setattr(fmha, "_is_supported_with_reason", support_check)
     q = Mock(spec=torch.Tensor)
     metadata = SimpleNamespace()
-    forward_args = AttentionForwardArgs()
+    forward_args = make_fmha_forward_args()
 
     assert fmha.is_supported(
         q,
@@ -946,7 +933,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         max_seq_len=128,
     )
     output = torch.empty((3, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.context_only,
         attention_window_size=64,
@@ -1151,7 +1138,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     )
     total_num_blocks = fmha._get_total_num_blocks(metadata)
     output = torch.empty((2, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
@@ -1488,7 +1475,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
     )
     output = torch.empty((2, attn.num_heads, 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
@@ -1731,7 +1718,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     )
     total_num_blocks = fmha._get_total_num_blocks(metadata)
     output = torch.empty((2, attn.num_heads, 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
@@ -1833,7 +1820,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
         kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
     )
     output = torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=96,
@@ -1877,7 +1864,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
         kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
     )
     output = torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=96,
@@ -1914,7 +1901,7 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
         tokens_per_block=32,
         kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=96,
@@ -1958,7 +1945,7 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
         num_ctx_tokens=0,
         tokens_per_block=32,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((2, 8 * 128), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=128,
@@ -2013,7 +2000,7 @@ def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(
         num_ctx_tokens=4,
         tokens_per_block=32,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((6, 8 * 128), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=128,
@@ -2060,7 +2047,7 @@ def test_workspace_cannot_grow_during_capture(monkeypatch: pytest.MonkeyPatch) -
         tokens_per_block=32,
         kv_lens_runtime=torch.tensor([64, 96], dtype=torch.int32),
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((2, 8 * 128), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=128,
@@ -2105,7 +2092,7 @@ def test_phased_forward_routes_mixed_batch_to_context_and_generation(
         prompt_lens_cuda_runtime=torch.tensor([3, 1, 1], dtype=torch.int32),
         prompt_lens_cpu_runtime=torch.tensor([3, 1, 1], dtype=torch.int32),
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=128,

@@ -238,8 +238,12 @@ class PhasedFmha(Fmha):
 
     def prepare_workspace(
         self,
-        params: FmhaParams,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
     ) -> None:
         pass
 
@@ -274,6 +278,7 @@ class PhasedFmha(Fmha):
                 f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attention_input_type}."
             )
 
+        self.prepare_workspace(q, k, v, metadata, forward_args, workspace)
         params = self._build_params(
             q,
             k,
@@ -282,7 +287,6 @@ class PhasedFmha(Fmha):
             forward_args,
             workspace,
         )
-        self.prepare_workspace(params, metadata)
 
         out_tensor = cast(torch.Tensor, params.output)
 

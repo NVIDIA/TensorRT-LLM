@@ -17,16 +17,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention
+from fmha_test_utils import FakeAttention, make_fmha_forward_args
 
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
 )
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-)
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -91,7 +88,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
         phases = (None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION)
     num_tokens = num_contexts + num_generations
     q = torch.empty((num_tokens, 3 * attn.head_dim), dtype=dtype)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((num_tokens, attn.head_dim), dtype=dtype),
         attention_input_type=input_type,
         is_fused_qkv=True,
@@ -149,7 +146,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
         tokens_per_block=64,
         beam_width=1,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((1, q_hidden_size), dtype=dtype),
         attention_input_type=AttentionInputType.context_only,
         is_fused_qkv=True,

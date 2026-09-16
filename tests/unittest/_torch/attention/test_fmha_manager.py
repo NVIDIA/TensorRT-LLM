@@ -20,14 +20,13 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
+from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha, make_fmha_forward_args
 
 from tensorrt_llm._torch.attention.backends.fmha import manager as fmha_manager
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
     AttentionInputType,
     PredefinedAttentionMask,
 )
@@ -89,7 +88,7 @@ def test_select_non_mla_fmha_combines_supported_phases() -> None:
         None,
         None,
         _make_metadata(num_contexts=1, num_generations=1, num_ctx_tokens=1),
-        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+        make_fmha_forward_args(attention_input_type=AttentionInputType.mixed),
     )
 
     assert isinstance(selected, CombinedFmha)
@@ -118,7 +117,7 @@ def test_select_non_mla_fmha_checks_followup_support() -> None:
         None,
         None,
         _make_metadata(num_contexts=1, num_generations=1, num_ctx_tokens=1),
-        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+        make_fmha_forward_args(attention_input_type=AttentionInputType.mixed),
     )
 
     assert selected is None
@@ -148,7 +147,7 @@ def test_select_non_mla_fmha_reuses_one_implementation() -> None:
         None,
         None,
         _make_metadata(num_contexts=1, num_generations=1, num_ctx_tokens=1),
-        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+        make_fmha_forward_args(attention_input_type=AttentionInputType.mixed),
     )
 
     assert selected is fmha
@@ -173,7 +172,7 @@ def test_select_non_mla_fmha_skips_same_phased_implementation_after_full_rejecti
         None,
         None,
         _make_metadata(num_contexts=1, num_generations=1),
-        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+        make_fmha_forward_args(attention_input_type=AttentionInputType.mixed),
     )
 
     assert selected is fallback_fmha
@@ -197,7 +196,7 @@ def test_select_non_mla_fmha_uses_context_only_phased_implementation() -> None:
         None,
         None,
         _make_metadata(num_contexts=1, num_generations=0),
-        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+        make_fmha_forward_args(attention_input_type=AttentionInputType.mixed),
     )
 
     assert selected is context_fmha
@@ -225,7 +224,7 @@ def test_select_non_mla_fmha_preserves_registry_order() -> None:
         None,
         None,
         _make_metadata(num_contexts=1, num_generations=1, num_ctx_tokens=1),
-        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+        make_fmha_forward_args(attention_input_type=AttentionInputType.mixed),
     )
 
     assert selected is non_phased_fmha
@@ -253,7 +252,7 @@ def test_fmha_cache_separates_generation_q_boundaries(
     manager.fmha_libs = [upper_boundary_fmha, fallback]
     batch_size = 128
     metadata = _make_metadata(num_contexts=0, num_generations=batch_size)
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.generation_only)
     request_order = (
         (upper_q_length, lower_q_length) if upper_first else (lower_q_length, upper_q_length)
     )
@@ -309,7 +308,7 @@ def test_fmha_cache_separates_generation_batch_boundaries(
     )
     fallback = FakeFmha(attn, "fallback", events)
     manager.fmha_libs = [upper_boundary_fmha, fallback]
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.generation_only)
     request_order = (
         (upper_batch_size, lower_batch_size)
         if upper_first
@@ -363,7 +362,7 @@ def test_fmha_cache_reuses_grid_cell() -> None:
     )
     fallback = FakeFmha(attn, "fallback", events)
     manager.fmha_libs = [boundary_fmha, fallback]
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.generation_only)
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
         for batch_size, q_length in ((57, 5), (63, 7)):
@@ -403,7 +402,7 @@ def test_context_fmha_cache_uses_batch_grid_only() -> None:
     attn, manager = _make_manager()
     fmha = FakeFmha(attn, "fmha", events)
     manager.fmha_libs = [fmha]
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.context_only)
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
         first = manager.select(
@@ -450,11 +449,11 @@ def test_fmha_cache_separates_compacted_mla_phases(generation_first: bool) -> No
     requests = {
         FmhaPhase.CONTEXT: (
             torch.empty((6, 4)),
-            AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
+            make_fmha_forward_args(attention_input_type=AttentionInputType.context_only),
         ),
         FmhaPhase.GENERATION: (
             torch.empty((2, 4)),
-            AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only),
+            make_fmha_forward_args(attention_input_type=AttentionInputType.generation_only),
         ),
     }
     request_order = (
@@ -512,11 +511,11 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
         manager.fmha_libs = [implicit_mask_only, fallback]
         metadata = _make_metadata(num_contexts=0, num_generations=1)
         q = torch.empty((1, 4))
-        implicit_mask_args = AttentionForwardArgs(
+        implicit_mask_args = make_fmha_forward_args(
             attention_input_type=AttentionInputType.generation_only,
             attention_mask=PredefinedAttentionMask.CAUSAL,
         )
-        mask_data_args = AttentionForwardArgs(
+        mask_data_args = make_fmha_forward_args(
             attention_input_type=AttentionInputType.generation_only,
             attention_mask=PredefinedAttentionMask.CAUSAL,
             attention_mask_data=torch.empty((1, 1)),
@@ -552,7 +551,7 @@ def test_block_sparse_requests_only_reach_libraries_that_declare_support() -> No
     block_sparse_fmha.supports_block_sparse_inputs = True
     manager.fmha_libs = [dense_fmha, block_sparse_fmha]
     metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         attention_input_type=AttentionInputType.context_only,
         sparse_runtime_params=SparseRuntimeParams(
             block_sparse_inputs=BlockSparseForwardInputs(
@@ -594,8 +593,8 @@ def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> Non
     metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
     q = torch.empty((1, 4))
     by_mode = {
-        False: AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
-        True: AttentionForwardArgs(
+        False: make_fmha_forward_args(attention_input_type=AttentionInputType.context_only),
+        True: make_fmha_forward_args(
             attention_input_type=AttentionInputType.context_only,
             sparse_runtime_params=SparseRuntimeParams(
                 block_sparse_inputs=BlockSparseForwardInputs(
@@ -630,7 +629,7 @@ def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> N
     fallback = FakeFmha(attn, "fallback", events)
     manager.fmha_libs = [regular_only, fallback]
     q = torch.empty((4, 4))
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.generation_only)
     metadata_by_mode = {
         False: _make_metadata(
             num_contexts=0,
@@ -691,11 +690,11 @@ def test_fmha_cache_tracks_lora_output_representation() -> None:
         manager.fmha_libs = [unpacked_only, fallback]
         metadata = _make_metadata(num_contexts=0, num_generations=4)
         q = torch.empty((4, 4), dtype=torch.bfloat16)
-        lora_args = AttentionForwardArgs(
+        lora_args = make_fmha_forward_args(
             output=torch.empty((4, 4), dtype=torch.bfloat16),
             attention_input_type=AttentionInputType.generation_only,
         )
-        base_args = AttentionForwardArgs(
+        base_args = make_fmha_forward_args(
             output=torch.empty((4, 2), dtype=torch.uint8),
             output_sf=torch.empty(4, dtype=torch.uint8),
             attention_input_type=AttentionInputType.generation_only,
@@ -730,11 +729,11 @@ def test_fmha_cache_sanity_check_logs_mismatched_inputs() -> None:
     cached_metadata.beam_width = 1
     uncached_metadata = _make_metadata(num_contexts=0, num_generations=1)
     uncached_metadata.beam_width = 2
-    cached_args = AttentionForwardArgs(
+    cached_args = make_fmha_forward_args(
         attention_input_type=AttentionInputType.generation_only,
         relative_attention_max_distance=0,
     )
-    uncached_args = AttentionForwardArgs(
+    uncached_args = make_fmha_forward_args(
         attention_input_type=AttentionInputType.generation_only,
         relative_attention_max_distance=7,
     )
@@ -781,7 +780,7 @@ def test_fmha_cache_sanity_check_accepts_equivalent_combined_fmha() -> None:
     generation_fmha = FakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
     manager.fmha_libs = [context_fmha, generation_fmha]
     metadata = _make_metadata(num_contexts=1, num_generations=1, num_ctx_tokens=1)
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.mixed)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.mixed)
     q = torch.empty((2, 4))
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
@@ -841,7 +840,7 @@ def test_fmha_cache_keeps_combined_selections_immutable() -> None:
         generation_small,
         generation_large,
     ]
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.mixed)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.mixed)
     small_metadata = _make_metadata(num_contexts=1, num_generations=1, num_ctx_tokens=2)
     large_metadata = _make_metadata(num_contexts=26, num_generations=26, num_ctx_tokens=52)
 
@@ -888,7 +887,7 @@ def test_fmha_cache_is_bypassed_while_autotuning() -> None:
             num_generations=num_generations,
             num_ctx_tokens=num_ctx_tokens,
         )
-        forward_args = AttentionForwardArgs(attention_input_type=attention_input_type)
+        forward_args = make_fmha_forward_args(attention_input_type=attention_input_type)
         q = torch.empty((num_q_tokens, 4))
 
         with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=False):
@@ -917,7 +916,7 @@ def test_fmha_cache_does_not_cache_failed_selection() -> None:
     unsupported = FakePhasedFmha(attn, set(), "unsupported", events)
     manager.fmha_libs = [unsupported]
     metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.context_only)
     q = torch.empty((1, 4))
 
     with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
@@ -940,6 +939,9 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
         def __init__(self, attn: TrtllmAttention) -> None:
             super().__init__(attn, "old", events)
 
+        def release(self) -> None:
+            events.append(("release", "old"))
+
     class _NewFmha(FakeFmha):
         def __init__(self, attn: TrtllmAttention) -> None:
             quant_states_during_construction.append(attn.has_fp8_kv_cache)
@@ -948,9 +950,9 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     attn = TrtllmAttention.__new__(TrtllmAttention)
     attn.is_mla_enable = False
     attn.skip_correction_threshold = 0.0
-    attn._attention_ops = {}
+    attn._fmha_manager = None
     metadata = _make_metadata(num_contexts=0, num_generations=1)
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))
 
     with (
@@ -974,7 +976,7 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     assert attn._fmha_manager._cache == {}
     assert isinstance(attn._fmha_manager.fmha_libs[0], _NewFmha)
     assert quant_states_during_construction == [True]
-    assert events == [("support", "old", None)]
+    assert events == [("support", "old", None), ("release", "old")]
 
 
 def test_a_new_manager_does_not_reuse_a_previous_selection() -> None:
@@ -984,7 +986,7 @@ def test_a_new_manager_does_not_reuse_a_previous_selection() -> None:
     into a different lib set. A shared or module-level cache would break that.
     """
     events: list[tuple] = []
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    forward_args = make_fmha_forward_args(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))
     metadata = _make_metadata(num_contexts=0, num_generations=1)
 

@@ -87,6 +87,32 @@ struct AttentionForwardArgs
 #include "tensorrt_llm/thop/attention_forward_args_accessors.inc"
 #include "tensorrt_llm/thop/attention_forward_args_fields.inc"
 
+    // The attention entry point's dtype dispatch supplies T.
+    template <typename T>
+    T* getLatentCache() const
+    {
+        return latent_cache.has_value() ? static_cast<T*>(latent_cache.value().data_ptr()) : nullptr;
+    }
+
+    template <typename T>
+    T* getQPe() const
+    {
+        return q_pe.has_value() ? static_cast<T*>(q_pe.value().data_ptr()) : nullptr;
+    }
+
+    template <typename T>
+    T* getCrossKv() const
+    {
+        return cross_kv.has_value() ? static_cast<T*>(cross_kv.value().data_ptr()) : nullptr;
+    }
+
+    template <typename T>
+    T* getRelativeAttentionBias() const
+    {
+        return relative_attention_bias.has_value() ? static_cast<T*>(relative_attention_bias.value().data_ptr())
+                                                   : nullptr;
+    }
+
     // Handwritten for the same reason as in FmhaParams: the native view of these
     // buffers is not their dtype.
     void* getOutputSf() const
@@ -118,8 +144,8 @@ struct AttentionForwardArgs
 /// contract in full. In short: device tensors arrive pre-sliced for the phase, while host
 /// tensors, KV-cache block offsets and FP4 scaling factors arrive whole-batch: a pointer
 /// accessor applies `seq_offset` / `token_offset` itself, so call sites never pass one.
-/// Accessors stay handwritten so dtype dispatch, validation and tensor lifetimes remain
-/// explicit.
+/// Fixed-dtype pointer accessors are generated. Runtime-dispatched types and semantic
+/// views stay handwritten so dtype dispatch, validation and offsets remain explicit.
 ///
 /// A C++-only field, for state the op derives rather than receives, is declared below the
 /// generated block and filled during initialization; it stays invisible to Python. A field
@@ -153,11 +179,66 @@ struct FmhaParams
     template <typename T>
     void finalizeMlaParams(kernels::MlaParams<T>& mla) const;
 
-    // ---- generated accessors: one typed view per tensor field ----
+    // ---- generated accessors: fixed-dtype tensor views ----
 #include "tensorrt_llm/thop/fmha_params_accessors.inc"
 
     // ---- generated forwarding: reaches through `fwd` so call sites stay flat ----
 #include "tensorrt_llm/thop/fmha_params_forwarding.inc"
+
+    // The attention entry point's dtype dispatch supplies T.
+    template <typename T>
+    T* getQkvOrQ() const
+    {
+        return static_cast<T*>(qkv_or_q.data_ptr());
+    }
+
+    template <typename T>
+    T* getK() const
+    {
+        return k.has_value() ? static_cast<T*>(k.value().data_ptr()) : nullptr;
+    }
+
+    template <typename T>
+    T* getV() const
+    {
+        return v.has_value() ? static_cast<T*>(v.value().data_ptr()) : nullptr;
+    }
+
+    template <typename T>
+    T* getQkvBias() const
+    {
+        return qkv_bias.has_value() ? static_cast<T*>(qkv_bias.value().data_ptr()) : nullptr;
+    }
+
+    template <typename T>
+    T* getAlibiSlopes() const
+    {
+        return alibi_slopes.has_value() ? static_cast<T*>(alibi_slopes.value().data_ptr()) : nullptr;
+    }
+
+    template <typename T>
+    T* getLatentCache() const
+    {
+        return fwd.getLatentCache<T>();
+    }
+
+    template <typename T>
+    T* getQPe() const
+    {
+        return fwd.getQPe<T>();
+    }
+
+    template <typename T>
+    T* getCrossKv() const
+    {
+        return fwd.getCrossKv<T>();
+    }
+
+    template <typename T>
+    T* getRelativeAttentionBias() const
+    {
+        return fwd.getRelativeAttentionBias<T>();
+    }
 
     // ---- hand-written accessors: the native view differs from the tensor's dtype ----
     // These read the buffer as something the schema cannot name: an opaque pointer, or

@@ -17,15 +17,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention, FakePhasedFmha, make_fake_metadata
+from fmha_test_utils import (
+    FakeAttention,
+    FakePhasedFmha,
+    make_fake_metadata,
+    make_fmha_forward_args,
+)
 
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    CustomAttentionMask,
-)
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType, CustomAttentionMask
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
 
@@ -65,7 +66,7 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         is_cross=False,
         is_spec_decoding_enabled=False,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((7, 4)),
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=8,
@@ -107,7 +108,7 @@ def test_phased_fmha_preserves_packed_nvfp4_output() -> None:
         None,
         None,
         metadata,
-        AttentionForwardArgs(
+        make_fmha_forward_args(
             output=output,
             attention_input_type=AttentionInputType.generation_only,
         ),
@@ -141,7 +142,7 @@ def test_phased_fmha_does_not_lower_custom_mask_before_delegation() -> None:
         None,
         None,
         metadata,
-        AttentionForwardArgs(
+        make_fmha_forward_args(
             output=torch.empty((1, 4)),
             attention_input_type=AttentionInputType.context_only,
             attention_mask=CustomAttentionMask.CUSTOM,
@@ -178,7 +179,7 @@ def test_cross_attention_uses_effective_beam_width() -> None:
         None,
         None,
         metadata,
-        AttentionForwardArgs(
+        make_fmha_forward_args(
             output=torch.empty((2, 4)),
             attention_input_type=AttentionInputType.generation_only,
         ),
@@ -206,7 +207,7 @@ def test_combined_fmha_uses_flattened_v2_page_bound(local_layer_idx: int) -> Non
         None,
         None,
         make_fake_metadata(kv_cache_manager=kv_cache_manager),
-        AttentionForwardArgs(output=torch.empty((1, 4))),
+        make_fmha_forward_args(output=torch.empty((1, 4))),
         torch.empty(0, dtype=torch.uint8),
     )
     assert params.layer_idx == 42

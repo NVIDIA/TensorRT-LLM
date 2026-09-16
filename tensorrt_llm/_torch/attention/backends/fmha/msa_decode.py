@@ -22,7 +22,7 @@ module-scope import here would close a cycle.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -78,17 +78,18 @@ class MsaDecodeFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        params: FmhaParams,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
+        forward_args: "AttentionForwardArgs",
+        workspace: torch.Tensor,
     ) -> None:
-        forward_args = cast("AttentionForwardArgs", params.fwd)
         if forward_args.sparse_runtime_params.sparse_attn_indices is not None:
             # A sparse layer; the Triton kernel takes its split-K scratch from
             # the arena itself, sized by the grid it just chose.
             return
-        self._reserve_dense_workspace(
-            cast(torch.Tensor, params.qkv_or_q), metadata, cast(torch.Tensor, params.workspace)
-        )
+        self._reserve_dense_workspace(q, metadata, workspace)
 
     def _reserve_dense_workspace(
         self,

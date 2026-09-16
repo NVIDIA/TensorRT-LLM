@@ -21,8 +21,16 @@ import torch
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams, PhasedFmha
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs, RopeParams
+from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.quantization.mode import QuantMode
+
+
+def make_fmha_forward_args(**overrides: object) -> AttentionForwardArgs:
+    """Build prepared inputs for tests that bypass ``TrtllmAttention.forward``."""
+    defaults = {"sparse_runtime_params": SparseRuntimeParams()}
+    defaults.update(overrides)
+    return AttentionForwardArgs(**defaults)
 
 
 def make_fake_metadata(**overrides: object) -> SimpleNamespace:
@@ -162,9 +170,16 @@ class FakePhasedFmha(PhasedFmha):
             self._support_predicate is None or self._support_predicate(metadata, phase)
         )
 
-    def prepare_workspace(self, params: FmhaParams, metadata: object) -> None:
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        metadata: object,
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
         self._events.append(("prepare", self._name))
-        workspace = params.workspace
         if workspace is not None and workspace.numel() < self._workspace_size:
             workspace.resize_(self._workspace_size)
 

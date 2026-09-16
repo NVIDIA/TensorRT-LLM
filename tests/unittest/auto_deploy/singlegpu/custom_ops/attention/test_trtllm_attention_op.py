@@ -322,8 +322,8 @@ def test_trtllm_attention_op_decode(prefill_seq_length, batch_size, n_heads, dty
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_trtllm_attention_q_scaling(scale, head_dim, mocker):
     _reset_trtllm_planner()
-    signature = inspect.signature(FallbackFmha.run_auto_deploy_mha)
-    run_mha = mocker.patch.object(FallbackFmha, "run_auto_deploy_mha", autospec=True)
+    signature = inspect.signature(FallbackFmha.attention)
+    attention = mocker.patch.object(FallbackFmha, "attention", autospec=True)
     q = torch.randn(1, 4, 8, head_dim, dtype=torch.float16, device="cuda")
     kv_cache = torch.zeros(1, 2, 8, 32, head_dim, dtype=q.dtype, device=q.device)
 
@@ -345,11 +345,16 @@ def test_trtllm_attention_q_scaling(scale, head_dim, mocker):
         scale=scale,
     )
 
-    run_mha.assert_called_once()
-    args = signature.bind(*run_mha.call_args.args, **run_mha.call_args.kwargs).arguments
+    attention.assert_called_once()
+    args = signature.bind(*attention.call_args.args, **attention.call_args.kwargs).arguments
     effective_scale = 1.0 / (args["q_scaling"] * math.sqrt(head_dim))
     expected_scale = scale if scale is not None else 1.0 / math.sqrt(head_dim)
     assert effective_scale == pytest.approx(expected_scale)
+    assert args["is_fused_qkv"]
+    assert args["use_paged_context_fmha"]
+    assert not args["is_mla_enable"]
+    assert args["local_layer_idx"] == 0
+    assert args["beam_width"] == 1
 
 
 @pytest.mark.parametrize("scale", [None, 0.0625, 0.25])

@@ -40,7 +40,7 @@ Example:
 
 import math
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -792,13 +792,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        params: FmhaParams,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
     ) -> None:
         attn = self.attn
-        q = cast(torch.Tensor, params.qkv_or_q)
-        forward_args = cast(AttentionForwardArgs, params.fwd)
-        workspace = cast(torch.Tensor, params.workspace)
         # Lazily cache the SM count from the first query tensor's device.
         if self._multi_processor_count is None:
             self._multi_processor_count = self._get_multi_processor_count(q.device)

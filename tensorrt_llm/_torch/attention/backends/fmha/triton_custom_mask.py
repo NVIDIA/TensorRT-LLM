@@ -159,11 +159,13 @@ class TritonCustomMaskFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        params: FmhaParams,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
     ) -> None:
-        q = params.qkv_or_q
-        workspace = params.workspace
         if self._multi_processor_count is None:
             self._multi_processor_count = self._get_multi_processor_count(q.device)
 

@@ -20,8 +20,12 @@ whose import pulls in the very bindings this generator runs before. Parsing also
 means a field's annotation is read exactly as written, which is where optionality
 and the non-dtype types come from.
 
-Each field's C++ type comes from its annotation, and ``ctype`` supplies the
+Each field's C++ type comes from its annotation, and ``dtype`` supplies the
 element type the annotation cannot carry -- a tensor's dtype, or a set's.
+Supported named types, scalars, and tensors, including Optional forms, need no
+cpp_metadata: ordinary defaults and default_factory are independent of codegen. Unmarked
+tensors have no generated getter. Native schema classes are registered explicitly;
+their inclusion does not depend on any field carrying cpp_metadata.
 """
 
 from __future__ import annotations
@@ -38,6 +42,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROOT_CLASS_NAME = "FmhaParams"
 METADATA_FACTORY = "cpp_metadata"
+# Structs declared in attentionOp.h, independent of their fields' dtype metadata.
+NATIVE_STRUCT_NAMES = (
+    "StaticAttentionConfig",
+    "AttentionForwardArgs",
+    "SparseBackendForwardArgs",
+    "SparseRuntimeParams",
+)
 
 # The schema classes are spread over the modules that own them, so every source
 # is parsed and a nested member is resolved by the class its annotation names.
@@ -46,9 +57,6 @@ DEFAULT_MODULE_PATHS = (
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "interface.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "sparse" / "params.py",
 )
-
-# Template parameter for a tensor whose element type is the op's runtime dtype.
-RUNTIME_DTYPE = "QkvType"
 
 _TORCH_DTYPE_CPP = {
     "torch.bool": "bool",
@@ -61,7 +69,7 @@ _TORCH_DTYPE_CPP = {
 }
 
 # Python spells one integer and one floating type, so every scalar widens to the
-# larger native type rather than carrying a redundant ctype.
+# larger native type rather than carrying a redundant dtype.
 _ANNOTATION_CPP = {
     "bool": "bool",
     "int": "std::int64_t",
@@ -80,14 +88,12 @@ _ANNOTATION_CPP = {
 # Torch spells these itself, so the getter uses the typed data_ptr<T>() overload.
 _TORCH_TYPED_PTR = frozenset(_TORCH_DTYPE_CPP) - {"torch.uint8"}
 
-_ABSENT = object()
-
 
 @dataclass(frozen=True)
 class Field:
     name: str
     annotation: str
-    ctype: str | None | object  # a torch dtype, None, or _ABSENT
+    dtype: str | None  # a torch dtype, or None (no generated accessor)
 
 
 @dataclass(frozen=True)
@@ -120,55 +126,85 @@ def _set_element(annotation: str) -> str | None:
     return None
 
 
-def _read_struct(class_def: ast.ClassDef) -> Struct | None:
-    """Collect one class's cpp_metadata fields, or None if it declares none."""
+def _has_cpp_metadata(statement: ast.stmt) -> bool:
+    return (
+        isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.value, ast.Call)
+        and getattr(statement.value.func, "id", None) == METADATA_FACTORY
+    )
+
+
+def _read_struct(class_def: ast.ClassDef, schema_names: set[str]) -> Struct | None:
+    """Collect native fields, including references to known nested schemas."""
     fields = []
+    implicit_types = schema_names | _ANNOTATION_CPP.keys() | {"torch.Tensor"}
     for statement in class_def.body:
-        if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.value, ast.Call):
+        if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.target, ast.Name):
             continue
-        call = statement.value
-        if getattr(call.func, "id", None) != METADATA_FACTORY:
+        annotation = ast.unparse(statement.annotation)
+        explicit = _has_cpp_metadata(statement)
+        if not explicit and (_optional_inner(annotation) or annotation) not in implicit_types:
             continue
-        ctype: object = _ABSENT
-        for keyword in call.keywords:
-            if keyword.arg == "ctype":
-                ctype = (
-                    None
-                    if isinstance(keyword.value, ast.Constant) and keyword.value.value is None
-                    else ast.unparse(keyword.value)
+        dtype = None
+        if explicit:
+            for keyword in statement.value.keywords:
+                if keyword.arg not in {"dtype", "default"}:
+                    raise ValueError(
+                        f"{statement.target.id}: unsupported {METADATA_FACTORY} argument {keyword.arg}"
+                    )
+                if keyword.arg == "dtype":
+                    dtype = (
+                        keyword.value.value
+                        if isinstance(keyword.value, ast.Constant)
+                        else ast.unparse(keyword.value)
+                    )
+            if dtype is None:
+                raise ValueError(
+                    f"{statement.target.id}: {METADATA_FACTORY} needs a dtype; "
+                    "use a plain default when no generated getter is needed"
                 )
         fields.append(
             Field(
                 name=statement.target.id,
-                annotation=ast.unparse(statement.annotation),
-                ctype=ctype,
+                annotation=annotation,
+                dtype=dtype,
             )
         )
     return Struct(class_def.name, tuple(fields)) if fields else None
 
 
-def load_schemas(source_paths: Sequence[Path], root_class: str) -> Schema:
+def load_schemas(
+    source_paths: Sequence[Path],
+    root_class: str,
+    struct_names: Sequence[str] = NATIVE_STRUCT_NAMES,
+) -> Schema:
     """Read every schema class out of the given sources without importing them."""
     structs: dict[str, Struct] = {}
+    classes: dict[str, ast.ClassDef] = {}
+    selected = {root_class, *struct_names}
     for path in source_paths:
         for node in ast.parse(path.read_text()).body:
-            if not isinstance(node, ast.ClassDef):
+            if not isinstance(node, ast.ClassDef) or node.name not in selected:
                 continue
-            struct = _read_struct(node)
-            if struct is not None:
-                structs[struct.name] = struct
+            classes[node.name] = node
+    # Discover schema names first so plain nested fields work across modules,
+    # regardless of which module or class is declared first.
+    for node in classes.values():
+        struct = _read_struct(node, selected)
+        if struct is not None:
+            structs[struct.name] = struct
     if root_class not in structs:
-        raise ValueError(f"no class named {root_class} declares {METADATA_FACTORY} fields")
+        raise ValueError(f"no class named {root_class} declares native fields")
     return Schema(source=", ".join(str(p) for p in source_paths), structs=structs)
 
 
 def _element_cpp(field: Field) -> str:
-    if field.ctype is _ABSENT or field.ctype is None:
-        raise ValueError(f"{field.name}: this type needs an explicit ctype")
+    if field.dtype is None:
+        raise ValueError(f"{field.name}: this type needs an explicit dtype")
     try:
-        return _TORCH_DTYPE_CPP[field.ctype]
+        return _TORCH_DTYPE_CPP[field.dtype]
     except KeyError:
-        raise ValueError(f"{field.name}: unsupported ctype {field.ctype}") from None
+        raise ValueError(f"{field.name}: unsupported dtype {field.dtype}") from None
 
 
 def render_field_type(schema: Schema, field: Field, annotation: str | None = None) -> str:
@@ -229,9 +265,8 @@ def _is_tensor(field: Field) -> bool:
 
 def _render_accessor(field: Field) -> list[str]:
     """Render one tensor getter: the pointer the kernels expect, or nullptr if absent."""
-    templated = field.ctype is _ABSENT
-    pointer = RUNTIME_DTYPE if templated else _element_cpp(field)
-    if templated or field.ctype not in _TORCH_TYPED_PTR:
+    pointer = _element_cpp(field)
+    if field.dtype not in _TORCH_TYPED_PTR:
         read = "static_cast<" + pointer + "*>({0}.data_ptr())"
     else:
         read = "{0}.data_ptr<" + pointer + ">()"
@@ -242,20 +277,18 @@ def _render_accessor(field: Field) -> list[str]:
     else:
         body = f"return {read.format(name)};"
 
-    lines = [f"template <typename {pointer}>"] if templated else []
-    lines += [f"{pointer}* {_accessor_name(name)}() const", "{", f"    {body}", "}"]
-    return lines
+    return [f"{pointer}* {_accessor_name(name)}() const", "{", f"    {body}", "}"]
 
 
 def render_accessors(schema: Schema, struct: Struct) -> str:
     """Render the getters that are a plain typed view of a tensor field.
 
-    A field with ``ctype=None`` is skipped: its native view is not its dtype, so
-    the getter is handwritten next to the ones that take an index or a size.
+    Unmarked tensors use handwritten getters for runtime-dispatched pointer
+    types and semantic views that need offsets or a different buffer layout.
     """
     lines = _header_lines(schema, struct)
     for field in struct.fields:
-        if not _is_tensor(field) or field.ctype is None:
+        if not _is_tensor(field) or field.dtype is None:
             continue
         lines.extend(_render_accessor(field))
         lines.append("")
@@ -264,7 +297,7 @@ def render_accessors(schema: Schema, struct: Struct) -> str:
 
 def _accessor_names(schema: Schema, struct: Struct) -> set[str]:
     """Names a struct answers itself, generated or forwarded."""
-    names = {_accessor_name(f.name) for f in struct.fields if _is_tensor(f) and f.ctype is not None}
+    names = {_accessor_name(f.name) for f in struct.fields if _is_tensor(f) and f.dtype is not None}
     for field in struct.fields:
         nested = schema.nested(field)
         if nested is not None:
@@ -280,7 +313,7 @@ def render_forwarding(schema: Schema, struct: Struct) -> str:
     `attention_mask` mean different things at the two levels.
     """
     lines = _header_lines(schema, struct)
-    own = {_accessor_name(f.name) for f in struct.fields if _is_tensor(f) and f.ctype is not None}
+    own = {_accessor_name(f.name) for f in struct.fields if _is_tensor(f) and f.dtype is not None}
     seen = set(own)
     for field in struct.fields:
         nested = schema.nested(field)
@@ -291,15 +324,11 @@ def render_forwarding(schema: Schema, struct: Struct) -> str:
             if name in seen:
                 continue
             seen.add(name)
-            templated = inner.ctype is _ABSENT
-            pointer = RUNTIME_DTYPE if templated else _element_cpp(inner)
-            call = f"{name}<{pointer}>()" if templated else f"{name}()"
-            if templated:
-                lines.append(f"template <typename {pointer}>")
+            pointer = _element_cpp(inner)
             lines += [
                 f"{pointer}* {name}() const",
                 "{",
-                f"    return {prefix}.{call};",
+                f"    return {prefix}.{name}();",
                 "}",
                 "",
             ]
@@ -312,7 +341,7 @@ def _forwardable(schema: Schema, struct: Struct, prefix: str):
         nested = schema.nested(field)
         if nested is not None:
             yield from _forwardable(schema, nested, f"{prefix}.{field.name}")
-        elif _is_tensor(field) and field.ctype is not None:
+        elif _is_tensor(field) and field.dtype is not None:
             yield field, prefix
 
 

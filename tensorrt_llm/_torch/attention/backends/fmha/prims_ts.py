@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -656,12 +656,15 @@ class PrimsTSFmha(PhasedFmha):
         self._mla_decode_wrappers[batch_size] = wrapper
         return wrapper
 
-    def prepare_workspace(self, params: FmhaParams, metadata: "TrtllmAttentionMetadata") -> None:
-        # Sizing runs before the phase split, so `params` still describes the whole
-        # batch: `qkv_or_q` is the full q and `workspace` the buffer to grow.
-        q = cast(torch.Tensor, params.qkv_or_q)
-        forward_args = cast(AttentionForwardArgs, params.fwd)
-        workspace = cast(torch.Tensor, params.workspace)
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
         block_offsets = metadata.kv_cache_block_offsets
         if block_offsets is None:
             raise RuntimeError("PrimTS requires paged KV-cache block offsets.")

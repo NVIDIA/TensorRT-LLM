@@ -905,93 +905,59 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
-    # Caller-facing output buffer, allocated here when absent. It is Python-only:
-    # the native side is handed the per-phase slice as ``FmhaParams.output``.
+    # Caller-facing output buffer, allocated here when absent. Native kernels
+    # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
-    output_sf: Optional[torch.Tensor] = cpp_metadata(ctype=None, default=None)
+    output_sf: Optional[torch.Tensor] = None
     kv_scale_orig_quant: Optional[torch.Tensor] = cpp_metadata(
-        ctype=torch.float32, default=None)
+        dtype=torch.float32)
     kv_scale_quant_orig: Optional[torch.Tensor] = cpp_metadata(
-        ctype=torch.float32, default=None)
-    out_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
-                                                     default=None)
-    out_scale_sf: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
-                                                        default=None)
-    latent_cache: Optional[torch.Tensor] = cpp_metadata(default=None)
-    q_pe: Optional[torch.Tensor] = cpp_metadata(default=None)
-    mrope_rotary_cos_sin: Optional[torch.Tensor] = cpp_metadata(ctype=None,
-                                                                default=None)
+        dtype=torch.float32)
+    out_scale: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
+    out_scale_sf: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
+    latent_cache: Optional[torch.Tensor] = None
+    q_pe: Optional[torch.Tensor] = None
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
     mrope_position_deltas: Optional[torch.Tensor] = cpp_metadata(
-        ctype=torch.int32, default=None)
-    softmax_stats_tensor: Optional[torch.Tensor] = cpp_metadata(ctype=None,
-                                                                default=None)
-    attention_sinks: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
-                                                           default=None)
-    cu_q_seqlens: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32,
-                                                        default=None)
-    cu_kv_seqlens: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32,
-                                                         default=None)
+        dtype=torch.int32)
+    softmax_stats_tensor: Optional[torch.Tensor] = None
+    attention_sinks: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
+    cu_q_seqlens: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    cu_kv_seqlens: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
     fmha_scheduler_counter: Optional[torch.Tensor] = cpp_metadata(
-        ctype=torch.uint32, default=None)
-    mla_bmm1_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
-                                                          default=None)
-    mla_bmm2_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
-                                                          default=None)
-    quant_q_buffer: Optional[torch.Tensor] = cpp_metadata(ctype=None,
-                                                          default=None)
-    cross_kv: Optional[torch.Tensor] = cpp_metadata(default=None)
-    relative_attention_bias: Optional[torch.Tensor] = cpp_metadata(default=None)
-    quant_scale_qkv: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
-                                                           default=None)
+        dtype=torch.uint32)
+    mla_bmm1_scale: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
+    mla_bmm2_scale: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
+    quant_q_buffer: Optional[torch.Tensor] = None
+    cross_kv: Optional[torch.Tensor] = None
+    relative_attention_bias: Optional[torch.Tensor] = None
+    quant_scale_qkv: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_metadata(
-        ctype=torch.float32, default=None)
-    enable_dsv4_epilogue_fusion: bool = cpp_metadata(default=False)
+        dtype=torch.float32)
+    enable_dsv4_epilogue_fusion: bool = False
 
     # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
     # RAW kv_a_proj output and the context RoPE kernel norms it before RoPE + quant +
     # paged write, so the caller drops its own RMSNorm and concat.
-    kv_norm_weight: Optional[torch.Tensor] = cpp_metadata(ctype=None,
-                                                          default=None)
-    kv_norm_eps: float = cpp_metadata(default=1e-06)
+    kv_norm_weight: Optional[torch.Tensor] = None
+    kv_norm_eps: float = 1e-6
 
-    attention_mask: AttentionMask = None
-    attention_input_type: AttentionInputType = cpp_metadata(default=None)
-    attention_window_size: Optional[int] = cpp_metadata(default=None)
-    attention_mask_data: Optional[torch.Tensor] = cpp_metadata(ctype=torch.bool,
-                                                               default=None)
-    relative_attention_max_distance: int = cpp_metadata(default=0)
-    chunked_prefill_buffer_batch_size: int = cpp_metadata(default=1)
-    skip_mla_rope_generation: bool = cpp_metadata(default=False)
-    sage_attn_num_elts_per_blk_q: int = cpp_metadata(default=0)
-    sage_attn_num_elts_per_blk_k: int = cpp_metadata(default=0)
-    sage_attn_num_elts_per_blk_v: int = cpp_metadata(default=0)
-    sage_attn_qk_int8: bool = cpp_metadata(default=False)
-    is_fused_qkv: bool = cpp_metadata(default=False)
-    update_kv_cache: bool = cpp_metadata(default=True)
-    timestep: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32,
-                                                    default=None)
-    sparse_backend_args: Optional[SparseBackendForwardArgs] = cpp_metadata(
-        default=None)
-    sparse_runtime_params: SparseRuntimeParams = cpp_metadata(default=None)
-
-    def __post_init__(self) -> None:
-        # These types live in modules that import this one; resolve them after
-        # interface.py has finished defining its enums.
-        if self.attention_mask is None:
-            from tensorrt_llm._torch.attention.backends.interface import \
-                PredefinedAttentionMask
-
-            self.attention_mask = PredefinedAttentionMask.CAUSAL
-        if self.attention_input_type is None:
-            from tensorrt_llm._torch.attention.backends.interface import \
-                AttentionInputType
-
-            self.attention_input_type = AttentionInputType.mixed
-        if self.sparse_runtime_params is None:
-            from tensorrt_llm._torch.attention.backends.sparse.params import \
-                SparseRuntimeParams
-
-            self.sparse_runtime_params = SparseRuntimeParams()
+    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
+    attention_input_type: AttentionInputType = AttentionInputType.mixed
+    attention_window_size: Optional[int] = None
+    attention_mask_data: Optional[torch.Tensor] = cpp_metadata(dtype=torch.bool)
+    relative_attention_max_distance: int = 0
+    chunked_prefill_buffer_batch_size: int = 1
+    skip_mla_rope_generation: bool = False
+    sage_attn_num_elts_per_blk_q: int = 0
+    sage_attn_num_elts_per_blk_k: int = 0
+    sage_attn_num_elts_per_blk_v: int = 0
+    sage_attn_qk_int8: bool = False
+    is_fused_qkv: bool = False
+    update_kv_cache: bool = True
+    timestep: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    sparse_backend_args: Optional[SparseBackendForwardArgs] = None
+    sparse_runtime_params: Optional[SparseRuntimeParams] = None
 
     @property
     def mask_type(self) -> AttentionMaskType:

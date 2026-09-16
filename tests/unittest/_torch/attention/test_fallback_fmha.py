@@ -21,26 +21,32 @@ refuse them itself rather than lower them and read back an untouched output.
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
+from contextlib import nullcontext
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention, make_fake_metadata
+from fmha_test_utils import FakeAttention, make_fake_metadata, make_fmha_forward_args
 from torch._dynamo.testing import CompileCounter
 
-from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
+from tensorrt_llm._torch.attention.backends.fmha import fallback as fallback_backend
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.fallback import (
     FallbackFmha,
+    _AttentionOpCache,
+    _legacy_forward_args,
     _set_context_workspace_shape,
 )
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaParams, StaticAttentionConfig
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
     AttentionInputType,
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm.functional import AttentionMaskType
 
 
 @pytest.mark.parametrize(
@@ -55,7 +61,7 @@ def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_ca
     """Do not dispatch requests that the native attention op rejects."""
     fmha = object.__new__(FallbackFmha)
     metadata = SimpleNamespace(is_cross=is_cross)
-    forward_args = AttentionForwardArgs(update_kv_cache=update_kv_cache)
+    forward_args = make_fmha_forward_args(update_kv_cache=update_kv_cache)
 
     assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
 
@@ -64,7 +70,7 @@ def test_fallback_rejects_raw_fp8_input():
     """Do not dispatch raw FP8 QKV to the native attention op."""
     fmha = object.__new__(FallbackFmha)
     metadata = SimpleNamespace(is_cross=False)
-    forward_args = AttentionForwardArgs(update_kv_cache=True)
+    forward_args = make_fmha_forward_args(update_kv_cache=True)
     q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
 
     assert not fmha.is_supported(q, None, None, metadata, forward_args)
@@ -135,25 +141,19 @@ def test_prepare_workspace_keeps_scheduler_and_multi_ctas_counters_separate(monk
         "tensorrt_llm._torch.attention.backends.fmha.fallback.get_multi_ctas_kv_counter",
         allocate_counter,
     )
-    monkeypatch.setattr(FallbackFmha, "_to_thop_params", lambda self, params: object())
-
-    fmha = object.__new__(FallbackFmha)
-    attn = SimpleNamespace(num_heads=8, attention_op=lambda params: AttentionOp())
-    fmha._attn_ref = lambda: attn
-    fmha._multi_ctas_kv_counter = None
-    params = FmhaParams(
-        fwd=AttentionForwardArgs(
-            attention_input_type=AttentionInputType.generation_only,
-            fmha_scheduler_counter=scheduler_counter,
-        ),
-        qkv_or_q=torch.empty((1, 8)),
-        workspace=torch.empty(0, dtype=torch.uint8),
-        host_context_lengths=torch.empty(0, dtype=torch.int32),
-        host_past_key_value_lengths=torch.empty(0, dtype=torch.int32),
-        cyclic_attention_window_size=128,
-        max_attention_window_size=128,
+    attn = FakeAttention()
+    attn.num_heads = 8
+    fmha = FallbackFmha(attn)
+    fmha.attention_op = lambda params: AttentionOp()
+    q = torch.empty((1, 32))
+    workspace = torch.empty(0, dtype=torch.uint8)
+    forward_args = make_fmha_forward_args(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.generation_only,
+        attention_window_size=128,
+        fmha_scheduler_counter=scheduler_counter,
     )
-    metadata = SimpleNamespace(
+    metadata = make_fake_metadata(
         num_generations=1,
         num_contexts=0,
         num_ctx_tokens=0,
@@ -163,43 +163,182 @@ def test_prepare_workspace_keeps_scheduler_and_multi_ctas_counters_separate(monk
         effective_beam_width=1,
     )
 
-    fmha.prepare_workspace(params, metadata)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
 
-    assert allocations == [(None, params.qkv_or_q.device, 8, 4)]
+    assert allocations == [(None, q.device, 8, 4)]
+    # Execution gets fresh parameters, not the private sizing parameters.
+    params = fmha._build_params(q, None, None, metadata, forward_args, workspace)
+    assert params.multi_ctas_kv_counter is None
+    fmha._to_thop_params(params)
     assert params.fwd.fmha_scheduler_counter is scheduler_counter
     assert params.multi_ctas_kv_counter is multi_ctas_kv_counter
 
 
-def test_attention_op_cache_separates_static_configurations(monkeypatch):
-    class FakeStaticConfig(str):
-        def to_thop_config(self):
-            return str(self)
-
+@pytest.fixture
+def native_ops(monkeypatch):
     created = []
 
     class AttentionOp:
         def __init__(self, config):
             self.config = config
-            created.append(config)
+            self.calls = []
+            created.append(self)
 
-    monkeypatch.setattr(
-        StaticAttentionConfig,
-        "from_params",
-        classmethod(lambda cls, params, **kwargs: params),
+        def get_attention_workspace_size(self, params, *args):
+            return 0
+
+        def run_context(self, params):
+            self.calls.append(params)
+
+        def run_generation(self, params):
+            self.calls.append(params)
+
+    monkeypatch.setattr(StaticAttentionConfig, "to_thop_config", lambda self: self)
+    monkeypatch.setattr(fallback_backend.thop, "AttentionOp", AttentionOp)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    fallback_backend._compat_attention_ops.clear()
+    yield created
+    fallback_backend._compat_attention_ops.clear()
+
+
+def test_attention_op_cache_separates_static_configurations(native_ops):
+    attn = FakeAttention()
+    fallback = FallbackFmha(attn)
+    params = FmhaParams(
+        fwd=make_fmha_forward_args(),
+        qkv_or_q=torch.empty((1, 12), dtype=torch.bfloat16),
+        output=torch.empty((1, 4), dtype=torch.bfloat16),
+        num_heads=1,
+        num_kv_heads=1,
+        head_size=4,
     )
-    monkeypatch.setattr(trtllm_backend, "thop", SimpleNamespace(AttentionOp=AttentionOp))
-    owner = SimpleNamespace(_attention_ops={}, skip_correction_threshold=0.0)
-    causal = FakeStaticConfig("causal")
-    full = FakeStaticConfig("full")
+    causal_op = fallback.attention_op(params)
+    assert fallback.attention_op(params) is causal_op
+    # Dynamic buffers and shapes are not part of the runner's static configuration.
+    dynamic = dataclasses.replace(
+        params, qkv_or_q=torch.empty((2, 12), dtype=torch.bfloat16), num_tokens=2
+    )
+    assert fallback.attention_op(dynamic) is causal_op
+    full = dataclasses.replace(
+        params, fwd=make_fmha_forward_args(attention_mask=PredefinedAttentionMask.FULL)
+    )
+    assert fallback.attention_op(full) is not causal_op
+    assert FallbackFmha(attn).attention_op(params) is not causal_op
+    assert len(native_ops) == 3
+    fallback.release()
+    assert fallback.attention_op(params) is not causal_op
 
-    causal_op = TrtllmAttention.attention_op(owner, causal)
 
-    assert TrtllmAttention.attention_op(owner, causal) is causal_op
-    assert TrtllmAttention.attention_op(owner, full) is not causal_op
-    assert created == ["causal", "full"]
+def test_attention_op_cache_isolates_devices_and_threads(native_ops, monkeypatch):
+    cache = _AttentionOpCache()
+    config = StaticAttentionConfig(num_heads=8)
+    first = cache.get(config, torch.device("cuda:0"))
+    assert cache.get(config, torch.device("cuda:0")) is first
+    assert cache.get(config, torch.device("cuda:1")) is not first
+    other_thread = Thread()
+    monkeypatch.setattr(fallback_backend, "current_thread", lambda: other_thread)
+    assert cache.get(config, torch.device("cuda:0")) is not first
+    assert len(native_ops) == 3
 
-    TrtllmAttention.release(owner)
-    assert owner._attention_ops == {}
+
+def test_compat_attention_caches_static_args_but_not_inputs(native_ops):
+    # Supply neutral values for the legacy signature's unrelated optional features.
+    kwargs = {
+        name: {bool: False, int: 0, float: 1.0}.get(parameter.annotation)
+        for name, parameter in inspect.signature(FallbackFmha.attention).parameters.items()
+        if parameter.default is inspect.Parameter.empty
+    }
+    kwargs.update(
+        output=torch.empty((1, 4), dtype=torch.bfloat16),
+        workspace=torch.empty(0, dtype=torch.uint8),
+        sequence_length=torch.tensor([1], dtype=torch.int32),
+        host_past_key_value_lengths=torch.tensor([0], dtype=torch.int32),
+        host_total_kv_lens=torch.tensor([1, 0], dtype=torch.int32),
+        context_lengths=torch.tensor([1], dtype=torch.int32),
+        host_context_lengths=torch.tensor([1], dtype=torch.int32),
+        kv_cache_block_offsets=torch.zeros((1, 1, 2, 4), dtype=torch.int32),
+        host_kv_cache_pool_pointers=torch.zeros((1, 2), dtype=torch.int64),
+        host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
+        num_heads=1,
+        num_kv_heads=1,
+        head_size=4,
+        tokens_per_block=32,
+        max_num_requests=1,
+        max_context_length=128,
+        max_seq_len=128,
+        attention_window_size=128,
+        mask_type=AttentionMaskType.causal,
+        num_contexts=1,
+        num_ctx_tokens=1,
+        beam_width=1,
+        predicted_tokens_per_seq=1,
+        q=torch.zeros((1, 12), dtype=torch.bfloat16),
+    )
+    FallbackFmha.attention(**kwargs)
+    first = native_ops[0]
+    kwargs["q"] = torch.ones((1, 12), dtype=torch.bfloat16)
+    kwargs["host_past_key_value_lengths"] = torch.tensor([4], dtype=torch.int32)
+    FallbackFmha.attention(**kwargs)
+    assert len(native_ops) == 1
+    assert len(first.calls) == 2
+    assert first.calls[0] is not first.calls[1]
+    assert first.calls[1].qkv_or_q.data_ptr() == kwargs["q"].data_ptr()
+    assert first.calls[1].max_past_kv_length == 4
+    assert first.calls[1].local_layer_idx == 0
+    kwargs["mask_type"] = AttentionMaskType.padding
+    FallbackFmha.attention(**kwargs)
+    assert len(native_ops) == 2
+    assert native_ops[-1].config.mask_type == AttentionMaskType.padding
+    kwargs["output"] = torch.empty((1, 4), dtype=torch.float8_e4m3fn)
+    FallbackFmha.attention(**kwargs)
+    assert len(native_ops) == 3
+    assert native_ops[-1].config.is_fp8_out
+
+    kwargs.update(
+        output=torch.empty((1, 4), dtype=torch.bfloat16),
+        mask_type=AttentionMaskType.causal,
+        attention_input_type=AttentionInputType.generation_only,
+        num_ctx_tokens=0,
+        # Decode-only Q, but metadata still has one prefill before decode.
+        host_context_lengths=torch.tensor([16, 1], dtype=torch.int32),
+        host_past_key_value_lengths=torch.tensor([0, 4], dtype=torch.int32),
+        host_total_kv_lens=torch.tensor([16, 5], dtype=torch.int32),
+        context_lengths=torch.tensor([16, 1], dtype=torch.int32),
+        sequence_length=torch.tensor([16, 5], dtype=torch.int32),
+    )
+    FallbackFmha.attention(**kwargs)
+    assert len(native_ops) == 3
+    decode = first.calls[-1]
+    assert decode.seq_offset == 1
+    assert decode.num_seqs == 1
+    assert decode.input_seq_length == 1
+    assert decode.sequence_length.tolist() == [5]
+
+
+def test_legacy_forward_args_preserves_nested_native_inputs():
+    tensor = torch.empty(1)
+    args = _legacy_forward_args(
+        {
+            "mask_type": AttentionMaskType.padding,
+            "kv_scale_orig_quant": tensor,
+            "out_scale": tensor,
+            "latent_cache": tensor,
+            "q_pe": tensor,
+            "sage_attn_qk_int8": True,
+            "sparse_attn_indices": tensor,
+            "skip_softmax_threshold_scale_factor_prefill": 0.5,
+            "chunked_prefill_buffer_batch_size": None,
+        }
+    )
+    assert args.mask_type == AttentionMaskType.padding
+    assert args.kv_scale_orig_quant is tensor
+    assert args.out_scale is tensor
+    assert args.latent_cache is tensor
+    assert args.q_pe is tensor
+    assert args.sage_attn_qk_int8
+    assert args.sparse_runtime_params.sparse_attn_indices is tensor
+    assert args.sparse_runtime_params.threshold_scale_factor_prefill == 0.5
+    assert args.chunked_prefill_buffer_batch_size == 1
 
 
 @pytest.mark.parametrize(
@@ -249,17 +388,18 @@ def test_fallback_native_phases_stay_eager_under_compile(
     monkeypatch.setattr(FallbackFmha, "_to_thop_params", to_thop_params)
     op = AttentionOp()
     attn = FakeAttention()
-    attn.attention_op = lambda params: op
     fallback = FallbackFmha(attn)
+    fallback.attention_op = lambda params: op
     fmha = fallback
     if combined:
         fmha = CombinedFmha(attn)
         fmha.set_fmha_impls(fallback, fallback)
     method = getattr(fmha, method_name)
     workspace = torch.empty(0, dtype=torch.uint8)
+    output = torch.empty((1, 4))
     params = FmhaParams(
-        fwd=AttentionForwardArgs(),
-        output=torch.empty((1, 4)),
+        fwd=make_fmha_forward_args(output=output, attention_window_size=1),
+        output=output,
         workspace=workspace,
         host_context_lengths=torch.tensor([1], dtype=torch.int32),
         host_past_key_value_lengths=torch.tensor([0], dtype=torch.int32),
@@ -267,13 +407,17 @@ def test_fallback_native_phases_stay_eager_under_compile(
         max_attention_window_size=1,
     )
     metadata = make_fake_metadata(
-        num_contexts=1, num_ctx_tokens=1, host_total_kv_lens=torch.tensor([1, 0])
+        num_contexts=1,
+        num_ctx_tokens=1,
+        host_total_kv_lens=torch.tensor([1, 0]),
+        prompt_lens_cpu_runtime=params.host_context_lengths,
+        kv_lens_runtime=params.host_past_key_value_lengths,
     )
 
     def invoke(x: torch.Tensor) -> torch.Tensor:
         params.qkv_or_q = x + 1
         if method_name == "prepare_workspace":
-            method(params, metadata)
+            method(params.qkv_or_q, None, None, metadata, params.fwd, workspace)
             return params.qkv_or_q + workspace.numel()
         method(params)
         return params.output + 1
@@ -297,8 +441,8 @@ def test_fallback_native_phases_stay_eager_under_compile(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native FMHA")
-@pytest.mark.parametrize("backend", ["eager", "inductor"])
-def test_fallback_compiled_context_matches_reference(backend: str) -> None:
+@pytest.mark.parametrize("backend", ["eager", "inductor", "cuda_graph"])
+def test_fallback_compiled_context_matches_reference(backend: str, monkeypatch) -> None:
     """Exercise workspace sizing and native context execution without an outer custom op."""
     torch._dynamo.reset()
     torch.manual_seed(0)
@@ -311,6 +455,18 @@ def test_fallback_compiled_context_matches_reference(backend: str) -> None:
         dtype=torch.bfloat16,
     )
     fmha = FallbackFmha(attn)
+    created = []
+    native_op = fallback_backend.thop.AttentionOp
+
+    def create_op(config):
+        op = native_op(config)
+        created.append(op)
+        return op
+
+    monkeypatch.setattr(fallback_backend.thop, "AttentionOp", create_op)
+    if backend == "cuda_graph":
+        monkeypatch.setattr(fallback_backend, "_compat_attention_ops", _AttentionOpCache())
+        monkeypatch.setattr(fmha, "attention_op", fallback_backend._compat_attention_op)
     lengths = torch.tensor([seq_len], dtype=torch.int32)
     metadata = make_fake_metadata(
         num_contexts=1,
@@ -332,7 +488,7 @@ def test_fallback_compiled_context_matches_reference(backend: str) -> None:
             None,
             None,
             metadata,
-            AttentionForwardArgs(
+            make_fmha_forward_args(
                 output=output,
                 attention_mask=PredefinedAttentionMask.FULL,
                 attention_window_size=seq_len,
@@ -340,7 +496,19 @@ def test_fallback_compiled_context_matches_reference(backend: str) -> None:
         )
         return output
 
-    compiled = torch.compile(invoke, backend=backend, fullgraph=False)
+    graphs = []
+    if backend == "cuda_graph":
+
+        def compiled(qkv):
+            graph = torch.cuda.CUDAGraph()
+            # invoke() was warmed on the default stream; capture switches streams.
+            with torch.cuda.graph(graph):
+                output = invoke(qkv)
+            graph.replay()
+            graphs.append(graph)
+            return output
+    else:
+        compiled = torch.compile(invoke, backend=backend, fullgraph=False)
     for _ in range(2):
         q, k, v = [
             torch.randn((seq_len, num_heads, head_dim), dtype=torch.bfloat16, device="cuda")
@@ -358,3 +526,4 @@ def test_fallback_compiled_context_matches_reference(backend: str) -> None:
         actual = compiled(qkv)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(actual.float(), reference, rtol=2e-2, atol=2e-2)
+    assert len(created) == 1

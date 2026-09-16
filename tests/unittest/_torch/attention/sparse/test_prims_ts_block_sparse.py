@@ -557,7 +557,7 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=True))
 
     with pytest.raises(RuntimeError, match="workspace must be sized"):
-        fmha.prepare_workspace(FmhaParams(qkv_or_q=q, fwd=_args, workspace=workspace), metadata)
+        fmha.prepare_workspace(q, None, None, metadata, _args, workspace)
 
     device_scope.assert_called_once_with(query_device)
     assert workspace.numel() == 0
@@ -571,7 +571,7 @@ def test_prepare_workspace_skips_generation_layout_for_contiguous_requests(monke
     fmha._multi_processor_count = 1
     workspace = torch.empty(0, dtype=torch.uint8)
 
-    fmha.prepare_workspace(FmhaParams(qkv_or_q=q, fwd=args, workspace=workspace), metadata)
+    fmha.prepare_workspace(q, None, None, metadata, args, workspace)
 
     layout.assert_not_called()
     assert workspace.numel() == 0
