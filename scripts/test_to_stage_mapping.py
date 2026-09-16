@@ -65,7 +65,7 @@ sys.path.insert(
         Path(__file__).resolve().parent.parent / 'jenkins' / 'scripts' /
         'cbts'))
 from blocks import block_matches_stage  # noqa: E402
-from blocks import Stage, YAMLIndex, derive_mako_from_stage
+from blocks import Stage, YAMLIndex, derive_mako_from_stage, normalize_test_id
 
 # Target wall-time per pytest-split shard, and a safety ceiling against a
 # corrupted/stale .test_durations blowing up shard counts.
@@ -114,22 +114,7 @@ def _load_durations(durations_path):
 
 
 def _dynamic_split_counts(specs, yaml_index, durations):
-    """Sizes every stage family from its actual (mako-filtered) test set.
-
-    For each spec, a synthetic '<name>-1' shard name is fed to
-    derive_mako_from_stage() (jenkins/scripts/cbts/blocks.py) -- the '-1'
-    suffix is needed only so trailing-dash keyword patterns like '-PyTorch-'
-    or '-Ray-' can match; every shard of a family shares the same filtering
-    regardless of shard index. block_matches_stage() then selects, from the
-    family's testDB YAML, only the blocks whose condition the derived mako
-    actually satisfies -- the same matching trt-test-db performs at runtime
-    via jenkins/L0_Test.groovy::getMakoArgsFromStageName. This correctly
-    sizes families that share a testDB with siblings and are told apart only
-    by stage-name keyword filtering (e.g. DGX_B200-CPP vs. DGX_B200-PyTorch),
-    which a naive "sum every block tagged with this phase" estimate would
-    over-count for every sibling. No-op (returns {}) when durations are
-    absent.
-    """
+    """Sizes every stage family from its actual (mako-filtered) test set."""
     if not durations:
         return {}
     avg = sum(durations.values()) / len(durations)
@@ -138,6 +123,8 @@ def _dynamic_split_counts(specs, yaml_index, durations):
         blocks_by_testdb[block.yaml_stem].append(block)
 
     overrides = {}
+    total_tests = 0
+    total_unmatched = 0
     for spec in specs:
         mako = derive_mako_from_stage(f"{spec['name']}-1")
         stage = Stage(name=spec['name'],
@@ -152,12 +139,32 @@ def _dynamic_split_counts(specs, yaml_index, durations):
                 tests.update(block.tests)
         if not tests:
             continue
-        seconds = sum(durations.get(t, avg) for t in tests)
+        # block.tests holds raw YAML entries (e.g. `test_fmha.py::test_fmha
+        # TIMEOUT (180)` / `... ISOLATION`); .test_durations is keyed by bare
+        # pytest node ids (params included, directive suffixes stripped), so
+        # normalize before lookup or every such entry silently misses and
+        # falls back to `avg`.
+        normalized = [normalize_test_id(t) for t in tests]
+        unmatched = [t for t in normalized if t not in durations]
+        if unmatched:
+            sys.stderr.write(
+                f"_dynamic_split_counts: {spec['name']}: "
+                f"{len(unmatched)}/{len(normalized)} test(s) "
+                f"({len(unmatched) / len(normalized):.0%}) not found in "
+                f".test_durations; using the {avg:.0f}s average for those\n")
+        total_tests += len(normalized)
+        total_unmatched += len(unmatched)
+        seconds = sum(durations.get(t, avg) for t in normalized)
         k = max(
             1,
             min(math.ceil(seconds / _TARGET_SHARD_SECONDS),
                 _DYNAMIC_SPLITS_CAP))
         overrides[spec['name']] = k
+    if total_tests:
+        sys.stderr.write(
+            f"_dynamic_split_counts: overall {total_unmatched}/{total_tests} "
+            f"test(s) ({total_unmatched / total_tests:.0%}) not found in "
+            ".test_durations across all sized families\n")
     return overrides
 
 
