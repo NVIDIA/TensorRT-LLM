@@ -1,50 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""GLM-5.3-Flash vision tower and multimodal wrapper (``glm5_next``).
+"""GLM-5.3-Flash vision encoder and conditional-generation wrapper.
 
-The checkpoint publishes ``Glm5NextForConditionalGeneration``: the accepted
-text decoder (:class:`~.modeling_glm5_next.Glm5NextForCausalLM`, hybrid KDA +
-sparse-MLA, FP8) plus a 24-block BF16 vision tower. This module adds the
-vision side directly on TensorRT-LLM's existing ``Attention`` abstraction —
-TRTLLM backend, ``kv_cache_manager=None``, module-side per-head Q/K RMSNorm
-and two-axis (h, w) rotary embedding — and composes a thin
-``MultimodalModelMixin`` wrapper around the unchanged text decoder. There is
-no pure-PyTorch/SDPA production attention path.
+Images and video frame pairs share a BF16 tower: patch embedding, pre-norm
+blocks, post-norm, spatial downsampling and a projector into text embeddings.
+Blocks use per-head Q/K RMSNorm, FP32 two-axis RoPE and clamped SwiGLU.
 
-Source semantics (HF ``Glm5NextVisionModel``, the named reference checkout):
-
-* patch embed: ``Conv3d(3, 1024, kernel=stride=(2, 14, 14))`` over packed
-  ``(N, 1176)`` patch rows (``3*2*14*14``), emitted by the checkpoint's
-  ``Glm5NextImageProcessor`` in spatial-merge-block order;
-* 24 pre-norm blocks: RMSNorm → biased fused QKV (16 heads × 64) → per-head
-  RMSNorm on Q and K (fp32 math, eps ``rms_norm_eps``) → 2-axis rotary over
-  the full head dim in fp32 (16 freqs per axis, theta 10000, neox pairing)
-  → full non-causal attention within each image segment → biased output
-  projection; RMSNorm → biased clamped-SwiGLU MLP (limit ``swiglu_limit``);
-* post RMSNorm → 2×2 ``Conv2d`` downsample (1024 → 4096) over each
-  spatial-merge block → projector ``linear → LayerNorm → GELU → clamped
-  SwiGLU → linear`` (all projector linears bias-free), one 4096-wide row per
-  image token.
-
-Per-image full attention reuses the Qwen-VL vision metadata contract
-(:func:`~.modeling_qwen2vl._prepare_qwen_vl_vision_attn_metadata`): every
-image is one context segment with ``PredefinedAttentionMask.FULL`` and no KV
-cache. TP4 shards QKV / gate&up column-wise and o_proj / down row-wise;
-norms, convolutions and the projector's first linear stay replicated.
-
-The prompt contract matches the sealed native-HF MMMU reference: OpenAI-style
-content parts with every ``<image>`` placeholder interleaved at its original
-position (``interleave_placeholders=True``, ``ContentFormat.OPENAI``); the
-chat template itself expands each image part to
-``<|begin_of_image|><|image|><|end_of_image|>`` and the input processor
-expands ``<|image|>`` to ``grid.prod() / spatial_merge_size**2`` image tokens.
-
-Image and video preprocessing come from the Hugging Face ``Glm5NextProcessor``
-(``AutoProcessor``), exactly as Qwen2-VL and the other VLMs in this tree do;
-this uses the GLM-specific Transformers revision documented in the deployment guide.
-
-Images and videos share the tower. The Hugging Face processor supplies the
-timestamped frame structure for videos.
+Vision attention uses the TRTLLM backend with per-item full-attention segments
+and no KV cache, reusing Qwen-VL metadata preparation. The HF Glm5NextProcessor
+handles preprocessing and placeholder expansion; the required Transformers
+revision is documented in the deployment guide.
 """
 
 import copy
@@ -82,6 +47,7 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..modules.swiglu import swiglu
+from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
 from ..utils import torch_compiling
 
 if IS_FLASHINFER_AVAILABLE:
@@ -89,11 +55,7 @@ if IS_FLASHINFER_AVAILABLE:
 else:  # pragma: no cover - CPU / no-flashinfer environments
     flashinfer_apply_rope_with_cos_sin_cache_inplace = None
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_glm5_next import (
-    Glm5NextForCausalLM,
-    get_glm5_next_text_config,
-    glm5_next_attention_mapping,
-)
+from .modeling_glm5_next import Glm5NextForCausalLM, glm5_next_attention_mapping
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
@@ -138,7 +100,7 @@ def _image_encoder_cuda_graph_config(
 
 
 def _text_dtype(model_config: ModelConfig[PretrainedConfig]) -> torch.dtype:
-    text_config = get_glm5_next_text_config(model_config.pretrained_config)
+    text_config = unwrap_glm5_next_text_config(model_config.pretrained_config)
     dtype = getattr(text_config, "dtype", None)
     if isinstance(dtype, str):
         dtype = getattr(torch, dtype)
@@ -146,16 +108,7 @@ def _text_dtype(model_config: ModelConfig[PretrainedConfig]) -> torch.dtype:
 
 
 def _require_trtllm_vision_backend(model_config: ModelConfig[PretrainedConfig], where: str) -> None:
-    """Fail closed on any attention backend other than plain TRTLLM.
-
-    The vision bring-up contract admits exactly one production attention
-    path: the TRTLLM backend with full-mask per-image segments and no KV
-    cache. VANILLA/FlashInfer (and the generic sparse-attention wrappers,
-    which swap in a different kernel/metadata contract) must not be
-    constructible for the vision tower — a configured non-TRTLLM backend is
-    an error here, never a fallback. The text decoder keeps its own
-    independently validated configuration.
-    """
+    """Require full-mask TRTLLM vision attention without sparse backend wrappers."""
     backend = getattr(model_config, "attn_backend", None)
     if not isinstance(backend, str) or backend.upper() != "TRTLLM":
         raise ValueError(
@@ -193,7 +146,7 @@ class Glm5NextVisionAttention(Attention):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int) -> None:
         _require_trtllm_vision_backend(model_config, type(self).__name__)
         config = model_config.pretrained_config.vision_config
-        text_config = get_glm5_next_text_config(model_config.pretrained_config)
+        text_config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         dtype = _text_dtype(model_config)
         super().__init__(
             hidden_size=config.hidden_size,
@@ -731,14 +684,8 @@ class Glm5NextVisionModelBase(nn.Module):
         # ``modules_to_not_convert``); scrub the quant config so no Linear
         # picks up FP8 behavior.
         self.model_config.quant_config = QuantConfig()
-        # Every TP collective this model constructs is pinned to NCCL: the
-        # text decoder pins all of its reductions (AUTO's runtime-selected
-        # tactic raced at decode on TP4), and the tower's row-parallel
-        # projections must stay on the same deterministic contract so image
-        # requests cannot reintroduce the unpinned path. The engine hands the
-        # wrapper a frozen ModelConfig (and the wrapper hands this class its
-        # own deepcopy), so use the documented `_frozen` bypass and restore
-        # the incoming state.
+        # Pin vision TP reductions to NCCL to avoid runtime autotuning.
+        # This wrapper owns a config copy; preserve its incoming frozen state.
         from ..distributed import AllReduceStrategy
 
         was_frozen = self.model_config._frozen
@@ -840,14 +787,9 @@ def _glm5_next_build_batched_input(multimodal_params: List[MultimodalParams]) ->
 
 
 class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
-    """Input processor on the Hugging Face ``Glm5NextProcessor`` (image and
-    video processors + placeholder expansion), the Qwen2-VL pattern.
+    """Adapt HF image/video preprocessing and placeholder expansion to engine inputs.
 
-    Uses the GLM-specific Transformers revision documented in the deployment guide. The
-    processor performs smart resize,
-    normalization, patchification, frame sampling / timestamped video token
-    layout and the ``<|image|>`` / ``<|video|>`` expansion; this class only
-    routes the outputs into the engine's payload format.
+    Requires the GLM-specific Transformers revision in the deployment guide.
     """
 
     def __init__(
@@ -865,7 +807,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
-        text_config = get_glm5_next_text_config(config)
+        text_config = unwrap_glm5_next_text_config(config)
         dtype = getattr(text_config, "dtype", None) or torch.bfloat16
         self._dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
         self._tokenizer = (
@@ -899,7 +841,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return self._dtype
 
     def get_vocab_size(self) -> int:
-        return int(get_glm5_next_text_config(self._config).vocab_size)
+        return int(unwrap_glm5_next_text_config(self._config).vocab_size)
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         # PIL is the HF processor's native input; the server's default float
@@ -1082,10 +1024,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     Glm5NextInputProcessor,
     model_type="glm5_next",
     placeholder_metadata=MultimodalPlaceholderMetadata(
-        # The chat template consumes OpenAI-style content parts natively and
-        # emits `<|begin_of_image|><|image|><|end_of_image|>` per image part;
-        # interleaving preserves each image's original position in the text —
-        # the contract the sealed native-HF MMMU reference recorded.
+        # Preserve each image/video placeholder at its original prompt position.
         placeholder_map={
             "image": "<|begin_of_image|><|image|><|end_of_image|>",
             "video": "<|begin_of_video|><|video|><|end_of_video|>",
@@ -1096,14 +1035,10 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     ),
 )
 class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
-    """Thin conditional-generation wrapper around the accepted text decoder.
+    """Compose the text decoder with an optional image/video encoder.
 
-    The inner LM is the unchanged :class:`Glm5NextForCausalLM` (constructed
-    through its own registered architecture name), so text-only requests run
-    the sealed text path byte-for-byte — the vision processor/tower is only
-    reachable when a request carries image or video data. The text decoder keeps
-    ``KVCacheManagerV2`` ownership; the vision tower runs context-only with
-    no cache manager.
+    The inner decoder owns recurrent/KV state and speculative decoding. Text-only
+    requests bypass the vision tower, which runs full attention without KV cache.
     """
 
     _supports_flash_attn = True
