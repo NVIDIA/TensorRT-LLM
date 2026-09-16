@@ -3090,7 +3090,7 @@ def CBTS_COVERAGE = "cbts_coverage"
 def INFRA_DRY_RUN = "infra_dry_run"
 // Dynamic split-count overrides computed once in L0_MergeRequest.groovy's
 // setupPipelineEnvironment (see applyDynamicSplitCounts) and propagated here
-// via the `testFilter` job parameter, the same way CBTS_RESULT is.
+// via the `testFilter` job parameter.
 @Field
 def DYNAMIC_SPLIT_COUNTS = "dynamic_split_counts"
 // Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
@@ -6209,16 +6209,7 @@ def buildK8sStageConfigs(stageName, platform, testlist, splitCount, gpuCount = 1
 }
 
 // Applies the dynamic split-count overrides computed once upstream in
-// L0_MergeRequest.groovy's setupPipelineEnvironment (same DYNAMIC_SPLIT_COUNTS
-// key, propagated here via the `testFilter` job parameter exactly like
-// CBTS_RESULT). That step runs scripts/test_to_stage_mapping.py --emit-splits
-// against its own already-fully-checked-out repo, in the same container
-// (and reusing the same apt-get python3-yaml install) that already runs CBTS's
-// jenkins/scripts/cbts/main.py -- so this pod never needs its own Python/YAML
-// install just to size stages. If the upstream computation failed or this pod
-// wasn't launched from L0_MergeRequest.groovy (testFilter[DYNAMIC_SPLIT_COUNTS]
-// is null/absent), specs keep their hardcoded "splits" from
-// test_stage_configs.json -- dynamic sizing must never block stage generation.
+// L0_MergeRequest.groovy's setupPipelineEnvironment .
 def applyDynamicSplitCounts(specs, testFilter) {
     def overrides = testFilter[(DYNAMIC_SPLIT_COUNTS)]
     if (overrides == null) {
@@ -6256,10 +6247,7 @@ def loadStageConfigSpecs(pipeline, testFilter) {
 // useClusterDurations (slurm only), modelExpressSidecar (K8s only)}.
 // Bucket is normally derived from (arch, slurm); an explicit "target" field
 // overrides that when a spec belongs to a differently-consumed map that
-// shares the same (arch, slurm) combo, e.g. "multiNodesSBSA" for the SBSA
-// multi-node Slurm jobs (distinct from the single-node SBSASlurmTestConfigs).
-// `splits` drives per-shard "<name>-<k>" expansion via buildStageConfigs /
-// buildK8sStageConfigs. Returns [x86: ..., x86Slurm: ..., sbsa: ..., sbsaSlurm: ..., multiNodesSBSA: ...].
+// shares the same (arch, slurm) combo.
 def buildStageConfigsFromSpecs(specs) {
     def grouped = [x86: [:], x86Slurm: [:], sbsa: [:], sbsaSlurm: [:], multiNodesSBSA: [:]]
     specs.each { spec ->
