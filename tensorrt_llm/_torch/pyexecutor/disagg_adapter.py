@@ -43,6 +43,9 @@ class PyExecutorEffects(ExecutorEffects):
     def prepare_gen_resources(self, requests: List[LlmRequest]) -> None:
         self._executor._prepare_disagg_gen_resources(requests)
 
+    def revert_ctx_alloc(self, requests: List[LlmRequest]) -> None:
+        self._executor._revert_ctx_alloc(requests)
+
 
 class PyExecutorRequestRegistry(ActiveRequestRegistry):
     def __init__(self, executor: "PyExecutor") -> None:

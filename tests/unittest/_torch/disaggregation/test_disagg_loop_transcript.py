@@ -21,7 +21,6 @@ executed-batch/lifecycle transcripts of PR-5.
 
 import inspect
 import queue
-from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -320,8 +319,7 @@ def test_pp_ranks_issue_the_same_collective_sensitive_calls(monkeypatch) -> None
 def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExecutor:
     """Idle executor on a two-rank ADP group with the coordinator the executor
     would really build: the no-op one without a transceiver, otherwise a real
-    one whose CS-1 paths run against a quiet transceiver (the still-delegated
-    entry points are stubbed)."""
+    one running against a quiet transceiver."""
     executor = _idle_executor(monkeypatch, calls)
     executor.enable_attention_dp = True
     executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
@@ -331,9 +329,6 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
     executor.kv_cache_transceiver = transceiver
     del executor._disagg_coordinator
     if transceiver is not None:
-        # admit is the one delegate whose return value the loop unpacks.
-        delegates = {f.name: (lambda *a, **k: None) for f in fields(DisaggLoopDelegates)}
-        delegates["admit"] = lambda fitting: (fitting, False)
         executor._disagg_coordinator = DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=executor.async_transfer_manager,
@@ -343,7 +338,7 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
             force_terminate_ctx_for_partial_reuse=False,
-            delegates=DisaggLoopDelegates(**delegates),
+            delegates=DisaggLoopDelegates(),
         )
     return executor
 

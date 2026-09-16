@@ -69,16 +69,21 @@ class CoordinatorHarness:
         *,
         kv_transfer_timeout_ms=None,
         supports_inflight_cancellation=False,
+        consumes_transfer_buffer=True,
         enable_attention_dp=False,
         world_size=1,
         tp_size=1,
+        pp_size=1,
         force_terminate_ctx_for_partial_reuse=False,
         draft_kv_cache_manager=None,
+        admission_controller=None,
+        is_kv_manager_v2=False,
         dist=None,
     ) -> None:
         self.transceiver = FakeKvCacheTransceiver(
             kv_transfer_timeout_ms=kv_transfer_timeout_ms,
             supports_inflight_cancellation=supports_inflight_cancellation,
+            consumes_transfer_buffer=consumes_transfer_buffer,
         )
         self.transceiver.has_retired_send_session = lambda req: False
         self.kv_cache_manager = Mock(spec=["store_blocks_for_reuse", "unpin_blocks_by_id"])
@@ -91,7 +96,9 @@ class CoordinatorHarness:
         self.registry = FakeRequestRegistry(self.active)
         self.effects = FakeExecutorEffects()
         self.dist = (
-            dist if dist is not None else Mock(rank=0, tp_size=tp_size, world_size=world_size)
+            dist
+            if dist is not None
+            else Mock(rank=0, tp_size=tp_size, world_size=world_size, pp_size=pp_size)
         )
         self.delegates = Mock()
         self.coordinator = DisaggTransferCoordinator(
@@ -105,6 +112,8 @@ class CoordinatorHarness:
             force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
             delegates=self.delegates,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            admission_controller=admission_controller,
+            is_kv_manager_v2=is_kv_manager_v2,
         )
 
     def send(self, *requests: TransferRequest) -> None:

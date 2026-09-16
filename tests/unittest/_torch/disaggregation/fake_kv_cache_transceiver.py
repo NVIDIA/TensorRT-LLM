@@ -49,9 +49,13 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self,
         kv_transfer_timeout_ms: Optional[int] = None,
         supports_inflight_cancellation: bool = False,
+        consumes_transfer_buffer: bool = True,
     ) -> None:
         self.kv_transfer_timeout_ms = kv_transfer_timeout_ms
         self._supports_inflight_cancellation = supports_inflight_cancellation
+        # C++-style transceivers consume the CacheTransBuffer budget; the
+        # asynchronous Python transceiver does not.
+        self._consumes_transfer_buffer = consumes_transfer_buffer
         self._pending_sends: Dict[int, LlmRequest] = {}
         self._pending_recvs: Dict[int, LlmRequest] = {}
         # rid -> outcome, consumed by the next check_*_transfer_status call.
@@ -100,6 +104,10 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self._sync_recv_outcomes[req.py_request_id] = outcome
 
     # -- KvCacheTransceiver contract -----------------------------------------
+
+    @property
+    def consumes_transfer_buffer(self) -> bool:
+        return self._consumes_transfer_buffer
 
     def respond_and_send_async(self, req: LlmRequest) -> None:
         self._assert_alive("respond_and_send_async")

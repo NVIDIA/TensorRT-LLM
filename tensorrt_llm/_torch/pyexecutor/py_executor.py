@@ -59,7 +59,8 @@ from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
     DisaggLoopDelegates, DisaggTransferCoordinator, NoopDisaggCoordinator,
-    attach_ctx_usage, is_gen_only_no_context_benchmark, uses_async_gen_transfer)
+    attach_ctx_usage, is_gen_only_no_context_benchmark,
+    transfer_window_bypass_eligible, uses_async_gen_transfer)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -960,7 +961,9 @@ class PyExecutor:
             max_tokens_in_buffer, tokens_per_block)
         if (self.global_rank == 0
                 and self._disagg_transfer_admission_controller.enabled()
-                and self._is_disagg_transfer_window_bypass_eligible()):
+                and transfer_window_bypass_eligible(self.kv_cache_transceiver,
+                                                    self.dist,
+                                                    self._is_kv_manager_v2)):
             logger.warning_once(
                 f"[PyExecutor] Bypassing the executor transfer window "
                 f"configured by max_tokens_in_buffer={max_tokens_in_buffer} "
@@ -3699,47 +3702,10 @@ class PyExecutor:
             enable_attention_dp=getattr(self, "enable_attention_dp", False),
             force_terminate_ctx_for_partial_reuse=getattr(
                 self, "force_terminate_ctx_for_partial_reuse", False),
-            delegates=DisaggLoopDelegates(
-                admit=self._apply_disagg_transfer_admission,
-                revert_deferred_gen_init=self.
-                _revert_deferred_disagg_gen_init_alloc,
-            ))
-
-    def _get_disagg_transfer_admission_controller(
-            self) -> DisaggTransferAdmissionController:
-        controller = getattr(self, "_disagg_transfer_admission_controller",
-                             None)
-        if controller is not None:
-            return controller
-
-        cache_transceiver_config = getattr(getattr(self, "llm_args", None),
-                                           "cache_transceiver_config", None)
-        kv_cache_manager = getattr(self, "kv_cache_manager", None)
-        return DisaggTransferAdmissionController(
-            getattr(cache_transceiver_config, "max_tokens_in_buffer", None),
-            getattr(kv_cache_manager, "tokens_per_block", None),
-        )
-
-    def _is_disagg_transfer_window_bypass_eligible(self) -> bool:
-        """Return whether this runtime may bypass an enabled transfer window."""
-        transceiver = getattr(self, "kv_cache_transceiver", None)
-        return (transceiver is not None
-                and transceiver.consumes_transfer_buffer is False
-                and self._uses_async_disagg_gen_transfer()
-                and self.dist.pp_size == 1 and self._is_kv_manager_v2)
-
-    def _disagg_transfer_window_is_active(self) -> bool:
-        """Return whether the executor-level transfer window is active.
-
-        ``max_tokens_in_buffer`` describes the C++ transceiver's physical
-        buffer. The asynchronous Python transceiver does not consume that
-        buffer. With KV cache manager V2 and PP1, its generation requests
-        remain constrained by inline scheduler KV admission without a second
-        executor-level budget. Other configurations retain the window.
-        """
-        return (getattr(self, "kv_cache_transceiver", None) is not None
-                and self._get_disagg_transfer_admission_controller().enabled()
-                and not self._is_disagg_transfer_window_bypass_eligible())
+            admission_controller=getattr(
+                self, "_disagg_transfer_admission_controller", None),
+            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False),
+            delegates=DisaggLoopDelegates())
 
     @staticmethod
     def _is_disagg_gen_only_no_context_benchmark() -> bool:
@@ -3748,62 +3714,6 @@ class PyExecutor:
     @staticmethod
     def _uses_async_disagg_gen_transfer() -> bool:
         return uses_async_gen_transfer()
-
-    def _apply_disagg_transfer_admission(
-        self, fitting_disagg_gen_init_requests: List[LlmRequest]
-    ) -> Tuple[List[LlmRequest], bool]:
-        # gen_only_no_context has no CTX worker and does not transfer data.
-        # Real synchronous gen_only transfers still honor the budget to bound
-        # the number of blocking transfers started in one executor iteration.
-        if self._is_disagg_gen_only_no_context_benchmark():
-            return fitting_disagg_gen_init_requests, False
-
-        controller = self._get_disagg_transfer_admission_controller()
-        if not (self._disagg_transfer_window_is_active()
-                and fitting_disagg_gen_init_requests):
-            return fitting_disagg_gen_init_requests, False
-
-        admission_result = controller.select(self.active_requests,
-                                             fitting_disagg_gen_init_requests)
-        if admission_result.deferred_request_count > 0:
-            logger.debug("Disagg transfer admission deferred "
-                         f"{admission_result.deferred_request_count} requests; "
-                         f"active transfer blocks="
-                         f"{admission_result.active_transfer_blocks}, "
-                         f"admitted transfer blocks="
-                         f"{admission_result.admitted_transfer_blocks}, "
-                         f"budget={controller.max_transfer_blocks}")
-
-        self._revert_deferred_disagg_gen_init_alloc(
-            fitting_disagg_gen_init_requests,
-            admission_result.admitted_requests)
-
-        return (admission_result.admitted_requests,
-                admission_result.is_blocked_by_active_transfers())
-
-    def _revert_deferred_disagg_gen_init_alloc(
-            self, candidates: List[LlmRequest],
-            admitted_requests: List[LlmRequest]) -> None:
-        """Revert Scheduler V2 allocations absent from an admitted request set.
-
-        Scheduler V2 allocates KV while evaluating generation-init requests.
-        This reconciliation is required both after transfer-window admission
-        and when a PP follower's local candidates differ from the canonical
-        schedule propagated by rank 0.
-        """
-        if not (self._is_kv_manager_v2 and candidates):
-            return
-
-        admitted_request_ids = {
-            request.py_request_id
-            for request in admitted_requests
-        }
-        deferred_requests = [
-            request for request in candidates
-            if request.py_request_id not in admitted_request_ids
-        ]
-        if deferred_requests:
-            self._revert_ctx_alloc(deferred_requests)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:

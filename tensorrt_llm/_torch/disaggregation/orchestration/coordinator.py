@@ -11,7 +11,7 @@ reached through the ``interfaces`` Protocols.
 import os
 import time
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Callable, List, Set, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
@@ -23,6 +23,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.logger import logger
 
+from .admission import DisaggTransferAdmissionController
 from .interfaces import ActiveRequestRegistry, ExecutorEffects
 
 if TYPE_CHECKING:
@@ -42,6 +43,24 @@ def uses_async_gen_transfer() -> bool:
     )
 
 
+def transfer_window_bypass_eligible(transceiver, dist, is_kv_manager_v2: bool) -> bool:
+    """Whether this runtime may skip the executor-level transfer window.
+
+    ``max_tokens_in_buffer`` describes the C++ transceiver's physical buffer.
+    The asynchronous Python transceiver does not consume it, and with KV cache
+    manager V2 and PP1 its generation requests stay bounded by the scheduler's
+    inline KV admission, so no second budget is applied. Other configurations
+    keep the window.
+    """
+    return (
+        transceiver is not None
+        and transceiver.consumes_transfer_buffer is False
+        and uses_async_gen_transfer()
+        and dist.pp_size == 1
+        and is_kv_manager_v2
+    )
+
+
 def attach_ctx_usage(request: LlmRequest, response) -> None:
     """Copy gen-first context usage from the transfer aux data onto the response."""
     disagg_params = request.py_disaggregated_params
@@ -51,14 +70,10 @@ def attach_ctx_usage(request: LlmRequest, response) -> None:
 
 @dataclass(frozen=True)
 class DisaggLoopDelegates:
-    """Executor callables the coordinator still forwards to.
+    """Transitional table of executor callables the coordinator forwards to.
 
-    Transitional: each field is removed once the corresponding logic moves
-    into the coordinator (admission).
+    Every entry point now lives in the coordinator, so the table is empty.
     """
-
-    admit: Callable[[List[LlmRequest]], Tuple[List[LlmRequest], bool]]
-    revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
 
 
 class DisaggTransferCoordinator:
@@ -84,6 +99,8 @@ class DisaggTransferCoordinator:
         force_terminate_ctx_for_partial_reuse: bool,
         delegates: DisaggLoopDelegates,
         draft_kv_cache_manager=None,
+        admission_controller: Optional[DisaggTransferAdmissionController] = None,
+        is_kv_manager_v2: bool = False,
     ) -> None:
         self._transceiver = transceiver
         self._transfers = transfer_manager
@@ -94,6 +111,9 @@ class DisaggTransferCoordinator:
         self._registry = registry
         self._enable_attention_dp = enable_attention_dp
         self._force_terminate_ctx_for_partial_reuse = force_terminate_ctx_for_partial_reuse
+        # Transfer-window budget; None or a disabled controller means no window.
+        self._admission_controller = admission_controller
+        self._is_kv_manager_v2 = is_kv_manager_v2
         self._d = delegates
         # Context sends that failed after leaving the transfer manager; applied
         # at the next rank-synchronized error pass.
@@ -254,13 +274,62 @@ class DisaggTransferCoordinator:
 
         Returns ``(admitted, blocked_by_active_transfers)``.
         """
-        return self._d.admit(fitting_gen_init)
+        # gen_only_no_context has no CTX worker and does not transfer data.
+        # Real synchronous gen_only transfers still honor the budget to bound
+        # the number of blocking transfers started in one executor iteration.
+        if is_gen_only_no_context_benchmark():
+            return fitting_gen_init, False
+
+        if not (self._transfer_window_is_active() and fitting_gen_init):
+            return fitting_gen_init, False
+
+        controller = self._admission_controller
+        admission_result = controller.select(self._registry.active_requests(), fitting_gen_init)
+        if admission_result.deferred_request_count > 0:
+            logger.debug(
+                "Disagg transfer admission deferred "
+                f"{admission_result.deferred_request_count} requests; "
+                f"active transfer blocks={admission_result.active_transfer_blocks}, "
+                f"admitted transfer blocks={admission_result.admitted_transfer_blocks}, "
+                f"budget={controller.max_transfer_blocks}"
+            )
+
+        self.revert_deferred_gen_init(fitting_gen_init, admission_result.admitted_requests)
+
+        return (
+            admission_result.admitted_requests,
+            admission_result.is_blocked_by_active_transfers(),
+        )
 
     def revert_deferred_gen_init(
         self, candidates: List[LlmRequest], admitted: List[LlmRequest]
     ) -> None:
-        """Release KV allocated for candidates that were not admitted."""
-        self._d.revert_deferred_gen_init(candidates, admitted)
+        """Release KV allocated for candidates that were not admitted.
+
+        Scheduler V2 allocates KV while evaluating generation-init requests.
+        This reconciliation is required both after transfer-window admission
+        and when a PP follower's local candidates differ from the canonical
+        schedule propagated by rank 0.
+        """
+        if not (self._is_kv_manager_v2 and candidates):
+            return
+
+        admitted_request_ids = {request.py_request_id for request in admitted}
+        deferred_requests = [
+            request for request in candidates if request.py_request_id not in admitted_request_ids
+        ]
+        if deferred_requests:
+            self._effects.revert_ctx_alloc(deferred_requests)
+
+    def _transfer_window_is_active(self) -> bool:
+        """Whether the executor-level transfer window bounds admission."""
+        return (
+            self._admission_controller is not None
+            and self._admission_controller.enabled()
+            and not transfer_window_bypass_eligible(
+                self._transceiver, self._dist, self._is_kv_manager_v2
+            )
+        )
 
     @nvtx_range("receive_gen_init")
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
@@ -745,6 +814,11 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
         return fitting_gen_init, False
+
+    def revert_deferred_gen_init(
+        self, candidates: List[LlmRequest], admitted: List[LlmRequest]
+    ) -> None:
+        return None
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         return None

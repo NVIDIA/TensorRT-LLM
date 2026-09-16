@@ -67,7 +67,7 @@ def test_orchestration_modules_do_not_depend_on_py_executor(module) -> None:
 
 def test_executor_facing_surface_is_a_closed_set() -> None:
     """The executor-owned behavior the coordinator can trigger is a closed set:
-    five effects plus one registry mutation. Growing it is a design decision,
+    six effects plus one registry mutation. Growing it is a design decision,
     not a convenience."""
     assert _public_methods(ExecutorEffects) == {
         "terminate_request",
@@ -75,6 +75,7 @@ def test_executor_facing_surface_is_a_closed_set() -> None:
         "fail_requests",
         "fail_fatal",
         "prepare_gen_resources",
+        "revert_ctx_alloc",
     }
     assert _public_methods(ActiveRequestRegistry) == {
         "active_requests",
