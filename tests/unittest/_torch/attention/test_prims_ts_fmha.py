@@ -315,10 +315,34 @@ def test_supported_matrix(case: dict) -> None:
     assert supported, reason
 
 
-@pytest.mark.parametrize("num_heads", [6, 12, 96, 128])
+@pytest.mark.parametrize("allow_fp8_mla", [False, True])
+def test_paged_kv_policy_fp8_mla_requires_opt_in(allow_fp8_mla: bool) -> None:
+    attn = _Attention(head_dim=576, is_mla=True)
+    attn.quant_mode = QuantMode.FP8_KV_CACHE
+    metadata = SimpleNamespace(
+        beam_width=1,
+        is_spec_decoding_enabled=False,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
+    )
+    reason = prims_ts_module.get_paged_kv_policy_unsupported_reason(
+        attn, metadata, allow_fp8_mla=allow_fp8_mla
+    )
+    if allow_fp8_mla:
+        assert reason is None
+    else:
+        # Other adapters sharing this policy helper must still reject quantized KV.
+        assert reason == "quantized KV cache is not supported by the initial adapter."
+
+
+@pytest.mark.parametrize("num_heads", [6, 12, 64, 96, 128])
 @pytest.mark.parametrize("use_kv_cache_v2", [False, True])
 @pytest.mark.parametrize("tokens_per_block", [16, 32, 64, 128])
-def test_fp8_mla_supported(num_heads: int, use_kv_cache_v2: bool, tokens_per_block: int) -> None:
+@pytest.mark.parametrize("max_seq_len", [64, 128], ids=["short-kv", "regular-kv"])
+def test_fp8_mla_supported(
+    num_heads: int, use_kv_cache_v2: bool, tokens_per_block: int, max_seq_len: int
+) -> None:
     supported, reason = _support_result(
         attention_input_type=AttentionInputType.generation_only,
         head_dim=576,
@@ -328,6 +352,7 @@ def test_fp8_mla_supported(num_heads: int, use_kv_cache_v2: bool, tokens_per_blo
         kv_dtype=DataType.FP8,
         use_kv_cache_v2=use_kv_cache_v2,
         tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
     )
     assert supported, reason
 
@@ -347,7 +372,6 @@ def test_fp8_mla_supported(num_heads: int, use_kv_cache_v2: bool, tokens_per_blo
         ({"attention_input_type": AttentionInputType.mixed}, "generation-only"),
         ({"use_spec_decoding": True}, "speculative decoding"),
         ({"has_sparse_attention": True}, "sparse attention"),
-        ({"max_seq_len": 64}, "paged KV capacity >=128"),
     ],
 )
 def test_fp8_mla_unsupported(overrides: dict, expected_reason: str) -> None:

@@ -403,13 +403,6 @@ class PrimsTSFmha(PhasedFmha):
             if output.numel() != q.shape[0] * attn.num_heads * attn.kv_lora_rank:
                 return False, "MLA output has an incompatible extent."
             if is_fp8_mla:
-                # The automatic 1CTA policy for <=64 query rows has no profile
-                # below 128 KV tokens. This is the plan's page-table capacity,
-                # not the live request length; short requests remain supported.
-                if attn.num_heads <= 64 and (
-                    meta.kv_cache_block_offsets.shape[-1] * tokens_per_block < 128
-                ):
-                    return False, "FP8 MLA with <=64 heads requires a paged KV capacity >=128."
                 error = self._mla_fp8_input_error(q, fwd)
                 if error is not None:
                     return False, error

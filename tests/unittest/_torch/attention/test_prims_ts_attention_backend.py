@@ -414,8 +414,9 @@ def test_prims_ts_fp8_mla_preprocessing(
 
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("batch_size", [2, 65])
+@pytest.mark.parametrize("max_seq_len", [64, 128], ids=["short-kv", "regular-kv"])
 def test_prims_ts_fp8_mla_scales_and_graph_replay(
-    monkeypatch: pytest.MonkeyPatch, num_heads: int, batch_size: int
+    monkeypatch: pytest.MonkeyPatch, num_heads: int, batch_size: int, max_seq_len: int
 ) -> None:
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts as prims_ts_module
     from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
@@ -444,7 +445,7 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
     fmha = PrimsTSFmha(attn)
     query = torch.randn(batch_size, num_heads, 576, device=device).to(torch.float8_e4m3fn)
     kv_cache = torch.randn(batch_size * 2, 1, 32, 576, device=device).to(torch.float8_e4m3fn)
-    block_tables = torch.zeros((batch_size, 2, 4), dtype=torch.int32, device=device)
+    block_tables = torch.zeros((batch_size, 2, max_seq_len // 32), dtype=torch.int32, device=device)
     block_tables[:, 0, :2] = torch.arange(batch_size * 2, device=device).view(batch_size, 2)
     seq_lens = torch.full((batch_size,), 33, dtype=torch.int32, device=device)
     output = torch.empty((batch_size, num_heads * 512), dtype=torch.bfloat16, device=device)
@@ -453,7 +454,7 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
     bmm1_scale, bmm2_scale = 0.025, 1.75
     fwd = AttentionForwardArgs(
         attention_input_type=AttentionInputType.generation_only,
-        attention_window_size=128,
+        attention_window_size=max_seq_len,
         output=output,
         quant_q_buffer=query.view(torch.uint8),
         mla_bmm1_scale=torch.tensor([bmm1_scale, bmm1_scale * math.log2(math.e)], device=device),
@@ -520,6 +521,10 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
         assert relative_error.item() < 0.04
 
     fmha.run_mla_generation(params)
+    if max_seq_len < 128:
+        # Auto policy must fall back when the 1CTA profile cannot cover this capacity.
+        wrapper = fmha._mla_decode_wrappers[batch_size]
+        assert dict(wrapper._plan_state.policy)["kernel"] == "throughput_2cta"
     check_output()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
