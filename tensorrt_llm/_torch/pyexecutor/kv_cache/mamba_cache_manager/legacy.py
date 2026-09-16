@@ -750,7 +750,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._dummy_request_mask_host.zero_()
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(torch.as_tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask.copy_(self._dummy_request_mask_host, non_blocking=True)
+        mask_staging = torch.empty_like(self._dummy_request_mask_host, pin_memory=prefer_pinned())
+        mask_staging.copy_(self._dummy_request_mask_host)
+        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
@@ -1212,7 +1214,9 @@ class _LegacyMambaHybridCacheManager(MambaHybridCacheManager):
         self._dummy_request_mask_host.zero_()
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask.copy_(self._dummy_request_mask_host, non_blocking=True)
+        mask_staging = torch.empty_like(self._dummy_request_mask_host, pin_memory=prefer_pinned())
+        mask_staging.copy_(self._dummy_request_mask_host)
+        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
@@ -1224,16 +1228,16 @@ class _LegacyMambaHybridCacheManager(MambaHybridCacheManager):
             and self.prev_num_accepted_tokens is not None
             and self.cache_buf_idx is not None
         ):
-            self.prev_num_accepted_tokens[context_slots] = 0
-            self.cache_buf_idx[context_slots] = 0
+            self.prev_num_accepted_tokens.index_fill_(0, context_slots, 0)
+            self.cache_buf_idx.index_fill_(0, context_slots, 0)
             if self.old_x is not None:
-                self.old_x[:, context_slots] = 0
+                self.old_x.index_fill_(1, context_slots, 0)
             if self.old_B is not None:
-                self.old_B[:, context_slots] = 0
+                self.old_B.index_fill_(1, context_slots, 0)
             if self.old_dt is not None:
-                self.old_dt[:, context_slots] = 0
+                self.old_dt.index_fill_(1, context_slots, 0)
             if self.old_dA_cumsum is not None:
-                self.old_dA_cumsum[:, context_slots] = 0
+                self.old_dA_cumsum.index_fill_(1, context_slots, 0)
 
         if self.mamba_ssm_rand_seed is None:
             return
@@ -1247,8 +1251,8 @@ class _LegacyMambaHybridCacheManager(MambaHybridCacheManager):
         self.mamba_ssm_rand_seed[context_slots] = torch.tensor(
             new_seeds,
             dtype=torch.int64,
-            device=self.mamba_ssm_rand_seed.device,
-        )
+            pin_memory=prefer_pinned(),
+        ).to(self.mamba_ssm_rand_seed.device, non_blocking=True)
 
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         """Set reusable Mamba snapshot boundaries before scheduling."""
@@ -2239,7 +2243,9 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
                 )
             self._host_state_indices[:n] = values
 
-        self.cuda_state_indices.copy_(self._host_state_indices, non_blocking=True)
+        idx_staging = torch.empty_like(self._host_state_indices, pin_memory=prefer_pinned())
+        idx_staging.copy_(self._host_state_indices)
+        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
 

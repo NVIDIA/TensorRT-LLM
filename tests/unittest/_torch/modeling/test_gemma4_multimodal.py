@@ -817,6 +817,8 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         )
         model = Gemma4ForConditionalGeneration(mc)
 
+        self.assertIs(model.model_config.extra_attrs, mc.extra_attrs)
+        self.assertIs(model.llm.model.model_config.extra_attrs, mc.extra_attrs)
         self.assertIsNotNone(model.llm)
         self.assertIsNotNone(model.vision_tower)
         self.assertIsNotNone(model.embed_vision)

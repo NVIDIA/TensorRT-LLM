@@ -1261,11 +1261,12 @@ class BaseLLM:
         flat_token_ids = [tid for tids in token_ids_list for tid in tids]
 
         # Build inputs dict — common + model-specific kwargs.
-        # Filter keys that are set internally by _prepare_encoder_inputs or
-        # _forward_step to avoid "multiple values for keyword argument" errors.
+        # Filter keys that are supplied by EncoderRunner itself to avoid
+        # "multiple values for keyword argument" errors.
         _RESERVED_KEYS = {
             'input_ids',
             'seq_lens',
+            'multi_item_part_lens',
             'attn_metadata',
             'return_context_logits',
         }
@@ -1273,12 +1274,6 @@ class BaseLLM:
             k: v
             for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
         }
-
-        if filtered_kwargs and engine.encoder_cuda_graph_runner.enabled:
-            raise NotImplementedError(
-                "LLM.encode(..., **model_kwargs) is not supported when encoder CUDA "
-                "graphs are enabled. Disable encoder CUDA graphs or omit model_kwargs. "
-                f"Unsupported keys: {sorted(filtered_kwargs)}")
 
         forward_inputs = {
             'input_ids': flat_token_ids,
@@ -1700,6 +1695,57 @@ class BaseLLM:
             self) -> Optional[transformers.PretrainedConfig]:
         return ModelLoader.load_hf_model_config(
             self.args.model, trust_remote_code=self.args.trust_remote_code)
+
+    @set_api_status("prototype")
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start iteration-scoped profiling of the backend engine.
+
+        Mirrors the ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``
+        environment-variable behaviour but can be triggered at runtime (for
+        example via the ``trtllm-serve`` ``/start_profile`` HTTP endpoint).
+        Only supported when running the PyTorch / AutoDeploy backend; on the
+        TensorRT backend this is a no-op.
+
+        See ``PyExecutor.start_profile`` for full argument semantics.
+
+        Args:
+            output_dir (str, optional): Directory where chrome traces are
+                written. If ``None``, falls back to the
+                ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
+                to ``/tmp``. Defaults to None.
+            num_steps (int, optional): Number of engine iterations to
+                capture. When set, the engine stops the window automatically
+                and ``stop_profile`` does not need to be called. When
+                ``None``, profiling runs until ``stop_profile`` is called.
+                Defaults to None.
+            start_step (int): Additional iterations to skip before profiling actually begins, relative to the current iteration counter. Defaults to 0.
+            activities (List[str], optional): Subset of
+                ``["CPU", "GPU", "CUDA_PROFILER"]`` selecting which profiler
+                activities to record. When ``CUDA_PROFILER`` is the only
+                entry, ``torch.profiler`` is not started so only
+                ``cudaProfilerStart``/``cudaProfilerStop`` brackets run,
+                which is suitable for nsys capture. Defaults to None, which
+                resolves to ``["CPU", "GPU"]``.
+        """
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot start profiling.")
+        return self._executor.start_profile(output_dir=output_dir,
+                                            num_steps=num_steps,
+                                            start_step=start_step,
+                                            activities=activities)
+
+    @set_api_status("prototype")
+    def stop_profile(self) -> None:
+        """Stop any in-progress runtime profiling."""
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot stop profiling.")
+        return self._executor.stop_profile()
 
     @set_api_status("beta")
     def shutdown(self) -> None:

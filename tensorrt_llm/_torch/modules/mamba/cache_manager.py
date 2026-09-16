@@ -24,11 +24,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     ReplayStateUpdateMetadata,
     SpeculativeMambaLayerCache,
     _promote_intermediate_states,
+    _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -129,7 +130,9 @@ def _reset_mamba_seed_buffer(
 ) -> None:
     """Refresh selected slots in the graph-stable int64 Philox buffer."""
     seeds = [compute_deterministic_mamba_seed(counter, slot, rank_offset) for slot in host_slots]
-    seed_buffer[slots] = torch.tensor(seeds, dtype=torch.int64, device=seed_buffer.device)
+    seed_buffer[slots] = torch.tensor(seeds, dtype=torch.int64, pin_memory=prefer_pinned()).to(
+        seed_buffer.device, non_blocking=True
+    )
 
 
 class Mamba2State(IntermediateState):
@@ -191,6 +194,7 @@ class ReplayHistory:
     def __init__(self, tokens_per_gen_step: int) -> None:
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
+        self._stacked_conv: torch.Tensor | None = None
         self.intermediate_conv: torch.Tensor | None = None
         self.intermediate_indices: torch.Tensor | None = None
         self.rand_seed: torch.Tensor | None = None
@@ -223,6 +227,7 @@ class ReplayHistory:
     ) -> None:
         self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
+        self._stacked_conv = _stack_state_views(conv_states)
         self._seed_rank_offset = context.seed_rank_offset
         if not context.mamba_pp_layers:
             return
@@ -292,10 +297,10 @@ class ReplayHistory:
         )
 
     def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
-        self.prev_num_accepted_tokens[slots] = 0
-        self.cache_buf_idx[slots] = 0
+        self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
+        self.cache_buf_idx.index_fill_(0, slots, 0)
         for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):
-            buffer[:, slots] = 0
+            buffer.index_fill_(1, slots, 0)
         if self.rand_seed is not None:
             self._seed_request_counter += 1
             _reset_mamba_seed_buffer(
@@ -319,7 +324,9 @@ class ReplayHistory:
             batch.num_accepted_tokens,
             batch.is_dummy_request,
         )
-        _promote_intermediate_states(self._conv_states, self.intermediate_conv, batch)
+        _promote_intermediate_states(
+            self._conv_states, self.intermediate_conv, batch, self._stacked_conv
+        )
 
     def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None:
         if self.prev_num_accepted_tokens is None or self.cache_buf_idx is None:
@@ -334,6 +341,7 @@ class ReplayHistory:
     def shutdown(self) -> None:
         self._ssm_states = ()
         self._conv_states = ()
+        self._stacked_conv = None
         self.intermediate_conv = None
         self.intermediate_indices = None
         self.rand_seed = None

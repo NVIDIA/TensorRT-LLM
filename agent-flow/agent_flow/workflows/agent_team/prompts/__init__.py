@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from .coder import SYSTEM_PROMPT as CODER_SYSTEM_PROMPT
+from .mcp_tools import MCP_TOOLS_EXTENSIONS
 from .plan_drafter import SYSTEM_PROMPT as PLAN_DRAFTER_SYSTEM_PROMPT
 from .plan_reviewer import SYSTEM_PROMPT as PLAN_REVIEWER_SYSTEM_PROMPT
 from .qa import SYSTEM_PROMPT as QA_SYSTEM_PROMPT
@@ -14,6 +15,13 @@ class PromptBundle:
     Pass a custom bundle to ``AgentTeamWorkflow(..., prompts=...)`` to swap
     or extend the default prompts; use ``with_extensions`` to derive a
     bundle that appends domain-specific guidance to the defaults.
+
+    Bundles are **transport-neutral**: they describe what each role reads
+    and records, not the mechanism that moves it. ``AgentTeamWorkflow``
+    appends :data:`~.mcp_tools.MCP_TOOLS_EXTENSIONS` on top of whatever
+    bundle it is given when the run has in-process MCP tools enabled, and
+    omits them under ``--no-mcp-tools``. Domain bundles therefore must not
+    name an MCP tool in their own extensions.
     """
 
     plan_drafter: str
@@ -63,6 +71,7 @@ DEFAULT_PROMPTS = PromptBundle(
 __all__ = [
     "CODER_SYSTEM_PROMPT",
     "DEFAULT_PROMPTS",
+    "MCP_TOOLS_EXTENSIONS",
     "PLAN_DRAFTER_SYSTEM_PROMPT",
     "PLAN_REVIEWER_SYSTEM_PROMPT",
     "PromptBundle",

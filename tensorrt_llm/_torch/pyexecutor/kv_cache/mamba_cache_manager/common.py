@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     get_pp_layers,
 )
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -699,16 +700,67 @@ __all__ = [
 ]
 
 
+def _stack_state_views(states: List[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Returns one ``[num_layers, num_slots, *state_shape]`` view of ``states``.
+
+    A stacked view collapses per-layer promotion loop into a single launch of _promote_mamba_state_triton.
+    This requires per-layer pool views to be *affine*: identical dtype/device/shape/strides, and base
+    pointers spaced by a constant. returns ``None`` otherwise.
+    """
+    if not states:
+        return None
+    ref = states[0]
+    # TensorWrapper exposes CUDA pointers; CPU contract tests use per-layer views.
+    if ref.device.type != "cuda":
+        return None
+    if len(states) == 1:
+        return ref.unsqueeze(0)
+    for state in states[1:]:
+        if (
+            state.dtype != ref.dtype
+            or state.device != ref.device
+            or state.shape != ref.shape
+            or state.stride() != ref.stride()
+        ):
+            return None
+    itemsize = ref.element_size()
+    layer_stride_bytes = states[1].data_ptr() - states[0].data_ptr()
+    if layer_stride_bytes <= 0 or layer_stride_bytes % itemsize != 0:
+        return None
+    base = states[0].data_ptr()
+    if any(
+        state.data_ptr() != base + layer * layer_stride_bytes for layer, state in enumerate(states)
+    ):
+        return None
+    layer_stride = layer_stride_bytes // itemsize
+    # Highest element one layer's view can reach, so the flat wrapper below
+    # covers every byte the stacked view addresses and no more.
+    layer_extent = 1 + sum((size - 1) * stride for size, stride in zip(ref.shape, ref.stride()))
+    total_elems = (len(states) - 1) * layer_stride + layer_extent
+    flat = convert_to_torch_tensor(TensorWrapper(base, ref.dtype, [total_elems]))
+    return flat.as_strided([len(states)] + list(ref.shape), [layer_stride] + list(ref.stride()))
+
+
 def _promote_intermediate_states(
     destination_states: tuple[torch.Tensor, ...],
     intermediate_states: torch.Tensor,
     batch: MambaAcceptanceBatch,
+    stacked: torch.Tensor | None = None,
 ) -> None:
     """Copy accepted positions from [layer, batch, step, ...] into per-layer pools."""
     # Preserve the established kernel monkeypatch point without coupling the
     # concrete intermediate and replay algorithms through inheritance.
     from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
 
+    if stacked is not None:
+        mamba_cache_manager._promote_mamba_state_triton(
+            stacked,
+            intermediate_states,
+            batch.source_state_indices,
+            batch.accepted_positions,
+            batch.destination_state_indices,
+        )
+        return
     for layer_offset, destination in enumerate(destination_states):
         mamba_cache_manager._promote_mamba_state_triton(
             destination.unsqueeze(0),
@@ -725,6 +777,8 @@ class IntermediateState:
     def __init__(self) -> None:
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
+        self._stacked_ssm: torch.Tensor | None = None
+        self._stacked_conv: torch.Tensor | None = None
         self.intermediate_ssm: torch.Tensor | None = None
         self.intermediate_conv: torch.Tensor | None = None
         self.intermediate_indices: torch.Tensor | None = None
@@ -738,6 +792,8 @@ class IntermediateState:
         """Borrow persistent per-layer views until shutdown; allocate owned scratch."""
         self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
+        self._stacked_ssm = _stack_state_views(ssm_states)
+        self._stacked_conv = _stack_state_views(conv_states)
         if not context.mamba_pp_layers:
             return
 
@@ -778,12 +834,18 @@ class IntermediateState:
     def update(self, batch: MambaAcceptanceBatch) -> None:
         if self.intermediate_indices is None:
             return
-        _promote_intermediate_states(self._ssm_states, self.intermediate_ssm, batch)
-        _promote_intermediate_states(self._conv_states, self.intermediate_conv, batch)
+        _promote_intermediate_states(
+            self._ssm_states, self.intermediate_ssm, batch, self._stacked_ssm
+        )
+        _promote_intermediate_states(
+            self._conv_states, self.intermediate_conv, batch, self._stacked_conv
+        )
 
     def shutdown(self) -> None:
         self._ssm_states = ()
         self._conv_states = ()
+        self._stacked_ssm = None
+        self._stacked_conv = None
         self.intermediate_ssm = None
         self.intermediate_conv = None
         self.intermediate_indices = None

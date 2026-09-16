@@ -41,6 +41,7 @@ from _torch.moe.moe_test_utils import (
 )
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
+from utils.util import check_accuracy
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
@@ -54,6 +55,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
+    MoEActivation,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
@@ -78,6 +80,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEStaticCapability,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+    MoEDep,
     collect_moe_environment,
     override_moe_environment,
 )
@@ -560,8 +563,10 @@ def _make_trtllm_gen_moe(
     top_k: int = 2,
     hidden_size: int = 512,
     intermediate_size: int = 256,
+    tp_size: int = 1,
+    tp_rank: int = 0,
 ) -> TRTLLMGenFusedMoE:
-    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override."""
+    """A TRTLLM-Gen MoE, with or without the SiTu override."""
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
     pretrained_config.hidden_size = hidden_size
@@ -570,7 +575,7 @@ def _make_trtllm_gen_moe(
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        mapping=Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank),
         moe_backend="TRTLLM",
     )
     return TRTLLMGenFusedMoE(
@@ -740,18 +745,20 @@ def test_nvfp4_trtllm_gen_resolve_alignments_matches_create_weights(
 
 
 @_situ_supported
-def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
-    """Why the MoE-TP check cannot read the class attribute.
+def test_nvfp4_trtllm_gen_tp_accepts_logical_group_aligned_shard() -> None:
+    """Logical TP alignment is independent of the padded kernel layout."""
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        situ=True,
+        hidden_size=7168,
+        intermediate_size=3072,
+        tp_size=16,
+    )
 
-    ``hidden=1536``/``intermediate=192`` resolves to a 128 weight alignment.
-    192 is divisible by the class default (32) but not by 128, so validating
-    against ``NVFP4TRTLLMGenFusedMoEMethod.weight_alignment`` admits a shard
-    the loader cannot lay out. Pins the gap, so reverting the check to the
-    class attribute fails here rather than in a multi-GPU accuracy run.
-    """
-    resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
-    assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
-    assert 192 % resolved != 0
+    assert backend.intermediate_size_per_partition == 192
+    assert backend.intermediate_size_per_partition % 16 == 0
+    assert backend.quant_method.weight_alignment == 128
+    assert backend.intermediate_size_per_partition % backend.quant_method.weight_alignment != 0
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
@@ -1054,7 +1061,10 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
-def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
+def _make_megamoe_cutedsl_for_ctor_test(
+    *,
+    activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
+) -> MegaMoECuteDsl:
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
         moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
@@ -1068,7 +1078,147 @@ def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
         dtype=torch.bfloat16,
         model_config=model_config,
         init_load_balancer=False,
+        activation=activation,
     )
+
+
+def _make_megamoe_cutedsl_minimax_problem(
+    *,
+    bias: bool,
+    activation: ActivationType,
+) -> MoEProblem:
+    return MoEProblem(
+        quant=QuantAlgo.NVFP4.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=512,
+        intermediate_size=512,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=True,
+        bias=bias,
+        activation=activation.name,
+        activation_constants=frozenset({"alpha", "beta", "clamp"}),
+    )
+
+
+def _make_megamoe_cutedsl_test_deployment(
+    *, ep_size: int = 1, parallel_size: int = 1, use_dp: bool = False
+) -> MoEDeployment:
+    return MoEDeployment(
+        ep_size=ep_size,
+        tp_size=1,
+        parallel_size=parallel_size,
+        use_dp=use_dp,
+        num_slots=8,
+        env=MoEEnvironment(
+            sm=100,
+            available_deps=(MoEDep.MEGAMOE_CUTEDSL_RUNTIME, MoEDep.MEGAMOE_CUTEDSL_OP),
+        ),
+    )
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_accepts_minimax_m3_problem() -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(
+            bias=False,
+            activation=ActivationType.SwigluBias,
+        ),
+        _make_megamoe_cutedsl_test_deployment(),
+    )
+
+    assert verdict.eligible, verdict.detail
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "bias, activation",
+    [
+        (True, ActivationType.SwigluBias),
+        (False, ActivationType.Swiglu),
+    ],
+    ids=["expert_bias", "wrong_activation"],
+)
+def test_megamoe_cutedsl_rejects_non_minimax_swiglu_bias_package(
+    bias: bool,
+    activation: ActivationType,
+) -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(bias=bias, activation=activation),
+        _make_megamoe_cutedsl_test_deployment(),
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_tep_requires_minimax_m3_activation() -> None:
+    deployment = _make_megamoe_cutedsl_test_deployment(ep_size=4, parallel_size=4)
+    minimax_verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(
+            bias=False,
+            activation=ActivationType.SwigluBias,
+        ),
+        deployment,
+    )
+    plain_swiglu_verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            swiglu_gptoss_style=False,
+            bias=False,
+            activation=ActivationType.Swiglu.name,
+        ),
+        deployment,
+    )
+
+    assert minimax_verdict.eligible, minimax_verdict.detail
+    assert not plain_swiglu_verdict.eligible
+    assert plain_swiglu_verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test(
+        activation=SwigluBiasActivation(
+            gate_sigmoid_scale=torch.full((8,), 1.702),
+            linear_offset=torch.ones(8),
+            clamp=torch.full((8,), 7.0),
+        )
+    )
+
+    assert moe.act_alpha == pytest.approx(1.702)
+    assert moe.act_beta == pytest.approx(1.0)
+    assert moe.act_clamp == pytest.approx(7.0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("parameter_name", "register_name"),
+    [
+        ("gate_sigmoid_scale", "alpha"),
+        ("clamp", "clamp"),
+    ],
+)
+def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(
+    parameter_name: str, register_name: str
+) -> None:
+    parameters = {
+        "gate_sigmoid_scale": torch.full((8,), 1.702),
+        "linear_offset": torch.ones(8),
+        "clamp": torch.full((8,), 7.0),
+    }
+    parameters[parameter_name][-1] += 1.0
+
+    with pytest.raises(ValueError, match=rf"uniform .*activation {register_name}"):
+        _make_megamoe_cutedsl_for_ctor_test(
+            activation=SwigluBiasActivation(**parameters),
+        )
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
@@ -1109,6 +1259,165 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
     invalid_tactic[2] = 511
     with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
         megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+
+
+@pytest.mark.gpu
+def test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 100)
+    runner_kwargs = {
+        "world_size": 1,
+        "local_rank": 0,
+        "num_topk": 2,
+        "num_experts_per_rank": 8,
+        "hidden_size": 512,
+        "intermediate_size_per_partition": 512,
+        "expand_intermediate_size_per_partition": 1024,
+        "max_tokens_per_rank": 64,
+        "output_dtype": torch.bfloat16,
+        "gate_up_clamp": 7.0,
+    }
+    runner = megamoe_op.Sm100MegaMoENvfp4Runner(
+        **runner_kwargs,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+    )
+    different_alpha = megamoe_op.Sm100MegaMoENvfp4Runner(
+        **runner_kwargs,
+        swiglu_alpha=1.0,
+        swiglu_beta=1.0,
+    )
+    different_beta = megamoe_op.Sm100MegaMoENvfp4Runner(
+        **runner_kwargs,
+        swiglu_alpha=1.702,
+        swiglu_beta=0.0,
+    )
+    tactic = megamoe_op.default_megamoe_tactic(64)
+
+    assert runner.unique_id() != different_alpha.unique_id()
+    assert runner.unique_id() != different_beta.unique_id()
+    assert runner._tactic_cache_key(tactic) != different_alpha._tactic_cache_key(tactic)
+    assert runner._tactic_cache_key(tactic) != different_beta._tactic_cache_key(tactic)
+
+
+@pytest.mark.gpu
+def test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics() -> None:
+    """Run bias-free MiniMax SwiGLU through the B200 kernel and its reference."""
+    backend_type = MoeBackendType.MEGAMOE_CUTEDSL
+    dtype = torch.bfloat16
+    num_experts = 8
+    top_k = 2
+    hidden_size = 512
+    intermediate_size = 512
+    seq_len = 16
+    swiglu_alpha = 1.702
+    swiglu_beta = 1.0
+    swiglu_limit = 7.0
+
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(
+            bias=False,
+            activation=ActivationType.SwigluBias,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping(rank=mpi_rank())
+    _ensure_single_proc_dist_for_megamoe(backend_type, mapping.rank)
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        # The larger input range makes the dequantized FC1 gate/up values cross
+        # MiniMax's clamp boundary in both directions.
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda") * 8.0
+        router_logits = torch.full((seq_len, num_experts), -100.0, dtype=dtype, device="cuda")
+        router_logits[:, 0] = 100.0
+        router_logits[:, 1] = 90.0
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=True,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            activation_type=ActivationType.SwigluBias,
+        )
+        swiglu_tensors = quantize_util.get_swiglu_tensors()
+        assert swiglu_tensors is not None
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            bias=False,
+            swiglu_alpha=swiglu_tensors["swiglu_alpha"],
+            swiglu_beta=swiglu_tensors["swiglu_beta"],
+            swiglu_limit=swiglu_tensors["swiglu_limit"],
+            activation_type=ActivationType.SwigluBias,
+        )
+        ref_cls = quant_kwargs.pop("ref_cls")
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = quantize_util.create_ref_module(
+            routing_method,
+            ref_cls=ref_cls,
+        )
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            gate_up = ref_fused_moe.experts[0].gate_up_proj(x)
+            gate, up = gate_up.chunk(2, dim=-1)
+            assert torch.any(gate > swiglu_limit)
+            assert torch.any(gate < swiglu_limit)
+            assert torch.any(up < -swiglu_limit)
+            assert torch.any((up < 0) & (up > -swiglu_limit))
+            ref_output = ref_fused_moe(x, router_logits)
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+
+        # This clamp-heavy input is intentionally wider than the generic
+        # MegaMoE sweep and needs one percentage point of NVFP4 headroom.
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
 
 
 def run_backend_moe(
@@ -1588,6 +1897,8 @@ def test_moe_backend(
         # swiglu_gptoss_style is True when any swiglu parameter deviates from default
         # Default values: alpha=1, beta=0, limit=inf
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
+    expert_bias = swiglu_gptoss_style and not is_minimax_megamoe
 
     locality_domain_runtime_skip = should_skip_locality_domain_runtime(enable_locality_domains)
     if locality_domain_runtime_skip:
@@ -1648,7 +1959,7 @@ def test_moe_backend(
             intermediate_size=intermediate_size,
             hidden_size=hidden_size,
             quant_config=quant_config,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_gptoss_style=swiglu_gptoss_style,
             swiglu_alpha=swiglu_alpha if swiglu_gptoss_style else None,
             swiglu_beta=swiglu_beta if swiglu_gptoss_style else None,
@@ -1680,7 +1991,7 @@ def test_moe_backend(
             dtype=dtype_activation,
             quant_config=quant_config,
             mapping=mapping,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
             swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,

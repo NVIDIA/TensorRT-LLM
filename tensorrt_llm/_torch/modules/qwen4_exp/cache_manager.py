@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.constants import (
     QSA_SPARSE_KV_CACHE_DTYPES,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     create_gdn_state,
@@ -172,6 +173,16 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
     as the indexer. A local fallback could otherwise give the indexer and its
     paged cache different shapes or page strides.
     """
+
+    @override
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """PLE state and request-wide QSA positions are replicated across TP."""
+        return {
+            **super().get_disagg_role_mapper_kinds(),
+            PLE_CONV_STATE: MapperKind.REPLICATED,
+            PLE_NGRAM_CONTEXT: MapperKind.REPLICATED,
+            QSA_INDEX_POSITION: MapperKind.REPLICATED,
+        }
 
     @override
     def __init__(

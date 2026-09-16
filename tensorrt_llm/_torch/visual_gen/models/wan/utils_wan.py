@@ -264,8 +264,8 @@ def apply_fused_layernorm_adaln_quant(
     # .contiguous() handles non-contiguous views (chunk/squeeze/reshape patterns) and
     # transposed layouts injected by torch.compile's inductor memory planner.
     x = x.contiguous()
-    scale_msa = scale_msa.to(dtype=x.dtype).contiguous()
-    shift_msa = shift_msa.to(dtype=x.dtype).contiguous()
+    scale_msa = scale_msa.to(dtype=torch.float32).contiguous()
+    shift_msa = shift_msa.to(dtype=torch.float32).contiguous()
     if fp4_input_scale is not None:
         y_fp4, sf_out = torch.ops.trtllm.fused_adaptive_layernorm_quant(
             x, None, None, scale_msa, shift_msa, fp4_input_scale, seq_len_per_batch, eps
@@ -293,11 +293,13 @@ def apply_fused_layernorm_affine_quant(
     # seq_len_per_batch is unused on the affine path (kernel only reads it under HAS_MODULATION).
     # Pass 0 so any future kernel change that accidentally reads it here fails loudly.
     seq_len_per_batch = 0
+    ln_weight = ln_weight.to(dtype=torch.float32).contiguous()
+    ln_bias = ln_bias.to(dtype=torch.float32).contiguous()
     if fp4_input_scale is not None:
         y_fp4, sf_out = torch.ops.trtllm.fused_adaptive_layernorm_quant(
             x,
-            ln_weight.to(x.dtype),
-            ln_bias.to(x.dtype),
+            ln_weight,
+            ln_bias,
             None,
             None,
             fp4_input_scale,
@@ -306,6 +308,6 @@ def apply_fused_layernorm_affine_quant(
         )
         return Fp4QuantizedTensor(y_fp4, sf_out)
     out = torch.ops.trtllm.fused_adaptive_layernorm(
-        x, ln_weight.to(x.dtype), ln_bias.to(x.dtype), None, None, seq_len_per_batch, eps
+        x, ln_weight, ln_bias, None, None, seq_len_per_batch, eps
     )
     return out

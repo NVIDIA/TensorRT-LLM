@@ -434,6 +434,7 @@ def test_warmup_cleanup_clears_registered_persistent_roles_only(
     manager.ssm_state_dtype = manager.conv_state_dtype = torch.float32
     manager.ssm_bytes, manager.conv_bytes = 128, 288
     manager._num_reserved_dummy_slots = 0
+    manager._guard_page_by_layer = {}
     manager.kv_cache_config = SimpleNamespace()
     manager._minimum_live_gpu_quota = lambda: 0
     manager._init_qwen4_exp_ple_geometry(
@@ -481,7 +482,7 @@ def test_warmup_cleanup_clears_registered_persistent_roles_only(
     state = manager._speculative_state
     scratch_before = {}
     for name, tensor in vars(state).items():
-        if isinstance(tensor, torch.Tensor):
+        if isinstance(tensor, torch.Tensor) and not name.startswith("_stacked_"):
             if tensor.is_floating_point():
                 tensor.fill_(torch.nan)
             scratch_before[name] = tensor.clone()

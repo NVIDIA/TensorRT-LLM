@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    MAMBA_CONV_ROLE,
+    AttentionLayerGroup,
+    MambaLayerGroup,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState, Qwen35HybridCacheManagerV2
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
@@ -53,6 +57,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _stack_state_views
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
@@ -796,6 +801,7 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
 
 def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
+    from tensorrt_llm._torch.models.modeling_nemotron_nano import NemotronH_Nano_VL_V2
     from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 
@@ -807,7 +813,12 @@ def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     ):
         monkeypatch.delenv(env_var, raising=False)
 
-    for model_cls in (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel):
+    for model_cls in (
+        NemotronHForCausalLM,
+        Qwen3NextForCausalLM,
+        Qwen3_5VLModel,
+        NemotronH_Nano_VL_V2,
+    ):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
@@ -1832,6 +1843,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -1864,6 +1876,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -2093,6 +2106,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr._generation_kv_capacity_headroom = 1
         mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
         mgr.head_dim_per_layer = [64, 64]
@@ -2235,6 +2249,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_attention_dp=False,
     enable_swa_scratch_reuse=False,
     dtype=DataType.HALF,
+    kv_cache_dtype="auto",
     conv_state_layout="x_b_c",
     speculative_state=None,
     mamba_d_conv=4,
@@ -2266,7 +2281,7 @@ def _build_v2_hybrid_with_mamba_layer(
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
             enable_branch_snapshot=enable_branch_snapshot,
         ),
-        dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
+        dtype=kv_cache_dtype,
     )
     model_cls = (
         KimiK3HybridCacheManagerV2
@@ -2418,8 +2433,10 @@ def test_v2_hybrid_allocates_mamba_state_and_dummy_indices():
 
 
 @skip_no_cuda
-def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales():
-    mgr = _build_v2_hybrid_with_mamba_layer(dtype=DataType.NVFP4)
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "nvfp4"])
+def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales(kv_cache_dtype: str) -> None:
+    # "auto" keeps the user config unchanged when the checkpoint selects NVFP4.
+    mgr = _build_v2_hybrid_with_mamba_layer(dtype=DataType.NVFP4, kv_cache_dtype=kv_cache_dtype)
     try:
         ssm_pool_id = mgr.impl.get_layer_group_id(LayerId(0))
         attention_pool_id = mgr.impl.get_layer_group_id(LayerId(1))
@@ -3460,7 +3477,8 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         assert isinstance(mamba_group, MambaLayerGroup)
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        assert mamba_group.conv_section_bytes == [
+        conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
+        assert conv_view.section_bytes == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]
@@ -4472,3 +4490,24 @@ def test_cpp_hybrid_zero_local_mamba_layers():
         )
     )
     assert metadata.state_indices[0].item() == 0
+
+
+@skip_no_cuda
+def test_v2_stack_state_views_detects_affine_layout():
+    pool = torch.zeros(3, 4, 8, device="cuda")
+    layers = [pool[i] for i in range(3)]
+
+    stacked = _stack_state_views(layers)
+
+    assert stacked.shape == (3, 4, 8)
+    stacked[2, 1, 3] = 5.0
+    assert layers[2][1, 3] == 5.0
+
+
+def test_v2_stack_state_views_rejects_non_affine_layout():
+    pool = torch.zeros(4, 4, 8)
+    stack = _stack_state_views
+
+    assert stack([pool[0], pool[1], pool[3]]) is None
+    assert stack([pool[0], torch.zeros(5, 8)]) is None
+    assert stack([]) is None

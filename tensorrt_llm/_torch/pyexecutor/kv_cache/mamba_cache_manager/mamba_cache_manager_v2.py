@@ -38,7 +38,9 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
     KVCacheManagerV2,
     Role,
@@ -358,6 +360,33 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @classmethod
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
         return 0
+
+    @override
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """Convolution sections shard independently; SSM state shards by head."""
+        return {
+            **super().get_disagg_role_mapper_kinds(),
+            MambaRole.CONV_STATE: MapperKind.SECTIONED,
+        }
+
+    @override
+    def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Describe per-layer recurrent geometry for resharding across TP."""
+        if self.local_num_mamba_layers == 0:
+            return {}
+        d_conv_m1 = int(self.conv_state_shape[1])
+        _, head_dim, d_state = self.ssm_state_shape
+        return {
+            MambaRole.CONV_STATE: RoleLayout(
+                section_bytes=tuple(
+                    int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
+                    for dim in self.conv_section_dims
+                )
+            ),
+            MambaRole.SSM_STATE: RoleLayout(
+                bytes_per_head=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
+            ),
+        }
 
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0
@@ -706,7 +735,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def get_num_free_blocks(self) -> int:
-        assert len(self.kv_cache_map) == 0, (
+        reserved = set(self.kv_cache_map) & _RESERVED_REQUEST_IDS
+        assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
         attention_pages = []
@@ -864,7 +894,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     )
                 self._host_state_indices[i] = base_index
 
-        self.cuda_state_indices.copy_(self._host_state_indices, non_blocking=True)
+        idx_staging = torch.empty_like(self._host_state_indices, pin_memory=prefer_pinned())
+        idx_staging.copy_(self._host_state_indices)
+        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
@@ -898,7 +930,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._dummy_request_mask_host.zero_()
         if count:
             self._dummy_request_mask_host[:count].copy_(torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask.copy_(self._dummy_request_mask_host, non_blocking=True)
+        mask_staging = torch.empty_like(self._dummy_request_mask_host, pin_memory=prefer_pinned())
+        mask_staging.copy_(self._dummy_request_mask_host)
+        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
 
     @override
     def get_state_indices(
@@ -1244,21 +1278,22 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return report
 
     @override
-    def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
+    def _iter_cache_buffers_for_invalid_check(self) -> Iterable[tuple[int, torch.Tensor]]:
         for global_layer_id, local_layer_id in self.layer_offsets.items():
             if self._is_local_mamba_layer(local_layer_id):
                 continue
             # A layer group is a lifecycle, not a physical memory pool.
             # Differently sized attention buffers can share one lifecycle,
             # so scan every attention layer in this diagnostic path.
-            yield KVCacheManagerV2.get_buffers(self, global_layer_id)
+            yield global_layer_id, KVCacheManagerV2.get_buffers(self, global_layer_id)
 
         for (layer_id, role), buffer in self._recurrent_buffers.items():
             if buffer is None:
                 raise RuntimeError(
                     f"Recurrent buffer view was not bound: layer={layer_id}, role={role}"
                 )
-            yield buffer
+            # Recurrent roles have no attention guard page.
+            yield -1, buffer
 
     @override
     def shutdown(self):

@@ -44,6 +44,8 @@ from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
+from ..models.checkpoints.weight_load_plan import WeightLoadPlan
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
@@ -350,6 +352,7 @@ _SUPPORTED_CHECKPOINT_IO_POLICIES = (
     _NATIVE_CHECKPOINT_IO_POLICY,
     _RANK_STRIPED_CHECKPOINT_IO_POLICY,
 )
+_SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
 
 
 def _resolve_checkpoint_io_policy(
@@ -524,6 +527,43 @@ def _timed_checkpoint_weight_session(
             session.__exit__(None, None, None)
 
 
+def _inspect_shadow_weight_load_plan(
+        checkpoint_loader: Any, checkpoint_dir: str, weight_mapper: Any,
+        **kwargs: Any) -> tuple[CheckpointCatalog, WeightLoadPlan] | None:
+    """Build and validate advisory checkpoint metadata without changing loading."""
+    enabled = os.environ.get(_SHADOW_WEIGHT_LOAD_PLAN_ENV,
+                             "0").lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return None
+
+    build_catalog = getattr(checkpoint_loader, "build_checkpoint_catalog", None)
+    build_plan = getattr(weight_mapper, "build_weight_load_plan", None)
+    if build_catalog is None or build_plan is None:
+        return None
+
+    try:
+        catalog = build_catalog(checkpoint_dir, **kwargs)
+        if catalog is None:
+            return None
+        plan = build_plan(catalog)
+        plan.validate_against(catalog)
+    except Exception as error:
+        # Shadow inspection is strictly advisory. In particular, it must not
+        # turn a successful native load into a startup failure.
+        logger.warning("Checkpoint shadow plan inspection failed; continuing "
+                       "with the unchanged loader: "
+                       f"{type(error).__name__}: {error}")
+        return None
+
+    logger.info(
+        "Checkpoint shadow plan validated: "
+        f"catalog_id={catalog.catalog_id}, plan_id={plan.plan_id}, "
+        f"coverage={plan.coverage.value}, ordering={plan.ordering.value}, "
+        f"objects={len(catalog.objects)}, "
+        f"tensors={len(catalog.tensors)}, demands={len(plan.demands)}.")
+    return catalog, plan
+
+
 def _apply_to_buffers_only(model: torch.nn.Module, fn):
     """Apply *fn* to every buffer in *model*, skipping parameters.
     """
@@ -544,6 +584,27 @@ class ModelLoaderMetricNames(Enum):
     DRAFT_CHECKPOINT_FINALIZATION_SECONDS = (
         "draft_checkpoint_finalization_seconds")
     POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+
+
+def _checkpoint_startup_metadata(
+    checkpoint_loader: BaseCheckpointLoader,
+    load_format: LoadFormat | str,
+) -> dict[str, str]:
+    """Describe the concrete checkpoint source selected for this load."""
+    weight_loader = getattr(checkpoint_loader, "weight_loader", None)
+    source_kind = getattr(checkpoint_loader, "checkpoint_format", None)
+    load_format_name = getattr(load_format, "name", load_format)
+    return {
+        "checkpoint_loader_kind":
+        type(checkpoint_loader).__name__,
+        "checkpoint_weight_loader_kind":
+        (type(weight_loader).__name__
+         if weight_loader is not None else "unknown"),
+        "checkpoint_source_kind":
+        str(source_kind or "unknown"),
+        "load_format":
+        str(load_format_name).lower(),
+    }
 
 
 class ModelLoader:
@@ -655,11 +716,17 @@ class ModelLoader:
         self._checkpoint_loader: Optional[BaseCheckpointLoader] = None
         # Mostly weight loading and processing time metrics, updated when load() is called.
         self._metrics: dict[str, float] = {}
+        self._startup_metadata: dict[str, str] = {}
 
     @property
     def metrics(self) -> dict[str, float]:
         """Return weight loading and processing time metrics."""
         return self._metrics
+
+    @property
+    def startup_metadata(self) -> dict[str, str]:
+        """Return checkpoint-source metadata captured by the latest load."""
+        return self._startup_metadata
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -695,8 +762,8 @@ class ModelLoader:
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
         # Preferences follow the checkpoint's original architecture:
-        # _resolve_class may rewrite it to an execution class (e.g.
-        # MTPDraftModelForCausalLM), which must not drop the target model's
+        # _resolve_class may rewrite it to an execution class (e.g. the EAGLE3
+        # prefixing above), which must not drop the target model's
         # preferences.
         preference_cls = model_cls
         architectures = getattr(config.pretrained_config, 'architectures', None)
@@ -817,6 +884,8 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        self._startup_metadata = _checkpoint_startup_metadata(
+            checkpoint_loader, load_format)
 
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
@@ -1885,6 +1954,12 @@ class ModelLoader:
             weights_preloaded = checkpoint_loader.is_weights_preloaded()
             self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                 model, config)
+            _inspect_shadow_weight_load_plan(
+                checkpoint_loader,
+                checkpoint_dir,
+                self.weight_mapper,
+                **load_weights_kwargs,
+            )
             if weights:
                 with timing_metric(
                         ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
@@ -1917,6 +1992,12 @@ class ModelLoader:
             else:
                 # MTP one-model + separate MTP checkpoint: no draft HF architecture.
                 draft_weight_mapper = self.weight_mapper
+            _inspect_shadow_weight_load_plan(
+                checkpoint_loader,
+                self.spec_config.speculative_model,
+                draft_weight_mapper,
+                mapping=self.mapping,
+            )
             with timing_metric(
                     ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.
                     value, self._metrics):
