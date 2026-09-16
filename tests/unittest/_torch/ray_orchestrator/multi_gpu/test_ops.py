@@ -65,6 +65,8 @@ class PgOpTest:
             "group": self.mapping.tp_group,
         })
         if pg_op_name == "allreduce_pg":
+            additional_kwargs.update({"pg": self.mapping.tp_group_pg.boxed()})
+        elif pg_op_name == "allreduce_pg_by_name":
             additional_kwargs.update(
                 {"group_name": self.mapping.tp_group_pg.group_name})
         else:
@@ -259,6 +261,81 @@ def test_allreduce_pg_op(setup_ray_cluster, seq_len, hidden_size):
     ])
     for r in results:
         assert r is True
+
+
+@pytest.mark.part2
+@pytest.mark.parametrize("hidden_size", [128, 1024],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
+def test_allreduce_pg_by_name_op(setup_ray_cluster, seq_len, hidden_size):
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    world_size = 2
+    test_tensor = torch.randn((seq_len, hidden_size), dtype=dtype)
+    expected_result = test_tensor * world_size
+
+    runtime_env = ray.runtime_env.RuntimeEnv()
+    runtime_env["env_vars"] = os.environ.copy()
+    runtime_env["env_vars"].update({
+        "TLLM_DISABLE_MPI": "1",
+        "MASTER_ADDR": "127.0.0.1",
+    })
+
+    remotePGTests = []
+    for rank in range(world_size):
+        remotePGTests.append(
+            PgOpTest.options(runtime_env=runtime_env).remote(rank, world_size))
+
+    ray.get(
+        [remotePGTest.__ray_ready__.remote() for remotePGTest in remotePGTests])
+
+    port = ray.get(remotePGTests[0].setup_tcp_store.remote())
+    ray.get([
+        remotePGTest.setup_distributed_env.remote(port)
+        for remotePGTest in remotePGTests
+    ])
+
+    results = ray.get([
+        remotePGTest.run.remote("allreduce_pg_by_name",
+                                test_tensor,
+                                expected_result,
+                                residual=None,
+                                norm_weight=None,
+                                scale=None,
+                                bias=None,
+                                workspace=None,
+                                strategy=AllReduceStrategy.NCCL,
+                                op=AllReduceFusionOp.NONE,
+                                eps=1e-5,
+                                trigger_completion_at_end=True,
+                                rank=i)
+        for i, remotePGTest in enumerate(remotePGTests)
+    ])
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.part2
+@pytest.mark.cpu_only
+class TestAllReduceOpSelection:
+    """tp_size=1 skips workspace allocation, so no GPU/process group needed."""
+
+    def test_visual_gen_mapping_uses_pg_by_name(self, monkeypatch):
+        monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+        from tensorrt_llm._torch.distributed.ops import AllReduce
+        from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+
+        mapping = VisualGenMapping(world_size=1, rank=0).to_llm_mapping()
+        allreduce = AllReduce(mapping=mapping)
+        assert allreduce.all_reduce_op is torch.ops.trtllm.allreduce_pg_by_name
+
+    def test_llm_mapping_uses_pg(self, monkeypatch):
+        monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+        from tensorrt_llm._torch.distributed.ops import AllReduce
+
+        mapping = Mapping(world_size=1, rank=0)
+        allreduce = AllReduce(mapping=mapping)
+        assert allreduce.all_reduce_op is torch.ops.trtllm.allreduce_pg
 
 
 @ray.remote(num_gpus=1)

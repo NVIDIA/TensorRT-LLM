@@ -229,7 +229,10 @@ def visual_gen_command(
         seconds = num_frames / fps
         logger.info(f"Computed seconds={seconds:.3f} from num_frames={num_frames} / fps={fps}")
 
-    gen_params_kwargs: dict = {"seed": seed, "frame_rate": float(fps)}
+    gen_params_kwargs: dict = {"seed": seed}
+    ctx = click.get_current_context()
+    if ctx.get_parameter_source("fps") == click.core.ParameterSource.COMMANDLINE:
+        gen_params_kwargs["frame_rate"] = float(fps)
     if height is not None:
         gen_params_kwargs["height"] = height
     if width is not None:
@@ -338,22 +341,24 @@ def _run_benchmark(
     ``save()`` to a per-run temp directory. The save mirrors what the
     serving path (``openai_video_routes.py`` / ``openai_server.py``) does
     inside its own ``latency`` window: encode and write to a persisted
-    location. The directory is cleaned up at the end of the run.
+    location. The directory is left on disk after the run (not
+    auto-deleted) so generated media can be inspected/copied afterward.
     """
     import asyncio
 
-    with tempfile.TemporaryDirectory(prefix="trtllm-bench-vg-") as media_dir:
-        if max_concurrency <= 1:
-            return _run_sequential(visual_gen, input_requests, gen_params, media_dir)
-        return asyncio.run(
-            _run_concurrent(
-                visual_gen,
-                input_requests,
-                gen_params,
-                max_concurrency,
-                media_dir,
-            )
+    media_dir = tempfile.mkdtemp(prefix="trtllm-bench-vg-")
+    logger.info(f"Saving generated media to {media_dir}")
+    if max_concurrency <= 1:
+        return _run_sequential(visual_gen, input_requests, gen_params, media_dir)
+    return asyncio.run(
+        _run_concurrent(
+            visual_gen,
+            input_requests,
+            gen_params,
+            max_concurrency,
+            media_dir,
         )
+    )
 
 
 def _save_for_timing(result, media_dir: str, idx: int) -> None:

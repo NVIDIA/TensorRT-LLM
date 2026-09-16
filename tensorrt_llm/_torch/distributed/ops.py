@@ -881,17 +881,13 @@ class AllReduce(nn.Module):
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
 
-        # Resolved once here, outside forward(), so torch.compile(fullgraph=True)
-        # never has to trace the mesh/ProcessGroup lookup (the mesh is
-        # build-once-per-process, so this stays valid for the module's lifetime).
-        self._tp_group = self.mapping.tp_group
-        self._tp_group_name = None
-        if self._disable_mpi:
-            pg = self.mapping.tp_group_pg
-            assert pg is not None, "TP ProcessGroup not initialised"
-            self._tp_group_name = pg.group_name
+        self._is_visual_gen = getattr(mapping, "_visual_gen_origin", False)
 
-        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
+        self.all_reduce_op = torch.ops.trtllm.allreduce
+        if self._disable_mpi:
+            self.all_reduce_op = (torch.ops.trtllm.allreduce_pg_by_name
+                                  if self._is_visual_gen else
+                                  torch.ops.trtllm.allreduce_pg)
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
@@ -1067,10 +1063,20 @@ class AllReduce(nn.Module):
 
         additional_args = {}
         if self._disable_mpi:
-            additional_args = {
-                "rank": torch.distributed.get_rank(),
-                "group_name": self._tp_group_name,
-            }
+            if self._is_visual_gen:
+                pg = self.mapping.tp_group_pg
+                assert pg is not None, "TP ProcessGroup not initialised"
+                additional_args = {
+                    "rank": torch.distributed.get_rank(),
+                    "group_name": pg.group_name,
+                }
+            else:
+                pg = self.mapping.tp_group_pg
+                assert pg is not None, "TP ProcessGroup not initialised"
+                additional_args = {
+                    "rank": torch.distributed.get_rank(),
+                    "pg": pg.boxed(),
+                }
 
         # In case that AutoTuner brings potential perf regression
         # TODO: Remove this if no perf regression is observed.
@@ -1088,7 +1094,7 @@ class AllReduce(nn.Module):
                     scale=all_reduce_params.scale,
                     bias=all_reduce_params.bias,
                     workspace=self.workspace,
-                    group=self._tp_group,
+                    group=self.mapping.tp_group,
                     strategy=allreduce_strategy,
                     op=all_reduce_params.fusion_op,
                     eps=all_reduce_params.eps,
@@ -1103,7 +1109,7 @@ class AllReduce(nn.Module):
                     scale=all_reduce_params.scale,
                     bias=all_reduce_params.bias,
                     workspace=self.workspace,
-                    group=self._tp_group,
+                    group=self.mapping.tp_group,
                     strategy=allreduce_strategy,
                     op=all_reduce_params.fusion_op,
                     eps=all_reduce_params.eps,
@@ -1118,7 +1124,7 @@ class AllReduce(nn.Module):
                 scale=all_reduce_params.scale,
                 bias=all_reduce_params.bias,
                 workspace=self.workspace,
-                group=self._tp_group,
+                group=self.mapping.tp_group,
                 strategy=allreduce_strategy,
                 op=all_reduce_params.fusion_op,
                 eps=all_reduce_params.eps,

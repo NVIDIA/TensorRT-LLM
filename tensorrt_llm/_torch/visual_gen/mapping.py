@@ -142,6 +142,9 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     # are used throughout the process
     _shutdown_pg_registered: bool = False
 
+    # Propagated through to_llm_mapping()/to_autotuner_mapping(); see AllReduce.__init__.
+    _visual_gen_origin: bool = True
+
     def __init__(
         self,
         world_size: int,
@@ -219,9 +222,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self._attn2d_col_group: Optional[ProcessGroup] = None
         # Flattened ``cp_row`` × ``cp_col`` submesh (Attention2D logical CP tile).
         self._cp_plane_mesh_flat: Optional[DeviceMesh] = None
-        # Mesh is build-once-per-process, so this stays valid; re-resolved in
-        # build_mesh() once the real mesh exists.
-        self._tp_pg: Optional[ProcessGroup] = self._group("tp")
 
         if dist.is_initialized() and world_size > 1:
             if self.tp_size > 1:
@@ -298,7 +298,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 )
             if self._use_attn2d_plane:
                 self._attach_attn2d_groups_from_device_mesh()
-            self._tp_pg = self._group("tp")
             return
 
         shape = tuple(self._dim_sizes[d] for d in self._dim_names)
@@ -341,8 +340,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if self._use_attn2d_plane:
             self._attach_attn2d_groups_from_device_mesh()
-
-        self._tp_pg = self._group("tp")
 
     def _attach_attn2d_groups_from_device_mesh(self) -> None:
         """Set Attention2D row/col process groups from the ``cp_row`` × ``cp_col`` submesh.
@@ -547,7 +544,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
     @property
     def tp_group_pg(self) -> Optional[ProcessGroup]:
-        return self._tp_pg
+        return self._group("tp")
 
     @property
     def cfg_group(self) -> Optional[ProcessGroup]:
@@ -603,17 +600,21 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     # ------------------------------------------------------------------
     def to_llm_mapping(self) -> Mapping:
         """Return a ``Mapping`` whose TP group is backed by this mesh's TP dim."""
-        return Mapping(
+        mapping = Mapping(
             world_size=self.tp_size,
             rank=self.tp_rank,
             tp_size=self.tp_size,
         )
+        mapping._visual_gen_origin = True
+        return mapping
 
     def to_autotuner_mapping(self) -> Mapping:
         """Mapping that makes the autotuner treat all world ranks as one tuning
         group (tp_size == world_size), so its post-tune cross-rank merge engages."""
-        return Mapping(
+        mapping = Mapping(
             world_size=self.world_size,
             rank=self._rank,
             tp_size=self.world_size,
         )
+        mapping._visual_gen_origin = True
+        return mapping

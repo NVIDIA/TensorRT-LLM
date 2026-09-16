@@ -272,6 +272,11 @@ class TestToLlmMapping:
         assert m.tp_size == 2
         assert m.world_size == 2
 
+    def test_marks_visual_gen_origin(self):
+        vgm = VisualGenMapping(world_size=1, rank=0)
+        assert vgm.to_llm_mapping()._visual_gen_origin is True
+        assert vgm.to_autotuner_mapping()._visual_gen_origin is True
+
 
 # =============================================================================
 # Multi-GPU tests — validate actual DeviceMesh groups and ranks
