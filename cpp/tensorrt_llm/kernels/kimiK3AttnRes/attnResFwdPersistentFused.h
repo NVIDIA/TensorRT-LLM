@@ -39,10 +39,11 @@ namespace kernels::kimiK3AttnRes
 //! form. layerResidualAdd is optional: shapes with no residual add to fold
 //! would otherwise be pushed back onto the per-token path. When it is non-null
 //! updatedLayerResidual must be non-null too (see
-//! attnResPersistentFusedSupported). updatedLayerResidual may alias
-//! layerResidual to recover the in-place fold, but it does not have to -- the
-//! residual the kernel consumes comes from its shared-memory copy rather than
-//! a reload of layerResidual.
+//! attnResPersistentFusedSupported). updatedLayerResidual must NOT alias
+//! layerResidual: the kernel takes both as __restrict__, so folding in place
+//! is undefined behaviour even though the residual it consumes comes from a
+//! shared-memory copy rather than a reload. Every in-tree caller passes a
+//! freshly allocated tensor.
 void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream);
 
 //! True when invokeAttnResPersistentFusedFwd can serve this shape, so callers

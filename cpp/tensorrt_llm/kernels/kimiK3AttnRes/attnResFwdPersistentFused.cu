@@ -313,9 +313,11 @@ __global__ void __launch_bounds__(BLK, 1)
     attn_res_fwd_persistent_fused_kernel(bf16_t const* __restrict__ block_res, bf16_t const* __restrict__ layer_res,
         // Diverges from the source copy, which folded the residual add in place on
         // layer_res. TensorRT-LLM's attn_res_add_rmsnorm_fwd returns the updated
-        // prefix sum as a new tensor, and the read is not affected by the split:
-        // the value consumed here comes from the TMA'd shared-memory copy, not from
-        // a reload of layer_res. Pass layer_res again to recover in-place.
+        // prefix sum as a new tensor. Note that recovering the in-place form by
+        // passing layer_res here is NOT valid: both pointers are __restrict__, so
+        // the compiler may assume the read and the store do not overlap. That the
+        // consumed value comes from the TMA'd shared-memory copy rather than a
+        // reload of layer_res removes one hazard, not the no-alias contract.
         bf16_t* __restrict__ updated_layer_res, bf16_t const* __restrict__ delta, bf16_t const* __restrict__ res_w,
         bf16_t const* __restrict__ rms_w, bf16_t* __restrict__ output, int T, int block_stride_m, int block_stride_r,
         float rms_eps, bf16_t const* __restrict__ output_norm_weight, float output_norm_eps)
