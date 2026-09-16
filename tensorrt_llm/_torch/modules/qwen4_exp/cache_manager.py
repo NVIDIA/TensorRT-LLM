@@ -183,6 +183,12 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     # Its QSA side buffers and get_buffers override do not support mixed-precision KV.
     _supports_mixed_precision_kv = False
 
+    # The parent opts in because its draft pool is attention-only. QSA's is
+    # not: each draft layer adds a Role.INDEX_KEY buffer and a
+    # QSA_INDEX_POSITION page, unvalidated for cross-request reuse.
+    # KvCacheCreator reads this off the class, so dense Qwen4-Exp opts out too.
+    _supports_draft_reuse_match_backoff = False
+
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """PLE state and request-wide QSA positions are replicated across TP."""
