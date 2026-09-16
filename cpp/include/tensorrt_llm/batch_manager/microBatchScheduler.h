@@ -31,6 +31,16 @@ struct ContextChunkingConfig
 {
     ContextChunkingConfig() = default;
 
+    // Declaring the default constructor above makes this a non-aggregate since C++20 ([dcl.init.aggr],
+    // P1008), so the brace initialization used by the callers no longer resolves to aggregate
+    // initialization. Spell the two-argument constructor out to keep those call sites working.
+    ContextChunkingConfig(
+        executor::ContextChunkingPolicy chunkingPolicy, tensorrt_llm::runtime::SizeType32 chunkUnitSize)
+        : chunkingPolicy(chunkingPolicy)
+        , chunkUnitSize(chunkUnitSize)
+    {
+    }
+
     executor::ContextChunkingPolicy chunkingPolicy;
     /// The minimum size, also known as the chunk unit size. It generally
     /// needs to be equal to the size of the kv cache block or its integer

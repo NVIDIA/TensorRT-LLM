@@ -674,6 +674,23 @@ inline __device__ T cuda_clamp(T val, T minVal, T maxVal)
 }
 
 #ifdef ENABLE_FP8
+// cuda_fp8.hpp declares "explicit operator float2()" on __nv_fp8x2_e4m3 (and "explicit operator
+// float4()" on __nv_fp8x4_e4m3). Writing float2(val) used to invoke that explicit conversion
+// operator, but float2/float4 are aggregates, so since C++20 the parenthesized expression list is
+// treated as aggregate initialization (P0960) and the compiler tries to convert the fp8 value to
+// the single float member instead. Naming the conversion operator explicitly keeps the original
+// code path under both standards; copy-initialization would not work at all because the operator
+// is explicit.
+__device__ inline float2 fp8x2_to_float2(__nv_fp8x2_e4m3 val)
+{
+    return val.operator float2();
+}
+
+__device__ inline float4 fp8x4_to_float4(__nv_fp8x4_e4m3 val)
+{
+    return val.operator float4();
+}
+
 template <>
 __device__ inline float2 cuda_cast<float2, __nv_fp8x2_e4m3>(__nv_fp8x2_e4m3 val)
 {
