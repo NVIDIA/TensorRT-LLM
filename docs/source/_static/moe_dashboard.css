@@ -1,0 +1,541 @@
+/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* MoE Perf Dashboard — in-page widget styles.
+ *
+ * Rendered by the `trtllm_moe_dashboard` directive (docs/source/_ext/) into the
+ * documentation page itself, the same way `config_selector.css` backs the recipe
+ * selector. Every rule is scoped under `#moe-dashboard` so nothing leaks into the
+ * surrounding page, and nothing in the page reaches in.
+ *
+ * Ported from the standalone MoE Perf Dashboard (moe-perf-analysis/web/index.html).
+ * Two deliberate departures from that original:
+ *   1. Colour comes from the theme's --pst-color-* variables instead of a private
+ *      palette, so the widget follows the documentation's light/dark switch rather
+ *      than the OS preference.
+ *   2. The controls sit in a bar across the top instead of a fixed left rail — a
+ *      full-height rail has nowhere to stand inside a documentation column.
+ */
+
+/* ----------------------------------------------------------------- tokens --- */
+/* The dashboard's own token names are kept so the ported rules below are
+   unchanged; only what they resolve to is remapped. .multi-panel is listed too
+   because those popovers are parented to <body> to escape overflow clipping,
+   which puts them outside #moe-dashboard's inheritance. */
+#moe-dashboard,
+.multi-panel {
+  --bg:            transparent;
+  --panel:         var(--pst-color-on-background);
+  /* The shaded strips — card header and table header — take the theme's own table
+     heading tint rather than a generic surface, so a results card reads as the
+     same species of object as a table written in the documentation itself. */
+  --panel-2:       var(--pst-color-table-heading-bg);
+  --panel-hover:   var(--pst-color-table-row-zebra-high-bg);
+  --line:          var(--pst-color-border);
+  --line-strong:   var(--pst-color-text-muted);
+  --text:          var(--pst-color-text-base);
+  --muted:         var(--pst-color-text-muted);
+  --accent:        var(--pst-color-primary);
+  --accent-weak:   var(--pst-color-primary-bg);
+  --best:          var(--pst-color-success);
+  --best-weak:     var(--pst-color-success-bg);
+  --best-line:     var(--pst-color-success);
+  --warn:          var(--pst-color-warning);
+  --warn-weak:     var(--pst-color-warning-bg);
+  --warn-line:     var(--pst-color-warning);
+  --shadow:        0 1px 2px var(--pst-color-shadow), 0 6px 18px -8px var(--pst-color-shadow);
+  --radius:        8px;
+  --radius-sm:     6px;
+  --mono:          ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+                   "Liberation Mono", monospace;
+}
+
+/* Browser surfaces we did not draw still carry the design. */
+#moe-dashboard ::selection { background: var(--accent-weak); color: var(--text); }
+
+#moe-dashboard ::-webkit-scrollbar { width: 11px; height: 11px; }
+#moe-dashboard ::-webkit-scrollbar-track { background: transparent; }
+#moe-dashboard ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 6px;
+                                 border: 3px solid var(--bg); background-clip: padding-box; }
+#moe-dashboard ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+#moe-dashboard, #moe-dashboard * { box-sizing: border-box; }
+/* The UA's [hidden] rule loses to any explicit display, and several elements
+   here are flex. Without this, hiding them silently does nothing. */
+#moe-dashboard [hidden] { display: none !important; }
+
+#moe-dashboard {
+  margin: 0;
+  /* Reserves the fixed control rail. The rail is out of flow so it can paint the
+     full viewport height; without this the tables would run underneath it. */
+  padding-left: var(--side, 272px);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  caret-color: var(--accent);
+  accent-color: var(--accent);
+  -webkit-font-smoothing: antialiased;
+}
+/* Measurement is set in mono; language is set in the system sans. */
+#moe-dashboard .topn .rank, #moe-dashboard .topn .metric, #moe-dashboard .topn td.detail, #moe-dashboard .delta-num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+#moe-dashboard :where(a, button, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Capped so a configuration and its latency stay in one eye movement. At 1600
+   the stretch column opened ~900px of void between them and job 2 — weighing
+   the top three — is a horizontal read. */
+#moe-dashboard .wrap { max-width: var(--rail, 1320px); margin: 0 auto; padding: 0 24px; }
+
+/* --------------------------------------------------------- banner --- */
+#moe-dashboard .banner {
+  display: flex; align-items: center; gap: 9px;
+  margin: 16px 0 0; padding: 9px 13px;
+  background: var(--warn-weak); border: 1px solid var(--warn-line);
+  border-radius: var(--radius-sm);
+  color: var(--warn); font-size: 13px; font-weight: 500;
+}
+#moe-dashboard .banner svg { width: 15px; height: 15px; flex: none; }
+
+/* -------------------------------------------------------- filters --- */
+#moe-dashboard .moe-main { padding: 24px 0 56px; }
+/* Two columns: a standing control rail, then the results. --side is also added
+   back into the JS rail calculation, so the page still stops where its content
+   stops instead of the sidebar pushing the tables off their measured width. */
+/* The rail is fixed, so the stage is a plain block: only .content is in flow. */
+#moe-dashboard .stage { display: block; }
+#moe-dashboard .content { min-width: 0; }
+/* Full-height control rail, IDE chrome rather than a card: square, flush to the
+   viewport's left edge, separated by one border. Own scroll, because a panel
+   painted to the viewport floor cannot rely on the page scrolling to reveal a
+   control that overflows it. */
+#moe-dashboard .filters {
+  position: fixed; top: 0; left: 0; bottom: 0; z-index: 5;
+  width: var(--side, 272px);
+  display: grid; gap: 14px; align-content: start;
+  grid-template-columns: 1fr;
+  overflow: auto;
+  padding: 22px 18px;
+  background: var(--panel);
+  border: 0; border-right: 1px solid var(--line); border-radius: 0;
+}
+#moe-dashboard .filter { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+#moe-dashboard .filter-label {
+  font-size: 11px; font-weight: 500; letter-spacing: .03em;
+  text-transform: uppercase; color: var(--muted);
+}
+#moe-dashboard select {
+  font: inherit; font-size: 13px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 6px 9px; cursor: pointer;
+  /* Fill the grid column rather than the widest option: min-width:0 defeats the
+     intrinsic sizing that made these ragged in the first place. */
+  width: 100%; min-width: 0;
+}
+#moe-dashboard select:hover { border-color: var(--line-strong); background: var(--panel-hover); }
+
+/* ------------------------------------------------ multi-select panel --- */
+/* The trigger mimics the native select exactly, so a set-valued control does
+   not read as a different species of widget in the same rail. */
+#moe-dashboard .multi-trigger {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; font: inherit; font-size: 13px; text-align: left;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 6px 9px; cursor: pointer;
+}
+#moe-dashboard .multi-trigger:hover { border-color: var(--line-strong); background: var(--panel-hover); }
+#moe-dashboard .multi-trigger.has-sel { border-color: var(--accent); }
+#moe-dashboard .multi-caption { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#moe-dashboard .multi-chevron { width: 13px; height: 13px; flex: none; color: var(--muted); }
+/* position:fixed and parented to <body>: the rail clips its own overflow. */
+.multi-panel {
+  position: fixed; z-index: 40;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--panel); border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow);
+}
+.multi-tools {
+  display: flex; gap: 6px; padding: 7px 8px;
+  border-bottom: 1px solid var(--line); background: var(--panel-2);
+}
+.multi-tool {
+  font: inherit; font-size: 11px; letter-spacing: .03em; text-transform: uppercase;
+  color: var(--muted); background: none; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 4px; padding: 2px 8px;
+}
+.multi-tool:hover { color: var(--text); border-color: var(--line-strong); background: var(--panel-hover); }
+.multi-list { overflow: auto; padding: 5px 0; }
+.multi-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 10px; font-size: 13px; cursor: pointer;
+}
+.multi-item:hover { background: var(--panel-hover); }
+.multi-item input { accent-color: var(--accent); margin: 0; cursor: pointer; }
+
+/* --------------------------------------------------------- status --- */
+#moe-dashboard .status-bar {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+  /* No top margin: the status line is the first thing in the right column and
+     has to sit level with the top of the control rail. */
+  margin: 0 0 10px;
+}
+#moe-dashboard .status { color: var(--muted); font-size: 13px; }
+
+/* ---------------------------------------------------------- empty --- */
+#moe-dashboard .placeholder {
+  padding: 56px 24px; text-align: center;
+  border: 1px dashed var(--line); border-radius: var(--radius);
+  background: var(--panel);
+}
+#moe-dashboard .placeholder h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+#moe-dashboard .placeholder p { margin: 0; color: var(--muted); font-size: 13px; }
+
+/* ---------------------------------------------------------- cards --- */
+/* One column, always. Two-up forced a wide table into a half-width card, which
+   pushed the latency and the margin — the two columns the page exists for —
+   behind a horizontal scrollbar. Stacking also makes the world-size sequence
+   read as the progression it is. */
+#moe-dashboard .results { display: grid; grid-template-columns: 1fr; gap: 14px; }
+
+#moe-dashboard .card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  overflow: hidden;
+}
+#moe-dashboard .card-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+}
+#moe-dashboard .card-title { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.008em; }
+
+/* Sits at the right end of the status row. Only rendered once a local batch is
+   chosen. */
+/* PORTED: this kept the standalone dashboard's own micro-pill — 24px tall, 12px
+   text, 6px radius, borrowed from a design system this page no longer uses. Beside
+   a 44px option card it read as a different species of control. It takes the option
+   buttons' shape instead: same border, radius, type and green pressed state, only
+   sized to its content since it is one toggle rather than one of a set. */
+#moe-dashboard .merge-toggle {
+  appearance: none;
+  /* Full width of the panel above it: the merged view replaces every card with a
+     single table, so the control that switches into it spans the same measure as
+     the thing it acts on rather than hiding in a corner. */
+  width: 100%;
+  flex: 1 1 100%;
+  min-height: 38px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--pst-color-shadow);
+  background: var(--pst-color-background);
+  color: var(--pst-color-text-base);
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.25;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
+}
+#moe-dashboard .merge-toggle:hover {
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  background: var(--pst-color-background);
+  color: var(--pst-color-text-base);
+  transform: translateY(-1px);
+}
+#moe-dashboard .merge-toggle:focus-visible {
+  outline: 2px solid var(--nv-color-green, var(--pst-color-primary));
+  outline-offset: 2px;
+}
+#moe-dashboard .merge-toggle.on {
+  background: var(--nv-color-green, var(--pst-color-primary));
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  color: #fff;
+  box-shadow: 0 0 0 1px var(--nv-color-green, var(--pst-color-primary));
+  transform: none;
+}
+/* Provenance columns are data, not asides: the merged table has no card title to
+   carry them, so they read at full strength rather than muted like a detail. */
+#moe-dashboard .topn.merged { width: 100%; }
+#moe-dashboard .topn.merged td.detail { color: var(--text); }
+#moe-dashboard .card-facet { display: inline-flex; align-items: baseline; gap: 5px; font-size: 13px; color: var(--muted); }
+#moe-dashboard .card-facet b { font-weight: 600; color: var(--text); }
+
+#moe-dashboard .table-wrap { overflow-x: auto; }
+#moe-dashboard .topn { width: 100%; border-collapse: collapse; }
+#moe-dashboard .topn th, #moe-dashboard .topn td {
+  text-align: left; padding: 7px 10px; white-space: nowrap;
+  border-bottom: 1px solid var(--line);
+}
+#moe-dashboard .topn tbody tr:last-child th, #moe-dashboard .topn tbody tr:last-child td { border-bottom: 0; }
+#moe-dashboard .topn th {
+  font-size: 11px; font-weight: 500; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--muted);
+  background: var(--panel);
+}
+/* PORTED: colour must be stated here, not inherited. The documentation theme
+   styles bare `td` directly, and any direct rule beats an inherited value however
+   specific the ancestor — so the theme's light-mode table text (#212529) landed on
+   every cell that did not set its own colour, which in dark mode is 1.4:1 on the
+   card and 1.0:1 on the winning row's tint: invisible. The cells that looked fine
+   (rank, detail, vs-fastest) were only fine because they each declare a colour.
+   `.detail` and `tr.best .metric` are class selectors and still win over this. */
+#moe-dashboard .topn td { font-size: 15px; color: var(--text); }
+#moe-dashboard .topn tbody tr:hover td, #moe-dashboard .topn tbody tr:hover th { background: var(--panel-hover); }
+#moe-dashboard .topn .rank {
+  width: 1%; color: var(--muted); font-size: 13px; font-weight: 500;
+  font-variant-numeric: tabular-nums; text-align: right;
+}
+#moe-dashboard .topn .detail { color: var(--muted); font-size: 13px; }
+#moe-dashboard .topn .num { font-variant-numeric: tabular-nums; text-align: right; }
+#moe-dashboard .topn .metric { font-weight: 600; }
+
+/* The winner never rides on colour alone: a tinted row, a green rank, a green
+   metric, and the word "fastest" in the comparison column — four channels, of
+   which three survive with colour removed. */
+#moe-dashboard .topn tr.best td, #moe-dashboard .topn tr.best th { background: var(--best-weak); }
+#moe-dashboard .topn tr.best:hover td, #moe-dashboard .topn tr.best:hover th { background: var(--best-weak); }
+#moe-dashboard .topn tr.best .rank { color: var(--best); }
+#moe-dashboard .topn tr.best .metric { color: var(--best); }
+
+/* vs fastest: the number alone. */
+#moe-dashboard .delta-num {
+  font-variant-numeric: tabular-nums; font-size: 13px;
+  text-align: right; color: var(--muted);
+}
+#moe-dashboard tr.best .delta-num { color: var(--best); font-weight: 600; }
+
+#moe-dashboard .card-empty { padding: 22px 14px; color: var(--muted); font-size: 13px; }
+
+
+@media (max-width: 700px) {
+#moe-dashboard .wrap { padding: 0 14px; }
+  /* Below 700px there is no room for a rail beside the tables: it returns to the
+     flow as a bordered block above the results, and body reclaims its width. */
+#moe-dashboard { padding-left: 0; }
+#moe-dashboard .stage { display: block; }
+#moe-dashboard .filters {
+    position: static; width: auto; overflow: visible;
+    gap: 10px 12px; padding: 14px; margin-bottom: 16px;
+    border: 1px solid var(--line); border-radius: var(--radius);
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+
+  /* Below 700px the row stops being a table row and becomes a labeled block.
+     Hiding columns cost the liftable MoE EP/TP fields and still left the table
+     scrolling with COMM clipped mid-word — the tradeoff bought nothing. */
+#moe-dashboard .table-wrap { overflow-x: visible; }
+#moe-dashboard .topn, #moe-dashboard .topn tbody, #moe-dashboard .topn tr, #moe-dashboard .topn td { display: block; width: auto; }
+#moe-dashboard .topn thead { display: none; }
+#moe-dashboard .topn tbody tr { padding: 9px 14px; border-bottom: 1px solid var(--line); }
+#moe-dashboard .topn tbody tr:last-child { border-bottom: 0; }
+#moe-dashboard .topn td {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 14px; padding: 2px 0; border: 0; white-space: normal; text-align: right;
+  }
+#moe-dashboard .topn td::before {
+    content: attr(data-label); flex: none; text-align: left;
+    font-size: 11px; font-weight: 500; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--muted);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  /* width:1% from the table rule survives into a flex row it no longer suits and
+     leaves the rank value hugging its label while every sibling right-aligns. */
+#moe-dashboard .topn .rank { width: auto; text-align: right; font-size: 13px; }
+#moe-dashboard .topn tr.best td, #moe-dashboard .topn tr.best th { background: none; }
+#moe-dashboard .topn tbody tr.best { background: var(--best-weak); }
+}
+@media (prefers-reduced-motion: reduce) {
+#moe-dashboard, #moe-dashboard * { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+}
+
+/* ------------------------------------------------ layout: controls on top --- */
+/* The original stands the controls in a fixed full-height rail at the viewport's
+   left edge. Inside a documentation column there is no such edge to stand on, so
+   the rail returns to the flow as a bordered control bar above the results — the
+   same shape the original already falls back to below 700px. */
+#moe-dashboard {
+  padding-left: 0;
+  margin: 1.5rem 0 0.5rem;
+}
+
+/* Width is governed by the documentation column, not by the measured table
+   width, so --rail (still computed by the script) is left inert here. */
+#moe-dashboard .wrap { max-width: none; margin: 0; padding: 0; }
+#moe-dashboard .moe-main { padding: 0 0 8px; }
+
+/* ------------------------------------------------------- control panel --- */
+/* Shaped after the recipe selector on the deployment-guide page: one panel, one
+   labelled row per dimension, and the values laid out as option cards rather
+   than hidden inside a dropdown. Green marks the chosen one. */
+#moe-dashboard .filters {
+  position: static;
+  width: auto;
+  overflow: visible;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  padding: 18px;
+  margin: 0 0 20px;
+  border: 1px solid var(--pst-color-shadow);
+  border-radius: 14px;
+  background: var(--pst-color-background);
+}
+
+#moe-dashboard .filter {
+  display: grid;
+  grid-template-columns: minmax(120px, 170px) 1fr;
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+}
+
+#moe-dashboard .filter-label {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.2;
+  color: var(--pst-color-text-base);
+}
+
+#moe-dashboard .filter-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+#moe-dashboard .opt {
+  appearance: none;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--pst-color-shadow);
+  background: var(--pst-color-surface);
+  color: var(--pst-color-text-base);
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.25;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
+}
+
+#moe-dashboard .opt[data-status="available"] { background: var(--pst-color-background); }
+
+#moe-dashboard .opt:hover {
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  transform: translateY(-1px);
+}
+
+#moe-dashboard .opt:focus-visible {
+  outline: 2px solid var(--nv-color-green, var(--pst-color-primary));
+  outline-offset: 2px;
+}
+
+#moe-dashboard .opt[data-status="active"] {
+  background: var(--nv-color-green, var(--pst-color-primary));
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  color: #fff;
+  box-shadow: 0 0 0 1px var(--nv-color-green, var(--pst-color-primary));
+  cursor: default;
+  transform: none;
+}
+
+/* The dropdown and the multi-select trigger are the fallbacks for dimensions with
+   too many values to lay out as cards; they take the same metrics so a panel that
+   mixes the two still reads as one instrument. */
+#moe-dashboard select,
+#moe-dashboard .multi-trigger {
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--pst-color-shadow);
+  background: var(--pst-color-background);
+  font-size: 0.9rem;
+}
+
+#moe-dashboard select:hover,
+#moe-dashboard .multi-trigger:hover {
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  background: var(--pst-color-background);
+}
+
+#moe-dashboard .multi-trigger.has-sel {
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  box-shadow: 0 0 0 1px var(--nv-color-green, var(--pst-color-primary));
+}
+
+/* Below the reference's own breakpoint the label stops being a column and
+   becomes a heading above its options. */
+@media (max-width: 820px) {
+  #moe-dashboard .filter { grid-template-columns: 1fr; }
+  #moe-dashboard .filter-label { min-height: 0; }
+}
+
+/* The banner is the widget's first element now that there is no rail beside it. */
+#moe-dashboard .banner { margin: 0 0 14px; }
+
+/* ------------------------------------------------------- width containment --- */
+/* The original sized the page to the widest table and let the viewport absorb the
+   rest; here the documentation column is fixed and the table has to yield to it.
+   A grid item's default min-width is `auto`, which refuses to shrink below its
+   content — so without these the widest card pushes straight through the column.
+   min-width:0 restores the shrink, and the table then scrolls inside .table-wrap
+   (overflow-x:auto) instead of the card overflowing the page. */
+#moe-dashboard .results { min-width: 0; }
+#moe-dashboard .results > * { min-width: 0; max-width: 100%; }
+#moe-dashboard .card { overflow: hidden; }
+#moe-dashboard .table-wrap { overflow-x: auto; max-width: 100%; }
+
+/* The table is only wide because every cell is nowrap, and two configuration
+   names are long: `AllGather + ReduceScatter` (25 characters) and
+   `MegaMoE DeepGEMM`. Letting those wrap is what actually brings the table
+   inside the column. Measurements keep nowrap — a latency broken across two
+   lines is unreadable, and they are short enough to never be the constraint. */
+#moe-dashboard .topn th,
+#moe-dashboard .topn td { white-space: normal; }
+#moe-dashboard .topn .rank,
+#moe-dashboard .topn .num,
+#moe-dashboard .topn .metric,
+#moe-dashboard .topn .delta-num { white-space: nowrap; }
+
+/* The script measures the widest table and publishes it as --rail. Nothing reads
+   it here — the column decides the width — but .wrap is pinned explicitly so a
+   future edit cannot reintroduce the measured width as a max-width. */
+#moe-dashboard .wrap { max-width: 100%; }
+
+/* ---------------------------------------------------------- status line --- */
+/* The "N scenarios · GB300 · … · ranked by MoE Latency" recap is dropped: every
+   fact in it is already on screen, in the controls above and the card titles
+   below. The element stays in the DOM because the merged-view toggle is parented
+   to its row. */
+#moe-dashboard .status { display: none; }
+/* With the recap hidden the row is usually empty, so it must not reserve space.
+   It gets its margin back only when the merged-view toggle is actually in it. */
+#moe-dashboard .status-bar { margin: 0; }
+/* :not([hidden]) matters — the toggle is always in the DOM and merely hidden when
+   no local batch is chosen, so matching the bare class would reserve the gap on
+   every render. */
+#moe-dashboard .status-bar:has(.merge-toggle:not([hidden])) { margin: 0 0 10px; }
