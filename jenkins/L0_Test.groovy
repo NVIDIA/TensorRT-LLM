@@ -1509,7 +1509,10 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            // The dispatcher may use an x86 image while the test runs on SBSA.
+            withEnv(["TRTLLM_CI_RUNTIME_IMAGE=${LLM_DOCKER_IMAGE}"]) {
+                executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            }
         } catch (InterruptedException e) {
             pendingStageFailure = e
             throw e
@@ -2152,6 +2155,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 envVarNames.each { varName ->
                     envVarsToExport[varName] = env."${varName}"
                 }
+                // Record the original test image, not the dispatcher or .sqsh cache path.
+                envVarsToExport['TRTLLM_CI_RUNTIME_IMAGE'] = LLM_DOCKER_IMAGE
 
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
@@ -3935,6 +3940,8 @@ ${blockedNodeAffinity}
                       valueFrom:
                         fieldRef:
                           fieldPath: spec.nodeName
+                    - name: TRTLLM_CI_RUNTIME_IMAGE
+                      value: "${image}"
                     ${extraDeviceEnv}
                   ${serviceContainerConfig}
                   - name: jnlp

@@ -183,6 +183,43 @@ Multiple client rows can share one server startup; use
 `s_startup_observation_id` to group them and filter
 `b_startup_observation_primary_row:true` to count each startup once.
 
+The primary model's finalized policy is also published as
+`startup_metrics.model_loader.checkpoint_io_policy` in `/server_info`.
+This detached snapshot is captured after weight-session finalization, before a
+separate draft checkpoint can reuse the loader. It preserves activation even
+when a subsequent advisory read failure makes the effective policy native.
+Unsupported, preloaded, or unobserved paths report an explicit unknown (`null`),
+not an inferred native policy. The collector prefers this structured primary
+status; only older runtimes without the field use `legacy_logs` fallback.
+Draft statuses do not override the structured primary status.
+
+Use the following fields to qualify a comparison (with `ctx_` or `gen_`
+prefixes for disaggregated server roles):
+
+- `s_checkpoint_io_policy_source`: `server_info`, `legacy_logs`, or `unknown`.
+- `b_checkpoint_io_policy_complete`: every expected server provided one valid
+  structured primary policy. Legacy log attribution is not considered complete.
+- `b_startup_metrics_timing_complete`: every expected server provided finite,
+  nonnegative preparation, population, finalization, and total model-loading
+  times. The existing collection-complete flag only checks successful fetches
+  and server counts; it does not imply these fields were present.
+
+Image provenance is recorded from the actual test-container launch reference,
+not the Jenkins dispatcher image: `s_runtime_image`, `s_runtime_image_source`,
+`s_runtime_image_digest`, and `s_runtime_image_identity_strength`. A valid
+digest-pinned launch reference reports `digest_pinned`; a tagged reference
+reports `reference_only` with an unknown digest. Missing provenance remains
+`unknown`. A tag, its hash, or an Enroot cache filename is not evidence of the
+resolved runtime digest. Group comparisons by image identity as well as
+model/configuration, GPU and parallelism; tagged-image comparisons still lack
+immutable-image verification.
+
+These additions do not change loader policy or add startup collectives. Timing
+remains rank-0-based per server, and failed launches are not comprehensively
+persisted. Native counterfactual eligibility, checkpoint fingerprints,
+slowest-rank timing, and process-launch-to-first-token measurement remain
+separate follow-ups.
+
 This policy remains separate from ModelStreamer, MX, GMS, or snapshot
 integrations. Those systems may change the source or bypass raw loading without
 requiring a new combined checkpoint format.
