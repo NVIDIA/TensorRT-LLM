@@ -22,6 +22,7 @@ l0_a10:
   - unittest/_torch/test_fused_relu2.py
   - unittest/_torch/test_mnnvl_alltoall_workspace.py
   - unittest/_torch/test_mnnvl_memory_lifecycle.py
+  - unittest/_torch/test_mnnvl_utils.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_nemotron_nas.py
@@ -46,6 +47,7 @@ l0_a10:
   - unittest/_torch/models/checkpoints
   - unittest/_torch/models/test_qwen3_next_moe_quant.py
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py
+  - unittest/_torch/models/test_qwen3next_moe_allreduce_guard.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/others/test_cache_transceiver_precheck_config.py
@@ -127,6 +129,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
   - unittest/_torch/visual_gen/test_profiler.py
+  - unittest/visual_gen/test_executor_shared_tensor_ipc.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py

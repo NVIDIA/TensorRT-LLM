@@ -12,112 +12,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from fake_executor_effects import FakeExecutorEffects, FakeRequestRegistry
-from fake_kv_cache_transceiver import FakeKvCacheTransceiver
+from coordinator_harness import CoordinatorHarness as _Harness
+from coordinator_harness import TransferRequest as _Request
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
-from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
-from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
-
-
-class _Request(SimpleNamespace):
-    """Request stub with the attributes the transfer paths read."""
-
-    def __init__(self, rid: int, **overrides) -> None:
-        defaults = dict(
-            py_request_id=rid,
-            request_id=rid,
-            parent_request_id=None,
-            is_child=False,
-            state=LlmRequestState.CONTEXT_INIT,
-            is_context_only_request=True,
-            is_context_finished=True,
-            is_finished_due_to_length=False,
-            is_finished_due_to_cancellation=False,
-            is_disagg_generation_init_state=False,
-            is_disagg_generation_transmission_in_progress=False,
-            py_kv_transfer_start_time=None,
-            py_kv_transfer_timed_out=False,
-            py_disaggregated_params=None,
-            cached_tokens=0,
-            response=None,
-        )
-        defaults.update(overrides)
-        super().__init__(**defaults)
-        self.state_at_response_creation = None
-
-    def create_response(self, _use_fast_logits, _rank):
-        self.state_at_response_creation = self.state
-        return self.response
-
-    @property
-    def is_generation_only_request(self) -> bool:
-        return not self.is_context_only_request
-
-
-class _Harness:
-    def __init__(
-        self,
-        *,
-        kv_transfer_timeout_ms=None,
-        supports_inflight_cancellation=False,
-        enable_attention_dp=False,
-        world_size=1,
-        tp_size=1,
-        force_terminate_ctx_for_partial_reuse=False,
-        draft_kv_cache_manager=None,
-    ) -> None:
-        self.transceiver = FakeKvCacheTransceiver(
-            kv_transfer_timeout_ms=kv_transfer_timeout_ms,
-            supports_inflight_cancellation=supports_inflight_cancellation,
-        )
-        self.transceiver.has_retired_send_session = lambda req: False
-        self.kv_cache_manager = Mock(spec=["store_blocks_for_reuse", "unpin_blocks_by_id"])
-        self.kv_cache_manager.store_blocks_for_reuse.side_effect = lambda req, _: req.py_request_id
-        resource_manager = SimpleNamespace(
-            resource_managers={ResourceManagerType.KV_CACHE_MANAGER: self.kv_cache_manager}
-        )
-        self.transfers = AsyncTransferManager(resource_manager)
-        self.active = []
-        self.registry = FakeRequestRegistry(self.active)
-        self.effects = FakeExecutorEffects()
-        self.dist = Mock(rank=0, tp_size=tp_size, world_size=world_size)
-        self.delegates = Mock()
-        self.delegates.requests_in_error_state.return_value = []
-        self.coordinator = DisaggTransferCoordinator(
-            transceiver=self.transceiver,
-            transfer_manager=self.transfers,
-            kv_cache_manager=self.kv_cache_manager,
-            dist=self.dist,
-            effects=self.effects,
-            registry=self.registry,
-            enable_attention_dp=enable_attention_dp,
-            force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
-            delegates=self.delegates,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-        )
-
-    def send(self, *requests: _Request) -> None:
-        self.coordinator.send_completed_context(list(requests))
-
-    def in_transfer(self, req: _Request) -> bool:
-        return req.py_request_id in self.transfers.requests_in_transfer()
-
-
-@pytest.fixture
-def inflight_cancel(monkeypatch):
-    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: True)
-
-
-@pytest.fixture
-def clock(monkeypatch):
-    now = {"t": 100.0}
-    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: now["t"])
-    return now
 
 
 # -- sending -----------------------------------------------------------------
@@ -273,8 +174,9 @@ def test_fast_completion_without_a_response_terminates_immediately() -> None:
 
 
 def test_failed_send_releases_its_claim_but_leaves_the_request_to_the_error_path() -> None:
-    """The transfer ends (blocks unpinned) but the request stays active so the
-    rank-synchronized error pass can respond; nothing is terminated here."""
+    """The transfer ends (blocks unpinned) and the still-active request is
+    handed to the executor's error path as a context failure; the reap itself
+    terminates nothing."""
     h = _Harness()
     req = _Request(1)
     h.active.append(req)
@@ -288,7 +190,7 @@ def test_failed_send_releases_its_claim_but_leaves_the_request_to_the_error_path
     assert not h.in_transfer(req)
     assert h.effects.terminated == []
     assert h.effects.staged_responses == []
-    h.delegates.check_transfer_errors.assert_called_once_with("context requests")
+    assert h.effects.failed == [("Error in kv cache transfer for context requests", [req], False)]
 
 
 def test_failure_reported_after_release_is_kept_for_the_synced_error_pass() -> None:
@@ -373,6 +275,7 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
         _Request(1, is_context_only_request=False),
         _Request(2, is_context_only_request=False),
     )
+    h.active.extend([remote, user])
     h.registry.canceled = [2]
     h.transceiver.request_and_receive_async(remote)
     h.transceiver.request_and_receive_async(user)
@@ -383,17 +286,22 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
 
     assert remote.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert user.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-    h.delegates.check_transfer_errors.assert_called_once_with("generation requests")
+    assert h.effects.failed == [
+        ("Error in kv cache transfer for generation requests", [remote], False)
+    ]
 
 
 def test_gen_reap_leaves_error_handling_to_the_consensus_path_under_inflight_cancel(
     inflight_cancel,
 ) -> None:
     h = _Harness(supports_inflight_cancellation=True)
+    h.active.append(
+        _Request(1, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR)
+    )
 
     h.coordinator.reap_gen_receives(0)
 
-    h.delegates.check_transfer_errors.assert_not_called()
+    assert h.effects.failed == []
 
 
 # -- timeouts ----------------------------------------------------------------
@@ -585,7 +493,7 @@ def test_peer_rank_timeout_decision_is_mirrored_locally(inflight_cancel, clock) 
 def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_cancel) -> None:
     h = _Harness(supports_inflight_cancellation=True, tp_size=2)
     error_req = _Request(1, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR)
-    h.delegates.requests_in_error_state.return_value = [error_req]
+    h.active.append(error_req)
     h.dist.tp_allgather.return_value = [[], []]  # no timed-out receives on any rank
 
     h.dist.tp_allreduce.return_value = 0

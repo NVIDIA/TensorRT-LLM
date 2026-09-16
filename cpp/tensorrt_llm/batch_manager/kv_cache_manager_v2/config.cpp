@@ -43,6 +43,14 @@ void KVCacheManagerConfig::validate() const
     {
         swaScratchReuse->validate();
     }
+    for (auto const& batch : constraints)
+    {
+        batch.validate();
+    }
+    if (typicalStep.has_value())
+    {
+        typicalStep->validate();
+    }
 
     poolRebalance.validate();
 

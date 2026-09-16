@@ -21,25 +21,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 
-try:
-    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
-
-    from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import WanCausalConvHalo
-    from tensorrt_llm._torch.visual_gen.modules.vae import (
-        HaloExchangeConv,
-        HaloExchangeConv2dStride2,
-    )
-    from tensorrt_llm._torch.visual_gen.modules.vae.conv import (
-        _cat_spatial_halos,
-        _halo_exchange_buffer,
-        _physical_to_logical_channels_last,
-        _spatial_channels_last_format,
-    )
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import WanCausalConvHalo
+from tensorrt_llm._torch.visual_gen.modules.vae import HaloExchangeConv, HaloExchangeConv2dStride2
+from tensorrt_llm._torch.visual_gen.modules.vae.conv import (
+    _cat_spatial_halos,
+    _halo_exchange_buffer,
+    _physical_to_logical_channels_last,
+    _spatial_channels_last_format,
+)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -79,8 +70,6 @@ def _distributed_worker(rank, world_size, test_fn, port):
 
 
 def _run(world_size: int, test_fn: Callable):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
     # Spawn distributed workers via a helper that retries with a fresh master
@@ -345,7 +334,6 @@ class TestHaloExchangeConv2dStride2:
         _run(4, _logic_halo_conv2d_stride2_offset_group)
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 class TestHaloExchangeValidation:
     def test_missing_required_adjacent_group_fails_at_construction(self) -> None:
         conv = nn.Conv2d(4, 4, kernel_size=3, padding=1)
@@ -359,7 +347,6 @@ class TestHaloExchangeValidation:
         HaloExchangeConv(conv, chunk_dim=3, adj_groups=[None], rank=0, world_size=2)
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 class TestSpatialChannelsLastFormat:
     """CPU unit tests for the halo channels-last layout helper.
 

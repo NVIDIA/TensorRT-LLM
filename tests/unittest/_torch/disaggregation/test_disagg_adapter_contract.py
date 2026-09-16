@@ -9,7 +9,7 @@ the real executor.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from fake_executor_effects import FakeExecutorEffects, FakeRequestRegistry
@@ -29,6 +29,8 @@ def _executor() -> PyExecutor:
     executor._pending_response_terminations = []
     executor._terminate_request = Mock()
     executor._handle_errors = Mock()
+    executor._fatal_error = None
+    executor.is_shutdown = False
     executor.active_requests = []
     executor.canceled_req_ids = []
     return executor
@@ -80,6 +82,31 @@ def test_fail_requests_uses_the_executor_error_path() -> None:
     )
 
 
+def test_fail_fatal_marks_the_executor_fatal_before_the_aligned_error_path_runs() -> None:
+    """The coordinator calls this only after a world-wide collective agreed,
+    so the executor may enter the collective-aligned fatal path. The fatal
+    state must already be set when ``_handle_errors`` runs: with
+    ``charge_budget=False`` it reads ``_fatal_error`` to decide whether to do
+    the fatal cleanup, so the reverse order would take the plain error path."""
+    executor = _executor()
+    state_on_entry = {}
+
+    def record_state_on_entry(*_args, **_kwargs):
+        state_on_entry["fatal_error"] = executor._fatal_error
+        state_on_entry["is_shutdown"] = executor.is_shutdown
+
+    executor._handle_errors.side_effect = record_state_on_entry
+
+    PyExecutorEffects(executor).fail_fatal("poisoned")
+
+    executor._handle_errors.assert_called_once_with(
+        "poisoned", requests=None, charge_budget=False, fatal_is_collective_aligned=True
+    )
+    assert isinstance(state_on_entry["fatal_error"], RuntimeError)
+    assert str(state_on_entry["fatal_error"]) == "Fatal error: poisoned"
+    assert state_on_entry["is_shutdown"] is True
+
+
 def test_registry_reads_the_executor_lists_live() -> None:
     """The executor rebinds active_requests; the registry must not cache."""
     executor = _executor()
@@ -118,6 +145,7 @@ def test_fake_and_adapter_record_the_same_effects() -> None:
         ("terminate_request", (request,), {}),
         ("stage_transfer_response", (7, response, late_request), {}),
         ("fail_requests", ("boom", [request]), {"charge_budget": False}),
+        ("fail_fatal", ("poisoned",), {}),
     ]
     fake = FakeExecutorEffects()
     executor = _executor()
@@ -132,9 +160,12 @@ def test_fake_and_adapter_record_the_same_effects() -> None:
     assert executor._pending_transfer_responses == [(7, response)]
     assert executor._pending_response_terminations == [late_request]
     assert fake.failed == [("boom", [request], False)]
-    executor._handle_errors.assert_called_once_with(
-        error_msg="boom", requests=[request], charge_budget=False
-    )
+    assert fake.fatal == ["poisoned"]
+    assert executor.is_shutdown is True
+    assert executor._handle_errors.call_args_list == [
+        call(error_msg="boom", requests=[request], charge_budget=False),
+        call("poisoned", requests=None, charge_budget=False, fatal_is_collective_aligned=True),
+    ]
 
 
 def test_fake_registry_reads_live_and_removes_like_the_adapter() -> None:
