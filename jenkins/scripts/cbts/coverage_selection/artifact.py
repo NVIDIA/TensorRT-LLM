@@ -15,7 +15,8 @@
 
 Candidates are recent builds of `<ARTIFACT_BASE>` with both x86 and SBSA
 coverage tarballs. The newest complete pair wins. A squashed PR commit must
-cherry-pick cleanly to that DB's revision; otherwise Tier 2 declines. Revision
+cherry-pick cleanly for Tier 2's residual paths at that DB's revision;
+otherwise Tier 2 declines. Revision
 metadata comes from the forge compare API and needs `GITHUB_API_TOKEN`, the
 anonymous quota being per-IP and exhausted by shared CI egress.
 
@@ -240,8 +241,9 @@ def _patch_apply_status(
     db_commit: str,
     repo_root: Path = Path("."),
     upstream_url: Optional[str] = None,
+    relevant_paths: Optional[list[str]] = None,
 ) -> _PatchApplyStatus:
-    """Check a squashed PR commit against the DB revision."""
+    """Check the relevant paths of a squashed PR commit against the DB revision."""
     repo_source = repo_root.resolve()
     main_repo = upstream_url or os.environ.get(COVERAGE_GIT_REPO_ENV)
     if not main_repo:
@@ -317,18 +319,54 @@ def _patch_apply_status(
         applied = _run_git(["cherry-pick", "--no-commit", pr_commit], cwd=repo)
         if applied is None:
             return "unknown"
-        return "clean" if applied.returncode == 0 else "conflict"
+        if applied.returncode == 0:
+            return "clean"
+        if relevant_paths is None:
+            return "conflict"
+        unmerged = _run_git(
+            ["diff", "--name-only", "--diff-filter=U", "-z"],
+            cwd=repo,
+        )
+        if unmerged is None or unmerged.returncode != 0:
+            return "unknown"
+        conflict_paths = {
+            path.decode("utf-8", "surrogateescape") for path in unmerged.stdout.split(b"\0") if path
+        }
+        if not conflict_paths:
+            return "unknown"
+        relevant_conflicts = conflict_paths.intersection(relevant_paths)
+        if relevant_conflicts:
+            return "conflict"
+        print(
+            "[artifact] ignoring conflict(s) outside the Tier-2 residual: "
+            + ", ".join(sorted(conflict_paths)),
+            file=sys.stderr,
+        )
+        return "clean"
 
 
-def _selection_accepts_pr_diff(sel: dict, pr_base_commit: str, pr_head: str) -> bool:
-    sel["patch_apply_status"] = _patch_apply_status(pr_base_commit, pr_head, sel["commit"])
-    if sel["patch_apply_status"] == "clean":
-        return True
-    print(
-        f"[artifact] coverage tier declined: PR diff does not apply cleanly to "
-        f"latest DB commit {sel['commit'][:10]} ({sel['patch_apply_status']})",
-        file=sys.stderr,
+def _selection_accepts_pr_diff(
+    sel: dict,
+    pr_base_commit: str,
+    pr_head: str,
+    relevant_paths: Optional[list[str]] = None,
+) -> bool:
+    sel["patch_apply_status"] = _patch_apply_status(
+        pr_base_commit,
+        pr_head,
+        sel["commit"],
+        relevant_paths=relevant_paths,
     )
+    if sel["patch_apply_status"] == "clean":
+        sel["coverage_decline_reason"] = ""
+        sel["coverage_decline_category"] = ""
+        return True
+    sel["coverage_decline_reason"] = (
+        "coverage tier declined: Tier-2 residual does not apply cleanly to "
+        f"latest DB commit {sel['commit'][:10]} ({sel['patch_apply_status']})"
+    )
+    sel["coverage_decline_category"] = f"compatibility_{sel['patch_apply_status']}"
+    print(f"[artifact] {sel['coverage_decline_reason']}", file=sys.stderr)
     return False
 
 
@@ -450,7 +488,11 @@ def extract(tarball: Path, dest: Path) -> bool:
     return True
 
 
-def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
+def prepare(
+    dest_dir: str,
+    pr_head: Optional[str],
+    relevant_paths: list[str],
+) -> Optional[dict]:
     """Resolve, download, and merge the DB pair; `{path, meta}` or None on failure.
 
     `meta` is the selection JSON on disk, which `main.py --coverage-db-meta` reads.
@@ -466,12 +508,21 @@ def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
     sel = select_tarball(pr_base_commit)
     if sel is None:
         return None
-    if not _selection_accepts_pr_diff(sel, pr_base_commit, pr_head):
-        return None
+    compatible = _selection_accepts_pr_diff(
+        sel,
+        pr_base_commit,
+        pr_head,
+        relevant_paths,
+    )
     print(describe(sel), file=sys.stderr)
 
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
+    meta = dest / META_NAME
+    meta.write_text(json.dumps(sel))
+    if not compatible:
+        return {"path": None, "meta": str(meta)}
+
     db = dest / DB_NAME
     with tempfile.TemporaryDirectory(prefix="cbts_artifacts_", dir=dest) as temp_dir:
         temp = Path(temp_dir)
@@ -494,9 +545,22 @@ def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
             return None
         connection.close()
 
-    meta = dest / META_NAME
-    meta.write_text(json.dumps(sel))
     return {"path": str(db), "meta": str(meta)}
+
+
+def _load_paths_json(path: Optional[str]) -> Optional[list[str]]:
+    """Load the non-empty JSON list of repository-relative Tier-2 paths."""
+    if not path:
+        return None
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[artifact] residual paths unreadable ({path}): {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, list) or not data or not all(isinstance(item, str) for item in data):
+        print("[artifact] residual paths must be a non-empty JSON string list", file=sys.stderr)
+        return None
+    return sorted(set(data))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -525,13 +589,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="required PR head revision; its merge base measures DB drift and defines "
         "the diff checked against the latest coverage revision",
     )
+    ap.add_argument(
+        "--paths-json",
+        default=None,
+        help="JSON list of Tier-2 residual paths; required for the compatibility check",
+    )
     args = ap.parse_args(argv)
 
     if not args.print_selection and not args.prepare:
         ap.error("one of --print-selection / --prepare is required")
 
     if args.prepare:
-        ready = prepare(args.prepare, args.pr_head)
+        relevant_paths = _load_paths_json(args.paths_json)
+        if relevant_paths is None:
+            return 1
+        ready = prepare(args.prepare, args.pr_head, relevant_paths)
         if ready is None:
             return 1
         print(json.dumps(ready))
@@ -539,6 +611,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not args.pr_head:
         print("[artifact] --pr-head is required", file=sys.stderr)
+        return 1
+    relevant_paths = _load_paths_json(args.paths_json)
+    if relevant_paths is None:
         return 1
     pr_base_commit = merge_base(args.pr_head)
     if not pr_base_commit:
@@ -563,7 +638,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         best = select_tarball(pr_base_commit)
     if best is None:
         return 1
-    if not _selection_accepts_pr_diff(best, pr_base_commit, args.pr_head):
+    if not _selection_accepts_pr_diff(best, pr_base_commit, args.pr_head, relevant_paths):
         return 1
     print(json.dumps(best))
     return 0
