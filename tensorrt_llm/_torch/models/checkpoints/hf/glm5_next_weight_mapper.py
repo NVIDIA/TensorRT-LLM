@@ -12,12 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Checkpoint-key mapping for GLM-5.3-Flash (``glm5_next``).
+"""Map GLM-5.3-Flash checkpoint keys to text/MTP destinations and loading owners.
 
-Everything here is a pure function of checkpoint key names and the HF config:
-the per-key audit (loaded / transformed / ignored), the key remap onto the
-runtime's parameter names and destination-owner routing. The tensors are placed by
-``Glm5NextForCausalLM.load_weights``.
+Mapping and audit use key names and config only; the model loader places tensors.
 """
 
 from __future__ import annotations
@@ -36,11 +33,7 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-#: Checkpoint namespaces this bring-up deliberately does not load. These are
-#: matched as exact dotted-component prefixes, never as substrings or globs: a
-#: pattern like ``*visual*`` would also swallow a decoder weight that merely
-#: contained the word, and the whole point of the audit is that nothing is
-#: dropped by accident.
+# Match dotted namespaces exactly so unrelated decoder weights are not ignored.
 _VISION_PREFIX = "model.visual."
 _LANGUAGE_PREFIX = "model.language_model."
 
@@ -60,8 +53,7 @@ class Disposition:
 
     #: Placed on a destination parameter unchanged.
     LOADED = "loaded"
-    #: Placed after a shape/dtype/layout transformation (conv fusion, expert
-    #: stacking, block-FP8 dequantization, or a companion scale tensor).
+    #: Routed through expert packing or scale-layout conversion.
     TRANSFORMED = "transformed"
     #: Deliberately not loaded, under an exact allowlisted namespace.
     IGNORED = "ignored"
@@ -126,19 +118,11 @@ def audit_glm5_next_checkpoint(
     *,
     num_mtp_layers: int = 0,
 ) -> Glm5NextWeightAudit:
-    """Resolve every checkpoint key to exactly one destination and disposition.
+    """Classify checkpoint keys and resolve text/MTP destinations without loading tensors.
 
-    This is the Goal-1.2 contract in executable form. It is deliberately
-    analytic -- it needs only the safetensors index and the config, not 328 GB
-    of materialized weights -- so it can gate every later loading change
-    cheaply.
-
-    ``num_mtp_layers`` is how many of the checkpoint's appended next-n
-    prediction (MTP) layers the model actually instantiates -- ``0`` for the
-    plain text model, ``1`` under one-model MTP speculative decoding. Those
-    layers' keys are placed on ``model.layers.{num_hidden_layers + i}.*``
-    (the alias the speculative base class appends the draft layers under);
-    any remaining MTP layer stays an allowlisted ignore.
+    num_mtp_layers controls how many appended checkpoint layers are instantiated.
+    Remaining MTP layers and the separately loaded vision namespace are ignored;
+    unrecognized keys are reported as unresolved.
     """
     text = unwrap_glm5_next_text_config(config)
     num_layers = int(text.num_hidden_layers)
@@ -192,19 +176,9 @@ def audit_glm5_next_checkpoint(
 
 
 def glm5_next_is_quantized(model_config: ModelConfig[PretrainedConfig]) -> bool:
-    """Whether construction uses the checkpoint's block-FP8 form.
+    """Read block-FP8 construction from ModelConfig, rejecting other quantization modes.
 
-    The runtime constructs models through ``AutoModelForCausalLM.from_config``,
-    which calls ``cls(model_config)`` with no further arguments -- so the
-    quantization decision must live on the ``ModelConfig`` itself, exactly
-    where ``ModelConfig.from_pretrained`` puts it when it reads the
-    checkpoint's ``quantization_config`` (``weight_block_size=[128,128]`` maps
-    to ``FP8_BLOCK_SCALES``). A constructor flag that defaulted to bf16 would
-    make the runtime path build a model the loader must reject.
-
-    This checkpoint is published in exactly one quantized form; any other
-    non-None algorithm on the config is a configuration error, not a request
-    for a different build.
+    Unquantized modules are also supported for component construction.
     """
     quant = getattr(model_config, "quant_config", None)
     if quant is None or quant.quant_algo is None:
@@ -235,16 +209,10 @@ def _destination_owner(dest: str, num_layers: int) -> Any:
 @register_mapper("HF", "Glm5NextForConditionalGeneration")
 @register_mapper("HF", "Glm5NextForCausalLM")
 class Glm5NextHfWeightMapper(HfWeightMapper):
-    """Checkpoint-key mapper for GLM-5.3-Flash (``glm5_next``).
+    """Resolve checkpoint destinations and owners for the model's custom loader.
 
-    The HF checkpoint is a multimodal ``Glm5NextForConditionalGeneration``
-    tree; the text model loads its ``model.language_model.*`` subtree with an
-    audited 1:1 placement (see :func:`audit_glm5_next_checkpoint`). This class
-    is the mapping half of that loader: which keys are ignored (vision tower,
-    surplus MTP layers), where each remaining key lands (:meth:`destination`),
-    and which materialization unit owns it (:meth:`owner`). The model's
-    ``load_weights`` owns the placement itself, so the generic module-name
-    callbacks of :class:`HfWeightMapper` are not used for this architecture.
+    The text decoder loads model.language_model.* and optional MTP layers; vision
+    weights are handled separately. Generic module-name callbacks are not used.
     """
 
     def audit(self, keys: Iterable[str]) -> Glm5NextWeightAudit:

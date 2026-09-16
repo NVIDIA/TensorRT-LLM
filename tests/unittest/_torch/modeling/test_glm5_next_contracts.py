@@ -19,8 +19,10 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
     SPARSE_MLP,
     Glm5NextDecoderLayer,
     Glm5NextLinearAttention,
+    Glm5NextMTP,
     Glm5NextRuntimeContext,
     Glm5NextSparseAttention,
+    build_glm5_next_runtime_context,
     glm5_next_tp_reduces,
 )
 from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVisionModelBase
@@ -93,6 +95,45 @@ def test_layer_masks_accept_composite_and_text_configs():
     config.text_config.layer_types = ["linear_attention", "unknown"]
     with pytest.raises(ValueError, match="must be exactly one"):
         get_glm5_next_layer_masks(config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_cuda_graph", [False, True])
+def test_runtime_context_uses_prepared_schedules_and_live_lengths(is_cuda_graph):
+    live_lengths = torch.tensor([6, 9], dtype=torch.int32)
+    prepared = SimpleNamespace(
+        glm_block_tables=torch.tensor([[0, 1], [2, 3]]),
+        glm_ctx_cu_seqlens=[0, 3],
+        glm_cached_lens_host=[3, 5],
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=object(),
+        mamba_metadata=prepared,
+        seq_lens=torch.tensor([3, 4]),
+        num_contexts=1,
+        num_ctx_tokens=3,
+        num_tokens=7,
+        kv_lens_cuda=live_lengths,
+        is_cuda_graph=is_cuda_graph,
+    )
+    context = build_glm5_next_runtime_context(metadata)
+    assert context.ctx_cu_seqlens is prepared.glm_ctx_cu_seqlens
+    assert context.cached_lens is prepared.glm_cached_lens_host
+    assert context.gen_phase == "verify"
+    assert context.gen_tokens_per_request == 4
+    torch.testing.assert_close(context.kv_lens, live_lengths.long())
+    # MTP rewinds the device lengths without changing the host prefill schedule.
+    live_lengths[1] -= 2
+    torch.testing.assert_close(
+        build_glm5_next_runtime_context(metadata).kv_lens, torch.tensor([6, 7])
+    )
+    prepared.glm_block_tables = None
+    with pytest.raises(RuntimeError, match="requires prepared glm_block_tables"):
+        build_glm5_next_runtime_context(metadata)
+    prepared.glm_block_tables = torch.tensor([[0, 1], [2, 3]])
+    metadata.kv_lens_cuda = None
+    with pytest.raises(ValueError, match="kv_lens_cuda"):
+        build_glm5_next_runtime_context(metadata)
 
 
 @pytest.mark.cpu_only
@@ -367,27 +408,29 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("tokens_per_request", [1, 4], ids=["decode", "verify"])
-def test_attention_dp_mixed_batches_keep_one_full_batch_moe_call(tokens_per_request: int) -> None:
-    # Rank-local phase mixes differ under ADP. Exercise the real decoder
-    # dispatch and FFN wrapper with lightweight math stubs.
+@pytest.mark.parametrize("attention_dp", [False, True], ids=["tp", "attention-dp"])
+@pytest.mark.parametrize("layer_kind", ["decoder", "mtp"])
+def test_mixed_batches_keep_one_full_batch_moe_call(
+    tokens_per_request: int, attention_dp: bool, layer_kind: str
+) -> None:
+    # ADP ranks may have different phase mixes, but must issue one MoE call
+    # per layer. TP attention must reduce its output once for the full batch.
     batches = [(3, 1), (3, 0), (0, 1), (2, 1)]
     counts = [
         context_tokens + generations * tokens_per_request for context_tokens, generations in batches
     ]
     for rank, (context_tokens, generations) in enumerate(batches):
         mapping = Mapping(
-            world_size=4, tp_size=4, moe_ep_size=4, rank=rank, enable_attention_dp=True
+            world_size=4, tp_size=4, moe_ep_size=4, rank=rank, enable_attention_dp=attention_dp
         )
         contexts = int(context_tokens > 0)
         metadata = SimpleNamespace(all_rank_num_tokens=counts)
         context = Glm5NextRuntimeContext(
-            manager=object(),
             num_contexts=contexts,
             num_ctx_tokens=context_tokens,
             num_generations=generations,
             ctx_cu_seqlens=[0, context_tokens] if contexts else [0],
             cached_lens=[0] * contexts + [1] * generations,
-            state_indices=torch.arange(contexts + generations),
             kv_lens=torch.tensor(
                 ([context_tokens] if contexts else [])
                 + ([1 + tokens_per_request] if generations else [])
@@ -400,6 +443,10 @@ def test_attention_dp_mixed_batches_keep_one_full_batch_moe_call(tokens_per_requ
         attention = SimpleNamespace(
             tp_all_reduce=reduction if glm5_next_tp_reduces(mapping) else None
         )
+
+        def attend(x, *args, reduce=True, **kwargs):
+            return attention.tp_all_reduce(x) if reduce and attention.tp_all_reduce else x
+
         for phase in ("prefill", "decode", "verify"):
             implementation = MethodType(
                 getattr(Glm5NextSparseAttention, f"forward_{phase}"), attention
@@ -407,7 +454,7 @@ def test_attention_dp_mixed_batches_keep_one_full_batch_moe_call(tokens_per_requ
             setattr(
                 attention,
                 f"forward_{phase}",
-                create_autospec(implementation, side_effect=lambda x, *args, **kwargs: x),
+                create_autospec(implementation, side_effect=attend),
             )
         attention.forward_mixed = MethodType(Glm5NextSparseAttention.forward_mixed, attention)
         connection = SimpleNamespace(
@@ -425,11 +472,37 @@ def test_attention_dp_mixed_batches_keep_one_full_batch_moe_call(tokens_per_requ
             post_attention_layernorm=torch.nn.Identity(),
             mlp=Mock(side_effect=lambda x, all_rank_num_tokens: x),
         )
-        layer.forward_direct = MethodType(Glm5NextDecoderLayer.forward_direct, layer)
-        layer.run_mlp = MethodType(Glm5NextDecoderLayer.run_mlp, layer)
-        result = Glm5NextDecoderLayer.forward(layer, hidden_states=hidden, runtime_ctx=context)
-        assert result.shape == hidden.shape
-        reduction.assert_not_called()
+        if layer_kind == "decoder":
+            attn_input = hidden.mean(dim=1)
+            layer.forward_direct = MethodType(Glm5NextDecoderLayer.forward_direct, layer)
+            layer.run_mlp = MethodType(Glm5NextDecoderLayer.run_mlp, layer)
+            result = Glm5NextDecoderLayer.forward(layer, hidden_states=hidden, runtime_ctx=context)
+            expected = hidden + attn_input.unsqueeze(1)
+            expected = expected + expected.mean(dim=1, keepdim=True)
+        else:
+            hidden = hidden.mean(dim=1)
+            input_ids = torch.arange(hidden.shape[0])
+            embed_tokens = torch.nn.Embedding(hidden.shape[0], 8)
+            layer.enorm = layer.hnorm = torch.nn.Identity()
+            layer.model_config = SimpleNamespace(mapping=mapping)
+            layer.eh_proj = torch.nn.Linear(16 if attention_dp else 4, 8, bias=False)
+            layer.shared_head = SimpleNamespace(norm=torch.nn.Identity())
+            projected_input = torch.cat([embed_tokens(input_ids), hidden], dim=-1)
+            if not attention_dp:
+                projected_input = projected_input.chunk(mapping.tp_size, dim=-1)[mapping.tp_rank]
+            attn_input = layer.eh_proj(projected_input)
+            with patch(
+                "tensorrt_llm._torch.models.modeling_glm5_next.build_glm5_next_runtime_context",
+                return_value=context,
+            ):
+                result = Glm5NextMTP.forward(layer, input_ids, None, hidden, embed_tokens, metadata)
+            expected = 4 * attn_input
+        torch.testing.assert_close(result, expected)
+        if attention_dp:
+            reduction.assert_not_called()
+        else:
+            reduction.assert_called_once()
+            torch.testing.assert_close(reduction.call_args.args[0], attn_input)
         layer.mlp.assert_called_once()
         mlp_tokens, all_rank_num_tokens = layer.mlp.call_args.args
         assert mlp_tokens.shape[0] == counts[rank]
@@ -437,7 +510,7 @@ def test_attention_dp_mixed_batches_keep_one_full_batch_moe_call(tokens_per_requ
         if contexts:
             attention.forward_prefill.assert_called_once()
             torch.testing.assert_close(
-                attention.forward_prefill.call_args.args[0], hidden.mean(dim=1)[:context_tokens]
+                attention.forward_prefill.call_args.args[0], attn_input[:context_tokens]
             )
         else:
             attention.forward_prefill.assert_not_called()
@@ -445,9 +518,7 @@ def test_attention_dp_mixed_batches_keep_one_full_batch_moe_call(tokens_per_requ
         if generations:
             generation.assert_called_once()
             assert generation.call_args.kwargs["metadata"] is metadata
-            torch.testing.assert_close(
-                generation.call_args.args[0], hidden.mean(dim=1)[context_tokens:]
-            )
+            torch.testing.assert_close(generation.call_args.args[0], attn_input[context_tokens:])
             if contexts:
                 assert generation.call_args.kwargs["reduce"] is False
             if tokens_per_request > 1:

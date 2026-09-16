@@ -322,11 +322,7 @@ def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
 
 @pytest.mark.parametrize("context", [False, True])
 def test_fp8_cache_storage_helpers_preserve_coalesced_pages(context):
-    """Check cache-write and compatibility prefix-gather helpers.
-
-    The production model supplies topk_rows and does not call gather_paged_prefix;
-    its FP8 attention core is covered by the sparse-core test above.
-    """
+    """Write FP8 payloads without disturbing coalesced pages or indexer pool keys."""
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -351,11 +347,16 @@ def test_fp8_cache_storage_helpers_preserve_coalesced_pages(context):
     packed = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device="cuda")
     positions = torch.tensor([0] if context else [[0]], device="cuda")
     backend.append_paged_state(
-        latent, packed, positions, object(), request_index=0 if context else None
+        latent,
+        packed,
+        positions,
+        object(),
+        request_ids=torch.zeros(1, dtype=torch.int32, device="cuda") if context else None,
     )
-    decoded, actual_packed = backend.gather_paged_prefix(1, object(), request_index=0)
+    decoded = latent_pool[2, 0].float() * backend.kv_scale_quant_orig
+    actual_packed = index_pool[2, 0, :4]
     expected = (latent * 2).clamp(-448, 448).to(torch.float8_e4m3fn).float() * 0.5
-    torch.testing.assert_close(decoded.float(), expected)
-    torch.testing.assert_close(actual_packed.float(), packed)
+    torch.testing.assert_close(decoded.unsqueeze(0), expected)
+    torch.testing.assert_close(actual_packed.float().unsqueeze(0), packed)
     assert torch.count_nonzero(storage.float()[[0, 2, 3, 5, 6, 8]]) == 0
     assert torch.count_nonzero(index_pool[:, :, 4:]) == 0

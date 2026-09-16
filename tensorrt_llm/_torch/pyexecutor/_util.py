@@ -274,8 +274,9 @@ def get_kv_cache_manager_cls(
                     "indexer state is a V2 extra buffer). Leave "
                     "kv_cache_config.use_kv_cache_manager_v2='auto' or set it "
                     "to True.")
-            from ..models.modeling_glm5_next import glm5_next_cache_manager_cls
-            return glm5_next_cache_manager_cls()
+            from ..attention.backends.sparse.glm_kpool import \
+                Glm5NextCacheManager
+            return Glm5NextCacheManager
 
         # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
         # (CppMambaHybridCacheManager) like the other hybrid linear models —

@@ -25,12 +25,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
-    INDEX_SENTINEL,
     GlmKpoolSparseAttention,
     GlmKpoolSparseParams,
     latent_pool_rows,
     paged_slot_indices,
-    positions_to_pool_rows,
 )
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.params import (
     GlmKpoolBackendForwardArgs,
@@ -61,23 +59,16 @@ def forward_case():
     )
 
 
-@pytest.mark.parametrize(
-    "route", ["context", "generation", "verify", "paged_context", "paged_generation"]
-)
+@pytest.mark.parametrize("route", ["context", "generation", "verify"])
 @pytest.mark.parametrize("supply_output", [False, True])
 def test_forward_dispatches_latent_rows_and_preserves_output(forward_case, route, supply_output):
     case = forward_case
-    context = route in ("context", "paged_context")
+    context = route == "context"
     q = case.q.repeat_interleave(2, dim=0) if route == "verify" else case.q
     indices = case.indices.repeat_interleave(2, dim=0) if route == "verify" else case.indices
     core_output = torch.arange(q.shape[0] * 8, dtype=q.dtype).view(q.shape[0], 2, 4)
     case.backend._dispatch_sparse_core.return_value = core_output
-    latent_prefix = torch.zeros(3, 4, dtype=q.dtype) if route == "context" else None
-    selection = (
-        GlmKpoolBackendForwardArgs(topk_rows=indices)
-        if route.startswith("paged_")
-        else GlmKpoolBackendForwardArgs(topk_indices=indices)
-    )
+    selection = GlmKpoolBackendForwardArgs(topk_rows=indices)
     output = torch.empty(q.shape[0], 8, dtype=q.dtype) if supply_output else None
     args = AttentionForwardArgs(
         attention_input_type=(
@@ -86,7 +77,7 @@ def test_forward_dispatches_latent_rows_and_preserves_output(forward_case, route
         sparse_backend_args=selection,
         output=output,
     )
-    actual = case.backend.forward(q, latent_prefix, None, case.metadata, args)
+    actual = case.backend.forward(q, None, None, case.metadata, args)
     torch.testing.assert_close(actual, core_output.flatten(1))
     if supply_output:
         assert actual is output
@@ -96,36 +87,38 @@ def test_forward_dispatches_latent_rows_and_preserves_output(forward_case, route
         case.backend._dispatch_sparse_core.call_args.args
     )
     torch.testing.assert_close(dispatched_q, q.view(-1, 2, 4))
-    if route == "context":
-        torch.testing.assert_close(dispatched_k, latent_prefix.view(3, 1, 4))
-        torch.testing.assert_close(dispatched_indices, indices)
-    else:
-        torch.testing.assert_close(dispatched_k, case.state.latent_pool.view(-1, 1, 4))
-        expected = (
-            indices
-            if route.startswith("paged_")
-            else torch.tensor([[8, -1], [1, 2]], dtype=torch.int32)
-        )
-        if route == "verify":
-            expected = expected.repeat_interleave(2, dim=0)
-        torch.testing.assert_close(dispatched_indices, expected)
+    torch.testing.assert_close(dispatched_k, case.state.latent_pool.view(-1, 1, 4))
+    torch.testing.assert_close(dispatched_indices, indices)
 
 
 @pytest.mark.parametrize(
     "invalid",
-    ["selection", "v", "out_scale", "out_scale_sf", "output_sf", "shape", "dtype", "device"],
+    [
+        "selection",
+        "legacy_indices",
+        "v",
+        "out_scale",
+        "out_scale_sf",
+        "output_sf",
+        "shape",
+        "dtype",
+        "device",
+    ],
 )
 def test_forward_rejects_invalid_arguments_before_cache_access(forward_case, invalid):
     case = forward_case
     args = AttentionForwardArgs(
         attention_input_type=AttentionInputType.context_only,
-        sparse_backend_args=GlmKpoolBackendForwardArgs(topk_indices=case.indices),
+        sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=case.indices),
     )
     v = None
     error, message = ValueError, "quantized attention output"
     if invalid == "selection":
         args.sparse_backend_args = None
-        error, message = NotImplementedError, "pool-expanded selection"
+        error, message = ValueError, "pool-expanded selection"
+    elif invalid == "legacy_indices":
+        args.sparse_backend_args.topk_indices = case.indices
+        message = "not request-local topk_indices"
     elif invalid == "v":
         v = torch.zeros(1)
         message = "v must be None"
@@ -145,14 +138,9 @@ def test_forward_rejects_invalid_arguments_before_cache_access(forward_case, inv
     case.backend._dispatch_sparse_core.assert_not_called()
 
 
-@pytest.mark.parametrize("paged", [False, True])
-def test_forward_rejects_mixed_phase(forward_case, paged):
+def test_forward_rejects_mixed_phase(forward_case):
     case = forward_case
-    selection = (
-        GlmKpoolBackendForwardArgs(topk_rows=case.indices)
-        if paged
-        else GlmKpoolBackendForwardArgs(topk_indices=case.indices)
-    )
+    selection = GlmKpoolBackendForwardArgs(topk_rows=case.indices)
     args = AttentionForwardArgs(
         attention_input_type=AttentionInputType.mixed, sparse_backend_args=selection
     )
@@ -162,29 +150,29 @@ def test_forward_rejects_mixed_phase(forward_case, paged):
 
 
 @pytest.mark.parametrize("context", [False, True])
-def test_forward_requires_phase_specific_latent_source(forward_case, context):
+def test_forward_rejects_explicit_latent_source(forward_case, context):
     case = forward_case
     args = AttentionForwardArgs(
         attention_input_type=(
             AttentionInputType.context_only if context else AttentionInputType.generation_only
         ),
-        sparse_backend_args=GlmKpoolBackendForwardArgs(topk_indices=case.indices),
+        sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=case.indices),
     )
-    k = None if context else torch.zeros(3, 4, dtype=case.q.dtype)
-    message = "contiguous latent prefix as k" if context else "k must be None"
+    k = torch.zeros(3, 4, dtype=case.q.dtype)
+    message = "k must be None"
     with pytest.raises(ValueError, match=message):
         case.backend.forward(case.q, k, None, case.metadata, args)
     case.backend._dispatch_sparse_core.assert_not_called()
 
 
-def test_cache_state_prefers_live_metadata_and_rejects_graph_fallback():
+@pytest.mark.parametrize("is_cuda_graph", [False, True])
+def test_cache_state_uses_prepared_metadata_without_fallback(is_cuda_graph):
     backend = object.__new__(GlmKpoolSparseAttention)
     backend.layer_idx = 0
     latent = torch.zeros(4, 8, 1, 512, dtype=torch.bfloat16)
     index = torch.zeros(4, 8, 1, 384, dtype=torch.bfloat16)
     tables = torch.tensor([[2, 0], [3, 1]], dtype=torch.long)
     live_lengths = torch.tensor([5, 8], dtype=torch.int32)
-    stale_lengths = torch.tensor([9, 12], dtype=torch.long)
     metadata = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
             tokens_per_block=8,
@@ -193,9 +181,9 @@ def test_cache_state_prefers_live_metadata_and_rejects_graph_fallback():
         ),
         seq_lens=torch.ones(2, dtype=torch.long),
         num_contexts=0,
-        is_cuda_graph=True,
+        is_cuda_graph=is_cuda_graph,
         kv_lens_cuda=live_lengths,
-        mamba_metadata=SimpleNamespace(glm_block_tables=tables, glm_kv_lens=stale_lengths),
+        mamba_metadata=SimpleNamespace(glm_block_tables=tables),
     )
     state = backend._cache_state(metadata)
     assert state.block_tables.data_ptr() == tables.data_ptr()
@@ -203,8 +191,12 @@ def test_cache_state_prefers_live_metadata_and_rejects_graph_fallback():
     torch.testing.assert_close(state.kv_lens, live_lengths)
     metadata.mamba_metadata.glm_block_tables = None
     with patch("torch.zeros", side_effect=AssertionError("must not allocate fallback tables")):
-        with pytest.raises(RuntimeError, match="CUDA-graph execution requires"):
+        with pytest.raises(RuntimeError, match="requires prepared glm_block_tables"):
             backend._cache_state(metadata)
+    metadata.mamba_metadata.glm_block_tables = tables
+    metadata.kv_lens_cuda = None
+    with pytest.raises(ValueError, match="kv_lens_cuda"):
+        backend._cache_state(metadata)
 
 
 @pytest.mark.parametrize("heads", [16, 64])
@@ -255,15 +247,6 @@ def test_paged_slot_indices_returns_page_and_offset_pairs():
     page, offset = paged_slot_indices(table, positions, tokens_per_block=8)
     assert torch.equal(page, torch.tensor([[7, 7, 9], [4, 0, 1]]))
     assert torch.equal(offset, torch.tensor([[0, 5, 0], [3, 0, 7]]))
-
-
-def test_positions_to_pool_rows_preserves_sentinels():
-    table = torch.tensor([[7, 2], [4, 0]])
-    positions = torch.tensor([[0, 9, INDEX_SENTINEL], [15, INDEX_SENTINEL, 8]], dtype=torch.int32)
-    rows = positions_to_pool_rows(positions, table, 8, base_row=3, rows_per_slot=10)
-    assert rows.dtype == torch.int32
-    # base + slot * rows_per_slot + within_page; sentinels stay -1, never clamped.
-    assert torch.equal(rows, torch.tensor([[73, 24, -1], [10, -1, 3]], dtype=torch.int32))
 
 
 def test_latent_pool_rows_reinterprets_a_coalesced_pool_without_copying():

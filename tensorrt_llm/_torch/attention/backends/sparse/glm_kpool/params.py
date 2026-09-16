@@ -103,13 +103,10 @@ class GlmKpoolSparseParams(SparseParams):
 
 @dataclass(kw_only=True, slots=True)
 class GlmKpoolBackendForwardArgs(SparseBackendForwardArgs):
-    """``SparseBackendForwardArgs`` plus the backend's own row-id selection.
+    """Global latent-cache row selection produced by expand_selection.
 
-    ``topk_rows`` carries a selection already translated to latent-cache row
-    ids (int32 ``[T, kernel_output_width]``, ``-1`` invalid) by
-    :meth:`GlmKpoolSparseAttention.expand_selection`; when present it is
-    consumed directly and ``topk_indices`` (request-local positions) is not
-    needed.
+    topk_rows is int32 [tokens, kernel_output_width], with -1 marking invalid
+    entries. Request-local topk_indices from the base carrier are unsupported.
     """
 
     topk_rows: torch.Tensor | None = None
