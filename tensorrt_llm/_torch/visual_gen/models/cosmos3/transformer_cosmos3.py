@@ -462,6 +462,19 @@ class DomainAwareLinear(nn.Module):
         )
 
 
+def _project_video_tokens(tokens: torch.Tensor, projection: nn.Linear) -> torch.Tensor:
+    if tokens.is_contiguous():
+        return projection(tokens)
+    # Extra modality tokens leave gaps between video batches. nn.Linear then
+    # rounds the matmul to BF16 before adding bias; keep bias in the GEMM instead.
+    output = tokens.new_empty((*tokens.shape[:-1], projection.out_features))
+    for batch_idx in range(tokens.shape[0]):
+        torch.addmm(
+            projection.bias, tokens[batch_idx], projection.weight.t(), out=output[batch_idx]
+        )
+    return output
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -1786,7 +1799,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         # --- Decode video velocity ------------------------------------------------
         video_vel = self.unpatchify(
-            self.llm2vae(hidden_gen[:, T_control : T_control + T_vid_tokens]), T, H, W
+            _project_video_tokens(
+                hidden_gen[:, T_control : T_control + T_vid_tokens], self.llm2vae
+            ),
+            T,
+            H,
+            W,
         )
 
         # --- Decode extra-modality velocity (action XOR audio; follows video) ---
