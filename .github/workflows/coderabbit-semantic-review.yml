@@ -75,6 +75,7 @@ jobs:
             });
             const numbers = pulls.filter(pr => !pr.draft && pr.labels.some(l => l.name === LABEL))
               .map(pr => pr.number);
+            let retryPosted = false;
 
             for (const number of numbers) {
               // Read current metadata instead of trusting a possibly queued event payload.
@@ -113,9 +114,13 @@ jobs:
               const {data: comment} = await github.rest.issues.createComment({
                 ...repo, issue_number: number, body,
               });
+              if (number === retryNumber) retryPosted = true;
               core.info(`PR #${number}: requested ${head} + ${base}: ${comment.html_url}`);
               await core.summary.addRaw(
                 `PR #${number}: [requested CodeRabbit analysis](${comment.html_url}) for ` +
                 `head \`${head}\` + main \`${base}\`. No AI verdict is asserted.\n\n`
               ).write();
+            }
+            if (retryNumber && !retryPosted) {
+              throw new Error(`PR #${retryNumber}: retry not posted; requires an open, non-draft main PR with the ${LABEL} label.`);
             }
