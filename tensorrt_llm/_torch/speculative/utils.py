@@ -14,6 +14,7 @@ from tensorrt_llm.logger import logger
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+from ..pyexecutor.config_utils import match_nemotron_h_layer_types
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..speculative.interface import SpecMetadata
@@ -259,23 +260,30 @@ def _merge_mtp_fields_from_speculative_model(spec_config,
 
     for field in _MTP_STRUCTURE_FIELDS_FROM_DRAFT:
         if field in draft_cfg and draft_cfg[field] is not None:
+            value = draft_cfg[field]
+            if field == "mtp_layers_block_type":
+                # draft_cfg is the draft checkpoint's config.json, read raw, so
+                # it may use the transformers 5.13 spelling.
+                value = match_nemotron_h_layer_types(model_config, value)
             _set_pretrained_config_attr(
                 model_config,
                 field,
-                draft_cfg[field],
+                value,
                 required=(field != "mtp_block_configs"),
             )
 
     # HF NemotronHConfig: mtp_hybrid_override_pattern is a read-only property
-    # derived from mtp_layers_block_type. Convert the pattern when the draft
-    # checkpoint only provides the legacy string form.
+    # derived from mtp_layers_block_type. Expand the pattern when the draft
+    # checkpoint provides only the packed string form.
     if (draft_cfg.get("mtp_layers_block_type") is None
             and draft_cfg.get("mtp_hybrid_override_pattern") is not None):
         _set_pretrained_config_attr(
             model_config,
             "mtp_layers_block_type",
-            _pattern_to_mtp_layers_block_type(
-                draft_cfg["mtp_hybrid_override_pattern"]),
+            match_nemotron_h_layer_types(
+                model_config,
+                _pattern_to_mtp_layers_block_type(
+                    draft_cfg["mtp_hybrid_override_pattern"])),
         )
 
     if draft_nextn is not None:

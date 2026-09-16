@@ -69,7 +69,8 @@
     {
       "allowed_values": [
         "round_robin",
-        "least_queued"
+        "least_queued",
+        "least_tokens"
       ],
       "capture_policy": "literal",
       "kind": "categorical",

@@ -39,8 +39,8 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _run_lpips_eval,
     _run_wan_lpips_pipeline,
     _save_lpips_video_mp4,
-    _skip_if_missing,
 )
+from test_common.llm_data import get_checkpoint
 
 
 def _parallel_config(**kwargs):
@@ -279,8 +279,7 @@ def wan22_within_build_reference(tmp_path_factory):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < 1:
         pytest.skip("Within-build reference generation requires a GPU")
-    model_path = _lpips_model_path("Wan2.2-T2V-A14B-Diffusers")
-    _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
+    model_path = get_checkpoint("Wan2.2-T2V-A14B-Diffusers")
     tllm_site = _validated_tllm_site(
         os.path.dirname(os.path.dirname(os.path.abspath(tllm_bindings.__file__)))
     )

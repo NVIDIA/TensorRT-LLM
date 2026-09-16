@@ -71,7 +71,8 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
-from ..tokenizer import TOKENIZER_ALIASES
+from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
+from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -1638,12 +1639,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
-# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) is
-# imported from `tensorrt_llm.tokenizer`, which is where the built-in custom
-# tokenizers live. It used to be duplicated here, and the copy drifted: it was
-# missing every alias added after it, so `--custom_tokenizer <alias>` failed
-# with "not enough values to unpack" for those while the identical alias worked
-# through `load_custom_tokenizer`.
+# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) lives in
+# `tensorrt_llm.tokenizer`, where the built-in custom tokenizers register
+# themselves, and is re-exported from here. It used to be duplicated here, and
+# the copy drifted: it was missing every alias added after it, so
+# `--custom_tokenizer <alias>` failed with "not enough values to unpack" for
+# those. `custom_tokenizer` now resolves through `load_custom_tokenizer`, the
+# same loader every other entry point uses.
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
@@ -1730,8 +1732,8 @@ class AttentionDpConfig(StrictBaseModel):
         default=False,
         description=
         "Enable explicit conversation-affinity routing for attention DP. When "
-        "True, the first request of each conversation is round-robined across "
-        "ranks and every subsequent request carrying the same "
+        "True, the first request is placed by kv_cache_routing_new_conv_placement "
+        "and every subsequent request carrying the same "
         "conversation_params.conversation_id is pinned to that conversation's "
         "first-turn rank. OpenAI requests use the body conversation_params as "
         "canonical; the serve edge only creates conversation_params from the "
@@ -1740,8 +1742,8 @@ class AttentionDpConfig(StrictBaseModel):
         "block reuse, minimizing cross-rank migration). Unlike "
         "enable_kv_cache_aware_routing (affinity inferred from prefix-match "
         "length, which is lost when blocks are evicted), the conversation->rank "
-        "map is explicit and survives eviction. Falls back to load-balanced "
-        "round-robin when no conversation_id is available. Takes precedence "
+        "map is explicit and survives eviction. The same placement policy is "
+        "used when no conversation_id is available. Takes precedence "
         "over enable_kv_cache_aware_routing when both are set.")
     kv_cache_routing_max_sessions: int = Field(
         default=65536,
@@ -1751,18 +1753,17 @@ class AttentionDpConfig(StrictBaseModel):
         "are tracked, bounding memory on long-running servers. Only used when "
         "kv_cache_routing_conversation_affinity is True.")
     kv_cache_routing_new_conv_placement: Literal[
-        "round_robin", "least_queued"] = Field(
+        "round_robin", "least_queued", "least_tokens"] = Field(
             default="round_robin",
             description=
             "Placement policy in conversation-affinity routing for requests "
             "with no pinned rank yet (first turn of a conversation, requests "
             "without a conversation_id, sticky overflow). 'round_robin' "
-            "(default) equalizes per-rank conversation counts. 'least_queued' "
-            "places them on the rank with the fewest live requests instead: "
-            "per-conversation load (turn rate, fan-out, prefill length) is "
-            "not uniform, so count-uniform round-robin can leave some ranks "
-            "with deep queues while others idle; steering new conversations "
-            "by queue depth evens that out and cuts tail TTFT. Existing "
+            "(default) rotates across eligible ranks. 'least_queued' chooses "
+            "the fewest live requests. 'least_tokens' chooses the fewest active "
+            "prompt tokens, including requests assigned in the current batch; "
+            "ties use live request count, then the rotating rank cursor. "
+            "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
 
@@ -5211,27 +5212,15 @@ class BaseLlmArgs(StrictBaseModel):
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            # Resolve short aliases via the module-level TOKENIZER_ALIASES.
-            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
-                                                   self.custom_tokenizer)
-
-            # Dynamically import and use custom tokenizer
-            from importlib import import_module
-            try:
-                module_path, class_name = tokenizer_path.rsplit('.', 1)
-                module = import_module(module_path)
-                tokenizer_class = getattr(module, class_name)
-                # Use tokenizer path if specified, otherwise use model path
-                load_path = self.tokenizer if self.tokenizer else self.model
-                self.tokenizer = tokenizer_class.from_pretrained(
-                    load_path,
-                    trust_remote_code=self.trust_remote_code,
-                    use_fast=self.tokenizer_mode != 'slow')
-            except (ValueError, ImportError, AttributeError) as e:
-                raise ValueError(
-                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
-                    "Expected format: 'module.path.ClassName' or a recognized alias."
-                ) from e
+            # Use tokenizer path if specified, otherwise use model path.
+            load_path = self.tokenizer if self.tokenizer else self.model
+            # The one loader for aliases and import paths; it raises
+            # ValueError("Failed to load custom tokenizer ...") on failure.
+            self.tokenizer = load_custom_tokenizer(
+                self.custom_tokenizer,
+                load_path,
+                trust_remote_code=self.trust_remote_code,
+                use_fast=self.tokenizer_mode != 'slow')
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
