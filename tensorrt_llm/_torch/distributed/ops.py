@@ -1064,16 +1064,14 @@ class AllReduce(nn.Module):
 
         additional_args = {}
         if self._disable_mpi:
+            pg = self.mapping.tp_group_pg
+            assert pg is not None, "TP ProcessGroup not initialised"
             if self._is_visual_gen:
-                pg = self.mapping.tp_group_pg
-                assert pg is not None, "TP ProcessGroup not initialised"
                 additional_args = {
                     "rank": torch.distributed.get_rank(),
                     "group_name": pg.group_name,
                 }
             else:
-                pg = self.mapping.tp_group_pg
-                assert pg is not None, "TP ProcessGroup not initialised"
                 additional_args = {
                     "rank": torch.distributed.get_rank(),
                     "pg": pg.boxed(),
