@@ -1,20 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Entry layouts and host views over existing per-request KvCache objects.
+"""Model entry layouts, passed separately from KVCM's borrowed HostSourceView.
 
-These views describe storage; they do not allocate KV, hold pages, copy bytes,
-change page residency, or choose victims. Owners must keep tables and storage
-alive and stable through GPU use. Build views before graph capture.
-
-The planned HiSparse path takes logical selections, layout/host views, and its
-own mutable GPU-cache state directly.
+KVCM owns host locations, token coverage, and storage protection. EntryLayout
+only describes the model's stored entries, byte offsets, strides, and scales.
+The future ensure_resident() path takes both alongside logical selections.
 """
 
 from dataclasses import dataclass
-
-import torch
-
-from .selection import check_tensor
 
 
 @dataclass(frozen=True)
@@ -78,39 +71,3 @@ class EntryLayout:
                 > self.pool_slot_bytes[c.pool_index]
             ):
                 raise ValueError("Component extends beyond its pool slot")
-
-
-@dataclass(frozen=True)
-class HostStorageView:
-    """Host pool offsets, separate from ordinary GPU page indices.
-
-    request_ids: CUDA int64 [requests], identifies current table rows.
-    page_slots: CUDA int64 [requests, pages], host slot IDs; -1 means absent.
-        A page uses the same slot ID across its lifecycle's pools.
-    valid_entries: CUDA int32 [requests, pages], completed host entries in each
-        page, as a prefix. A copy in flight is not valid. Full, uncommitted pages
-        are allowed. Task 4 supplies retained copies and their protection.
-    pool_bytes: actual allocated byte capacity of each host pool. This view
-        stores offsets rather than CPU pointers; the transfer backend owns and
-        registers the corresponding pinned memory and keeps it alive.
-    """
-
-    layout: EntryLayout
-    request_ids: torch.Tensor
-    page_slots: torch.Tensor
-    valid_entries: torch.Tensor
-    pool_bytes: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if (
-            self.request_ids.ndim != 1
-            or self.page_slots.ndim != 2
-            or self.page_slots.shape[0] != self.request_ids.numel()
-        ):
-            raise ValueError("Host page tables need one row per request")
-        device = self.request_ids.device
-        check_tensor(self.request_ids, self.request_ids.shape, torch.int64, device)
-        check_tensor(self.page_slots, self.page_slots.shape, torch.int64, device)
-        check_tensor(self.valid_entries, self.page_slots.shape, torch.int32, device)
-        if len(self.pool_bytes) != len(self.layout.pool_slot_bytes) or min(self.pool_bytes) < 0:
-            raise ValueError("Provide a nonnegative byte capacity for each host pool")

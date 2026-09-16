@@ -219,6 +219,9 @@ public:
     // Close: release all blocks back to KvCacheManager.
     void close();
 
+    //! Update request identity and its host-source row together.
+    void setId(std::optional<RequestIdType> requestId);
+
     // Commit or discard request-local statistics accumulated since the previous scheduler commit.
     KVCacheStatsDelta commitPendingStats();
     void discardPendingStats();

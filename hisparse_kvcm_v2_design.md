@@ -112,7 +112,7 @@ For HiSparse, use this split:
 
 
 **Sparse KV still has a full history.** The difference is where that history is stored.
-Full-history lookup tables stay on GPU.
+Full-history lookup tables must be GPU-readable.
 
 Two implementation steps are required:
 
@@ -167,6 +167,30 @@ Hold needed pages to prevent dropping their data. Also keep active host addresse
 alone still allows movement. Restore any needed disk data to host before decode; GPU fetches
 cannot read disk.
 
+**KVCM owns one `HostSourceTable`.** Reserve its request, beam, and page limits before creating
+requests or capturing a graph. Its mapped, pinned memory has fixed addresses until manager
+shutdown. For each request slot it stores the request ID and a reuse generation. For each
+beam, layer group, and block it stores the retained host slot, host level, and completed token
+count. Pool metadata gives the host base address, slot size, capacity, and pool group.
+
+KVCM updates these records with the request and page lifecycle. Pending or invalid copies have
+no published slot and zero coverage. Refresh polls backup events without waiting for the backup;
+only completed copies become visible. Commit and prefix reuse follow the actual shared page.
+Suspend keeps retained sources; resume replaces sources when it copies a partial prefix into a
+new writable page. Close clears the row before its slot can be reused.
+
+`HostSourceView` only borrows the table's addresses and dimensions. It owns no memory, builds no
+second table, allocates no storage, and copies no data. Keep model-specific `EntryLayout` separate:
+KVCM reports completed **tokens**; the model layout defines stored entries, strides, and scales.
+
+Before GPU use, acquire a table read scope. It refreshes completed sources and protects them
+with existing `HostPageRead` handles. Close the scope after submitting GPU work, including graph
+replay. Its completion event protects the table and host slots. Table changes are rejected while
+a read scope is open; after close, CPU updates wait for its GPU work before changing mapped
+metadata. This is a scheduler boundary, not a per-layer operation. The view itself is not a
+lifetime guard. A captured graph must acquire a fresh read scope for each replay.
+See [host-source table usage](docs/source/developer-guide/kv-cache-host-copies.md#host-source-table).
+
 > **KVCM owner review:** confirm copy validity, safe reuse, fixed host addresses, partial pages,
 > shared data, and host/disk exhaustion.
 
@@ -175,8 +199,8 @@ cannot read disk.
 ### 3.4 Find GPU hits, fetch misses, and give attention its indices
 
 **Pass logical selections directly to `ensure_resident()`, backed by HiSparse's
-`load_cache_to_device_buffer_kernel`.** Its inputs are `SelectedEntries`, the entry layout and
-host view with protected host sources, and mutable GPU-cache state. It handles:
+`load_cache_to_device_buffer_kernel`.** Its inputs are `SelectedEntries`, a separate `EntryLayout`,
+KVCM's `HostSourceView` protected by a read scope, and mutable GPU-cache state. It handles:
 
 1. Validate selection IDs and bounds.
 2. Find GPU hits and choose replaceable LRU entries for misses.
@@ -225,14 +249,15 @@ This follows the [generalization principle](hisparse_design_principle.md).
 
 **Each layer writes new KV, prepares selected KV on GPU, and runs attention.**
 
-Before graph replay, the CPU reserves memory and updates request IDs, lengths, and valid rows
-in existing buffers, including padding. Host source addresses must stay valid.
+Reserve table and cache capacity before graph capture. Before each replay, update request IDs,
+lengths, and valid rows, including padding. Acquire a KVCM host-source read scope for that replay
+and close it after submission. Host source addresses must stay valid until the reads finish.
 
 Each layer runs these steps on GPU:
 
 1. **Write** new KV and scoring data. Wait for prior uses before overwriting a slot.
 2. **Select** the KV to read. IndexShare layers can share a selection but need their own KV.
-3. **Fetch** missing KV by passing the selection, layout/host view, and GPU-cache state directly
+3. **Fetch** missing KV by passing the selection, `EntryLayout`, `HostSourceView`, and GPU-cache state directly
   to `ensure_resident()`. New KV can use its protected GPU copy while backup is pending.
 4. **Run attention** using the returned indices, after the required copies finish.
 

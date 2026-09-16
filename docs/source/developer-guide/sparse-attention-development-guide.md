@@ -376,8 +376,8 @@ If the algorithm needs extra tensors beyond the main KV cache:
 
 The internal interfaces in `backends/sparse/selection.py` and `kv_layout.py`
 describe selected KV before host offload is connected to models. They keep one
-existing `KvCache` per request. Layouts and host views describe KV sources without
-owning or moving pages.
+existing `KvCache` per request. Model layouts are separate from KVCM's non-owning
+`HostSourceView`.
 
 | Type | What it carries |
 | --- | --- |
@@ -385,7 +385,7 @@ owning or moving pages.
 | `SelectionContext` | Request IDs, query-to-request rows, KVCM layer/lifecycle IDs, and per-query valid lengths. |
 | `SelectedEntries` | Logical positions and an optional validity mask, in attention order. |
 | `EntryLayout` | Entries per page and byte spans for KV, scales, or other entry data. |
-| `HostStorageView` | Host slot IDs, completed entry counts, and pool sizes. |
+| `HostSourceView` (C++ KVCM) | Borrowed addresses for request IDs/generations, retained host slots, completed token counts, and host-pool metadata. |
 
 `DSATrtllmAttention.select_kv()` exposes DSA top-K before the ordinary GPU
 page-table conversion. It also supports shared indexer output. The caller
@@ -414,8 +414,14 @@ offset = host_slot[request, page] * pool_slot_bytes[c.pool_index]
          + c.offset + entry * c.stride
 ```
 
-The planned HiSparse path passes `SelectedEntries`, the layout/host view, and
-mutable GPU-cache state directly to `ensure_resident()`. HiSparse owns hit lookup,
+KVCM owns and updates the `HostSourceTable`; the view never builds a second table.
+Pending and stale copies are absent. Completed coverage counts input tokens;
+the model adapter converts it to stored entries according to `EntryLayout`.
+Reserve table capacity before graph capture and use a table read scope for each
+GPU use. See [host-source table usage](kv-cache-host-copies.md#host-source-table).
+
+The planned HiSparse path passes `SelectedEntries`, `EntryLayout`, `HostSourceView`,
+and mutable GPU-cache state directly to `ensure_resident()`. HiSparse owns hit lookup,
 LRU replacement, and fetching. Attention runs after the required copies, with
 selected slots protected until attention finishes. Step 5 implements this path later.
 

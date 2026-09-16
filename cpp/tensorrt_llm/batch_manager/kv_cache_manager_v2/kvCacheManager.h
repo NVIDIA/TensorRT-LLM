@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
+#include "kv_cache_manager_v2/hostSourceTable.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/movingAverage.h"
@@ -124,6 +125,34 @@ public:
 
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
+
+    //! Internal opt-in. Reserve fixed metadata storage before creating requests or capturing graphs.
+    //! Requests with an ID get a stable row until close(); anonymous caches are not published.
+    void reserveHostSourceTable(int maxRequests, int maxPages, int maxBeams = 1);
+    HostSourceView hostSourceView() const;
+    void refreshHostSourceTable();
+    std::unique_ptr<HostSourceRead> acquireHostSources(CUstream stream);
+    int hostSourceSlot(KvCache const& cache) const;
+
+    //! Internal lifecycle hooks, under the exclusive API lock. Nesting is supported.
+    [[nodiscard]] auto updateHostSources()
+    {
+        if (mHostSources)
+        {
+            mHostSources->beginUpdate();
+        }
+        return FuncGuard(
+            [this]()
+            {
+                if (mHostSources)
+                {
+                    mHostSources->endUpdate();
+                }
+            });
+    }
+
+    void checkHostSourceCapacity(KvCache const& cache, int capacity) const;
+    void setHostSourceRequestId(KvCache& cache, std::optional<RequestIdType> id);
 
     // ---- KvCache creation -------------------------------------------------
 
@@ -348,6 +377,7 @@ public:
     // White-box introspection (incl. test-only auto-tuner state mutation) reaches
     // private members directly rather than widening the public API.
     friend class KvCacheIntrospection;
+    friend class HostSourceRead;
 
 private:
     // First member, so the registration covers the whole lifetime: it is taken before any state
@@ -379,6 +409,7 @@ private:
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;
+    std::unique_ptr<HostSourceTable> mHostSources;
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;

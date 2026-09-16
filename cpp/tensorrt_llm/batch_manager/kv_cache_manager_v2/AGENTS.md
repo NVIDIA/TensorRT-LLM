@@ -143,6 +143,23 @@ pages and performs final commit-state bookkeeping.
   copies of cached GPU pages; inactive host pages remain normally evictable.
 - See [host-copy usage and layout](../../../../docs/source/developer-guide/kv-cache-host-copies.md).
 
+### Host-source table
+
+- `KvCacheManager` optionally owns a fixed-capacity, mapped `HostSourceTable`.
+  Reserve it before requests and graph capture; never resize its arrays.
+  `HostSourceView` borrows these arrays and contains no model `EntryLayout`.
+- Lifecycle mutations use `updateHostSources()` under the exclusive API lock.
+  The nested guard clears old sources before mutation and rebuilds from the
+  actual request pages afterward, including rollback paths. Extend these hooks
+  when adding a new API that changes pages, coverage, request identity, or pools.
+- Publish only completed retained copies, capped by request and page coverage.
+  Refresh polls CUDA events; it does not wait for pending backups. Request rows
+  keep their identity through suspend and increment their generation on reuse.
+- `HostSourceRead` pins published sources using `HostPageRead`. Close it after
+  submitting GPU use, outside graph capture. Table updates reject open scopes
+  and wait for closed scopes' GPU work before writing mapped metadata. A view
+  is not a lifetime guard; each graph replay needs a fresh read scope.
+
 ### Page status
 
 - `LOCKED`: required on GPU; neither eviction nor dropping is permitted.

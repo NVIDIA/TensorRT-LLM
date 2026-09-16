@@ -1469,6 +1469,186 @@ class TestNoBatching(TestKVCacheManagerV2):
             profiler.dump_stats("profiler.prof")
 
 
+@requires_cpp_backend
+class TestHostSourceTable(TestKVCacheManagerV2):
+    def setUp(self) -> None:
+        super().setUp()
+        self.prepare(4 << 20, 4 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=4096)
+        self.manager._reserve_host_source_table(max_requests=2, max_pages=8)
+        self.view = self.manager._host_source_view
+        self.group = self.manager.get_layer_group_id(LayerId(0))
+        self.cache = self.manager.create_kv_cache(id=41)
+        self.stream_holder = TemporaryCudaStream([])
+        self.stream = cast(CudaStream, self.stream_holder.handle)
+        self.assertTrue(self.cache.resume(self.stream))
+        self.assertTrue(self.cache.resize(20, 16))
+        self.index = (self.cache._host_source_slot, 0, self.group, 1)
+        self.logic_error = import_module(type(self.cache).__module__).LogicError
+
+    def tearDown(self) -> None:
+        self.cache.close()
+        self.stream_holder.synchronize()
+        self.stream_holder.close()
+        super().tearDown()
+
+    def test_completed_partial_copy_and_invalidation(self) -> None:
+        self.cache.close()
+        self.cache = self.manager.create_kv_cache(id=41)
+        self.assertTrue(self.cache.resume(self.stream))
+        self.assertTrue(self.cache.resize(8, 6))
+        self.cache._backup_to_host(self.group, 1, 2)
+        self.stream_holder.synchronize()
+        self.manager._refresh_host_source_table()
+        counts = self.view.completed_tokens
+        slots = self.view.slot_ids
+        self.assertEqual(counts[self.index], 2)
+        self.assertGreaterEqual(slots[self.index], 0)
+        self.assertFalse(counts.flags.writeable)
+        self.assertFalse(counts.flags.owndata)
+        self.assertEqual(
+            counts.ctypes.data, self.manager._host_source_view.completed_tokens.ctypes.data
+        )
+        self.assertEqual(
+            self.view.completed_tokens_address,
+            self.manager._host_source_view.completed_tokens_address,
+        )
+        with self.assertRaises(ValueError):
+            counts[self.index] = 4
+        read = self.manager._acquire_host_sources(self.stream)
+        try:
+            with self.assertRaises(self.logic_error):
+                self.cache._invalidate_host_copy(self.group, 1)
+        finally:
+            read.close()
+        self.cache._invalidate_host_copy(self.group, 1)
+        self.assertEqual(counts[self.index], 0)
+        self.assertEqual(slots[self.index], -1)
+
+    def test_pending_copy_is_not_published(self) -> None:
+        import ctypes
+        import threading
+
+        runtime = ctypes.CDLL("libcudart.so")
+        callback_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+        runtime.cudaLaunchHostFunc.argtypes = [ctypes.c_void_p, callback_type, ctypes.c_void_p]
+        runtime.cudaLaunchHostFunc.restype = ctypes.c_int
+        released = threading.Event()
+        callback = callback_type(lambda _: released.wait())
+        self.stream_holder.synchronize()
+        self.assertEqual(runtime.cudaLaunchHostFunc(self.stream, callback, None), 0)
+        try:
+            self.cache._backup_to_host(self.group, 1, 4)
+            self.manager._refresh_host_source_table()
+            self.assertEqual(self.view.completed_tokens[self.index], 0)
+            self.assertEqual(self.view.slot_ids[self.index], -1)
+        finally:
+            released.set()
+            self.stream_holder.synchronize()
+        self.manager._refresh_host_source_table()
+        self.assertEqual(self.view.completed_tokens[self.index], 4)
+        self.assertGreaterEqual(self.view.slot_ids[self.index], 0)
+
+    def test_offload_shared_prefix_and_request_slot_reuse(self) -> None:
+        self.cache._backup_to_host(self.group, 1, 4)
+        self.stream_holder.synchronize()
+        self.cache._set_residency_window(self.group, 5, num_sink_tokens=4)
+        self.cache._offload_to_host(self.group, 1)
+        slot = self.view.slot_ids[self.index]
+        self.cache.suspend()
+        self.assertEqual(self.view.slot_ids[self.index], slot)
+        self.assertTrue(self.cache.resume(self.stream))
+        self.cache.commit(list(range(16)))
+        shared = self.manager.create_kv_cache(input_tokens=list(range(16)), id=42)
+        try:
+            other_index = (shared._host_source_slot, 0, self.group, 1)
+            self.assertEqual(self.view.slot_ids[other_index], slot)
+            self.assertTrue(shared.resume(self.stream))
+            generation = int(self.view.generations[0])
+            self.cache.close()
+            self.assertEqual(self.view.request_valid[0], 0)
+            self.assertEqual(self.view.slot_ids[self.index], -1)
+            self.assertEqual(self.view.slot_ids[other_index], slot)
+            self.cache = self.manager.create_kv_cache(id=41)
+            self.assertEqual(self.cache._host_source_slot, 0)
+            self.assertEqual(self.view.generations[0], generation + 1)
+            self.assertEqual(self.view.request_ids[0], 41)
+            self.assertEqual(self.view.slot_ids[self.index], -1)
+        finally:
+            shared.close()
+        self.assertEqual(self.view.request_valid[1], 0)
+        self.assertEqual(self.view.slot_ids[other_index], -1)
+
+    def test_page_reader_survives_table_cleanup(self) -> None:
+        self.cache._backup_to_host(self.group, 1, 4)
+        self.stream_holder.synchronize()
+        self.manager._refresh_host_source_table()
+        reader = self.cache._acquire_host_copy(self.group, 1)
+        try:
+            address = reader.address
+            self.cache.close()
+            self.assertEqual(self.view.slot_ids[self.index], -1)
+            self.assertEqual(self.view.request_valid[0], 0)
+            self.assertEqual(reader.address, address)
+            with self.assertRaises(RuntimeError):
+                self.manager.shutdown()
+        finally:
+            reader.close()
+        self.manager.shutdown()
+        # The view is non-owning: do not access it after shutdown.
+        with self.assertRaises(self.logic_error):
+            _ = self.manager._host_source_view
+
+    def test_request_id_setter_updates_identity_and_rejects_duplicates(self) -> None:
+        generation = int(self.view.generations[0])
+        self.cache.id = 43
+        self.assertEqual(self.view.request_ids[0], 43)
+        self.assertEqual(self.view.generations[0], generation + 1)
+        other = self.manager.create_kv_cache(id=44)
+        try:
+            with self.assertRaises(ValueError):
+                self.cache.id = 44
+            self.assertEqual(self.cache.id, 43)
+            self.assertEqual(self.view.request_ids[0], 43)
+        finally:
+            other.close()
+        self.cache.id = None
+        self.assertEqual(self.cache._host_source_slot, -1)
+        self.assertEqual(self.view.request_valid[0], 0)
+        self.cache.id = 45
+        self.assertEqual(self.cache._host_source_slot, 0)
+        self.assertEqual(self.view.request_ids[0], 45)
+        self.assertEqual(self.view.generations[0], generation + 2)
+
+    def test_read_scope_keeps_request_alive_until_implicit_close(self) -> None:
+        read = self.manager._acquire_host_sources(self.stream)
+        del self.cache
+        self.assertEqual(self.view.request_valid[0], 1)
+        read.close()
+        self.assertEqual(self.view.request_valid[0], 0)
+        self.cache = self.manager.create_kv_cache(id=41)
+
+    def test_view_does_not_own_manager_or_table_storage(self) -> None:
+        before = num_live_managers()
+        manager = KVCacheManager(self.cfg)
+        manager._reserve_host_source_table(1, 2)
+        view = manager._host_source_view
+        counts = view.completed_tokens
+        self.assertFalse(counts.flags.owndata)
+        self.assertEqual(num_live_managers(), before + 1)
+        del manager
+        self.assertEqual(num_live_managers(), before)
+        # Borrowed objects remain ordinary Python objects; their storage is now invalid.
+        del counts, view
+
+    def test_empty_table_read_guards_shutdown_and_implicit_close(self) -> None:
+        self.cache.close()
+        read = self.manager._acquire_host_sources(self.stream)
+        with self.assertRaises(self.logic_error):
+            self.manager.shutdown()
+        del read
+        self.manager.shutdown()
+
+
 class TestLivingKvCacheGuard(TestKVCacheManagerV2):
     """Guard against clearing/freeing the reuse state while KV caches are still open.
 
