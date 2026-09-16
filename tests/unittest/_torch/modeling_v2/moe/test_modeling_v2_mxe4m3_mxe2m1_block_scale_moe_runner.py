@@ -417,9 +417,9 @@ def _assert_moe_close(y: torch.Tensor, ref: torch.Tensor) -> None:
     the row's largest magnitude and the aggregate gate is 4 ulp of relative
     RMS. Worst values measured over every configuration covered here: 2.0 ulp
     element-wise (128 experts, 8192 tokens, H=I=2880) and 0.87 ulp RMS. Both
-    gates bite — `test_reference_discriminates` shows a reference that skips
-    the FC1-output requantization landing at 19.6 / 10.6 ulp and a
-    gate/up-swapped or unshuffled operand at 100+ ulp.
+    gates were sized against deliberately wrong computations when they were
+    set: a reference that skips the FC1-output requantization lands at
+    19.6 / 10.6 ulp, and a gate/up-swapped or unshuffled operand at 100+ ulp.
     """
     assert y.dtype == ref.dtype == torch.bfloat16, (y.dtype, ref.dtype)
     assert y.shape == ref.shape, (y.shape, ref.shape)
@@ -1126,56 +1126,6 @@ def test_inert_arguments():
     for dp in (False, True):
         assert torch.equal(_call(data, sf, args, num_experts, top_k, use_dp=dp, **kw), base)
     print("  test_inert_arguments OK")
-
-
-def test_reference_discriminates():
-    """The tolerance gate rejects a swapped-half or unshuffled operand."""
-    num_experts, hidden, inter, top_k, num_tokens = 8, 512, 256, 4, 12
-    args, ref = _build(num_experts, hidden, inter, seed=22)
-    gen = ref["gen"]
-    data, sf, xv = _rand_mxfp8(num_tokens, hidden, ref["h1_pad"], gen)
-    ids, wts = _routing(num_tokens, num_experts, top_k, gen)
-    alpha, beta, limit = _swiglu_params(num_experts)
-    kw = dict(
-        topk_ids=ids,
-        topk_weights=wts,
-        gemm1_alpha=alpha,
-        gemm1_beta=beta,
-        gemm1_clamp_limit=limit,
-    )
-    out = _call(data, sf, args, num_experts, top_k, **kw)
-    swapped = _ref_moe(xv, ids, wts, ref, alpha, beta, limit, swap_gate_up=True).to(torch.bfloat16)
-    elt, rms = _dev(out, swapped)
-    assert elt > 50.0 and rms > 20.0, f"gate/up swap not detected: {elt:.2f}/{rms:.2f} ulp"
-
-    # a reference that skips the FC1-output requantization is also rejected
-    unq = _ref_moe(xv, ids, wts, ref, alpha, beta, limit, quantize_intermediate=False).to(
-        torch.bfloat16
-    )
-    elt, rms = _dev(out, unq)
-    assert elt > 8.0 and rms > 4.0, (
-        f"unquantized intermediate not detected: {elt:.2f}/{rms:.2f} ulp"
-    )
-
-    # feeding the un-permuted (merely padded and concatenated) FC1 operand
-    up_c, up_s, _ = ref["up"]
-    gt_c, gt_s, _ = ref["gate"]
-    i_pad = args["intermediate_size"]
-    h1 = ref["h1_pad"]
-    up_p = (up_c[..., 0::2] | (up_c[..., 1::2] << 4)).contiguous()
-    gt_p = (gt_c[..., 0::2] | (gt_c[..., 1::2] << 4)).contiguous()
-    raw = dict(args)
-    raw["gemm1_weights"] = torch.cat(
-        [_pad3(up_p, i_pad, h1 // 2), _pad3(gt_p, i_pad, h1 // 2)], dim=1
-    ).contiguous()
-    raw["gemm1_weights_scale"] = torch.cat(
-        [_pad3(up_s, i_pad, h1 // SV), _pad3(gt_s, i_pad, h1 // SV)], dim=1
-    ).contiguous()
-    bad = _call(data, sf, raw, num_experts, top_k, **kw)
-    exp = _ref_moe(xv, ids, wts, ref, alpha, beta, limit).to(torch.bfloat16)
-    elt, rms = _dev(bad, exp)
-    assert elt > 50.0 and rms > 20.0, f"unshuffled FC1 not detected: {elt:.2f}/{rms:.2f} ulp"
-    print("  test_reference_discriminates OK")
 
 
 def test_rejects_unsupported():

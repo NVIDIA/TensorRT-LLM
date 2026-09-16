@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 22}
+  sm_103: {status: passed, tests: 15}
 ---
 
 # mla_rope_generation

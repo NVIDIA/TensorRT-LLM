@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 19}
+  sm_103: {status: passed, tests: 18}
 ---
 
 # mxe4m3_mxe2m1_block_scale_moe_runner

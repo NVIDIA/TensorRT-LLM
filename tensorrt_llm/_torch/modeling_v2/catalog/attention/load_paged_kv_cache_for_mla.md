@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 18}
+  sm_103: {status: passed, tests: 10}
 ---
 
 # load_paged_kv_cache_for_mla

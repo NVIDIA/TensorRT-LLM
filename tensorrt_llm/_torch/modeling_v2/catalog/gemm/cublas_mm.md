@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 7}
+  sm_103: {status: passed, tests: 5}
 ---
 
 # cublas_mm
