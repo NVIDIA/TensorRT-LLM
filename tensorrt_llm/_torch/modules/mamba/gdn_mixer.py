@@ -24,7 +24,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
-from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -56,12 +56,18 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # (SM100/SM103); on consumer Blackwell (SM120) and other archs it aborts at
 # launch, so we fall back to Triton there. Resolution is deferred to first call
 # (and cached) so importing this module never initializes CUDA.
-@functools.lru_cache(maxsize=1)
-def _resolve_chunk_gated_delta_rule():
-    if (
+def _use_flashinfer_gdn_prefill() -> bool:
+    """Check the prefill backend setting and supported GPU architecture."""
+    return (
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
         and is_flashinfer_gdn_supported_arch()
-    ):
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_chunk_gated_delta_rule():
+    """Resolve and cache the selected prefill implementation."""
+    if _use_flashinfer_gdn_prefill():
         from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as impl
     else:
         from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as impl
@@ -69,7 +75,12 @@ def _resolve_chunk_gated_delta_rule():
 
 
 @torch.compiler.disable
-def chunk_gated_delta_rule(*args, **kwargs):
+def chunk_gated_delta_rule(
+    *args, state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None, **kwargs
+):
+    """Dispatch prefill, omitting unused FlashInfer-only workspace arguments."""
+    if state_workspace is not None:
+        kwargs["state_workspace"] = state_workspace
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
 
 
@@ -887,6 +898,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     head_first=False,
                     use_qk_l2norm_in_kernel=False,
                     output=output_p,
+                    state_workspace=kwargs.get("state_workspace"),
                 )
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
@@ -1002,9 +1014,33 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             head_first=False,
             use_qk_l2norm_in_kernel=False,
             output=output,
+            state_workspace=kwargs.get("state_workspace"),
         )
 
         return core_attn_out
+
+    def _get_prefill_state_workspace(
+        self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Reserve maximum state scratch on first use and reuse it across layers."""
+        # Blackwell uses indexed pool I/O directly, without state scratch.
+        if not _use_flashinfer_gdn_prefill() or is_sm_100f():
+            return None
+        key = (ssm_states.device, ssm_states.shape[1:])
+        # First use during warmup reserves the configured maximum, not the current batch.
+        # Sequential layers share this persistent input/output scratch.
+        workspaces = self.model_config.extra_attrs.setdefault("gdn_state_workspaces", {})
+        workspace = workspaces.get(key)
+        capacity = min(
+            attn_metadata.max_num_sequences or attn_metadata.max_num_requests,
+            attn_metadata.max_num_tokens,
+        )
+        if workspace is None or workspace[0].shape[0] < capacity:
+            state_in = torch.empty(
+                (capacity, *ssm_states.shape[1:]), dtype=torch.float32, device=ssm_states.device
+            )
+            workspace = workspaces[key] = (state_in, torch.empty_like(state_in))
+        return workspace
 
     def forward(
         self,
@@ -1143,6 +1179,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 intermediate_ssm_states=intermediate_ssm_states,
                 is_target_verify=is_target_verify,
                 output=output,
+                state_workspace=self._get_prefill_state_workspace(attn_metadata, ssm_states),
                 **kwargs,
             )
         else:
