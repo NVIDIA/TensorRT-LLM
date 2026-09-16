@@ -32,6 +32,10 @@ def _make_down_proj() -> nn.Module:
     down_proj = nn.Module()
     down_proj.has_fp8_qdq = False
     down_proj.has_w4a8_nvfp4_fp8 = False
+    # The unfused branch calls ``_can_fuse_swiglu_fp8_quant``, whose first
+    # check reads this attribute, so a stand-in without it raises
+    # AttributeError before the assertions below are reached.
+    down_proj.has_fp8_block_scales = False
     down_proj.forward = Mock(side_effect=lambda value, **kwargs: value + 1)
     return down_proj
 
@@ -57,7 +61,11 @@ def test_gate_up_partition_falls_back_to_swiglu(
 
     assert not mlp._can_fuse_gate_up_swiglu()
     mlp.gate_up_proj.forward.assert_called_once_with(inputs)
-    swiglu.assert_called_once_with(projected, swiglu_limit=None)
+    # ``GatedMLP`` forwards all three SwiGLU shape parameters on every call;
+    # they are None here because this layer is plain SwiGLU.
+    swiglu.assert_called_once_with(
+        projected, swiglu_limit=None, swiglu_alpha=None, swiglu_beta=None
+    )
     mlp.down_proj.forward.assert_called_once()
     down_args, down_kwargs = mlp.down_proj.forward.call_args
     torch.testing.assert_close(down_args[0], activated)
