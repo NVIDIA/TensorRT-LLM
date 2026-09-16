@@ -63,6 +63,9 @@ def test_stage_python_package(
         (project / name).write_text("not a packaging input\n")
     (project / "unrelated").mkdir()
     (project / "unrelated" / "requirements-nested.txt").write_text("nested\n")
+    # A root-level directory whose name matches requirements*.txt must be
+    # skipped, not handed to copy() (which would raise IsADirectoryError).
+    (project / "requirements-local.txt").mkdir()
 
     build_wheel.stage_python_package(project, staging)
 

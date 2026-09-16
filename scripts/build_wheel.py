@@ -760,7 +760,8 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
     ]
     # setup.py reads requirements for optional extras and platform variants too.
     top_level_files += sorted(f.name
-                              for f in project_dir.glob("requirements*.txt"))
+                              for f in project_dir.glob("requirements*.txt")
+                              if f.is_file())
     top_level_files += [
         f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
     ]
