@@ -99,6 +99,11 @@ class DFlashSpecMetadata(SpecMetadata):
 
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
+        # Keeps the capture-dtype notice to one line per metadata object rather
+        # than one per layer per forward. create_cuda_graph_metadata() re-runs
+        # __post_init__ on its shallow copy, so expect one line per graph
+        # bucket as well.
+        self._warned_capture_dtype = False
 
         # Set up hidden state capture buffer
         if self.layers_to_capture is not None and len(self.layers_to_capture) > 0:
@@ -183,12 +188,33 @@ class DFlashSpecMetadata(SpecMetadata):
         pass the pre-add pair and this folds them, while K3 hands in an
         already-mixed aggregated stream value and passes ``residual=None``
         (see the DSpark tap in ``modeling_kimi_linear.py``).
+
+        The tapped dtype is model-specific too. The buffer is allocated in the
+        target's ``torch_dtype``, but a model may tap a stream that is wider --
+        an FP32 residual folded into a bf16 buffer, for instance -- and folding
+        ``residual`` here can promote the result for other callers too.
+        ``Tensor.copy_`` converted silently, so this was invisible until #18553
+        replaced it with ``inplace_slice_copy``, which requires matching dtypes
+        and raises during the first forward. Converting to the buffer's dtype
+        restores the previous behaviour exactly, which matters beyond the crash:
+        the drafter has always consumed values rounded to the buffer dtype, so
+        capturing anything wider would silently move acceptance length.
         """
         if self.captured_hidden_states is None:
             return
         i = self._layer_to_idx.get(layer_id)
         if i is not None:
             to_save = hidden_states + residual if residual is not None else hidden_states
+            if to_save.dtype != self.captured_hidden_states.dtype:
+                if not self._warned_capture_dtype:
+                    logger.info(
+                        f"DFlash: capture tap for layer {layer_id} is "
+                        f"{to_save.dtype}, buffer is "
+                        f"{self.captured_hidden_states.dtype}; converting on "
+                        f"capture."
+                    )
+                    self._warned_capture_dtype = True
+                to_save = to_save.to(self.captured_hidden_states.dtype)
             inplace_slice_copy(
                 self.captured_hidden_states,
                 to_save,
