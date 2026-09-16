@@ -92,31 +92,6 @@ operation is proposed in section 3.4.
 Sources: [KvCache](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.cpp), [residency rules](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md#internal-sparse-residency), [page locks](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.cpp),
 [storage management](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.cpp), and [the codec](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCodec.h).
 
-### 2.3 What the existing GPU page table means
-
-Each request's GPU page table lists slots for the pages **that request GPU-locks**. Releasing a
-lock immediately changes its entry to `-1`. This does not immediately move the bytes.
-
-For example, an old page leaves the residency window and is neither a sink nor writable:
-
-
-| Stage                                      | Where the bytes are | This request's table entry |
-| ------------------------------------------ | ------------------- | -------------------------- |
-| Request locks the page                     | GPU slot 7          | `7`                        |
-| Request releases the lock and keeps a hold | Still GPU slot 7    | `-1`                       |
-| Storage later moves the page to host       | Host                | `-1`                       |
-
-
-In this example, `-1` records the released GPU lock; it does not mean the bytes have left GPU.
-The [lock-release code](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.cpp#L397) writes this value. HiSparse needs a separate mapping for
-selected GPU entries, described in section 3.4.
-
-### 2.4 Local implementation progress
-
-Residency controls, selection/layout interfaces, retained host copies, and the GPU entry cache
-are implemented locally. `ensure_resident()` now uses the pinned HiSparse kernel. The wrapper
-adds host/layout checks, duplicate handling, GPU read protection, newest-entry writes, and shared
-miss plans. A separate CUDA kernel releases read protection after attention. 
 
 ## 3. Proposed changes
 
