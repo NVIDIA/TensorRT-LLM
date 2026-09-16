@@ -335,11 +335,13 @@ class DFlashWorker(SpecWorkerBase):
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
         # The DFlash 2 selector indexes full-vocab codebooks by draft-token
-        # id, so a d2t-remapped draft vocab would score the wrong tokens.
-        assert self._d2t is None or not getattr(draft_model, "is_dflash2", False), (
-            "DFlash 2 candidate selection requires a shared draft/target vocab "
-            "(d2t vocab mapping is not supported)."
-        )
+        # id, so a d2t-remapped draft vocab would score the wrong tokens. This
+        # is an explicit raise rather than an assert so it survives `python -O`.
+        if self._d2t is not None and getattr(draft_model, "is_dflash2", False):
+            raise NotImplementedError(
+                "DFlash 2 candidate selection requires a shared draft/target vocab "
+                "(d2t vocab mapping is not supported)."
+            )
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype):
         """Fail with the arithmetic before allocating the drafter context arena.

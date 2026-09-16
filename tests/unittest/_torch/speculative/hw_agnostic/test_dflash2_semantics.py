@@ -453,9 +453,9 @@ def _bind_drafter(is_dflash2: bool, d2t):
 
 def test_dflash2_drafter_with_a_remapped_draft_vocab_fails_at_bind():
     """The codebooks are indexed by draft-vocab id, so a d2t remap would score
-    the wrong tokens. No DFlash 2 drafter ships one, so it is an invariant
-    checked when the worker binds the drafter, not on the first draft step."""
-    with pytest.raises(AssertionError, match="shared draft/target"):
+    the wrong tokens. It is rejected when the worker binds the drafter, not on
+    the first draft step, and raises explicitly so it survives `python -O`."""
+    with pytest.raises(NotImplementedError, match="shared draft/target"):
         _bind_drafter(is_dflash2=True, d2t=torch.zeros(VOCAB, dtype=torch.long))
 
 
