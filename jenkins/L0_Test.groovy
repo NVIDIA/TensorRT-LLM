@@ -3088,6 +3088,11 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
+// Dynamic split-count overrides computed once in L0_MergeRequest.groovy's
+// setupPipelineEnvironment (see applyDynamicSplitCounts) and propagated here
+// via the `testFilter` job parameter, the same way CBTS_RESULT is.
+@Field
+def DYNAMIC_SPLIT_COUNTS = "dynamic_split_counts"
 // Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
 // Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
@@ -3117,6 +3122,7 @@ def testFilter = [
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
     (INFRA_DRY_RUN): false,
+    (DYNAMIC_SPLIT_COUNTS): null,
 ]
 
 @Field
@@ -6202,60 +6208,27 @@ def buildK8sStageConfigs(stageName, platform, testlist, splitCount, gpuCount = 1
     return configs
 }
 
-// Computes dynamic split counts by shelling out to
-// scripts/test_to_stage_mapping.py --emit-splits, which sizes every stage
-// family from its actual (mako-filtered) test set using
-// block_matches_stage()/derive_mako_from_stage() from
-// jenkins/scripts/cbts/blocks.py -- the same matching trt-test-db performs
-// at runtime via getMakoArgsFromStageName(). Delegating keeps that matching
-// logic (and TARGET_SHARD_SECONDS/DYNAMIC_SPLITS_CAP) in exactly one place
-// instead of a second Groovy port that could drift out of sync; it also
-// sizes families that share a testDB with siblings and are told apart only
-// by stage-name keyword filtering (e.g. DGX_B200-CPP vs. DGX_B200-PyTorch),
-// which the old testDB-sum estimate had to skip entirely.
-// Any failure here (python3/pyyaml unavailable, checkout failure, missing/
-// stale .test_durations, JSON parse error) falls back to specs' hardcoded
-// "splits" from test_stage_configs.json -- dynamic sizing must never block
-// stage generation.
-def computeDynamicSplitCounts(pipeline, specs) {
-    try {
-        trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "scripts/test_to_stage_mapping.py", "${LLM_ROOT}/scripts")
-        trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/cbts/blocks.py", "${LLM_ROOT}/jenkins/scripts/cbts")
-        trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "tests/integration/defs/.test_durations", "${LLM_ROOT}/tests/integration/defs")
-        specs.collect { it.testDB }.unique().each { testDB ->
-            trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "tests/integration/test_lists/test-db/${testDB}.yml", "${LLM_ROOT}/tests/integration/test_lists/test-db")
+// Applies the dynamic split-count overrides computed once upstream in
+// L0_MergeRequest.groovy's setupPipelineEnvironment (same DYNAMIC_SPLIT_COUNTS
+// key, propagated here via the `testFilter` job parameter exactly like
+// CBTS_RESULT). That step runs scripts/test_to_stage_mapping.py --emit-splits
+// against its own already-fully-checked-out repo, in the same container
+// (and reusing the same apt-get python3-yaml install) that already runs CBTS's
+// jenkins/scripts/cbts/main.py -- so this pod never needs its own Python/YAML
+// install just to size stages. If the upstream computation failed or this pod
+// wasn't launched from L0_MergeRequest.groovy (testFilter[DYNAMIC_SPLIT_COUNTS]
+// is null/absent), specs keep their hardcoded "splits" from
+// test_stage_configs.json -- dynamic sizing must never block stage generation.
+def applyDynamicSplitCounts(specs, testFilter) {
+    def overrides = testFilter[(DYNAMIC_SPLIT_COUNTS)]
+    if (overrides == null) {
+        return specs
+    }
+    specs.each { spec ->
+        def k = overrides[spec.name]
+        if (k != null && k != spec.splits) {
+            spec.splits = k
         }
-
-        // Unwrapped `sh` steps on this pod run in the default container (the
-        // "jnlp" agent container), which has git (checkoutFile above works)
-        // but runs as a non-root user with no apt-get/apk available to it --
-        // apt-get fails on "/var/lib/apt/lists/partial ... Permission
-        // denied" and there's no apk binary at all there. The "alpine"
-        // container in this pod's spec exists exactly for lightweight
-        // scratch work like this, so run the install + python there
-        // instead, the same way jenkins/BoltProfileGen.groovy does for its
-        // own container('alpine') { ... } step. Containers in a pod share
-        // the workspace volume, so files fetched above via checkoutFile
-        // (run in the default container) are visible here too.
-        def output
-        container('alpine') {
-            sh(label: "Install python3/pyyaml for split sizing", script: "apk add --no-cache python3 py3-yaml")
-            output = sh(
-                label: "Compute dynamic split counts",
-                script: "cd ${LLM_ROOT} && python3 -B scripts/test_to_stage_mapping.py --emit-splits",
-                returnStdout: true,
-            ).trim()
-        }
-        def overrides = output ? pipeline.readJSON(text: output, returnPojo: true) : [:]
-        specs.each { spec ->
-            def k = overrides[spec.name]
-            if (k != null && k != spec.splits) {
-                spec.splits = k
-            }
-        }
-    } catch (Exception e) {
-        echo "computeDynamicSplitCounts: failed to size splits via test_to_stage_mapping.py " +
-             "(${e.class.simpleName}: ${e.message}); keeping hardcoded splits from test_stage_configs.json"
     }
     return specs
 }
@@ -6266,15 +6239,15 @@ def computeDynamicSplitCounts(pipeline, specs) {
 // the same file and replicates this expansion in Python, so the two stay in
 // sync without either one parsing the other's source. Each spec's "splits" is
 // then dynamically resized from .test_durations where eligible -- see
-// computeDynamicSplitCounts.
-def loadStageConfigSpecs(pipeline) {
+// applyDynamicSplitCounts.
+def loadStageConfigSpecs(pipeline, testFilter) {
     // The top-level pipeline pod runs with skipDefaultCheckout() and never
     // clones the full repo, so fetch just this one file instead of requiring
     // a full checkoutSource() on that pod.
     trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/test_stage_configs.json", "${LLM_ROOT}/jenkins/scripts")
     def specText = pipeline.readFile(file: "${LLM_ROOT}/jenkins/scripts/test_stage_configs.json")
     def specs = (pipeline.readJSON(text: specText, returnPojo: true)).configs
-    return computeDynamicSplitCounts(pipeline, specs)
+    return applyDynamicSplitCounts(specs, testFilter)
 }
 
 // Expands the loaded specs into the 5 stage maps launchTestJobs consumes.
@@ -6350,7 +6323,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // (x86/SBSA, K8s/Slurm) from jenkins/scripts/test_stage_configs.json.
     // scripts/test_to_stage_mapping.py reads the same file directly instead
     // of parsing this Groovy source, so the two never drift out of sync.
-    def allTestConfigs = loadStageConfigSpecs(pipeline)
+    def allTestConfigs = loadStageConfigSpecs(pipeline, testFilter)
     def groupedTestConfigs = buildStageConfigsFromSpecs(allTestConfigs)
     x86TestConfigs = groupedTestConfigs.x86
     x86SlurmTestConfigs = groupedTestConfigs.x86Slurm
