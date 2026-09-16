@@ -177,6 +177,7 @@ jobs:
             const name = 'Semantic conflict with target branch';
             const repo = context.repo;
             const preview = context.eventName === 'pull_request';
+            const fixture = preview && process.env.SEMANTIC_FIXTURE_TEST === 'true';
             const number = preview ? context.payload.pull_request.number : context.payload.issue.number;
             const advisory = 'CodeRabbit can make mistakes, including false positives. Review the evidence. ' +
               'This check is advisory and must remain non-required; its failure does not block merging ' +
@@ -185,15 +186,25 @@ jobs:
             const eligible = pr => pr.state === 'open' && pr.base.ref === 'main' &&
               (preview || (!pr.draft && pr.labels.some(label => label.name === 'ai: semantic-conflict')));
             if (!eligible(pr)) return;
-            if (preview && pr.head.sha !== context.payload.pull_request.head.sha) {
+            if (preview && !fixture && pr.head.sha !== context.payload.pull_request.head.sha) {
               core.warning('This preview run is stale; use a run for the current PR head.');
               return;
             }
-            const {data: ref} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
-            const head = pr.head.sha;
-            const base = ref.object.sha;
+            let head = pr.head.sha;
+            let base;
+            if (fixture) {
+              head = '9ae0c8db42244bbc1e538cefd44ec304760b0eef';
+              base = '3b7d13a768918d6182cb30f439c596d74eaf0b91';
+            } else {
+              const {data: ref} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
+              base = ref.object.sha;
+            }
             let comment;
-            if (preview) {
+            if (fixture) {
+              ({data: comment} = await github.rest.issues.getComment({
+                owner: 'NVIDIA', repo: 'TensorRT-LLM', comment_id: 5697984104,
+              }));
+            } else if (preview) {
               const comments = await github.paginate(github.rest.issues.listComments, {
                 ...repo, issue_number: number, per_page: 100,
               });
@@ -247,7 +258,8 @@ jobs:
               if (reportedHead !== head || reportedBase !== base) return;
               const {data: comparison} = await github.request(
                 'GET /repos/{owner}/{repo}/compare/{basehead}',
-                {...repo, basehead: `${base}...${head}`});
+                {...(fixture ? {owner: 'chzblych', repo: 'TensorRT-LLM'} : repo),
+                  basehead: `${base}...${head}`});
               const expectedStatus = {PASS: /Passed/i, FAIL: /Warning|Error/i, INCONCLUSIVE: /Inconclusive/i};
               if (comparison.merge_base_commit?.sha === mergeBase && expectedStatus[reportedVerdict].test(row[2])) {
                 verdict = reportedVerdict;
@@ -257,19 +269,22 @@ jobs:
               }
             }
             // Recheck refs after fetching the result and history.
-            const {data: current} = await github.rest.pulls.get({...repo, pull_number: number});
-            const {data: currentRef} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
-            if (current.head.sha !== head || currentRef.object.sha !== base ||
-                !eligible(current)) {
-              if (preview) core.warning('The PR or main changed during this preview; rerun for fresh evidence.');
-              return;
+            if (!fixture) {
+              const {data: current} = await github.rest.pulls.get({...repo, pull_number: number});
+              const {data: currentRef} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
+              if (current.head.sha !== head || currentRef.object.sha !== base ||
+                  !eligible(current)) {
+                if (preview) core.warning('The PR or main changed during this preview; rerun for fresh evidence.');
+                return;
+              }
             }
             const titles = {
               PASS: 'No semantic conflict found (best effort)',
               FAIL: 'Possible semantic conflict — CodeRabbit may be wrong',
               INCONCLUSIVE: '⚠️ Semantic analysis inconclusive',
             };
-            const summary = `${reason}\n\n[CodeRabbit analysis](${comment.html_url})\n\n${advisory}`;
+            const scope = fixture ? 'KNOWN CONFLICT FIXTURE: expected red failure; not a verdict on this PR. ' : '';
+            const summary = `${scope}${reason}\n\n[CodeRabbit analysis](${comment.html_url})\n\n${advisory}`;
             if (!preview) await github.rest.checks.update({
               ...repo, check_run_id: check.id, status: 'completed',
               conclusion: {PASS: 'success', FAIL: 'failure', INCONCLUSIVE: 'neutral'}[verdict],
@@ -281,7 +296,8 @@ jobs:
             });
             await core.summary.addRaw(`${preview ? 'Read-only PR preview\n\n' : ''}` +
               `${titles[verdict]}\n\n${summary}\n`).write();
-            if (verdict === 'FAIL') core.setFailed(`${titles[verdict]}. ${advisory} ${comment.html_url}`);
+            core.info(`${scope}Verified semantic verdict: ${verdict}; head=${head}; target=${base}`);
+            if (verdict === 'FAIL') core.setFailed(`${scope}${titles[verdict]}. ${advisory} ${comment.html_url}`);
             if (verdict === 'INCONCLUSIVE') core.warning(`${titles[verdict]}: ${comment.html_url}`);
 
   preview-result:
@@ -291,6 +307,19 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps: *result-steps
+
+  known-conflict-display-test:
+    name: Known conflict fixture - expected red failure (not a PR verdict)
+    if: github.event_name == 'pull_request' && github.event.pull_request.number == 19268
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    env:
+      SEMANTIC_FIXTURE_TEST: 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps: *result-steps
