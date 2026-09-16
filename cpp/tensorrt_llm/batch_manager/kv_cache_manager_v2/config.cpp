@@ -44,6 +44,8 @@ void KVCacheManagerConfig::validate() const
         swaScratchReuse->validate();
     }
 
+    poolRebalance.validate();
+
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.
     if (cacheTiers.empty() || cacheTierOf(cacheTiers[0]) != CacheTier::GPU_MEM)

@@ -73,6 +73,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
+    PoolRebalanceConfig,
     ReuseScope,
     SsmLayerConfig,
     SwaScratchReuseConfig,
@@ -2768,6 +2769,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
+        rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
         return KVCacheManagerConfigPy(
             # Used by the backend only for token<->block arithmetic and
             # radix hashing; BufferConfig.size above stays the physical page.
@@ -2789,6 +2791,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
+            pool_rebalance=PoolRebalanceConfig(
+                min_sampled_kv_caches=rebalance_cfg.min_sampled_kv_caches,
+                cooldown_secs=rebalance_cfg.cooldown_secs,
+                target_ratio_update_interval=rebalance_cfg.target_ratio_update_interval,
+                ratio_tolerance=rebalance_cfg.ratio_tolerance,
+                moving_average_decay=rebalance_cfg.moving_average_decay,
+            ),
         )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:

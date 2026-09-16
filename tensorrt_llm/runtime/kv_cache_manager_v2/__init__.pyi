@@ -179,6 +179,14 @@ class SwaScratchReuseConfig:
     max_rewind_len: int = 0
 
 @dataclass(slots=True)
+class PoolRebalanceConfig:
+    min_sampled_kv_caches: int = 2000
+    cooldown_secs: float = 120.0
+    target_ratio_update_interval: int = 100
+    ratio_tolerance: float = 0.25
+    moving_average_decay: float = 0.9999
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     cache_tiers: list[CacheTierConfig]
@@ -197,6 +205,7 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    pool_rebalance: PoolRebalanceConfig = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

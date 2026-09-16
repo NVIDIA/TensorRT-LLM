@@ -61,6 +61,7 @@ if _BACKEND == "python":
         HostCacheTierConfig,
         KVCacheDesc,
         KVCacheManagerConfig,
+        PoolRebalanceConfig,
         SsmLayerConfig,
         SwaScratchReuseConfig,
     )
@@ -233,6 +234,7 @@ else:
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
+    PoolRebalanceConfig = getattr(_cpp, "PoolRebalanceConfig", None)
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
 
@@ -353,6 +355,7 @@ __all__ = [
     "SlidingWindowSize",
     "SlotDesc",
     "SlotDescVariant",
+    "PoolRebalanceConfig",
     "SsmLayerConfig",
     "SwaScratchReuseConfig",
     "TokenId",
