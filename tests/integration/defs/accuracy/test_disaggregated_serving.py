@@ -2191,34 +2191,29 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
             "decoding_type": "MTP",
             "max_draft_len": 3,
         } if mtp else None
-        ctx_server_config = {
+        common_config = {
             "tensor_parallel_size": 4,
             "pipeline_parallel_size": 1,
             "moe_expert_parallel_size": 4,
             "max_batch_size": 64,
             "max_num_tokens": 16384,
             "max_seq_len": 8192,
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
             "kv_cache_config": kv_cache_config,
             "speculative_config": speculative_config,
             "cache_transceiver_config": cache_transceiver_config,
         }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
         gen_server_config = {
-            "tensor_parallel_size": 4,
-            "pipeline_parallel_size": 1,
-            "moe_expert_parallel_size": 4,
-            "max_batch_size": 64,
-            "max_num_tokens": 16384,
-            "max_seq_len": 8192,
+            **common_config,
             "disable_overlap_scheduler": False,
             "cuda_graph_config": {
                 "max_batch_size": 64,
                 "enable_padding": True,
             },
-            "kv_cache_config": kv_cache_config,
-            "speculative_config": speculative_config,
-            "cache_transceiver_config": cache_transceiver_config,
         }
         disaggregated_server_config = {
             "hostname": "localhost",

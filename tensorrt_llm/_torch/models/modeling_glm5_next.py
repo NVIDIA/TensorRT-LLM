@@ -40,7 +40,6 @@ from ..attention.backends.interface import (
     AttentionMetadata,
 )
 from ..attention.backends.sparse.glm_kpool import (
-    Glm5NextCacheManager,
     Glm5NextMamba2Metadata,
     GlmKpoolBackendForwardArgs,
     GlmKpoolSparseParams,
@@ -69,7 +68,6 @@ if TYPE_CHECKING:
     from ..distributed import AllReduceStrategy
     from ..modules.mamba.mamba2_metadata import Mamba2Metadata
     from ..modules.mhc.hyper_connection import mHC
-    from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
     from .checkpoints.base_weight_mapper import BaseWeightMapper
 
 
@@ -81,17 +79,6 @@ LINEAR_ATTENTION = "linear_attention"
 SPARSE_ATTENTION = "deepseek_sparse_attention"
 DENSE_MLP = "dense"
 SPARSE_MLP = "sparse"
-
-
-def get_glm5_next_text_config(config: PretrainedConfig) -> PretrainedConfig:
-    """Return the text-decoder config, accepting either nesting level.
-
-    The runtime resolves the model from the top-level ``Glm5NextConfig``, but
-    every decoder contract (schedules, ranks, MoE, HC) lives on
-    ``text_config``. Callers may already hold the inner config, so this is
-    idempotent.
-    """
-    return unwrap_glm5_next_text_config(config)
 
 
 @dataclass(frozen=True)
@@ -113,15 +100,11 @@ class Glm5NextSchedule:
 
 
 def resolve_glm5_next_schedule(config: PretrainedConfig) -> Glm5NextSchedule:
-    """Read and cross-validate the literal dispatch lists.
+    """Validate the explicit attention and MLP schedules.
 
-    Raises on any disagreement between the three redundant encodings. A model
-    whose attention schedule is inferred from a cadence, or whose MLP schedule
-    is inferred from ``first_k_dense_replace``, would silently place the wrong
-    module (and therefore the wrong cache descriptor) at some layer; the config
-    states both lists explicitly, so there is no reason to guess.
+    Cross-check optional redundant fields; do not infer layer types from a cadence.
     """
-    text = get_glm5_next_text_config(config)
+    text = unwrap_glm5_next_text_config(config)
     num_layers = int(text.num_hidden_layers)
 
     attention = tuple(text.layer_types)
@@ -141,9 +124,7 @@ def resolve_glm5_next_schedule(config: PretrainedConfig) -> Glm5NextSchedule:
 
     schedule = Glm5NextSchedule(attention=attention, mlp=mlp)
 
-    # Third, redundant encoding of the attention schedule. It is not used for
-    # dispatch, but a disagreement means the checkpoint is not the variant this
-    # bring-up was validated against.
+    # Optional redundant schedule fields must agree with the explicit lists.
     linear_attn_config = getattr(text, "linear_attn_config", None) or {}
     kda_layers = linear_attn_config.get("kda_layers")
     full_attn_layers = linear_attn_config.get("full_attn_layers")
@@ -156,8 +137,7 @@ def resolve_glm5_next_schedule(config: PretrainedConfig) -> Glm5NextSchedule:
                 "glm5_next linear_attn_config.full_attn_layers disagrees with layer_types"
             )
 
-    # first_k_dense_replace is asserted against the literal list, not used to
-    # build it.
+    # Validate the dense prefix without using it to infer the MLP schedule.
     first_k_dense = getattr(text, "first_k_dense_replace", None)
     if first_k_dense is not None:
         expected_dense = tuple(range(int(first_k_dense)))
@@ -172,19 +152,10 @@ def resolve_glm5_next_schedule(config: PretrainedConfig) -> Glm5NextSchedule:
 
 
 def glm5_next_allreduce_strategy() -> AllReduceStrategy:
-    """The ``AllReduceStrategy`` for every TP collective this model owns.
+    """Select the small-message TP all-reduce strategy (default: ONESHOT).
 
-    Default ``ONESHOT``: the fused one-shot Lamport kernel (15-20 us for the
-    decode-sized [tokens, hidden] messages here, vs 20-75 us for NCCL's LL
-    ring at c=8..64; ``MIN_LATENCY`` switches to the two-shot kernel from a
-    few hundred tokens, which measured 38 us vs 19 us one-shot for the
-    256-token speculative-verify messages). Messages above
-    :attr:`Glm5NextAllReduce.SMALL_MAX_TOKENS` go to NCCL regardless. The
-    bring-up pinned ``NCCL`` because the ``AUTO`` *autotuner* raced at TP4
-    decode; a fixed strategy never enters the autotuner, so the race does not
-    apply. ``TLLM_GLM5_ALLREDUCE`` selects another strategy by name
-    (``NCCL``, ``MIN_LATENCY``, ``TWOSHOT``, ``AUTO``, ``NCCL_SYMMETRIC``) for
-    A/B measurement and as the escape hatch.
+    TLLM_GLM5_ALLREDUCE overrides the strategy for tuning. Large messages use NCCL
+    regardless of this setting; a fixed strategy avoids AUTO's runtime autotuning.
     """
     from ..distributed import AllReduceStrategy
 
@@ -229,20 +200,12 @@ def glm5_next_attention_mapping(mapping: Mapping | None) -> Mapping | None:
 
 
 class Glm5NextAllReduce(nn.Module):
-    """TP all-reduce whose strategy follows the message size at call time.
+    """Use the configured TP collective for small messages and NCCL for large ones.
 
-    The fused one-shot Lamport kernel (``ONESHOT``) is 15-20 us for
-    decode-sized ``[tokens, hidden]`` messages where NCCL's LL ring takes
-    20-75 us, but from ~1K tokens up the fused kernels are slower than NCCL
-    (56 vs 46 us at 1K tokens; 408 vs 355 us two-shot vs NCCL at 8K). One
-    ``AllReduce`` per strategy, chosen by the token count -- a Python int, so a
-    captured decode graph has a fixed choice. Parameter-free.
+    Dispatch depends only on tensor shape, so CUDA graph capture fixes the choice.
     """
 
-    #: Messages with more tokens than this go to NCCL. Measured on this node
-    #: (TP4, hidden 4096, bf16): the fused kernels win up to ~256 tokens
-    #: (15-19 us vs 20-27 us NCCL), tie around 512, and lose from 1024 tokens
-    #: (56 vs 46 us) upward.
+    # TP4/BF16 tuning uses fused collectives up to 512 tokens, then NCCL.
     SMALL_MAX_TOKENS = 512
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype = torch.bfloat16) -> None:
@@ -268,16 +231,11 @@ class Glm5NextAllReduce(nn.Module):
 
 
 def _normalize_glm5_next_top_config(config: PretrainedConfig) -> None:
-    """Give the composite multimodal config the fields the runtime reads.
+    """Expose text-config fields required by runtime capacity planning and MTP.
 
-    The checkpoint's top-level ``Glm5NextConfig`` carries no
-    ``num_hidden_layers`` or ``torch_dtype`` -- both live on ``text_config`` --
-    but ``DecoderModel``/``DecoderModelForCausalLM`` and executor capacity
-    planning read them from the config they are handed. Copy them up once,
-    from the text config, rather than teaching every runtime consumer about
-    the wrapper. Values already present are left alone.
+    Keep existing top-level values when the config is already flattened.
     """
-    text = get_glm5_next_text_config(config)
+    text = unwrap_glm5_next_text_config(config)
     if getattr(config, "num_hidden_layers", None) is None:
         config.num_hidden_layers = int(text.num_hidden_layers)
     if getattr(config, "torch_dtype", None) is None:
@@ -339,24 +297,16 @@ class Glm5NextContextRows:
 
 @dataclass
 class Glm5NextRuntimeContext:
-    """Per-forward schedule arguments derived once from AttentionMetadata.
+    """Per-forward schedule shared by all layers of a context-first packed batch.
 
-    The sparse layers take *schedule* values (request boundaries, positions)
-    plus the prepared ``metadata`` itself -- their attention backend derives
-    every cache pool, block table, and visible length from that metadata. The
-    KDA layers consume the prepared metadata directly (the shared Kimi KDA
-    mixer reads its pools and slot ids from it). This object is built
-    once per model forward; requests are packed context-first, matching the
-    executor's batch layout.
+    Sparse backends derive cache state from metadata; KDA consumes it directly.
     """
 
-    manager: Any
     num_contexts: int
     num_ctx_tokens: int
     num_generations: int
     ctx_cu_seqlens: list[int]
     cached_lens: list[int]
-    state_indices: torch.Tensor
     #: Per-request visible lengths (cached + this step's tokens) as a device
     #: tensor. The decode path consumes ONLY device values so that captured
     #: CUDA graphs replay against prepare()-refreshed buffers rather than
@@ -386,37 +336,22 @@ class Glm5NextRuntimeContext:
 
     @property
     def gen_phase(self) -> str:
-        """Which attention entry point the generation rows take.
-
-        ``"decode"`` is the single-token path; ``"verify"`` is the
-        multi-token speculative verification path (the fused Kimi KDA replay
-        kernel: the state is committed after the golden token and the drafts
-        are cached for replay once the sampler has decided the accepted count).
-        """
+        """Select single-token decode or multi-token speculative verification."""
         return "decode" if self.gen_tokens_per_request == 1 else "verify"
 
-    def mixed_kwargs(self, layer_idx: int) -> dict[str, Any]:
-        """Arguments of the sparse layers' ``forward_mixed`` for a
-        context+generation batch.
-
-        The attention module splits the packed tokens at ``num_ctx_tokens``
-        and runs its context rows through the prefill kernels and its
-        generation rows through the decode or verify kernels; everything outside
-        attention runs once over the whole batch (the vLLM layout). The KDA
-        layers do this split inside the shared mixer from the metadata.
-        """
+    def mixed_kwargs(self) -> dict[str, Any]:
+        """Split sparse attention by phase while keeping the rest of the batch together."""
         return {
             "num_ctx_tokens": self.num_ctx_tokens,
-            "prefill": self.sparse_kwargs(layer_idx, "prefill"),
-            "generation": self.sparse_kwargs(layer_idx, self.gen_phase),
+            "prefill": self.sparse_kwargs("prefill"),
+            "generation": self.sparse_kwargs(self.gen_phase),
             "generation_phase": self.gen_phase,
         }
 
-    def sparse_kwargs(self, layer_idx: int, phase: str) -> dict[str, Any]:
+    def sparse_kwargs(self, phase: str) -> dict[str, Any]:
         # Schedule only: the backend (keyed by its own layer_idx) derives the
         # slot-indexed latent/indexer views, block tables, and lengths from
         # the prepared metadata itself.
-        del layer_idx
         kwargs: dict[str, Any] = {"metadata": self.metadata}
         if phase == "prefill":
             kwargs.update(
@@ -441,11 +376,7 @@ def _glm5_gen_tokens_per_request(attn_metadata: AttentionMetadata, num_generatio
     """
     if num_generations <= 0:
         return 1
-    num_tokens = getattr(attn_metadata, "num_tokens", None)
-    if num_tokens is None:
-        # Harness carriers without the runtime's cached token count: the
-        # host seq_lens carry the same information (never a captured path).
-        num_tokens = int(attn_metadata.seq_lens.sum())
+    num_tokens = attn_metadata.num_tokens
     gen_tokens = int(num_tokens) - int(attn_metadata.num_ctx_tokens)
     if gen_tokens <= 0 or gen_tokens % num_generations:
         raise ValueError(
@@ -455,155 +386,56 @@ def _glm5_gen_tokens_per_request(attn_metadata: AttentionMetadata, num_generatio
     return gen_tokens // num_generations
 
 
-def glm5_next_visible_lens(attn_metadata: AttentionMetadata, batch: int) -> torch.Tensor | None:
-    """Per-request visible lengths (``cached + this step's tokens``) as int64.
+def build_glm5_next_runtime_context(attn_metadata: AttentionMetadata) -> Glm5NextRuntimeContext:
+    """Derive per-forward schedules from prepared GLM metadata.
 
-    Prefers the attention metadata's own ``kv_lens_cuda`` over the
-    ``Glm5NextMamba2Metadata`` copy. Both hold the same values after
-    ``prepare()``, but only ``kv_lens_cuda`` receives the engine's in-graph
-    corrections: under the overlap scheduler with speculative decoding the
-    host prepares generation requests as if every draft of the previous step
-    had been accepted, and ``_preprocess_inputs`` subtracts the rejected
-    count on device (``previous_kv_lens_offsets_cuda``) right before the
-    forward; the speculative worker likewise rewinds it between draft steps.
-    Reading the host-derived copy there positions the new latent/indexer rows
-    past the real prefix and attends stale page contents -- observed as
-    non-deterministic MTP output under config E. Returns ``None`` when the
-    metadata carries no ``kv_lens_cuda`` (harness carriers), so callers fall
-    back to the GLM buffer. The int32 -> int64 cast is a device op with no
-    host sync, so it is legal inside CUDA-graph capture.
+    Prefill uses host schedules prepared before forward. Decode and MTP use
+    kv_lens_cuda, which receives overlap corrections and draft rewinds on device.
+    No cache tables or lengths are reconstructed inside forward.
     """
-    live = getattr(attn_metadata, "kv_lens_cuda", None)
-    if live is None:
-        return None
-    return live[:batch].to(torch.long)
-
-
-def build_glm5_next_runtime_context(
-    attn_metadata: AttentionMetadata,
-    *,
-    kv_lens_source: str = "glm",
-) -> Glm5NextRuntimeContext:
-    """Derive the per-forward cache arguments from prepared metadata.
-
-    Requires ``attn_metadata.prepare()`` to have run: that is what attaches
-    ``mamba_metadata`` (the manager is a ``BaseMambaCacheManager``) and fills
-    its batch-ordered ``state_indices``. ``cached_lens`` follows the runtime's
-    own convention -- tokens already in the cache, excluding the ones in this
-    step -- which is exactly what ``forward_prefill``/``forward_decode`` seed
-    and position from.
-
-    Visible lengths come from :func:`glm5_next_visible_lens` (the metadata's
-    device-corrected ``kv_lens_cuda``) whenever the metadata carries it, for
-    both the target and the MTP draft layer; the ``Glm5NextMamba2Metadata``
-    copy is the fallback for harness carriers. ``kv_lens_source`` is kept for
-    call-site documentation (``"metadata"`` marks the draft layer, whose
-    lengths the speculative worker rewinds in place between draft steps) and
-    to reject unknown values; it no longer changes the source when
-    ``kv_lens_cuda`` is present.
-    """
-    manager = attn_metadata.kv_cache_manager
-    if manager is None:
+    if attn_metadata.kv_cache_manager is None:
         raise ValueError("glm5_next requires a kv cache manager; got None")
     mamba_metadata = attn_metadata.mamba_metadata
     if mamba_metadata is None or mamba_metadata is False:
-        raise ValueError(
-            "glm5_next requires mamba_metadata; call attn_metadata.prepare() "
-            "with the Glm5NextCacheManager attached"
+        raise ValueError("glm5_next requires mamba_metadata; call attn_metadata.prepare() first")
+    if getattr(mamba_metadata, "glm_block_tables", None) is None:
+        raise RuntimeError(
+            "glm5_next requires prepared glm_block_tables; call attn_metadata.prepare() "
+            "with Glm5NextMamba2Metadata before eager execution or CUDA graph capture"
         )
-    if kv_lens_source not in ("glm", "metadata"):
-        raise ValueError(f"glm5_next: unknown kv_lens_source {kv_lens_source!r}")
+    live_lengths = getattr(attn_metadata, "kv_lens_cuda", None)
+    if live_lengths is None:
+        raise ValueError("glm5_next requires prepared attn_metadata.kv_lens_cuda")
     batch = int(attn_metadata.seq_lens.shape[0])
     num_contexts = int(attn_metadata.num_contexts)
     num_generations = batch - num_contexts
-    gen_tokens_per_request = _glm5_gen_tokens_per_request(attn_metadata, num_generations)
-
-    if getattr(mamba_metadata, "glm_block_tables", None) is not None:
-        # Persistent path: every tensor below is a prepare()-refreshed buffer
-        # slice, so this function does no allocation, no H2D, and no host
-        # sync -- it is safe to run inside CUDA graph capture, and replays
-        # read the refreshed values at the same addresses.
-        kv_lens = glm5_next_visible_lens(attn_metadata, batch)
-        if kv_lens is None:
-            if kv_lens_source == "metadata":
-                raise ValueError(
-                    "glm5_next draft layer needs attn_metadata.kv_lens_cuda (the "
-                    "TRTLLM metadata family); the attached metadata has none"
-                )
-            kv_lens = mamba_metadata.glm_kv_lens[:batch]
-        return Glm5NextRuntimeContext(
-            manager=manager,
-            num_contexts=num_contexts,
-            num_ctx_tokens=int(attn_metadata.num_ctx_tokens),
-            num_generations=num_generations,
-            ctx_cu_seqlens=mamba_metadata.glm_ctx_cu_seqlens,
-            cached_lens=mamba_metadata.glm_cached_lens_host,
-            state_indices=mamba_metadata.state_indices[:batch],
-            kv_lens=kv_lens,
-            metadata=attn_metadata,
-            gen_tokens_per_request=gen_tokens_per_request,
-        )
-
-    # Legacy eager construction, kept for harnesses whose fake managers do
-    # not attach the GLM metadata buffers. It allocates and copies, so it
-    # must never run inside a captured region. (The sparse backend applies
-    # the same rule to its own metadata-derived block tables.)
-    if getattr(attn_metadata, "is_cuda_graph", False):
-        raise RuntimeError(
-            "glm5_next CUDA-graph execution requires the Glm5NextCacheManager's "
-            "Glm5NextMamba2Metadata (persistent prepare()-refreshed buffers); "
-            "the attached mamba_metadata has no glm_block_tables"
-        )
-    lens = attn_metadata.seq_lens.tolist()
-    kv_params = attn_metadata.kv_cache_params
-    if kv_params is None or kv_params.num_cached_tokens_per_seq is None:
-        raise ValueError("glm5_next requires kv_cache_params.num_cached_tokens_per_seq")
-    cached_lens = [int(n) for n in kv_params.num_cached_tokens_per_seq[:batch]]
-
-    ctx_cu = [0]
-    for length in lens[:num_contexts]:
-        ctx_cu.append(ctx_cu[-1] + int(length))
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    kv_lens = torch.as_tensor(
-        [c + n for c, n in zip(cached_lens, lens)], dtype=torch.long, device=device
-    )
-
-    live = glm5_next_visible_lens(attn_metadata, batch)
-    if live is not None:
-        kv_lens = live
-
     return Glm5NextRuntimeContext(
-        manager=manager,
         num_contexts=num_contexts,
         num_ctx_tokens=int(attn_metadata.num_ctx_tokens),
         num_generations=num_generations,
-        ctx_cu_seqlens=ctx_cu,
-        cached_lens=cached_lens,
-        state_indices=mamba_metadata.state_indices[:batch],
-        kv_lens=kv_lens,
+        ctx_cu_seqlens=mamba_metadata.glm_ctx_cu_seqlens,
+        cached_lens=mamba_metadata.glm_cached_lens_host,
+        kv_lens=live_lengths[:batch].to(torch.long),
         metadata=attn_metadata,
-        gen_tokens_per_request=gen_tokens_per_request,
+        gen_tokens_per_request=_glm5_gen_tokens_per_request(attn_metadata, num_generations),
     )
 
 
 @register_auto_model("Glm5NextForCausalLM")
 class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
-    """GLM-5.3-Flash text decoder with an optional one-model MTP drafter.
+    """GLM-5.3-Flash decoder with an optional one-model MTP drafter.
 
-    The speculative base class owns logits processing and the draft/verify
-    lifecycle. This class narrows the composite config and loads each rank's
-    checkpoint shard, including the optional appended MTP layer. Vision weights
-    are excluded explicitly by :func:`audit_glm5_next_checkpoint`.
+    The speculative base class manages draft/verify execution. The weight mapper
+    routes text and MTP tensors and excludes the vision namespace.
     """
 
     @property
     def mamba_metadata_cls(self) -> type[Mamba2Metadata]:
         """Metadata with paged tables refreshed before CUDA graph replay."""
-        return glm5_next_mamba_metadata_cls()
+        return Glm5NextMamba2Metadata
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
-        text_config = get_glm5_next_text_config(model_config.pretrained_config)
+        text_config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         # tie_word_embeddings is false on this checkpoint, so lm_head is a real
         # weight rather than a view of the embedding; it is asserted, not assumed.
         if bool(getattr(text_config, "tie_word_embeddings", False)):
@@ -642,9 +474,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         # AutoModelForCausalLM.from_config calls cls(model_config) and nothing
         # else, so this is the only place the decision can live.
         self.quantized = glm5_next_is_quantized(model_config)
-        # One provenance line per rank: engine-scale runs (LLM API / serving)
-        # spawn MPI workers whose model objects the driver cannot introspect,
-        # so the resolved production stack is published through the worker log.
+        # Log the resolved backends from each worker process.
         attn_backends = sorted(
             {
                 type(layer.self_attn.attn_backend).__name__
@@ -705,23 +535,12 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                     )
 
     def infer_max_seq_len(self) -> int:
-        """Max sequence length the runtime sizes KV/mamba caches for.
-
-        The executor calls this during capacity planning. GLM-5.3-Flash declares
-        ``max_position_embeddings=1048576`` and is fully NoPE (no rope-factor
-        scaling), so the value is the text config's directly.
-        """
+        """Use the text config's context limit directly; this model has no RoPE scaling."""
         return int(self.text_config.max_position_embeddings)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
-        """Opt this model into ``KVCacheManagerV2``.
-
-        The hybrid latent-KV + pool-indexer + recurrent/conv state is owned by a
-        single ``Glm5NextCacheManager`` (a ``MambaHybridCacheManagerV2`` subclass,
-        :func:`glm5_next_cache_manager_cls`); V1 cannot express it. This is the
-        ``"auto"`` -> V2 resolution hook the runtime consults.
-        """
+        """Use V2 for the shared latent-KV, pool-indexer and recurrent-state cache."""
         return "V2"
 
     def attention_type(self, layer_idx: int) -> str:
@@ -747,33 +566,18 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         *,
         device_map: dict[Any, Any] | None = None,
     ) -> None:
-        """Materialize and fill the whole text model from a raw checkpoint.
+        """Load checkpoint tensors one owner at a time to bound peak memory.
 
-        ``weight_mapper`` is the :class:`Glm5NextHfWeightMapper` registered for
-        this architecture (the runtime's ``ModelLoader`` hands over the
-        initialized instance; harnesses may omit it and one is created here).
-        It owns every checkpoint-key decision -- the audit, the key remap and
-        the destination owner -- while this method owns the materialization:
-        exact-shape placement one owner at a time, then the decode fusions.
-        A generic HF mapper is rejected: its module-name rules cannot place
-        this checkpoint.
+        The registered GLM mapper resolves keys and destination owners. FP8 payloads
+        and FP32 block scales retain their checkpoint representation; module loaders
+        handle sharding and fused projections. Unresolved or unfilled tensors raise.
 
-        ``weights`` is any mapping from checkpoint key to the tensor **as
-        stored** -- e4m3 payloads and their FP32 block scales are copied
-        verbatim, never dequantized, because excluded modules are published in
-        BF16 and quantized ones in e4m3 with a scale, with no overlap. That
-        makes the load a 1:1 placement and keeps the resident model at the
-        checkpoint's own 328 GB.
-
-        ``device_map`` maps each owner -- a layer index, or ``"embed"``,
-        ``"norm"``, ``"head"`` -- to a device. The model is expected to have
-        been constructed on ``meta``: each owner is materialized directly onto
-        its target device and filled immediately, so peak memory is one layer
-        above the final footprint rather than a second full copy.
-
-        A checkpoint tensor that finds no parameter, and a parameter that
-        receives no tensor, are both errors: either one leaves a model that
-        still runs and still looks plausible.
+        Args:
+            weights: Mapping of checkpoint keys to tensors or lazy safetensors slices.
+            weight_mapper: Initialized Glm5NextHfWeightMapper, or None to create one.
+            device_map: Optional owner-to-device map. Owners are layer indices or
+                "embed", "norm", and "head". Modules are materialized from meta
+                directly onto their target devices.
         """
         if weight_mapper is None:
             weight_mapper = Glm5NextHfWeightMapper()
@@ -788,7 +592,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 "glm5_next whole-model loading requires the block-FP8 build "
                 "(quantized=True). Dequantizing all 288 experts of 42 routed "
                 "layers to bf16 would double the resident model to ~656 GB and "
-                "move it four times further from the source's own arithmetic."
+                "exceed the supported loading footprint."
             )
         # Decoder stack plus the aliased MTP draft layer(s), if any: owners
         # ``45..`` are the draft layers, placed from the checkpoint's own
@@ -1283,55 +1087,16 @@ class Glm5NextIndexer(nn.Module):
 
 
 class Glm5NextSparseAttention(nn.Module):
-    """Fully NoPE sparse MLA with a pool-compressed indexer.
+    """NoPE sparse MLA with a pool-compressed indexer.
 
-    ``qk_rope_head_dim`` is 0 on this checkpoint and ``mla_use_nope`` is true:
-    there is no text rotary call and no rotary cache. ``indexer_rope_interleave``
-    is present in the config but vestigial for the text path, so no rotary
-    branch is created for it -- long-range position sensitivity comes from the
-    causal KDA layers and the indexer's learned pool APE.
+    Owns projections, sparse selection and MLA weight absorption. The TRTLLM
+    sparse backend owns paged-cache access and attention, receiving metadata and
+    selected rows through AttentionForwardArgs. BF16 kv_b_proj weights are
+    reassociated directly, without dequantization.
 
-    Layering follows the attention developer guide. This module owns the
-    module math only: low-rank q/kv projections and norms, the pool indexer's
-    scoring/selection (model-layer sparse prediction, as in MiniMax-M3), the
-    absorbed-MLA query/value reassociation, and ``o_proj``. Everything below
-    that -- the paged latent/indexer cache path and the sparse-MLA core --
-    belongs to ``self.attn_backend``, a
-    :class:`~tensorrt_llm._torch.attention.backends.sparse.glm_kpool.GlmKpoolSparseAttention`:
-    a ``TrtllmAttention`` subclass (the fully-NoPE branch of the TRTLLM sparse
-    family) constructed through the standard ``create_attention(...)``
-    dispatch on the configured backend slot (``ModelConfig.attn_backend``,
-    default TRTLLM) with ``SparseParams(algorithm="glm_kpool")``. Its typed
-    metadata family is ``TrtllmAttentionMetadata`` (``attn_backend.Metadata``),
-    the class the engine constructs for this model.
-
-    Cache ownership: one latent ``kv_lora_rank``-wide entry per token (the
-    pre-``kv_b_proj`` latent, not expanded K/V) plus the indexer's packed
-    ``[k | gate]`` state, both held by the one hybrid ``KVCacheManagerV2`` and
-    read/written only by the backend, which derives every pool, block table,
-    and visible length from the prepared attention metadata it is handed --
-    this module passes schedule values and the metadata, never raw pools. The
-    pool-expanded selection travels to the backend inside the standard
-    ``AttentionForwardArgs.sparse_backend_args`` carrier.
-
-    ``kv_b_proj`` is on this checkpoint's ``modules_to_not_convert`` list
-    (BF16), so absorption is a reassociation of the same BF16 weights, not a
-    dequantization.
-
-    Tensor parallelism: with ``tp_size > 1`` this module owns
-    ``num_heads = 64 // tp_size`` local query heads and the matching rows of
-    the column-sharded ``q_b_proj``/``kv_b_proj`` (so the absorbed per-head
-    views are local by construction), while the low-rank latents
-    (``q_a``/``kv_a``) and both norms stay replicated and the row-sharded
-    ``o_proj`` returns a partial that this module reduces once through
-    :class:`Glm5NextAllReduce` -- the DeepSeek-V3 MLA ownership with a
-    message-size-aware collective. The latent cache and the indexer's packed state stay
-    *complete* (512- and 256-wide) on every rank: ``num_kv_heads == 1`` is
-    never divided, all ranks compute identical latent/packed rows from the
-    replicated projections, and each rank's backend reads its own full copy.
-    The backend is constructed with the local head count, exactly as MLA's
-    per-rank ``num_heads // tp_size``. At ``tp_size == 1`` construction and
-    math are byte-identical to the pre-TP module.
+    TP shards query heads and output projections; latent and indexer state stay
+    replicated. The output projection returns a partial for one explicit
+    reduction. Attention DP instead keeps all heads local with no TP reduction.
     """
 
     #: The two low-rank input projections are both block-FP8 and replicated:
@@ -1373,7 +1138,7 @@ class Glm5NextSparseAttention(nn.Module):
         if self.qk_rope_head_dim != 0:
             raise ValueError(
                 "glm5_next text attention is fully NoPE; a non-zero qk_rope_head_dim "
-                f"({self.qk_rope_head_dim}) would need a rotary path this bring-up does not have"
+                f"({self.qk_rope_head_dim}) is not supported"
             )
         self.scaling = self.qk_head_dim**-0.5
         eps = float(config.rms_norm_eps)
@@ -1513,28 +1278,22 @@ class Glm5NextSparseAttention(nn.Module):
         visible: torch.Tensor,
         metadata: AttentionMetadata,
         input_type: AttentionInputType,
-        request_index: int | None = None,
         rows_per_request: int = 1,
         reduce: bool = True,
         request_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fused indexer selection over the paged cache, then sparse attention.
+        """Score pools, select members and tail, then attend to paged latent rows.
 
-        Score the cached pool keys, top-k, expand + tail + row translation,
-        attend. ``visible[i]`` is query row ``i``'s visible length (its own
-        position + 1); ``request_index`` selects one context request's block
-        table, ``request_ids`` (``[rows]`` int32) the block table of each
-        packed context row (``None`` for both: the generation rows). Every step is a fixed-shape
-        kernel with work proportional to the visible length, not the buffer
-        capacity, so decode replays it inside CUDA graphs and prefill no
-        longer materializes ``[tokens, pools, head_dim]`` gathers.
+        visible gives each query's prefix length. Packed context uses request_ids;
+        verification uses rows_per_request. Single-token decode reads live lengths
+        from metadata. All device work uses fixed buffer shapes for graph replay.
         """
         indexer = self.indexer
         rows = q_resid.shape[0]
         q_index = indexer.wq_b(q_resid).view(rows, indexer.n_heads, indexer.head_dim)
         # Generation rows read their visible length from the metadata unless
         # each request contributes several rows (context or verification).
-        plain_decode = request_index is None and request_ids is None and rows_per_request == 1
+        plain_decode = request_ids is None and rows_per_request == 1
         kv_lens = None if plain_decode else visible
         scores = self.attn_backend.score_pools(
             q_index,
@@ -1542,7 +1301,6 @@ class Glm5NextSparseAttention(nn.Module):
             metadata,
             q_scale=indexer.softmax_scale,
             w_scale=indexer.head_mix_scale,
-            request_index=request_index,
             kv_lens=kv_lens,
             rows_per_request=rows_per_request,
             request_ids=request_ids,
@@ -1559,7 +1317,6 @@ class Glm5NextSparseAttention(nn.Module):
         topk_rows = self.attn_backend.expand_selection(
             selected,
             metadata,
-            request_index=request_index,
             kv_lens=kv_lens,
             rows_per_request=rows_per_request,
             request_ids=request_ids,
@@ -1585,23 +1342,11 @@ class Glm5NextSparseAttention(nn.Module):
         reduce: bool = True,
         ctx_rows_fn: Callable[[int, torch.device], Glm5NextContextRows] | None = None,
     ) -> torch.Tensor:
-        """Context phase, including continuation chunks -- all requests at once.
+        """Process all packed context rows, including continuation chunks.
 
-        ``cached_lens[i]`` is how many tokens of request ``i`` are already in
-        the cache, so a chunk is scored against the whole visible prefix rather
-        than only against its own tokens. Scoring a chunk in isolation is the
-        classic chunked-prefill bug here: it still passes a one-shot test.
-        Only schedule values are passed here; every pool write and read goes
-        through the backend's metadata-derived cache path.
-
-        The packed context tokens of every request go through each stage in
-        one launch (projections, cache write, pool-key refresh, scoring,
-        top-k, expansion, attention): the kernels address each row's block
-        table through :class:`Glm5NextContextRows.request_ids`. A per-request
-        Python loop here was the dominant cost of mixed context+generation
-        iterations (measured 50% GPU idle with ~17 short prompts in flight).
-        ``ctx_rows_fn`` (the runtime context's cache) shares the schedule
-        across the sparse layers of one forward.
+        cached_lens counts tokens before this chunk. Each query attends to its full
+        visible prefix. Row schedules identify request block tables and completed
+        pools; ctx_rows_fn caches these schedules across layers of one forward.
         """
         kpool = self.indexer.index_kpool
         device = hidden_states.device
@@ -1642,34 +1387,14 @@ class Glm5NextSparseAttention(nn.Module):
         metadata: AttentionMetadata,
         reduce: bool = True,
     ) -> torch.Tensor:
-        """Generation phase: one token per request, fully batched.
+        """Decode one token per request using device-resident visible lengths.
 
-        CUDA-graph contract: every shape here is a function of the *buffer*
-        geometry (the metadata's block-table width times tokens_per_block),
-        never of the current lengths, and every request-dependent value
-        (``kv_lens`` and the metadata's block tables) is a device tensor
-        refreshed by metadata ``prepare()`` outside the captured region. No
-        ``.item()``/``.tolist()``, no per-request Python loop, no
-        host->device copy, and no data-dependent branch runs on this path, so
-        a captured decode graph replays correctly as lengths grow and slots
-        are reused.
+        kv_lens includes the new token, whose position is kv_lens - 1. Shapes depend
+        only on buffer geometry; metadata preparation refreshes device tensors before
+        CUDA graph replay. This path must not synchronize lengths to the host.
 
-        ``kv_lens[i]`` is the request's visible length *including* the token
-        being decoded, so the new token's position is ``kv_lens[i] - 1``; it
-        must be the same prepare()-refreshed lengths the metadata carries,
-        sliced to the generation rows. Positions at or beyond a request's
-        ``kv_lens`` gather page-0 garbage in the indexer prefix; the backend
-        masks them by replacement and the indexer's own validity masks exclude
-        them from pools, selection, and the tail. The attention core never
-        gathers the latent at all: the backend reads the paged pool directly
-        through its storage row view derived from the metadata, and only
-        selected (valid) positions are translated into row ids -- sentinels
-        stay ``-1``. There is no empty-row assertion here: it would force a
-        host sync, which is illegal under CUDA-graph capture -- and a decode
-        query is always covered by construction, either by the
-        always-selected tail (``visible % kpool != 0``) or by the final
-        complete pool, whose last member *is* the query position
-        (``visible % kpool == 0``).
+        The backend masks invalid cache positions. Every query is covered by either
+        the incomplete tail pool or its final complete pool.
         """
         batch = hidden_states.shape[0]
         positions = kv_lens - 1  # [B]
@@ -1718,24 +1443,12 @@ class Glm5NextSparseAttention(nn.Module):
         tokens_per_request: int,
         reduce: bool = True,
     ) -> torch.Tensor:
-        """Generation phase with ``tokens_per_request`` tokens per request.
+        """Verify packed [batch * tokens_per_request, hidden] generation rows.
 
-        The speculative-decoding target scores the golden token plus the
-        drafts in one pass; the MTP draft layer's first step sees the same
-        packed layout. Request ``i``'s tokens sit at cache positions
-        ``kv_lens[i] - T .. kv_lens[i] - 1`` (``kv_lens`` already counts them,
-        exactly as in :meth:`forward_decode`), so the latent/indexer rows are
-        appended there and every query is scored against its *own* visible
-        prefix: pool scoring masks pools whose last member lies beyond the
-        query's position, and selection expansion builds the tail from the query's
-        own position, so token ``j`` never sees tokens ``j+1..``. Rows written
-        for drafts that are later rejected are simply overwritten by the next
-        step, which re-appends at the rewound ``kv_lens`` -- the same
-        positional-cache convention MLA relies on.
-
-        Every shape is a function of ``tokens_per_request`` and the buffer
-        geometry, with no host sync, so a captured verification graph replays
-        against refreshed lengths and tables.
+        Request tokens occupy positions kv_lens - T through kv_lens - 1. Each query
+        uses its own visible prefix, excluding later drafts. Rejected draft entries
+        are overwritten after lengths rewind. Shapes depend only on buffer geometry
+        and T, allowing CUDA graph replay with refreshed lengths and block tables.
         """
         tokens_per_request = int(tokens_per_request)
         if tokens_per_request <= 1:
@@ -1775,21 +1488,6 @@ class Glm5NextSparseAttention(nn.Module):
             rows_per_request=tokens_per_request,
             reduce=reduce,
         )
-
-
-# ---------------------------------------------------------------------------
-# Heterogeneous request state
-# ---------------------------------------------------------------------------
-
-
-def glm5_next_mamba_metadata_cls() -> type[Mamba2Metadata]:
-    """Return the model's ``Mamba2Metadata`` subclass (see the sparse backend's ``cache_manager``)."""
-    return Glm5NextMamba2Metadata
-
-
-def glm5_next_cache_manager_cls() -> type[MambaHybridCacheManagerV2]:
-    """Return the model's ``KVCacheManagerV2`` subclass (see the sparse backend's ``cache_manager``)."""
-    return Glm5NextCacheManager
 
 
 class Glm5NextGate(DeepseekV3Gate):
@@ -1836,20 +1534,11 @@ class Glm5NextGate(DeepseekV3Gate):
 
 
 class Glm5NextMoE(nn.Module):
-    """Routed experts plus one always-active shared expert.
+    """Fused routed experts with a shared GatedMLP expert.
 
-    The routed experts are a fused-MoE layer built through ``create_moe`` --
-    the one selection entry point -- with the DeepSeek noaux_tc routing method
-    (:class:`Glm5NextGate`, the shared DeepSeek gate kept FP32) and the
-    DSV4-style uniform ``swiglu_limit_scalar``. On this checkpoint (FP8 block
-    scales, SM100) the resolver lands on ``TRTLLMGenFusedMoE`` whose
-    ``trtllm::fp8_block_scale_moe_runner`` consumes the clamp limit as
-    ``gemm1_clamp_limit``; the ``AUTO`` ``moe_backend`` default resolves to
-    ``TRTLLM`` for exactly this quant/SM pair in
-    ``ModelConfig.resolve_moe_backend``. The shared expert is the shared
-    ``GatedMLP`` (DeepSeek-V3 composition): TP-sharded with
-    ``reduce_output=False``, its partial summed with the routed partial before
-    this module's single all-reduce.
+    Uses FP32 DeepSeek routing and clamped SwiGLU. Under TP, routed and shared
+    expert partials are summed before one reduction. Under attention DP, fused
+    MoE owns dispatch/combine and the shared expert is replicated.
     """
 
     def __init__(
@@ -2030,21 +1719,12 @@ def glm5_next_hyper_head(hidden_streams: torch.Tensor) -> torch.Tensor:
 
 
 class Glm5NextDecoderLayer(DecoderLayer):
-    """One decoder layer: two hyper-connection sites wrapping attention and FFN.
+    """Wrap attention and FFN in separate mHC residual connections.
 
-    The residual path is *not* an ordinary add. Each site collapses the four
-    streams into one sequence with the learned ``pre`` weights, runs the
-    sublayer, then writes the result back across the streams as
-    ``post * out + comb^T @ residual``. Both module choices come from the two
-    literal per-layer lists, never from a cadence or ``first_k_dense_replace``.
-
-    Two entry points share one implementation: the runtime ``forward``
-    receives ``AttentionMetadata`` (plus the once-per-forward
-    :class:`Glm5NextRuntimeContext`) and derives this layer's cache
-    arguments; ``forward_direct`` takes them explicitly and is what the
-    component tests call. The runtime path is
-    a thin argument-derivation shim over the direct path, so parity between
-    them is an argument-sourcing check, not a second implementation.
+    Each connection collapses [tokens, hc_mult, hidden] streams for the sublayer
+    and mixes its output back into the streams. Attention and MLP types come from
+    the explicit per-layer schedules. forward derives runtime arguments;
+    forward_direct applies the same math with explicit attention arguments.
     """
 
     def __init__(
@@ -2142,14 +1822,14 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 hidden_states,
                 phase="mixed",
                 all_rank_num_tokens=all_rank_num_tokens,
-                **runtime_ctx.mixed_kwargs(self.layer_idx),
+                **runtime_ctx.mixed_kwargs(),
             )
         if runtime_ctx.num_contexts > 0:
             return self.forward_direct(
                 hidden_states,
                 phase="prefill",
                 all_rank_num_tokens=all_rank_num_tokens,
-                **derive(self.layer_idx, "prefill"),
+                **derive("prefill"),
             )
         # "decode" (one token per request) or "verify" (golden + drafts per
         # request while a speculative-decoding target scores them).
@@ -2158,7 +1838,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
             hidden_states,
             phase=phase,
             all_rank_num_tokens=all_rank_num_tokens,
-            **derive(self.layer_idx, phase),
+            **derive(phase),
         )
 
     def forward_direct(
@@ -2212,7 +1892,7 @@ class Glm5NextModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         _normalize_glm5_next_top_config(model_config.pretrained_config)
         super().__init__(model_config)
-        config = get_glm5_next_text_config(model_config.pretrained_config)
+        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         schedule = resolve_glm5_next_schedule(model_config.pretrained_config)
         # Pipeline parallelism rides the base machinery wholesale: the
         # inter-layer activation is the four-stream tensor [tokens, hc_mult,
@@ -2328,7 +2008,7 @@ class Glm5NextModel(DecoderModel):
                 attn_out = layer.self_attn(x, runtime_ctx.metadata)
             else:
                 attn_out = getattr(layer.self_attn, f"forward_{phase}")(
-                    x, **runtime_ctx.sparse_kwargs(layer_idx, phase)
+                    x, **runtime_ctx.sparse_kwargs(phase)
                 )
             residual, post, comb, x = layer.hc_ffn.fused_hc(
                 attn_out,
@@ -2418,31 +2098,16 @@ class Glm5NextMTPHead(nn.Module):
 
 
 class Glm5NextMTP(nn.Module):
-    """GLM-5.3-Flash's one next-token-prediction layer (``layers.45``).
+    """Native next-token prediction layer with ordinary residual connections.
 
-    Structure, verified against the checkpoint's own keys and the vLLM GLM-5
-    port (``glm5next/nvidia/mtp.py``) since the HF reference implements no
-    MTP: ``enorm(embed(next_token)) ++ hnorm(target_hidden) -> eh_proj`` into
-    a **plain-residual** decoder block -- the MTP layer has no
-    hyper-connection weights, unlike the 45 main layers -- made of the same
-    sparse-MLA + k-pool indexer attention and 288+1-expert MoE as the main
-    sparse layers, closed by ``shared_head.norm``. The attention and MoE are
-    the *same classes* as the main stack (with ``layer_idx = 45``), so the
-    draft layer owns its own latent/indexer pages in the one hybrid cache
-    manager (the executor appends one attention layer for it) and shares the
-    projection-swap, TP-shard, and exact-placement loading contracts.
+    Normalizes and concatenates token embeddings and target hidden states before
+    eh_proj. Reuses the main stack's sparse attention and MoE, with its own
+    latent/indexer pages, followed by shared_head.norm. Unlike the main decoder,
+    the MTP layer has no mHC weights.
 
-    Constructed by :class:`~.modeling_speculative.MTPForCausalLM` through
-    the model-type dispatch and called by the one-model speculative worker
-    as ``mtp_layer(input_ids, position_ids, hidden_states, embed_tokens,
-    attn_metadata, all_rank_num_tokens, spec_metadata)``. ``hidden_states``
-    are the target's post-final-norm states for the same packed tokens (the
-    convention the DeepSeek-V3/Qwen3-Next/vLLM MTP paths all use), and the
-    first draft step's token schedule is *identical* to the target
-    verification pass (contexts: prompt shifted by one; generation:
-    ``1 + runtime_draft_len`` accepted/padded tokens at the same positions),
-    so it reuses the target's runtime-context derivation, reading the
-    metadata's live ``kv_lens_cuda`` so later draft steps' rewinds are seen.
+    The first draft step shares the target's packed context/verification layout.
+    Later steps read live metadata lengths after the speculative worker rewinds
+    them. The target supplies post-final-norm hidden states.
     """
 
     def __init__(
@@ -2459,7 +2124,7 @@ class Glm5NextMTP(nn.Module):
                 "glm5_next MTP runs one-model speculative decoding only (MTP / MTP_EAGLE_ONE_MODEL)"
             )
         _normalize_glm5_next_top_config(model_config.pretrained_config)
-        config = get_glm5_next_text_config(model_config.pretrained_config)
+        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         schedule = resolve_glm5_next_schedule(model_config.pretrained_config)
         num_nextn = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
         if not (schedule.num_layers <= layer_idx < schedule.num_layers + num_nextn):
@@ -2522,26 +2187,16 @@ class Glm5NextMTP(nn.Module):
             hidden_states = torch.chunk(hidden_states, mapping.tp_size, dim=-1)[mapping.tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
-        runtime_ctx = build_glm5_next_runtime_context(attn_metadata, kv_lens_source="metadata")
+        runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
         residual = hidden_states
         attn_in = self.input_layernorm(hidden_states)
-        parts = []
-        if runtime_ctx.num_contexts > 0:
-            parts.append(
-                self.self_attn.forward_prefill(
-                    attn_in[: runtime_ctx.num_ctx_tokens],
-                    **runtime_ctx.sparse_kwargs(self.layer_idx, "prefill"),
-                )
+        if runtime_ctx.num_contexts > 0 and runtime_ctx.num_generations > 0:
+            attn_out = self.self_attn.forward_mixed(attn_in, **runtime_ctx.mixed_kwargs())
+        else:
+            phase = "prefill" if runtime_ctx.num_contexts > 0 else runtime_ctx.gen_phase
+            attn_out = getattr(self.self_attn, f"forward_{phase}")(
+                attn_in, **runtime_ctx.sparse_kwargs(phase)
             )
-        if runtime_ctx.num_generations > 0:
-            phase = runtime_ctx.gen_phase
-            parts.append(
-                getattr(self.self_attn, f"forward_{phase}")(
-                    attn_in[runtime_ctx.num_ctx_tokens :],
-                    **runtime_ctx.sparse_kwargs(self.layer_idx, phase),
-                )
-            )
-        attn_out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
         hidden_states = residual + attn_out
 
         residual = hidden_states
