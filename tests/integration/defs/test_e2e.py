@@ -654,7 +654,7 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device(4)
-@pytest.mark.skip_less_device_memory(40000)
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("service_discovery", ["etcd"])
 def test_openai_disagg_multi_nodes_completion_service_discovery(
         llm_root, llm_venv, service_discovery):
@@ -670,7 +670,7 @@ def test_openai_disagg_multi_nodes_completion_service_discovery(
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device(4)
-@pytest.mark.skip_less_device_memory(40000)
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("gen_config",
                          ["gen_tp2pp1", "gen_tp1pp2", "gen_tp1pp1"])
 @pytest.mark.parametrize("ctx_config",

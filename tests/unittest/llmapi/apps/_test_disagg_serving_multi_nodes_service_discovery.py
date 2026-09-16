@@ -107,7 +107,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
         "disagg_cluster": disagg_cluster_config,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.5,
+            "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
