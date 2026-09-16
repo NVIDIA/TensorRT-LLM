@@ -1663,6 +1663,17 @@ def executor_request_to_llm_request(
     return llm_request
 
 
+def _rewind_context_after_cache_drop(request: LlmRequest,
+                                     tokens_per_block: int) -> None:
+    """Reset context progress after callers release the request's KV caches."""
+    request.set_prepopulated_prompt_len(0, tokens_per_block)
+    # Clearing prepopulation does not rewind the native context cursor.
+    request.context_current_position = 0
+    request.context_chunk_size = request.prompt_len
+    request.estimated_reusable_tokens = 0
+    request.py_ctx_pre_resize_cap = None
+
+
 def get_draft_token_length(request: LlmRequest) -> int:
     """Get the length of draft tokens for a given request.
 

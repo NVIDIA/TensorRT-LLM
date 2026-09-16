@@ -20,7 +20,12 @@ from typing import Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    _rewind_context_after_cache_drop,
+    get_draft_token_length,
+)
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -755,12 +760,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 if manager is not None and req.py_request_id in manager.kv_cache_map:
                     manager.free_resources(req)
-            req.set_prepopulated_prompt_len(0, self.tokens_per_block)
-            # Clearing prepopulation does not rewind the native cursor.
-            req.context_current_position = 0
-            req.context_chunk_size = req.prompt_len
-            req.estimated_reusable_tokens = 0
-            req.py_ctx_pre_resize_cap = None
+            _rewind_context_after_cache_drop(req, self.tokens_per_block)
 
         return result
 
@@ -875,10 +875,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:
-            # TODO: consider suspending first-chunk KVCache to release
-            # GPU pages. Currently we skip without suspend to avoid
-            # pathological suspend/resume cycles. suspend_request is
-            # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(
