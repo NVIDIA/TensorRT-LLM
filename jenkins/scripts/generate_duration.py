@@ -69,7 +69,7 @@ def load_test_list_specs(test_list_dir):
     return specs, yml_files
 
 
-def query_opensearch_durations(days):
+def query_opensearch_durations(days, cluster=None):
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -84,6 +84,16 @@ def query_opensearch_durations(days):
     after_key = None
     page = 0
 
+    # s_cluster records the full node-group host (e.g. "oci-hsg-cs-001"), which
+    # always starts with the short SlurmConfig clusterName (e.g. "oci-hsg").
+    # A prefix match on that clusterName scopes the query to a single cluster.
+    must_clauses = [
+        {"term": {"s_status": "PASSED"}},
+        {"range": {"ts_created": {"gte": since_ms}}},
+    ]
+    if cluster:
+        must_clauses.append({"prefix": {"s_cluster": cluster}})
+
     while True:
         composite_agg = {
             "size": 1000,
@@ -96,10 +106,7 @@ def query_opensearch_durations(days):
             "size": 0,
             "query": {
                 "bool": {
-                    "must": [
-                        {"term": {"s_status": "PASSED"}},
-                        {"range": {"ts_created": {"gte": since_ms}}},
-                    ],
+                    "must": must_clauses,
                     "must_not": [{"term": {"s_turtle_name": "Stage Failed"}}],
                 }
             },
@@ -152,16 +159,17 @@ def main():
     parser.add_argument(
         "--duration-file",
         type=str,
-        default="new_test_duration.json",
-        help="Path to the output duration file (default: new_test_duration.json)",
+        default=None,
+        help="Path to the output duration file. Defaults to "
+        "tests/integration/defs/.test_durations_<cluster> (relative to the "
+        "repo root) when --cluster is set, otherwise new_test_duration.json.",
     )
     parser.add_argument(
         "--cluster",
         type=str,
         default=None,
-        help="Cluster name (e.g. 'aws_dfw').  When set, writes "
-        "tests/integration/defs/.test_durations_<cluster> relative to the "
-        "repo root instead of --duration-file.",
+        help="SlurmConfig clusterName (e.g. 'oci-hsg') to scope the OpenSearch "
+        "query to, via a prefix match on s_cluster.",
     )
     parser.add_argument(
         "--days",
@@ -185,17 +193,32 @@ def main():
     )
     args = parser.parse_args()
 
-    # Resolve output path
-    if args.cluster:
+    # Resolve output path. clusterKey mirrors the sanitization L0_Test.groovy
+    # applies to SlurmPartition.clusterName when it reads
+    # ".test_durations_<clusterKey>" (non-alphanumeric chars -> "_").
+    if args.duration_file:
+        NEW_TEST_DURATION = args.duration_file
+    elif args.cluster:
+        cluster_key = re.sub(r"[^a-zA-Z0-9]", "_", args.cluster)
         NEW_TEST_DURATION = os.path.join(
-            _REPO_ROOT, "tests", "integration", "defs", f".test_durations_{args.cluster}"
+            _REPO_ROOT, "tests", "integration", "defs", f".test_durations_{cluster_key}"
         )
     else:
-        NEW_TEST_DURATION = args.duration_file
+        NEW_TEST_DURATION = "new_test_duration.json"
 
-    print(f"Querying OpenSearch for last {args.days} day(s)...")
-    test_durations = query_opensearch_durations(args.days)
+    print(
+        f"Querying OpenSearch for last {args.days} day(s)..."
+        + (f" (cluster: {args.cluster})" if args.cluster else "")
+    )
+    test_durations = query_opensearch_durations(args.days, cluster=args.cluster)
     raw_count = len(test_durations)
+
+    if args.cluster and raw_count == 0:
+        print(
+            f"No OpenSearch records for cluster '{args.cluster}'; "
+            f"cluster is not in use, skipping file generation."
+        )
+        return
 
     # Filter against the turtle test-db lists: an aggregated turtle name may be
     # a stale entry or a subtest that is no longer scheduled.  Keep only names
