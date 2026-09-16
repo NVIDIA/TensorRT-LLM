@@ -50,14 +50,14 @@ Tested on Ubuntu 24.04.
 Before the pre-built Python wheel can be installed via `pip`, a few
 prerequisites must be put into place:
 
-Install CUDA Toolkit 13.2 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+Install CUDA Toolkit 13.4 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
 and make sure `CUDA_HOME` environment variable is properly set.
 
-The `cuda-compat-13-2` package may be required depending on your system's NVIDIA GPU
+The `cuda-compat-13-4` package may be required depending on your system's NVIDIA GPU
 driver version. For additional information, refer to the [CUDA Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html).
 
 ```bash
-# By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+# By default, the PyTorch CUDA 12.8 package is installed. Install the CUDA 13 one instead: cu130 is PyTorch's only CUDA 13 channel, and it runs on the toolkit above through CUDA minor version compatibility.
 pip3 install torch==2.12.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
 sudo apt-get -y install libopenmpi-dev
@@ -141,9 +141,31 @@ There are some known limitations when you pip install the pre-built TensorRT LLM
     to discover a SLURM installation in the usual places.
     ```
 
-2. Prevent `pip` from replacing existing PyTorch installation
+2. Prevent Open MPI 5 from rejecting a long hostname when spawning workers
 
-   On certain systems, particularly Ubuntu 22.04, users installing TensorRT LLM would find that their existing, CUDA 13.0 compatible PyTorch installation (e.g., `torch==2.9.0+cu130`) was being uninstalled by `pip`. It was then replaced by a CUDA 12.8 version (`torch==2.9.0`), causing the TensorRT LLM installation to be unusable and leading to runtime errors.
+    Where the MPI implementation is Open MPI 5 -- which the release container now provides, since
+    its base image ships it -- a singleton `MPI_Comm_spawn` fails when the hostname PMIx is handed
+    is too long for MPI, despite being a perfectly valid hostname: the generated singleton ID,
+    `singleton.{hostname}.{pid}`, has to fit a 50-byte buffer, so how long a hostname is too long
+    depends on the system-assigned pid. Open MPI 4 left the hostname out of that ID, which is why
+    this surfaces only now. TensorRT LLM spawns one such worker per `MpiPoolSession`, so on a host
+    with a long name, a Kubernetes pod for instance, startup fails with:
+
+    ```text
+    mpi4py.MPI.Exception: MPI_ERR_UNKNOWN: unknown error
+    ```
+
+    Export a shorter `PMIX_HOSTNAME` in the environment TensorRT LLM starts from. PMIx only uses
+    the value to identify the node during the handshake, so it does not have to resolve; any short
+    string will do:
+
+    ```bash
+    export PMIX_HOSTNAME=trtllm-node
+    ```
+
+3. Prevent `pip` from replacing existing PyTorch installation
+
+   On certain systems, particularly Ubuntu 22.04, users installing TensorRT LLM would find that their existing, CUDA 13.x compatible PyTorch installation (e.g., `torch==2.9.0+cu130`) was being uninstalled by `pip`. It was then replaced by a CUDA 12.y version (`torch==2.9.0`), causing the TensorRT LLM installation to be unusable and leading to runtime errors.
 
    The solution is to create a `pip` constraints file, locking `torch` to the currently installed version. Here is an example of how this can be done manually:
 

@@ -23,8 +23,9 @@ fi
 #   *_ALLOW_RUN_AS_ROOT  Open MPI 5's PRRTE refuses to fork a DVM as root without
 #                        them. The --allow-run-as-root below only covers mpirun
 #                        itself, not the nested spawn.
-#   PMIX_HOSTNAME        PMIx rejects a hostname of 31 characters or more during
-#                        the singleton handshake, and CI pod names are 63.
+#   PMIX_HOSTNAME        The singleton ID singleton.{hostname}.{pid} has to fit a
+#                        50-byte buffer, so a hostname too long for MPI fails the
+#                        spawn -- and CI pod names are 63.
 #
 # The caller (jenkins/L0_Test.groovy) sets all of them; -x is what carries them
 # across. Keep it in sync if that list changes.
