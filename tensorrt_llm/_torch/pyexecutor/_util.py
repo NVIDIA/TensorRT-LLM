@@ -3577,7 +3577,7 @@ def create_py_executor_instance(
         enable_kv_pool_rebalance=llm_args.kv_cache_config.
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
-        kv_pool_rebalance_check_interval,
+        kv_pool_rebalance_config.check_interval,
     )
 
 

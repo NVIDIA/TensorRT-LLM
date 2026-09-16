@@ -283,7 +283,7 @@ class KVCacheManager:
         radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         self._storage = storage
         self._radix_tree = radix_tree
-        decay = config.rebalance_moving_average_decay
+        decay = config.pool_rebalance.moving_average_decay
         self._avg_reused_length = MovingAverage(decay)
         self._avg_sqr_capacity = MovingAverage(decay)
         self._avg_sqr_history_length = MovingAverage(decay)
@@ -890,16 +890,18 @@ class KVCacheManager:
         def check_mismatch(
             a: TypedIndexList[PoolGroupIndex, float],
             b: TypedIndexList[PoolGroupIndex, float],
-            thres: float,
+            tolerance: float,
         ) -> bool:
-            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b, strict=True))
+            # Symmetric in a vs b: compare the larger of the two ratios, so the test does
+            # not depend on which side has drifted.
+            return any(max(x / y, y / x) > 1.0 + tolerance for x, y in zip(a, b, strict=True))
 
-        threshold = self._init_config.rebalance_ratio_threshold
+        tolerance = self._init_config.pool_rebalance.ratio_tolerance
         if level == GPU_LEVEL:
-            return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, threshold)
+            return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, tolerance)
         else:
             return check_mismatch(
-                self._target_ratio_list_other, self._current_other_ratios, threshold
+                self._target_ratio_list_other, self._current_other_ratios, tolerance
             )
 
     def _adjust_level(self, level: CacheLevel, new_quota: int | None = None) -> None:
@@ -934,11 +936,11 @@ class KVCacheManager:
 
     @property
     def need_adjustment(self) -> bool:
-        if self._num_sampled_kv_caches < self._init_config.rebalance_min_sampled_kv_caches:
+        if self._num_sampled_kv_caches < self._init_config.pool_rebalance.min_sampled_kv_caches:
             return False
         if (
             time.monotonic() - self._last_adjustment_time
-            < self._init_config.rebalance_cooldown_secs
+            < self._init_config.pool_rebalance.cooldown_secs
         ):
             return False
         return self._need_adjustment(GPU_LEVEL) or self._need_adjustment(
@@ -963,7 +965,7 @@ class KVCacheManager:
     def _try_update_target_ratios(self) -> None:
         if (
             self._num_sampled_kv_caches - self._last_update_num_sampled_kv_caches
-            < self._init_config.rebalance_target_ratio_update_interval
+            < self._init_config.pool_rebalance.target_ratio_update_interval
         ):
             return
         self._last_update_num_sampled_kv_caches = self._num_sampled_kv_caches

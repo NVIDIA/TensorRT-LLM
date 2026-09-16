@@ -18,7 +18,6 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
-#include <cmath>
 #include <filesystem>
 #include <set>
 #include <stdexcept>
@@ -45,26 +44,7 @@ void KVCacheManagerConfig::validate() const
         swaScratchReuse->validate();
     }
 
-    if (rebalanceMinSampledKvCaches < 0)
-    {
-        throw std::invalid_argument("KVCacheManagerConfig: rebalance_min_sampled_kv_caches must be non-negative");
-    }
-    if (!std::isfinite(rebalanceCooldownSecs) || rebalanceCooldownSecs < 0.0)
-    {
-        throw std::invalid_argument("KVCacheManagerConfig: rebalance_cooldown_secs must be finite and non-negative");
-    }
-    if (rebalanceTargetRatioUpdateInterval <= 0)
-    {
-        throw std::invalid_argument("KVCacheManagerConfig: rebalance_target_ratio_update_interval must be positive");
-    }
-    if (!std::isfinite(rebalanceRatioThreshold) || rebalanceRatioThreshold <= 1.0f)
-    {
-        throw std::invalid_argument("KVCacheManagerConfig: rebalance_ratio_threshold must be finite and > 1.0");
-    }
-    if (rebalanceMovingAverageDecay <= 0.0 || rebalanceMovingAverageDecay >= 1.0)
-    {
-        throw std::invalid_argument("KVCacheManagerConfig: rebalance_moving_average_decay must be in (0, 1)");
-    }
+    poolRebalance.validate();
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.

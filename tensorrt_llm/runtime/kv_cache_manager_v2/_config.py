@@ -180,6 +180,52 @@ class SwaScratchReuseConfig:
 
 
 @dataclass(slots=True)
+class PoolRebalanceConfig:
+    """
+    Tuning for the pool rebalancing auto-tuner (see KVCacheManager.need_adjustment /
+    adjust). Only consulted when the executor opts in to rebalancing.
+
+    Args:
+        min_sampled_kv_caches: Minimum number of sampled (closed) KvCaches observed
+            before rebalancing is considered.
+        cooldown_secs: Minimum time, in seconds, between successive adjustments.
+        target_ratio_update_interval: Number of newly sampled KvCaches between
+            recomputations of the target pool ratios.
+        ratio_tolerance: How far a pool group's current ratio may drift from its target
+            before a rebalance is triggered, as a fraction of the smaller of the two.
+            The comparison is symmetric, so 0.25 means "rebalance once one of the two
+            exceeds the other by more than 25%".
+        moving_average_decay: Decay factor for the exponential moving averages (reused
+            length, capacity, history length) used to compute target pool ratios. Higher
+            values react more slowly to change.
+    """
+
+    min_sampled_kv_caches: int = 2000
+    cooldown_secs: float = 120.0
+    target_ratio_update_interval: int = 100
+    ratio_tolerance: float = 0.25
+    moving_average_decay: float = 0.9999
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        assert self.min_sampled_kv_caches >= 0, "min_sampled_kv_caches must be non-negative"
+        assert math.isfinite(self.cooldown_secs) and self.cooldown_secs >= 0, (
+            "cooldown_secs must be finite and non-negative"
+        )
+        assert self.target_ratio_update_interval > 0, (
+            "target_ratio_update_interval must be positive"
+        )
+        assert math.isfinite(self.ratio_tolerance) and self.ratio_tolerance > 0.0, (
+            "ratio_tolerance must be finite and > 0"
+        )
+        assert math.isfinite(self.moving_average_decay) and (
+            0.0 < self.moving_average_decay < 1.0
+        ), "moving_average_decay must be finite and in (0, 1)"
+
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     """
     Configuration for the KV cache manager.
@@ -271,32 +317,9 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
-    rebalance_min_sampled_kv_caches: int = 2000
+    pool_rebalance: PoolRebalanceConfig = field(default_factory=PoolRebalanceConfig)
     """
-    Minimum number of sampled (closed) KvCaches observed before pool rebalancing is
-    considered.
-    """
-
-    rebalance_cooldown_secs: float = 120.0
-    """
-    Minimum time, in seconds, between successive pool rebalancing adjustments.
-    """
-
-    rebalance_target_ratio_update_interval: int = 100
-    """
-    Number of newly sampled KvCaches between recomputations of the target pool ratios.
-    """
-
-    rebalance_ratio_threshold: float = 1.25
-    """
-    Relative deviation between current and target pool-group ratios that triggers a
-    rebalance (e.g. 1.25 means a >25% deviation in either direction triggers adjustment).
-    """
-
-    rebalance_moving_average_decay: float = 0.9999
-    """
-    Decay factor for the exponential moving averages (reused length, capacity, history
-    length) used to compute target pool ratios. Higher values react more slowly to change.
+    Tuning for the pool rebalancing auto-tuner. Only consulted when the executor opts in.
     """
 
     @property
@@ -318,10 +341,4 @@ class KVCacheManagerConfig:
             assert self.commit_min_snapshot, (
                 "commit_min_snapshot must be True when SSM layers are present"
             )
-        assert self.rebalance_min_sampled_kv_caches >= 0
-        assert math.isfinite(self.rebalance_cooldown_secs) and self.rebalance_cooldown_secs >= 0
-        assert self.rebalance_target_ratio_update_interval > 0
-        assert (
-            math.isfinite(self.rebalance_ratio_threshold) and self.rebalance_ratio_threshold > 1.0
-        )
-        assert 0.0 < self.rebalance_moving_average_decay < 1.0
+        self.pool_rebalance.validate()

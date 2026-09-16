@@ -4136,6 +4136,67 @@ class BlockReuseConfig(StrictBaseModel):
         "`policy` is 'per_conversation'.")
 
 
+class KvPoolRebalanceConfig(StrictBaseModel):
+    """Tuning for the KV cache manager v2 pool rebalance auto-tuner.
+
+    Only used when ``kv_cache_config.enable_kv_pool_rebalance`` is True.
+    """
+
+    min_sampled_kv_caches: int = Field(
+        default=2000,
+        ge=0,
+        status="prototype",
+        description=
+        "Minimum number of sampled (closed) KvCaches observed before the auto-tuner "
+        "will consider making an adjustment.")
+
+    cooldown_secs: float = Field(
+        default=120.0,
+        ge=0,
+        allow_inf_nan=False,
+        status="prototype",
+        description=
+        "Minimum time, in seconds, between successive rebalance adjustments.")
+
+    target_ratio_update_interval: int = Field(
+        default=100,
+        gt=0,
+        status="prototype",
+        description=
+        "Number of newly sampled KvCaches between recomputations of the target "
+        "pool-group ratios.")
+
+    ratio_tolerance: float = Field(
+        default=0.25,
+        gt=0,
+        allow_inf_nan=False,
+        status="prototype",
+        description=
+        "How far a pool group's current ratio may drift from its target before a "
+        "rebalance is triggered, as a fraction of the smaller of the two. The "
+        "comparison is symmetric, so 0.25 means a rebalance is triggered once one of "
+        "the two exceeds the other by more than 25%.")
+
+    moving_average_decay: float = Field(
+        default=0.9999,
+        gt=0,
+        lt=1,
+        allow_inf_nan=False,
+        status="prototype",
+        description=
+        "Decay factor for the exponential moving averages (reused length, capacity, "
+        "history length) used to compute target pool ratios. Higher values react more "
+        "slowly to change.")
+
+    check_interval: int = Field(
+        default=10,
+        gt=0,
+        status="prototype",
+        description=
+        "Number of PyExecutor iterations between checks of whether a pool rebalance "
+        "should be attempted.")
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4334,71 +4395,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for "
         "rebalancing pool-group ratios between iterations. When True the "
         "PyExecutor calls ``adjust()`` opportunistically; the auto-tuner "
-        "itself remains gated by the ``kv_pool_rebalance_min_sampled_kv_caches`` "
-        "/ ``kv_pool_rebalance_cooldown_secs`` thresholds (2000 samples / 120s "
-        "by default). When False (default) the rebalance hook is skipped "
-        "entirely and pool ratios remain at their warmup-derived values. "
-        "Beta: enable at your own risk. Only used when using KV cache "
-        "manager v2 (experimental). This option is incompatible with "
-        "dtype='fp8_ds_mla'.")
+        "itself remains gated by the ``kv_pool_rebalance_config`` thresholds "
+        "(2000 samples / 120s by default). When False (default) the rebalance "
+        "hook is skipped entirely and pool ratios remain at their "
+        "warmup-derived values. Beta: enable at your own risk. Only used when "
+        "using KV cache manager v2 (experimental). This option is incompatible "
+        "with dtype='fp8_ds_mla'.")
 
-    kv_pool_rebalance_min_sampled_kv_caches: int = Field(
-        default=2000,
-        ge=0,
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = Field(
+        default_factory=KvPoolRebalanceConfig,
         status="prototype",
         description=
-        "Minimum number of sampled (closed) KvCaches observed before the "
-        "KVCacheManagerV2 pool rebalance auto-tuner will consider making an "
-        "adjustment. Only used when ``enable_kv_pool_rebalance`` is True.")
-
-    kv_pool_rebalance_cooldown_secs: float = Field(
-        default=120.0,
-        ge=0,
-        allow_inf_nan=False,
-        status="prototype",
-        description=
-        "Minimum time, in seconds, between successive KVCacheManagerV2 pool "
-        "rebalance adjustments. Only used when ``enable_kv_pool_rebalance`` "
-        "is True.")
-
-    kv_pool_rebalance_target_ratio_update_interval: int = Field(
-        default=100,
-        gt=0,
-        status="prototype",
-        description=
-        "Number of newly sampled KvCaches between recomputations of the "
-        "KVCacheManagerV2 target pool-group ratios. Only used when "
+        "Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when "
         "``enable_kv_pool_rebalance`` is True.")
-
-    kv_pool_rebalance_ratio_threshold: float = Field(
-        default=1.25,
-        gt=1.0,
-        allow_inf_nan=False,
-        status="prototype",
-        description=
-        "Relative deviation between current and target pool-group ratios "
-        "that triggers a KVCacheManagerV2 rebalance (e.g. 1.25 means a "
-        ">25% deviation in either direction triggers adjustment). Only used "
-        "when ``enable_kv_pool_rebalance`` is True.")
-
-    kv_pool_rebalance_moving_average_decay: float = Field(
-        default=0.9999,
-        gt=0,
-        lt=1,
-        status="prototype",
-        description=
-        "Decay factor for the exponential moving averages (reused length, "
-        "capacity, history length) KVCacheManagerV2 uses to compute target "
-        "pool ratios. Higher values react more slowly to change. Only used "
-        "when ``enable_kv_pool_rebalance`` is True.")
-
-    kv_pool_rebalance_check_interval: int = Field(
-        default=10,
-        gt=0,
-        status="prototype",
-        description="Number of PyExecutor iterations between checks of whether a "
-        "KVCacheManagerV2 pool rebalance should be attempted. Only used "
-        "when ``enable_kv_pool_rebalance`` is True.")
 
     disk_prefetch_num_reqs: int = Field(
         default=0,

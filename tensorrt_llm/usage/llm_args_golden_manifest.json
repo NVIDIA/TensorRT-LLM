@@ -889,42 +889,42 @@
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.kv_pool_rebalance_check_interval"
+      "path": "kv_cache_config.kv_pool_rebalance_config.check_interval"
     },
     {
       "allowed_values": [],
       "annotation": "<class 'float'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.kv_pool_rebalance_cooldown_secs"
+      "path": "kv_cache_config.kv_pool_rebalance_config.cooldown_secs"
     },
     {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.kv_pool_rebalance_min_sampled_kv_caches"
+      "path": "kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches"
     },
     {
       "allowed_values": [],
       "annotation": "<class 'float'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.kv_pool_rebalance_moving_average_decay"
+      "path": "kv_cache_config.kv_pool_rebalance_config.moving_average_decay"
     },
     {
       "allowed_values": [],
       "annotation": "<class 'float'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.kv_pool_rebalance_ratio_threshold"
+      "path": "kv_cache_config.kv_pool_rebalance_config.ratio_tolerance"
     },
     {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.kv_pool_rebalance_target_ratio_update_interval"
+      "path": "kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval"
     },
     {
       "allowed_values": [

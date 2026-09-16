@@ -60,7 +60,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig, KvPoolRebalanceConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -100,14 +100,10 @@ class KvCacheConfigV2:
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
-    # Mirrors the KvCacheConfig.kv_pool_rebalance_* defaults in
+    # Mirrors KvCacheConfig.kv_pool_rebalance_config in
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
-    # reads all of them unconditionally.
-    kv_pool_rebalance_min_sampled_kv_caches: int = 2000
-    kv_pool_rebalance_cooldown_secs: float = 120.0
-    kv_pool_rebalance_target_ratio_update_interval: int = 100
-    kv_pool_rebalance_ratio_threshold: float = 1.25
-    kv_pool_rebalance_moving_average_decay: float = 0.9999
+    # reads it unconditionally.
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
 
 
 _THIS_DIR = Path(__file__).resolve().parent
