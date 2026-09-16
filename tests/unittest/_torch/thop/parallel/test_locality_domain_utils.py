@@ -106,7 +106,6 @@ class TestLocalityDomainSupport:
 class TestLocalityDomainComputeTopology:
     """Pure mocked tests for compute topology and grid sizing."""
 
-    @pytest.mark.skip(reason="requires _get_full_device_max_active_clusters (cute_dsl_custom_ops)")
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
     def test_cluster_occupancy_cache_keeps_topology_scaling_dynamic(self, monkeypatch):
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
@@ -144,7 +143,6 @@ class TestLocalityDomainComputeTopology:
         finally:
             occupancy_cache.cache_clear()
 
-    @pytest.mark.skip(reason="requires _get_full_device_max_active_clusters (cute_dsl_custom_ops)")
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
     def test_cluster_occupancy_cache_is_scoped_by_device_and_cluster(self, monkeypatch):
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
@@ -349,7 +347,6 @@ class TestLocalityDomainLinearRouting:
         "fusion_op",
         [AllReduceFusionOp.NONE, AllReduceFusionOp.RESIDUAL_RMS_NORM],
     )
-    @pytest.mark.skip(reason="requires the Linear/model_config wire-up (call-site PR)")
     def test_shards_bypass_full_weight_paths(self, fusion_op):
         input_tensor = torch.ones(2, 4)
         local_output = torch.full((2, 3), 2.0)

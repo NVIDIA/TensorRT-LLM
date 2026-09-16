@@ -14,6 +14,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_locality_domains:
+        annotation: bool
+        default: False
+        status: prototype
       cp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
         default: null
