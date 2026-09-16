@@ -32,7 +32,12 @@ from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.speculative.utils import update_draft_len
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PARDDecodingConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DraftTargetDecodingConfig,
+    PARDDecodingConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 
@@ -150,6 +155,49 @@ def _build_engine_and_resource_manager():
     )
     resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
     return model_engine, resource_manager
+
+
+@pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
+@pytest.mark.parametrize(
+    "draft_len", [None, 0, 3, 1], ids=["general", "cuda_graph_0", "cuda_graph_3", "cuda_graph_1"]
+)
+def test_warmup_builders_resynchronize_stale_draft_length(
+    config_cls: type[DecodingBaseConfig], draft_len: int | None
+) -> None:
+    config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
+    engine, resource_manager = _build_engine_and_resource_manager()
+    engine.spec_config = config
+    engine.max_draft_len = config.max_draft_len
+    engine.max_total_draft_tokens = config.tokens_per_gen_step - 1
+    engine.max_draft_loop_tokens = engine.max_total_draft_tokens
+    engine.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    # Profiling a batch of two leaves K=2; every requested warmup shape below
+    # differs from that value and must synchronize the real engine and requests.
+    engine.runtime_draft_len = 2
+    batch_size = 2
+
+    if draft_len is None:
+        expected_draft_len = engine.max_draft_len
+        warmup_request = engine._create_warmup_request(
+            resource_manager,
+            num_tokens=batch_size * config.tokens_per_gen_step,
+            num_gen_requests=batch_size,
+        )
+    else:
+        expected_draft_len = draft_len
+        warmup_request = engine._create_cuda_graph_warmup_request(
+            resource_manager, batch_size, draft_len, max_seq_len=16
+        )
+
+    with engine._release_batch_context(warmup_request, resource_manager) as batch:
+        assert batch is not None
+        assert len(batch.generation_requests) == batch_size
+        assert engine.runtime_draft_len == expected_draft_len
+        expected_buffer_width = config.get_runtime_tokens_per_gen_step(expected_draft_len) - 1
+        assert all(
+            len(request.py_draft_tokens) == expected_buffer_width
+            for request in batch.generation_requests
+        )
 
 
 class _Tracker:

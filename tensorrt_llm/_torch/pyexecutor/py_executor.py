@@ -72,6 +72,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from ..speculative.utils import update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
@@ -3346,8 +3347,6 @@ class PyExecutor:
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         """Synchronize draft length and buffers before preparing resources."""
-        from ..speculative.utils import update_draft_len
-
         update_draft_len(self.model_engine,
                          scheduled_batch,
                          speculation_permanently_disabled=self.

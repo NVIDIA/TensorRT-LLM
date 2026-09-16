@@ -938,6 +938,18 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     return 0
 
 
+def get_static_draft_len(model_engine: "ModelEngine") -> int:
+    """Return logical K for linear modes or total tree tokens for tree modes.
+
+    This selects the static maximum without applying a batch-size schedule or
+    changing engine state. PARD's physical buffer width is derived separately.
+    """
+    spec_config = model_engine.spec_config
+    if spec_config is None or spec_config.is_linear_tree:
+        return model_engine.max_draft_len
+    return model_engine.max_total_draft_tokens
+
+
 def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,
@@ -945,9 +957,14 @@ def update_draft_len(model_engine: "ModelEngine",
                      speculation_permanently_disabled: bool = False) -> None:
     """Resolve this batch's draft length and synchronize its draft buffers.
 
-    Normal iterations use the configured batch-size schedule before preparing
-    resources. Warmup supplies the explicit length used to allocate its dummy
-    batch, including graph shapes that differ from the normal schedule.
+    Normal iterations must call this before ``prepare_resources`` so KV cache
+    allocation uses the selected draft length. Dynamic and explicit lengths
+    pad or truncate generation-request buffers to a uniform width, as required
+    by CUDA graph replay and the attention kernel. Static normal decoding
+    preserves the drafter's proposals instead.
+
+    Warmup supplies the explicit length used to allocate its dummy batch,
+    including graph shapes that differ from the normal batch-size schedule.
     """
     if not hasattr(model_engine, 'max_draft_len'):
         return
@@ -969,10 +986,7 @@ def update_draft_len(model_engine: "ModelEngine",
         else:
             # Static decoding preserves the proposals produced by the drafter,
             # including requests intentionally entering with no draft tokens.
-            model_engine.runtime_draft_len = (
-                model_engine.max_draft_len
-                if spec_config is not None and spec_config.is_linear_tree else
-                model_engine.max_total_draft_tokens)
+            model_engine.runtime_draft_len = get_static_draft_len(model_engine)
             return
 
     draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
