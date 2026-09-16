@@ -27,8 +27,11 @@ than overwrite:
   countable rather than only visible on stderr.
 * ``sol_attn_ineligible_reason()`` names the specific reason (architecture,
   head_dim, dtype) instead of returning one boolean.
-* ``SOL_ATTN_STRICT=1`` also covers the eligibility path; upstream raises only
-  on kernel exceptions, so an ineligible run stayed silent.
+* Kernel exceptions propagate. Upstream catches them and silently reruns the
+  call with torch SDPA; a failed CuTe launch can leave the device in a bad
+  state, so recovery is not attempted here. Only inputs known up front to be
+  unservable (shape, dtype, architecture) are routed to dense attention, and
+  ``TRTLLM_SOL_ATTN_STRICT=1`` turns even that into an error.
 * Dense paths route to ``cute_dsl_fmha_fwd`` through ``dense_fn``. Upstream
   falls back to torch SDPA; staying inside the configured backend is what lets
   a ``backend: CUTEDSL`` A/B isolate sparsity rather than also swapping the
@@ -47,10 +50,11 @@ TRT-LLM's dispatch path (``attention_backend/cute_dsl/sol_attn.py``,
 lives there too, keyed off the normalized timestep forward kwarg.
 
 CuTe DSL imports and compilation are deferred to first use. Calls the kernel
-cannot serve -- wrong shape, dtype, or an architecture with no kernel --
-delegate to dense attention rather than failing, and increment
-``_SOL_STATS["dense_fallback_calls"]`` so the degradation is countable. Set
-``SOL_ATTN_STRICT=1`` to raise instead of falling back.
+is known not to serve -- wrong shape, dtype, or an architecture with no kernel
+-- are delegated to dense attention before any launch, logged once, and
+counted in ``_SOL_STATS["dense_fallback_calls"]``. Set
+``TRTLLM_SOL_ATTN_STRICT=1`` to raise instead. Errors raised by the kernel
+itself are not caught.
 """
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ from typing import Callable, Optional
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
 HEAD_DIM = 128
@@ -83,10 +88,10 @@ def _load_sol_attn() -> Callable:
     return sol_attn
 
 
-# Architectures with a Sol-Attn CuTe kernel. Kept in sync with
-# ``sol_attn/interface.py::_CUTE_BACKENDS``; duplicated here so the eligibility
-# check does not have to import the CuTe DSL.
-SUPPORTED_ARCHS = frozenset({(10, 0), (10, 3)})
+# SM versions with a Sol-Attn CuTe kernel, in ``get_sm_version()`` form
+# (major * 10 + minor). Kept in sync with ``sol_attn/interface.py::_CUTE_BACKENDS``;
+# duplicated here so the eligibility check does not have to import the CuTe DSL.
+SUPPORTED_ARCHS = frozenset({100, 103})
 
 
 def sol_attn_ineligible_reason(q) -> Optional[str]:
@@ -108,13 +113,10 @@ def sol_attn_ineligible_reason(q) -> Optional[str]:
         return f"head_dim must be {HEAD_DIM}, got {q.shape[-1]}"
     if q.dtype != torch.bfloat16:
         return f"dtype must be bfloat16, got {q.dtype}"
-    try:
-        arch = tuple(torch.cuda.get_device_capability(q.device))
-    except Exception as exc:
-        return f"could not query device capability: {exc}"
-    if arch not in SUPPORTED_ARCHS:
-        return f"no Sol-Attn kernel for SM{arch[0]}{arch[1]}; supported: " + ", ".join(
-            f"SM{a}{b}" for a, b in sorted(SUPPORTED_ARCHS)
+    sm = get_sm_version()
+    if sm not in SUPPORTED_ARCHS:
+        return f"no Sol-Attn kernel for SM{sm}; supported: " + ", ".join(
+            f"SM{v}" for v in sorted(SUPPORTED_ARCHS)
         )
     return None
 
@@ -138,9 +140,9 @@ def _cute_runtime_available() -> bool:
 
 
 def _strict() -> bool:
-    """Whether SOL_ATTN_STRICT=1 asks us to raise instead of degrading."""
+    """Whether TRTLLM_SOL_ATTN_STRICT=1 asks us to raise on an unservable input."""
 
-    return os.environ.get("SOL_ATTN_STRICT", "0") == "1"
+    return os.environ.get("TRTLLM_SOL_ATTN_STRICT", "0") == "1"
 
 
 def _dense_bthd(q, k, v):
@@ -149,36 +151,6 @@ def _dense_bthd(q, k, v):
         k.transpose(1, 2),
         v.transpose(1, 2),
     ).transpose(1, 2)
-
-
-def _degradable_kernel_errors() -> tuple[type[BaseException], ...]:
-    """Exception types whose failure is safe to answer with dense attention.
-
-    `CODING_GUIDELINES.md` asks for the smallest exception set. A bare
-    ``except Exception`` also swallowed ordinary programming and integration
-    errors -- ``TypeError``, ``NameError``, ``AttributeError`` -- turning a bug
-    into "Sol-Attn just didn't speed anything up". Those now propagate.
-
-    ``DSLBaseError`` has to be named explicitly because CuTe DSL derives it
-    from ``Exception``, not ``RuntimeError``, so a narrower tuple would stop
-    catching real JIT and codegen failures that were previously degraded. It
-    is resolved lazily and cached: this module defers every CuTe DSL import to
-    first use, and the tuple is only needed once something has already raised.
-    """
-    global _DEGRADABLE_KERNEL_ERRORS
-    if _DEGRADABLE_KERNEL_ERRORS is None:
-        types: list[type[BaseException]] = [ImportError, OSError, RuntimeError]
-        try:
-            from cutlass.base_dsl.common import DSLBaseError
-        except ImportError:
-            pass
-        else:
-            types.append(DSLBaseError)
-        _DEGRADABLE_KERNEL_ERRORS = tuple(types)
-    return _DEGRADABLE_KERNEL_ERRORS
-
-
-_DEGRADABLE_KERNEL_ERRORS: tuple[type[BaseException], ...] | None = None
 
 
 # Opaque to Dynamo, like every other CuTe DSL launch boundary here (see
@@ -207,7 +179,11 @@ def _run_sol_attn_bthd(
     sink_tokens: int = 0,
     dense_fn: Callable | None = None,
 ):
-    """Run Sol-Attn on contiguous BTHD tensors, with a safe dense fallback."""
+    """Run Sol-Attn on contiguous BTHD tensors.
+
+    Inputs the kernel is known not to serve go to dense attention up front;
+    errors raised by the kernel itself propagate.
+    """
 
     q0, k0, v0 = q.contiguous(), k.contiguous(), v.contiguous()
 
@@ -223,52 +199,39 @@ def _run_sol_attn_bthd(
     if reason is None and (k0.dtype != q0.dtype or v0.dtype != q0.dtype):
         reason = f"k/v dtype must match q {q0.dtype}"
     if reason is not None:
-        # Same strictness contract as the kernel-exception path below: this is
-        # the arm that silently turns Sol-Attn into a no-op for a whole run
-        # (wrong arch, head_dim, or dtype), so it must be visible.
+        # This is the arm that silently turns Sol-Attn into a no-op for a whole
+        # run (wrong arch, head_dim, or dtype), so it must be visible.
         if _strict():
             raise RuntimeError(f"[sol-attn] cannot run the CuTe kernel: {reason}")
         logger.warning_once(
             f"[sol-attn] falling back to dense attention: {reason}. Sol-Attn will not "
-            "accelerate this run. Set SOL_ATTN_STRICT=1 to raise instead.",
+            "accelerate this run. Set TRTLLM_SOL_ATTN_STRICT=1 to raise instead.",
             key=("sol_attn_ineligible", reason),
         )
         return dense()
 
-    try:
-        kernel = _load_sol_attn()
-        out = kernel(
-            q0,
-            k0,
-            v0,
-            tau=float(tau),
-            thresh_type=str(thresh_type),
-            # Only 1 split exists on the shipped sm100/sm103 kernels (2/4 was an
-            # SM90-only path), so this is not a user-facing knob. The kernel
-            # interface rejects anything else before the try below can swallow it.
-            kv_splits=int(kv_splits),
-            sink_start=sink_start,
-            sink_tokens=int(sink_tokens),
-        )
-    except _degradable_kernel_errors() as exc:
-        if _strict():
-            raise
-        logger.warning_once(
-            f"[sol-attn] kernel raised {type(exc).__name__}: {exc}; falling back to dense "
-            "attention for this call. Set SOL_ATTN_STRICT=1 to raise instead of silently falling "
-            "back.",
-            key=(type(exc).__name__, str(exc)),
-        )
-        return dense()
-
+    kernel = _load_sol_attn()
+    out = kernel(
+        q0,
+        k0,
+        v0,
+        tau=float(tau),
+        thresh_type=str(thresh_type),
+        # Only 1 split exists on the shipped sm100/sm103 kernels (2/4 was an
+        # SM90-only path), so this is not a user-facing knob; the kernel
+        # interface rejects anything else.
+        kv_splits=int(kv_splits),
+        sink_start=sink_start,
+        sink_tokens=int(sink_tokens),
+    )
     _SOL_STATS["kernel_calls"] += 1
     return out
 
 
 # Lightweight run-validation counters. `kernel_calls` is the census used to
-# prove the CuTe kernel actually ran: because forward() falls back to dense
-# SDPA on any kernel exception, a run that "works" but never increments this
-# was silently dense. Set SOL_ATTN_STRICT=1 to raise instead of falling back.
+# prove the CuTe kernel actually ran; `dense_fallback_calls` counts calls the
+# kernel was known not to serve. Set TRTLLM_SOL_ATTN_STRICT=1 to raise instead
+# of falling back on those.
 _SOL_STATS = {"kernel_calls": 0, "dense_fallback_calls": 0}
 
 

@@ -84,27 +84,14 @@ def _cute_dense_available() -> bool:
     return True
 
 
-def _parse_dense_layers(spec: Optional[str]) -> frozenset[int]:
-    layers: set[int] = set()
-    for item in str(spec or "").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "-" in item:
-            start, end = item.split("-", 1)
-            layers.update(range(int(start), int(end) + 1))
-        else:
-            layers.add(int(item))
-    return frozenset(layers)
-
-
 class SolAttention(AttentionBackend):
     """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100/sm103).
 
-    The kernel wrapper already falls back to dense attention on any unsupported
-    shape/dtype/arch (see ``_run_sol_attn_bthd``); this class only adds the
-    ``dense_layers`` layer-skip guard (evaluated at construction time, no
-    external plumbing needed) and forwards the routing knobs from config.
+    Inputs the kernel cannot serve (shape, dtype, architecture) are delegated to
+    dense attention up front by ``_run_sol_attn_bthd``; a kernel error is not
+    recovered from and propagates. This class adds the ``dense_layers`` guard
+    (evaluated at construction time, no external plumbing needed) and forwards
+    the routing knobs from config.
     """
 
     def __init__(
@@ -140,7 +127,7 @@ class SolAttention(AttentionBackend):
         self.tau = getattr(cfg, "tau", 1.0)
         self.thresh_type = getattr(cfg, "thresh_type", "diag")
         self.disabled_until_timestep = getattr(cfg, "disabled_until_timestep", None)
-        self.dense_layers = _parse_dense_layers(getattr(cfg, "dense_layers", None))
+        self.dense_layers = frozenset(getattr(cfg, "dense_layers", None) or ())
 
         # Sol-Attn's dense steps must run the backend the user selected. Without
         # this they ran torch SDPA while a `backend: CUTEDSL` baseline ran
@@ -167,13 +154,15 @@ class SolAttention(AttentionBackend):
             dtype=dtype,
         )
         # Whether the CuTe DSL dense kernel can serve this device, decided once
-        # here. Doing it at construction (rather than lazily on the first call)
-        # keeps `_dense` free of attribute mutation, so it stays traceable and
-        # the dense step sits in the same place in the graph as the dense
-        # CUTEDSL baseline's does. Deciding it lazily and marking `_dense`
-        # `@torch.compiler.disable` instead moved the whole dense step out of
-        # the graph and reintroduced the very mismatch this is meant to remove:
-        # measured LPIPS 0.4044 compiled, against 0.2112 eager.
+        # here rather than lazily on the first call. Neither a kernel bug nor a
+        # torch.compile bug is involved; this is about graph structure. A lazy
+        # decision needs attribute mutation inside `_dense`, which forces
+        # `@torch.compiler.disable` on it, and that moves the whole dense step
+        # out of the compiled graph. The dense CUTEDSL baseline keeps its dense
+        # step inside the graph, so the two then differ on every dense step:
+        # measured LPIPS 0.4044 compiled against 0.2112 eager. Deciding here
+        # keeps `_dense` traceable and the dense step in the same place as the
+        # baseline's.
         self._cute_dense_ok = _cute_dense_available()
         if not self._cute_dense_ok:
             logger.warning_once(
@@ -274,8 +263,13 @@ class SolAttention(AttentionBackend):
         Qwen-Image always, and WAN's ``attn1`` under async Ulysses -- silently
         costing those modules their configured backend.
         """
-        # Cross-attention: K/V come from another sequence. Sol-Attn's routing
-        # assumes one self-attending sequence.
+        # Cross-attention: K/V come from another sequence, and Sol-Attn's
+        # routing assumes one self-attending sequence. Unequal Q/K lengths are
+        # a heuristic for that, not a definition: a cross-attention call whose
+        # context happens to match the query length is not caught here. The
+        # `Attention` module knows the answer (`encoder_hidden_states`), but the
+        # backend `forward` kwargs carry no such flag yet; TRTLLM-16475 tracks
+        # threading an explicit signal through and retiring this check.
         if k.shape[1] != q.shape[1]:
             return False
         # Masks: the sparse kernel is noncausal and takes no mask, so a masked

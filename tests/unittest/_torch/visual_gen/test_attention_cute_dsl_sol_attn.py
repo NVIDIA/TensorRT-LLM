@@ -32,10 +32,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
 from tensorrt_llm._torch.visual_gen.attention_backend import CuTeDSLAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import (
-    SolAttention,
-    _parse_dense_layers,
-)
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import SolAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -197,23 +194,6 @@ def test_sol_attn_rejects_gqa_mqa():
 
 
 @pytest.mark.parametrize(
-    "spec,expected",
-    [
-        (None, frozenset()),
-        ("", frozenset()),
-        ("0", frozenset({0})),
-        ("0,2,4", frozenset({0, 2, 4})),
-        ("0-3", frozenset({0, 1, 2, 3})),
-        ("0-1,5,7-8", frozenset({0, 1, 5, 7, 8})),
-        (" 0 , 2 ", frozenset({0, 2})),
-    ],
-    ids=["none", "empty", "single", "list", "range", "mixed", "whitespace"],
-)
-def test_parse_dense_layers(spec, expected):
-    assert _parse_dense_layers(spec) == expected
-
-
-@pytest.mark.parametrize(
     "timestep,expected",
     [
         (0.99, 0),  # early/noisy -> dense prefix
@@ -369,7 +349,7 @@ def test_cuda_graph_key_separates_dense_prefix_from_sparse_phase():
 
 def test_cuda_graph_key_unregistered_without_prefix():
     """dense_layers alone is fixed per layer, so it needs no graph key."""
-    model = _make_solattn_model(disabled_until_timestep=None, dense_layers="0,2")
+    model = _make_solattn_model(disabled_until_timestep=None, dense_layers=[0, 2])
     runner = _graph_runner()
     model.register_cuda_graph_extra_key_fns(runner)
 
@@ -423,11 +403,11 @@ def test_ineligible_reason_is_reported(make, expect):
 
 
 def test_strict_raises_on_ineligible_input(monkeypatch):
-    """SOL_ATTN_STRICT=1 must cover the shape/dtype/arch path, not just kernel
-    exceptions. Without this, an unsupported arch degrades to dense silently
-    even under STRICT, and the counters the PR relies on cannot be trusted."""
+    """TRTLLM_SOL_ATTN_STRICT=1 must turn an unservable input into an error.
+    Without it an unsupported arch degrades to dense silently and the counters
+    the PR relies on cannot be trusted."""
     sab = _backend_mod()
-    monkeypatch.setenv("SOL_ATTN_STRICT", "1")
+    monkeypatch.setenv("TRTLLM_SOL_ATTN_STRICT", "1")
     q = k = v = torch.randn(1, 4, 2, 128)  # CPU -> ineligible
     with pytest.raises(RuntimeError, match="cannot run the CuTe kernel"):
         sab._run_sol_attn_bthd(q, k, v)
@@ -436,7 +416,7 @@ def test_strict_raises_on_ineligible_input(monkeypatch):
 def test_ineligible_falls_back_to_dense_and_counts(monkeypatch):
     """Without STRICT the same input degrades to dense and increments the counter."""
     sab = _backend_mod()
-    monkeypatch.delenv("SOL_ATTN_STRICT", raising=False)
+    monkeypatch.delenv("TRTLLM_SOL_ATTN_STRICT", raising=False)
     sab.reset_sol_attn_stats()
     q = k = v = torch.randn(1, 4, 2, 128)
     out = sab._run_sol_attn_bthd(q, k, v)
@@ -453,7 +433,9 @@ def test_supported_archs_matches_kernel_dispatch_map():
     drift, eligibility silently rejects an arch the kernel actually supports."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn import interface
 
-    assert _backend_mod().SUPPORTED_ARCHS == frozenset(interface._CUTE_BACKENDS)
+    assert _backend_mod().SUPPORTED_ARCHS == frozenset(
+        major * 10 + minor for major, minor in interface._CUTE_BACKENDS
+    )
 
 
 def test_datacenter_blackwell_archs_are_supported():
@@ -537,40 +519,24 @@ def test_zero_cutoff_rejected():
 
 
 @pytest.mark.parametrize(
-    "spec,reason",
-    [
-        ("4-2", "descending"),
-        ("abc", "not a layer index"),
-        ("0,x", "not a layer index"),
-        ("-1", "not a layer index"),
-        (",", "empty entry"),
-        ("0,,2", "empty entry"),
-        (" ", "empty entry"),
-    ],
-    ids=[
-        "descending_range",
-        "non_numeric",
-        "non_numeric_in_list",
-        "negative",
-        "only_separator",
-        "empty_in_list",
-        "whitespace_only",
-    ],
+    "layers",
+    [[-1], [0, -2], ["x"], "0,2", [1.5]],
+    ids=["negative", "negative_in_list", "non_numeric", "string_spec", "float"],
 )
-def test_dense_layers_rejects_malformed_spec(spec, reason):
-    """Malformed dense_layers must fail at config time, not silently or late.
-
-    A descending range is the dangerous one: `_parse_dense_layers('4-2')`
-    yields an empty set, so the layers the user asked to force dense would
-    quietly stay sparse with no error anywhere.
-    """
-    with pytest.raises(ValueError, match=reason):
-        SolAttentionConfig(tau=2.0, dense_layers=spec)
+def test_dense_layers_rejects_invalid_values(layers):
+    """dense_layers is a list of non-negative layer indices; anything else fails at
+    config time rather than at attention construction."""
+    with pytest.raises(ValueError):
+        SolAttentionConfig(tau=2.0, dense_layers=layers)
 
 
-@pytest.mark.parametrize("spec", [None, "0", "0,2-4", " 0 , 2 ", "0-0"])
-def test_dense_layers_accepts_valid_spec(spec):
-    assert SolAttentionConfig(tau=2.0, dense_layers=spec).dense_layers == spec
+@pytest.mark.parametrize(
+    "layers,expected",
+    [(None, None), ([0], [0]), ([0, 2, 4], [0, 2, 4]), ([4, 2, 2, 0], [0, 2, 4])],
+    ids=["none", "single", "list", "unsorted_with_duplicates"],
+)
+def test_dense_layers_normalizes_valid_values(layers, expected):
+    assert SolAttentionConfig(tau=2.0, dense_layers=layers).dense_layers == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Sol-Attn needs CUDA")

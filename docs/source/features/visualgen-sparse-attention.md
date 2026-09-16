@@ -41,7 +41,7 @@ attention_config:
     tau: 2.0                        # routing threshold; higher routes more blocks sparse
     thresh_type: diag               # or "exact"
     disabled_until_timestep: 0.9090 # dense while normalized timestep >= cutoff
-    dense_layers: '0'               # optional: layers forced dense
+    dense_layers: [0]               # optional: layer indices forced dense
 ```
 
 `disabled_until_timestep` has the same meaning as it does for Skip Softmax:
@@ -49,12 +49,13 @@ attention runs dense while the normalized denoising timestep is at or above the
 cutoff, protecting the high-noise prefix, and switches to the sparse kernel
 below it. Use `None` rather than `0.0` to disable the prefix.
 
-On an input the kernel cannot serve — an unsupported architecture, a
-`head_dim` other than 128, a non-bfloat16 dtype — Sol-Attn falls back to dense
-attention -- the configured backend's dense kernel where available, torch SDPA
-otherwise -- logs the specific reason once, and counts the fallback. Set
-`SOL_ATTN_STRICT=1` to raise instead of falling back, which is useful when
-benchmarking to confirm the kernel actually ran.
+On an input the kernel is known not to serve — an unsupported architecture, a
+`head_dim` other than 128, a non-bfloat16 dtype — Sol-Attn runs dense
+attention instead (the configured backend's dense kernel where available,
+torch SDPA otherwise), logs the specific reason once, and counts the fallback.
+Set `TRTLLM_SOL_ATTN_STRICT=1` to raise instead, which is useful when
+benchmarking to confirm the kernel actually ran. Errors raised by the kernel
+itself are not caught.
 
 ## Skip Softmax Attention
 
