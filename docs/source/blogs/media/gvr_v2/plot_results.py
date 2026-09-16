@@ -349,7 +349,7 @@ def _evolution(rows: list[dict]) -> None:
 
 
 def _algorithm() -> None:
-    fig, ax = plt.subplots(figsize=(14, 6.8))
+    fig, ax = plt.subplots(figsize=(14, 9))
     ax.set(xlim=(0, 14), ylim=(0, 7))
     ax.axis("off")
     headings = [
@@ -422,17 +422,162 @@ def _algorithm() -> None:
             (11.6, y + 0.25),
             arrowprops={"arrowstyle": "->", "color": "#64748b"},
         )
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.27, top=0.98)
+    guard = fig.add_axes((0.025, 0.03, 0.95, 0.26))
+    guard.set(xlim=(0, 14), ylim=(0, 3))
+    guard.axis("off")
+    guard.text(
+        0.05, 2.8, "EXACTNESS CHECKS BEFORE OUTPUT", fontsize=12, weight="bold", color="#334155"
+    )
+    _box(
+        guard,
+        (3.2, 1.96),
+        (7.6, 0.44),
+        "Full-row coverage · valid bracket · complete candidates",
+        "#f1f4f7",
+        11,
+    )
+    paths = [
+        (0.15, "Enough survivors\nRefine the crossing → exact Top-K", "#edf5df"),
+        (4.85, "Too few survivors\nLower admission and verify again", "#fff3d9"),
+        (9.55, "Overflow or unusable bracket\nExact complete-set / whole-row recovery", "#e9eff5"),
+    ]
+    for x, label, color in paths:
+        _box(guard, (x, 0.24), (4.15, 0.98), label, color, 10)
+        guard.annotate(
+            "",
+            (x + 2.075, 1.34),
+            (7, 1.86),
+            arrowprops={"arrowstyle": "->", "color": "#64748b", "lw": 1.4},
+        )
+    _save(fig, "algorithm")
+
+
+def _integration() -> None:
+    fig, ax = plt.subplots(figsize=(14, 8.4))
+    ax.set(xlim=(0, 14), ylim=(0, 9))
+    ax.axis("off")
+    ax.text(
+        0.3,
+        8.65,
+        "One selection core, two row interfaces",
+        fontsize=21,
+        weight="bold",
+        color="#17202b",
+    )
     _box(
         ax,
-        (0.25, 0.12),
-        (13.2, 0.64),
-        "If the sample misses: lower the admission threshold or invoke exact recovery. "
-        "An incomplete candidate buffer never proves correctness.",
-        "#f1f4f7",
-        10,
+        (0.75, 7.35),
+        (12.5, 0.82),
+        "Sparse-attention indexer → TopK dispatcher\nOne self-sampling configuration for both phases",
+        "#e9eff5",
+        12,
     )
-    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.03, top=0.98)
-    _save(fig, "algorithm")
+    adapters = [
+        (
+            0.75,
+            "DECODE · run_varlen\nKV lengths + MTP offset + compression → valid prefix\n"
+            "Routing: streaming, register, or cluster families",
+            "#edf5df",
+        ),
+        (
+            7.45,
+            "PREFILL · run_prefill\nCompressed-column window [start, end)\n"
+            "Local indices · one thread block per row",
+            "#e9eff5",
+        ),
+    ]
+    for x, label, color in adapters:
+        _box(ax, (x, 5.1), (5.8, 1.38), label, color, 11.5)
+        ax.annotate(
+            "",
+            (x + 2.9, 6.6),
+            (7, 7.23),
+            arrowprops={"arrowstyle": "->", "color": "#64748b", "lw": 1.5},
+        )
+        ax.annotate(
+            "",
+            (x + 2.9, 4.34),
+            (x + 2.9, 4.98),
+            arrowprops={"arrowstyle": "->", "color": "#64748b", "lw": 1.5},
+        )
+    ax.text(
+        3.65,
+        4.62,
+        "streaming route",
+        ha="center",
+        fontsize=9,
+        color="#447a00",
+        backgroundcolor="white",
+    )
+    ax.text(
+        10.35,
+        4.62,
+        "compile-time window mode",
+        ha="center",
+        fontsize=9,
+        color="#52616f",
+        backgroundcolor="white",
+    )
+    ax.add_patch(
+        FancyBboxPatch(
+            (0.75, 2.03),
+            12.5,
+            2.15,
+            boxstyle="round,pad=0.08,rounding_size=0.08",
+            facecolor="#f5f9ee",
+            edgecolor="#99bb6c",
+            linewidth=1.3,
+        )
+    )
+    ax.text(
+        7,
+        3.73,
+        "Shared streaming implementation · GvrMainKernel",
+        ha="center",
+        fontsize=14,
+        weight="bold",
+        color="#447a00",
+    )
+    stages = ["Self-sample", "Multi-threshold\nexact counts", "Collect + refine", "Exact indices"]
+    for i, label in enumerate(stages):
+        x = 1.03 + i * 3.08
+        _box(ax, (x, 2.49), (2.55, 0.7), label, "#ffffff", 11)
+        if i < 3:
+            ax.annotate(
+                "",
+                (x + 2.95, 2.84),
+                (x + 2.68, 2.84),
+                arrowprops={"arrowstyle": "->", "color": "#64748b", "lw": 1.4},
+            )
+    ax.text(
+        7,
+        2.14,
+        "Prefill specializes addressing, masks, and index origin; selection logic is shared.",
+        ha="center",
+        fontsize=10,
+        color="#52616f",
+    )
+    _box(
+        ax,
+        (0.75, 0.72),
+        (12.5, 0.66),
+        "Caller-owned INT32 output · no previous-step Top-K prior for V2",
+        "#edf5df",
+        12,
+    )
+    ax.annotate(
+        "", (7, 1.5), (7, 1.91), arrowprops={"arrowstyle": "->", "color": "#64748b", "lw": 1.5}
+    )
+    ax.text(
+        0.75,
+        0.1,
+        "Runtime support: layout gates · precompiled launchers · exact native fallback",
+        fontsize=10.5,
+        color="#52616f",
+    )
+    fig.subplots_adjust(left=0.015, right=0.985, bottom=0.025, top=0.99)
+    _save(fig, "integration")
 
 
 def _matching(rows: list[dict], model: str) -> list[dict]:
@@ -775,7 +920,7 @@ def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
 
 
 def main() -> None:
-    """Validate the frozen dataset, then regenerate statistics and seven figures."""
+    """Validate the frozen dataset, then regenerate statistics and eight figures."""
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
@@ -818,6 +963,7 @@ def main() -> None:
     _speedup_map(rows, "deepselect", "DeepSelect FP32", "DeepSelect FP32 · unsorted indices")
     _latency(rows)
     _roofline(rows)
+    _integration()
 
 
 if __name__ == "__main__":

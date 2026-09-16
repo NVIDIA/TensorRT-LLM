@@ -19,7 +19,7 @@ With NumPy and Matplotlib installed, run from the repository root:
 python docs/source/blogs/media/gvr_v2/plot_results.py
 ```
 
-The script regenerates `summary.json` and seven SVGs: `speedup.svg`, `evolution.svg`, `algorithm.svg`, `sglang_map.svg`, `deepselect_map.svg`, `latency.svg`, and `roofline.svg`. It requires no GPU. The algorithm diagrams are schematic; every performance panel uses the bundled timing observations.
+The script regenerates `summary.json` and eight SVGs: `speedup.svg`, `evolution.svg`, `algorithm.svg`, `sglang_map.svg`, `deepselect_map.svg`, `latency.svg`, `roofline.svg`, and `integration.svg`. It requires no GPU. The algorithm diagrams are schematic; every performance panel uses the bundled timing observations.
 
 ## Published Data
 
@@ -73,6 +73,29 @@ SGLang and FlashInfer lack V3.2 layers 0–2 and cover 9,515 cases in total. HPC
 The latency and roofline curves use arithmetic-mean durations over matching layers at each row-length/batch point: 21 layers for Flash, 30 for Pro, and 58 for V3.2. All layers at each plotted point have the same valid width. The SGLang and DeepSelect FP32 heatmaps (Figures 4 and 5) instead geometrically average per-layer speedups at each shape, using each baseline's full paired coverage. DeepSelect therefore includes all 61 V3.2 layers; SGLang includes 58. Both maps share a 0.8–8.0 scale with parity at 1.0, and cell labels round to one decimal place. A shape average can hide individual regressions.
 
 Correctness compares selected value multisets with `torch.topk`, allowing tied indices to differ. The capture-grid checks do not establish NaN ordering parity or a universal tie order. The linked implementation PRs additionally cover padding, variable lengths, exceptional values, and graph replay.
+
+## Additional Numerical Views
+
+The article uses Figure 1 for the model-level comparison. The following table retains each baseline's full paired coverage; Figure 1 instead uses the common intersection within each model.
+
+| Baseline | V4 Flash, $K=512$ | V4 Pro, $K=1024$ | V3.2, $K=2048$ |
+| :--- | ---: | ---: | ---: |
+| SGLang v2, plan + transform | 1.78× | 1.76× | 1.55× |
+| FlashInfer 0.6.14 | 2.12× | 2.14× | 1.89× |
+| TensorRT-LLM radix CUDA | 4.74× | 4.73× | 5.15× |
+| DeepSelect FP32 | 1.98× | 2.07× | 2.79× |
+| HPC-ops FP32 | 2.30× | Unsupported | 1.30× |
+
+*Each model column uses the workloads supported by that baseline.*
+
+For a concrete large-batch slice, the following times are at $B=1024$ and $N\approx131{,}072$, averaged over the same layers as Figure 6:
+
+| Model | GVR V2 | SGLang | FlashInfer | Radix CUDA | DeepSelect FP32 | HPC-ops FP32 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| V4 Flash | **113.1 µs** | 196.8 µs | 275.4 µs | 461.3 µs | 190.5 µs | 199.2 µs |
+| V4 Pro | **132.8 µs** | 199.1 µs | 298.3 µs | 477.7 µs | 209.1 µs | — |
+| V3.2 | **124.0 µs** | 211.0 µs | 388.8 µs | 496.6 µs | 419.6 µs | 159.7 µs |
+
 
 ## Roofline Definitions
 

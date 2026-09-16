@@ -1,0 +1,292 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="992.16pt" height="598.032pt" viewBox="0 0 992.16 598.032" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:description>Copyright (c) 2026 NVIDIA CORPORATION &amp; AFFILIATES. SPDX-License-Identifier: Apache-2.0</dc:description>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.8, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 598.032
+L 992.16 598.032
+L 992.16 0
+L 0 0
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 59.58 119.38704
+L 932.58 119.38704
+Q 938.1672 119.38704 938.1672 114.1992
+L 938.1672 61.02384
+Q 938.1672 55.836 932.58 55.836
+L 59.58 55.836
+Q 53.9928 55.836 53.9928 61.02384
+L 53.9928 114.1992
+Q 53.9928 119.38704 59.58 119.38704
+z
+" clip-path="url(#p0970280cf8)" style="fill: #e9eff5; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 59.58 265.29504
+L 464.652 265.29504
+Q 470.2392 265.29504 470.2392 260.1072
+L 470.2392 170.61696
+Q 470.2392 165.42912 464.652 165.42912
+L 59.58 165.42912
+Q 53.9928 165.42912 53.9928 170.61696
+L 53.9928 260.1072
+Q 53.9928 265.29504 59.58 265.29504
+z
+" clip-path="url(#p0970280cf8)" style="fill: #edf5df; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 527.508 265.29504
+L 932.58 265.29504
+Q 938.1672 265.29504 938.1672 260.1072
+L 938.1672 170.61696
+Q 938.1672 165.42912 932.58 165.42912
+L 527.508 165.42912
+Q 521.9208 165.42912 521.9208 170.61696
+L 521.9208 260.1072
+Q 521.9208 265.29504 527.508 265.29504
+z
+" clip-path="url(#p0970280cf8)" style="fill: #e9eff5; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 59.58 464.3784
+L 932.58 464.3784
+Q 938.1672 464.3784 938.1672 459.19056
+L 938.1672 319.76736
+Q 938.1672 314.57952 932.58 314.57952
+L 59.58 314.57952
+Q 53.9928 314.57952 53.9928 319.76736
+L 53.9928 459.19056
+Q 53.9928 464.3784 59.58 464.3784
+z
+" clip-path="url(#p0970280cf8)" style="fill: #f5f9ee; stroke: #99bb6c; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 79.1352 434.54832
+L 257.2272 434.54832
+Q 262.8144 434.54832 262.8144 429.36048
+L 262.8144 383.96688
+Q 262.8144 378.77904 257.2272 378.77904
+L 79.1352 378.77904
+Q 73.548 378.77904 73.548 383.96688
+L 73.548 429.36048
+Q 73.548 434.54832 79.1352 434.54832
+z
+" clip-path="url(#p0970280cf8)" style="fill: #ffffff; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 294.2424 434.54832
+L 472.3344 434.54832
+Q 477.9216 434.54832 477.9216 429.36048
+L 477.9216 383.96688
+Q 477.9216 378.77904 472.3344 378.77904
+L 294.2424 378.77904
+Q 288.6552 378.77904 288.6552 383.96688
+L 288.6552 429.36048
+Q 288.6552 434.54832 294.2424 434.54832
+z
+" clip-path="url(#p0970280cf8)" style="fill: #ffffff; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 509.3496 434.54832
+L 687.4416 434.54832
+Q 693.0288 434.54832 693.0288 429.36048
+L 693.0288 383.96688
+Q 693.0288 378.77904 687.4416 378.77904
+L 509.3496 378.77904
+Q 503.7624 378.77904 503.7624 383.96688
+L 503.7624 429.36048
+Q 503.7624 434.54832 509.3496 434.54832
+z
+" clip-path="url(#p0970280cf8)" style="fill: #ffffff; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 724.4568 434.54832
+L 902.5488 434.54832
+Q 908.136 434.54832 908.136 429.36048
+L 908.136 383.96688
+Q 908.136 378.77904 902.5488 378.77904
+L 724.4568 378.77904
+Q 718.8696 378.77904 718.8696 383.96688
+L 718.8696 429.36048
+Q 718.8696 434.54832 724.4568 434.54832
+z
+" clip-path="url(#p0970280cf8)" style="fill: #ffffff; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 59.58 549.32928
+L 932.58 549.32928
+Q 938.1672 549.32928 938.1672 544.14144
+L 938.1672 501.34176
+Q 938.1672 496.15392 932.58 496.15392
+L 59.58 496.15392
+Q 53.9928 496.15392 53.9928 501.34176
+L 53.9928 544.14144
+Q 53.9928 549.32928 59.58 549.32928
+z
+" clip-path="url(#p0970280cf8)" style="fill: #edf5df; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 21px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202b" x="28.152" y="29.8968" transform="rotate(-0 28.152 29.8968)">One selection core, two row interfaces</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(365.165625 82.836364)">Sparse-attention indexer → TopK dispatcher</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(351.579375 99.009176)">One self-sampling configuration for both phases</text>
+   </g>
+   <g id="text_3">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(201.373539 202.876494)">DECODE · run_varlen</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(107.218187 218.695283)">KV lengths + MTP offset + compression → valid prefix</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(126.221039 234.194228)">Routing: streaming, register, or cluster families</text>
+   </g>
+   <g id="patch_11">
+    <path d="M 494.112926 122.324446
+Q 379.100351 142.40767 265.739829 162.202416
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 270.452677 163.612758
+L 265.739829 162.202416
+L 269.695812 159.278343
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 262.116 269.887596
+Q 262.116 288.639016 262.116 305.713385
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 264.316 301.313385
+L 262.116 305.713385
+L 259.916 301.313385
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="text_4">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(673.288805 202.876494)">PREFILL · run_prefill</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(613.231852 218.695283)">Compressed-column window [start, end)</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(615.526461 234.194228)">Local indices · one thread block per row</text>
+   </g>
+   <g id="patch_13">
+    <path d="M 498.047074 122.324446
+Q 613.059649 142.40767 726.420171 162.202416
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 722.464188 159.278343
+L 726.420171 162.202416
+L 721.707323 163.612758
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 730.044 269.887596
+Q 730.044 288.639016 730.044 305.713385
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 732.244 301.313385
+L 730.044 305.713385
+L 727.844 301.313385
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="text_5">
+    <g id="patch_15">
+     <path d="M 222.113109 297.065959
+L 302.118891 297.065959
+L 302.118891 280.435646
+L 222.113109 280.435646
+z
+" style="fill: #ffffff; stroke: #ffffff; stroke-linejoin: miter"/>
+    </g>
+    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #447a00" x="262.116" y="291.23424" transform="rotate(-0 262.116 291.23424)">streaming route</text>
+   </g>
+   <g id="text_6">
+    <g id="patch_16">
+     <path d="M 663.861656 297.065959
+L 796.226344 297.065959
+L 796.226344 280.435646
+L 663.861656 280.435646
+z
+" style="fill: #ffffff; stroke: #ffffff; stroke-linejoin: miter"/>
+    </g>
+    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616f" x="730.044" y="291.23424" transform="rotate(-0 730.044 291.23424)">compile-time window mode</text>
+   </g>
+   <g id="text_7">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #447a00" x="496.08" y="348.94896" transform="rotate(-0 496.08 348.94896)">Shared streaming implementation · GvrMainKernel</text>
+   </g>
+   <g id="text_8">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #17202b" x="168.1812" y="409.698993" transform="rotate(-0 168.1812 409.698993)">Self-sample</text>
+   </g>
+   <g id="patch_17">
+    <path d="M 268.309014 406.66368
+Q 275.734155 406.66368 281.594049 406.66368
+" style="fill: none; stroke: #64748b; stroke-width: 1.4; stroke-linecap: round"/>
+    <path d="M 277.194049 404.46368
+L 281.594049 406.66368
+L 277.194049 408.86368
+" style="fill: none; stroke: #64748b; stroke-width: 1.4; stroke-linecap: round"/>
+   </g>
+   <g id="text_9">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(341.961916 402.286453)">Multi-threshold</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(348.064337 417.111532)">exact counts</text>
+   </g>
+   <g id="patch_18">
+    <path d="M 483.416214 406.66368
+Q 490.841355 406.66368 496.701249 406.66368
+" style="fill: none; stroke: #64748b; stroke-width: 1.4; stroke-linecap: round"/>
+    <path d="M 492.301249 404.46368
+L 496.701249 406.66368
+L 492.301249 408.86368
+" style="fill: none; stroke: #64748b; stroke-width: 1.4; stroke-linecap: round"/>
+   </g>
+   <g id="text_10">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #17202b" x="598.3956" y="409.698993" transform="rotate(-0 598.3956 409.698993)">Collect + refine</text>
+   </g>
+   <g id="patch_19">
+    <path d="M 698.523414 406.66368
+Q 705.948555 406.66368 711.808449 406.66368
+" style="fill: none; stroke: #64748b; stroke-width: 1.4; stroke-linecap: round"/>
+    <path d="M 707.408449 404.46368
+L 711.808449 406.66368
+L 707.408449 408.86368
+" style="fill: none; stroke: #64748b; stroke-width: 1.4; stroke-linecap: round"/>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #17202b" x="813.5028" y="409.698993" transform="rotate(-0 813.5028 409.698993)">Exact indices</text>
+   </g>
+   <g id="text_12">
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616f" x="496.08" y="452.05728" transform="rotate(-0 496.08 452.05728)">Prefill specializes addressing, masks, and index origin; selection logic is shared.</text>
+   </g>
+   <g id="text_13">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #17202b" x="496.08" y="526.05285" transform="rotate(-0 496.08 526.05285)">Caller-owned INT32 output · no previous-step Top-K prior for V2</text>
+   </g>
+   <g id="patch_20">
+    <path d="M 496.08 468.974834
+Q 496.08 480.266544 496.08 489.881203
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 498.28 485.481203
+L 496.08 489.881203
+L 493.88 485.481203
+" style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="text_14">
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #52616f" x="59.58" y="584.3472" transform="rotate(-0 59.58 584.3472)">Runtime support: layout gates · precompiled launchers · exact native fallback</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p0970280cf8">
+   <rect x="7.2" y="7.2" width="977.76" height="583.632"/>
+  </clipPath>
+ </defs>
+</svg>

@@ -26,13 +26,12 @@ On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM 
 - [From GVR V1 to V2: Two Costs to Remove](#from-gvr-v1-to-v2-two-costs-to-remove)
 - [Self-Sampling: Calibrate the Search to This Row](#self-sampling-calibrate-the-search-to-this-row)
 - [Multi-Thresholding: Make Each Full-Row Pass Count](#multi-thresholding-make-each-full-row-pass-count)
-- [Why the Two Ideas Work Together](#why-the-two-ideas-work-together)
 - [Mapping Selection to Blackwell](#mapping-selection-to-blackwell)
 - [Performance Against Five Baselines](#performance-against-five-baselines)
 - [The Roofline Model: Fewer Passes, More Useful Work](#the-roofline-model-fewer-passes-more-useful-work)
 - [Decode and Prefill in TensorRT-LLM](#decode-and-prefill-in-tensorrt-llm)
-- [Further Reading](#further-reading)
 - [Conclusion](#conclusion)
+- [Further Reading](#further-reading)
 
 ## From GVR V1 to V2: Two Costs to Remove
 
@@ -65,7 +64,7 @@ Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA
 
 ## Self-Sampling: Calibrate the Search to This Row
 
-The first job is to place the search near the upper tail of this row's score distribution. V2 takes a small, deterministic sample distributed across the row and uses its ranks to estimate thresholds for the full population. The sample supplies a starting region; the later full-row verification decides whether that region contains enough candidates.
+V2 takes a small, deterministic sample across the valid row and uses its ranks to estimate the upper tail of the full population. The sample chooses a starting region; full-row verification determines whether it contains enough candidates.
 
 In the `main` family, a sample unit is two adjacent `float4` vectors: eight scores loaded together. The clustered streaming family uses four vectors, or sixteen scores. Sample units are regularly spaced across the valid interval. Their addresses follow from the row layout, so sampling does not wait for previous-step indices. Sampling can still miss an unusual tail; its role is to reduce work, not to decide output membership.
 
@@ -81,11 +80,11 @@ provide three anchors:
 - **Upper anchor $T_K$:** estimate the neighborhood of rank $K$; together with $T$, it defines the upper classification bound $H$ (`HIC` in the implementation).
 - **Lower floor $T_{\mathrm{floor}}$:** admit a larger population if the first estimate is too aggressive (`TSH` in the implementation).
 
-The concrete sample budget, safety margin in $A$, rank rounding, and capacity clamps depend on the launch family. The algorithm does not assume independent random samples or a known analytical distribution. Its useful property is that the bracket is calibrated from the same row whose boundary will be verified.
+Sample budgets, safety margins, and capacity clamps depend on the launch family. The estimate requires neither independent random samples nor a known analytical distribution; exact verification handles a poor estimate.
 
-![Self-sampling chooses a bracket, multi-threshold verification obtains exact bin counts, and refinement emits 980 certain winners plus 44 of 73 boundary candidates for K=1024.](../media/gvr_v2/algorithm.svg)
+![Self-sampling, exact multi-threshold counts, and crossing-bin refinement, with three verification outcomes: refine, lower admission, or exact recovery.](../media/gvr_v2/algorithm.svg)
 
-*Figure 3. Two histograms serve different purposes: the sample histogram estimates a useful region; the verification histogram contains exact populations from the complete valid row or its complete admitted candidates. The pictured bin heights and 980/73/44 example are illustrative. Register-resident shortcuts are described below.*
+*Figure 3. The sample histogram estimates a bracket; the verification histogram counts the complete admitted population. The lower panel shows how verification controls refinement and recovery. Bin heights and the 980/73/44 example are illustrative; exact recovery depends on the kernel family.*
 
 ## Multi-Thresholding: Make Each Full-Row Pass Count
 
@@ -94,7 +93,7 @@ A scalar verification pass answers one question: how many scores exceed $T$? Mul
 Conceptually, divide the bracket $[T,H]$ into $M$ ordered bins, with boundaries $t_0,\ldots,t_M$, and let $h_j$ be the exact population of bin $j$. A descending cumulative scan yields
 
 $$
-C(t_j)=\sum_{\ell=j}^{M-1}h_\ell.
+C(t_j)=\sum_{\ell=j}^{M-1}h_\ell,\qquad 0\le j\lt M.
 $$
 
 The streaming verification histogram has 256 bins. Each survivor is assigned to a bin once; a small on-chip cumulative scan then exposes counts at all its boundaries. **One classification contributes to an entire family of threshold counts.** The expensive score reads are shared, and the remaining scan touches only the bin counters. Verification can locate where the population crosses $K$ without issuing another full-row query for each trial threshold.
@@ -120,21 +119,15 @@ For $K=1024$, suppose 980 scores lie above the crossing bin and 73 lie inside it
 
 The histogram discretizes the search region, not the selected scores. Exact comparisons within the crossing bin resolve its coarse boundaries, including ties. Thus fewer passes do not require approximate Top-K membership.
 
-### Two Kinds of Thresholds, Two Different Jobs
+### How Verification Preserves Exactness
 
-The **sample-derived admission ladder** ($T$, a lower floor, and a conservative sentinel) repairs a poor initial guess. The **verification bin boundaries** answer many exact population queries within an admitted region. They work at different levels and should not be confused.
+**The sample focuses the bins; exact bin counts make the sample safe.** A useful bracket keeps the crossing small, while multi-threshold verification avoids a separate full-row query for every trial boundary. Figure 3 distinguishes the resulting paths: refine a complete admitted set, lower admission when too few scores survive, or recover exactly when staging or bracket checks fail.
 
-For non-split streaming, too few survivors can trigger another full-row scan at a valid lower floor and then at the sentinel. Split-row streaming can stage down to the lower floor within its scan and use exact recovery if necessary. Candidate overflow cannot be treated as a successful partial selection: the kernel re-scans or falls back to exact key-space selection over a complete candidate set or the whole row.
+Two mechanisms have different jobs. The **admission ladder**—the primary threshold, lower floor, and conservative sentinel—widens the candidate region. The **verification bin boundaries** locate rank $K$ within that region. Non-split streaming can rescan at a lower threshold; split-row streaming can stage down to the lower floor within its scan. Overflow requires complete-set or whole-row exact recovery.
 
-## Why the Two Ideas Work Together
+Guess quality controls work, while complete counts and exact refinement control membership. There is no fixed one-pass guarantee. For example, [PR #18625](https://github.com/NVIDIA/TensorRT-LLM/pull/18625) repairs infinite-width brackets in register families with exact whole-row key selection, preserving `+inf` winners.
 
-The two ideas address successive sources of work. Self-sampling gives the histogram a useful region to resolve. Multi-threshold verification locates the exact crossing within that region. Refinement ranks only the candidates whose membership is still undecided. The expensive global operation gets progressively more information before the algorithm commits to more work.
-
-A good sample without broad verification could still pay for repeated full-row threshold tests. A histogram without a useful bracket could put too many scores into the crossing bin and leave expensive refinement. **V2 uses the sample to focus the bins, and the exact bin counts to make the sample safe.** Its performance objective is to avoid repeated expensive passes over $N$, while keeping most remaining work within a much smaller candidate region.
-
-This is an optimization of work, not a fixed one-pass guarantee. Difficult distributions, staging overflow, and unusable brackets may require extra scans. Exactness includes those paths: [PR #18625](https://github.com/NVIDIA/TensorRT-LLM/pull/18625) fixes register-family infinite-width brackets by using exact whole-row key selection, preserving `+inf` among the winners.
-
-The output contract is an exact selected **value multiset** with valid unique indices. Equal-valued candidates are interchangeable; index order need not match `torch.topk`. Short rows return all valid local indices followed by `-1` padding. NaN ordering remains implementation-specific. Guess quality controls the amount of work; complete counts and exact refinement control membership.
+The output contract is an exact selected **value multiset** with valid unique indices. Tied indices may differ from `torch.topk`; output order is unrestricted. Short rows return valid local indices followed by `-1` padding. NaN ordering remains implementation-specific.
 
 ## Mapping Selection to Blackwell
 
@@ -155,11 +148,35 @@ This explains the two sources of performance improvement: a better starting thre
 
 ## Performance Against Five Baselines
 
+### Benchmark Setup
+
+The benchmarks use FP32 indexer scores from the three models below on NVIDIA B200, with batch sizes from 1 to 1,024. Results report cold-L2 GPU kernel time, excluding compilation, input preparation, and Python overhead. Speedups are geometric means over matched workloads.
+
+| Model | $K$ | Indexer compression | Valid row lengths $N$ |
+| :--- | ---: | ---: | :--- |
+| DeepSeek-V4 Flash | 512 | 4 | 1,027–262,127 |
+| DeepSeek-V4 Pro | 1,024 | 4 | 1,027–262,127 |
+| DeepSeek-V3.2 | 2,048 | 1 | 4,111–163,775 |
+
+**$N$ is the indexer row width, not the original prompt length.** A roughly 512K-token V4 context yields a roughly 128K-wide indexer row because of 4× compression.
+
+### Overall Results
+
+| Baseline | Geomean speedup | Minimum speedup | GVR V2 faster |
+| :--- | ---: | ---: | ---: |
+| SGLang v2, plan + transform | **1.66×** | 0.95× | 99.91% |
+| FlashInfer 0.6.14 `top_k` | **2.01×** | 1.20× | 100.00% |
+| TensorRT-LLM radix CUDA dispatch | **4.93×** | 1.34× | 100.00% |
+| DeepSelect v1.0.0 FP32 | **2.37×** | 0.84× | 99.60% |
+| HPC-ops FP32 | **1.55×** | 0.71× | 98.38% |
+
+The minimum column retains individual regressions. Figure 1 shows the model-level comparison on the common workloads supported by each implementation.
+
 ### The Gains Extend Beyond an Average
 
-Figure 1 puts the GVR evolution and library baselines on the same scale. Across the three models, tiered temporal GVR takes **1.34–1.50×** V2's time, SGLang takes **1.55–1.78×**, and radix CUDA takes **4.73–5.15×**. The comparison also reveals model-dependent behavior: HPC-ops is closer on V3.2 than on Flash, while DeepSelect's FP32 V3.2 route leaves a larger gap.
+The comparison changes with the model and shape. Figure 1 shows HPC-ops closest on V3.2 and a larger DeepSelect FP32 gap there. The heatmaps resolve those averages into the row-length and batch regions where each advantage appears.
 
-GVR V2 is faster in every tested radix and FlashInfer comparison and in **99.91%** of SGLang comparisons. Figure 4 shows how the advantage changes with row length and batch size.
+Figure 4 locates the SGLang gains across the full length–batch grid.
 
 ![Three heatmaps of GVR V2 speedup over SGLang for every captured row-length bucket and all eleven batch sizes, averaged geometrically across layers.](../media/gvr_v2/sglang_map.svg)
 
@@ -175,41 +192,7 @@ DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long
 
 For **V3.2, the gain reaches 7.66× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.23×** and **4.34×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.996×).
 
-Two details determine how these gains carry into an application: the actual row-length and batch distribution, and the work each API returns. The next sections make both explicit.
-
-### Benchmark Setup
-
-The benchmarks use FP32 indexer scores from the three models below on NVIDIA B200, with batch sizes from 1 to 1,024. Results report cold-L2 GPU kernel time, excluding compilation, input preparation, and Python overhead. Speedups are geometric means over matched workloads.
-
-| Model | $K$ | Indexer compression | Valid row lengths $N$ |
-| :--- | ---: | ---: | :--- |
-| DeepSeek-V4 Flash | 512 | 4 | 1,027–262,127 |
-| DeepSeek-V4 Pro | 1,024 | 4 | 1,027–262,127 |
-| DeepSeek-V3.2 | 2,048 | 1 | 4,111–163,775 |
-
-**$N$ is the indexer row width, not the original prompt length.** A roughly 512K-token V4 context yields a roughly 128K-wide indexer row because of 4× compression.
-
-### Overall and Per-Model Results
-
-| Baseline | Geomean speedup | Minimum speedup | GVR V2 faster |
-| :--- | ---: | ---: | ---: |
-| SGLang v2, plan + transform | **1.66×** | 0.95× | 99.91% |
-| FlashInfer 0.6.14 `top_k` | **2.01×** | 1.20× | 100.00% |
-| TensorRT-LLM radix CUDA dispatch | **4.93×** | 1.34× | 100.00% |
-| DeepSelect v1.0.0 FP32 | **2.37×** | 0.84× | 99.60% |
-| HPC-ops FP32 | **1.55×** | 0.71× | 98.38% |
-
-The minimum column exposes individual regressions that a geometric mean can hide. GVR V2 wins every recorded radix and FlashInfer pair, while SGLang, DeepSelect, and HPC-ops retain individual winning cases.
-
-| Baseline | V4 Flash, $K=512$ | V4 Pro, $K=1024$ | V3.2, $K=2048$ |
-| :--- | ---: | ---: | ---: |
-| SGLang v2, plan + transform | 1.78× | 1.76× | 1.55× |
-| FlashInfer 0.6.14 | 2.12× | 2.14× | 1.89× |
-| TensorRT-LLM radix CUDA | 4.74× | 4.73× | 5.15× |
-| DeepSelect FP32 | 1.98× | 2.07× | 2.79× |
-| HPC-ops FP32 | 2.30× | Unsupported | 1.30× |
-
-*Each model column uses the workloads supported by that baseline.*
+These patterns identify useful operating regions. The native API contracts below explain which work is included in each comparison.
 
 ### What Explains the Differences
 
@@ -230,16 +213,6 @@ The minimum column exposes individual regressions that a geometric mean can hide
 *Figure 6. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. Solid and dashed lines distinguish benchmark runs. Both axes are logarithmic; 1K means 1,024.*
 
 At $B=1$, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At $B=1024$, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.
-
-For a concrete large-batch slice, the following times are at $B=1024$ and $N\approx131{,}072$, averaged over the same layers as Figure 6:
-
-| Model | GVR V2 | SGLang | FlashInfer | Radix CUDA | DeepSelect FP32 | HPC-ops FP32 |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| V4 Flash | **113.1 µs** | 196.8 µs | 275.4 µs | 461.3 µs | 190.5 µs | 199.2 µs |
-| V4 Pro | **132.8 µs** | 199.1 µs | 298.3 µs | 477.7 µs | 209.1 µs | — |
-| V3.2 | **124.0 µs** | 211.0 µs | 388.8 µs | 496.6 µs | 419.6 µs | 159.7 µs |
-
-The contrast between single-row latency and large-batch throughput reflects the importance of selecting the right execution family.
 
 ## The Roofline Model: Fewer Passes, More Useful Work
 
@@ -296,21 +269,23 @@ The full ideal bound is $T_{\mathrm{roof}}=\max(Q_{\min}/\mathrm{BW},W/R_{\mathr
 
 ### One Selection Core, Two Row Interfaces
 
-TensorRT-LLM integrates GVR V2 around a **shared selection core with phase-specific row adapters**. The `TopK` module connects the sparse-attention indexer to the selected engine and writes INT32 indices into the caller's output buffer. The same configuration selects self-sampling for supported decode and prefill paths, giving both phases a common exact-selection contract.
+TensorRT-LLM separates phase-specific row metadata from shared selection logic. The `TopK` module applies the same self-sampling configuration to supported decode and prefill paths, then passes each phase's valid score interval to the selected engine.
 
-The adapters express each phase's work as a valid score interval. Decode's `run_varlen` derives each row's length from device-resident KV lengths, the multi-token prediction offset, and the indexer's compression ratio. Prefill's `run_prefill` receives `[start, end)` intervals already expressed in compressed score columns and returns indices relative to `start`. Both preserve identity indices for short rows and fill unused output slots with `-1`.
+![Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes.](../media/gvr_v2/integration.svg)
 
-The kernel reuse is concrete: prefill specializes the **same `GvrMainKernel` streaming implementation used by decode**. A compile-time window mode adapts row addressing, masks values outside the valid interval, and translates the selected indices into the local output frame. The self-sampling, multi-threshold counting, candidate collection, and exact refinement remain in the shared implementation. Prefill uses one thread block per row, while decode retains its register and cluster specializations for other workload shapes. This keeps the selection logic shared while allowing each phase to use an appropriate execution plan. [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) introduces this reuse.
+*Figure 8. Shared selection logic with phase-specific row interfaces. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
 
-Self-sampling also simplifies the lifecycle around that core. Each invocation builds its bracket from the current scores, so the V2 path needs no previous-step selection buffer, prefill-to-decode prior seeding, or post-decode prior write-back. The integration allocates and updates that state only for the temporal engine. This lets the same selection design serve both a newly computed prefill window and a growing decode row. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) makes the dispatch and state ownership consistent.
+The adapters preserve each phase's indexing semantics. Decode derives valid prefixes from device KV lengths, multi-token prediction offsets, and compression. Prefill receives `[start, end)` in compressed columns and returns indices relative to `start`. Both write INT32 indices into caller-owned output, with identity indices and `-1` padding for short rows.
+
+Prefill's compile-time mode changes addressing, masking, and index origin in the same **`GvrMainKernel` streaming implementation** used by decode. Self-sampling, multi-threshold counting, collection, and exact refinement stay shared. One block per prefill row and specialized decode scheduling let the common algorithm serve different parallelism requirements. [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) implements this reuse.
+
+The bracket comes from the current scores in both phases. Consequently, V2 needs no previous-step Top-K buffer, prefill-to-decode prior seeding, or prior write-back. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) limits that state to the temporal engine.
 
 ### Stable Launches, Dynamic Row Lengths
 
-CUDA Graph replay needs a stable launch configuration even as requests grow. The host chooses a kernel family and launch envelope before capture. During decode, each row reads its actual length from device-resident metadata, including its multi-token prediction offset and compression ratio.
+Host routing chooses a stable launch envelope; device metadata supplies each row's actual length. The physical memory bound remains separate from the bound used to select an execution plan. Warmup prepares exact-row decode launchers and a bounded set of prefill tiers and width buckets, with distinct compilation-cache keys for the two phase specializations. [PR #18683](https://github.com/NVIDIA/TensorRT-LLM/pull/18683) and [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) establish these rules.
 
-The framework separates the physical row-width bound used for safe memory access from the routing bound used to choose an execution plan. Warmup prepares the decode launchers for exact row counts and the prefill launchers for a bounded set of row-count tiers and width buckets. Decode and prefill specializations have distinct compilation-cache keys, even though they share the streaming implementation. [PR #18683](https://github.com/NVIDIA/TensorRT-LLM/pull/18683) and [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) establish these launch and warmup rules.
-
-The `TopK` boundary also checks whether the score layout supports the fast path. Unsupported layouts use exact native selection; a prefill specialization missing during graph capture falls back to radix without compiling inside capture. Configuration, warmup, and fallback therefore support the same selection contract as the shared kernel.
+Unsupported layouts use exact native selection. If a prefill specialization is missing during CUDA Graph capture, `TopK` selects radix without compiling inside capture. Both adapters preserve the exact output contract when the fast path is unavailable.
 
 ### Serving Gains from the Shared Engine
 
@@ -340,6 +315,12 @@ trtllm-serve deepseek-ai/DeepSeek-V4-Flash \
 
 V2 requires CUTLASS DSL, datacenter Blackwell SM100/SM103, $K\in\lbrace 512,1024,2048\rbrace$, and supported indexer compression ratios 1 or 4. The fast path expects FP32 scores with unit inner stride, a row stride divisible by four floats, and a 16-byte-aligned base. Unsupported layouts use exact native fallback selection. The retired `TRTLLM_GVR_SELF_SAMPLING` environment variable is no longer the enablement mechanism, and `use_cute_dsl_topk` is not required to select V2.
 
+## Conclusion
+
+GVR V2 makes exact Top-K cheaper by learning more before repeating expensive work. **Self-sampling focuses the search; multi-threshold counts locate the crossing; exact refinement resolves the remaining membership.** Register, streaming, and cluster execution paths adapt that design to the available parallelism.
+
+The performance maps show where the gains occur, and the Pareto curves express them as progress toward the bandwidth roof. A shared streaming implementation carries the same selection logic into decode and prefill, with phase-specific row interfaces and no temporal Top-K prior.
+
 ## Further Reading
 
 [Benchmark methodology and figure reproduction](../media/gvr_v2/README.md) are available separately.
@@ -355,9 +336,3 @@ Implementation milestones:
 - [PR #18702: self-sampling prefill](https://github.com/NVIDIA/TensorRT-LLM/pull/18702).
 
 For the surrounding model pipeline, see [Sparse Attention in TensorRT-LLM](blog17_Sparse_Attention_in_TensorRT-LLM.md) and [DeepSeek-V4 on NVIDIA Blackwell](blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md).
-
-## Conclusion
-
-GVR V2 reduces the cost of finding the boundary before optimizing the work left at that boundary. **Self-sampling** places the search near the current row's tail. **Multi-thresholding** turns a classification pass into many exact population counts. The crossing bin then isolates the candidates that still need ranking. This removes the previous-step Top-K state and dependent gather of temporal GVR while preserving exact membership through verification and recovery.
-
-The B200 results connect that algorithmic change to practical kernels: 4.93× over radix CUDA, 1.66× over SGLang including planning, and broad gains over FlashInfer, DeepSelect FP32, and HPC-ops FP32 on their paired case sets. The roofline makes the objective concrete: move useful selection throughput closer to the bandwidth roof by spending less time revisiting the row. Register, streaming, and cluster specializations make this design work across launch sizes, while the shared exactness contract carries it from decode into prefill.
