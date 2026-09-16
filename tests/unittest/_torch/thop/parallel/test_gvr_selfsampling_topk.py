@@ -1835,6 +1835,7 @@ def _check_varlen_against_reference(lg, out, ref, tag=""):
         (128, 65536, 512, "main", "ties"),  # integer plateaus: many exact ties
         (32, 131072, 1024, "clus", "randn"),  # 4-CTA cluster
         (64, 131072, 512, "clus", "relu"),  # 2-CTA cluster, indexer-like zero plateau
+        (64, 262144, 1024, "clus", "randn"),  # 2-CTA cluster at 1M: the enabled band
         (4, 262144, 1024, "main", "randn"),  # SPLIT main (R=37): skip is legal, just not useful
         (8, 32768, 1024, "reg_clus", "randn"),  # register family: block_max ignored
     ],
@@ -1983,14 +1984,15 @@ def test_selfsampling_block_skip_guards():
 
 def test_selfsampling_block_skip_useful_families():
     """The glue arms the skip only where it measured a win: the single-CTA
-    streaming main at envelopes of >= 512k raw tokens; shorter envelopes, the
-    cluster family, the register families and the multi-CTA SPLIT main are
-    excluded."""
+    streaming main at envelopes of >= 512k raw tokens and the 2-CTA cluster
+    family at >= 1M; shorter envelopes, the 4-CTA cluster, the register
+    families and the multi-CTA SPLIT main are excluded."""
     k = 1024
     assert ss_host.block_skip_useful(128, 131072, k, 131072)  # main R=1, 512k
     assert ss_host.block_skip_useful(128, 262144, k, 262144)  # main R=1, 1M
     assert not ss_host.block_skip_useful(128, 65536, k, 65536)  # main R=1 but 256k
-    assert not ss_host.block_skip_useful(64, 131072, k, 131072)  # clus cs=2
+    assert ss_host.block_skip_useful(64, 262144, k, 262144)  # clus cs=2, 1M
+    assert not ss_host.block_skip_useful(64, 131072, k, 131072)  # clus cs=2, 512k
     assert not ss_host.block_skip_useful(32, 262144, k, 262144)  # clus cs=4
     assert not ss_host.block_skip_useful(1, 262144, k, 262144)  # SPLIT main R=64
     assert not ss_host.block_skip_useful(8, 65536, k, 65536)  # reg_clus

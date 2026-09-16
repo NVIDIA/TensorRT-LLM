@@ -785,10 +785,11 @@ class Indexer(nn.Module):
             and self.use_fp4
         )
         # Block-max skip for the self-sampling engine (FP4 + DSL scorer): the
-        # epilogue emits per-32-position maxima and the single-CTA streaming
-        # top-k skips the blocks below its sampled line. Armed per launch
-        # geometry (large batch at >= 512k-token envelopes, where the row scan
-        # is bandwidth-bound; see gvr_topk_decode_self_sampling_host.block_skip_useful).
+        # epilogue emits per-32-position maxima and the streaming top-k
+        # (single-CTA main, 2-CTA cluster) skips the blocks below its sampled
+        # line. Armed per launch geometry (large batch at >= 512k-token
+        # envelopes, where the row scan is bandwidth-bound; see
+        # gvr_topk_decode_self_sampling_host.block_skip_useful).
         self.use_gvr_block_skip = (
             getattr(sparse_params, "use_gvr_block_skip", True)
             and self._use_self_sampling_topk

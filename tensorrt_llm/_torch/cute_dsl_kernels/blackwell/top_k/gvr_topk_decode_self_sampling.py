@@ -115,25 +115,37 @@ def build_skip_table(
     TF,
     tidx,
     s_skipb,
+    it0,
     u: cutlass.Constexpr,
     blk: cutlass.Constexpr,
+    it_step: cutlass.Constexpr = 1,
 ):
     """bm_addr: Int64 byte base of this row's block maxima; jbase = c0 >> 3;
-    jlim = exclusive block bound; n_it tiles; step8 = tile stride in blocks."""
-    tot = n_it * cutlass.Int32(SKIP_GROUPS)
+    jlim = exclusive block bound; n_it tiles; step8 = tile stride in blocks.
+    Builds tiles it0, it0 + it_step, ... < n_it (a cluster rank builds only the
+    chunks it scans); the U block-max loads of a byte are issued together."""
+    n_own = (n_it - it0 + cutlass.Int32(it_step - 1)) // cutlass.Int32(it_step)
+    tot = n_own * cutlass.Int32(SKIP_GROUPS)
     b = tidx
     while b < tot:
-        it = b // cutlass.Int32(SKIP_GROUPS)
-        d = b - it * cutlass.Int32(SKIP_GROUPS)
+        itl = b // cutlass.Int32(SKIP_GROUPS)
+        d = b - itl * cutlass.Int32(SKIP_GROUPS)
+        it = it0 + itl * cutlass.Int32(it_step)
         byte = cutlass.Int32(0)
         if d <= cutlass.Int32(128):
             j0 = jbase + d + it * step8
+            vals = []
+            for uu in cutlass.range_constexpr(u):
+                jc = j0 + cutlass.Int32(uu * (blk // 8))
+                if jc >= jlim:
+                    jc = jlim - cutlass.Int32(1)
+                vals.append(ldg_f32(bm_addr, jc))
             for uu in cutlass.range_constexpr(u):
                 j = j0 + cutlass.Int32(uu * (blk // 8))
                 if j < jlim:
-                    if ldg_f32(bm_addr, j) >= TF:
+                    if vals[uu] >= TF:
                         byte = byte | cutlass.Int32(1 << uu)
-        s_skipb[b] = cutlass.Int8(byte)
+        s_skipb[it * cutlass.Int32(SKIP_GROUPS) + d] = cutlass.Int8(byte)
         b = b + cutlass.Int32(blk)
 
 
@@ -2305,6 +2317,7 @@ class GvrMainKernel:
                         TF,
                         tidx,
                         s_skipb,
+                        cutlass.Int32(0),
                         u=U,
                         blk=BLK,
                     )
@@ -5290,12 +5303,27 @@ class GvrClusKernel:
             # PRIME-LATE: every rank's sample has landed; prime NOW.
             lim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
             pf = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(PFD)]
-            for uu in cutlass.range_constexpr(PFD):  # clamped prime
-                i_ = rank * cutlass.Int32(STEPC) + tidx + cutlass.Int32(uu * BLK)
-                ic = i_
-                if ic >= n4:
-                    ic = lim4
-                C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
+            if cutlass.const_expr(not self.block_skip):
+                for uu in cutlass.range_constexpr(PFD):  # clamped prime
+                    i_ = rank * cutlass.Int32(STEPC) + tidx + cutlass.Int32(uu * BLK)
+                    ic = i_
+                    if ic >= n4:
+                        ic = lim4
+                    C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
+            else:
+                # block-skip variant: L2 hints only here (pf[] stays dead across the
+                # sample histogram and the skip table); the gated register prime
+                # follows the attempt-0 skip table
+                gp0 = cutlass.Int32(0)
+                if (rank + cutlass.Int32(1)) * cutlass.Int32(STEPC) <= n4:
+                    gp0 = cutlass.Int32(1)
+                for uu in cutlass.range_constexpr(PFD):
+                    i_ = rank * cutlass.Int32(STEPC) + tidx + cutlass.Int32(uu * BLK)
+                    ic = i_
+                    if ic >= n4:
+                        ic = lim4
+                    if gp0 != cutlass.Int32(0):
+                        C._prefetch_l2(x_addr + cutlass.Int64(i_) * cutlass.Int64(16))
             # asm prefetch gate: DEEP rows only; empty for U<=PFD
             if cutlass.const_expr(U > PFD):
                 gpp = cutlass.Int32(0)
@@ -5483,8 +5511,8 @@ class GvrClusKernel:
                 # MUFU.RCP spelling: WD >= 1e-30 finite by the wdok clamp;
                 # classify bucketing is SC-invariant for any SC > 0.
                 SC = cute.arch.rcp_approx(WD)
-                # block-max skip table for this attempt's line (every rank builds
-                # the whole row: chunk `g` -> table tile `g`)
+                # block-max skip table for this attempt's line (each rank builds
+                # the tiles of its own chunks: chunk `g` -> table tile `g`)
                 skip_on = cutlass.Int32(0)
                 if cutlass.const_expr(self.block_skip):
                     if skip_en != cutlass.Int32(0):
@@ -5504,10 +5532,29 @@ class GvrClusKernel:
                             TF,
                             tidx,
                             s_skipb,
+                            rank,
                             u=U,
                             blk=BLK,
+                            it_step=CS,
                         )
                         cute.arch.barrier()  # ---- barrier (skip table) ----
+                    if att == cutlass.Int32(0):  # gated prime of the first owned chunk
+                        okb0 = cutlass.Int32(0xFF)
+                        if skip_on != cutlass.Int32(0):
+                            okb0 = cutlass.Int32(
+                                s_skipb[
+                                    rank * cutlass.Int32(SKIP_GROUPS) + (tidx >> cutlass.Int32(3))
+                                ]
+                            ) & cutlass.Int32(0xFF)
+                        for uu in cutlass.range_constexpr(PFD):
+                            pc0 = rank * cutlass.Int32(STEPC) + tidx + cutlass.Int32(uu * BLK)
+                            if pc0 >= n4:
+                                pc0 = lim4
+                            if (okb0 & cutlass.Int32(1 << uu)) != cutlass.Int32(0):
+                                C.ld_g_f32x4(atom128, x_addr, pc0, pf[uu])
+                            else:
+                                for q in cutlass.range_constexpr(4):
+                                    pf[uu][q] = cutlass.Float32(0.0)
 
                 # ---- P3 row pass over OWNED CHUNKS ----
                 g = rank + cutlass.Int32(0)

@@ -943,6 +943,8 @@ def _varlen_launcher(
 
 
 BLOCK_SKIP_MIN_N = 131072  # compressed positions (512k raw @ cr=4)
+BLOCK_SKIP_CLUS_MIN_N = 262144  # 2-CTA cluster family: 1M raw @ cr=4
+BLOCK_SKIP_MAX_N = 262144  # skip table covers SKIP_BLOCKS * 32 compressed positions
 
 
 def block_skip_useful(
@@ -955,19 +957,21 @@ def block_skip_useful(
 ) -> bool:
     """True when the varlen dispatch for this geometry lands on the single-CTA
     streaming main (R == 1) at an envelope of >= BLOCK_SKIP_MIN_N compressed
-    positions -- the only regime where the row scan is bandwidth-bound enough
-    for the gated loads to pay (cold B200, real DSv4 rows: 512k B128 +9/+14 %,
-    1M B128 +26/+34 % Pro/Flash; 128k-256k single-CTA rows -2..-6 %). The
-    cluster family (-3..-16 %), the register families (row loaded before a
-    line exists) and the multi-CTA SPLIT main (~1 us of row per launch) do
-    not pay for the table build and the per-tile gating. Pure host function
-    (mirrors _varlen_launcher's tiers)."""
+    positions (cold B200, real DSv4 rows: 512k B128 +8/+14 %, 1M B128
+    +26/+32 % Pro/Flash; 128k-256k single-CTA rows -2..-6 %), or on the 2-CTA
+    cluster family at >= BLOCK_SKIP_CLUS_MIN_N (1M B64 +15/+14 %; its 512k
+    band is flat and the 4-CTA cluster stays within noise). The register
+    families (row loaded before a line exists) and the multi-CTA SPLIT main
+    (~1 us of row per launch) do not pay for the table build and the per-tile
+    gating. Pure host function (mirrors _varlen_launcher's tiers)."""
     n_kernel = min(int(n_env), int(npad))
-    if n_kernel < BLOCK_SKIP_MIN_N:
+    if n_kernel < BLOCK_SKIP_MIN_N or n_kernel > BLOCK_SKIP_MAX_N:
         return False
     n_route = max(n_kernel, int(k) + 1)
     plan_free = route(int(num_rows), n_route, int(npad), int(k), num_sms, sm_version)
-    if plan_free["kernel"] in ("clus", "reg_clus", "reg", "regimg"):
+    if plan_free["kernel"] == "clus":
+        return int(plan_free["cluster"]) == 2 and n_kernel >= BLOCK_SKIP_CLUS_MIN_N
+    if plan_free["kernel"] in ("reg_clus", "reg", "regimg"):
         return False
     plan = route_streaming(int(num_rows), n_route, int(npad), int(k), force_main=True)
     return int(plan["rt"]["R"]) == 1
