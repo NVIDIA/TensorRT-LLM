@@ -90,7 +90,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
 
     def test_docs_skip_junit_after_a_successful_build(self) -> None:
         self.assertIn(
-            'cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, '
+            'cacheErrorAndUploadResult(pipeline, "${key}", values[1], {}, true, attemptTag, '
             "isFinalAttempt, retryContext)",
             L0_TEST,
         )
