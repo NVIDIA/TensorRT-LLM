@@ -44,8 +44,11 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4MoeRoutingMethod,
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
+    _Gemma4SharedKVLinearMethod,
 )
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, UnquantizedLinearMethod
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -201,6 +204,396 @@ class TestGemma4Config(unittest.TestCase):
         explicit = ["full_attention"] * 4
         cfg = Gemma4TextConfig(num_hidden_layers=4, layer_types=explicit)
         self.assertEqual(cfg.layer_types, explicit)
+
+
+class TestGemma4SharedKVLinear(unittest.TestCase):
+    @torch.no_grad()
+    def test_shared_kv_selection(self) -> None:
+        model = Gemma4ForCausalLM(_make_model_config(GEMMA4_SMALL_CONFIG))
+        for layer in model.model.layers:
+            attn = layer.self_attn
+            expected = attn.use_k_eq_v and not attn.is_kv_shared
+            # Weight creation resets the method, as it does in deferred
+            # mixed-precision checkpoint loading. Selection must happen
+            # afterwards, including on a reload of the same module.
+            for _ in range(2):
+                attn.qkv_proj._weights_created = False
+                attn.qkv_proj.create_weights()
+                self.assertIs(type(attn.qkv_proj.quant_method), UnquantizedLinearMethod)
+                attn.post_load_weights()
+                self.assertEqual(
+                    isinstance(attn.qkv_proj.quant_method, _Gemma4SharedKVLinearMethod),
+                    expected,
+                )
+                method = attn.qkv_proj.quant_method
+                attn.cache_derived_state()
+                self.assertIs(attn.qkv_proj.quant_method, method)
+
+    def test_shared_kv_selection_preserves_other_methods(self) -> None:
+        class CustomLinearMethod(UnquantizedLinearMethod):
+            pass
+
+        for case in ("custom", "row_parallel", "unsharded", "separate_kv", "external_kv"):
+            with self.subTest(case=case):
+                projection = SimpleNamespace(
+                    quant_method=CustomLinearMethod()
+                    if case == "custom"
+                    else UnquantizedLinearMethod(),
+                    tp_mode={
+                        "row_parallel": TensorParallelMode.ROW,
+                        "unsharded": None,
+                    }.get(case, TensorParallelMode.COLUMN),
+                )
+                attn = SimpleNamespace(
+                    is_kv_shared=case == "external_kv",
+                    use_k_eq_v=case != "separate_kv",
+                    q_size=128,
+                    kv_size=64,
+                )
+                if case != "external_kv":
+                    attn.qkv_proj = projection
+                original = projection.quant_method
+                Gemma4Attention.cache_derived_state(attn)
+                if case in ("row_parallel", "unsharded"):
+                    self.assertIsInstance(projection.quant_method, _Gemma4SharedKVLinearMethod)
+                    self.assertIs(projection.quant_method.original, original)
+                else:
+                    self.assertIs(projection.quant_method, original)
+
+    @torch.no_grad()
+    def test_shared_kv_projection_graph_and_reload(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest("BF16 CUDA required")
+        torch.manual_seed(721)
+        q, kv, hidden = 16384, 2048, 5376
+        linear = Linear(hidden, q + 2 * kv, bias=False, dtype=torch.bfloat16).cuda()
+        linear.weight.normal_()
+        linear.weight[q + kv :].copy_(linear.weight[q : q + kv])
+        state_keys = set(linear.state_dict())
+        linear.quant_method = _Gemma4SharedKVLinearMethod(linear.quant_method, q, kv)
+
+        def check_output(actual: torch.Tensor, x: torch.Tensor) -> None:
+            expected = torch.nn.functional.linear(x, linear.weight)
+            torch.testing.assert_close(
+                actual[..., q : q + kv], actual[..., q + kv :], rtol=0, atol=0
+            )
+            if x.numel() == 0 or (
+                get_sm_version() == 120 and (x.shape[0] <= 1 or x.shape[0] >= 64)
+            ):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                return
+            # Changing the GEMM width can change cuBLAS reduction order at
+            # small M. Compare both paths with FP64: require BF16-level error
+            # on every row and no material increase over the original GEMM.
+            reference = torch.nn.functional.linear(x.double(), linear.weight.double())
+            norm = reference.norm(dim=-1)
+            error = (actual.double() - reference).norm(dim=-1) / norm
+            original_error = (expected.double() - reference).norm(dim=-1) / norm
+            self.assertLess(error.max().item(), 0.002)
+            self.assertTrue(torch.all(error <= original_error * 1.01 + 1e-6).item())
+
+        for tokens in (0, 1, 2, 4, 7, 8, 16, 32, 64, 65, 128, 256, 1024, 4096):
+            with self.subTest(tokens=tokens):
+                x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+                original = linear.quant_method.original
+                with unittest.mock.patch.object(
+                    original, "apply", wraps=original.apply
+                ) as fallback:
+                    check_output(linear(x), x)
+                    fallback.assert_not_called()
+        for tokens in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+            with self.subTest(graph_tokens=tokens):
+                x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+                linear(x)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = linear(x)
+                for _ in range(3):
+                    x.normal_()
+                    graph.replay()
+                    torch.testing.assert_close(captured, linear(x), rtol=0, atol=0)
+                    check_output(captured, x)
+
+        # The eager path must read the current parameter after in-place reload
+        # and replacement. Graphs must be recaptured after pointer replacement.
+        for replace in (False, True):
+            if replace:
+                linear.weight = torch.nn.Parameter(
+                    torch.empty_like(linear.weight), requires_grad=False
+                )
+            linear.weight.normal_()
+            linear.weight[q + kv :].copy_(linear.weight[q : q + kv])
+            linear.cache_derived_state()
+            check_output(linear(x), x)
+        self.assertEqual(set(linear.state_dict()), state_keys)
+
+    @torch.no_grad()
+    def test_shared_kv_tp_shards_and_replication(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        torch.manual_seed(722)
+        # Keep 31B's head counts/dimension, with a smaller input width. Each
+        # rank runs on this test's GPU; this checks loading/local computation,
+        # not distributed collectives or multi-GPU serving performance.
+        config = dict(
+            GEMMA4_SMALL_CONFIG,
+            num_attention_heads=32,
+            num_global_key_value_heads=4,
+            global_head_dim=512,
+        )
+        hidden = config["hidden_size"]
+        wq = torch.randn(32 * 512, hidden, device="cuda", dtype=torch.bfloat16)
+        wk = torch.randn(4 * 512, hidden, device="cuda", dtype=torch.bfloat16)
+        for tp in (1, 2, 4, 8):
+            for rank in range(tp):
+                with self.subTest(tp=tp, rank=rank):
+                    model_config = _make_model_config(config)
+                    model_config.mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+                    # AllReduce's constructor allocates peer workspaces even
+                    # for COLUMN linears. No collective is used by QKV, so
+                    # suppress only that allocation in this single-GPU test.
+                    with unittest.mock.patch(
+                        "tensorrt_llm._torch.distributed.AllReduce",
+                        return_value=torch.nn.Module(),
+                    ):
+                        attn = Gemma4Attention(model_config, layer_idx=5).cuda()
+                    linear = attn.qkv_proj
+                    mapper = Gemma4HfWeightMapper()
+                    mapper.init_model_and_config(
+                        SimpleNamespace(
+                            model_config=model_config, config=model_config.pretrained_config
+                        ),
+                        model_config,
+                    )
+                    weights = [
+                        mapper._duplicate_kv_weights_with_head_dim(
+                            linear, name, {"weight": weight}, 512
+                        )
+                        for name, weight in (("q_proj", wq), ("k_proj", wk), ("v_proj", wk))
+                    ]
+                    linear.load_weights(weights)
+                    attn.post_load_weights()
+                    self.assertIsInstance(linear.quant_method, _Gemma4SharedKVLinearMethod)
+                    q, kv = attn.q_size, attn.kv_size
+                    self.assertEqual(q, 32 * 512 // tp)
+                    self.assertEqual(kv, max(4 // tp, 1) * 512)
+                    # Independent expected shard selection, including TP8's
+                    # ranks 0/1 -> KV head 0, ranks 2/3 -> head 1, etc.
+                    kv_offset = rank * kv if tp <= 4 else (rank // (tp // 4)) * 512
+                    local_weight = torch.cat(
+                        (
+                            wq[rank * q : (rank + 1) * q],
+                            wk[kv_offset : kv_offset + kv],
+                            wk[kv_offset : kv_offset + kv],
+                        )
+                    )
+                    torch.testing.assert_close(linear.weight, local_weight, rtol=0, atol=0)
+                    for rows in (1, 2, 4, 256):
+                        x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+                        with unittest.mock.patch.object(
+                            linear.quant_method.original,
+                            "apply",
+                            side_effect=AssertionError("TP shard unexpectedly fell back"),
+                        ):
+                            actual = linear(x)
+                        reference = torch.nn.functional.linear(x.double(), local_weight.double())
+                        error = (actual.double() - reference).norm(dim=-1) / reference.norm(dim=-1)
+                        self.assertLess(error.max().item(), 0.002)
+                        torch.testing.assert_close(
+                            actual[:, q : q + kv], actual[:, q + kv :], rtol=0, atol=0
+                        )
+
+    @torch.no_grad()
+    def test_shared_kv_lora_addition(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        torch.manual_seed(723)
+        q, kv, hidden = 128, 64, 128
+        linear = Linear(
+            hidden,
+            q + 2 * kv,
+            bias=False,
+            dtype=torch.bfloat16,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+        ).cuda()
+        linear.weight.normal_()
+        linear.weight[q + kv :].copy_(linear.weight[q : q + kv])
+        # Adapter GEMMs are unchanged. Supply known independent low-rank
+        # updates and exercise the real base/adapter merging in both callers.
+        adapter = LoraLayer([], [])
+        linear.lora = adapter
+        attn = SimpleNamespace(
+            is_kv_shared=False, use_k_eq_v=True, qkv_proj=linear, q_size=q, kv_size=kv
+        )
+        Gemma4Attention.cache_derived_state(attn)
+        self.assertIsInstance(linear.quant_method, _Gemma4SharedKVLinearMethod)
+        for rows in (1, 2, 256):
+            x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+            a = torch.randn(2, hidden, device="cuda", dtype=torch.bfloat16)
+            b = torch.randn(q + 2 * kv, 2, device="cuda", dtype=torch.bfloat16)
+            full_delta = torch.nn.functional.linear(torch.nn.functional.linear(x, a), b)
+            for target in ("qkv", "k", "v"):
+                with self.subTest(rows=rows, target=target):
+                    delta = full_delta.clone()
+                    if target == "k":
+                        delta[:, :q] = 0
+                        delta[:, q + kv :] = 0
+                    elif target == "v":
+                        delta[:, : q + kv] = 0
+                    base = linear(x)
+                    expected = base.clone().add_(delta)
+                    with (
+                        unittest.mock.patch.object(adapter, "forward", return_value=delta),
+                        unittest.mock.patch.object(
+                            linear.quant_method.original,
+                            "apply",
+                            side_effect=AssertionError("LoRA base unexpectedly fell back"),
+                        ),
+                    ):
+                        # Linear-attached and attention-level LoRA both add
+                        # after producing the complete base Q/K/V output.
+                        actual = linear(x, lora_params={"test_active_adapter": True}, layer_idx=5)
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        actual = LoraLayer.forward_with_base(
+                            lambda: linear(x), (adapter,), x, {"test_active_adapter": True}, 5
+                        )
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    if target == "k":
+                        torch.testing.assert_close(
+                            actual[:, q + kv :], base[:, q + kv :], rtol=0, atol=0
+                        )
+                    elif target == "v":
+                        torch.testing.assert_close(
+                            actual[:, q : q + kv], base[:, q : q + kv], rtol=0, atol=0
+                        )
+
+    @torch.no_grad()
+    def test_shared_kv_low_m_dispatch(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        linear = Linear(128, 256, bias=False, dtype=torch.bfloat16).cuda()
+        linear.weight.normal_()
+        linear.weight[192:].copy_(linear.weight[128:192])
+        method = _Gemma4SharedKVLinearMethod(linear.quant_method, 128, 64)
+        x = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
+        reduced = torch.nn.functional.linear(x, linear.weight[:192])
+        expected = torch.cat((reduced, reduced[:, 128:]), dim=-1)
+        for active, result in ((False, None), (True, None), (True, reduced)):
+            with (
+                self.subTest(active=active, dispatched=result is not None),
+                unittest.mock.patch("tensorrt_llm._torch.modules.linear.LOW_M_GEMM_ACTIVE", active),
+                unittest.mock.patch(
+                    "tensorrt_llm._torch.models.modeling_gemma4.apply_low_m_gemm",
+                    return_value=result,
+                ) as dispatch,
+            ):
+                torch.testing.assert_close(method.apply(linear, x, None), expected, rtol=0, atol=0)
+                self.assertEqual(dispatch.call_count, int(active))
+                if active:
+                    module, actual_input, weight, bias = dispatch.call_args.args
+                    self.assertIs(module, linear)
+                    self.assertIs(actual_input, x)
+                    self.assertIsNone(bias)
+                    self.assertEqual(weight.shape, (192, 128))
+                    self.assertEqual(weight.data_ptr(), linear.weight.data_ptr())
+
+    @torch.no_grad()
+    def test_shared_kv_tensor_variants(self) -> None:
+        torch.manual_seed(724)
+        q, kv, hidden = 128, 64, 128
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                for layout in ("dense", "empty", "vector", "batched", "strided"):
+                    with self.subTest(device=device, dtype=dtype, layout=layout):
+                        width = 2 * hidden if layout == "strided" else hidden
+                        weight = torch.randn(q + 2 * kv, width, device=device, dtype=dtype)
+                        x = torch.randn(4, width, device=device, dtype=dtype)
+                        if layout == "strided":
+                            weight, x = weight[:, ::2], x[:, ::2]
+                        elif layout == "empty":
+                            x = x[:0]
+                        elif layout == "vector":
+                            x = x[0]
+                        elif layout == "batched":
+                            x = x.view(2, 2, hidden)
+                        weight[q + kv :].copy_(weight[q : q + kv])
+                        module = SimpleNamespace(
+                            weight=weight,
+                            use_custom_cublas_mm=False,
+                            use_cute_dsl_bf16_gemm=False,
+                        )
+                        method = _Gemma4SharedKVLinearMethod(UnquantizedLinearMethod(), q, kv)
+                        with unittest.mock.patch.object(
+                            method.original,
+                            "apply",
+                            side_effect=AssertionError("Unexpected fallback"),
+                        ):
+                            actual = method.apply(module, x, None)
+                        expected = torch.nn.functional.linear(x, weight)
+                        torch.testing.assert_close(actual, expected)
+                        torch.testing.assert_close(
+                            actual[..., q : q + kv], actual[..., q + kv :], rtol=0, atol=0
+                        )
+
+    @torch.no_grad()
+    def test_shared_kv_compile(self) -> None:
+        linear = Linear(128, 256, bias=False, dtype=torch.float32)
+        linear.weight.normal_()
+        linear.weight[192:].copy_(linear.weight[128:192])
+        linear.quant_method = _Gemma4SharedKVLinearMethod(linear.quant_method, 128, 64)
+        x = torch.randn(4, 128)
+        expected = torch.nn.functional.linear(x, linear.weight)
+        with (
+            unittest.mock.patch("tensorrt_llm._torch.modules.linear.LOW_M_GEMM_ACTIVE", False),
+            unittest.mock.patch.object(
+                linear.quant_method.original,
+                "apply",
+                side_effect=AssertionError("Compilation unexpectedly fell back"),
+            ),
+        ):
+            compiled = torch.compile(linear, backend="eager", fullgraph=True)
+            torch.testing.assert_close(compiled(x), expected)
+
+    @torch.no_grad()
+    def test_shared_kv_runtime_fallbacks(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        linear = Linear(128, 256, bias=False, dtype=torch.bfloat16).cuda()
+        method = _Gemma4SharedKVLinearMethod(linear.quant_method, 128, 64)
+        x = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+        for flag, value in (
+            ("use_custom_cublas_mm", True),
+            ("use_cute_dsl_bf16_gemm", True),
+        ):
+            with (
+                self.subTest(flag=flag),
+                unittest.mock.patch.object(linear, flag, value),
+                unittest.mock.patch.object(method.original, "apply") as fallback,
+            ):
+                self.assertIs(method.apply(linear, x, None), fallback.return_value)
+                fallback.assert_called_once_with(linear, x, None)
+        with torch.enable_grad(), unittest.mock.patch.object(method.original, "apply") as fallback:
+            self.assertIs(method.apply(linear, x, None), fallback.return_value)
+        bias = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+        with unittest.mock.patch.object(method.original, "apply") as fallback:
+            self.assertIs(method.apply(linear, x, bias), fallback.return_value)
+            fallback.assert_called_once_with(linear, x, bias)
+
+        # K/V weights are equal in value, but biases and gradients can differ.
+        linear.weight.normal_()
+        linear.weight[192:].copy_(linear.weight[128:192])
+        torch.testing.assert_close(
+            method.apply(linear, x, bias), torch.nn.functional.linear(x, linear.weight, bias)
+        )
+        with torch.enable_grad():
+            linear.weight.requires_grad_(True)
+            output = method.apply(linear, x, None)
+            coefficients = torch.arange(256, device=x.device, dtype=x.dtype)
+            gradient = torch.autograd.grad((output * coefficients).sum(), linear.weight)[0]
+            torch.testing.assert_close(gradient, coefficients[:, None] * x)
 
 
 class TestGemma4ModelInstantiation(unittest.TestCase):
@@ -1456,6 +1849,48 @@ class TestGemma4HFComparison(unittest.TestCase):
             deepcopy(GEMMA4_31B_LIKE_CONFIG),
         )
 
+    @torch.no_grad()
+    def test_31b_fp8_qkv_prep_matches_unfused(self) -> None:
+        """Graph-replayed mixed-dtype prep matches the serving reference chain."""
+        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+            self.skipTest("BF16 CUDA required")
+        _, trt, _ = self._make_hf_and_trt_models(
+            deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG),
+            quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        )
+        for layer_idx in (0, 5):
+            attn = trt.model.layers[layer_idx].self_attn
+            attn.attn.flashinfer_backend = "fa2"
+            for n_tokens in (1, 7, 65):
+                qkv = torch.randn(
+                    n_tokens,
+                    attn.q_size + 2 * attn.kv_size,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                positions = torch.arange(n_tokens, dtype=torch.int32, device="cuda")
+                attn.apply_rope(qkv, None, None, positions)
+                self.assertTrue(attn._fused_qkv_prep_enabled())
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = attn.apply_rope(qkv, None, None, positions)
+                qkv.normal_()
+                positions.add_(113)
+                graph.replay()
+
+                attn._fused_prep_blocked = True
+                expected = attn.apply_rope(qkv, None, None, positions)
+                attn._fused_prep_blocked = False
+                self.assertEqual(actual[0].dtype, torch.bfloat16)
+                self.assertEqual(actual[1].dtype, torch.float8_e4m3fn)
+                self.assertEqual(actual[2].dtype, torch.float8_e4m3fn)
+                torch.testing.assert_close(actual[0], expected[0], atol=0.02, rtol=0.02)
+                for fused, ref in zip(actual[1:], expected[1:], strict=True):
+                    ref = ref.to(torch.float8_e4m3fn)
+                    mismatch = (fused.view(torch.uint8) != ref.view(torch.uint8)).float().mean()
+                    self.assertLess(mismatch.item(), 1e-3)
+                    torch.testing.assert_close(fused.float(), ref.float(), atol=0.0625, rtol=0.13)
+
     # ---- Batched and mixed ctx+gen HF comparison tests ----
 
     @torch.no_grad()
@@ -2487,6 +2922,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         return SimpleNamespace(
             _fused_qkv_prep=None,
             _fused_qkv_prep_out_fp8=False,
+            _fused_qkv_prep_out_kv_fp8=False,
             is_kv_shared=False,
             fuse_qk_norm_rope=False,
             skip_rope=False,
@@ -2505,25 +2941,42 @@ class TestGemma4ModelDefaults(unittest.TestCase):
             v_norm=SimpleNamespace(variance_epsilon=eps),
         )
 
-    def test_fused_qkv_prep_backend_output_modes(self):
-        """TRTLLM requests BF16 while FlashInfer requests FP8 output."""
+    def test_fused_qkv_prep_backend_output_modes(self) -> None:
+        """Each backend preserves its expected Q and KV dtypes."""
         trtllm = self._make_fused_qkv_prep_case("TRTLLM", use_trtllm_fused_qkv_prep=True)
         flashinfer = self._make_fused_qkv_prep_case("FLASHINFER", flashinfer_backend="trtllm-gen")
+        fa2 = self._make_fused_qkv_prep_case("FLASHINFER", flashinfer_backend="fa2")
 
         self.assertTrue(Gemma4Attention._fused_qkv_prep_enabled(trtllm))
         self.assertFalse(trtllm._fused_qkv_prep_out_fp8)
+        self.assertFalse(trtllm._fused_qkv_prep_out_kv_fp8)
         self.assertTrue(Gemma4Attention._fused_qkv_prep_enabled(flashinfer))
         self.assertTrue(flashinfer._fused_qkv_prep_out_fp8)
+        self.assertTrue(flashinfer._fused_qkv_prep_out_kv_fp8)
+        self.assertTrue(Gemma4Attention._fused_qkv_prep_enabled(fa2))
+        self.assertFalse(fa2._fused_qkv_prep_out_fp8)
+        self.assertTrue(fa2._fused_qkv_prep_out_kv_fp8)
 
         bf16_kv_trtllm = self._make_fused_qkv_prep_case("TRTLLM", has_fp8_kv_cache=False)
         self.assertFalse(Gemma4Attention._fused_qkv_prep_enabled(bf16_kv_trtllm))
 
-        unsupported_head_dim = self._make_fused_qkv_prep_case(
-            "TRTLLM",
-            use_trtllm_fused_qkv_prep=True,
-            head_dim=192,
-        )
-        self.assertFalse(Gemma4Attention._fused_qkv_prep_enabled(unsupported_head_dim))
+        for head_dim in (4, 192):
+            with self.subTest(head_dim=head_dim):
+                unsupported_head_dim = self._make_fused_qkv_prep_case(
+                    "FLASHINFER", flashinfer_backend="fa2", head_dim=head_dim
+                )
+                self.assertFalse(Gemma4Attention._fused_qkv_prep_enabled(unsupported_head_dim))
+
+    def test_fa2_qkv_prep_selection_across_gpu_architectures(self) -> None:
+        for sm in (80, 90, 100, 103, 120):
+            with (
+                self.subTest(sm=sm),
+                unittest.mock.patch("tensorrt_llm._utils.get_sm_version", return_value=sm),
+            ):
+                fa2 = self._make_fused_qkv_prep_case("FLASHINFER", flashinfer_backend="fa2")
+                self.assertTrue(Gemma4Attention._fused_qkv_prep_enabled(fa2))
+                self.assertFalse(fa2._fused_qkv_prep_out_fp8)
+                self.assertTrue(fa2._fused_qkv_prep_out_kv_fp8)
 
     @unittest.mock.patch("tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True)
     def test_trtllm_fp8_sliding_uses_model_rope(self, _mock_is_sm_100f):
