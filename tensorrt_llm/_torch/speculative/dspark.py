@@ -37,6 +37,18 @@ if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
 
 
+def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
+    """Return the number of RoPE entries needed by the DSv4 block drafter.
+
+    A target verification can accept the target token plus every draft token,
+    so ``start_pos`` advances by ``max_draft_len + 1``. The block drafter then
+    indexes ``block_size`` positions beginning at that start. With ``old``
+    bounded by ``max_ctx``, the largest index is
+    ``max_ctx + max_draft_len + 1 + block_size``; the length is one greater.
+    """
+    return int(max_ctx) + int(max_draft_len) + int(block_size) + 2
+
+
 @dataclass
 class DSparkSpecMetadata(SpecMetadata):
     """Metadata for DSpark speculative decoding.
@@ -124,21 +136,32 @@ class DSparkSpecMetadata(SpecMetadata):
             # without this, all concurrent gen requests fall through to the shared
             # scratch row below and corrupt each other's draft window at batch
             # size > 1 (GitHub #16767). Context-prefix entries are left to
-            # ``_seed_context_windows``; the ADP-idle (id 0) and CUDA-graph
-            # padding dummies are kept on the scratch row.
+            # ``_seed_context_windows``. CUDA-graph metadata is an explicit
+            # engine contract: its synthetic generation rows get resettable
+            # per-request slots, independent of their numeric request IDs.
+            # Outside that path, ADP-idle and padding dummies use scratch.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            is_graph_warmup = self.is_cuda_graph and num_seqs > 0
             for rid in self.request_ids[num_contexts:]:
-                if (
+                if is_graph_warmup or (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    worker._assign_slot(rid, reset=False)
+                    worker._assign_slot(rid, reset=is_graph_warmup)
             # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
             # requests, or disagg seed forwards without a real id) map to the
             # dedicated throwaway scratch row so they cannot overwrite a live
             # request's rolling window (they previously aliased to slot 0).
             scratch = worker._scratch_slot
+            # Reset every iteration. The scratch row has no prefill to seed it
+            # and no completion to free it, so _advance_generation_state's
+            # unconditional advance would leave its ABSOLUTE position climbing
+            # across graph shapes and iterations until it indexes past the RoPE
+            # table. A real slot is bounded instead by its request's lifetime.
+            worker._ctx_len[scratch] = 0
+            worker._valid_len[scratch] = 0
+            worker._position_initialized[scratch] = False
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
@@ -270,7 +293,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _lazy_init(self, draft_model, spec_metadata) -> None:
+    def _lazy_init(self, draft_model, spec_metadata, attn_metadata=None) -> None:
         block_size = int(draft_model.block_size)
         if block_size != self.max_draft_len:
             raise ValueError(
@@ -279,6 +302,24 @@ class DSv4DSparkWorker(SpecWorkerBase):
             )
 
         if not self._win_inited:
+            # Published before the RoPE table is built, which happens lazily on
+            # the first forward. The engine's max_seq_len is what positions
+            # actually reach and is strictly above model_config's whenever spec
+            # decoding is on, so the config-derived cap undersizes the table.
+            # Unlike DFlash, the DSv4 block path can advance by a fully accepted
+            # block and then index another full block, so it needs the
+            # DSpark-specific bound.
+            max_ctx = getattr(attn_metadata, "max_seq_len", None)
+            if max_ctx is not None:
+                ceiling = _dspark_position_ceiling(max_ctx, block_size, self.max_draft_len)
+                draft_model._runtime_position_ceiling = ceiling
+                # The worker owns the DSv4 wrapper, while the RoPE-table cache
+                # lives on its inner ``dspark_model``. Publish to both so the
+                # value that sizes the table is the runtime bound rather than
+                # the construction fallback.
+                inner_model = getattr(draft_model, "dspark_model", None)
+                if inner_model is not None:
+                    inner_model._runtime_position_ceiling = ceiling
             max_batch = spec_metadata.max_num_requests
             num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
@@ -313,7 +354,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
             self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
             self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
-            self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+            self._batch_to_slot = torch.full(
+                (max_batch,), self._scratch_slot, dtype=torch.long, device="cuda"
+            )
             self._free_slots = deque(range(max_batch))
             self._req_to_slot = {}
             logger.info(
@@ -424,6 +467,17 @@ class DSv4DSparkWorker(SpecWorkerBase):
         input_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Bootstrap and advance per-slot decode state without host synchronization."""
+        # ``prepare()`` runs before graph creation, not before every replay. A
+        # CUDA-graph padding / ADP-idle request therefore reuses this one
+        # scratch row across all capture shapes. It has no persistent request
+        # state: reset it in the captured forward so its absolute position
+        # always bootstraps from ``input_positions`` rather than accumulating
+        # until a RoPE-table gather goes out of range. The row is never assigned
+        # to a live request, so this cannot reset user-visible state.
+        scratch = self._scratch_slot
+        self._ctx_len[scratch].zero_()
+        self._valid_len[scratch].zero_()
+        self._position_initialized[scratch].zero_()
         old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
         start_pos = old + num_accepted_tokens
         self._ctx_len[slots] = start_pos
@@ -579,7 +633,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         raw_logits = logits
         K = self.max_draft_len
 
-        self._lazy_init(draft_model, spec_metadata)
+        self._lazy_init(draft_model, spec_metadata, attn_metadata)
         # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
         # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path.
         spec_metadata._dspark_worker = self

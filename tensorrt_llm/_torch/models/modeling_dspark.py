@@ -1095,7 +1095,7 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
 
 
 def _runtime_position_cap(model_config, pretrained_config, slack: int = 0) -> int:
-    """Positions a RoPE table must span: the served length, not the advertised one.
+    """Fallback RoPE table length: the served length, not the advertised one.
 
     Both drafter families build a position table, and both were sized from the
     checkpoint's max_position_embeddings. K3 advertises 1,048,576, which costs
@@ -1103,16 +1103,23 @@ def _runtime_position_cap(model_config, pretrained_config, slack: int = 0) -> in
     ~768 MiB transient -- while the context cache is bounded by the runtime
     max_seq_len. Only the table length is affected; YaRN's correction range is
     computed from original_max_position_embeddings and does not move.
+
+    Shrinking the table this way is also what made its bound matter: sized from
+    max_position_embeddings it could not be indexed past, sized from
+    model_config.max_seq_len it can. Hence _runtime_position_ceiling, which
+    every drafter prefers over this value whenever a worker has published it.
     """
     runtime = getattr(model_config, "max_seq_len", None)
     return int(runtime or getattr(pretrained_config, "max_position_embeddings", 163840)) + slack
 
 
-# NOTE on slack: this is a construction-time cap only. A drafter driven by
-# DFlashWorker gets its real bound at runtime from dflash_position_ceiling
-# (published as _runtime_position_ceiling), because the engine raises
-# max_seq_len past model_config's value and never writes it back. The DSv4 site
-# keeps its own slack because it is not driven by that worker.
+# NOTE on slack: this is a construction-time FALLBACK only, for direct
+# construction in tests. Every drafter's real bound comes at runtime from
+# dflash_position_ceiling (published as _runtime_position_ceiling), because the
+# engine raises max_seq_len past model_config's value and never writes it back.
+# DSv4 needs it too: not being driven by DFlashWorker keeps its ctx_len from
+# being clamped to the engine's value, but its positions still come from the
+# target's position_ids, which are bounded by exactly that value.
 
 
 class DSv4DSparkDraftModel(nn.Module):
@@ -1232,6 +1239,7 @@ class DSv4DSparkDraftModel(nn.Module):
         # batched paths. It is built once per device and gathered/sliced by the
         # runtime decode positions, so the cache does not grow with sequence
         # length and the batched consuming op's shape remains static.
+        # Fallback: _dspark_freqs_table prefers _runtime_position_ceiling.
         self._freqs_cap = _runtime_position_cap(model_config, config, self.block_size + 2)
         self._freqs_table_cache: Dict = {}
 
@@ -1336,13 +1344,23 @@ class DSv4DSparkDraftModel(nn.Module):
         self._cache_attn_weights(weights)
 
     def _dspark_freqs_table(self, device: torch.device) -> torch.Tensor:
-        """Return the fixed-size plain-RoPE table cached for ``device``."""
-        key = str(device)
+        """Return the plain-RoPE table cached for ``(device, cap)``.
+
+        Sized from the ceiling the worker publishes once it knows the runtime
+        one, because that is what the decode positions actually reach: they come
+        from the target's position_ids, and py_executor_creator raises the
+        engine's max_seq_len past model_config's value without writing it back.
+        ``_freqs_cap`` is the fallback for direct construction in tests, where no
+        worker runs. MLADSparkForCausalLM reads the same attribute in
+        ``_mla_freqs_cis``.
+        """
+        cap = int(getattr(self, "_runtime_position_ceiling", None) or self._freqs_cap)
+        key = (str(device), cap)
         cached = self._freqs_table_cache.get(key)
         if cached is None:
             cached = precompute_dspark_freqs_cis(
                 self._attn_params["rope_head_dim"],
-                self._freqs_cap,
+                cap,
                 rope_theta=self._rope_theta,
                 device=device,
             )
@@ -1564,7 +1582,8 @@ class DSv4DSparkDraftModel(nn.Module):
         eps = float(self._attn_params["eps"])
         positions = positions.long()
         slots = slots.long()
-        freqs = self._dspark_freqs_table(main_hidden.device)[positions]  # [G, M, rd//2]
+        safe_positions = torch.where(mask, positions, torch.zeros_like(positions))
+        freqs = self._dspark_freqs_table(main_hidden.device)[safe_positions]  # [G, M, rd//2]
         cols = positions % win  # [G, M]
         rows = slots[:, None].expand(-1, M)  # [G, M]
         mask3 = mask.unsqueeze(-1)  # [G, M, 1]
