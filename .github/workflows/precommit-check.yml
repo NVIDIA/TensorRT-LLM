@@ -36,6 +36,9 @@ jobs:
       - name: Test stale pull request cleanup workflow
         run: node .github/scripts/cleanup_stale_prs.test.js
 
+      - name: Test semantic conflict review requests
+        run: node --test .github/scripts/coderabbit_semantic_review.test.js
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'

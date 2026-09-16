@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CodeRabbit Semantic Conflict Review
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, edited, auto_merge_enabled]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: 'Open PR number to recheck (requires ai: semantic-conflict label)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+# Coalesce repeated events per PR or main; each run reads current refs.
+concurrency:
+  group: coderabbit-semantic-conflict-${{ github.event.pull_request.number || inputs.pull_number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  request-review:
+    name: Request advisory semantic review
+    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # API-only trusted workflow code; no repository checkout is needed.
+      - name: Request CodeRabbit checks for the current SHA pair
+        uses: actions/github-script@v8
+        env:
+          DISPATCH_PULL_NUMBER: ${{ inputs.pull_number }}
+        with:
+          script: |
+            const LABEL = 'ai: semantic-conflict';
+            const BOT = 'github-actions[bot]';
+
+            const pullNumber = process.env.DISPATCH_PULL_NUMBER;
+            const repo = context.repo;
+            let numbers;
+            if (context.eventName === 'workflow_dispatch') {
+              const raw = (pullNumber || '').trim();
+              const number = Number(raw);
+              if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(number)) {
+                throw new Error('pull_number must be a positive integer');
+              }
+              numbers = [number];
+            } else if (context.eventName === 'push') {
+              const pulls = await github.paginate(github.rest.pulls.list, {
+                ...repo, state: 'open', base: 'main', per_page: 100,
+              });
+              numbers = pulls.filter(pr => !pr.draft && pr.labels.some(l => l.name === LABEL))
+                .map(pr => pr.number);
+            } else if (context.eventName === 'pull_request_target') {
+              numbers = [context.payload.pull_request.number];
+            } else {
+              throw new Error(`Unsupported event: ${context.eventName}`);
+            }
+
+            for (const number of numbers) {
+              // Read current metadata instead of trusting a possibly queued event payload.
+              const {data: pr} = await github.rest.pulls.get({...repo, pull_number: number});
+              if (pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' ||
+                  !pr.labels.some(l => l.name === LABEL)) {
+                core.info(`PR #${number}: not an open, non-draft, opted-in main PR; skipped.`);
+                continue;
+              }
+              const {data: ref} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
+              const head = pr.head.sha;
+              const base = ref.object.sha;
+              const marker = `<!-- coderabbit-semantic-request:${number}:${head}:${base} -->`;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...repo, issue_number: number, per_page: 100,
+              });
+              // Only our own bot's comments can suppress an automatic request. A manual
+              // dispatch always retries, including after a CodeRabbit timeout or failure.
+              if (context.eventName !== 'workflow_dispatch' && comments.some(comment =>
+                comment.user?.login === BOT && comment.body?.includes(marker))) {
+                core.info(`PR #${number}: this SHA pair has already been requested.`);
+                continue;
+              }
+              const body = [
+                '@coderabbitai run pre-merge checks',
+                '',
+                marker,
+                `Semantic compatibility review requested for PR head \`${head}\` and main \`${base}\`.`,
+                'Run the configured "Semantic conflict with target branch" check against these revisions.',
+                'Verify both live refs. If either differs or cannot be inspected, return Inconclusive.',
+                'Report the actual head, target, and merge-base SHAs with the analysis.',
+                '',
+                'This is an advisory request, not a passing check. Previous results for a different',
+                'SHA pair are stale; a successful workflow only means the request was posted.',
+              ].join('\n');
+              const {data: comment} = await github.rest.issues.createComment({
+                ...repo, issue_number: number, body,
+              });
+              core.info(`PR #${number}: requested ${head} + ${base}: ${comment.html_url}`);
+              await core.summary.addRaw(
+                `PR #${number}: [requested CodeRabbit analysis](${comment.html_url}) for ` +
+                `head \`${head}\` + main \`${base}\`. No AI verdict is asserted.\n\n`
+              ).write();
+            }
