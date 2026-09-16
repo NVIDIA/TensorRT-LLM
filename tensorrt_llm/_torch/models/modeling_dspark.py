@@ -95,7 +95,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._utils import is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -384,9 +384,35 @@ def _rope_last_dims_batched(
     return torch.cat([nope, rope], dim=-1)
 
 
+def _mla_rope_into(
+    q: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    rope_head_dim: int,
+    out_rope_offset: int,
+) -> bool:
+    """Rotate q's rope tail into ``out[..., out_rope_offset:]``; False if unavailable.
+
+    Returns a bool rather than raising so the caller keeps the eager path for
+    builds without the fused kernel, the same way _rmsnorm_rope_batched does.
+    """
+    if not (IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()):
+        return False
+    freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
+    if not is_fused_dspark_rmsnorm_rope_supported(
+        q, None, freqs_real, num_heads, rope_head_dim, q.shape[-1] - rope_head_dim
+    ):
+        return False
+    torch.ops.trtllm.cute_dsl_dspark_rope_into(
+        q, freqs_real, out, num_heads, rope_head_dim, out_rope_offset
+    )
+    return True
+
+
 def _rmsnorm_rope_batched(
     t: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     rope_head_dim: int,
     freqs_cis: torch.Tensor,
@@ -398,6 +424,9 @@ def _rmsnorm_rope_batched(
     norm_dim: Optional[int] = None,
 ) -> torch.Tensor:
     """Fuse DSpark RMSNorm and last-dimension RoPE when supported.
+
+    ``weight`` may be None when ``apply_weight`` is False -- no path reads it
+    then, fused or eager.
 
     ``norm_dim`` bounds the RMSNorm (and the weight) to a prefix of the row.
     None means the whole row, which is DSpark's own convention. The other
@@ -604,7 +633,7 @@ def dspark_attention_forward_batched(
     q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [G, block, h, head_dim]
     q = _rmsnorm_rope_batched(
         q,
-        kv_norm_w,
+        None,
         eps,
         rd,
         blk_freqs,
@@ -2356,6 +2385,44 @@ class _MLABlockFixup(NamedTuple):
     valid: torch.Tensor  # [1, block, 1, block] strict upper triangle
     page_tables_i32: torch.Tensor  # kernel operands, cast once
     seq_lens_i32: torch.Tensor  # ctx_len + block_size
+    kv_bounds_i32: torch.Tensor  # [B * block] seq_lens repeated per query token
+
+
+@lru_cache(maxsize=1)
+def cute_dsl_mla_decode_unavailability_reason() -> Optional[str]:
+    """Return why the cute-dsl MLA decode cannot run here, or None.
+
+    Mirrors ``dflash_trtllm_gen_unavailability_reason``: the op itself only
+    reports by raising, and ``attention_backend="CUTEDSL"`` has to fail at
+    construction rather than five layers into the first draft step.
+
+    The ``kv_bounds`` probe is not paranoia. The op exists upstream without
+    per-token KV bounds, and this backend's whole shape -- one pass over
+    context and block, no fixup -- is expressed through them. Without the probe
+    the mismatch surfaces as a torch dispatch TypeError at the first draft
+    step, naming an argument count rather than a missing kernel feature.
+    """
+    if (sm := get_sm_version()) not in (100, 103, 107):
+        return f"requires SM100, SM103 or SM107, got SM{sm}"
+    try:
+        import cutlass  # noqa: F401
+
+        from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner  # noqa: F401
+    except ImportError as error:
+        return f"the cute-dsl kernels are not importable: {error}"
+    op = getattr(torch.ops.trtllm, "cute_dsl_mla_decode_fp16_blackwell", None)
+    if op is None:
+        return "trtllm::cute_dsl_mla_decode_fp16_blackwell is not registered"
+    if not any(
+        arg.name == "kv_bounds"
+        for overload in op.overloads()
+        for arg in getattr(op, overload)._schema.arguments
+    ):
+        return (
+            "the registered cute_dsl_mla_decode_fp16_blackwell takes no kv_bounds, "
+            "so per-token KV bounds are unavailable in this build"
+        )
+    return None
 
 
 def _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size) -> _MLABlockFixup:
@@ -2363,6 +2430,7 @@ def _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size) -> _MLAB
     device = ctx_len.device
     pos = ctx_len.view(-1, 1) + torch.arange(block_size, device=device)
     idx = torch.arange(block_size, device=device)
+    seq_lens = (ctx_len + block_size).to(torch.int32)
     return _MLABlockFixup(
         pages=page_tables.gather(1, pos // page_size),
         offsets=pos % page_size,
@@ -2370,7 +2438,11 @@ def _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size) -> _MLAB
             1, block_size, 1, block_size
         ),
         page_tables_i32=page_tables.to(torch.int32),
-        seq_lens_i32=(ctx_len + block_size).to(torch.int32),
+        seq_lens_i32=seq_lens,
+        # repeat_interleave, not repeat: the kernel indexes kv_bounds at
+        # b * seq_len_q + q (mla_decode_fp16.py:400-407), so the batch must be
+        # the slow axis. B == 1 cannot tell the two apart.
+        kv_bounds_i32=seq_lens.repeat_interleave(block_size),
     )
 
 
@@ -2570,7 +2642,19 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    # TRTLLM, matching what the shipped K3 configs already pin
+    # (examples/kimi_k3/eval_extra_llm_options_dspark{,_nvfp4}.yaml); VANILLA
+    # additionally needs the optional flash-attn package. AUTO degrades to
+    # VANILLA off SM100/SM103.
+    #
+    # This also moves the drafter's context KV into the manager's paged pool,
+    # and that is the point, not a side effect: dflash.py:592 keys `use_paged`
+    # off the backend name, and this class leaves _paged_ctx_cache False, so
+    # VANILLA is the only way to get the arena that is dense in max_seq_len and
+    # that free_gpu_memory_fraction never bounds.
+    _default_attention_backend = "TRTLLM"
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
         self._init_dspark_heads(draft_config.pretrained_config)
 
@@ -2593,27 +2677,44 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     against the GQA drafter's 20480 under attention-DP, where KV heads are
     unsharded.
 
-    Block attention runs on flashinfer's trtllm-gen absorbed-MLA paged decode
-    (``_mla_paged_attention``); the eager torch path stays only as the
-    reference, for builds without flashinfer and for the unpaged arena.
-    ``spec_config.attention_backend`` does NOT select between those two -- it
-    picks the *GQA* drafter's backend in the shared DFlash worker, and this
-    class overrides the attention entirely.
+    ``spec_config.attention_backend`` selects among this class's own three
+    block-decode implementations, not among the shared DFlash worker op sets:
+
+    ``CUTEDSL``  one cute-dsl pass with ``kv_bounds``, no fixup
+                 (``_cute_dsl_block_decode``). Paged only. What ``AUTO`` picks
+                 on a build that can run it.
+    ``TRTLLM``   flashinfer's trtllm-gen absorbed-MLA paged decode plus the
+                 upper-triangle fixup (``_mla_paged_attention``).
+    ``VANILLA``  the eager torch reference. It is also what the other two
+                 degrade to on the unpaged arena, where there are no page
+                 tables to hand a kernel.
 
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
 
-    # Attention is _mla_paged_attention, so neither worker backend applies and
+    # Attention is _mla_paged_attention, so neither worker OP SET applies and
     # neither backend's shape checks bind -- the absorbed shape (64 heads : 1 KV
-    # head, head_dim 576) would fail both.
+    # head, head_dim 576) would fail both. The backend NAME still selects, via
+    # _mla_block_decode_variant below.
     _uses_worker_attention_backend = False
+    # CUTEDSL stays selectable but is NOT the default here: it needs a
+    # cute_dsl_mla_decode_fp16_blackwell that takes per-token kv_bounds, which
+    # this branch's kernel does not have. Flip this one line once it does --
+    # measured 35.7% off the drafter region (947.50 -> 608.95 us/iteration,
+    # jobs 3006025/3006026) at no cost in acceptance or accuracy, on both
+    # aggregated and disaggregated gsm8k (jobs 3006856/3006857, 3006673/3006684).
+    # CUTEDSL never degrades: an explicit request raises in __init__ with the
+    # reason rather than hiding a slower path behind the name.
+    _default_attention_backend = "TRTLLM"
+    _supported_attention_backends = ("VANILLA", "TRTLLM", "CUTEDSL")
+
     # The whole point of the MLA drafter: its context KV comes out of the
     # manager's pool (5760 B/token/rank) instead of an arena dense in
     # max_seq_len that free_gpu_memory_fraction never bounds. Independent of the
     # backend field, which is why either value of it works here.
     _paged_ctx_cache = True
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         cfg = draft_config.pretrained_config
         # Pin the backbone instead of relying on the model_type-derived name
         # (the Laguna precedent in modeling_dflash.py): the checkpoint labels
@@ -2646,7 +2747,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._mla_workspace = None
         self._mla_freqs = None
         self._mla_freqs_cap = None
-        self._mla_noop_weight = None
+        self._cute_dsl_checked_shape = None
         # HF DeepSeek folds YaRN's attention scaling into the softmax scale:
         # softmax_scale = mscale^2 / sqrt(qk_nope + qk_rope). NOT 1/sqrt(576) --
         # the absorbed product reproduces the 192-dim un-absorbed score.
@@ -2654,6 +2755,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self.softmax_scale = (mscale * mscale) / math.sqrt(
             self.qk_nope_head_dim + self.qk_rope_head_dim
         )
+        # Raise here rather than five layers into the first draft step, and name
+        # the reason. Reached for an explicit CUTEDSL and for the AUTO default
+        # alike -- neither degrades.
+        if self.dflash_attention_backend == "CUTEDSL":
+            reason = cute_dsl_mla_decode_unavailability_reason()
+            if reason is not None:
+                raise ValueError(
+                    f"attention_backend='CUTEDSL' was requested but the cute-dsl "
+                    f"MLA decode is unavailable: {reason}."
+                )
 
     # -- shape / buffers ---------------------------------------------------
 
@@ -2703,18 +2814,149 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         except (ImportError, AttributeError):
             return None
 
-    def _mla_rope_noop_weight(self, like: torch.Tensor) -> torch.Tensor:
-        """Placeholder weight for a rope-only call; never read by the kernel."""
-        if self._mla_noop_weight is None:
-            self._mla_noop_weight = torch.ones(like.shape[-1], device=like.device, dtype=like.dtype)
-        return self._mla_noop_weight
+    def _mla_block_decode_variant(self, paged: bool) -> str:
+        """Which of the three block-decode implementations this step runs.
 
-    def _mla_decode_workspace(self, device):
-        if self._mla_workspace is None:
-            self._mla_workspace = torch.zeros(
-                _MLA_DECODE_WORKSPACE_BYTES, dtype=torch.uint8, device=device
-            )
+        ``paged`` is False on the private arena, where there are no page tables
+        for either kernel, so both kernel backends degrade to eager there.
+        """
+        if not paged or self.dflash_attention_backend == "VANILLA":
+            return "eager"
+        if self.dflash_attention_backend == "CUTEDSL":
+            return "cute_dsl"
+        return "trtllm_gen" if self._mla_decode_op() is not None else "eager"
+
+    def _mla_decode_workspace(self, device, min_bytes: int = 0):
+        want = max(_MLA_DECODE_WORKSPACE_BYTES, int(min_bytes))
+        if self._mla_workspace is None or self._mla_workspace.numel() < want:
+            self._mla_workspace = torch.zeros(want, dtype=torch.uint8, device=device)
         return self._mla_workspace
+
+    def _assert_cute_dsl_can_implement(self, batch, block_size, page_size, dtype) -> None:
+        """Reject a shape the kernel cannot serve, here, naming the reason.
+
+        Without this the rejection is silent until it is not: ``get_valid_tactics``
+        returns [] (cute_dsl_custom_ops.py:8508), the AutoTuner falls back to its
+        -1 sentinel, and ``forward`` compiles an unvalidated config -- so a draft
+        pool with ``tokens_per_block=256`` (``128 % 256 != 0``,
+        mla_decode_fp16.py:3798) surfaces as a CUTLASS error out of the fifth
+        drafter layer rather than as the configuration problem it is.
+
+        Page size is the only operand here that is not fixed by the checkpoint,
+        and it comes from the draft KV pool, so this cannot move to __init__.
+        """
+        key = (batch, block_size, page_size, dtype)
+        if self._cute_dsl_checked_shape == key:
+            return
+        import cutlass
+
+        from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+        in_dtype = cutlass.Float16 if dtype == torch.float16 else cutlass.BFloat16
+        runner = CuteDSLNVMlaDecodeBlackwellRunner
+        # Mirror the runner's own probe (cute_dsl_custom_ops.py:8542) through its
+        # own constants, so this cannot drift from the tactic it will pick. Its
+        # candidate tiler list has one entry; split_kv=1 is always in range.
+        ok = runner._KERNEL_CLASS_BY_DTYPE[in_dtype].can_implement(
+            batch,
+            block_size,
+            page_size,
+            self._num_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            in_dtype,
+            in_dtype,
+            cutlass.Float32,
+            cutlass.Float32,
+            (128, 128),
+            (128, 256),
+            1,
+            False,
+            runner._IS_VAR_SEQ,
+            runner._IS_VAR_SPLIT_KV,
+            page_size,
+        )
+        if not ok:
+            raise ValueError(
+                f"attention_backend='CUTEDSL' cannot serve this shape: batch={batch}, "
+                f"block_size={block_size}, page_size={page_size}, "
+                f"num_heads={self._num_heads}, dtype={dtype}. Use "
+                f"attention_backend='TRTLLM', or set kv_cache_config.tokens_per_block "
+                f"to a divisor of 128 other than 1."
+            )
+        self._cute_dsl_checked_shape = key
+
+    def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size):
+        """One cute-dsl MLA decode over context AND block, no fixup.
+
+        The trtllm-gen path has to split the work: its q_len semantics are
+        causal, so query i cannot see block positions j > i, and the strict
+        upper triangle is recovered eagerly afterwards and merged by LSE. The
+        cute-dsl kernel takes ``kv_bounds`` -- a per-query-token KV length that
+        REPLACES the implicit causal bound (mla_decode_fp16.py:400-407) -- so
+        filling it with ctx_len + block_size makes every block position visible
+        to every other in one pass and deletes the fixup outright.
+
+        No fallback: what the kernel cannot serve raises. Build-level
+        availability is checked at construction through
+        ``cute_dsl_mla_decode_unavailability_reason``; the shape depends on the
+        draft pool's page size, which is not known until here, so it is checked
+        on the first call.
+        """
+        import cutlass
+
+        from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+        batch, _, num_heads, _ = query.shape
+        device = query.device
+        pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
+        page_size = pool.shape[1]
+        d_latent = self.kv_lora_rank
+        self._assert_cute_dsl_can_implement(batch, block_size, page_size, query.dtype)
+
+        # stride[1] == 1 is the kernel's only layout demand (mla_decode_fp16.py:465-470);
+        # a 576-wide row sliced at 512 keeps that on both halves, so no copy.
+        # detach(): cute.runtime.from_dlpack refuses a tensor that requires grad
+        # ("Can't export tensors that require gradient"). Production runs under
+        # inference_mode so nothing here carries grad, but the in-place pool
+        # write above pulls the pool into the autograd graph whenever a caller
+        # does not -- a unit test, for one. Views, so no copy.
+        q_latent = query.detach()[..., :d_latent].permute(2, 3, 1, 0)
+        q_rope = query.detach()[..., d_latent:].permute(2, 3, 1, 0)
+        c_latent = pool.detach()[..., :d_latent].permute(1, 2, 0)
+        c_rope = pool.detach()[..., d_latent:].permute(1, 2, 0)
+
+        out = torch.empty(batch, block_size, num_heads, d_latent, dtype=query.dtype, device=device)
+        workspace_numel = CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
+            num_heads, block_size, d_latent, batch, cutlass.Float32
+        )
+        workspace = self._mla_decode_workspace(device, workspace_numel)
+        torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            # .t() WITHOUT .contiguous(): the kernel wants (max_blocks, B) with
+            # dim 0 as the leading (stride-1) dimension. contiguous() would make
+            # it row-major, i.e. stride (B, 1), and the kernel rejects it with
+            # "Expected strides[leading_dim] == 1, but got B" for every B > 1
+            # (probe job 3005553; B=1 passes by coincidence). The transposed
+            # view of a row-major (B, max_blocks) already has stride (1, max_blocks).
+            fixup.page_tables_i32.t(),
+            fixup.seq_lens_i32,
+            out.permute(2, 3, 1, 0),
+            workspace,
+            num_heads,
+            block_size,
+            page_size,
+            self.softmax_scale,
+            1.0,
+            batch,
+            None,
+            # Every block token sees the whole block, not just its causal prefix.
+            fixup.kv_bounds_i32,
+        )
+        return out
 
     def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
         """Absorbed-MLA block attention: paged kernel + a block-local fixup.
@@ -2738,10 +2980,15 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         device = query.device
 
         # --- the block's own latents into the pool, then one causal pass ---
+        # Must precede BOTH decode paths: each reads the block back out of the
+        # pool, so writing it afterwards would attend uninitialised slots.
         pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
         pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_kv.reshape(
             -1, blk_kv.shape[-1]
         )
+
+        if self._mla_block_decode_variant(paged=True) == "cute_dsl":
+            return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)
         out_lower = torch.empty(
             batch, block_size, num_heads, self.kv_lora_rank, dtype=query.dtype, device=device
         )
@@ -2793,7 +3040,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         """Adjacent-pair YaRN table, cached. See build_dspark_mla_yarn_freqs_cis.
 
         Sized from the ceiling the worker publishes once it knows the runtime
-        one (_runtime_position_ceiling, set in DFlashDrafter._lazy_init_ctx_buffers
+        one (_runtime_position_ceiling, set in DFlashWorker._lazy_init_ctx_buffers
         before any forward), because that is the value ctx_len is clamped to and
         it is strictly above model_config.max_seq_len whenever spec decoding is
         on. The config-derived cap is the fallback for direct construction in
@@ -2945,9 +3192,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # is what keeps them out -- not the block table.
         page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
         capacity = ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
-        # The paged kernel is the fast path; the eager gather stays as the
-        # reference and covers builds without flashinfer and the unpaged arena.
-        use_kernel = page_tables is not None and self._mla_decode_op() is not None
+        # attention_backend picks the implementation; both kernel backends need
+        # page tables, so the eager gather also covers the private arena.
+        variant = self._mla_block_decode_variant(page_tables is not None)
+        use_kernel = variant != "eager"
         # Kernel path: index and mask operands are layer-invariant, so build
         # them once here rather than five times inside the decode loop.
         fixup = (
@@ -2957,12 +3205,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
         logger.info_once(
             "MLA DSpark block decode: "
-            + (
-                "trtllm-gen paged kernel, block in pool + upper-triangle fixup"
-                if use_kernel
-                else f"eager (paged={page_tables is not None}, "
-                f"flashinfer={self._mla_decode_op() is not None})"
-            ),
+            + {
+                "trtllm_gen": "trtllm-gen paged kernel, block in pool + upper-triangle fixup",
+                "cute_dsl": "one cute-dsl pass over context and block, no fixup",
+                "eager": f"eager (backend={self.dflash_attention_backend!r}, "
+                f"paged={page_tables is not None}, "
+                f"flashinfer={self._mla_decode_op() is not None})",
+            }[variant],
             key="mla_dspark_block_decode_variant",
         )
         # Eager path only: dense key mask over the gathered context.
@@ -2988,24 +3237,52 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
             q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hs_normed)))
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
-            # Rotate the trailing rope slice of every head in one kernel. No
-            # norm and no weight here -- q_a_layernorm already ran -- but the
-            # fused op still shape-checks the weight, hence the dummy.
-            q = _rmsnorm_rope_batched(
-                q,
-                self._mla_rope_noop_weight(q),
-                0.0,
-                self.qk_rope_head_dim,
-                blk_freqs,
-                num_heads=num_heads,
-                apply_weight=False,
-                apply_rmsnorm=False,
+            # The 576-wide query is assembled in one buffer rather than
+            # cat([absorbed, rope]): q's rope half is a 64-slice of a 192-wide
+            # row, so that cat had a non-contiguous input and PyTorch dropped
+            # off CatArrayBatchedCopy_alignedK_contig onto the generic kernel --
+            # 17.3 us vs 1.6 us per launch, five launches per iteration
+            # (measured job 2986420). Mirrors fused_q in modules/mla.py
+            # forward_absorption_generation.
+            query = torch.empty(
+                (batch, block_size, num_heads, self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=q.dtype,
+                device=q.device,
             )
-            q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            # Rotate the trailing rope slice of every head straight into the
+            # destination's rope columns. No norm and no weight here --
+            # q_a_layernorm already ran. Writing the rotation into `query`
+            # instead of back into `q` removes the strided
+            # `query[..., kv_lora_rank:] = q_rope` copy that replaced the cat.
+            q_rope_into = _mla_rope_into(
+                q, blk_freqs, query, num_heads, self.qk_rope_head_dim, self.kv_lora_rank
+            )
+            if not q_rope_into:
+                q = _rmsnorm_rope_batched(
+                    q,
+                    None,
+                    0.0,
+                    self.qk_rope_head_dim,
+                    blk_freqs,
+                    num_heads=num_heads,
+                    apply_weight=False,
+                    apply_rmsnorm=False,
+                )
+                query[..., self.kv_lora_rank :] = q[..., self.qk_nope_head_dim :]
+            q_nope = q[..., : self.qk_nope_head_dim]
             # Absorb the nope half into latent space so the block attends the
             # stored latent directly (MQA), instead of expanding it per head.
-            q_absorbed = torch.einsum("bshd,hdc->bshc", q_nope, attn._k_b_proj.to(q_nope.dtype))
-            query = torch.cat([q_absorbed, q_rope], dim=-1)
+            # [h, b*s, nope] x [h, nope, kv_lora_rank] straight into the latent
+            # half. view(), never reshape(): both of these are strided views and
+            # reshape would silently stage a copy that bmm_out then writes into
+            # and throws away, whereas view() raises.
+            torch.ops.trtllm.bmm_out(
+                q_nope.view(batch * block_size, num_heads, self.qk_nope_head_dim).transpose(0, 1),
+                attn._k_b_proj.to(q.dtype),
+                query[..., : self.kv_lora_rank]
+                .view(batch * block_size, num_heads, self.kv_lora_rank)
+                .transpose(0, 1),
+            )
 
             # The block's own latent comes from the draft hidden; the context's
             # from the projected target hidden (precompute_context_kv). That

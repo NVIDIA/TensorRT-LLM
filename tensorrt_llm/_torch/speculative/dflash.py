@@ -387,6 +387,12 @@ class DFlashWorker(SpecWorkerBase):
         )
         if draft_model_dflash_attention_backend is None:
             raise ValueError("DFlash draft model is missing dflash_attention_backend.")
+        if self._dflash_attention_backend == "AUTO":
+            # The draft model resolved AUTO against its own family and this
+            # build; adopt that, because _lazy_init_ctx_buffers keys paging and
+            # the trtllm-gen shape checks off the concrete value.
+            self._dflash_attention_backend = draft_model_dflash_attention_backend
+            return
         if draft_model_dflash_attention_backend != self._dflash_attention_backend:
             raise ValueError(
                 "DFlash worker and draft model attention backends must match; "

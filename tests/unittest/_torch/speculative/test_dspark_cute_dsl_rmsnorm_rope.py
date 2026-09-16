@@ -110,7 +110,7 @@ def test_cute_dsl_dspark_rmsnorm_rope_rejects_invalid_inputs():
     )
 
     x, weight, freqs = _make_inputs(2, 5, 512, 64, 1)
-    with pytest.raises(ValueError, match="requires contiguous BF16"):
+    with pytest.raises(ValueError, match="requires regular row-strided BF16"):
         cute_dsl_dspark_rmsnorm_rope(x.float(), weight, freqs, 1, 64, 1e-6, True, True, False)
 
 
@@ -246,3 +246,38 @@ def test_fused_dspark_rmsnorm_rope_norm_dim(split_norm):
     ref = torch.cat([ref[..., :nope], rot.to(ref.dtype)], dim=-1)
 
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_fused_dspark_rmsnorm_rope_accepts_no_weight() -> None:
+    """A gain-less call may pass None, and must match passing an ignored weight.
+
+    The kernel is compiled with apply_weight=False, so the weight operand is not
+    in its signature at all; None is the only thing a caller without a norm gain
+    should have to produce. Asserting equality against a real-but-ignored weight
+    is what catches a compile wrapper that silently starts applying it.
+    """
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
+    x, weight, freqs = _make_inputs(2, 5, 512, 64, 1, seed=11)
+    args = (1, 64, 1e-6, False, True, False)
+
+    assert is_fused_dspark_rmsnorm_rope_supported(x, None, freqs, 1, 64)
+    without = cute_dsl_dspark_rmsnorm_rope(x, None, freqs, *args)
+    with_ignored = cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args)
+    expected = _reference(x, weight, freqs, *args)
+
+    torch.testing.assert_close(without, with_ignored, rtol=0, atol=0)
+    torch.testing.assert_close(without, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_fused_dspark_rmsnorm_rope_rejects_missing_weight() -> None:
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+    )
+
+    x, _, freqs = _make_inputs(2, 5, 512, 64, 1, seed=12)
+    with pytest.raises(ValueError, match="needs a weight when apply_weight is set"):
+        cute_dsl_dspark_rmsnorm_rope(x, None, freqs, 1, 64, 1e-6, True, True, False)
