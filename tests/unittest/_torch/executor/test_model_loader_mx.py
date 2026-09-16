@@ -23,6 +23,7 @@ import tensorrt_llm.mapping as mapping_mod
 from tensorrt_llm._torch import distributed as distributed_mod
 from tensorrt_llm._torch.attention import mla as mla_mod
 from tensorrt_llm._torch.attention.mla import MLA
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
 from tensorrt_llm._torch.models import modeling_mistral as modeling_mistral_mod
@@ -1770,11 +1771,29 @@ def test_speculative_mode_name_is_canonical_and_fails_closed(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "qualification_case",
+    ["unregistered-model", "locality_domain-feature"],
+)
 def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    monkeypatch,
+    qualification_case,
+):
     events = []
     loader = _make_loader(monkeypatch, events=events)
+    if qualification_case == "locality_domain-feature":
+        monkeypatch.setattr(
+            ModelLoader,
+            "_POST_TRANSFORM_PROFILE_REGISTRY",
+            _tiny_profile_registry(),
+        )
+        model = _TinyModel(events)
+        model.model_config.locality_domain_policy = LocalityDomainPolicy(enabled=True)
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM,
+            "from_config",
+            MagicMock(return_value=model),
+        )
     checkpoint_loader = _PostTransformMxLoader(post_transform=True)
 
     model, _ = loader.load("/ckpt", checkpoint_loader)

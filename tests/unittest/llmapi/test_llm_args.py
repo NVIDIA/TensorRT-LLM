@@ -3090,6 +3090,13 @@ class TestServeDefaults:
         assert llm_args.get("max_batch_size") == 128
         assert llm_args.get("tensor_parallel_size") == 4
 
+    def test_serve_enable_locality_domain_flag(self):
+        llm_args, _ = get_llm_args(model=llama_model_path,
+                                   backend="pytorch",
+                                   enable_locality_domains=True)
+
+        assert llm_args["enable_locality_domains"] is True
+
     def test_serve_video_pruning_rate_maps_to_multimodal_config(self):
         llm_args, _ = get_llm_args(
             model=llama_model_path,

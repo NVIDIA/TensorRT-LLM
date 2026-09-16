@@ -115,9 +115,7 @@
       "path": "batch_wait_timeout_ms"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "cache_transceiver_config.agent_bounce_buffer_enable"
     },
@@ -357,6 +355,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "enable_lm_head_tp_in_adp"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_locality_domains"
     },
     {
       "capture_policy": "bool",
