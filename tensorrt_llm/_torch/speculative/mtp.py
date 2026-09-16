@@ -272,6 +272,28 @@ class MTPWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def _compute_draft_logits(self, mtp_layer, hidden_states, draft_model,
+                              attn_metadata, spec_metadata, last_tokens_idx):
+        if ((spec_metadata.draft_skip_top_k_top_p
+             or spec_metadata.use_rejection_sampling)
+                and getattr(self.mapping, "enable_lm_head_tp_in_adp", False)):
+            # ADP replicates the LM head. Project local request rows directly:
+            # shared_head would stack peer rows and shard the vocabulary.
+            # Keep this layout for all-greedy batches too: vanilla MTP does
+            # not pass an LM-head-TP mapping to the draft sampler.
+            local_states = hidden_states[last_tokens_idx]
+            local_forward = getattr(mtp_layer.shared_head,
+                                    "forward_local_full_vocab", None)
+            if local_forward is None:
+                raise RuntimeError(
+                    f"{type(mtp_layer.shared_head).__name__} must implement "
+                    "forward_local_full_vocab for ADP + LM-head TP advanced "
+                    "MTP sampling")
+            return local_forward(local_states, draft_model.lm_head,
+                                 attn_metadata, True)
+        return mtp_layer.shared_head(hidden_states, draft_model.lm_head,
+                                     attn_metadata)
+
     def _commit_target_mamba_states(
         self,
         attn_metadata: AttentionMetadata,
@@ -478,9 +500,10 @@ class MTPWorker(SpecWorkerBase):
                 hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                           **draft_inputs)
 
-                logits = mtp_layer.shared_head(hidden_states,
-                                               draft_model.lm_head,
-                                               attn_metadata).float()
+                logits = self._compute_draft_logits(mtp_layer, hidden_states,
+                                                    draft_model, attn_metadata,
+                                                    spec_metadata,
+                                                    last_tokens_idx).float()
                 if self.guided_decoder is not None:
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)

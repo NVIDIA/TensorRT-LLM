@@ -46,7 +46,8 @@ from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
-from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from ..pyexecutor.sampler.ops.vanilla import (GREEDY_TEMPERATURE_THRESHOLD,
+                                              greedy_search_sampling_batch)
 
 
 def rejection_sampling_one_model(
@@ -548,7 +549,7 @@ class SpecMetadata:
     is_all_greedy_sample: bool = True
     # Group-synchronized override for ``is_all_greedy_sample`` (AND over the
     # TP group's local flags; None = no group sync configured, use the local
-    # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
+    # value). Under ADP + LM-head TP with stochastic drafting, the greedy-vs-
     # advanced choice gates group collectives, so all ranks must take the same
     # path even though their batches (and thus local flags) differ. Set by
     # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
@@ -560,6 +561,8 @@ class SpecMetadata:
     use_rejection_sampling: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
+    # MTP proposal-only policy; never changes target filtering or greedy dispatch.
+    draft_skip_top_k_top_p: bool = False
     # Whether the occurrence penalties are enabled (deploy-time; from
     # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
     enable_penalty: bool = False
@@ -1247,8 +1250,11 @@ class SpecMetadata:
 
     @property
     def wants_advanced_draft_sampling(self) -> bool:
-        """Whether the current batch takes the advanced (rejection) draft
-        path: rejection sampling enabled AND not an all-greedy batch.
+        """Whether the current batch takes the stochastic draft path.
+
+        Non-greedy batches sample drafts when rejection sampling is enabled or
+        temperature-only draft proposals are explicitly requested. Verification
+        still independently follows ``use_rejection_sampling``.
 
         Single source of truth for the greedy-vs-advanced decision: the
         sampler branch (``sample_draft_tokens``) and the worker's LM-head-TP
@@ -1256,7 +1262,8 @@ class SpecMetadata:
         divergence feeds the wrong logits layout to the sampler -- so both
         read this property instead of re-deriving the predicate.
         """
-        return self.use_rejection_sampling and not self.is_all_greedy_sample
+        return (self.use_rejection_sampling or
+                self.draft_skip_top_k_top_p) and not self.is_all_greedy_sample
 
     def update_is_all_greedy_sample(self, requests: list["LlmRequest"]) -> None:
         """Refresh ``is_all_greedy_sample`` for the *current* batch.
@@ -2188,6 +2195,26 @@ class SpecWorkerBase(nn.Module, ABC):
             logits, temperatures, top_ks, top_ps)
 
     @staticmethod
+    def _restore_greedy_draft_rows(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        probs: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Keep greedy requests deterministic inside a mixed draft batch."""
+        greedy_rows = temperatures <= GREEDY_TEMPERATURE_THRESHOLD
+        greedy_tokens, greedy_probs = greedy_search_sampling_batch(
+            logits, return_probs=probs is not None)
+        draft_tokens = torch.where(greedy_rows,
+                                   greedy_tokens.to(draft_tokens.dtype),
+                                   draft_tokens)
+        if probs is not None:
+            assert greedy_probs is not None
+            probs = torch.where(greedy_rows.unsqueeze(-1),
+                                greedy_probs.to(probs.dtype), probs)
+        return draft_tokens, probs
+
+    @staticmethod
     def _zero_padding_rows(logits: torch.Tensor, spec_metadata,
                            num_contexts: int, batch_size: int,
                            rows_per_request: int) -> torch.Tensor:
@@ -2243,6 +2270,9 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ks = spec_metadata.request_top_ks[:batch_size]
         top_ps = spec_metadata.request_top_ps[:batch_size]
         min_ps = spec_metadata.request_min_ps[:batch_size]
+        draft_sampling_mode = (AdvancedSamplingMode.NO_TOPK_NO_TOPP
+                               if spec_metadata.draft_skip_top_k_top_p else
+                               spec_metadata.advanced_sampling_mode)
 
         # One row per request here, matching the request_* slices above.
         # Slot 0 of the step's offset window belongs to the target sampler, so
@@ -2258,7 +2288,7 @@ class SpecWorkerBase(nn.Module, ABC):
             logits = self._zero_padding_rows(logits, spec_metadata, 0,
                                              batch_size, 1)
             draft_tokens, probs = self._sample_from_logits_with_probs(
-                spec_metadata.advanced_sampling_mode,
+                draft_sampling_mode,
                 logits,
                 temperatures,
                 top_ks,
@@ -2266,6 +2296,10 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
+            if spec_metadata.draft_skip_top_k_top_p:
+                draft_tokens, probs = self._restore_greedy_draft_rows(
+                    logits, temperatures, draft_tokens, probs)
+            assert probs is not None
             # Scatter probs into the slot-indexed buffer so each request's data
             # lands at its stable py_seq_slot row regardless of batch shifts.
             assert spec_metadata.batch_slot_ids is not None, (
@@ -2277,15 +2311,17 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
         else:
-            draft_tokens = self._sample_from_logits(
-                spec_metadata.advanced_sampling_mode,
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                min_ps,
-                seed=seed,
-                offset=offset)
+            draft_tokens = self._sample_from_logits(draft_sampling_mode,
+                                                    logits,
+                                                    temperatures,
+                                                    top_ks,
+                                                    top_ps,
+                                                    min_ps,
+                                                    seed=seed,
+                                                    offset=offset)
+            if spec_metadata.draft_skip_top_k_top_p:
+                draft_tokens, _ = self._restore_greedy_draft_rows(
+                    logits, temperatures, draft_tokens)
 
         return draft_tokens.type(torch.int32)
 
@@ -2431,10 +2467,9 @@ class SpecWorkerBase(nn.Module, ABC):
             gen_logits = self._zero_padding_rows(gen_logits, spec_metadata,
                                                  num_contexts, batch_size,
                                                  runtime_draft_len + 1)
-            # The target distribution the acceptance test divides by. It must be
-            # filtered exactly as the draft probs were (see advanced_sample_draft),
-            # which is why both use the same backend selection on the same mode --
-            # a mismatch here corrupts acceptance silently rather than raising.
+            # Target distribution p for rejection sampling. Keep the target's
+            # filters: draft q is stored separately and may intentionally use
+            # the temperature-only draft mode.
             target_probs_flat = self._compute_probs_from_logits(
                 spec_metadata.advanced_sampling_mode, gen_logits, temperatures,
                 spec_metadata.top_ks[gen_start:gen_end],
@@ -2800,15 +2835,9 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         is_block = logits.dim() == 3
 
-        # Draft tokens use argmax unless rejection sampling is engaged for a
-        # non-greedy batch. Rejection sampling is the only path that needs the
-        # draft's stochastic proposal distribution (stored in draft_probs); every
-        # other path (all-greedy, or non-greedy with strict/exact-match
-        # acceptance) accepts a draft token only when it equals the target's
-        # choice, and there argmax maximizes the acceptance rate (E[accept] =
-        # max_i p_i >= sum_i p_i^2 = E[accept] for a stochastic draft). This
-        # matches sglang/vLLM, which draft with argmax/top-k by default and apply
-        # sampling params only on the target/acceptance side.
+        # Keep the existing argmax path by default. Non-greedy requests can
+        # opt into temperature-only proposals independently of verification;
+        # only rejection sampling needs their probability distribution saved.
         advanced = spec_metadata.wants_advanced_draft_sampling
 
         # All samplers below return tokens in draft-vocab space; d2t is applied
@@ -2827,9 +2856,8 @@ class SpecWorkerBase(nn.Module, ABC):
             # so the input batch shape no longer applies. Keep as-is; the
             # caller trims the max_num_requests padding to token_count.
         else:
-            # Advanced sampling gathers the vocab-sharded draft logits to full
-            # vocab, then samples (scattering this step's proposal distribution
-            # into draft_probs).
+            # Advanced sampling gathers vocab-sharded draft logits to full
+            # vocab, then samples. Only rejection sampling stores draft_probs.
             logits = self.maybe_gather_sharded_draft_logits(
                 logits, spec_metadata, mapping_lm_head_tp)
             if is_block:

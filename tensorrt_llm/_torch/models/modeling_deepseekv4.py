@@ -1235,6 +1235,33 @@ class DeepseekV4MTPHead(nn.Module):
 
         self.mapping_lm_head_tp = None
 
+    def _prepare_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        return_context_logits: bool,
+    ) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = _get_last_token_states(hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
+        hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
+        return self.norm(self.hc_head(hidden_states))
+
+    def forward_local_full_vocab(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: Linear,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        return_context_logits: bool = False,
+    ) -> torch.Tensor:
+        """Apply the HC head locally, then project the replicated full vocabulary."""
+        hidden_states = self._prepare_hidden_states(
+            hidden_states, attn_metadata, return_context_logits
+        )
+        return lm_head(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1242,15 +1269,9 @@ class DeepseekV4MTPHead(nn.Module):
         attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         return_context_logits: bool = False,
     ) -> torch.Tensor:
-        if not return_context_logits:
-            if attn_metadata is not None:
-                hidden_states = _get_last_token_states(hidden_states, attn_metadata)
-            else:
-                hidden_states = hidden_states[-1].unsqueeze(0)
-
-        hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
-        hidden_states = self.hc_head(hidden_states)
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self._prepare_hidden_states(
+            hidden_states, attn_metadata, return_context_logits
+        )
 
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
         enable_lm_head_tp_in_adp = (

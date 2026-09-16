@@ -1201,6 +1201,33 @@ class Step3p7MTPHead(nn.Module):
         last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         return hidden_states[last_tokens]
 
+    def _prepare_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        return_context_logits: bool,
+    ) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = self._get_last_token_states(hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
+        return self.norm(hidden_states)
+
+    def forward_local_full_vocab(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: LMHead,
+        attn_metadata: AttentionMetadata,
+        return_context_logits: bool = False,
+    ) -> torch.Tensor:
+        """Normalize local ADP rows, then use this MTP layer's full-vocab head."""
+        del lm_head
+        hidden_states = self._prepare_hidden_states(
+            hidden_states, attn_metadata, return_context_logits
+        )
+        return self.output(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1209,11 +1236,9 @@ class Step3p7MTPHead(nn.Module):
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         del lm_head
-        if not return_context_logits:
-            if attn_metadata is not None:
-                hidden_states = self._get_last_token_states(hidden_states, attn_metadata)
-            else:
-                hidden_states = hidden_states[-1].unsqueeze(0)
+        hidden_states = self._prepare_hidden_states(
+            hidden_states, attn_metadata, return_context_logits
+        )
 
         mapping = self.model_config.mapping
         enable_attention_dp = mapping.enable_attention_dp
@@ -1222,8 +1247,6 @@ class Step3p7MTPHead(nn.Module):
         if enable_lm_head_tp_in_adp:
             self.mapping_lm_head_tp = create_lm_head_tp_mapping(mapping, hidden_states.shape[0])
             hidden_states = allgather(hidden_states, self.mapping_lm_head_tp, dim=0)
-
-        hidden_states = self.norm(hidden_states)
 
         if not enable_attention_dp or enable_lm_head_tp_in_adp:
             self.output.gather_output = False

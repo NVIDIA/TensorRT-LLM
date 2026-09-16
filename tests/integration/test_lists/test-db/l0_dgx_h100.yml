@@ -17,6 +17,7 @@ l0_dgx_h100:
   tests:
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
+  # Includes draft-only MTP sampling and ADP transitions (at most 2 ranks).
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
   - unittest/_torch/moe/multi_gpu -m "not post_merge" TIMEOUT (90)
   - unittest/_torch/modeling/test_modeling_pixtral.py::test_tensor_parallelism

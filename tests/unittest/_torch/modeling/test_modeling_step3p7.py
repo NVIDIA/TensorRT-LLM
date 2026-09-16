@@ -470,6 +470,13 @@ class TestStep3p7Helpers(unittest.TestCase):
             expected = hidden_states[-1:] / hidden_states[-1:].pow(2).mean(-1, keepdim=True).sqrt()
             self.assertTrue(torch.allclose(output.seen, expected))
             self.assertTrue(torch.allclose(logits, expected))
+
+            local_logits = head.forward_local_full_vocab(
+                hidden_states, lm_head=None, attn_metadata=None, return_context_logits=True
+            )
+            local_expected = hidden_states / hidden_states.pow(2).mean(-1, keepdim=True).sqrt()
+            self.assertTrue(torch.allclose(output.seen, local_expected))
+            self.assertTrue(torch.allclose(local_logits, local_expected))
         finally:
             rms_norm_module.IS_FLASHINFER_AVAILABLE = flashinfer_available
 

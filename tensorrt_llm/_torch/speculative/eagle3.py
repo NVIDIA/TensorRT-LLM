@@ -486,6 +486,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    @staticmethod
+    def _forward_local_mtp_head(shared_head, hidden_states, draft_model,
+                                attn_metadata):
+        local_forward = getattr(shared_head, "forward_local_full_vocab", None)
+        if local_forward is None:
+            raise RuntimeError(
+                f"{type(shared_head).__name__} must implement "
+                "forward_local_full_vocab for ADP + LM-head TP advanced "
+                "MTP sampling")
+        return local_forward(hidden_states, draft_model.lm_head, attn_metadata,
+                             True)
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs
@@ -849,18 +861,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # weight) is only usable when the consumer is an argmax: the
                 # distributed greedy sampler recovers the global argmax from
                 # vocab-shard maxima without materializing full distributions.
-                # Advanced (rejection) sampling needs each request's full-vocab
+                # Advanced draft sampling needs each request's full-vocab
                 # distribution, so a batch headed for the advanced path
                 # bypasses LM-head-TP and computes full-vocab logits locally --
                 # under ADP the lm_head weight is replicated (the sliced-shard
                 # trick is a runtime optimization), exactly like the target
-                # head. With rejection off, non-greedy batches keep the
-                # LM-head-TP argmax path unconditionally, where the per-rank
-                # greedy flag never enters control flow. This branch is safe
-                # to take group-uniformly because is_all_greedy_sample is
-                # group-synchronized whenever rejection+ADP+LM-head-TP are
-                # combined -- see SpecMetadata.group_all_greedy_sample (anchor
-                # for the group-sync semantics).
+                # head. Non-greedy batches use this path with rejection sampling
+                # or an explicit temperature-only draft proposal override.
+                # This branch is group-uniform because is_all_greedy_sample is
+                # group-synchronized whenever either option is enabled with
+                # ADP+LM-head-TP -- see SpecMetadata.group_all_greedy_sample
+                # (anchor for the group-sync semantics).
                 advanced_draft_sampling = (
                     spec_metadata.wants_advanced_draft_sampling)
                 # enable_lm_head_tp_in_adp implies enable_attention_dp
@@ -903,18 +914,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         # full vocabulary. Model-specific shared heads may need
                         # preprocessing before that local projection.
                         shared_head = draft_model.mtp_layers[0].shared_head
-                        local_full_vocab_forward = getattr(
-                            shared_head, "forward_local_full_vocab", None)
-                        if local_full_vocab_forward is None:
-                            logits = draft_model.lm_head(
-                                hidden_states[gather_ids])
-                        else:
-                            logits = local_full_vocab_forward(
-                                hidden_states[gather_ids],
-                                draft_model.lm_head,
-                                attn_metadata,
-                                True,
-                            )
+                        logits = self._forward_local_mtp_head(
+                            shared_head, hidden_states[gather_ids], draft_model,
+                            attn_metadata)
                     else:
                         logits = draft_model.mtp_layers[0].shared_head(
                             hidden_states[gather_ids], draft_model.lm_head,

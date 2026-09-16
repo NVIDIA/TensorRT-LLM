@@ -693,6 +693,21 @@ class DeepseekV3MTPHead(nn.Module):
             lm_head.gather_output = True
         return logits
 
+    def forward_local_full_vocab(
+            self,
+            hidden_states: torch.Tensor,
+            lm_head: Linear,
+            attn_metadata: AttentionMetadata,
+            return_context_logits: bool = False) -> torch.Tensor:
+        """Project local ADP rows without LM-head-TP row stacking or vocab slicing."""
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = self.get_last_token_states(
+                    hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
+        return lm_head(hidden_states)
+
 
 class DeepseekV3Linear(Linear):
     """
