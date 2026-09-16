@@ -791,11 +791,12 @@ class MultimodalModelMixin:
         embeddings: torch.Tensor,
         **forward_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Optional hook before active chunk rows are selected.
+        """Optional hook after multimodal embeddings are gathered.
 
-        Runs after cache lookup or encoder execution has produced full
-        per-request multimodal embeddings, but before the mixin selects rows
-        active in the current forward chunk.
+        Runs after cache lookup or encoder execution, before active-row model
+        hooks. Legacy inputs still contain full-request rows here; item
+        scheduling already supplies current-chunk rows. Row-dependent model
+        transforms should use `after_active_multimodal_embeddings` instead.
         """
         return input_ids, embeddings
 
@@ -1003,8 +1004,8 @@ class MultimodalModelMixin:
         """Prepare multimodal inputs for a concrete model forward.
 
         This method owns the common framework sequence around a model-specific
-        encoder hook: retrieve/cache full request embeddings, select active
-        chunk rows, run optional model hooks, and fuse rows into text embeds.
+        encoder hook: retrieve/cache embeddings, select active chunk rows if
+        needed, run optional model hooks, and fuse rows into text embeds.
         """
         context_params = list(
             self.select_multimodal_params(
@@ -1015,16 +1016,16 @@ class MultimodalModelMixin:
         if not context_params:
             return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
 
-        full_embeddings = self._get_or_encode_multimodal_embeddings(context_params)
+        embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
-        input_ids, full_embeddings = self.after_full_multimodal_embeddings(
+        input_ids, embeddings = self.after_full_multimodal_embeddings(
             input_ids=input_ids,
             multimodal_params=context_params,
-            embeddings=full_embeddings,
+            embeddings=embeddings,
             **forward_kwargs,
         )
 
-        active_embeddings = find_input_mm_embeds([full_embeddings], list(context_params))
+        active_embeddings = find_input_mm_embeds([embeddings], list(context_params))
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
             multimodal_params=context_params,
@@ -1060,6 +1061,8 @@ class MultimodalModelMixin:
 
         Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
         the single tensor contract for both encoded and cached-only paths.
+        If item scheduling supplies current-chunk rows, the gather selects
+        current-chunk rows for every request before concatenating the batch.
 
         During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
         the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
@@ -1104,7 +1107,14 @@ class MultimodalModelMixin:
 
         # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
         # checked, not just paths that ran the encoder.
-        self._validate_embeddings(embeddings, multimodal_params)
+        self._validate_embeddings(
+            embeddings,
+            multimodal_params,
+            current_chunk_only=any(
+                param.multimodal_data.get("multimodal_embedding_is_chunk", False)
+                for param in multimodal_params
+            ),
+        )
         return embeddings[0]
 
     def _initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
@@ -1541,9 +1551,13 @@ class MultimodalModelMixin:
     def _validate_embeddings(
         embeddings: list[torch.Tensor],
         multimodal_params: Sequence[MultimodalParams],
+        *,
+        current_chunk_only: bool = False,
     ) -> None:
         """Validate gathered embeddings' row count against runtime metadata.
 
+        `current_chunk_only` matches the gather layout; it does not change the
+        original per-request runtime counts used for later prefill chunks.
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
         cannot be evaluated without complete metadata.
         """
@@ -1561,7 +1575,11 @@ class MultimodalModelMixin:
             has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
             has_runtime_metadata.append(has_runtime)
             if has_runtime:
-                expected_rows += runtime.total_embeds_in_request
+                expected_rows += (
+                    runtime.num_mm_tokens_in_chunk
+                    if current_chunk_only
+                    else runtime.total_embeds_in_request
+                )
 
         if any(has_runtime_metadata) and not all(has_runtime_metadata):
             raise ValueError(

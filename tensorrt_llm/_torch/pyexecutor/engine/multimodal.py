@@ -20,9 +20,14 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.inputs.multimodal import MultimodalParams, strip_mm_encoder_inputs
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalParams,
+    MultimodalRuntimeData,
+    strip_mm_encoder_inputs,
+)
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -543,8 +548,15 @@ class MultimodalItemScheduler:
             if state is not None and state.progress is MultimodalEncoderProgress.READY:
                 strip_mm_encoder_inputs(request.py_multimodal_data)
 
-    def build_multimodal_data_for_llm(self, request: LlmRequest) -> dict[str, Any] | None:
-        """Attach prompt-ordered cached item outputs for LLM prefill."""
+    def build_multimodal_data_for_llm(
+        self, request: LlmRequest, runtime: MultimodalRuntimeData | None = None
+    ) -> dict[str, Any] | None:
+        """Attach only the cached embedding rows consumed by this prefill chunk.
+
+        The request keeps its original metadata and cache references. The
+        returned per-forward payload marks its tensor as already chunk-local
+        so the common gather can also slice any full-request peers in a batch.
+        """
         state = request.py_mm_encoder_state
         if state is None:
             return request.py_multimodal_data
@@ -567,5 +579,12 @@ class MultimodalItemScheduler:
             segments.append(segment)
 
         multimodal_data = dict(request.py_multimodal_data or {})
-        multimodal_data["multimodal_embedding"] = torch.cat(segments, dim=0)
+        start = runtime.num_cached_mm_tokens if runtime is not None else 0
+        end = start + runtime.num_mm_tokens_in_chunk if runtime is not None else None
+        # Slice before joining: a long request must not copy all of its
+        # cached output for every small LLM chunk. One segment stays a view.
+        # TODO: Remove the remaining current-chunk join at the common LLM
+        # fusion boundary in the separate embedding-materialization follow-up.
+        multimodal_data["multimodal_embedding"] = _join_embeddings(segments, start=start, end=end)
+        multimodal_data["multimodal_embedding_is_chunk"] = True
         return multimodal_data

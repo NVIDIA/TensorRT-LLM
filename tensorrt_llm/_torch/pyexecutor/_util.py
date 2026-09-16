@@ -1307,11 +1307,21 @@ class KvCacheCreator:
     def _get_multimodal_encoder_memory_reserve(self,
                                                profiled_output_bytes: int = 0
                                                ) -> int:
-        """Return unified encoder-store capacity absent from the measured peak."""
+        """Reserve the unprofiled encoder store and chunk-assembly copies."""
         encoder_cache = self._model_engine.mm_encoder_cache
         if encoder_cache is None:
             return 0
-        return max(0, encoder_cache.max_bytes - profiled_output_bytes)
+        reserve = max(0, encoder_cache.max_bytes - profiled_output_bytes)
+        if self._model_engine.mm_encoder_item_scheduling_enabled:
+            # The text-only dummy does not assemble cached MM rows for LLM
+            # prefill. Per-request joins and their batch-wide join can coexist.
+            # Both contain only current-chunk rows, bounded by the LLM token
+            # budget even when many requests reuse the same cached item.
+            chunk_output_bytes = (
+                self._max_num_tokens *
+                self._model_engine.bytes_per_mm_encoder_embedding)
+            reserve += 2 * chunk_output_bytes
+        return reserve
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""

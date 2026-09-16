@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -29,7 +29,11 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     is_multimodal_encoder_ready,
     make_mm_encoder_transient_cache_key,
 )
-from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     MultimodalEncoderItemMetadata,
@@ -261,8 +265,10 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
     assert all(is_multimodal_encoder_ready(request) for request in requests)
 
 
+@pytest.mark.parametrize("window", [None, (0, 3), (2, 7), (6, 8), (3, 5)])
 def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     monkeypatch: pytest.MonkeyPatch,
+    window: tuple[int, int] | None,
 ) -> None:
     class _Model(MultimodalModelMixin):
         embedding_dtype = torch.float32
@@ -311,8 +317,29 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     assert "image" not in request.py_multimodal_data
     assert is_multimodal_encoder_ready(request)
 
-    multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request)
+    runtime = None
+    if window is not None:
+        # Two image-A rows, a text-only gap, then three image-B rows.
+        runtime = MultimodalRuntimeData(
+            embed_mask_cumsum=torch.tensor([0, 1, 2, 2, 2, 3, 4, 5]),
+            past_seen_token_num=window[0],
+            chunk_end_pos=window[1],
+        )
+    start = runtime.num_cached_mm_tokens if runtime is not None else 0
+    end = start + runtime.num_mm_tokens_in_chunk if runtime is not None else 5
+    expected = torch.cat([first, second])[start:end]
+    with patch("torch.cat", wraps=torch.cat) as join:
+        multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
+    output = multimodal_data["multimodal_embedding"]
     torch.testing.assert_close(
-        multimodal_data["multimodal_embedding"],
-        torch.cat([torch.full((2, 2), 2.0), torch.full((3, 2), 3.0)]),
+        output,
+        expected,
     )
+    assert join.call_count == int(start < 2 < end)
+    if start < end and join.call_count == 0:
+        source = first if end <= 2 else second
+        assert output.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+    assert multimodal_data["multimodal_embedding_is_chunk"]
+    assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
+    assert "multimodal_embedding" not in request.py_multimodal_data
+    assert mm_item_scheduler.encoder_cache.current_bytes == 40
