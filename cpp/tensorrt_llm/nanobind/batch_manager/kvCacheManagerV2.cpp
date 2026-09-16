@@ -31,6 +31,7 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/streamingEventSink.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include <algorithm>
@@ -1049,7 +1050,36 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         self.attentionDpRank, self.layerGroupId));
             });
 
-    nb::class_<kv::EventManager>(m, "KVCacheEventManager")
+    nb::class_<kv::EventSink>(m, "KVCacheEventSink");
+
+    nb::class_<kv::StreamingBlockStoredData>(m, "StreamingBlockStoredData")
+        .def_ro("block_hashes", &kv::StreamingBlockStoredData::blockHashes)
+        .def_ro("parent_block_hash", &kv::StreamingBlockStoredData::parentBlockHash)
+        .def_ro("token_ids", &kv::StreamingBlockStoredData::tokenIds);
+
+    nb::class_<kv::StreamingBlockRemovedData>(m, "StreamingBlockRemovedData")
+        .def_ro("block_hashes", &kv::StreamingBlockRemovedData::blockHashes);
+
+    nb::class_<kv::StreamingEventStats>(m, "StreamingEventStats")
+        .def_ro("stored_blocks", &kv::StreamingEventStats::storedBlocks)
+        .def_ro("removed_blocks", &kv::StreamingEventStats::removedBlocks)
+        .def_ro("partial_blocks_suppressed", &kv::StreamingEventStats::partialBlocksSuppressed)
+        .def_ro("multimodal_blocks_suppressed", &kv::StreamingEventStats::multimodalBlocksSuppressed)
+        .def_ro("non_target_life_cycles_ignored", &kv::StreamingEventStats::nonTargetLifeCyclesIgnored)
+        .def_ro("dropped_events", &kv::StreamingEventStats::droppedEvents);
+
+    nb::class_<kv::StreamingEventSink, kv::EventSink>(m, "StreamingEventSink")
+        .def(nb::init<int, int>(), nb::arg("tokens_per_block"), nb::arg("max_entries") = 50'000)
+        .def(
+            "set_target_life_cycle",
+            [](kv::StreamingEventSink& self, int lifeCycleId)
+            { self.setTargetLifeCycle(kv::LifeCycleId{lifeCycleId}); },
+            nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>())
+        .def("drain_iteration_events", &kv::StreamingEventSink::drainIterationEvents,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("stats", &kv::StreamingEventSink::getStats, nb::call_guard<nb::gil_scoped_release>());
+
+    nb::class_<kv::EventManager, kv::EventSink>(m, "KVCacheEventManager")
         .def(
             "__init__",
             [](kv::EventManager* self, int maxKvEventEntries, int windowSize, std::optional<int> attentionDpRank,
@@ -2033,6 +2063,26 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         { eventManager.addStoredLifeCycle(*block.block, kv::LifeCycleId{lifeCycleId}); },
         nb::arg("event_manager"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "streaming_event_sink_add_stored_block",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block)
+        { eventSink.addStoredBlock(*block.block); },
+        nb::arg("event_sink"), nb::arg("block"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "streaming_event_sink_add_stored_life_cycle",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block, int lifeCycleId)
+        { eventSink.addStoredLifeCycle(*block.block, kv::LifeCycleId{lifeCycleId}); },
+        nb::arg("event_sink"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "streaming_event_sink_add_removed_block",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block)
+        { eventSink.addRemovedBlock(block.block->key); },
+        nb::arg("event_sink"), nb::arg("block"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "streaming_event_sink_add_removed_life_cycle",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block, int lifeCycleId)
+        { eventSink.addRemovedLifeCycle(block.block->key, kv::LifeCycleId{lifeCycleId}); },
+        nb::arg("event_sink"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
         "active_page_stats",
         [](kv::KvCache const& kvCache)
         {
@@ -2245,7 +2295,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::shared_ptr<kv::EventSink> eventSink;
                 if (!eventManager.is_none())
                 {
-                    eventSink = nb::cast<std::shared_ptr<kv::EventManager>>(eventManager);
+                    eventSink = nb::cast<std::shared_ptr<kv::EventSink>>(eventManager);
                 }
 
                 std::unique_ptr<kv::IKvCacheColdPageCodec> codec;

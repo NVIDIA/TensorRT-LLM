@@ -39,6 +39,7 @@ import zmq
 
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime import kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent, KVCacheEventDiff
 
@@ -412,17 +413,8 @@ def validate_streaming_support(
         raise ValueError("Streaming KV events do not support pipeline parallelism")
     if cp_size > 1:
         raise ValueError("Streaming KV events do not support context parallelism")
-    if backend != "python":
-        # StreamingKVCacheEventManager is a duck-typed Python event sink, which cannot
-        # satisfy the nanobind constructor's nb::cast<std::shared_ptr<kv::EventManager>>
-        # (and the C++ radix tree calls the sink natively, not through Python). Fail
-        # with an actionable message instead of an opaque TypeError from the cast.
-        raise ValueError(
-            "Streaming KV events (kv_cache_config.kv_events_config) are only supported "
-            f"by the Python KV cache manager V2 backend, but '{backend}' is active. Set "
-            "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python to enable streaming KV events, or "
-            "use the buffered path via kv_cache_config.event_buffer_max_size."
-        )
+    if backend not in ("cpp", "python"):
+        raise ValueError(f"Unsupported KV cache manager V2 backend: {backend!r}")
     validate_endpoint_ranges(config, ranks_per_host, data_parallel_size)
 
 
@@ -515,13 +507,13 @@ class _MultimodalBlockError(ValueError):
 
 
 class StreamingKVCacheEventManager:
-    """Scheduler-local fast path that produces KV cache event wire messages directly.
+    """Scheduler-local facade for streaming KV event capture and publishing.
 
-    Implements the V2 KV-cache-manager event-sink hook interface by duck
-    typing rather than inheriting ``KVCacheEventManager``: it fully replaces
-    event production (reusing the radix block hashes) and shares none of the
-    base manager's state, so subclassing would only risk partially initialised
-    base attributes.
+    With the Python KV-cache backend this object is the duck-typed event sink. With
+    the C++ backend, ``native_event_sink`` captures the same semantics without a
+    Python callback on the cache hot path, and this facade drains its DTOs at the
+    once-per-iteration flush boundary. Both modes share publisher lifecycle,
+    batching, counters, and wire structs here.
     """
 
     def __init__(
@@ -532,12 +524,14 @@ class StreamingKVCacheEventManager:
         block_size: int,
         max_window_size: int,
         max_entries: int = 50_000,
+        native_event_sink: object | None = None,
     ) -> None:
         self._rank = data_parallel_rank
         self._publisher = create_event_publisher(config, data_parallel_rank)
         self._block_size = block_size
         self._max_window_size = max_window_size
         self._max_entries = max_entries
+        self._native_event_sink = native_event_sink
         self._target_life_cycle_id: int | None = None
         self._stored_blocks: dict[bytes, int] = {}
         self._pending_events: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
@@ -582,6 +576,8 @@ class StreamingKVCacheEventManager:
         if not target_ids:
             raise ValueError("Streaming KV events require an attention KV cache life cycle")
         self._target_life_cycle_id = min(target_ids)
+        if self._native_event_sink is not None:
+            self._native_event_sink.set_target_life_cycle(self._target_life_cycle_id)
         logger.info(
             "Streaming KV event fast path selected "
             f"lifecycle_id={self._target_life_cycle_id} "
@@ -761,11 +757,18 @@ class StreamingKVCacheEventManager:
         return False
 
     def flush_iteration_events(self) -> None:
-        if self._closed or not self._pending_events:
+        if self._closed:
             return
-        events = self._pending_events
-        self._pending_events = []
-        self._pending_entries = 0
+        if self._native_event_sink is not None:
+            events = self._drain_native_events()
+        else:
+            if not self._pending_events:
+                return
+            events = self._pending_events
+            self._pending_events = []
+            self._pending_entries = 0
+        if not events:
+            return
         batch = KVEventBatch(
             ts=time.time(),
             events=events,
@@ -784,6 +787,47 @@ class StreamingKVCacheEventManager:
                 f"{traceback.format_exc()}"
             )
 
+    @property
+    def event_sink(self) -> object:
+        """Return the backend-specific sink installed in KVCacheManager."""
+        return self if self._native_event_sink is None else self._native_event_sink
+
+    def _drain_native_events(
+        self,
+    ) -> list[BlockStored | BlockRemoved | AllBlocksCleared]:
+        assert self._native_event_sink is not None
+        result: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
+        for event in self._native_event_sink.drain_iteration_events():
+            if isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockStoredData):
+                result.append(
+                    BlockStored(
+                        block_hashes=list(event.block_hashes),
+                        parent_block_hash=event.parent_block_hash,
+                        token_ids=list(event.token_ids),
+                        block_size=self._block_size,
+                        lora_id=None,
+                        medium="GPU",
+                        lora_name=None,
+                    )
+                )
+            elif isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockRemovedData):
+                result.append(BlockRemoved(block_hashes=list(event.block_hashes), medium="GPU"))
+            else:
+                raise TypeError(f"Unsupported native streaming KV event: {type(event)!r}")
+        self._sync_native_stats()
+        return result
+
+    def _sync_native_stats(self) -> None:
+        if self._native_event_sink is None:
+            return
+        stats = self._native_event_sink.stats
+        self.stored_blocks = stats.stored_blocks
+        self.removed_blocks = stats.removed_blocks
+        self.partial_blocks_suppressed = stats.partial_blocks_suppressed
+        self.multimodal_blocks_suppressed = stats.multimodal_blocks_suppressed
+        self.non_target_life_cycles_ignored = stats.non_target_life_cycles_ignored
+        self.dropped_events = stats.dropped_events
+
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
         # Streaming publishing pushes events out-of-band, so the pull API has
         # nothing to return. Return empty instead of raising so callers of the
@@ -796,6 +840,7 @@ class StreamingKVCacheEventManager:
         self.flush_iteration_events()
         self._closed = True
         self._publisher.shutdown()
+        self._sync_native_stats()
         logger.info(
             "Streaming KV event fast path "
             f"rank={self._rank} "

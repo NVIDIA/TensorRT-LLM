@@ -380,17 +380,16 @@ def test_validate_streaming_support_rejects_unsupported_setups() -> None:
     config = KVEventsConfig(enable_kv_cache_events=True, endpoint="tcp://*:5557")
     supported = dict(pp_size=1, cp_size=1, ranks_per_host=1, data_parallel_size=1, backend="python")
 
-    # The supported baseline must not raise, or the negative cases prove nothing.
+    # Both implementations use a backend-specific sink behind the same facade.
     validate_streaming_support(config, **supported)
+    validate_streaming_support(config, **{**supported, "backend": "cpp"})
 
     with pytest.raises(ValueError, match="pipeline parallelism"):
         validate_streaming_support(config, **{**supported, "pp_size": 2})
     with pytest.raises(ValueError, match="context parallelism"):
         validate_streaming_support(config, **{**supported, "cp_size": 2})
-    # The default backend is "cpp", whose nanobind KVCacheManager cannot accept a
-    # duck-typed Python event sink; the error must name the env var that fixes it.
-    with pytest.raises(ValueError, match="TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"):
-        validate_streaming_support(config, **{**supported, "backend": "cpp"})
+    with pytest.raises(ValueError, match="Unsupported KV cache manager V2 backend"):
+        validate_streaming_support(config, **{**supported, "backend": "invalid"})
 
 
 @pytest.mark.parametrize(
