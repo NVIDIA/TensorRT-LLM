@@ -127,7 +127,7 @@ class TestPayloadVerification:
         assert params["cpuArchitecture"] == platform.machine()
         assert params["cpuCount"] == os.cpu_count()
         assert params["cudaVersion"] == torch.version.cuda
-        assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassName"] == "Qwen3ForCausalLM"
         assert params["backend"] == "pytorch"
 
         # Step 4: String length checks (ShortString<=128, LongString<=256)

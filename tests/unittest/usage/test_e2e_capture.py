@@ -297,7 +297,7 @@ class TestE2ECapture:
         assert "cudaVersion" in params
 
         # Model architecture
-        assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassName"] == "Qwen3ForCausalLM"
         assert params["architectureClassHash"] == ""
 
         # Backend
