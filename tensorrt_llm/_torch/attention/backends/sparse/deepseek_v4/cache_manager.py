@@ -264,6 +264,7 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 
 class DeepseekV4CacheManager(KVCacheManagerV2):
     _supports_reuse_match_backoff = False
+    _supports_draft_reuse_match_backoff = False
 
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains one virtual attention-op pool per local

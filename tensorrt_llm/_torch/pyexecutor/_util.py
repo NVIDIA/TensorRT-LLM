@@ -1781,12 +1781,14 @@ class KvCacheCreator:
         if lookahead is None:
             return False
         if lookahead > 0 and not getattr(self._kv_cache_manager_cls,
-                                         "_supports_reuse_match_backoff",
+                                         "_supports_draft_reuse_match_backoff",
                                          False):
             # The opt-out is about backing the match off by `lookahead` tokens,
             # which a specialized commit/history protocol (recurrent snapshots,
             # DSA) cannot express. A zero span asks for no backoff at all, so
             # every backoff-sized path stays a no-op and the pairing is safe.
+            # The pool that has to express the backoff is the draft pool, which
+            # holds only the speculation layers.
             return False
         return True
 
