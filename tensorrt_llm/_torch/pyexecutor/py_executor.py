@@ -275,8 +275,6 @@ def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
                                         time.monotonic() + timeout_s)
 
 
-
-
 @contextmanager
 def _distributed_warmup_guard(dist: Distributed,
                               mapping: Mapping) -> Iterator[None]:
@@ -6735,19 +6733,20 @@ class PyExecutor:
     def _handle_multimodal_encoder_request_error(
             self, scheduled_requests: ScheduledRequests, error_msg: str,
             failed_request_ids: set[int]) -> None:
-        """Remove requests that depend on a failed MM encoder output."""
+        """Fail the named requests and defer any unready contexts for retry."""
         failed_requests = [
             request for request in self.active_requests
             if request.request_id in failed_request_ids
         ]
 
-        # Capacity scheduling may already have placed requests whose last
-        # pending item was selected into this iteration's context batch.
-        # Remove the failed owners before the LLM forward; unrelated context
-        # and generation work remains intact.
+        # Requests enter the context batch before their selected items are
+        # encoded. If encoding stops early, also defer contexts whose outputs
+        # are still missing. Only the named owners fail; the others keep their
+        # cache references and retry on the next scheduling pass.
         scheduled_requests.reset_context_requests([
             request for request in scheduled_requests.context_requests
             if request.request_id not in failed_request_ids
+            and is_multimodal_encoder_ready(request)
         ])
         scheduled_requests.scheduled_mm_encoder_items = None
 

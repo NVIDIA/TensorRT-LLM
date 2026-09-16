@@ -205,10 +205,12 @@ A 1024×1024 fp32 patch tensor is ~12 MB; a video clip can be hundreds of MB. Na
 ### Contract 4 — Batch the multimodal encoder across requests
 
 Implement `MultimodalModelMixin.encode_multimodal_inputs` as one batched forward over its
-`MultimodalParams` list. The item-scheduled path calls `prepare_multimodal_encoder_inputs` for
-only the selected producer items, then `forward_multimodal_encoder_items` groups compatible
-modality runs and calls that same encoder hook. The legacy path also calls it for uncached
-requests through `get_multimodal_embeddings`. Concatenate requests' `pixel_values` /
+`MultimodalParams` list. The legacy path batches uncached requests through
+`get_multimodal_embeddings`. The item-scheduled path instead passes sliced inputs for selected
+producer items and calls the same hook once per compatible modality run. For example,
+`image -> video -> image` can require three calls, even if the model supports both modalities
+in one encoder group; the hook must not assume it receives the complete request.
+Within each call, concatenate requests' `pixel_values` /
 `image_grid_thw` / mel frames, build one ad-hoc `attn_metadata` whose `seq_lens` preserves item
 boundaries, and run the encoder blocks once. Never loop over requests and call the encoder once
 per request.
@@ -219,7 +221,9 @@ modalities, runs one encoder call, and restores request/prompt order from `mm_it
 the processor-declared output lengths. Override `build_multimodal_encoder_input` only when the
 default packed-grid, stacked-image, or stacked-audio slicers cannot represent the model's input.
 
-**Audit.** Under load with several multimodal requests in one batch, the encoder kernels in nsys should appear as **one wide block per iteration**, not N narrow blocks. A fan of N narrow blocks means the encoder is being looped per request instead of batched — one of the easiest VLM perf regressions to introduce while refactoring.
+**Audit.** Under load, compatible requests should share one wide encoder block per hook call,
+not one block per request. Item scheduling may produce multiple blocks per iteration when
+the selected items cross modality-run boundaries.
 
 ---
 
@@ -287,7 +291,7 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
     ) -> torch.Tensor:
         if self.mm_encoder is None:
             raise ValueError("Raw multimodal inputs require a local encoder")
-        return self.mm_encoder.forward(multimodal_params)
+        return self.mm_encoder(multimodal_params)
 
     @property
     def language_model(self) -> torch.nn.Module:
@@ -497,7 +501,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 - [ ] Broadcast payload < 1 MB per rank per request (NVTX `broadcast_requests` / `tp_broadcast_requests`); media crosses ranks only via `to_handle` / `to_tensor`.
 - [ ] Post-prefill/termination cleanup drains item-cache refs exactly once and leaves only fields retained by `strip_mm_data_for_generation`.
 - [ ] Encoder output is one tensor whose first dim equals the processor-declared MM output rows; cache item splits preserve prompt order and are reassembled into the existing single-tensor fusion contract.
-- [ ] Encoder is batched across requests: a multi-request batch produces a single wide encoder block in nsys, not N narrow blocks (Contract 4).
+- [ ] Encoder is batched across compatible requests within each hook call; separate item-scheduled modality runs may produce separate blocks (Contract 4).
 
 **Tests & docs**
 - [ ] Per-model unit test at `tests/unittest/_torch/modeling/test_modeling_<name>.py` subclassing `TestModelingMultimodal`; six abstract methods implemented; `get_scenarios()` declares the *minimum* modality × cuda_graph × chunked_prefill × kv_cache_reuse combinations that cover this model's distinctive paths (no full cartesian product) and they all pass.

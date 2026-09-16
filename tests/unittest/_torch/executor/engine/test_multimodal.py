@@ -212,10 +212,61 @@ def test_item_encoder_does_not_translate_system_errors(failure_stage: str) -> No
         mm_item_scheduler.forward_items([request], {request.request_id: [0]})
 
 
+@pytest.mark.parametrize("invalid_output", ["rows", "width", "dtype", "rank", "type"])
+def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -> None:
+    class _Model(MultimodalModelMixin):
+        embedding_dtype = torch.bfloat16
+
+        def prepare_multimodal_encoder_inputs(self, _):
+            return []
+
+        def forward_multimodal_encoder_items(self, _):
+            return outputs
+
+    outputs = [torch.ones(1, 4, dtype=torch.bfloat16) for _ in range(3)]
+    outputs[1] = {
+        "rows": torch.ones(2, 4, dtype=torch.bfloat16),
+        "width": torch.ones(1, 3, dtype=torch.bfloat16),
+        # Same byte size as bfloat16: byte accounting alone cannot catch this.
+        "dtype": torch.ones(1, 4, dtype=torch.float16),
+        "rank": torch.ones(4, dtype=torch.bfloat16),
+        "type": None,
+    }[invalid_output]
+    scheduler = bare_mm_item_scheduler(_Model())
+    scheduler.bytes_per_embedding = 8
+    producers = [make_mm_request(request_id, [4]) for request_id in (1, 2, 3)]
+    for request in producers:
+        _bind_items(scheduler, request)
+    follower = make_mm_request(4, [4])
+    shared_key = producers[1].py_mm_encoder_state.item_cache_keys[0]
+    assert scheduler.encoder_cache.acquire(shared_key, 8, retain_after_release=False)
+    follower.py_mm_encoder_state.set_item_cache_key(0, shared_key, ready=False)
+    requests = [*producers, follower]
+    selected = {request.request_id: [0] for request in producers}
+
+    with pytest.raises(MultimodalEncoderRequestError, match="must produce") as error:
+        scheduler.forward_items(requests, selected)
+
+    assert error.value.request_ids == {2, 4}
+    assert scheduler.encoder_cache.current_bytes == 0
+    for request in requests:
+        state = request.py_mm_encoder_state
+        assert state.item_ready == [False]
+        assert state.item_cache_keys[0] is not None
+        assert "image" in request.py_multimodal_data
+
+    outputs[1] = torch.ones(1, 4, dtype=torch.bfloat16)
+    scheduler.forward_items(requests, selected)
+    assert scheduler.encoder_cache.current_bytes == 24
+    assert all(is_multimodal_encoder_ready(request) for request in requests)
+
+
 def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Model(MultimodalModelMixin):
+        embedding_dtype = torch.float32
+
         def forward_multimodal_encoder_items(self, encoder_inputs):
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
@@ -225,6 +276,7 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
 
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.bytes_per_embedding = 8
     request = make_llm_request(
         1,
         multimodal_data={

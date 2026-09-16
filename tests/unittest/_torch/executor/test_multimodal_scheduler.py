@@ -326,29 +326,45 @@ def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
     failed = make_mm_request(1, [4])
     unrelated_context = make_llm_request(2)
     unrelated_generation = make_llm_request(3)
+    deferred = make_mm_request(4, [4])
+    deferred_state = deferred.py_mm_encoder_state
+    deferred_state.set_item_cache_key(0, "pending-output", ready=False)
+    ready_context = make_mm_request(5, [4], ready=[0])
     handled = []
 
     def fail_encoder(*_):
-        raise MultimodalEncoderRequestError("bad MM output")
+        raise MultimodalEncoderRequestError("bad MM output", request_ids={failed.request_id})
 
     executor = object.__new__(PyExecutor)
-    executor.active_requests = [failed, unrelated_context, unrelated_generation]
+    executor.active_requests = [
+        failed,
+        unrelated_context,
+        unrelated_generation,
+        deferred,
+        ready_context,
+    ]
     executor.enable_attention_dp = False
     executor.dist = SimpleNamespace(world_size=1)
     executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
     executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
 
     scheduled_requests = ScheduledRequests()
-    scheduled_requests.reset_context_requests([failed, unrelated_context])
+    scheduled_requests.reset_context_requests([failed, unrelated_context, deferred, ready_context])
     scheduled_requests.append_generation_request(unrelated_generation)
-    scheduled_requests.scheduled_mm_encoder_items = {failed.request_id: [0]}
+    scheduled_requests.scheduled_mm_encoder_items = {
+        failed.request_id: [0],
+        deferred.request_id: [0],
+    }
 
     executor._forward_multimodal_encoder_step(scheduled_requests)
 
-    assert scheduled_requests.context_requests == [unrelated_context]
+    assert scheduled_requests.context_requests == [unrelated_context, ready_context]
     assert scheduled_requests.generation_requests == [unrelated_generation]
     assert scheduled_requests.scheduled_mm_encoder_items is None
     assert handled == [("bad MM output", {"requests": [failed], "charge_budget": False})]
+    assert deferred.py_mm_encoder_state is deferred_state
+    assert deferred_state.item_cache_keys == ["pending-output"]
+    assert not is_multimodal_encoder_ready(deferred)
 
 
 def test_forward_multimodal_encoder_step_contains_model_contract_error():
