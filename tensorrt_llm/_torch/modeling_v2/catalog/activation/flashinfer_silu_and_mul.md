@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 4}
+  sm_103: {status: passed, tests: 5}
 ---
 
 # flashinfer_silu_and_mul

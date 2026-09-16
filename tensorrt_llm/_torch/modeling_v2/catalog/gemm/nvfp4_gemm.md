@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 19}
+  sm_103: {status: passed, tests: 20}
 ---
 
 # nvfp4_gemm

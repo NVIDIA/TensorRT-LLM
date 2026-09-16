@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 5}
+  sm_103: {status: passed, tests: 3}
 ---
 
 # flashinfer_fused_add_rmsnorm

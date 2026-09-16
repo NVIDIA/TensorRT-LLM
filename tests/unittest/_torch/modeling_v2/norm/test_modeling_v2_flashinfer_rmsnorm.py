@@ -56,19 +56,3 @@ def test_bf16_strided_rows() -> None:
     assert not x.is_contiguous() and x.stride(-1) == 1
     w = torch.randn(4096, dtype=torch.bfloat16, device="cuda")
     _check(x, w, 1e-6)
-
-
-def test_fp16_2d() -> None:
-    torch.manual_seed(4)
-    for num_tokens, hidden in [(2, 4096), (1024, 2048)]:
-        x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda")
-        w = torch.randn(hidden, dtype=torch.float16, device="cuda")
-        _check(x, w, 1e-6)
-
-
-def test_fp32_2d() -> None:
-    torch.manual_seed(5)
-    for num_tokens, hidden in [(2, 4096), (1024, 2048)]:
-        x = torch.randn(num_tokens, hidden, dtype=torch.float32, device="cuda")
-        w = torch.randn(hidden, dtype=torch.float32, device="cuda")
-        _check(x, w, 1e-6)

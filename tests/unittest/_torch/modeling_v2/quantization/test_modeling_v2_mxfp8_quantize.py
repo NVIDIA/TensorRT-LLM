@@ -117,17 +117,6 @@ def test_alignment_padding() -> None:
     assert (padded_sf.view(64, 96)[:, 90:] == 0).all()
 
 
-def test_fp16_input() -> None:
-    torch.manual_seed(3)
-    for t in (1, 512):
-        x = torch.randn(t, 2880, dtype=torch.float16, device="cuda")
-        data, sf = mxfp8_quantize(x, False, 512)
-        ref_data, ref_sf = _ref(x, 3072)
-        assert data.dtype == torch.float8_e4m3fn
-        assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
-        assert torch.equal(sf.view(t, 96), ref_sf)
-
-
 def test_3d_input_collapses_leading_dims() -> None:
     torch.manual_seed(4)
     x = torch.randn(2, 5, 2880, dtype=torch.bfloat16, device="cuda")

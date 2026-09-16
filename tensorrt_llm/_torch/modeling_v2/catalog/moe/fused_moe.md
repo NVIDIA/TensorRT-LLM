@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 23}
+  sm_103: {status: passed, tests: 17}
 ---
 
 # fused_moe

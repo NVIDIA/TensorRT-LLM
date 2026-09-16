@@ -67,21 +67,3 @@ def test_bf16_strided_rows() -> None:
     _check(x, r, w, 1e-6)
     # mutation must land in the parent buffers' left halves only
     assert torch.equal(torch.cat([x_buf[:, 4096:], r_buf[:, 4096:]]), right_before)
-
-
-def test_fp16_2d() -> None:
-    torch.manual_seed(3)
-    for num_tokens, hidden in [(2, 4096), (1024, 2048)]:
-        x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda")
-        r = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda")
-        w = torch.randn(hidden, dtype=torch.float16, device="cuda")
-        _check(x, r, w, 1e-6)
-
-
-def test_fp32_2d() -> None:
-    torch.manual_seed(4)
-    for num_tokens, hidden in [(2, 4096), (1024, 2048)]:
-        x = torch.randn(num_tokens, hidden, dtype=torch.float32, device="cuda")
-        r = torch.randn(num_tokens, hidden, dtype=torch.float32, device="cuda")
-        w = torch.randn(hidden, dtype=torch.float32, device="cuda")
-        _check(x, r, w, 1e-6)

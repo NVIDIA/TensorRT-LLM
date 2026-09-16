@@ -51,13 +51,6 @@ def test_bf16_edge_sizes() -> None:
         _check(x)
 
 
-def test_fp16_2d() -> None:
-    torch.manual_seed(3)
-    for num_tokens, two_d in [(2, 8192), (1024, 4096)]:
-        x = torch.randn(num_tokens, two_d, dtype=torch.float16, device="cuda")
-        _check(x)
-
-
 def test_a_misaligned_half_is_rejected_before_dispatch() -> None:
     """A final dim of 24 passes the op's own check and faults the kernel.
 

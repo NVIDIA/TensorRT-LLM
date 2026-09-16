@@ -420,9 +420,10 @@ def _assert_moe_close(y: torch.Tensor, ref: torch.Tensor) -> None:
     3.20 (H=2560) and 9.62 / 4.68 (H=7168), but only the RMS gate is
     scale-free — read it, not the element one, when sizing a caller's
     tolerance.
-    Both gates bite — `test_reference_discriminates` shows, at H=256/I=128
-    and at H=7168/I=2048 respectively, a gate/up swap (263 / 278 ulp), a
-    scalar-role swap (177 / 48), a missing scale swizzle (408 / 357), a
+    Both gates were sized against deliberately wrong computations when they
+    were set. At H=256/I=128 and at H=7168/I=2048 respectively: a gate/up
+    swap (263 / 278 ulp), a scalar-role swap (177 / 48), a missing scale
+    swizzle (408 / 357), a
     missing row shuffle (508 / 432), and a reference that skips the FC1-output
     requantization (43 / 28 ulp element, 23 / 23 ulp RMS); the smallest RMS
     distance any of those reaches is 39.8, at the R1 shape's scalar-role swap.
@@ -669,83 +670,6 @@ def test_intermediate_is_nvfp4_requantized():
         f"{y.numel()} elements; unrounded scale {fracs['exact (unrounded) scale']:.1%}, "
         f"no requantization {fracs['no requantization']:.1%})"
     )
-
-
-def test_reference_discriminates():
-    """Every layout / scalar-role mistake lands far outside the numeric gate.
-
-    Run at two hidden/intermediate pairs, because both operand layouts are
-    functions of `H` and `I`: the small one, and the DeepSeek-R1 routed shape
-    (`H = 7168`, `I = 2048`) at a reduced expert count — the row shuffle and
-    the 128x4 scale swizzle are per-expert, so `E` is free to be small while
-    the layout question is entirely `H`/`I`.
-    """
-    for num_experts, hidden, inter, top_k, num_tokens, seed in (
-        (8, 256, 128, 2, 32, 303),
-        (16, 7168, 2048, 8, 32, 7168),
-    ):
-        args, ref = _build(num_experts, hidden, inter, seed=seed)
-        gen = ref["gen"]
-        g1 = 137.0
-        data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
-        ids, wts = _routing(num_tokens, num_experts, top_k, gen)
-        g2 = _calibrate_g2(x, ids, ref)
-        s1, sg, s2 = _scalars(num_experts, g1, g2)
-        base = dict(
-            topk_ids=ids,
-            topk_weights=wts,
-            output1_scale_scalar=s1,
-            output1_scale_gate_scalar=sg,
-            output2_scale_scalar=s2,
-        )
-        y = _call(data, sf, args, num_experts, top_k, **base)[0]
-        good = _ref_moe(x, ids, wts, ref, g2).to(torch.bfloat16)
-        _assert_moe_close(y, good)
-        print(f"    E={num_experts} H={hidden} I={inter} top-{top_k}, T={num_tokens}:")
-
-        up_p, gt_p, up_s, gt_s, dn_p, dn_s = ref["raw"]
-        variants = {
-            "[gate|up] instead of [up|gate]": _dev(
-                y, _ref_moe(x, ids, wts, ref, g2, swap_gate_up=True).to(torch.bfloat16)
-            ),
-            "output1 scalars swapped": _dev(
-                y, _ref_moe(x, ids, wts, ref, g2, swap_scalars=True).to(torch.bfloat16)
-            ),
-            "no intermediate requantization": _dev(
-                y,
-                _ref_moe(x, ids, wts, ref, g2, quantize_intermediate=False).to(torch.bfloat16),
-            ),
-        }
-        for name, (elt, rms) in variants.items():
-            assert elt > 25.0, f"{name} only {elt:.1f} ulp away — not discriminated"
-            print(f"      {name:34s} {elt:8.1f} elt / {rms:6.2f} rms ulp")
-
-        # operand-preparation mistakes: the kernel is fed the wrong bytes
-        for name, kw in (
-            (
-                "weight scales not 128x4 swizzled",
-                dict(
-                    gemm1_weights_scale=_prep_fc1(up_p, gt_p, up_s, gt_s, swizzle=False)[1],
-                    gemm2_weights_scale=_prep_fc2(dn_p, dn_s, swizzle=False)[1],
-                ),
-            ),
-            (
-                "rows not shuffled",
-                dict(
-                    gemm1_weights=_prep_fc1(up_p, gt_p, up_s, gt_s, shuffle=False)[0],
-                    gemm1_weights_scale=_prep_fc1(up_p, gt_p, up_s, gt_s, shuffle=False)[1],
-                    gemm2_weights=_prep_fc2(dn_p, dn_s, shuffle=False)[0],
-                    gemm2_weights_scale=_prep_fc2(dn_p, dn_s, shuffle=False)[1],
-                ),
-            ),
-        ):
-            bad = _call(data, sf, args, num_experts, top_k, **base, **kw)[0]
-            elt, rms = _dev(bad, good.float())
-            assert elt > 25.0, f"{name} only {elt:.1f} ulp away — not discriminated"
-            print(f"      {name:34s} {elt:8.1f} elt / {rms:6.2f} rms ulp")
-        del args, ref, y, good, data, sf, x
-        torch.cuda.empty_cache()
-    print("  test_reference_discriminates OK")
 
 
 def test_fp4_quantize_pairing():

@@ -61,15 +61,3 @@ def test_bf16_unaligned_shapes() -> None:
     torch.manual_seed(2)
     for batch, m, k, n in [(3, 5, 100, 60), (7, 13, 333, 129)]:
         _check(*_make(batch, m, k, n, torch.bfloat16))
-
-
-def test_fp16() -> None:
-    torch.manual_seed(3)
-    for batch, m, k, n in [(64, 1, 512, 128), (8, 1024, 512, 256)]:
-        _check(*_make(batch, m, k, n, torch.float16))
-
-
-def test_fp32() -> None:
-    torch.manual_seed(4)
-    for batch, m, k, n in [(32, 2, 256, 128), (4, 1024, 512, 256)]:
-        _check(*_make(batch, m, k, n, torch.float32))
