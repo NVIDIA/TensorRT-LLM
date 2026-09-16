@@ -1481,6 +1481,7 @@ class GvrMainKernel:
         assert self.ck_off % 16 == 0, "ck64 must stay 16B aligned (ulonglong2)"
         self.dyn_bytes = self.ck_off + (self.cmpb + 1) * 8
         self.lb = self.nbs.bit_length() - 1  # log2(NBS)=8
+        self.um = 4  # SPLIT line-miss re-stage: float4 loads in flight per thread
 
     # ------------------------------------------------------------------
     # GVR_EMITC: classify+stage one survivor.
@@ -1555,7 +1556,8 @@ class GvrMainKernel:
     # need0-th key; returns the final rlo (every key >= rlo is a winner or
     # a member of the crossing tie class).  emit: tie-aware ballot emit of
     # the need0 winners to out_row[obase ..).  List source: srcg != 0 ->
-    # gbuf_row (u64 slab), else s_list (u64) / s_cbuf (packed) per VSTG.
+    # gbuf_row (u64 slab), else s_list (u64) / s_cbuf (packed) per VSTG;
+    # batch_g: gbuf-only caller, 4 slab loads in flight per level iteration.
     # ------------------------------------------------------------------
     @cute.jit
     def _degen_narrow(
@@ -1576,6 +1578,7 @@ class GvrMainKernel:
         out_row,
         s_ld,
         emit: cutlass.Constexpr,
+        batch_g: cutlass.Constexpr,
     ):
         BLK = self.blk
         NBS = self.nbs
@@ -1615,35 +1618,69 @@ class GvrMainKernel:
                     sh2 = cutlass.Int32(0)
                 sh2u = cutlass.Uint32(sh2)
                 i = tidx
-                while i < lN:
-                    uq = cutlass.Uint32(0)
-                    if cutlass.const_expr(self.vstg):
-                        vx = cutlass.Int32(0)
-                        vy = cutlass.Int32(0)
-                        if cutlass.const_expr(self.split):
-                            if srcg != cutlass.Int32(0):
-                                vx, vy = C._ldcg_v2_i32(
-                                    gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
-                                )
+                if cutlass.const_expr(batch_g):
+                    lNm = lN - cutlass.Int32(1)
+                    while i < lN:
+                        gq = []
+                        for uu in cutlass.range_constexpr(4):
+                            ig = i + cutlass.Int32(uu * BLK)
+                            if ig > lNm:
+                                ig = lNm
+                            gx_, gy_ = C._ldcg_v2_i32(
+                                gbuf_row + cutlass.Int64(ig) * cutlass.Int64(8)
+                            )
+                            gq.append(gx_)
+                        for uu in cutlass.range_constexpr(4):
+                            okg = cutlass.Int32(0)
+                            if i + cutlass.Int32(uu * BLK) < lN:
+                                okg = cutlass.Int32(1)
+                            if okg != cutlass.Int32(0):
+                                uq = C.fkey_bits(cutlass.Uint32(gq[uu]))
+                                if uq >= cutlass.Uint32(rlo):
+                                    if uq <= cutlass.Uint32(rhi):
+                                        du = (uq - cutlass.Uint32(rlo)) >> sh2u
+                                        if du > cutlass.Uint32(NBS - 1):
+                                            du = cutlass.Uint32(NBS - 1)
+                                        C.atomic_add_cta(
+                                            s_hist.iterator + cutlass.Int32(du), cutlass.Int32(1)
+                                        )
+                        i = i + cutlass.Int32(4 * BLK)
+                else:
+                    while i < lN:
+                        uq = cutlass.Uint32(0)
+                        if cutlass.const_expr(self.vstg):
+                            vx = cutlass.Int32(0)
+                            vy = cutlass.Int32(0)
+                            if cutlass.const_expr(self.split):
+                                if srcg != cutlass.Int32(0):
+                                    vx, vy = C._ldcg_v2_i32(
+                                        gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                    )
+                                else:
+                                    pk64 = s_list[i]
+                                    vx = cutlass.Int32(
+                                        cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                    )
                             else:
                                 pk64 = s_list[i]
                                 vx = cutlass.Int32(
                                     cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
                                 )
+                            uq = C.fkey_bits(cutlass.Uint32(vx))
                         else:
-                            pk64 = s_list[i]
-                            vx = cutlass.Int32(cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF)))
-                        uq = C.fkey_bits(cutlass.Uint32(vx))
-                    else:
-                        id0 = cutlass.Int32(cutlass.Uint32(s_cbuf[i]) & cutlass.Uint32(IDXM__main))
-                        uq = C.fkey(C.ldg_f32(x_addr, id0))
-                    if uq >= cutlass.Uint32(rlo):
-                        if uq <= cutlass.Uint32(rhi):
-                            du = (uq - cutlass.Uint32(rlo)) >> sh2u
-                            if du > cutlass.Uint32(NBS - 1):
-                                du = cutlass.Uint32(NBS - 1)
-                            C.atomic_add_cta(s_hist.iterator + cutlass.Int32(du), cutlass.Int32(1))
-                    i = i + cutlass.Int32(BLK)
+                            id0 = cutlass.Int32(
+                                cutlass.Uint32(s_cbuf[i]) & cutlass.Uint32(IDXM__main)
+                            )
+                            uq = C.fkey(C.ldg_f32(x_addr, id0))
+                        if uq >= cutlass.Uint32(rlo):
+                            if uq <= cutlass.Uint32(rhi):
+                                du = (uq - cutlass.Uint32(rlo)) >> sh2u
+                                if du > cutlass.Uint32(NBS - 1):
+                                    du = cutlass.Uint32(NBS - 1)
+                                C.atomic_add_cta(
+                                    s_hist.iterator + cutlass.Int32(du), cutlass.Int32(1)
+                                )
+                        i = i + cutlass.Int32(BLK)
                 cute.arch.barrier()  # ---- barrier (level hist) ----
                 C.scan_cross0(
                     s_hist,
@@ -1724,6 +1761,86 @@ class GvrMainKernel:
                 )
                 it = it + cutlass.Int32(1)
         return cutlass.Uint32(rlo)
+
+    # ------------------------------------------------------------------
+    # SPLIT line-miss re-stage: one whole-row pass staging every x with
+    # lo_f <= x and not (x >= hi_f) as (value bits, index) u64 into s_stg
+    # (count in s_scal[0]; slots past MCAP land in the trash slot).  hi_f =
+    # NaN disables the upper bound.  UM float4 loads are in flight per
+    # thread before any compare; a float4 whose max is below lo_f costs one
+    # FMNMX chain, the survivors (rare) are re-read and stored from a
+    # warp-aggregated reservation like the P3 row pass.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _miss_restage(self, lo_f, hi_f, n, tidx, lane, x_addr, s_stg, s_scal):
+        BLK = self.blk
+        UM = self.um
+        MCAP = self.scpb + self.cmpb
+        atom128 = C.g2r_atom_f32(128, invariant=True)
+        stg_b = cutlass.Int32(s_stg.iterator.toint())
+        fm = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(UM)]
+        n4 = n >> cutlass.Int32(2)
+        lim4 = n4 - cutlass.Int32(1)
+        nItm = (n4 + cutlass.Int32(BLK * UM - 1)) // cutlass.Int32(BLK * UM)
+        it = cutlass.Int32(0)
+        while it < nItm:
+            i0 = it * cutlass.Int32(BLK * UM) + tidx
+            for uu in cutlass.range_constexpr(UM):
+                ic = i0 + cutlass.Int32(uu * BLK)
+                if ic > lim4:
+                    ic = lim4
+                C.ld_g_f32x4(atom128, x_addr, ic, fm[uu])
+            Mlo = cutlass.Int32(0)
+            Mhi = cutlass.Int32(0)
+            for uu in cutlass.range_constexpr(UM):
+                okq = cutlass.Int32(0)
+                if i0 + cutlass.Int32(uu * BLK) < n4:
+                    okq = cutlass.Int32(1)
+                if okq != cutlass.Int32(0):
+                    m4 = C.fmax_f32(
+                        C.fmax_f32(fm[uu][0], fm[uu][1]), C.fmax_f32(fm[uu][2], fm[uu][3])
+                    )
+                    if m4 >= lo_f:
+                        for q in cutlass.range_constexpr(4):
+                            Mlo = Mlo | (
+                                cutlass.Int32(fm[uu][q] >= lo_f) << cutlass.Int32(uu * 4 + q)
+                            )
+                            Mhi = Mhi | (
+                                cutlass.Int32(fm[uu][q] >= hi_f) << cutlass.Int32(uu * 4 + q)
+                            )
+            M = Mlo - (Mlo & Mhi)
+            cnt = cutlass.Int32(C.popc(M))
+            inc = C.warp_incl_scan_add(cnt, lane)
+            bpos = cutlass.Int32(0)
+            if lane == cutlass.Int32(31):
+                if inc != cutlass.Int32(0):
+                    bpos = C.atomic_add_cta(s_scal.iterator + 0, inc)
+            pos = cute.arch.shuffle_sync(bpos, cutlass.Int32(31)) + (inc - cnt)
+            while M != cutlass.Int32(0):
+                bp = C.ffs_m1(M)
+                M = M & (M - cutlass.Int32(1))
+                idx = ((i0 + (bp >> cutlass.Int32(2)) * cutlass.Int32(BLK)) << cutlass.Int32(2)) + (
+                    bp & cutlass.Int32(3)
+                )
+                xv = C.ldg_f32(x_addr, idx)
+                pm = pos
+                if pm > cutlass.Int32(MCAP):
+                    pm = cutlass.Int32(MCAP)
+                _st_s_v2_u32(stg_b + pm * cutlass.Int32(8), C.u32_of_f32(xv), cutlass.Uint32(idx))
+                pos = pos + cutlass.Int32(1)
+            it = it + cutlass.Int32(1)
+        itm = (n4 << cutlass.Int32(2)) + tidx  # scalar tail
+        while itm < n:
+            xm = C.ldg_f32(x_addr, itm)
+            okt = cutlass.Int32(xm >= lo_f) - (
+                cutlass.Int32(xm >= lo_f) & cutlass.Int32(xm >= hi_f)
+            )
+            if okt != cutlass.Int32(0):
+                pm = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                if pm > cutlass.Int32(MCAP):
+                    pm = cutlass.Int32(MCAP)
+                _st_s_v2_u32(stg_b + pm * cutlass.Int32(8), C.u32_of_f32(xm), cutlass.Uint32(itm))
+            itm = itm + cutlass.Int32(BLK)
 
     # ------------------------------------------------------------------
     # kernel
@@ -3112,7 +3229,7 @@ class GvrMainKernel:
                     s_lst = s_stg
                 else:
                     s_lst = s_cbuf2
-                if cutlass.const_expr(self.split):
+                if cutlass.const_expr(self.split and not self.prefill):
                     if dga != cutlass.Int32(0):
                         lN = listN
                         srcg = fromg
@@ -3121,12 +3238,13 @@ class GvrMainKernel:
                         # top-k superset into s_stg, then the staged
                         # narrowing (vs the whole-row narrowing below).
                         # UNDER (total < k): slab = top-`total`; stage
-                        # [floor, TF) with the sample's rank-2*TGT floor.
+                        # [floor, TF) with the sample's rank-2*TGT floor
+                        # (same float compares as the slab's x >= TF).
                         # OVER (total > GCAP): the k-th key of the slab
                         # prefix bounds the row's k-th from below; stage
-                        # keys >= it.  Any overflow / short count -> degen B.
-                        klo = cutlass.Uint32(0)
-                        khi = cutlass.Uint32(0xFFFFFFFF)
+                        # x >= it.  Any overflow / short count -> degen B.
+                        lo_f = cutlass.Float32(0.0)
+                        hi_f = cutlass.Float32(0.0)
                         okm = cutlass.Int32(0)
                         if tidx == cutlass.Int32(0):
                             s_scal[0] = cutlass.Int32(0)
@@ -3138,16 +3256,14 @@ class GvrMainKernel:
                                 gvx, gvy = C._ldcg_v2_i32(
                                     gbuf_row + cutlass.Int64(im) * cutlass.Int64(8)
                                 )
-                                if cutlass.const_expr(self.prefill):
-                                    gvy = gvy - s_ld[0]
                                 out_row[im] = gvy
                                 im = im + cutlass.Int32(BLK)
                             T3 = s_tsh[0]
                             if T3 > cutlass.Float32(_NEG_INF):
                                 if T3 < TF:
                                     okm = cutlass.Int32(1)
-                                    klo = C.fkey(T3)
-                                    khi = C.fkey(TF) - cutlass.Uint32(1)
+                                    lo_f = T3
+                                    hi_f = TF
                         else:
                             klo = self._degen_narrow(
                                 cutlass.Int32(GCAP__main),
@@ -3166,47 +3282,13 @@ class GvrMainKernel:
                                 out_row,
                                 s_ld,
                                 emit=False,
+                                batch_g=True,
                             )
-                            khi = cutlass.Uint32(0xFFFFFFFF)
+                            lo_f = C.invkey(klo)
+                            hi_f = cutlass.Float32(float("nan"))
                             okm = cutlass.Int32(1)
                         if okm != cutlass.Int32(0):
-                            stg_b = cutlass.Int32(s_stg.iterator.toint())
-                            fq = cute.make_rmem_tensor((4,), cutlass.Float32)
-                            i4m = tidx
-                            while i4m < (n >> cutlass.Int32(2)):
-                                C.ld_g_f32x4(atom128, x_addr, i4m, fq)
-                                for qm in cutlass.range_constexpr(4):
-                                    uqm = C.fkey(fq[qm])
-                                    if uqm >= cutlass.Uint32(klo):
-                                        if uqm <= cutlass.Uint32(khi):
-                                            pm = C.atomic_add_cta(
-                                                s_scal.iterator + 0, cutlass.Int32(1)
-                                            )
-                                            if pm > cutlass.Int32(MCAP):
-                                                pm = cutlass.Int32(MCAP)
-                                            _st_s_v2_u32(
-                                                stg_b + pm * cutlass.Int32(8),
-                                                C.u32_of_f32(fq[qm]),
-                                                cutlass.Uint32(
-                                                    (i4m << cutlass.Int32(2)) + cutlass.Int32(qm)
-                                                ),
-                                            )
-                                i4m = i4m + cutlass.Int32(BLK)
-                            itm = (n & cutlass.Int32(~3)) + tidx
-                            while itm < n:
-                                xm = C.ldg_f32(x_addr, itm)
-                                uqm = C.fkey(xm)
-                                if uqm >= cutlass.Uint32(klo):
-                                    if uqm <= cutlass.Uint32(khi):
-                                        pm = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
-                                        if pm > cutlass.Int32(MCAP):
-                                            pm = cutlass.Int32(MCAP)
-                                        _st_s_v2_u32(
-                                            stg_b + pm * cutlass.Int32(8),
-                                            C.u32_of_f32(xm),
-                                            cutlass.Uint32(itm),
-                                        )
-                                itm = itm + cutlass.Int32(BLK)
+                            self._miss_restage(lo_f, hi_f, n, tidx, lane, x_addr, s_stg, s_scal)
                         cute.arch.barrier()  # ---- barrier (miss stage) ----
                         # unusable floor -> nothing staged -> cN = 0 < need0
                         cN = s_scal[0]
@@ -3243,6 +3325,7 @@ class GvrMainKernel:
                         out_row,
                         s_ld,
                         emit=True,
+                        batch_g=False,
                     )
                 else:
                     # ---- degen B: whole-row narrowing ----
