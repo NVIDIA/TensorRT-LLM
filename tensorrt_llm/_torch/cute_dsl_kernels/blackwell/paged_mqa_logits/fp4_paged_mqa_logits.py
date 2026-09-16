@@ -573,6 +573,14 @@ class FP4MQALogitsKernel:
         # False emits block_max ONLY (no bitmap read, no hit aggregate).
         self.emit_block_meta = emit_block_meta
         self.emit_hit_stats = emit_hit_stats
+        # Deferred block_max emission: with only block_max requested, a
+        # tile's warp fmax + record store are issued under the NEXT tile's
+        # TMEM load instead of at the end of its epilogue chain. The
+        # sub-knobs below consume r_bmax in place, so they keep the in-place
+        # path.
+        self.emit_block_meta_deferred = (
+            emit_block_meta and not emit_hit_stats and not emit_seed_counts
+        )
         # emit_seed_counts (requires emit_block_meta): per row, count
         # stored logits >= each of the T=3 caller-provided thresholds.
         # Counts are computed on the POST-conversion value over valid
@@ -2274,6 +2282,14 @@ class FP4MQALogitsKernel:
                     # epilogue's critical path
                     bm_base = cutlass.Int64(0)
                     bm_nrec = cutlass.Int32(mBlockMax.shape[1])
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # pending emission of the previous tile: per-lane
+                        # masked values, record-0 byte address, armed flag
+                        pend_v = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            pend_v[_i] = cutlass.Float32(_META_NEG_FLT_MAX)
+                        pend_addr = cutlass.Int64(0)
+                        pend_on = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
                         scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
@@ -2428,6 +2444,22 @@ class FP4MQALogitsKernel:
 
                     # --- First sub-tile LDTM ---
                     cute.copy(tc_0, tTR_0[(None, None, None, 0, 0)], tTR_rAcc)
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # previous tile's block_max: CREDUX + lane-0 store
+                        # overlap this tile's in-flight TMEM load
+                        for _t in cutlass.range_constexpr(next_n):
+                            r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                            if pend_on != cutlass.Int32(0) and meta_lane == cutlass.Int32(0):
+                                _st_global_f32(
+                                    pend_addr
+                                    + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                    r_pend,
+                                )
+                        # arm this tile: record = tile*4 + warp, row base of q_idx
+                        pend_addr = bm_base + cutlass.Int64(
+                            meta_kv_tile * cutlass.Int32(4) + meta_warp
+                        ) * cutlass.Int64(4)
+                        pend_on = cutlass.Int32(1)
                     cute.arch.fence_view_async_tmem_load()
 
                     # --- Sub-tile compute loop ---
@@ -2610,19 +2642,22 @@ class FP4MQALogitsKernel:
                             bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
                             if meta_valid:
                                 bmax_v = f32_t
-                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
-                            # Warp-autonomous store: record index =
-                            # tile*4 + warp; the GVR consumer folds the
-                            # 4 warp-partials per block.
-                            if meta_lane == cutlass.Int32(0):
-                                rec_m = (
-                                    cutlass.Int32(t) * bm_nrec
-                                    + meta_kv_tile * cutlass.Int32(4)
-                                    + meta_warp
-                                )
-                                _st_global_f32(
-                                    bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
-                                )
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                pend_v[t] = bmax_v
+                            else:
+                                r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                                # Warp-autonomous store: record index =
+                                # tile*4 + warp; the GVR consumer folds the
+                                # 4 warp-partials per block.
+                                if meta_lane == cutlass.Int32(0):
+                                    rec_m = (
+                                        cutlass.Int32(t) * bm_nrec
+                                        + meta_kv_tile * cutlass.Int32(4)
+                                        + meta_warp
+                                    )
+                                    _st_global_f32(
+                                        bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
+                                    )
                             if cutlass.const_expr(self.emit_seed_counts):
                                 # Seed-count accumulation: branchless 0/1
                                 # adds on the post-conversion value; the
@@ -3003,6 +3038,16 @@ class FP4MQALogitsKernel:
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.emit_block_meta_deferred):
+                    # flush the last tile's pending block_max (WG 0)
+                    for _t in cutlass.range_constexpr(next_n):
+                        r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                        if pend_on != cutlass.Int32(0) and meta_lane == cutlass.Int32(0):
+                            _st_global_f32(
+                                pend_addr
+                                + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                r_pend,
+                            )
                 # Flush the final request's hit accumulators (WG 0).
                 if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
                     if q_idx < batch_size:
@@ -3077,6 +3122,14 @@ class FP4MQALogitsKernel:
                     # epilogue's critical path
                     bm_base = cutlass.Int64(0)
                     bm_nrec = cutlass.Int32(mBlockMax.shape[1])
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # pending emission of the previous tile: per-lane
+                        # masked values, record-0 byte address, armed flag
+                        pend_v = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            pend_v[_i] = cutlass.Float32(_META_NEG_FLT_MAX)
+                        pend_addr = cutlass.Int64(0)
+                        pend_on = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
                         scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
@@ -3232,6 +3285,22 @@ class FP4MQALogitsKernel:
 
                     # --- First sub-tile LDTM (WG1) ---
                     cute.copy(tc_1, tTR_1[(None, None, None, 0, 0)], tTR_rAcc)
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # previous tile's block_max: CREDUX + lane-0 store
+                        # overlap this tile's in-flight TMEM load
+                        for _t in cutlass.range_constexpr(next_n):
+                            r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                            if pend_on != cutlass.Int32(0) and meta_lane == cutlass.Int32(0):
+                                _st_global_f32(
+                                    pend_addr
+                                    + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                    r_pend,
+                                )
+                        # arm this tile: record = tile*4 + warp, row base of q_idx
+                        pend_addr = bm_base + cutlass.Int64(
+                            meta_kv_tile * cutlass.Int32(4) + meta_warp
+                        ) * cutlass.Int64(4)
+                        pend_on = cutlass.Int32(1)
                     cute.arch.fence_view_async_tmem_load()
 
                     # --- Sub-tile compute loop (WG1) ---
@@ -3406,19 +3475,22 @@ class FP4MQALogitsKernel:
                             bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
                             if meta_valid:
                                 bmax_v = f32_t
-                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
-                            # Warp-autonomous store: record index =
-                            # tile*4 + warp; the GVR consumer folds the
-                            # 4 warp-partials per block.
-                            if meta_lane == cutlass.Int32(0):
-                                rec_m = (
-                                    cutlass.Int32(t) * bm_nrec
-                                    + meta_kv_tile * cutlass.Int32(4)
-                                    + meta_warp
-                                )
-                                _st_global_f32(
-                                    bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
-                                )
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                pend_v[t] = bmax_v
+                            else:
+                                r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                                # Warp-autonomous store: record index =
+                                # tile*4 + warp; the GVR consumer folds the
+                                # 4 warp-partials per block.
+                                if meta_lane == cutlass.Int32(0):
+                                    rec_m = (
+                                        cutlass.Int32(t) * bm_nrec
+                                        + meta_kv_tile * cutlass.Int32(4)
+                                        + meta_warp
+                                    )
+                                    _st_global_f32(
+                                        bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
+                                    )
                             if cutlass.const_expr(self.emit_seed_counts):
                                 # Seed-count accumulation: branchless 0/1
                                 # adds on the post-conversion value; the
@@ -3799,6 +3871,16 @@ class FP4MQALogitsKernel:
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.emit_block_meta_deferred):
+                    # flush the last tile's pending block_max (WG 1)
+                    for _t in cutlass.range_constexpr(next_n):
+                        r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                        if pend_on != cutlass.Int32(0) and meta_lane == cutlass.Int32(0):
+                            _st_global_f32(
+                                pend_addr
+                                + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                r_pend,
+                            )
                 # Flush the final request's hit accumulators (WG 1).
                 if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
                     if q_idx < batch_size:
