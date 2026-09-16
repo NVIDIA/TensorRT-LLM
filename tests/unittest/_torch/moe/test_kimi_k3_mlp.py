@@ -281,7 +281,13 @@ def test_kimi_k3_shared_expert_parallel_construction(
     assert shared.gate_up_proj.tp_rank == expected_shared_rank
     assert shared.down_proj.tp_size == expected_shared_tp
     assert shared.down_proj.tp_rank == expected_shared_rank
-    assert shared.down_proj.reduce_output is False
+    # The shared branch carries its own all-reduce whenever it is TP-sharded:
+    # ``KimiK3MoERuntime`` passes ``reduce_output=use_shared_tp``, and the
+    # forward comment is explicit that "the shared GatedMLP includes its output
+    # all-reduce on the auxiliary stream", joined before the separate routed
+    # all-reduce. Only attention-DP (shared expert replicated at TP 1) and the
+    # single-rank case leave it unreduced.
+    assert shared.down_proj.reduce_output is (not attention_dp and tp_size > 1)
     local_intermediate = (
         config.moe_intermediate_size * config.num_shared_experts // expected_shared_tp
     )

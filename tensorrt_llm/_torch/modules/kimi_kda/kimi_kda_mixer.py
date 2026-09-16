@@ -66,6 +66,22 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
     module._apply(_cast)
 
 
+def _stage_state_rows(ssm_pool: torch.Tensor, slot_indices: torch.Tensor) -> torch.Tensor:
+    """Dense fp32 copy of the addressed recurrent-state rows.
+
+    The fp32-only consumers (indexed prefill kernel, fused decode kernel) run on
+    this copy when the pool is bf16; ``_writeback_state_rows`` rounds it back.
+    """
+    return ssm_pool.index_select(0, slot_indices.long()).float()
+
+
+def _writeback_state_rows(
+    ssm_pool: torch.Tensor, slot_indices: torch.Tensor, rows: torch.Tensor
+) -> None:
+    """Scatter dense state rows back into the pool, rounded to the pool dtype."""
+    ssm_pool.index_copy_(0, slot_indices.long(), rows.to(ssm_pool.dtype))
+
+
 def _kda_split_conv_sections(
     conv_state: torch.Tensor, dim: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -536,7 +552,7 @@ class KimiKDALinearAttention(nn.Module):
         staged_state = None
         kernel_pool, kernel_indices = ssm_pool, slot_indices
         if ssm_pool.dtype != torch.float32:
-            staged_state = ssm_pool.index_select(0, slot_indices_long).float()
+            staged_state = _stage_state_rows(ssm_pool, slot_indices_long)
             kernel_pool = staged_state
             # Staged rows are dense, so the kernel addresses them by position.
             kernel_indices = mamba_metadata._arange_buffer[:num_prefills]
@@ -558,7 +574,7 @@ class KimiKDALinearAttention(nn.Module):
             recurrent_in = (
                 staged_state
                 if staged_state is not None
-                else ssm_pool.index_select(0, slot_indices_long)
+                else _stage_state_rows(ssm_pool, slot_indices_long)
             )
             recurrent_in[~has_init] = 0
 
@@ -617,11 +633,11 @@ class KimiKDALinearAttention(nn.Module):
 
         # The packed convolution persisted the live convolution pool in place.
         if final_state is not None:
-            ssm_pool.index_copy_(0, slot_indices_long, final_state.to(ssm_pool.dtype))
+            _writeback_state_rows(ssm_pool, slot_indices_long, final_state)
         else:
             assert use_indexed_state
             if staged_state is not None:
-                ssm_pool.index_copy_(0, slot_indices_long, staged_state.to(ssm_pool.dtype))
+                _writeback_state_rows(ssm_pool, slot_indices_long, staged_state)
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).
@@ -669,7 +685,6 @@ class KimiKDALinearAttention(nn.Module):
             or not has_qkvg_projection
             or self._bfa_proj_weight is None
             or mamba_metadata is None
-            or ssm_pool.dtype != torch.float32
             or ssm_state_indices is None
         ):
             return self.forward_decode_fallback(
@@ -685,6 +700,21 @@ class KimiKDALinearAttention(nn.Module):
         hd = self.head_dim
         H = self.num_heads
         B = x2d.shape[0]
+
+        # The fused decode kernel updates fp32 state rows in place, addressing the
+        # conv and state pools with the same slot indices. A bf16 pool is staged
+        # through dense copies of the addressed rows (fp32 state, conv window as
+        # is), the kernel runs in its batch-dense form on them and the rows are
+        # written back (state rounded), which keeps the fused projections and
+        # kernel-native layouts of this path instead of the portable fallback.
+        staged_state = staged_conv = None
+        slots_long = None
+        kernel_state, kernel_state_indices, conv_src = ssm_pool, ssm_state_indices, conv_pool
+        if ssm_pool.dtype != torch.float32:
+            slots_long = slot_indices.long()
+            staged_state = _stage_state_rows(ssm_pool, slots_long)
+            staged_conv = conv_pool.index_select(0, slots_long)
+            kernel_state, kernel_state_indices, conv_src = staged_state, None, staged_conv
 
         # kda_decode is inplace-only. BCG supplies its graph-owned core buffer;
         # eager decode uses a persistent buffer whose pointer remains stable
@@ -744,9 +774,9 @@ class KimiKDALinearAttention(nn.Module):
 
         # Section views retain the live pool's slot stride, including V2
         # manager padding. The kernel uses ssm_state_indices for both pools.
-        cs_q = conv_pool[:, :d]
-        cs_k = conv_pool[:, d : 2 * d]
-        cs_v = conv_pool[:, 2 * d :]
+        cs_q = conv_src[:, :d]
+        cs_k = conv_src[:, d : 2 * d]
+        cs_v = conv_src[:, 2 * d :]
 
         o = self._dispatch.decode_kda(
             x_q=x_qkvg[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
@@ -765,11 +795,11 @@ class KimiKDALinearAttention(nn.Module):
             g=g.unflatten(-1, (H, hd)).unsqueeze(0),
             dt_bias=self._dt_bias_f32,
             beta=beta.unsqueeze(0),
-            state=ssm_pool,
+            state=kernel_state,
             onorm_g=x_qkvg[:, 3 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
             out=kda_out,
-            ssm_state_indices=ssm_state_indices,
+            ssm_state_indices=kernel_state_indices,
             cu_seqlens=mamba_metadata._arange_buffer[: B + 1],
             scale=hd**-0.5,
             onorm_eps=self.o_norm.eps,
@@ -778,6 +808,9 @@ class KimiKDALinearAttention(nn.Module):
             verbose=False,
             update_conv_cache=True,
         )
+        if staged_state is not None:
+            conv_pool.index_copy_(0, slots_long, staged_conv)
+            _writeback_state_rows(ssm_pool, slots_long, staged_state)
         # Fused-verify replay caches (spec decoding only): keep the
         # committed conv window in sync with the plain-decode advance.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
