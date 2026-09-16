@@ -250,6 +250,15 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
+# Keep statically linked NVRTC symbols local so they cannot be interposed by a
+# dynamic NVRTC loaded elsewhere in the process.
+if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
+  target_link_options(
+    ${SHARED_TARGET} PRIVATE
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_LIB}>"
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_BUILTINS_LIB}>")
+endif()
+
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 target_link_libraries(
