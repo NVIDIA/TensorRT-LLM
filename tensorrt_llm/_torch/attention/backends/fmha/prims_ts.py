@@ -102,8 +102,6 @@ def get_paged_kv_storage_unsupported_reason(
 def get_paged_kv_policy_unsupported_reason(
     attn: "TrtllmAttention",
     metadata: "TrtllmAttentionMetadata",
-    *,
-    allow_fp8_mla: bool = False,
 ) -> Optional[str]:
     """Return why the request's decoding policy is outside the fixed page-table envelope."""
     if metadata.beam_width != 1:
@@ -123,16 +121,13 @@ def get_paged_kv_policy_unsupported_reason(
     except (TypeError, ValueError):
         return "invalid KV-cache quantization mode."
     is_fp8_mla = (
-        allow_fp8_mla
-        and attn.is_mla_enable
+        attn.is_mla_enable
         and quant_mode.has_fp8_kv_cache()
         and not quant_mode.has_int8_kv_cache()
         and not quant_mode.has_fp4_kv_cache()
     )
     if quant_mode.has_kv_cache_quant() and not is_fp8_mla:
-        if allow_fp8_mla:
-            return "quantized KV cache is supported only for FP8 MLA decode."
-        return "quantized KV cache is not supported by the initial adapter."
+        return "quantized KV cache is supported only for FP8 MLA decode."
     return None
 
 
@@ -330,7 +325,7 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the attention mask is not causal or dense."
         if mask_type not in (AttentionMaskType.causal, AttentionMaskType.padding):
             return False, f"attention mask type {mask_type} is not supported."
-        policy_reason = get_paged_kv_policy_unsupported_reason(attn, meta, allow_fp8_mla=True)
+        policy_reason = get_paged_kv_policy_unsupported_reason(attn, meta)
         if policy_reason is not None:
             return False, policy_reason
         is_mla = attn.is_mla_enable

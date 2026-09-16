@@ -315,27 +315,6 @@ def test_supported_matrix(case: dict) -> None:
     assert supported, reason
 
 
-@pytest.mark.parametrize("allow_fp8_mla", [False, True])
-def test_paged_kv_policy_fp8_mla_requires_opt_in(allow_fp8_mla: bool) -> None:
-    attn = _Attention(head_dim=576, is_mla=True)
-    attn.quant_mode = QuantMode.FP8_KV_CACHE
-    metadata = SimpleNamespace(
-        beam_width=1,
-        is_spec_decoding_enabled=False,
-        use_spec_decoding=False,
-        is_spec_dec_tree=False,
-        is_spec_dec_dynamic_tree=False,
-    )
-    reason = prims_ts_module.get_paged_kv_policy_unsupported_reason(
-        attn, metadata, allow_fp8_mla=allow_fp8_mla
-    )
-    if allow_fp8_mla:
-        assert reason is None
-    else:
-        # Other adapters sharing this policy helper must still reject quantized KV.
-        assert reason == "quantized KV cache is not supported by the initial adapter."
-
-
 @pytest.mark.parametrize("num_heads", [6, 12, 64, 96, 128])
 @pytest.mark.parametrize("use_kv_cache_v2", [False, True])
 @pytest.mark.parametrize("tokens_per_block", [16, 32, 64, 128])
