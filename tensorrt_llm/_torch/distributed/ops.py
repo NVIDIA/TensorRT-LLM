@@ -881,6 +881,7 @@ class AllReduce(nn.Module):
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
 
+        # isinstance() won't work: to_llm_mapping() returns a plain Mapping.
         self._is_visual_gen = getattr(mapping, "_visual_gen_origin", False)
 
         self.all_reduce_op = torch.ops.trtllm.allreduce
