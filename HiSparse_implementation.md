@@ -74,18 +74,15 @@ before GPU page-table conversion. `SelectionContext` carries request/layer/lifec
 per-query valid lengths. Positions keep their order and duplicates.
 
 `EntryLayout` describes KV and scale bytes, including compressed entries. `HostStorageView`
-describes host locations over the existing per-request `KvCache`. The optional `resolve_entries()`
-helper reads it and a `GpuCacheView`, writing current availability and locations into
-`EntryResolution`. It does not move KV or protect storage; mappings can change after lookup.
-Use it for tests, validation, or other backends. HiSparse takes logical selections directly and
-does its own lookup in step 5. Pool ownership/backup follows in 4, and model wiring in 7, 9, and 10.
+describes host locations over the existing per-request `KvCache`. These interfaces describe
+selection and storage; they do not move KV or protect memory. HiSparse takes logical selections
+directly and owns GPU lookup and fetching in step 5. Pool ownership/backup follows in 4,
+and model wiring in 7, 9, and 10.
 
-**Validation:** 35 focused tests passed on GB300 using isolated source imports. Coverage includes
-DSA context/decode and IndexShare, duplicates, empty/partial/invalid selections, page boundaries,
-compressed entries/scales, multiple requests/layers, stale request IDs, and changed CUDA graph
-inputs. Host-only selections keep their offsets; a GPU entry hit leaves neighbours missing.
-The 30 selection/layout tests also passed CUDA memcheck with no errors. Full package validation
-is blocked by stale native bindings/operators in this checkout; model inference is not tested.
+**Validation:** 22 selection/layout and DSA tests passed on CPU using isolated source imports.
+Coverage includes identity, order, masks, invalid metadata, layout bounds, context/decode,
+and IndexShare. GPU lookup, fetching, and graph execution will be validated in step 5.
+Full package and model inference validation remain pending.
 
 See [the interface guide](docs/source/developer-guide/sparse-attention-development-guide.md#selected-kv-interfaces).
 
@@ -124,7 +121,6 @@ See [host-copy usage and layout](docs/source/developer-guide/kv-cache-host-copie
 **Work:** Use SGLang's [HiSparse kernels][hisparse-kernel] directly behind `ensure_resident()`.
 
 - Accept `SelectedEntries`, the layout/host view, and mutable GPU-cache state directly.
-  Skip `resolve_entries()` and its separate GPU mapping so HiSparse performs hit lookup once.
 - Integrate `load_cache_to_device_buffer_kernel` for GPU lookup, LRU replacement, host copies,
   and attention indices. Record the upstream revision and preserve its license.
 - Check host readiness, request IDs, capacity, duplicate/padded selections, layouts/scales,
@@ -136,7 +132,7 @@ See [host-copy usage and layout](docs/source/developer-guide/kv-cache-host-copie
 
 **Validation:** Check fetched KV/scales against host bytes. Test hits, misses, full capacity,
 newest entries, host ownership, shared plans, side-stream readers, and changing graph inputs.
-Check that decode skips the optional resolver and protects selected slots through attention.
+Check that selected slots stay protected through attention.
 Run CUDA memory and race checks. Record cache memory use and hit/miss timings; broader tuning
 and model measurements follow in later steps.
 

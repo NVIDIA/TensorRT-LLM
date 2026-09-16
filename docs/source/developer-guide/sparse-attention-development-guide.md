@@ -377,7 +377,7 @@ If the algorithm needs extra tensors beyond the main KV cache:
 The internal interfaces in `backends/sparse/selection.py` and `kv_layout.py`
 describe selected KV before host offload is connected to models. They keep one
 existing `KvCache` per request. Layouts and host views describe KV sources without
-owning or moving pages. The optional resolver also reads a GPU-cache view.
+owning or moving pages.
 
 | Type | What it carries |
 | --- | --- |
@@ -386,8 +386,6 @@ owning or moving pages. The optional resolver also reads a GPU-cache view.
 | `SelectedEntries` | Logical positions and an optional validity mask, in attention order. |
 | `EntryLayout` | Entries per page and byte spans for KV, scales, or other entry data. |
 | `HostStorageView` | Host slot IDs, completed entry counts, and pool sizes. |
-| `GpuCacheView` | Logical entry to ready GPU entry mapping for the optional resolver. |
-| `EntryResolution` | Observed logical validity, host availability/offsets, and GPU hits or misses; no storage protection. |
 
 `DSATrtllmAttention.select_kv()` exposes DSA top-K before the ordinary GPU
 page-table conversion. It also supports shared indexer output. The caller
@@ -398,7 +396,7 @@ entry point per query.
 Positions count tokens, or native compressed entries. For example, compression
 by four gives four entries in a 16-token page. The model adapter supplies the
 number of completed entries each query may read, including its causal limit.
-The resolver does not divide positions by the compression ratio again.
+Positions already use stored-entry units; do not divide them by the compression ratio again.
 Duplicates keep their columns. Negative positions, positions outside the valid
 length, and masked entries are invalid.
 
@@ -416,27 +414,15 @@ offset = host_slot[request, page] * pool_slot_bytes[c.pool_index]
          + c.offset + entry * c.stride
 ```
 
-For tests, validation, or other backends, use the optional
-`resolve_entries(selection, host_view, gpu_view, outputs)` helper. Allocate its
-CUDA tables and `EntryResolution` outputs before graph capture. It reads current
-GPU values and writes the outputs without allocating tensors, copying KV,
-changing page residency, or protecting storage. Request IDs in both views must
-match the selection's IDs. Order table updates before resolution and keep tables
-stable while it runs. Outputs can become stale after mappings change.
-
 The planned HiSparse path passes `SelectedEntries`, the layout/host view, and
 mutable GPU-cache state directly to `ensure_resident()`. HiSparse owns hit lookup,
-LRU replacement, and fetching; this path skips `resolve_entries()` and does not
-need its separate `GpuCacheView` table. Attention runs after the required copies,
-with selected slots protected until attention finishes. Step 5 implements this
-path later.
+LRU replacement, and fetching. Attention runs after the required copies, with
+selected slots protected until attention finishes. Step 5 implements this path later.
 
-A valid selection stays valid on a GPU miss. Host offsets remain available
-when the selected data is only on host. A missing or unfinished host copy has
-`host_valid = False` and offset `-1`; a ready GPU hit can still be used with the
-owner's protection. If a valid selection misses both stores, the caller must
-arrange backup/fetch or report failure, never discard it. One GPU entry hit says
-nothing about neighbouring entries or whole-page residency.
+A valid selection stays valid on a GPU miss. Fetch it from completed host data;
+report unavailable selected data instead of discarding it. A ready GPU hit can
+be used with the owner's protection while its host backup is pending. One GPU
+entry hit says nothing about neighbouring entries or whole-page residency.
 
 The storage/cache owners must keep addresses stable and protect reads and
 copies. KVCM V2 now provides [retained host copies and read handles](kv-cache-host-copies.md).

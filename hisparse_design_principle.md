@@ -56,10 +56,6 @@ Use these interfaces:
   mutable GPU-cache state directly. HiSparse finds hits, replaces GPU copies with
   LRU, fetches misses, and returns indices protected through attention.
 
-`resolve_entries()` is an optional lookup helper for tests, validation, or other
-backends. Its `EntryResolution` reports current locations without fetching or
-protecting KV. HiSparse skips this helper to avoid repeating hit lookup.
-
 HiSparse is the only GPU-cache implementation. Future experiments can replace
 its kernel adapter while keeping selection, layout, and ownership interfaces.
 Separate policy or copy launches are not required.

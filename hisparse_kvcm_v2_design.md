@@ -187,12 +187,6 @@ The HiSparse kernel combines lookup, LRU, and copying. Attention must run after 
 returning from the Python call does not wait for GPU completion. Keep host sources alive through
 copy completion and prevent selected GPU slots from being replaced until attention finishes.
 
-`resolve_entries()` is an optional helper for tests, validation, or other backends. It writes an
-`EntryResolution`: selection validity, host offsets, and current GPU hits or misses. It does not
-fetch KV or protect slots, and its results can become stale after mappings change. The HiSparse
-path skips this helper and performs its own hit lookup once. Its cache state need not maintain
-the helper's separate `GpuCacheView` mapping.
-
 Allocate buffers before graph capture. The KVCM integration must handle layouts/scales,
 duplicate and padded selections, request-slot reuse, and source validity. Keep required checks
 on GPU and report unavailable selected data; no per-layer CPU allocation or synchronization.
