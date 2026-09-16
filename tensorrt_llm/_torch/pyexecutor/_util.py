@@ -3233,14 +3233,28 @@ def should_enable_non_overlap_adp_forward_intent(
 def should_enable_overlap_headroom(mapping: Mapping,
                                    disable_overlap_scheduler: bool,
                                    kv_cache_manager_is_v2: bool,
-                                   is_hybrid: bool = False) -> bool:
+                                   is_hybrid: bool = False,
+                                   has_mrope_delta_cache: bool = False) -> bool:
     """Gate the extra micro-batch of sequence slots.
 
     True only where a retiring request and the replacement that took its place
     can own a seat at the same time: attention DP, non-PP, overlap-on, V2 and
     non-hybrid.
+
+    Widening the pool is only safe when every ``py_seq_slot``-indexed pool is
+    sized from ``compute_max_num_sequences``. Two model families size one from
+    something else instead, so they keep the single-micro-batch pool:
+
+    * ``is_hybrid``: ``MambaCacheManager`` re-derives its own capacity as
+      ``max_batch_size * pp_size``, which a doubled non-PP pool would exhaust.
+    * ``has_mrope_delta_cache``: Qwen2/2.5-VL and Qwen3-VL hold
+      ``max_num_tokens * pp_size + 1`` MRoPE deltas while indexing them by
+      ``py_seq_slot``, relying on ``max_batch_size <= max_num_tokens`` to stay in
+      bounds. The top entry is the reserved dummy slot, so a doubled pool first
+      aliases the dummy -- silently giving padded requests a real request's
+      delta -- and then indexes past the end.
     """
-    if is_hybrid or not kv_cache_manager_is_v2:
+    if is_hybrid or has_mrope_delta_cache or not kv_cache_manager_is_v2:
         return False
     return (mapping.enable_attention_dp and not mapping.has_pp()
             and not disable_overlap_scheduler)

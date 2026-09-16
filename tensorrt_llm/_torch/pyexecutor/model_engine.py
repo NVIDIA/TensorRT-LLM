@@ -129,6 +129,21 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
     return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
 
 
+def resolve_mrope_position_deltas_cache(
+        model: Optional[torch.nn.Module]) -> Optional[torch.Tensor]:
+    """The MRoPE delta cache held by ``model`` or by its draft model.
+
+    ``None`` for every model that does not keep one, which is also how
+    ``should_enable_overlap_headroom`` learns that the seat pool may be widened:
+    the cache is sized from ``max_num_tokens`` rather than from the seat pool.
+    """
+    cache = getattr(model, "mrope_position_deltas_cache", None)
+    if cache is None:
+        cache = getattr(getattr(model, "draft_model", None),
+                        "mrope_position_deltas_cache", None)
+    return cache
+
+
 def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
     is_multimodal_decode_compatible: Optional[Callable[[LlmRequest],
@@ -565,7 +580,9 @@ class PyTorchModelEngine(ModelEngine):
                 self.max_beam_width,
                 has_kv_connector=getattr(llm_args, "kv_connector_config",
                                          None) is not None),
-            is_hybrid=is_hybrid_linear(pretrained_config))
+            is_hybrid=is_hybrid_linear(pretrained_config),
+            has_mrope_delta_cache=resolve_mrope_position_deltas_cache(
+                self.model) is not None)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping,
             self.batch_size,
@@ -1317,13 +1334,8 @@ class PyTorchModelEngine(ModelEngine):
         if not self.use_mrope or padded_requests.num_generation_requests == 0:
             return
 
-        mrope_position_deltas_cache = getattr(self.model,
-                                              "mrope_position_deltas_cache",
-                                              None)
-        if mrope_position_deltas_cache is None:
-            mrope_position_deltas_cache = getattr(
-                getattr(self.model, "draft_model", None),
-                "mrope_position_deltas_cache", None)
+        mrope_position_deltas_cache = resolve_mrope_position_deltas_cache(
+            self.model)
         if mrope_position_deltas_cache is None:
             return
 

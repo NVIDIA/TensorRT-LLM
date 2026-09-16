@@ -23,7 +23,9 @@ seats exist. It stays off for V1 (the V1 capacity schedulers hardcode
 ``max_batch_size``). "V1" there is the manager the creator *selects*, not the
 ``use_kv_cache_manager_v2`` request: a plain model with ``max_beam_width > 1`` is
 demoted to V1 after the request is honoured, so the gate reads
-``resolved_kv_cache_manager_is_v2``.
+``resolved_kv_cache_manager_is_v2``. It also stays off for the Qwen-VL models that
+keep an MRoPE delta cache, which is sized ``max_num_tokens * pp_size + 1`` yet
+indexed by ``py_seq_slot``.
 
 The **index pool** (``KVCacheManagerV2.max_admissible_sequences``) is widened by
 a deliberately *broader* predicate -- ``is_disagg or (non-PP and overlap-on)``,
@@ -67,6 +69,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     validate_seq_slot_pool_covers_admission,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_deltas_cache
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -189,6 +192,91 @@ def test_non_adp_seat_pool_stays_at_max_batch_size(enable_attention_dp):
         ),
     )
     assert seats == (2 * max_batch_size if enable_attention_dp else max_batch_size)
+
+
+def test_overlap_headroom_gate_excludes_mrope_delta_cache_models():
+    """Qwen-VL sizes its MRoPE delta cache from ``max_num_tokens``, not the seats.
+
+    ``modeling_qwen2vl.py`` and ``modeling_qwen3vl.py`` allocate
+    ``max_num_tokens * pp_size + 1`` deltas and then index them by
+    ``py_seq_slot``, which only stays in bounds because ``max_batch_size <=
+    max_num_tokens``. Doubling the seat pool breaks that, so these models keep the
+    single micro-batch until the cache is sized from the seat pool instead.
+    """
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
+    kwargs = dict(kv_cache_manager_is_v2=True, is_hybrid=False)
+
+    assert should_enable_overlap_headroom(mapping, False, **kwargs) is True
+    assert (
+        should_enable_overlap_headroom(mapping, False, has_mrope_delta_cache=True, **kwargs)
+        is False
+    )
+
+
+@pytest.mark.parametrize("has_mrope_delta_cache", [False, True])
+def test_mrope_delta_cache_bounds_the_seat_pool(has_mrope_delta_cache):
+    """The arithmetic the exclusion exists for (nvbug 6704146 review).
+
+    With ``max_num_tokens == max_batch_size == 64`` and PP=1 -- the tightest
+    configuration ``max_batch_size <= max_num_tokens`` permits -- the delta cache
+    holds 65 rows and its top row, index 64, is the reserved dummy slot that
+    padded and CUDA-graph requests read. A ``2B`` pool hands out slot 64 (silently
+    overwriting the dummy's permanently-zero delta) and then slots 65..127, which
+    are past the end. Pinning the seat count against the dummy index is what
+    catches a future re-widening; asserting only on the predicate would not.
+    """
+    max_batch_size = 64
+    max_num_tokens = 64
+    pp_size = 1
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=pp_size, enable_attention_dp=True)
+    seats = compute_max_num_sequences(
+        mapping,
+        max_batch_size,
+        False,
+        enable_overlap_headroom=should_enable_overlap_headroom(
+            mapping,
+            False,
+            kv_cache_manager_is_v2=True,
+            has_mrope_delta_cache=has_mrope_delta_cache,
+        ),
+    )
+    # model_engine._prepare_inputs and cuda_graph_runner both derive this index.
+    mrope_dummy_seq_slot = max_num_tokens * pp_size
+
+    if has_mrope_delta_cache:
+        assert seats == max_batch_size
+        # Highest slot handed out is seats - 1, so every real slot stays below
+        # the dummy and inside the max_num_tokens * pp_size + 1 rows.
+        assert seats <= mrope_dummy_seq_slot
+    else:
+        assert seats == 2 * max_batch_size
+        assert seats > mrope_dummy_seq_slot
+
+
+def test_resolve_mrope_delta_cache_finds_the_model_and_draft_buffers():
+    """The gate's input is the buffer's presence, not an architecture list.
+
+    ``_pad_batch_seed_mrope_delta_cache`` and the gate must agree on which models
+    hold the cache, so both read it through this one resolver -- including the
+    draft-model fallback, since speculation puts the multimodal weights there.
+    """
+    cache = object()
+
+    assert resolve_mrope_position_deltas_cache(SimpleNamespace()) is None
+    assert resolve_mrope_position_deltas_cache(None) is None
+    assert (
+        resolve_mrope_position_deltas_cache(SimpleNamespace(mrope_position_deltas_cache=cache))
+        is cache
+    )
+    assert (
+        resolve_mrope_position_deltas_cache(
+            SimpleNamespace(draft_model=SimpleNamespace(mrope_position_deltas_cache=cache))
+        )
+        is cache
+    )
+    assert (
+        resolve_mrope_position_deltas_cache(SimpleNamespace(draft_model=SimpleNamespace())) is None
+    )
 
 
 @pytest.mark.parametrize("max_beam_width,expected_factor", [(1, 2), (2, 1), (4, 1)])
