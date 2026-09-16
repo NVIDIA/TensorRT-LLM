@@ -486,6 +486,33 @@ def test_kda_mixer_empty_prefill():
 
 
 @torch.no_grad()
+def test_kda_mixer_empty_prefill_preserves_initial_conv_state():
+    """A zero-token payload carrying an initial state leaves that state untouched."""
+    optimized = _make_kda()
+    hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    conv_seed = (
+        torch.randn(
+            1,
+            3 * NUM_HEADS * HEAD_DIM,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+    )
+    conv_pool = conv_seed.clone()
+    out = _run_production_prefill(
+        optimized,
+        hidden_states,
+        conv_pool=conv_pool,
+        has_initial_states=torch.ones(1, dtype=torch.bool, device="cuda"),
+    )
+    assert out.shape == (1, 0, HIDDEN_SIZE)
+    # No token shifts into the window, so the write-back must republish it verbatim.
+    assert torch.equal(conv_pool, conv_seed)
+
+
+@torch.no_grad()
 def test_indexed_prefill_routing_validates_equal_length_state_indices() -> None:
     dispatch = _kda_kernels.KDAKernelDispatch(
         use_optimized_prefill=True,
