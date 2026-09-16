@@ -2730,7 +2730,7 @@ class KVCacheManagerV2(BaseResourceManager):
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
-        if kv_cache_config.dtype == "nvfp4":
+        if self.dtype == DataType.NVFP4:
             for layer_idx, hd in enumerate(self.head_dim_per_layer):
                 assert hd % 2 == 0, (
                     f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
@@ -2911,6 +2911,16 @@ class KVCacheManagerV2(BaseResourceManager):
         layout onto the role's ``PoolView``.
         """
         return {}
+
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """Return local-only buffer roles excluded from disaggregation.
+
+        Specialized managers may register storage-only buffers to satisfy
+        physical pool layout constraints. Such buffers remain part of local
+        slot copies, but contain no model state that needs to be transferred
+        between disaggregated workers.
+        """
+        return frozenset()
 
     @property
     def blocks_in_primary_pool(self) -> int:

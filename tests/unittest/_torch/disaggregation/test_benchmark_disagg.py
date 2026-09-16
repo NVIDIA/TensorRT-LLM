@@ -95,7 +95,7 @@ def _stub_transfer_entry_points(ex) -> None:
     """Mock the coordinator's transfer polls once the executor builds it.
 
     The build stays lazy so a test can still swap delegated executor methods
-    (admission, gen init, idle progress) before the first ``ex.disagg`` use.
+    (admission, gen init) before the first ``ex.disagg`` use.
     """
     build = ex._build_disagg_coordinator
 
@@ -878,7 +878,6 @@ class TestPrepareAndScheduleBatchNoBlock:
 
         mock_fetch = Mock(return_value=[])
         ex._fetch_and_activate_new_requests = mock_fetch
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
@@ -1271,7 +1270,6 @@ class TestFailFastDuringBenchmarkFill:
         ex.active_requests = init_reqs + ready_reqs
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prepare_disagg_gen_init = Mock()
@@ -1310,20 +1308,20 @@ class TestFailFastDuringBenchmarkFill:
         ex._handle_errors.assert_not_called()
 
     def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
-        """The admitted subset is prepared and passed to the idle check."""
+        """Only the admitted subset is prepared for receive; the idle context
+        poll still runs once regardless of the deferred candidates."""
         admitted_req = _make_active_request(in_init=True)
         deferred_req = _make_active_request(in_init=True)
         candidates = [admitted_req, deferred_req]
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=candidates)
         ex._apply_disagg_transfer_admission = Mock(return_value=([admitted_req], False))
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
         ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
-        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with()
+        ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
     def test_fill_with_no_init_requests_does_not_kill(self):
@@ -1389,7 +1387,6 @@ class TestFailFastDuringBenchmarkFill:
         gather = getattr(ex.dist, gather_name)
         gather.return_value = all_rank_status
         ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1412,7 +1409,6 @@ class TestFailFastDuringBenchmarkFill:
             (True, False),
         ]
         ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1429,7 +1425,6 @@ class TestFailFastDuringBenchmarkFill:
             (True, True),
             (False, False),
         ]
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1454,7 +1449,6 @@ class TestFailFastDuringBenchmarkFill:
         ex.enable_attention_dp = True
         ex.dist.tp_size = 2
         ex.dist.world_size = 2
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1547,7 +1541,6 @@ class TestFillPhaseEndToEnd:
         ex.active_requests = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prepare_disagg_gen_init = Mock()
@@ -1621,7 +1614,6 @@ class TestFillPhaseEndToEnd:
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
         ex.active_requests = ready_reqs
         ex.dist.tp_allgather = Mock()
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None

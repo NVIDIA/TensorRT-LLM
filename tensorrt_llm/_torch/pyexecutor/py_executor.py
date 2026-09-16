@@ -3588,19 +3588,12 @@ class PyExecutor:
             force_terminate_ctx_for_partial_reuse=getattr(
                 self, "force_terminate_ctx_for_partial_reuse", False),
             delegates=DisaggLoopDelegates(
-                handle_errors_synced=self._handle_disagg_cache_errors_synced,
-                prepare_context_schedulable=self.
-                _check_disagg_ctx_schedulable_status,
                 admit=self._apply_disagg_transfer_admission,
                 revert_deferred_gen_init=self.
                 _revert_deferred_disagg_gen_init_alloc,
                 receive_gen_init=self._prepare_disagg_gen_init,
-                poll_progress_when_idle=self.
-                _check_disagg_transfer_progress_when_idle,
                 prepare_transmission_completed=self.
                 _prepare_disagg_gen_transmission_complete,
-                check_transfer_errors=self._check_cache_transfer_errors,
-                requests_in_error_state=self._get_disagg_reqs_in_error_state,
             ))
 
     def _get_disagg_transfer_admission_controller(
@@ -3730,26 +3723,6 @@ class PyExecutor:
         if self._dist_size(self.dist, "tp_size") > 1:
             return self.dist.tp_allgather(local_status)
         return [local_status]
-
-    def _check_disagg_transfer_progress_when_idle(self) -> None:
-        """Reap completed context KV transfers so their blocks can be freed.
-
-        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
-        must not enter the context status collective here. A single-rank
-        worker cannot diverge and polls only while a send is in flight.
-        """
-        uses_synchronous_gen_transfer = (
-            not self._uses_async_disagg_gen_transfer()
-            and not self._is_disagg_gen_only_no_context_benchmark())
-        should_poll_synchronous_context_status = (
-            uses_synchronous_gen_transfer
-            and self._dist_size(self.dist, "world_size") == 1
-            and self.async_transfer_manager.has_any_inflight_requests())
-        if (uses_synchronous_gen_transfer
-                and not should_poll_synchronous_context_status):
-            return
-
-        self.disagg.reap_context_sends(0)
 
     def _pp_ring_is_drained(self) -> bool:
         """Return whether no microbatch is queued or awaiting handling."""
@@ -4165,97 +4138,6 @@ class PyExecutor:
             f"completing; the loop would otherwise retry forever without "
             f"advancing iter_counter.")
 
-    @nvtx_range("_handle_disagg_cache_errors_synced")
-    def _handle_disagg_cache_errors_synced(self):
-        """Rank-safe disagg cache error and poison handler.
-
-        Called from the top of every executor iteration. Buffer poison is
-        reduced over the full executor world because one poisoned PP/DP rank
-        requires the whole distributed executor to stop. ADP TP ranks then
-        vote on failed request IDs and fail matching local replicas together;
-        otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
-        deadlocks or leaves peer replicas running.
-        """
-        if not self.kv_cache_transceiver:
-            return
-
-        pending_ids = self.disagg.take_pending_context_failures()
-        pending_requests = ([
-            request for request in self.active_requests
-            if get_unique_rid(request) in pending_ids
-        ] if pending_ids else [])
-        for request in pending_requests:
-            request.state = LlmRequestState.DISAGG_TRANS_ERROR
-
-        if self.disagg.inflight_cancel_active():
-            local_poisoned = self.kv_cache_transceiver.has_poisoned_transfer_buffer(
-            )
-            if self.dist.world_size != 1:
-                any_poisoned = bool(
-                    self.dist.allreduce(int(local_poisoned), op=ReduceOp.MAX))
-            else:
-                any_poisoned = local_poisoned
-            if any_poisoned:
-                error_msg = (
-                    "Disagg KV cache transfer buffer is poisoned; process "
-                    "restart is required")
-                self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
-                self.is_shutdown = True
-                self._handle_errors(error_msg,
-                                    requests=None,
-                                    charge_budget=False,
-                                    fatal_is_collective_aligned=True)
-                return
-
-        if not (self.enable_attention_dp and self.dist.world_size != 1):
-            if pending_requests:
-                self._check_cache_transfer_errors("context requests")
-            return
-
-        local_error_requests = [
-            request for request in self.active_requests
-            if request.state == LlmRequestState.DISAGG_TRANS_ERROR
-        ]
-        local_vote = {
-            "error_ids": [
-                self._request_vote_id(request)
-                for request in local_error_requests
-            ],
-            "blocked_ids": [
-                self._request_vote_id(request)
-                for request in local_error_requests
-                if self._is_disagg_error_cleanup_blocked(request)
-            ],
-        }
-        all_votes = self.dist.tp_allgather(local_vote)
-        voted_error_ids = {
-            request_id
-            for rank_vote in all_votes
-            for request_id in rank_vote["error_ids"]
-        }
-        blocked_error_ids = {
-            request_id
-            for rank_vote in all_votes
-            for request_id in rank_vote["blocked_ids"]
-        }
-        ready_error_ids = voted_error_ids - blocked_error_ids
-        if not ready_error_ids:
-            return
-        local_voted_error_requests = [
-            request for request in self.active_requests
-            if self._request_vote_id(request) in ready_error_ids
-        ]
-        logger.warning(
-            f"Disagg KV cache transfer error: rank={self.dist.rank} "
-            f"local_err_count={len(local_error_requests)}, "
-            f"voted_err_count={len(voted_error_ids)}, "
-            f"blocked_err_count={len(voted_error_ids & blocked_error_ids)}")
-        self._handle_errors(
-            "Disagg KV cache transfer error",
-            requests=local_voted_error_requests,
-            charge_budget=False,
-        )
-
     def _emit_initial_stats(self) -> None:
         """Emit a startup stats snapshot so that cache_config_info is
         immediately available to external metric scrapers (e.g. the
@@ -4381,8 +4263,8 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
-                    # _handle_disagg_cache_errors_synced() can buffer a
-                    # non-fatal response before scheduling observes shutdown.
+                    # handle_errors_synced() can buffer a non-fatal response
+                    # before scheduling observes shutdown.
                     # Drain it before leaving the loop so the client does not
                     # wait for its own timeout. Scheduling shutdown is
                     # model-parallel synchronized, so every ADP rank reaches
@@ -6904,26 +6786,6 @@ class PyExecutor:
             req.py_encoder_output = None
             req.py_skip_cross_kv_projection = True
 
-    @nvtx_range("_check_disagg_ctx_schedulable_status")
-    def _check_disagg_ctx_schedulable_status(self,
-                                             new_requests: List[LlmRequest]):
-        """
-        In context-first mode, context requests are schedulable immediately,
-        otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
-        """
-        if not self.kv_cache_transceiver:
-            return
-        gen_first_ctx_requests = [
-            req for req in new_requests
-            if req.is_context_only_request and req.py_disaggregated_params.
-            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        ]
-        # Always call prepare_context_requests when there are new requests
-        # or previously-waiting requests, so the tp_allgather consensus
-        # can promote requests whose peer info has arrived on all ranks.
-        self.kv_cache_transceiver.prepare_context_requests(
-            gen_first_ctx_requests)
-
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
@@ -7559,7 +7421,7 @@ class PyExecutor:
             # prepared request is left in DISAGG_GENERATION_INIT.
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
-            self._check_cache_transfer_errors("generation requests")
+            self.disagg.check_transfer_errors("generation requests")
             return
 
         for req in new_gen_reqs:
@@ -7608,45 +7470,6 @@ class PyExecutor:
         for req in requests:
             if req.is_finished:
                 kv_connector_request_finished(req)
-
-    @staticmethod
-    def _request_vote_id(request: LlmRequest) -> int:
-        return (request.parent_request_id
-                if request.is_child else request.py_request_id)
-
-    def _is_disagg_error_cleanup_blocked(self, request: LlmRequest) -> bool:
-        request_id = self._request_vote_id(request)
-        if request_id in getattr(self, "canceled_req_ids", ()):
-            return True
-
-        async_transfer_manager = getattr(self, "async_transfer_manager", None)
-        if (getattr(request, "is_context_only_request", False) is True
-                and async_transfer_manager is not None and request.py_request_id
-                in async_transfer_manager.requests_in_transfer()):
-            return True
-        return False
-
-    def _get_disagg_reqs_in_error_state(self):
-        return [
-            req for req in self.active_requests
-            if req.state == LlmRequestState.DISAGG_TRANS_ERROR
-            and not self._is_disagg_error_cleanup_blocked(req)
-        ]
-
-    def _check_cache_transfer_errors(self, error_msg_prefix: str):
-        """Check and handle cache transfer errors.
-
-        Under ADP this is a no-op: errors are handled by
-        ``_handle_disagg_cache_errors_synced`` at the loop top.
-        """
-        if self.enable_attention_dp and self.dist.world_size != 1:
-            return
-        error_requests = self._get_disagg_reqs_in_error_state()
-        if error_requests:
-            error_msg = f"Error in kv cache transfer for {error_msg_prefix}"
-            self._handle_errors(error_msg,
-                                requests=error_requests,
-                                charge_budget=False)
 
     def _maybe_prefetch_next_iter_mm_encoders(
             self, scheduled_batch: ScheduledRequests) -> None:
@@ -7976,7 +7799,8 @@ class PyExecutor:
         multi_rank_adp = (self.enable_attention_dp
                           and self.dist.world_size != 1)
         # ``fatal_is_collective_aligned`` is set only by the synchronized caller
-        # (_handle_disagg_cache_errors_synced, after its world allreduce), which
+        # (the coordinator's handle_errors_synced, through fail_fatal after its
+        # world allreduce), which
         # guarantees every ADP rank enters the fatal path in the same collective
         # order. Do NOT infer it from ``self._fatal_error is not None``: a
         # rank-local setter would then route into a tp_gather while peers are

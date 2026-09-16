@@ -1519,9 +1519,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                           mapping: "Mapping") -> int:
         """Context-MLA workspace sized by summed attended KV length.
 
-        Dense fp8 context-MLA stages expanded K/V. NVFP4 DSA stages selected
-        latent rows in fp8 plus selection/scan workspace. Cached tokens can
-        grow both beyond the fresh-prefill profiling floor.
+        Dense fp8 context-MLA stages expanded K/V. NVFP4 sparse MLA stages
+        selected latent rows in fp8 plus selection/scan workspace. Cached
+        tokens can grow both beyond the fresh-prefill profiling floor.
         """
         config = model_config.pretrained_config
         if not is_mla(config):
@@ -1542,6 +1542,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             nvfp4_gather_aux_bytes_per_token = 64
             return int(config.kv_lora_rank + config.qk_rope_head_dim +
                        nvfp4_gather_aux_bytes_per_token)
+
+        nvfp4_dsv4_context = (quant_mode is not None and getattr(
+            quant_mode, "has_fp4_kv_cache", lambda: False)()
+                              and sparse_algorithm == "deepseek_v4"
+                              and get_sm_version() >= 100)
+        if nvfp4_dsv4_context:
+            compress_ratios = [
+                ratio for ratio in getattr(model_config.sparse_attention_config,
+                                           "compress_ratios", []) if ratio > 1
+            ]
+            if not compress_ratios:
+                return 0
+            # Context compaction allocates one fp8 latent row and its
+            # selection/scan workspace per active compressed token. Express
+            # that in raw-KV-token units for the estimator and use the least
+            # compressed layer as the whole-model upper bound.
+            min_compress_ratio = min(compress_ratios)
+            latent_dim = config.kv_lora_rank + config.qk_rope_head_dim
+            nvfp4_gather_aux_bytes_per_compressed_token = 64
+            return math.ceil(
+                (latent_dim + nvfp4_gather_aux_bytes_per_compressed_token) /
+                min_compress_ratio)
 
         fp8_context_mla = (quant_config is not None
                            and quant_config.quant_mode.has_fp8_kv_cache()
@@ -1581,7 +1603,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def runtime_workspace_is_chunked_prefill_bounded(
             cls, model_config: "ModelConfig") -> bool:
-        """NVFP4 DSA gathers from the complete attended prefix."""
+        """NVFP4 sparse MLA gathers from the complete attended prefix."""
         config = model_config.pretrained_config
         if not is_mla(config):
             return True
@@ -1591,7 +1613,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    "algorithm", None)
         return not (quant_mode is not None
                     and getattr(quant_mode, "has_fp4_kv_cache", lambda: False)()
-                    and sparse_algorithm == "dsa" and get_sm_version() >= 100)
+                    and sparse_algorithm in ("dsa", "deepseek_v4")
+                    and get_sm_version() >= 100)
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
