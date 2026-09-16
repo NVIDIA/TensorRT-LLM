@@ -9,8 +9,9 @@ also be the target selector; ``modeling_v2_resolve`` rewrites it into the
 synthetic name, and ``AutoModelForCausalLM._resolve_class`` then looks that up
 in the ordinary registry.
 
-The pattern is upstream's own: ``MTPDraftModelForCausalLM`` is likewise a name
-no config.json declares, reached only through a rewrite in ``_resolve_class``.
+The pattern is upstream's own: the Eagle3 rewrite in ``_resolve_class`` builds
+``EAGLE3<Arch>`` the same way -- a name no config.json declares, reached only
+through that rewrite.
 
 Two levels, on purpose:
 

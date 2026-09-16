@@ -62,9 +62,8 @@ LLM(model=...)  ->  ModelLoader  ->  AutoModelForCausalLM._resolve_class
 ```
 
 The synthetic name (`ModelingV2GptOss120bSm103Tp1`) is a registry key that no
-checkpoint declares. Upstream already does exactly this for
-`MTPDraftModelForCausalLM`, which also exists only as a `_resolve_class`
-rewrite.
+checkpoint declares. Upstream already does exactly this for `EAGLE3<Arch>`,
+which also exists only as a `_resolve_class` rewrite.
 
 To ask why a configuration landed where it did:
 
