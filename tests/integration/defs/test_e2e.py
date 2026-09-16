@@ -27,9 +27,9 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
                                        check_output, print_info, print_warning)
 
 from .common import get_mmlu_accuracy, venv_check_call
-from .conftest import (get_device_count, get_sm_version, llm_models_root,
-                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                       skip_pre_hopper, unittest_path)
+from .conftest import (get_sm_version, llm_models_root, skip_post_blackwell,
+                       skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
+                       unittest_path)
 
 _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8
@@ -994,7 +994,6 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         "MTP",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
-        "--use_one_model",
     ])
 
 
@@ -1245,7 +1244,6 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         "--relaxed_topk=10",
         "--relaxed_delta=0.5",
         "--enable_attention_dp",
-        "--use_one_model",
         "--moe_backend",
         "DEEPGEMM" if is_blackwell else "CUTLASS",
     ])
@@ -1361,32 +1359,6 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
     finally:
         if os.path.exists(extra_config_path):
             os.remove(extra_config_path)
-
-
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    pytest.param('DeepSeek-V3-671B-FP8',
-                 'DeepSeek-V3-0324',
-                 8,
-                 marks=(skip_post_blackwell,
-                        pytest.mark.skip_less_device_memory(140000))),
-])
-def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
-                                            model_path, gpu_count):
-    print(f"Testing {model_name}.")
-    if gpu_count > get_device_count():
-        pytest.skip(f"Not enough GPUs for {model_name}")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    mapping = {"DeepSeek-V3-671B-FP8": 83.8}
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--enable_chunked_prefill",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        f"--tp_size={gpu_count}",
-        "--max_batch_size=32",
-        "--max_num_tokens=256",
-    ])
 
 
 @skip_pre_hopper
@@ -1839,7 +1811,6 @@ def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=True,
     )
     with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
         results_spec = llm_spec.generate([prompt], sampling_params)

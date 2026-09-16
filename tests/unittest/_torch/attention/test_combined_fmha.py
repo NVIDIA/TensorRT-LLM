@@ -117,6 +117,70 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
     assert not fmha._use_fp8_context_fmha(output, AttentionInputType.generation_only)
 
 
+@pytest.mark.parametrize(
+    "num_contexts,num_generations,dtype,expect_fallback",
+    [
+        (1, 0, torch.bfloat16, True),
+        (4, 0, torch.bfloat16, True),
+        (5, 0, torch.bfloat16, False),
+        (1, 1, torch.bfloat16, False),
+        (2, 9, torch.bfloat16, False),
+        (2, 19, torch.bfloat16, False),
+        (2, 38, torch.bfloat16, False),
+        (4, 1, torch.bfloat16, False),
+        (0, 1, torch.bfloat16, False),
+        (1, 0, torch.float16, False),
+    ],
+)
+def test_small_context_fallback_preserves_mixed_batch_generation(
+    num_contexts: int,
+    num_generations: int,
+    dtype: torch.dtype,
+    expect_fallback: bool,
+) -> None:
+    attn = FakeAttention()
+    attn.head_dim = 256
+    attn.sparse_params = None
+    attn.position_embedding_type = 0
+    fmha = FlashInferTrtllmGenFmha(attn)
+    metadata = SimpleNamespace(
+        num_contexts=num_contexts,
+        num_generations=num_generations,
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=None,
+        tokens_per_block=32,
+        is_cross=False,
+        beam_width=1,
+    )
+    if num_contexts == 0:
+        input_type = AttentionInputType.generation_only
+        phases = (None, FmhaPhase.GENERATION)
+    elif num_generations == 0:
+        input_type = AttentionInputType.context_only
+        phases = (None, FmhaPhase.CONTEXT)
+    else:
+        input_type = AttentionInputType.mixed
+        phases = (None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION)
+    num_tokens = num_contexts + num_generations
+    q = torch.empty((num_tokens, 3 * attn.head_dim), dtype=dtype)
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((num_tokens, attn.head_dim), dtype=dtype),
+        attention_input_type=input_type,
+        is_fused_qkv=True,
+    )
+
+    for phase in phases:
+        supported, reason = fmha._is_supported_with_reason(
+            q, None, None, attn, metadata, forward_args, phase=phase
+        )
+        assert supported is not expect_fallback, reason
+        if expect_fallback:
+            assert "small-batch BF16 context attention" in reason
+
+
 def test_triton_custom_mask_rejects_whole_request_probe() -> None:
     fmha = object.__new__(TritonCustomMaskFmha)
 

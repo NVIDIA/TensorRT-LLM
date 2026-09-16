@@ -4,6 +4,12 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.3
+
+### API Changes
+
+- **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. Its only remaining role is a modest performance edge for GPT-OSS on Hopper with `W4A16_MXFP4` — the single configuration `AUTO` resolves to TRITON, and the format an MXFP4 GPT-OSS checkpoint takes on SM90. As the model set and the supported platforms keep growing, a single-scenario MoE path is no longer worth its maintenance cost. `moe_config.backend="CUTLASS"` replaces it functionally on Hopper: it serves `W4A16_MXFP4` on SM90 along with the unquantized BF16 and FP8 per-tensor paths, and MoE backend resolution already degrades to it automatically when TRITON declines a layer. During the migration period TRITON keeps working and logs a one-time warning. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+
 ## TensorRT-LLM Release 1.2
 
 ### Key Features and Enhancements
@@ -27,6 +33,10 @@ All published functionality in the Release Notes has been fully tested and verif
 ### API Changes
 
 - <span style="color: red">**[BREAKING CHANGE] TensorRT backend removed.**</span> PyTorch is now the sole execution backend. `LLM(backend="tensorrt")` now raises a `ValueError`; `TrtLlmArgs`, `tensorrt_llm._tensorrt_engine.LLM`, the `trtllm-build` / `trtllm-refit` / `trtllm-prune` CLIs, the `--backend tensorrt` CLI choice, and the per-model `convert_checkpoint.py` scripts have all been removed. The `tensorrt` pip dependency is no longer installed. See the [TensorRT Backend Removed migration guide](legacy/tensorrt-backend-removal.md) for details.
+
+- <span style="color: red">**[BREAKING CHANGE] Two-model speculative decoding removed.**</span> The separate draft-engine path behind Eagle3, MTP-Eagle and Draft-Target has been removed; the one-model implementations (draft/drafter as a submodule) are now the only supported paths. The `eagle3_one_model` and `mtp_eagle_one_model` fields are removed from `EagleDecodingConfig` and `MTPDecodingConfig`; both have carried a deprecation warning since #11043/#11761 and have been forced to the one-model path since #17366. Configurations that still set them (including `True`) now fail with a Pydantic `unexpected field` error and should simply drop the field. The `--use_one_model` flag is removed from `examples/llm-api/quickstart_advanced.py`. `EagleDecodingConfig.greedy_sampling` and `EagleDecodingConfig.posterior_threshold`, which had no effect, are also removed.
+
+- <span style="color: red">**[BREAKING CHANGE] C++ executor API: `SpeculativeDecodingFastLogitsInfo::toTensor()` removed.**</span> This is a source and ABI break for downstream code linking against the C++ executor API: the exported symbol `tensorrt_llm::executor::SpeculativeDecodingFastLogitsInfo::toTensor() const` no longer exists, so an unmodified binary fails at link/load time with `undefined symbol`. There is no replacement — it served the fast-logits path of the removed TensorRT-engine flow; call sites should be deleted. The struct's data layout is unchanged (`sizeof` 16, `draftRequestId` at offset 0, `draftParticipantId` at offset 8), so no silent misreads are possible. Speculative-decoding accessors on `runtime::ModelConfig`, `runtime::SpeculativeDecodingMode` and `runtime::SpeculativeDecodingModule` are removed in the same change; these are `inline`/`constexpr` and therefore break at compile time rather than at load time.
 
 - `trtllm-serve`, `trtllm-eval`, `trtllm-bench`: explicit CLI flags now take precedence over values in `--config` / `--extra_llm_api_options` YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.
 

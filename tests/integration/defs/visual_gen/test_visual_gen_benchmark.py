@@ -31,8 +31,8 @@ from typing import List, Optional
 import pytest
 import requests
 import yaml
+from test_common.llm_data import get_checkpoint
 
-from defs import conftest
 from tensorrt_llm._utils import get_free_port
 
 # ---------------------------------------------------------------------------
@@ -42,16 +42,9 @@ from tensorrt_llm._utils import get_free_port
 _WAN_T2V_MODEL = "Wan2.1-T2V-1.3B-Diffusers"
 
 
-def _wan_t2v_path() -> Path:
-    """Resolve the Wan T2V model path, or call pytest.skip if unavailable."""
-    root = Path(conftest.llm_models_root())
-    model_path = root / _WAN_T2V_MODEL
-    if not model_path.is_dir():
-        pytest.skip(
-            f"Wan T2V model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {_WAN_T2V_MODEL} under scratch)"
-        )
-    return model_path
+def _wan_t2v_path() -> str:
+    """Resolve the Wan T2V model path, failing loudly if it is not staged."""
+    return get_checkpoint(_WAN_T2V_MODEL)
 
 
 # Common small-scale generation params for fast CI
@@ -205,6 +198,23 @@ def test_online_benchmark(
 ):
     """Run benchmark_visual_gen.py and validate output and saved results."""
     result_dir = str(tmp_path / "results")
+    width, _, height = _SMALL_GEN_PARAMS["size"].partition("x")
+    requests_path = tmp_path / "requests.yaml"
+    requests_path.write_text(
+        yaml.safe_dump(
+            {
+                "common_params": {
+                    "width": int(width),
+                    "height": int(height),
+                    "num_frames": int(_SMALL_GEN_PARAMS["num_frames"]),
+                    "frame_rate": float(_SMALL_GEN_PARAMS["fps"]),
+                    "num_inference_steps": int(_SMALL_GEN_PARAMS["num_inference_steps"]),
+                    "seed": int(_SMALL_GEN_PARAMS["seed"]),
+                },
+                "requests": [{"prompt": "A bird flying over the ocean"}],
+            }
+        )
+    )
     cmd = [
         sys.executable,
         benchmark_script,
@@ -216,20 +226,8 @@ def test_online_benchmark(
         server.host,
         "--port",
         str(server.port),
-        "--prompt",
-        "A bird flying over the ocean",
-        "--num-prompts",
-        "1",
-        "--size",
-        _SMALL_GEN_PARAMS["size"],
-        "--num-frames",
-        _SMALL_GEN_PARAMS["num_frames"],
-        "--fps",
-        _SMALL_GEN_PARAMS["fps"],
-        "--num-inference-steps",
-        _SMALL_GEN_PARAMS["num_inference_steps"],
-        "--seed",
-        _SMALL_GEN_PARAMS["seed"],
+        "--workload",
+        str(requests_path),
         "--max-concurrency",
         "1",
         "--save-result",
@@ -257,8 +255,10 @@ def test_online_benchmark(
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_latency" in data
-    assert "mean_generation" in data
+    assert data["e2e_latency"]["mean"] > 0
+    # The video route stamps gen_latency at the postprocessing transition, so it
+    # ends before the encode and the /content fetch that e2e_latency includes.
+    assert 0 < data["gen_latency"]["mean"] < data["e2e_latency"]["mean"]
 
 
 # ===========================================================================
@@ -323,5 +323,5 @@ def test_offline_benchmark(tmp_path):
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_latency" in data
-    assert "mean_generation" in data
+    assert data["mean_latency"] > 0
+    assert data["mean_generation"] > 0

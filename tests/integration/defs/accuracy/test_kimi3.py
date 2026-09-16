@@ -54,7 +54,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # so gate on GB300-class device memory. B300 clears this memory gate but
     # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) -- do not
     # schedule these tests on B300; that exclusion is enforced by QA's
-    # platform selection, not by this marker.
+    # platform selection and by the CI stage's gb300-only gpu wildcard,
+    # not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
     @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa", "dspark"])
     def test_w4a16_mxfp4(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,6 +67,11 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         decoding. The reuse mode requires an observed hybrid-cache hit. The SA
         and DSpark modes also guard acceptance length for the two speculative
         decoding techniques advertised in the model-feature matrix.
+
+        The baseline and sa modes run post-merge in the GB300 16-GPU 4-node CI
+        stage (test-db list l0_gb300_multi_nodes_node4_gpu16.yml); all four
+        modes also run in QA's weekly multinode pipeline
+        (qa/llm_function_multinode.txt).
         """
         if mode == "baseline":
             monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")

@@ -14,7 +14,7 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model pytorch/TRT yaml config for trtllm-bench perf tests
+Model PyTorch YAML config for trtllm-bench performance tests.
 """
 
 from ..conftest import llm_models_root
@@ -61,17 +61,12 @@ def get_model_yaml_config(model_label: str,
         Returns:
             dict: yaml config
         """
-    if 'pytorch' in model_label:
-        # Pytorch backend config
-        base_config = {
-            'print_iter_log': True,
-            'cuda_graph_config': {
-                'enable_padding': True,
-            },
-        }
-    else:
-        # TRT backend config
-        base_config = {}
+    base_config = {
+        'print_iter_log': True,
+        'cuda_graph_config': {
+            'enable_padding': True,
+        },
+    }
 
     if 'kv_cache_dtype' in model_label:
         base_config.update({
@@ -82,6 +77,61 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        # MAX NVFP4 TP8/MTP3 follows accuracy PR #18071.
+        {
+            'patterns': ['qwen3.8_max_fp4_mtp-serve-pytorch'],
+            'config': {
+                'max_seq_len': 8192,
+                'cuda_graph_config': {
+                    'max_batch_size': 32,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'bfloat16',
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        # Flash-Next single-GPU MTP3 with PLE host offload follows PR #18585.
+        {
+            'patterns': ['qwen3.8_flash_next_'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'max_batch_size': 16,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'bfloat16',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp8_mtp'],
+            'config': {
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp4_mtp'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
         # Deepseek default cases
         {
             'patterns': ['deepseek_r1'],

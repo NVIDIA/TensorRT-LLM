@@ -90,7 +90,12 @@ if _BACKEND == "python":
         KVCacheUpdatedData,
         UniqueToken,
     )
-    from ._exceptions import CuError, OutOfMemoryError, OutOfPagesError  # noqa: F401
+    from ._exceptions import (  # noqa: F401
+        CorruptedError,
+        CuError,
+        OutOfMemoryError,
+        OutOfPagesError,
+    )
     from ._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -102,6 +107,21 @@ if _BACKEND == "python":
     from ._storage._config import CoalescedBuffer, SlotDesc, SlotDescVariant  # noqa: F401
     from ._storage._core import PoolGroupIndex, PoolIndex  # noqa: F401
     from ._utils import HalfOpenRange, exact_div, typed_range  # noqa: F401
+
+    def poison_reason() -> str | None:
+        """First recorded KVCM2 invariant violation, or None.
+
+        The pure-Python backend has no poison latch, so this is always None.
+        """
+        return None
+
+    def take_poison() -> str | None:
+        """Report the recorded violation and clear it. Always None on this backend."""
+        return None
+
+    def num_live_managers() -> int:
+        """Number of constructed, not-yet-destroyed managers. Not tracked on this backend."""
+        return 0
 
     _cpp_introspection = None
 else:
@@ -220,10 +240,14 @@ else:
     SlotDescVariant = _cpp.SlotDescVariant
     SsmLayerConfig = _cpp.SsmLayerConfig
     _KVCache = _cpp._KVCache
+    poison_reason = _cpp.poison_reason
+    take_poison = _cpp.take_poison
+    num_live_managers = _cpp.num_live_managers
     _cpp_introspection = getattr(_cpp, "_introspection", None)
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
     PlannedDropHandle = _cpp.PlannedDropHandle
     CuError = _cpp.CuError
+    CorruptedError = _cpp.CorruptedError
 
     # Symbols added on main that are not yet ported to the C++ backend.
     # TODO(kvCacheManagerV2-cpp): port these and replace the fallbacks.
@@ -359,6 +383,7 @@ __all__ = [
     "TokenIdExt",
     "UniqueToken",
     "AttnLifeCycle",
+    "CorruptedError",
     "CuError",
     "OutOfMemoryError",
     "_KVCache",
@@ -367,6 +392,9 @@ __all__ = [
     "sequence_to_blockchain_keys",
     "rawref",
     "typed_range",
+    "poison_reason",
+    "take_poison",
+    "num_live_managers",
 ]
 
 if _BACKEND != "python":
