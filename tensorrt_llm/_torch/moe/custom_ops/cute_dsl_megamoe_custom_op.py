@@ -56,12 +56,24 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div, pad_up
 
 
+@functools.lru_cache(maxsize=None)
+def _megamoe_launch_cluster_count(cluster_size: int) -> int:
+    """Occupancy for a cluster of ``cluster_size`` CTAs on the active device.
+
+    MegaMoEKernel requires launch_cluster_count so its persistent scheduler and
+    its token communication agree on hardware occupancy.
+    """
+    import cutlass.utils as cutlass_utils
+
+    return int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
+
+
 def _import_megamoe_kernel():
     """Lazy import so non-SM100 / no-cutlass-dsl envs can still import this module."""
     from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import import_kernel
     from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4.token_comm import CombineFormat
 
-    return import_kernel(), CombineFormat
+    return import_kernel(get_sm_version()), CombineFormat
 
 
 __all__ = [
@@ -1051,6 +1063,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
         common = dict(
             mma_tiler_mnk=mma_tiler,
             cluster_shape_mnk=tuple(cluster_shape),
+            launch_cluster_count=_megamoe_launch_cluster_count(
+                int(cluster_shape[0]) * int(cluster_shape[1])
+            ),
             use_2cta_instrs=bool(mma_tiler[0] == 256),
             group_hint=int(group_hint),
             token_padding_block=64,
@@ -1128,10 +1143,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             tactic_autotune: bool = False,
         ) -> None:
             super().__init__()
-            if (sm_version := get_sm_version()) not in (100, 103):
+            if (sm_version := get_sm_version()) not in (100, 103, 107):
                 raise ValueError(
-                    f"Sm100MegaMoENvfp4Runner requires SM 100 (B200) or SM 103 "
-                    f"(B300); got SM {sm_version}."
+                    f"Sm100MegaMoENvfp4Runner requires SM 100 (B200), SM 103 "
+                    f"(B300), or SM 107 (Rubin); got SM {sm_version}."
                 )
             if num_experts_per_rank <= 0:
                 raise ValueError(
@@ -1367,6 +1382,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
             common = dict(
                 mma_tiler_mnk=tuple(mma_tiler),
                 cluster_shape_mnk=tuple(cluster_shape),
+                launch_cluster_count=_megamoe_launch_cluster_count(
+                    int(cluster_shape[0]) * int(cluster_shape[1])
+                ),
                 use_2cta_instrs=bool(mma_tiler[0] == 256),
                 group_hint=int(group_hint),
                 token_padding_block=64,
@@ -1738,10 +1756,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         codegen-time constants, so a change recompiles the kernel.
         """
         sm_version = get_sm_version()
-        if sm_version not in (100, 103):
+        if sm_version not in (100, 103, 107):
             raise RuntimeError(
-                f"cute_dsl_megamoe_nvfp4_blackwell requires SM 100 (B200) or "
-                f"SM 103 (B300); got SM {sm_version}."
+                f"cute_dsl_megamoe_nvfp4_blackwell requires SM 100 (B200), "
+                f"SM 103 (B300), or SM 107 (Rubin); got SM {sm_version}."
             )
 
         # Live-token trim: TopkReduce sizes its grid from THIS tensor's dim0,

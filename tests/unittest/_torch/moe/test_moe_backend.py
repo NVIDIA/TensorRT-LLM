@@ -775,6 +775,40 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     assert moe._weights_transformed is True
 
 
+def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
+    import tensorrt_llm._utils as utils
+
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    moe.ep_size = 8
+    mpi_comm = MagicMock()
+    mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
+    local_mpi_comm = MagicMock()
+    local_mpi_comm.Get_rank.return_value = 5
+    init_process_group = MagicMock()
+    set_device = MagicMock()
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
+    monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
+    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
+    monkeypatch.setattr(utils, "local_mpi_comm", lambda: local_mpi_comm)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+
+    moe._maybe_init_torch_dist_under_mpi()
+
+    set_device.assert_called_once_with(1)
+    init_process_group.assert_called_once_with(
+        backend="cuda:nccl,cpu:gloo",
+        rank=3,
+        world_size=8,
+        device_id=torch.device("cuda", 1),
+    )
+
+
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
     method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
     hidden_size = 128

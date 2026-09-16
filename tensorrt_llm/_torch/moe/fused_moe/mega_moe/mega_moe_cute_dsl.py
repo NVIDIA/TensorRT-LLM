@@ -740,11 +740,12 @@ class MegaMoECuteDsl(MoEImplBase):
         """
         if not dist.is_available() or dist.is_initialized():
             return
-        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+        from tensorrt_llm._utils import local_mpi_comm, mpi_comm, mpi_rank, mpi_world_size
 
         try:
             world = mpi_world_size()
             rank = mpi_rank()
+            local_rank = local_mpi_comm().Get_rank()
         except Exception as e:  # not under MPI either -> leave uninitialized
             logger.debug(
                 f"[MegaMoECuteDsl] MPI rank query failed ({e!r}); "
@@ -789,13 +790,24 @@ class MegaMoECuteDsl(MoEImplBase):
         host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
         os.environ["MASTER_ADDR"] = str(host)
         os.environ["MASTER_PORT"] = str(port)
+        device_id = None
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device_index = local_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_index)
+            device_id = torch.device("cuda", device_index)
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
+            f"local_rank={local_rank}, device={device_id}, "
             f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
             f"EP rendezvous."
         )
-        dist.init_process_group(backend="cuda:nccl,cpu:gloo", rank=rank, world_size=world)
+        dist.init_process_group(
+            backend="cuda:nccl,cpu:gloo",
+            rank=rank,
+            world_size=world,
+            device_id=device_id,
+        )
 
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.

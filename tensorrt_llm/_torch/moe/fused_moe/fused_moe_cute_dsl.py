@@ -954,11 +954,21 @@ class CuteDslFusedMoE(MoEImplBase):
         """
         assert self.has_nvfp4
         assert weight_view is not None
+        # This two-op path executes SwiGLU and Relu2 only. Both act-fusion
+        # kernels declare ``SUPPORTED_ACTIVATION_TYPES = (Swiglu, Relu2)`` and
+        # neither takes a SiTU soft-cap parameter, so admitting SiTu here only
+        # moves the failure into ``validate_activation_type``. SiTU is served by
+        # the backends that declare it in their own ``activation_support``.
+        #
+        # ``self.activation_type`` may be a plain int, so do not format it with
+        # ``.name``: that turns the rejection itself into an AttributeError and
+        # hides which activation was actually refused.
         if self.activation_type not in (ActivationType.Swiglu,
                                         ActivationType.Relu2):
             raise NotImplementedError(
                 "CuteDSL NVFP4 FC1 supports only SwiGLU and Relu2; "
-                f"got {self.activation_type.name}")
+                f"got {getattr(self.activation_type, 'name', self.activation_type)}"
+            )
         output_dtype = torch.bfloat16
 
         use_locality_domain = self._locality_domain_runtime is not None

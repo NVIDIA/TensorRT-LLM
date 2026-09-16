@@ -135,6 +135,7 @@ l0_b200:
   - unittest/disaggregated/test_kda_mamba_transfer.py
   - unittest/_torch/moe/test_kimi_k3_mlp.py
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py
+  - unittest/_torch/moe/test_nvfp4_situ_moe.py
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
   - unittest/_torch/modeling/test_kimi_k3_fp8_weight_read_gates.py

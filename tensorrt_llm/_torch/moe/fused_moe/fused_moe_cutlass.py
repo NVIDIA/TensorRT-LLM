@@ -139,9 +139,13 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103, 120, 121}
+        # NVFP4: SM in {100, 103, 107, 120, 121}
+        # SM107 is served by the same SM100-family grouped-GEMM path, but was
+        # never listed here. The omission was invisible on code paths that
+        # short-circuit an explicit CUTLASS request without calling
+        # can_implement; resolving through resolve_moe_cls exposes it.
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation
@@ -370,6 +374,8 @@ class CutlassFusedMoE(MoEImplBase):
         self.tune_max_num_tokens = min(
             self.moe_max_num_tokens,
             16384 * self.num_slots // routing_method.get_experts_per_token(),
+            # A forward can never present more tokens than this.
+            default_moe_max_num_tokens,
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
