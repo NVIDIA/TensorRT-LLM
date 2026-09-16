@@ -467,6 +467,45 @@ def _normalize_attention_windows(
     return normalized
 
 
+def _derive_layer_type_attention_windows(
+    config: object,
+    max_seq_len: int,
+) -> Optional[List[int]]:
+    """Per-layer attention windows for a mixed sliding/full-attention config.
+
+    Returns one window per decoder layer, in global model layer order
+    (sliding layers get the model's ``sliding_window``, full-attention layers
+    ``max_seq_len``), or ``None`` when the schedule is uniform and the
+    single-window default is already right. Layer types that
+    ``get_layer_attention_window`` does not recognize as sliding are treated
+    as full attention.
+    """
+    num_layers = getattr(config, "num_hidden_layers", None)
+    if not isinstance(num_layers, int) or num_layers <= 0:
+        return None
+    if not getattr(config, "layer_types", None):
+        return None
+    try:
+        windows = [
+            get_layer_attention_window(config, layer_idx)
+            for layer_idx in range(num_layers)
+        ]
+    except (NotImplementedError, ValueError) as error:
+        logger.warning(
+            "Unable to derive per-layer attention windows from layer_types "
+            f"({error}); falling back to the single-window default.")
+        return None
+    resolved = _normalize_attention_windows(
+        [max_seq_len if window is None else window for window in windows],
+        max_seq_len)
+    if resolved is None or not uses_vswa_kv_cache_layout(resolved):
+        # A schedule with <2 distinct positive windows can't select a VSWA
+        # (multi-pool) layout, so a derived vector would only reshape the single
+        # shared pool. Leave it to the single-window default.
+        return None
+    return resolved
+
+
 def _get_num_pool_groups_for_estimation(
     model_config: object,
     max_seq_len: int,
@@ -762,7 +801,7 @@ class KvCacheCreator:
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
-                max_num_tokens=self._max_num_tokens if is_draft else 0,
+                max_num_tokens=self._max_num_tokens,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
@@ -797,14 +836,29 @@ class KvCacheCreator:
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
+        draft_cost = self._get_draft_cache_cost(
+            kv_cache_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
+        if draft_cost is not None:
+            total += draft_cost
+        return total
+
+    def _get_draft_cache_cost(
+        self,
+        kv_cache_config: KvCacheConfig,
+        *,
+        use_separate_draft_kv_cache: bool,
+    ) -> Optional[CacheCost]:
+        """Return the draft manager's standalone cache cost, if it has one."""
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
-            total += self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                  draft_model_config,
-                                                  kv_cache_config)
-        elif use_separate_draft_kv_cache:
+            return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                                draft_model_config,
+                                                kv_cache_config)
+        if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
             # different layer count than what is actually used at runtime
@@ -822,20 +876,19 @@ class KvCacheCreator:
                     effective_draft_config,
                     draft_kv_cache_config,
                     is_disagg=self._is_disagg)
-                total += self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls,
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    is_draft=True)
+                return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                                    effective_draft_config,
+                                                    draft_kv_cache_config,
+                                                    is_draft=True)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
-                total += self._per_manager_cache_cost(
+                return self._per_manager_cache_cost(
                     self._kv_cache_manager_cls,
                     effective_draft_config,
                     draft_kv_cache_config,
                     num_layers=self._get_num_draft_layers(),
                     is_draft=True)
-        return total
+        return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
@@ -1693,7 +1746,6 @@ class KvCacheCreator:
         """Per-manager KV cache costs for target and draft layers."""
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
-        total_kv = self._get_kv_size_per_token(target_kv_cache_config)
         use_separate_draft_kv_cache = (
             self._should_create_separate_draft_kv_cache())
         target_kv = self._per_manager_cache_cost(
@@ -1701,8 +1753,14 @@ class KvCacheCreator:
             self._model_engine.model.model_config,
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
-                             intercept=total_kv.intercept - target_kv.intercept)
+        # Estimate the draft component directly so its independently modelled
+        # affine intercept is preserved exactly.
+        draft_kv = self._get_draft_cache_cost(
+            target_kv_cache_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
+        if draft_kv is None:
+            return None
         costs = (target_kv, draft_kv)
         if any(cost.slope < 0 or cost.intercept < 0 or (
                 cost.slope == 0 and cost.intercept == 0) for cost in costs):
@@ -1804,7 +1862,7 @@ class KvCacheCreator:
                 raise ValueError(
                     f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
                     f"insufficient after the combined fixed cost "
-                    f"({intercept_total / GB:.2f} GiB, e.g. mamba SSM state) "
+                    f"({intercept_total / GB:.2f} GiB, e.g. SWA or mamba state) "
                     f"for target+draft. Increase free_gpu_memory_fraction or "
                     f"max_gpu_total_bytes, or reduce max_batch_size (the fixed "
                     f"cost scales with batch size).")
@@ -2441,7 +2499,6 @@ def _create_kv_cache_manager(
         attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
         num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
                                        None) or num_key_value_heads)
-        sliding_window = getattr(config, 'sliding_window', None)
         head_dim_list = []
         kv_heads_list = []
         for lt in layer_types:
@@ -2457,24 +2514,35 @@ def _create_kv_cache_manager(
         head_dim = head_dim_list
         num_key_value_heads = kv_heads_list
 
-        # Set per-layer max_attention_window so V2 creates separate pool
-        # groups for sliding vs full attention layers (different page sizes).
-        # Sliding layers use the model's sliding_window; full layers use
-        # max_seq_len.  V2 uses this to evict old blocks when kv_len >
-        # window, saving memory (only ~ceil(sliding_window/page_size)
-        # blocks per sequence for sliding layers, vs the full kv_len for
-        # full attention layers).  FlashInfer's prepare() reads the
-        # currently-allocated block IDs per pool from the V2 manager,
-        # so the smaller sliding-pool block count after eviction is
-        # picked up automatically.
-        if (kv_cache_config.max_attention_window is None
-                and sliding_window is not None):
+    # Derive per-layer max_attention_window for any model that publishes a
+    # mixed sliding/full `layer_types` schedule (Gemma4 hybrid included) so V2
+    # creates separate pool groups for sliding vs full-attention layers;
+    # otherwise every layer lands in one full-context pool and the bounded
+    # layers keep blocks they can never read.  Sliding layers get the model's
+    # `sliding_window`, full layers `max_seq_len`; V2 then evicts old blocks
+    # once kv_len exceeds the window (only ~ceil(sliding_window/page_size)
+    # blocks per sequence for sliding layers), and FlashInfer's prepare()
+    # picks up the smaller per-pool block count automatically.  Gemma4 hybrid
+    # always resolves to KVCacheManagerV2 (see _non_hybrid_kv_cache_manager_cls),
+    # so the V2 guard never excludes it.  A user-supplied max_attention_window
+    # always wins.
+    # Skip derivation for the one-model draft manager: (1) in one-model
+    # spec-decode the KV memory budget is already split between target and
+    # draft, so VSWA sizing here would size each window pool from the unsplit
+    # free-memory budget; (2) draft layers live at global indices past the
+    # target's num_hidden_layers, so _project_max_attention_window_vec would
+    # wrap them back onto pattern[0]. The draft config sets
+    # max_attention_window=None to opt out, not to request derivation.
+    if (kv_cache_config.max_attention_window is None and not is_draft
+            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
+        derived_windows = _derive_layer_type_attention_windows(
+            config, max_seq_len)
+        if derived_windows is not None:
+            assert uses_vswa_kv_cache_layout(derived_windows), (
+                "derived per-layer windows must select a VSWA layout; a non-VSWA "
+                "vector would reshape the single pool instead of splitting it")
             kv_cache_config = copy.copy(kv_cache_config)
-            kv_cache_config.max_attention_window = [
-                int(sliding_window)
-                if lt == "sliding_attention" else int(max_seq_len)
-                for lt in layer_types
-            ]
+            kv_cache_config.max_attention_window = derived_windows
 
     # Note: Gemma4 KV sharing is handled at the model level — shared layers
     # use cache_layer_idx to read from the target layer's cache slot via
@@ -3787,7 +3855,6 @@ def validate_feature_combination(llm_args, model_engine):
             "chunked_prefill",
             "mtp",
             "eagle3_one_model",
-            "eagle3_two_model",
             "kv_cache_reuse",
             "slide_window_attention",
             "guided_decoding",
@@ -3802,12 +3869,8 @@ def validate_feature_combination(llm_args, model_engine):
         feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
         feature_status["mtp"] = isinstance(llm_args.speculative_config,
                                            MTPDecodingConfig)
-        feature_status["eagle3_one_model"] = (
-            isinstance(llm_args.speculative_config, EagleDecodingConfig)
-            and llm_args.speculative_config.eagle3_one_model)
-        feature_status["eagle3_two_model"] = (
-            isinstance(llm_args.speculative_config, EagleDecodingConfig)
-            and not llm_args.speculative_config.eagle3_one_model)
+        feature_status["eagle3_one_model"] = isinstance(
+            llm_args.speculative_config, EagleDecodingConfig)
         feature_status[
             "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
         feature_status["slide_window_attention"] = (

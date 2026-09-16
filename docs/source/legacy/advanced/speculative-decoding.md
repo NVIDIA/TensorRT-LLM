@@ -1,8 +1,12 @@
+---
+orphan: true
+---
+
 # Speculative Sampling
 
 - [About Speculative Sampling](#about-speculative-sampling)
-- [Performance Improvements](#Performance-improvements)
-- [Draft-Target-Model](#Draft-Target-Model)
+- [Performance Improvements](#performance-improvements)
+- [Draft-Target-Model](#draft-target-model)
 - [NGram](#ngram)
 - [Medusa](#medusa)
   - [Medusa Tree](#medusa-tree)
@@ -173,7 +177,7 @@ Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits
 
 ### Disaggregated Serving
 
-[Disaggregated Serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md) with EAGLE3 using the two model approach is supported in the Pytorch backend. Please refer to the following [Dynamo example](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/additional-resources/tensorrt-llm-details/llama4-plus-eagle.md) on how to run EAGLE3 with Disaggregated Serving for Llama 4 Maverick.
+[Disaggregated Serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md) with EAGLE3 is supported in the PyTorch backend. The two-model approach this section previously described has been removed; EAGLE3 now always runs the one-model implementation, with the draft model as a submodule. Please refer to the following [Dynamo example](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/additional-resources/tensorrt-llm-details/llama4-plus-eagle.md) on how to run EAGLE3 with Disaggregated Serving for Llama 4 Maverick.
 
 ## Lookahead Decoding
 

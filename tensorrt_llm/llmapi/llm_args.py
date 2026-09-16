@@ -71,7 +71,8 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
-from ..tokenizer import TOKENIZER_ALIASES
+from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
+from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -110,8 +111,9 @@ def Field(default: Any = ...,
             - "prototype": Not yet stable and subject to breaking changes; intended for experimentation only.
         telemetry: Optional field-local telemetry override for LLM API config
             capture. Type-safe fields (categorical/numeric) auto-enroll; pass
-            telemetry=TelemetryField.categorical(...) to opt a free-form str/Any field
-            in via an allowlist, or telemetry=False to opt a type-safe field out.
+            telemetry=TelemetryField.categorical(...) to opt an otherwise unsafe
+            categorical branch in with exact allowed values, or telemetry=False
+            to opt a type-safe field out.
         **kwargs: All other arguments passed to the original Pydantic Field
 
     Returns:
@@ -134,7 +136,7 @@ def Field(default: Any = ...,
             if isinstance(telemetry, TelemetryField):
                 telemetry_metadata = telemetry.as_json_schema_extra()
             elif telemetry is True:
-                telemetry_metadata = {"kind": "value"}
+                telemetry_metadata = {}
             elif isinstance(telemetry, dict):
                 telemetry_metadata = dict(telemetry)
             else:
@@ -1637,12 +1639,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
-# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) is
-# imported from `tensorrt_llm.tokenizer`, which is where the built-in custom
-# tokenizers live. It used to be duplicated here, and the copy drifted: it was
-# missing every alias added after it, so `--custom_tokenizer <alias>` failed
-# with "not enough values to unpack" for those while the identical alias worked
-# through `load_custom_tokenizer`.
+# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) lives in
+# `tensorrt_llm.tokenizer`, where the built-in custom tokenizers register
+# themselves, and is re-exported from here. It used to be duplicated here, and
+# the copy drifted: it was missing every alias added after it, so
+# `--custom_tokenizer <alias>` failed with "not enough values to unpack" for
+# those. `custom_tokenizer` now resolves through `load_custom_tokenizer`, the
+# same loader every other entry point uses.
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
@@ -1729,8 +1732,8 @@ class AttentionDpConfig(StrictBaseModel):
         default=False,
         description=
         "Enable explicit conversation-affinity routing for attention DP. When "
-        "True, the first request of each conversation is round-robined across "
-        "ranks and every subsequent request carrying the same "
+        "True, the first request is placed by kv_cache_routing_new_conv_placement "
+        "and every subsequent request carrying the same "
         "conversation_params.conversation_id is pinned to that conversation's "
         "first-turn rank. OpenAI requests use the body conversation_params as "
         "canonical; the serve edge only creates conversation_params from the "
@@ -1739,8 +1742,8 @@ class AttentionDpConfig(StrictBaseModel):
         "block reuse, minimizing cross-rank migration). Unlike "
         "enable_kv_cache_aware_routing (affinity inferred from prefix-match "
         "length, which is lost when blocks are evicted), the conversation->rank "
-        "map is explicit and survives eviction. Falls back to load-balanced "
-        "round-robin when no conversation_id is available. Takes precedence "
+        "map is explicit and survives eviction. The same placement policy is "
+        "used when no conversation_id is available. Takes precedence "
         "over enable_kv_cache_aware_routing when both are set.")
     kv_cache_routing_max_sessions: int = Field(
         default=65536,
@@ -1750,18 +1753,17 @@ class AttentionDpConfig(StrictBaseModel):
         "are tracked, bounding memory on long-running servers. Only used when "
         "kv_cache_routing_conversation_affinity is True.")
     kv_cache_routing_new_conv_placement: Literal[
-        "round_robin", "least_queued"] = Field(
+        "round_robin", "least_queued", "least_tokens"] = Field(
             default="round_robin",
             description=
             "Placement policy in conversation-affinity routing for requests "
             "with no pinned rank yet (first turn of a conversation, requests "
             "without a conversation_id, sticky overflow). 'round_robin' "
-            "(default) equalizes per-rank conversation counts. 'least_queued' "
-            "places them on the rank with the fewest live requests instead: "
-            "per-conversation load (turn rate, fan-out, prefill length) is "
-            "not uniform, so count-uniform round-robin can leave some ranks "
-            "with deep queues while others idle; steering new conversations "
-            "by queue depth evens that out and cuts tail TTFT. Existing "
+            "(default) rotates across eligible ranks. 'least_queued' chooses "
+            "the fewest live requests. 'least_tokens' chooses the fewest active "
+            "prompt tokens, including requests assigned in the current batch; "
+            "ties use live request count, then the rotating rank cursor. "
+            "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
 
@@ -2306,16 +2308,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         description=
         "Static tree structure for draft token generation. Each sublist represents a path in the tree. Mutually exclusive with use_dynamic_tree."
     )
-    greedy_sampling: Optional[bool] = Field(
-        default=True,
-        description=
-        "Whether to use greedy sampling (Top-1 with token equality acceptance) or typical acceptance with multinomial sampling."
-    )
-    posterior_threshold: Optional[float] = Field(
-        default=None,
-        description=
-        "Minimum token probability threshold for typical acceptance. Corresponds to epsilon in https://arxiv.org/pdf/2401.10774."
-    )
     use_dynamic_tree: Optional[bool] = Field(
         default=False,
         description=
@@ -2335,12 +2327,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
-    eagle3_one_model: Optional[bool] = Field(
-        default=True,
-        description=
-        "Always uses the one-model implementation (draft as submodule). "
-        "Setting False is ignored and falls back to True; the two-model path "
-        "is deprecated and will be removed in a future release.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2370,13 +2356,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        if not self.eagle3_one_model:
-            logger.warning(
-                "Eagle3 2-model (eagle3_one_model=False) is deprecated and "
-                "ignored; falling back to eagle3_one_model=True. "
-                "2-model will be removed in a future release.")
-            self.eagle3_one_model = True
-
         self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
@@ -2477,9 +2456,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.eagle3_one_model:
-            return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
-        return TorchSpeculativeDecodingMode.EAGLE3
+        return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
@@ -2734,7 +2711,6 @@ class SADecodingConfig(DecodingBaseConfig):
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = Field(default="Draft_Target")
-    _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
@@ -2753,9 +2729,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self._draft_target_one_model:
-            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
-        return TorchSpeculativeDecodingMode.DRAFT_TARGET
+        return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -2780,14 +2754,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "Force vanilla MTP mode (sequential MTP layers). When False, uses EAGLE-style MTP for single-layer checkpoints."
     )
-    mtp_eagle_one_model: bool = Field(
-        default=True,
-        description=
-        "When using EAGLE-style MTP, always uses the one-model implementation "
-        "(drafter as submodule). Setting False is ignored and falls back to "
-        "True; the two-model path is deprecated and will be removed in a "
-        "future release.")
-
     use_dynamic_tree: bool = Field(
         default=False,
         description=
@@ -2888,16 +2854,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
-    @model_validator(mode="after")
-    def log_two_model_deprecation_warning(self):
-        if not self.mtp_eagle_one_model:
-            logger.warning(
-                "2-model style MTP (mtp_eagle_one_model=False) is deprecated "
-                "and ignored; falling back to mtp_eagle_one_model=True. "
-                "2-model will be removed in a future release.")
-            self.mtp_eagle_one_model = True
-        return self
-
     def supports_backend(self, backend: str) -> bool:
         return backend in ("pytorch", "_autodeploy")
 
@@ -2911,7 +2867,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # both gated on self.is_mtp_eagle), so no capture buffer is needed
         # and we should skip allocation to avoid disabling post-MLP/MoE
         # fusion via the layer-capture hook.
-        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
+        return 0
 
     @property
     def spec_dec_mode(self):
@@ -2921,10 +2877,8 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # num_nextn_predict_layers is set from the model's pretrained config by
         # update_spec_config_from_model_config. Treat None (before model load) as 1.
         n = self.num_nextn_predict_layers if self.num_nextn_predict_layers is not None else 1
-        if n == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
+        if n == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif n == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
-            return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 
 
@@ -3011,20 +2965,59 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
-    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
+    attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
         default="VANILLA",
         description=
-        "Attention backend for DFlash pooled-context cross-attention. This is "
-        "independent of the backend used to construct the drafter's standard "
-        "attention modules. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
-        "GPU with SM100 or SM103, and uses generated FMHA kernels with a private "
-        "paged context cache; VANILLA uses FlashAttention with a contiguous cache."
-    )
+        "Attention backend for DFlash pooled-context cross-attention, independent "
+        "of the drafter's standard attention modules. VANILLA uses FlashAttention "
+        "with a contiguous context K/V cache and runs anywhere. TRTLLM uses "
+        "TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache "
+        "and supports SM100/SM103 only. FA4 uses the flash-attn CuTe DSL kernels "
+        "on the same paged cache and supports SM90 only.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
         return self
+
+    def resolve_from_checkpoint(self) -> None:
+        """Fill unset fields from the draft checkpoint's ``config.json``.
+
+        Must run once ``speculative_model`` names a local directory:
+        ``target_layer_ids`` has no usable default, and without it no target
+        hidden states are captured. Called from validation for a local path,
+        and again from model loading once a HF repo id has been downloaded.
+        """
+        if self.speculative_model is None:
+            return
+        draft_config_path = os.path.join(str(self.speculative_model),
+                                         "config.json")
+        if not os.path.exists(draft_config_path):
+            return
+        with open(draft_config_path) as f:
+            dflash_cfg = json.load(f).get("dflash_config", {})
+
+        if self.target_layer_ids is None:
+            layer_ids = dflash_cfg.get("target_layer_ids")
+            if layer_ids is not None:
+                self.target_layer_ids = layer_ids
+        if self.mask_token_id is None:
+            mask_id = dflash_cfg.get("mask_token_id")
+            if mask_id is not None:
+                self.mask_token_id = mask_id
+
+        # The drafter is trained for one block size. Another size still runs,
+        # but acceptance length drops, so warn rather than silently serving a
+        # slower configuration.
+        block_size = dflash_cfg.get("block_size")
+        if block_size is not None and block_size != self.max_draft_len + 1:
+            logger.warning(
+                f"DFlash drafter {self.speculative_model} was trained with "
+                f"block_size={block_size}, but max_draft_len="
+                f"{self.max_draft_len} gives a runtime block size of "
+                f"{self.max_draft_len + 1}. Set max_draft_len="
+                f"{block_size - 1} to match the checkpoint; acceptance length "
+                "is likely to be lower otherwise.")
 
     @property
     def tokens_per_gen_step(self) -> int:
@@ -3877,17 +3870,11 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
-_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
-    "quantization_for_cold_page", "triattention")
-
-
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     """Quantize Host and Disk KV pages without changing the active GPU cache."""
 
     algorithm: Literal["quantization_for_cold_page"] = Field(
-        default="quantization_for_cold_page",
-        telemetry=False,
-    )
+        default="quantization_for_cold_page")
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
@@ -3918,10 +3905,7 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = Field(
-        default="triattention",
-        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
-    )
+    algorithm: Literal["triattention"] = Field(default="triattention")
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=
@@ -5228,27 +5212,15 @@ class BaseLlmArgs(StrictBaseModel):
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            # Resolve short aliases via the module-level TOKENIZER_ALIASES.
-            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
-                                                   self.custom_tokenizer)
-
-            # Dynamically import and use custom tokenizer
-            from importlib import import_module
-            try:
-                module_path, class_name = tokenizer_path.rsplit('.', 1)
-                module = import_module(module_path)
-                tokenizer_class = getattr(module, class_name)
-                # Use tokenizer path if specified, otherwise use model path
-                load_path = self.tokenizer if self.tokenizer else self.model
-                self.tokenizer = tokenizer_class.from_pretrained(
-                    load_path,
-                    trust_remote_code=self.trust_remote_code,
-                    use_fast=self.tokenizer_mode != 'slow')
-            except (ValueError, ImportError, AttributeError) as e:
-                raise ValueError(
-                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
-                    "Expected format: 'module.path.ClassName' or a recognized alias."
-                ) from e
+            # Use tokenizer path if specified, otherwise use model path.
+            load_path = self.tokenizer if self.tokenizer else self.model
+            # The one loader for aliases and import paths; it raises
+            # ValueError("Failed to load custom tokenizer ...") on failure.
+            self.tokenizer = load_custom_tokenizer(
+                self.custom_tokenizer,
+                load_path,
+                trust_remote_code=self.trust_remote_code,
+                use_fast=self.tokenizer_mode != 'slow')
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
@@ -5813,9 +5785,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=PrefillCudaGraphBackend.DISABLED,
         description="CUDA graph implementation used for prefill requests. "
         "Defaults to disabled.",
-        status="prototype",
-        telemetry=TelemetryField.categorical("disabled", "piecewise",
-                                             "breakable"))
+        status="prototype")
 
     prefill_capture_num_tokens: Optional[List[int]] = Field(
         default=None,
@@ -6364,26 +6334,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
-                # Resolve target_layer_ids and mask_token_id from draft model config if not set
-                needs_target_layer_ids = self.speculative_config.target_layer_ids is None
-                needs_mask_token_id = self.speculative_config.mask_token_id is None
-                if (needs_target_layer_ids or needs_mask_token_id
-                    ) and self.speculative_config.speculative_model is not None:
-                    draft_config_path = os.path.join(
-                        self.speculative_config.speculative_model,
-                        "config.json")
-                    if os.path.exists(draft_config_path):
-                        with open(draft_config_path) as f:
-                            draft_cfg = json.load(f)
-                        dflash_cfg = draft_cfg.get("dflash_config", {})
-                        if needs_target_layer_ids:
-                            layer_ids = dflash_cfg.get("target_layer_ids")
-                            if layer_ids is not None:
-                                self.speculative_config.target_layer_ids = layer_ids
-                        if needs_mask_token_id:
-                            mask_id = dflash_cfg.get("mask_token_id")
-                            if mask_id is not None:
-                                self.speculative_config.mask_token_id = mask_id
+                # A Hugging Face repo id is not readable yet; CachedModelLoader
+                # calls this again after the drafter is downloaded.
+                self.speculative_config.resolve_from_checkpoint()
 
             if isinstance(self.speculative_config, DSparkDecodingConfig):
                 spec_cfg = self.speculative_config

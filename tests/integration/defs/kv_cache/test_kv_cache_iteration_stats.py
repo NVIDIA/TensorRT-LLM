@@ -73,6 +73,13 @@ ALL_FIELDS = [
     "iterIntraDeviceCopyBytes",
 ]
 
+SECONDARY_FIELDS = {
+    "secondaryMaxNumBlocks",
+    "secondaryFreeNumBlocks",
+    "secondaryUsedNumBlocks",
+}
+NON_SECONDARY_FIELDS = set(ALL_FIELDS) - SECONDARY_FIELDS
+
 TEST_NAMES = {
     1: "Cold start",
     2: "Partial block reuse",
@@ -383,26 +390,34 @@ class TestKvCacheIterationStats:
         assert total_alloc > 0, "iterAllocTotalBlocks = 0 across all entries"
 
     def test_field_completeness(self, llm_instance, all_collected, request):
-        """Field completeness — verify all 18 fields present across all collected stats."""
+        """Field completeness — verify fields in their V2 window and cold-pool views."""
         # If running standalone (no prior tests), generate some traffic
         if not all_collected:
             llm_instance.generate(["Hello world"], SamplingParams(max_tokens=16))
             collect_stats(llm_instance, all_collected)
 
         entries_with_kv = 0
-        missing_fields = set()
         for s in all_collected:
             ki = s.get("kvCacheIterationStats")
             if ki:
                 entries_with_kv += 1
+                # V2 reports secondary gauges by cold pool group, not by window.
                 for ws, v in ki.items():
-                    for field in ALL_FIELDS:
-                        if field not in v:
-                            missing_fields.add(field)
+                    missing_fields = NON_SECONDARY_FIELDS - v.keys()
+                    assert not missing_fields, (
+                        f"Missing kvCacheIterationStats fields for window {ws}: "
+                        f"{sorted(missing_fields)}"
+                    )
+
+                for group, v in s.get("kvCacheIterationStatsByColdPoolGroup", {}).items():
+                    missing_fields = SECONDARY_FIELDS - v.keys()
+                    assert not missing_fields, (
+                        f"Missing kvCacheIterationStatsByColdPoolGroup fields for group {group}: "
+                        f"{sorted(missing_fields)}"
+                    )
 
         print(f"  Entries with kvCacheIterationStats: {entries_with_kv}/{len(all_collected)}")
         assert entries_with_kv > 0, "no entries contain kvCacheIterationStats"
-        assert len(missing_fields) == 0, f"Missing fields: {sorted(missing_fields)}"
 
 
 # ---------------------------------------------------------------------------

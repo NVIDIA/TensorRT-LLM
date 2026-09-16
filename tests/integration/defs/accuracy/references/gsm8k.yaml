@@ -1,38 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-meta-llama/Llama-3.1-8B-Instruct:
-  - accuracy: 74.20
-  - spec_dec_algo: NGram
-    accuracy: 74.20
-  - spec_dec_algo: SA
-    accuracy: 74.20
-  - spec_dec_algo: Eagle
-    accuracy: 74.20
-  - spec_dec_algo: Eagle3
-    accuracy: 74.20
-  - spec_dec_algo: Eagle3
-    extra_acc_spec: use_sa_spec
-    accuracy: 74.20
-  - spec_dec_algo: PARD
-    accuracy: 74.20
-  - spec_dec_algo: PARD
-    extra_acc_spec: use_sa_spec
-    accuracy: 74.20
-  - spec_dec_algo: Draft_Target
-    accuracy: 74.20
-  - spec_dec_algo: DFlash
-    accuracy: 74.20
-  - quant_algo: FP8
-    accuracy: 74.30
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 72.85
-  - quant_algo: FP8
-    kv_cache_quant_algo: NVFP4
-    accuracy: 69.75
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 66.03
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   # B200 TP4/EP4 EAGLE-3 baseline over the full 1319-sample split.
   - quant_algo: FP8
@@ -138,6 +105,22 @@ deepseek-ai/DeepSeek-V4-Flash:
   - quant_algo: FP8_BLOCK_SCALES
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
+    accuracy: 95.11
+  # DeepSeek-V4-Flash-nvfp4-DSpark: the same weights plus the DSpark drafter
+  # for target layers 40-42, with the routed experts cast MXFP4 -> NVFP4.
+  # MIXED_PRECISION is what the checkpoint's hf_quant_config declares (NVFP4
+  # routed experts, attention / shared experts / head left alone). The
+  # checkpoint's own cast_mxfp4_to_nvfp4.log reports the cast as bit-lossless
+  # (33792/33792 layers, MSE 0) and speculative decoding is lossless too, so
+  # the threshold is kept level with the non-speculative row above.
+  # Measured by
+  # test_disaggregated_serving.py::TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4
+  # (1 ctx + 1 gen, both DEP4, MegaMoE CuTe DSL) over all 1319 samples on
+  # 8x B200 183 GB: 94.92-95.68 across 11 runs. The spread straddles the
+  # 95.11 reference, so the hypothesis test's margin is what carries this,
+  # not the point estimate.
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: DSpark
     accuracy: 95.11
 deepseek-ai/DeepSeek-V4-Flash-Base:
   # Base (pretrained, non-instruct) checkpoint, so GSM8K lands well below the
@@ -498,16 +481,6 @@ nvidia/Nemotron-3.5-Lightning:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 84.42
-MiniMaxAI/MiniMax-M2:
-  - accuracy: 89.045
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 93.75
-  - quant_algo: FP8_BLOCK_SCALES
-    extra_acc_spec: tp_attn
-    accuracy: 92.0
-MiniMaxAI/MiniMax-M2.5:
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 93.75
 # MiniMax-M3 text decoder (block-sparse MoE) GSM8K, full 1319-sample split.
 # Thresholds tracked per checkpoint / quantization scheme.
 MiniMaxAI/MiniMax-M3:
@@ -520,6 +493,10 @@ nvidia/MiniMax-M3-NVFP4:
     accuracy: 88
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
+    accuracy: 86
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: Eagle3
     accuracy: 86
 nvidia/NVIDIA-Nemotron-Nano-9B-v2:
   - accuracy: 85.027
