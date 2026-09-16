@@ -1296,6 +1296,12 @@ protected:
         {
             // Fall back to any tactic
             std::cout << "WARNING: Could not find config for sm version " << sm << std::endl;
+            // begin() == end() on an empty list, so the fallback below would dereference
+            // end(). This happens when the runner exposes no tactic at all for this SM and
+            // type combination, not merely none matching the filters above.
+            TLLM_CHECK_WITH_INFO(!tactics1.empty() && !tactics2.empty(),
+                "No MoE GEMM tactics available for sm %d (GEMM_1: %zu, GEMM_2: %zu)", sm, tactics1.size(),
+                tactics2.size());
             it1 = (it1 == tactics1.end()) ? tactics1.begin() : it1;
             it2 = (it2 == tactics2.end()) ? tactics2.begin() : it2;
         }
