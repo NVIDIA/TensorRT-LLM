@@ -881,9 +881,8 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Disable the "
-                        "incompatible features (e.g. use max_beam_width=1 and "
-                        "no KV connector) to run hybrid Mamba models.")
+                        "provide a compatible fallback. Use max_beam_width=1 "
+                        "to run hybrid linear models.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
