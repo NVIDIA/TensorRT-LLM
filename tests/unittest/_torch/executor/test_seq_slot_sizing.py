@@ -297,7 +297,7 @@ def test_v2_requested_but_beam_search_selects_v1_keeps_b_slots(max_beam_width, e
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
 
-    is_v2 = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width, has_kv_connector=False)
+    is_v2 = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width)
     assert is_v2 is (max_beam_width == 1)
 
     seats = compute_max_num_sequences(
@@ -323,6 +323,10 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(max_beam_width,
     for a manager the executor does not hold. Driving both off
     ``kv_cache_manager_v2_incompatible_features`` and asserting they agree is
     what makes a new trigger a test failure rather than a regression.
+
+    The ``has_kv_connector`` arms carry their weight in the other direction: a
+    connector is served through the pool layout registration path and must not
+    demote, so they fail if the fallback it used to force comes back.
     """
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
     # A plain model: not Gemma4 hybrid (no per-layer head_dim) and not hybrid
@@ -338,9 +342,7 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(max_beam_width,
     selected = creator._validate_or_fallback_kv_cache_manager_v2(
         KVCacheManagerV2, model_config, kv_cache_config
     )
-    resolved = resolved_kv_cache_manager_is_v2(
-        kv_cache_config, max_beam_width, has_kv_connector=has_kv_connector
-    )
+    resolved = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width)
 
     assert resolved is issubclass(selected, KVCacheManagerV2)
     assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
@@ -348,32 +350,34 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(max_beam_width,
 
 def test_resolved_v2_respects_an_explicit_v1_request():
     """A V1 request stays V1 however compatible the runtime features are."""
-    assert (
-        resolved_kv_cache_manager_is_v2(
-            KvCacheConfig(use_kv_cache_manager_v2=False), 1, has_kv_connector=False
-        )
-        is False
-    )
+    assert resolved_kv_cache_manager_is_v2(KvCacheConfig(use_kv_cache_manager_v2=False), 1) is False
     # "auto" is resolved to a bool during model loading; an unresolved value is
     # not a V2 selection.
     assert (
-        resolved_kv_cache_manager_is_v2(
-            KvCacheConfig(use_kv_cache_manager_v2="auto"), 1, has_kv_connector=False
-        )
-        is False
+        resolved_kv_cache_manager_is_v2(KvCacheConfig(use_kv_cache_manager_v2="auto"), 1) is False
     )
 
 
 def test_v2_incompatible_features_reports_every_trigger():
     """The strings reach the creator's user-facing fallback/rejection message."""
-    assert kv_cache_manager_v2_incompatible_features(1, False) == []
-    assert kv_cache_manager_v2_incompatible_features(None, False) == []
-    assert kv_cache_manager_v2_incompatible_features(2, False) == ["max_beam_width > 1"]
-    assert kv_cache_manager_v2_incompatible_features(1, True) == ["kv_connector_manager"]
-    assert kv_cache_manager_v2_incompatible_features(2, True) == [
-        "kv_connector_manager",
-        "max_beam_width > 1",
-    ]
+    assert kv_cache_manager_v2_incompatible_features(1) == []
+    assert kv_cache_manager_v2_incompatible_features(None) == []
+    assert kv_cache_manager_v2_incompatible_features(2) == ["max_beam_width > 1"]
+
+
+def test_v2_incompatibility_does_not_depend_on_the_kv_connector():
+    """A KV connector is served by pool layout registration, not a V1 fallback.
+
+    Asserting this by signature rather than by value is what keeps the demotion
+    from creeping back: a connector argument that no longer changes the answer
+    would still invite callers to reason as though it did, exactly the
+    conflation ``test_overlap_headroom_gate_does_not_depend_on_disaggregation``
+    guards against for the seat pool.
+    """
+    for fn in (kv_cache_manager_v2_incompatible_features, resolved_kv_cache_manager_is_v2):
+        params = inspect.signature(fn).parameters
+        assert "has_kv_connector" not in params
+        assert not [p for p in params if "connector" in p]
 
 
 @pytest.mark.parametrize("pp_size,expected", [(1, True), (2, False)])

@@ -448,6 +448,9 @@ class TestStatsSerializer:
         assert cold_group["coldPoolGroupId"] == 0
         assert cold_group["slotSize"] == [4 << 20]
         assert cold_group["windowSizes"] == [16, 64]
+        assert cold_group["secondaryMaxNumBlocks"] == 8
+        assert cold_group["secondaryFreeNumBlocks"] == 5
+        assert cold_group["secondaryUsedNumBlocks"] == 3
         assert cold_group["secondaryPeakFreeNumBlocks"] == 6
         assert cold_group["secondaryPeakUsedNumBlocks"] == 4
         assert cold_group["secondaryPeakEvictableNumBlocks"] == 2
