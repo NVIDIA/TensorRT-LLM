@@ -45,6 +45,23 @@ def test_fingerprint_ignores_argument_order(build_wheel):
     )
 
 
+def test_fingerprint_distinguishes_effective_value_of_duplicate_keys(build_wheel):
+    # cmake applies repeated -DKEY in order (last wins), so these lists
+    # configure FOO=2 vs FOO=1. Sorting the raw args used to collapse them to
+    # the same fingerprint, letting the stale-config guard miss a real change.
+    assert build_wheel.configure_args_fingerprint(
+        ["-DFOO=1", "-DFOO=2"]
+    ) != build_wheel.configure_args_fingerprint(["-DFOO=2", "-DFOO=1"])
+
+
+def test_fingerprint_keeps_only_last_definition_of_a_key(build_wheel):
+    # An earlier definition overridden by a later one does not change the
+    # effective configuration, so it must not change the fingerprint.
+    assert build_wheel.configure_args_fingerprint(
+        ["-DFOO=1", "-DFOO=2"]
+    ) == build_wheel.configure_args_fingerprint(["-DFOO=2"])
+
+
 def test_fingerprint_changes_when_an_argument_changes(build_wheel):
     base = ["-DCMAKE_CUDA_ARCHITECTURES=100-real"]
     with_nvrtc = base + ["-DNVRTC_DYNAMIC_LINKING=ON"]

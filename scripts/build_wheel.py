@@ -126,17 +126,45 @@ def get_build_dir(build_dir, build_type, build_root=None, out_of_tree=False):
 CONFIGURE_FINGERPRINT_FILENAME = ".cmake_configure_args.sha256"
 
 
+def _cmake_define_name(arg: str) -> Optional[str]:
+    """Cache-variable name of a ``-D`` define, or ``None`` for other arguments.
+
+    Handles ``-DKEY=value``, ``-DKEY:TYPE=value``, and the surrounding quotes
+    that ``--extra-cmake-vars`` expansion adds (``"-DKEY=value"``).
+    """
+    token = arg.strip().strip('"')
+    if not token.startswith("-D"):
+        return None
+    name = token[2:].split("=", 1)[0].split(":", 1)[0]
+    return name or None
+
+
 def configure_args_fingerprint(args: Sequence[str]) -> str:
     """Stable sha256 hex digest over the configure-affecting cmake arguments.
 
-    The arguments are sorted first so that ordering differences (e.g. the
-    set() expansion of --extra-cmake-vars) don't change the fingerprint.
+    cmake applies repeated ``-DKEY=value`` definitions in order (the last one
+    wins), so the fingerprint is taken over the *effective* configuration: for
+    each cache variable only its last ``-D`` definition is kept, and the
+    remaining (non-``-D``) arguments are order-insensitive. Reordering distinct
+    flags then fingerprints the same (as it should), while two lists whose
+    winning value for some key differs fingerprint differently -- otherwise the
+    stale-configuration guard could miss a real configuration change (e.g. via
+    ``--extra-cmake-vars`` passing the same key twice).
 
-    The sorted list is JSON-serialized rather than newline-joined so that an
+    The canonical list is JSON-serialized rather than newline-joined so that an
     argument whose value contains a newline can't collide with the separator
     (cmake flags/paths don't today, but the JSON form removes the ambiguity).
     """
-    payload = json.dumps(sorted(args), separators=(",", ":")).encode()
+    effective = {}
+    others = []
+    for arg in args:
+        name = _cmake_define_name(arg)
+        if name is None:
+            others.append(arg)
+        else:
+            effective[name] = arg  # last definition of a key wins, as in cmake
+    canonical = sorted(effective.values()) + sorted(others)
+    payload = json.dumps(canonical, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -960,8 +988,10 @@ def main(*,
             expanded_args += var.split(";")
 
         extra_cmake_vars = ["\"-D{}\"".format(var) for var in expanded_args]
-        # Don't include duplicate conditions
-        cmake_def_args.extend(set(extra_cmake_vars))
+        # Drop exact-duplicate conditions while preserving order, so that when
+        # the same key is passed twice cmake's last-wins semantics stay
+        # deterministic (a set() would reorder them arbitrarily).
+        cmake_def_args.extend(dict.fromkeys(extra_cmake_vars))
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
