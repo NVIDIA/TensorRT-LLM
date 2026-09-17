@@ -148,6 +148,12 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         # Two-model drafting runs the draft as its own engine over its own
         # request view, so nothing here is shifted against the target prompt.
         return None
+    if spec_mode.is_mtp_vanilla():
+        # Known limitation: an internal chunk lacks target_hidden[i + k], so reuse
+        # can attach draft KV an unchunked prefill would not produce. Acceptance only.
+        return spec_config.max_draft_len
+    if spec_mode.is_eagle_one_model():
+        return 1
     if spec_mode.is_pard():
         # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
         # its draft state at i is a function of tokens [0, i] like the target's.
@@ -160,10 +166,7 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         # and no chunk-tail lookahead token is needed. The paged pool then makes
         # a matched prefix addressable again (dflash.py _store_prefill_context).
         return 0
-    # A shift-by-1 (Eagle) or D-chained (vanilla MTP) span additionally needs the
-    # context-chunk lookahead token, whose plumbing this branch does not carry;
-    # keying those modes without it would attach draft KV a chunked prefill never
-    # produced. DraftTargetOneModel's span is unvalidated upstream.
+    # DraftTargetOneModel likely shifts by 1 but is unvalidated upstream.
     return None
 
 
