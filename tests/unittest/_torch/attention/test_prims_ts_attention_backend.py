@@ -19,10 +19,10 @@ import inspect
 import pytest
 import torch
 from backend_case import BackendCase, generate_inputs, run_backend, run_case
-from utils.util import isSM100Family
+from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
-    not isSM100Family(),
+    getSMVersion() not in (100, 103),
     reason="PrimsTS attention kernels require SM100 or SM103",
 )
 
