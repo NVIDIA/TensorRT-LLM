@@ -17,6 +17,12 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_q
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import (
     ColdPageQuantizationCompression,
 )
+from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.row_schema import (
+    BufferSchema,
+    ColdPagePolicy,
+    RowSpan,
+    rotary_dim,
+)
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
@@ -34,16 +40,45 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 pytestmark = pytest.mark.cpu_only
 
 
-def _manager(scale_checkpoint_path=None, *, model_type="qwen3"):
+def _manager(
+    scale_checkpoint_path=None,
+    *,
+    model_type="qwen3",
+    pretrained_config=None,
+    rope_precision="auto",
+):
     config = ColdPageQuantizationCompressionConfig(
         scale_checkpoint_path=(
             str(scale_checkpoint_path) if scale_checkpoint_path is not None else None
-        )
+        ),
+        rope_precision=rope_precision,
     )
     return Nvfp4ColdPageQuantizationCompression(
         config,
-        pretrained_config=SimpleNamespace(model_type=model_type),
+        pretrained_config=(
+            pretrained_config
+            if pretrained_config is not None
+            else SimpleNamespace(model_type=model_type)
+        ),
     )
+
+
+def _mla_config(kv_lora_rank=512, qk_rope_head_dim=64, model_type="glm_moe_dsa"):
+    """MLA latent rows: kv_lora_rank NoPE elements then qk_rope_head_dim RoPE elements."""
+
+    return SimpleNamespace(
+        model_type=model_type, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+    )
+
+
+def _partial_rotary_config(partial_rotary_factor=0.25, model_type="qwen3_5"):
+    """Qwen3.5 / Qwen3-Next style GQA: the first head_dim * factor K elements carry RoPE."""
+
+    return SimpleNamespace(model_type=model_type, partial_rotary_factor=partial_rotary_factor)
+
+
+def _geometry(buffer):
+    return (buffer.quantized_elements, buffer.raw_row_stride_elements)
 
 
 def _factory_model_engine(
@@ -300,7 +335,7 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
     assert [buffer.role for buffer in layout.buffers] == ["key", "value"]
     assert layout.num_kv_heads == 4
     assert layout.tokens_per_page == 5
-    assert layout.head_dim == 128
+    assert [_geometry(buffer) for buffer in layout.buffers] == [(128, 128)] * 2
     assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
         1.0,
         1.0,
@@ -646,7 +681,7 @@ def test_key_only_layout_rejects_partial_modelopt_scales(tmp_path):
         patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
         pytest.raises(ValueError, match="must contain both K and V"),
     ):
-        _manager(tmp_path).create_cold_page_codec(
+        _manager(tmp_path, pretrained_config=_mla_config()).create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(7,),
@@ -708,7 +743,7 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
         ),
     )
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        result = _manager(tmp_path).create_cold_page_codec(
+        result = _manager(tmp_path, pretrained_config=_mla_config()).create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(10,),
@@ -724,7 +759,8 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
     assert _codec_state(native).runtime_type == 1
     assert layout.num_kv_heads == 1
     assert layout.tokens_per_page == 64
-    assert layout.head_dim == 576
+    # auto mode quantizes the whole latent row, RoPE suffix included.
+    assert _geometry(layout.buffers[0]) == (576, 576)
     scales = layout.buffers[0].scales
     assert scales.nvfp4_orig_quant == scales.nvfp4_quant_orig == 1.0
     assert layout.buffers[1].scales is None
@@ -751,7 +787,7 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
     )
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager().create_cold_page_codec(
+        _manager(pretrained_config=_mla_config(16, 16)).create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(0,),
@@ -773,16 +809,12 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
     assert metadata.cold_page_bytes == 176
 
 
-@pytest.mark.parametrize("model_type", ("qwen3", "kimi_k3"))
-def test_non_deepseek_model_skips_deepseek_v4_layout_builder(model_type: str) -> None:
+@pytest.mark.parametrize("model_type", ("qwen3", "kimi_k3", "deepseek_v4"))
+def test_deepseek_v4_handling_is_role_driven_not_model_type_driven(model_type: str) -> None:
     native, _ = _native()
-    manager = _manager(model_type=model_type)
 
-    with (
-        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
-        patch.object(manager, "_build_deepseek_v4_layer_layouts") as build_deepseek_v4_layouts,
-    ):
-        manager.create_cold_page_codec(
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager(model_type=model_type).create_cold_page_codec(
             _cache_config((0, "attention")),
             runtime_dtype=DataType.BF16,
             pp_layers=(0,),
@@ -790,7 +822,9 @@ def test_non_deepseek_model_skips_deepseek_v4_layout_builder(model_type: str) ->
             head_dim_per_layer=(128,),
         )
 
-    build_deepseek_v4_layouts.assert_not_called()
+    layout = _layouts(native)[0]
+    assert [buffer.role for buffer in layout.buffers] == ["key", "value"]
+    assert [_geometry(buffer) for buffer in layout.buffers] == [(128, 128)] * 2
 
 
 @pytest.mark.parametrize(
@@ -823,12 +857,8 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
 
     layout = _layouts(native)[0]
     assert _codec_state(native).layer_ids == (8,)
-    assert (
-        layout.num_kv_heads,
-        layout.tokens_per_page,
-        layout.head_dim,
-        layout.raw_row_stride_elements,
-    ) == (1, 32, 448, 512)
+    assert (layout.num_kv_heads, layout.tokens_per_page) == (1, 32)
+    assert _geometry(layout.buffers[0]) == (448, 512)
     assert [buffer.scales is not None for buffer in layout.buffers] == [True, False]
 
     metadata = _configure_lifecycle(
@@ -1182,7 +1212,7 @@ def test_mla_model_layouts_are_built_in_python(
     cache_config = SimpleNamespace(tokens_per_block=64, layers=tuple(layers))
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager().create_cold_page_codec(
+        _manager(pretrained_config=_mla_config()).create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=tuple(range(expected_layers)),
@@ -1347,3 +1377,362 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         active_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"] is None
     )
     log.assert_called_once()
+
+
+# --- RoPE precision switch -------------------------------------------------
+
+
+def _qwen35_like_cache_config(tokens_per_block=4):
+    return SimpleNamespace(
+        tokens_per_block=tokens_per_block,
+        layers=(
+            AttentionLayerConfig(
+                layer_id=0,
+                buffers=[
+                    BufferConfig(role="key", size=2 * 256 * tokens_per_block),
+                    BufferConfig(role="value", size=2 * 256 * tokens_per_block),
+                ],
+            ),
+        ),
+    )
+
+
+def _create(manager, cache_config, native, **kwargs):
+    defaults = dict(
+        runtime_dtype=DataType.FP8,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(2,),
+        head_dim_per_layer=(256,),
+    )
+    defaults.update(kwargs)
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        manager.create_cold_page_codec(cache_config, **defaults)
+
+
+def test_partial_rotary_lossless_needs_a_prefix_kernel_and_fails_fast() -> None:
+    # Qwen3.5 rotates the first 64 of 256 K elements. The kernel preserves row
+    # suffixes only, so the switch must refuse rather than silently quantize.
+    native, _ = _native()
+    with pytest.raises(NotImplementedError, match="first 64 elements"):
+        _create(
+            _manager(pretrained_config=_partial_rotary_config(), rope_precision="lossless"),
+            _qwen35_like_cache_config(),
+            native,
+        )
+    native.create_python_cold_page_codec.assert_not_called()
+
+
+@pytest.mark.parametrize("rope_precision", ["auto", "quantized"])
+def test_partial_rotary_quantized_modes_merge_the_row(rope_precision: str) -> None:
+    native, _ = _native()
+    _create(
+        _manager(pretrained_config=_partial_rotary_config(), rope_precision=rope_precision),
+        _qwen35_like_cache_config(),
+        native,
+    )
+
+    layout = _layouts(native)[0]
+    assert [_geometry(buffer) for buffer in layout.buffers] == [(256, 256)] * 2
+    metadata = _configure_lifecycle(native, {0: {"key": 2048, "value": 2048}})
+    assert metadata.cold_page_bytes == 2304  # 288 B per token-head
+
+
+def test_mla_lossless_keeps_rope_suffix() -> None:
+    native, _ = _native()
+    cache_config = SimpleNamespace(
+        tokens_per_block=64,
+        layers=(
+            AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=64 * 576)]),
+        ),
+    )
+    _create(
+        _manager(pretrained_config=_mla_config(), rope_precision="lossless"),
+        cache_config,
+        native,
+        num_kv_heads_per_layer=(1,),
+        head_dim_per_layer=(576,),
+    )
+
+    layout = _layouts(native)[0]
+    assert _geometry(layout.buffers[0]) == (512, 576)
+    metadata = _configure_lifecycle(native, {0: {"key": 64 * 576}})
+    # 16384 B packed + 2048 B scales + 4096 B lossless RoPE = 352 B per row.
+    assert metadata.cold_page_bytes == 22528
+    assert metadata.integers[0].tolist() == [0, 0, 1, 64, 512, 576, 64]
+
+
+@pytest.mark.parametrize(
+    ("rope_precision", "geometry", "cold_page_bytes"),
+    [
+        ("auto", (448, 512), 12288),
+        ("lossless", (448, 512), 12288),
+        ("quantized", (512, 512), 10880),
+    ],
+)
+def test_deepseek_v4_rope_precision_modes(rope_precision, geometry, cold_page_bytes) -> None:
+    native, _ = _native()
+    cache_config = _deepseek_v4_csa_cache_config(first_layer_id=7, element_bytes=1)
+    _create(
+        _manager(model_type="deepseek_v4", rope_precision=rope_precision),
+        cache_config,
+        native,
+        pp_layers=(10,),
+        num_kv_heads_per_layer=(),
+        head_dim_per_layer=(),
+    )
+
+    layout = _layouts(native)[0]
+    assert _geometry(layout.buffers[0]) == geometry
+    metadata = _configure_lifecycle(
+        native,
+        {8: {"deepseek_v4_compress": 32 * 512, "deepseek_v4_indexer_compress": 32 * 68}},
+    )
+    assert metadata.cold_page_bytes == cold_page_bytes
+
+
+def test_full_rotary_key_rejects_lossless_rope() -> None:
+    native, _ = _native()
+    with pytest.raises(ValueError, match="no quantized span"):
+        _create(
+            _manager(rope_precision="lossless"),
+            _cache_config((0, "attention")),
+            native,
+            num_kv_heads_per_layer=(8,),
+            head_dim_per_layer=(128,),
+        )
+    native.create_python_cold_page_codec.assert_not_called()
+
+
+def test_per_layer_type_rope_parameters_quantize_but_reject_lossless() -> None:
+    config = SimpleNamespace(
+        model_type="gemma4",
+        rope_parameters={
+            "full_attention": {"rope_theta": 1_000_000.0, "partial_rotary_factor": 0.25},
+            "sliding_attention": {"rope_theta": 10_000.0},
+        },
+    )
+    native, _ = _native()
+    _create(
+        _manager(pretrained_config=config),
+        _cache_config((0, "attention")),
+        native,
+        num_kv_heads_per_layer=(8,),
+        head_dim_per_layer=(256,),
+    )
+    assert [_geometry(buffer) for buffer in _layouts(native)[0].buffers] == [(256, 256)] * 2
+
+    with pytest.raises(NotImplementedError, match="per-layer-type"):
+        _create(
+            _manager(pretrained_config=config, rope_precision="lossless"),
+            _cache_config((0, "attention")),
+            native,
+            num_kv_heads_per_layer=(8,),
+            head_dim_per_layer=(256,),
+        )
+
+
+def test_rotary_dim_ladder() -> None:
+    assert rotary_dim(SimpleNamespace(), 128) == 128
+    assert rotary_dim(SimpleNamespace(rotary_dim=32), 128) == 32
+    assert rotary_dim(SimpleNamespace(rotary_pct=0.5), 128) == 64
+    assert rotary_dim(SimpleNamespace(partial_rotary_factor=0.25), 256) == 64
+    assert rotary_dim(SimpleNamespace(rope_parameters={"partial_rotary_factor": 0.25}), 256) == 64
+    assert rotary_dim(SimpleNamespace(rope_parameters={"full_attention": {}}), 256) is None
+    with pytest.raises(ValueError, match="multiple of 16"):
+        rotary_dim(SimpleNamespace(partial_rotary_factor=0.1), 128)
+
+
+def test_partial_rotary_is_read_from_the_text_config_of_a_composite_model() -> None:
+    native, _ = _native()
+    composite = SimpleNamespace(
+        model_type="qwen3_5_moe",
+        text_config=_partial_rotary_config(model_type="qwen3_5_moe_text"),
+    )
+    # The rotary span is found on the nested text config: 64 leading elements.
+    with pytest.raises(NotImplementedError, match="first 64 elements"):
+        _create(
+            _manager(pretrained_config=composite, rope_precision="lossless"),
+            _qwen35_like_cache_config(),
+            native,
+        )
+
+
+def test_key_only_layer_with_non_mla_geometry_fails_closed() -> None:
+    native, _ = _native()
+    cache_config = SimpleNamespace(
+        tokens_per_block=64,
+        layers=(
+            AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=64 * 656)]),
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="fp8_ds_mla"):
+        _create(
+            _manager(pretrained_config=_mla_config()),
+            cache_config,
+            native,
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(656,),
+        )
+
+
+def test_fp8_ds_mla_kv_layout_is_rejected_at_admission() -> None:
+    with (
+        patch.object(util_mod, "is_sm_100f", return_value=True),
+        pytest.raises(NotImplementedError, match="fp8_ds_mla"),
+    ):
+        util_mod.validate_kv_cache_compression_compatibility(
+            ColdPageQuantizationCompressionConfig(),
+            SimpleNamespace(enable_block_reuse=False, dtype="fp8_ds_mla"),
+            None,
+        )
+
+
+def test_kvcm_layer_outside_wrapper_geometry_names_the_layer() -> None:
+    native, _ = _native()
+    with pytest.raises(ValueError, match="KVCM layer 1 has no registered head_dim"):
+        _create(
+            _manager(),
+            _cache_config((0, "attention"), (1, "attention")),
+            native,
+            pp_layers=(0, 1),
+            num_kv_heads_per_layer=(8, 8),
+            head_dim_per_layer=(128,),
+        )
+
+
+def test_bound_provider_forwards_each_kvcm_pretrained_config() -> None:
+    provider = MagicMock()
+    draft_config = SimpleNamespace(model_type="llama")
+    bound = util_mod._bind_cold_page_codec_provider(provider, draft_config)
+
+    bound.create_cold_page_codec("cache", runtime_dtype=DataType.BF16, is_draft=True)
+    provider.create_cold_page_codec.assert_called_once_with(
+        "cache", pretrained_config=draft_config, runtime_dtype=DataType.BF16, is_draft=True
+    )
+    assert bound.provides_cold_page_codec is provider.provides_cold_page_codec
+    assert util_mod._bind_cold_page_codec_provider(None, draft_config) is None
+
+
+def test_create_cold_page_codec_resolves_against_the_passed_pretrained_config() -> None:
+    native, _ = _native()
+    # The manager holds a full-rotary GQA target config; the draft KVCM is an MLA
+    # model whose 128-element rows split 64 + 64.
+    manager = _manager(rope_precision="lossless")
+    draft_layers = SimpleNamespace(
+        tokens_per_block=4,
+        layers=(
+            AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4 * 128 * 2)]),
+        ),
+    )
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        manager.create_cold_page_codec(
+            draft_layers,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(128,),
+            is_draft=True,
+            pretrained_config=_mla_config(kv_lora_rank=64, qk_rope_head_dim=64),
+        )
+    assert _geometry(_layouts(native)[0].buffers[0]) == (64, 128)
+
+
+def test_policy_row_geometry_rejects_two_quantized_runs_and_bad_tiling() -> None:
+    policy = ColdPagePolicy(position="lossless")
+    two_runs = BufferSchema(
+        role="key",
+        row_stride_elements=96,
+        spans=(RowSpan("content", 0, 32), RowSpan("position", 32, 32), RowSpan("content", 64, 32)),
+    )
+    with pytest.raises(ValueError, match="2 separate quantized runs"):
+        policy.row_geometry(two_runs, "gqa", where="test")
+    gap = BufferSchema(
+        role="key",
+        row_stride_elements=64,
+        spans=(RowSpan("content", 0, 32), RowSpan("position", 48, 16)),
+    )
+    with pytest.raises(ValueError, match="must tile"):
+        policy.row_geometry(gap, "gqa", where="test")
+    merged = policy.row_geometry(
+        BufferSchema(
+            role="key",
+            row_stride_elements=576,
+            spans=(RowSpan("content", 0, 512), RowSpan("position", 512, 64)),
+        ),
+        "mla",
+        where="test",
+    )
+    assert (merged.quantized_row_offset_elements, merged.quantized_elements) == (0, 512)
+    assert merged.lossless_suffix_elements == 64
+
+
+def test_auto_mode_reproduces_the_measured_glm52_and_deepseek_v4_pages() -> None:
+    """Whole-page byte pins for the two production layouts measured on GB300."""
+
+    # GLM-5.2: 79 MLA latent rows (78 layers + MTP) x 64 tokens at FP8, 22 indexer-K layers.
+    native, _ = _native()
+    full_indexer = {0, 1, 2, *range(6, 78, 4), 78}
+    layers = []
+    for layer_id in range(79):
+        buffers = [BufferConfig(role="key", size=64 * 576)]
+        if layer_id in full_indexer:
+            buffers.append(BufferConfig(role="index_key", size=64 * 132))
+        layers.append(AttentionLayerConfig(layer_id=layer_id, buffers=buffers))
+    _create(
+        _manager(pretrained_config=_mla_config()),
+        SimpleNamespace(tokens_per_block=64, layers=tuple(layers)),
+        native,
+        pp_layers=tuple(range(79)),
+        num_kv_heads_per_layer=(1,) * 79,
+        head_dim_per_layer=(576,) * 79,
+    )
+    hot = {
+        layer_id: {"key": 64 * 576, **({"index_key": 64 * 132} if layer_id in full_indexer else {})}
+        for layer_id in range(79)
+    }
+    assert len(full_indexer) == 22
+    assert _configure_lifecycle(native, hot).cold_page_bytes == 1_824_000
+
+    # DeepSeek-V4-Pro CSA lifecycle: 30 CSA layers (ratio 4) and 31 colocated HCA rows (ratio 128),
+    # 128-token pages at FP8.
+    native, _ = _native()
+    compress_ratios = [128, 128] + [4, 128] * 29 + [4]  # 30 CSA + 31 HCA layers
+    layers, hot, layer_id = [], {}, 0
+    for ratio in compress_ratios:
+        layers.append(
+            AttentionLayerConfig(
+                layer_id=layer_id, buffers=[BufferConfig(role="deepseek_v4_swa", size=128 * 512)]
+            )
+        )
+        layer_id += 1
+        if ratio == 4:
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=layer_id,
+                    buffers=[
+                        BufferConfig(role="deepseek_v4_compress", size=32 * 512),
+                        BufferConfig(role="deepseek_v4_indexer_compress", size=32 * 68),
+                    ],
+                )
+            )
+            hot[layer_id] = {
+                "deepseek_v4_compress": 32 * 512,
+                "deepseek_v4_indexer_compress": 32 * 68,
+            }
+        else:
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=layer_id, buffers=[BufferConfig(role="deepseek_v4_compress", size=512)]
+                )
+            )
+            hot[layer_id] = {"deepseek_v4_compress": 512}
+        layer_id += 1
+    _create(
+        _manager(model_type="deepseek_v4"),
+        SimpleNamespace(tokens_per_block=128, layers=tuple(layers)),
+        native,
+        pp_layers=tuple(range(len(compress_ratios))),
+        num_kv_heads_per_layer=(),
+        head_dim_per_layer=(),
+    )
+    assert _configure_lifecycle(native, hot).cold_page_bytes == 384_512

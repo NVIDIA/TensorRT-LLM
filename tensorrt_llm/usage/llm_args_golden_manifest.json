@@ -540,6 +540,16 @@
       "path": "kv_cache_compression_config.quant"
     },
     {
+      "allowed_values": [
+        "auto",
+        "quantized",
+        "lossless"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.rope_precision"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.attention_dp_events_gather_period_ms"

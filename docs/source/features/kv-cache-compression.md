@@ -203,6 +203,37 @@ Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets `KvCacheConfig(dtype="nvfp4")` and keeps active GPU KV in
 NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
+
+#### RoPE Precision
+
+The position-encoded (RoPE) part of a K row is a precision-versus-ratio
+trade-off. `rope_precision` selects how the cold page stores it; the NoPE part
+and V are always quantized, and side buffers such as DSA indexer keys are
+always copied byte-for-byte.
+
+| `rope_precision` | RoPE part in the cold page | Notes |
+|---|---|---|
+| `auto` (default) | Lossless for DeepSeek-V4 compressed rows, quantized elsewhere | Keeps the previously shipped layout per model |
+| `quantized` | Stored in the `quant` format | Best ratio; for example 1.78x on an FP8 MLA row |
+| `lossless` | Copied byte-for-byte from the active cache | Best accuracy; 1.64x on an FP8 MLA row, 1.62x on a DeepSeek-V4 compressed row |
+
+The codec locates the RoPE part from the model configuration: the trailing
+`qk_rope_head_dim` elements of an MLA latent row, the 64-element suffix of a
+DeepSeek-V4 compressed row, or the leading `head_dim * partial_rotary_factor`
+elements of a partial-rotary GQA K row (Qwen3.5, Qwen3-Next). `lossless` is
+rejected where it cannot apply: models whose K rows are fully rotated (Qwen3,
+Llama, GPT-OSS) have no NoPE part left to quantize, models with per-layer-type
+RoPE (Gemma4) have no single row shape, and partial-rotary GQA rows keep their
+RoPE at the start of the row, which the cold-page kernel does not yet preserve.
+Those models use `quantized` (the `auto` behavior).
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  rope_precision: lossless
+```
+
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
 

@@ -292,6 +292,29 @@ The framework connects storage-bound compression to KVCM V2 through the
 existing interfaces. A new compression format implements its provider APIs and
 algorithm launcher.
 
+#### Row schemas in the NVFP4 cold-page codec
+
+The NVFP4 codec separates three concerns so that no model-specific code touches
+the byte layout:
+
+- **Schema** (`row_schema.py`): what each hot row means. A `LayerSchema` lists
+  every buffer of a KVCM layer; a buffer is either opaque (copied byte-for-byte)
+  or a row of `content` and `position` spans. Schemas come from an ordered table
+  of resolvers that each see the whole layer list: `deepseek_v4` claims layers by
+  their `deepseek_v4_*` roles, `mla` claims key-only layers with the
+  `kv_lora_rank + qk_rope_head_dim` geometry, and `gqa` claims the rest. A
+  resolver may return `EXCLUDE` to leave a layer to KVCM's default lossless codec.
+- **Policy** (`ColdPagePolicy`): which precision each span kind gets. Content is
+  always quantized; the position span follows `rope_precision`. After precision
+  resolution, adjacent spans of the same precision merge, and the row must have
+  the shape `[lossless prefix][one quantized run][lossless suffix]`.
+- **Layout** (`nvfp4_quantization.py`): one function turns a schema into the
+  kernel-facing `_Nvfp4LayerLayout`, with per-buffer row geometry, and the
+  lifecycle metadata packs the tables the CUDA kernels read.
+
+To support a new attention family, write a resolver that names the spans of its
+rows; do not add a layout builder or a `model_type` check.
+
 ### 4. Add method-specific kernels
 
 Keep the manager responsible for policy and the kernel responsible for a

@@ -2469,6 +2469,29 @@ def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
     )
 
 
+class _BoundColdPageCodecProvider:
+    """Forward a cold-page codec provider to one KVCM with that KVCM's model config."""
+
+    def __init__(self, provider: object, pretrained_config: object) -> None:
+        self._provider = provider
+        self._pretrained_config = pretrained_config
+
+    def create_cold_page_codec(self, cache_config: object, **kwargs) -> object:
+        return self._provider.create_cold_page_codec(
+            cache_config, pretrained_config=self._pretrained_config, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._provider, name)
+
+
+def _bind_cold_page_codec_provider(
+        provider: Optional[object],
+        pretrained_config: object) -> Optional[object]:
+    if provider is None:
+        return None
+    return _BoundColdPageCodecProvider(provider, pretrained_config)
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2662,8 +2685,11 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        # Each KVCM describes its own model: a one-model draft KVCM must build
+        # its cold-page codec from the draft config, not the target config.
         manager_extra_kwargs[
-            "cold_page_codec_provider"] = cold_page_codec_provider
+            "cold_page_codec_provider"] = _bind_cold_page_codec_provider(
+                cold_page_codec_provider, _model_config.pretrained_config)
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         # V2 builds the block-reuse cache key of a multimodal token run from
@@ -3115,6 +3141,14 @@ def validate_kv_cache_compression_compatibility(
             raise RuntimeError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
                 "(SM100 or SM103).")
+        if getattr(kv_cache_config, "dtype", None) == "fp8_ds_mla":
+            # The packed inline-scale MLA layout stores FP8 NoPE values, FP32
+            # scales, and BF16 RoPE values in one row; it is not an element
+            # array the cold-page codec can quantize.
+            raise NotImplementedError(
+                "Cold-page quantization does not support the packed "
+                "kv_cache_config.dtype='fp8_ds_mla' KV layout; use 'fp8' or "
+                "the model's default KV dtype.")
     elif config.algorithm == "triattention" and not is_sm_100f():
         raise RuntimeError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")

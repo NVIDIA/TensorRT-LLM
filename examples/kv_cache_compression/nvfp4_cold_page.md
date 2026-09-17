@@ -329,6 +329,36 @@ These per-layer K/V global scales apply to the conventional two-buffer K/V
 layout. Key-only MLA and draft-model cold Pages currently use identity global
 scales.
 
+## RoPE Precision
+
+`rope_precision` controls the RoPE part of each K row in the cold page. The
+default `auto` keeps the shipped behavior per model: lossless for DeepSeek-V4
+compressed rows, quantized for MLA and GQA rows. Set `quantized` for the best
+ratio or `lossless` for the best accuracy:
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  rope_precision: lossless
+```
+
+Bytes per hot row at FP8, NoPE and V always NVFP4:
+
+| Model family | RoPE quantized | RoPE lossless |
+|---|---|---|
+| MLA 576-element latent row (DeepSeek-V3.x, GLM-5.2, Kimi-K2) | 324 B (1.78x) | 352 B (1.64x) |
+| DeepSeek-V4 compressed row (512 elements per 4 tokens) | 288 B (1.78x) | 316 B (1.62x) |
+| Qwen3.5 / Qwen3-Next K + V (256 elements each, 64 rotated at the row start) | 288 B (1.78x) | not yet supported, see below |
+
+`lossless` is rejected where it cannot apply: models whose K rows are fully
+rotated (Qwen3, Llama, GPT-OSS) have no NoPE part left to quantize; models with
+per-layer-type RoPE (Gemma4) have no single row shape; and partial-rotary GQA
+rows (Qwen3.5, Qwen3-Next) keep their RoPE at the start of the row, which the
+cold-page kernel does not yet preserve. These models use `quantized`, which is
+also what `auto` selects for them. The packed `kv_cache_config.dtype="fp8_ds_mla"`
+KV layout is not supported by cold-page quantization in any mode.
+
 ## Enablement Checklist
 
 1. Run the PyTorch backend on an SM100 or SM103 GPU.
