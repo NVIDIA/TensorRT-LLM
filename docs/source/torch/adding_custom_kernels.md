@@ -268,8 +268,8 @@ This is wired up for the following dense GEMM runners. Each builds its validated
 |---|---|---|
 | SM100/SM103 | NVFP4 | `tile`, `cluster` (prune); `swizzle`, `cta_order` (annotate only) |
 | SM100/SM103 | blockwise FP8 | `tile`, `cluster` |
-| SM100/SM103 | BF16 | all five |
-| SM107 (Rubin) | block-scaled NVFP4, incl. the uGPU in-place variant | all five |
+| SM100/SM103 | BF16 | `tile`, `cluster`, `swizzle`, `cta_order` |
+| SM107 (Rubin) | block-scaled NVFP4 | all five |
 | SM107 (Rubin) | block-scaled MXFP8 | all five |
 | SM107 (Rubin) | per-tensor FP8 | `tile`, `cluster`, `cta_order` |
 | SM107 (Rubin) | BF16 | all five |
@@ -318,6 +318,12 @@ autotuner_nvmmh_config:
   fields: [swizzle, cta_order, split_k]
   max_tactics: 5  # Top-K signatures per modeled problem/orientation.
 ```
+
+All active model engines in one process must use the same effective policy,
+including the disabled default. Creating an engine with a conflicting policy
+or changing that policy through `configure_nvmmh()` raises `ValueError` without
+replacing the current configuration. Identical policies can be reused. After
+the last engine is cleaned up or garbage-collected, a new policy can be installed.
 
 Compatible validated runner-specific tactics that NVMMH cannot represent are
 retained automatically and empirically profiled. The BF16 and SM107
