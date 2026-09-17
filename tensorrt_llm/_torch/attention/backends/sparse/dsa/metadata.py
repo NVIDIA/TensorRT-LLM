@@ -24,6 +24,7 @@ from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
+    _DSL_FP4_USE_DYN,
     Indexer,
     IndexerPrefillChunkMetadata,
     _compute_slot_mappings,
@@ -602,6 +603,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
                 gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
             )
+            if _DSL_FP4_USE_DYN and getattr(self, "dsl_dyn_state", None) is not None:
+                self.dsl_dyn_state.zero_()
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
             )
@@ -990,6 +993,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # FP4 DSL scorer dynamic-schedule state (arrival, exhausted mask,
+        # per-range claim counters); the kernel restores the zeros it uses.
+        # One buffer per process: launches that share it must be stream-ordered.
+        self.dsl_dyn_state = None
+        if _DSL_FP4_USE_DYN:
+            self.dsl_dyn_state = self.get_empty(
+                self.cuda_graph_buffers,
+                (64 + (self.num_sms + 31) // 32 * 32,),
+                cache_name="dsl_dyn_state",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.dsl_dyn_state.zero_()
         # Pre-allocated 2D kv_lens buffer for the new DeepGEMM 2D context_lens
         # API. Shape: (max_num_sequences, 1 + max_draft_tokens). Each row
         # broadcasts the same kv_len across next_n positions; kernel reads a

@@ -69,6 +69,17 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 _DG_SCHEDULE_BLOCK_KV = 64
+# Dynamic (work-stealing) scheduling of the FP4 DSL scorer: on when
+# TRTLLM_DSL_FP4_DYN_SCHED=1; "auto" follows _DSL_FP4_DYN_DEFAULT_ON.
+# Off by default: the build is chosen at CUDA-graph capture from the engine's
+# max sequence length, and the dynamic build's low-work regime (actual
+# contexts far below the envelope) costs 2-7 % against the static kernel at
+# 64k-256k, B32-128 (cold B200). Opt in with TRTLLM_DSL_FP4_DYN_SCHED=1.
+_DSL_FP4_DYN_DEFAULT_ON = False
+_DSL_FP4_DYN_SCHED = os.environ.get("TRTLLM_DSL_FP4_DYN_SCHED", "auto")
+_DSL_FP4_USE_DYN = _DSL_FP4_DYN_SCHED == "1" or (
+    _DSL_FP4_DYN_SCHED == "auto" and _DSL_FP4_DYN_DEFAULT_ON
+)
 
 
 def _pick_dsl_expand(
@@ -1228,6 +1239,11 @@ class Indexer(nn.Module):
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
         metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
+        dyn_state = getattr(metadata, "dsl_dyn_state", None)
+        if _DSL_FP4_USE_DYN and dyn_state is not None:
+            # the kernel restores these words itself; this recovers from an
+            # aborted launch
+            dyn_state.zero_()
         if not metadata.use_expanded_buffers_for_mtp:
             next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
             metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
@@ -1860,6 +1876,8 @@ class Indexer(nn.Module):
                         dsl_block_table = metadata.block_table_expanded[:exp_B]
                         dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
 
+                    if _DSL_FP4_USE_DYN and getattr(metadata, "dsl_dyn_state", None) is not None:
+                        gvr_emit_kwargs["dyn_state"] = metadata.dsl_dyn_state
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q,
                         decode_q_scale,

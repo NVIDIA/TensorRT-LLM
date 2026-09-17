@@ -10770,6 +10770,43 @@ if IS_CUTLASS_DSL_AVAILABLE:
     #  CuTE DSL FP4 Paged MQA Logits (Blackwell SM100)                   #
     # ------------------------------------------------------------------ #
 
+    # Dynamic (work-stealing) tile scheduling of the FP4 scorer.
+    # TRTLLM_DSL_FP4_DYN_SCHED: "auto" (dynamic iff a state buffer is passed),
+    # "1" (always; a per-device buffer is allocated on demand), "0" (never).
+    # TRTLLM_DSL_FP4_DYN_CHUNK / _NMIN override the pairs-per-chunk and the
+    # regime floor (pairs per CTA) without recompiling.
+    _FP4_DYN_MODE = os.environ.get("TRTLLM_DSL_FP4_DYN_SCHED", "auto")
+    _FP4_DYN_CHUNK = int(os.environ.get("TRTLLM_DSL_FP4_DYN_CHUNK", "16"))
+    _FP4_DYN_NMIN = int(os.environ.get("TRTLLM_DSL_FP4_DYN_NMIN", "64"))
+    _FP4_DYN_B_CAP = 1024
+    _FP4_DYN_RING = 128
+    _fp4_dyn_state_cache: dict = {}
+
+    def fp4_dyn_state_words(num_sms: int) -> int:
+        """int32 words of the scheduler state: arrival, 8 mask words, counters."""
+        return 64 + (num_sms + 31) // 32 * 32
+
+    def build_fp4_dyn_state(num_sms: int,
+                            device,
+                            extra_words: int = 0) -> torch.Tensor:
+        """Zeroed scheduler state buffer for cute_dsl_fp4_paged_mqa_logits
+        (dyn_state=). The kernel restores it to zero at the end of every
+        launch, so one buffer serves all launches on one stream; launches on
+        different streams must not share a buffer (the caller owns it per
+        stream)."""
+        return torch.zeros(fp4_dyn_state_words(num_sms) + extra_words,
+                           dtype=torch.int32,
+                           device=device)
+
+    def _fp4_dyn_state_cached(num_sms: int, device) -> torch.Tensor:
+        key = (str(device), num_sms,
+               torch.cuda.current_stream(device).cuda_stream)
+        t = _fp4_dyn_state_cache.get(key)
+        if t is None:
+            t = build_fp4_dyn_state(num_sms, device)
+            _fp4_dyn_state_cache[key] = t
+        return t
+
     class CuteDSLFP4PagedMQALogitsRunner:
         """Runner for CuTe DSL FP4 Paged MQA Logits kernel (Blackwell SM100).
 
@@ -10800,13 +10837,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      emit_cand=False,
                      cand_cap=5120,
                      emit_cand_bucketed=False,
-                     accept_cap=8192):
+                     accept_cap=8192,
+                     dynamic_sched=False,
+                     has_dyn_state=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap)
+                   emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state)
             if key in cls.kernel_cache:
                 return
 
@@ -10966,7 +11005,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_cap=cand_cap,
                 emit_cand_bucketed=emit_cand_bucketed,
                 accept_cap=accept_cap,
+                dynamic_sched=dynamic_sched,
+                ring_depth=_FP4_DYN_RING,
+                b_cap=_FP4_DYN_B_CAP,
             )
+            dyn_state_fake = None
+            if has_dyn_state:
+                dyn_state_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), ),
+                    stride_order=(0, ),
+                    assumed_align=16)
 
             compiled = cute.compile(
                 kernel,
@@ -10992,6 +11040,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_ctl=cand_ctl_fake,
                 cand_idx_t=cand_idx_fake,
                 cand_cur=cand_cur_fake,
+                dyn_state=dyn_state_fake,
+                dyn_chunk=cutlass.Int32(16),
+                dyn_nmin=cutlass.Int32(64),
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
@@ -11027,6 +11078,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             accept_cap: int = 8192,
             cand_idx_out: Optional[torch.Tensor] = None,
             cand_cur_out: Optional[torch.Tensor] = None,
+            dyn_state: Optional[torch.Tensor] = None,
+            dyn_chunk: Optional[int] = None,
+            dyn_nmin: Optional[int] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -11255,12 +11309,41 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_idx_out = None
                 cand_cur_out = None
 
+            # Dynamic scheduling: the kernel self-resets the state words, so a
+            # per-(device, stream) buffer serves every launch; B > 1024
+            # (prefix-table cap) and candidate emission keep the static
+            # schedule.
+            dynamic_sched = False
+            if dyn_nmin is None:
+                dyn_nmin = _FP4_DYN_NMIN
+            # upper bound on tile pairs; below the regime floor the kernel
+            # would only walk its static range, so use the static build
+            pairs_ub = B * ((max_context_len + 255) // 256)
+            if (_FP4_DYN_MODE != "0" and B <= _FP4_DYN_B_CAP
+                    and not (emit_cand or emit_cand_bucketed)
+                    and pairs_ub >= dyn_nmin * num_sms):
+                if dyn_state is None and _FP4_DYN_MODE == "1":
+                    dyn_state = _fp4_dyn_state_cached(num_sms, q.device)
+                dynamic_sched = dyn_state is not None
+            if dyn_state is not None:
+                assert (
+                    dyn_state.dtype == torch.int32 and dyn_state.is_cuda
+                    and dyn_state.is_contiguous()
+                    and dyn_state.numel() >= fp4_dyn_state_words(num_sms)), (
+                        "dyn_state must be int32 [>= 64 + roundup32(num_sms)]")
+            has_dyn_state = dyn_state is not None
+            if dyn_chunk is None:
+                dyn_chunk = _FP4_DYN_CHUNK
+            assert 1 <= dyn_chunk <= _FP4_DYN_RING // 2 - 4, (
+                f"dyn_chunk={dyn_chunk} must be in [1, {_FP4_DYN_RING // 2 - 4}]"
+            )
+
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap)
+                   emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -11280,7 +11363,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     emit_cand=emit_cand,
                     cand_cap=cand_cap,
                     emit_cand_bucketed=emit_cand_bucketed,
-                    accept_cap=accept_cap)
+                    accept_cap=accept_cap,
+                    dynamic_sched=dynamic_sched,
+                    has_dyn_state=has_dyn_state)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -11289,11 +11374,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          context_lens, schedule_meta, num_phys_blocks, B,
                          block_max_out, hit_stats_out, hit_bitmap, seed_thr,
                          seed_counts_out, cand_out, cand_ctl_out, cand_idx_out,
-                         cand_cur_out)
+                         cand_cur_out, dyn_state, dyn_chunk, dyn_nmin)
                 return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                      context_lens, schedule_meta, num_phys_blocks, B, None,
-                     None, None, None, None, None, None, None, None)
+                     None, None, None, None, None, None, None, None, dyn_state,
+                     dyn_chunk, dyn_nmin)
             return logits
 
     # NOTE: the optional emission tensors ARE written by the kernel but must
@@ -11321,6 +11407,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cand_ctl_out: Optional[torch.Tensor] = None,
         cand_cur_out: Optional[torch.Tensor] = None,
         accept_cap: int = 8192,
+        dyn_state: Optional[torch.Tensor] = None,
+        dyn_chunk: Optional[int] = None,
+        dyn_nmin: Optional[int] = None,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -11369,7 +11458,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_out=cand_out,
             cand_idx_out=cand_idx_out,
             cand_ctl_out=cand_ctl_out,
-            cand_cur_out=cand_cur_out)
+            cand_cur_out=cand_cur_out,
+            dyn_state=dyn_state,
+            dyn_chunk=dyn_chunk,
+            dyn_nmin=dyn_nmin)
         # with emission on the runner returns a tuple; the op returns
         # logits only (emission buffers are caller-owned)
         return ret[0] if isinstance(ret, tuple) else ret
@@ -11395,6 +11487,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cand_ctl_out: Optional[torch.Tensor] = None,
         cand_cur_out: Optional[torch.Tensor] = None,
         accept_cap: int = 8192,
+        dyn_state: Optional[torch.Tensor] = None,
+        dyn_chunk: Optional[int] = None,
+        dyn_nmin: Optional[int] = None,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
