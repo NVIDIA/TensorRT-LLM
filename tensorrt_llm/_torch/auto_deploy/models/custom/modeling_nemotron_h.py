@@ -757,7 +757,7 @@ class NemotronHModel(NemotronHPreTrainedModel):
 class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "backbone.embeddings.weight"}
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.backbone = NemotronHModel(config)
         self.vocab_size = config.vocab_size
