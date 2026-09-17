@@ -54,13 +54,17 @@ def _run_nccl_nvfp4_auxiliary_device_case(auxiliary: str, other_device: str,
         "residual": torch.full_like(x, 0.125),
         "norm_weight": torch.ones(128, dtype=dtype, device=x.device),
         "scale": torch.ones(1, dtype=torch.float32, device=x.device),
+        "bias": torch.zeros(128, dtype=dtype, device=x.device),
     }
     inputs[auxiliary] = inputs[auxiliary].to(other_device)
+    # Only the tensor under test is wired into its own argument position, so the
+    # rejection has to come from that tensor's device check.
+    bias = inputs["bias"] if auxiliary == "bias" else None
     with pytest.raises(RuntimeError,
                        match=f"{auxiliary} must be on the input device"):
         torch.ops.tensorrt_llm.allreduce(x, inputs["residual"],
                                          inputs["norm_weight"], inputs["scale"],
-                                         None, None, [tensorrt_llm.mpi_rank()],
+                                         bias, None, [tensorrt_llm.mpi_rank()],
                                          AllReduceStrategy.NCCL, fusion_op,
                                          1e-6, False)
     # A device error must be reported before launching either local tail and
@@ -71,7 +75,8 @@ def _run_nccl_nvfp4_auxiliary_device_case(auxiliary: str, other_device: str,
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [1], indirect=True)
-@pytest.mark.parametrize("auxiliary", ["residual", "norm_weight", "scale"])
+@pytest.mark.parametrize("auxiliary",
+                         ["residual", "norm_weight", "scale", "bias"])
 @pytest.mark.parametrize("other_device", ["cpu", "cuda:1"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("fusion_op", [

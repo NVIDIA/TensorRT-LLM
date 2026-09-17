@@ -856,11 +856,13 @@ private:
     {
         // If we reach here, it means the extra fallback operations are required.
         // All patterns are broken into ALlReduce + residual_rms_norm + following operations (quantization, etc.)
-        // Both local tails consume raw device pointers, so rejecting a device
-        // mismatch is required even when the fused NVFP4 path is not selected.
+        // Both local tails consume raw device pointers, and bias is handed to the
+        // residualRmsNorm kernel the same way, so rejecting a device mismatch is
+        // required even when the fused NVFP4 path is not selected.
         TORCH_CHECK(!residual || residual->device() == input.device(), "residual must be on the input device");
         TORCH_CHECK(!norm_weight || norm_weight->device() == input.device(), "norm_weight must be on the input device");
         TORCH_CHECK(!scale || scale->device() == input.device(), "scale must be on the input device");
+        TORCH_CHECK(!bias || bias->device() == input.device(), "bias must be on the input device");
         auto const size = input.numel();
         auto const hidden_size = input.size(-1);
         auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
