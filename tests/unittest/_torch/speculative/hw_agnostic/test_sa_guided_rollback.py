@@ -58,7 +58,7 @@ VOCAB_PADDED = 64
 K = 3  # draft tokens per step
 
 
-def _make_decoder() -> CapturableGuidedDecoder:
+def _make_decoder(max_num_sequences: int = 2) -> CapturableGuidedDecoder:
     pytest.importorskip("xgrammar")
     config = GuidedDecodingConfig(
         backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
@@ -66,7 +66,10 @@ def _make_decoder() -> CapturableGuidedDecoder:
         stop_token_ids=[EOS],
     )
     return CapturableGuidedDecoder(
-        config, max_num_sequences=2, vocab_size_padded=VOCAB_PADDED, max_num_draft_tokens=K
+        config,
+        max_num_sequences=max_num_sequences,
+        vocab_size_padded=VOCAB_PADDED,
+        max_num_draft_tokens=K,
     )
 
 
@@ -191,6 +194,97 @@ def test_without_the_rollback_the_next_verification_rejects_the_golden_token():
     logits = _target_step(decoder, _generation_request(), [A, QUOTE, COLON, ONE])
     assert decoder.num_advanced_tokens[0] == 0
     assert torch.all(logits == 0.0)
+
+
+def _init_matcher_at_slot(decoder: CapturableGuidedDecoder, seq_slot: int) -> None:
+    """Context step at ``seq_slot`` so its grammar matcher exists (no advance)."""
+    _target_step(
+        decoder,
+        _json_request(
+            request_id=seq_slot,
+            seq_slot=seq_slot,
+            is_context_init_state=True,
+            is_last_context_chunk=True,
+        ),
+    )
+    assert decoder.grammar_matchers[seq_slot] is not None
+
+
+def _guided_gen_request(seq_slot: int) -> GuidedRequest:
+    return _json_request(
+        request_id=seq_slot,
+        seq_slot=seq_slot,
+        is_generation_in_progress_state=True,
+        prev_seq_slot=seq_slot,
+    )
+
+
+def _batched_generation_step(decoder, requests, new_tokens_by_slot) -> None:
+    """One target verification over a hand-built multi-request batch.
+
+    Like ``_target_step`` but for a list of generation requests, each with its
+    own new-token column keyed by ``seq_slot``. Advances every guided matcher.
+    """
+    reqs = GuidedRequests(
+        requests, num_contexts=0, num_generations=len(requests), max_num_draft_tokens=K
+    )
+    decoder.requests = reqs
+    for seq_slot, new_tokens in new_tokens_by_slot.items():
+        decoder.new_tokens[:, seq_slot].copy_(torch.tensor(new_tokens, dtype=torch.int32))
+    decoder.queue.put((reqs, True))
+    logits = torch.zeros(reqs.num_bitmask_tokens, VOCAB_PADDED, device="cuda")
+    decoder.token_event.record()
+    decoder.execute(logits)
+    torch.cuda.synchronize()
+
+
+def test_rollback_indexes_counts_by_batch_position_not_seq_slot() -> None:
+    """Batched rollback: each row's count is applied to that row, not its slot.
+
+    ``fetch_accepted_batch`` reads ``num_accepted_tokens_list[i]`` by batch
+    position and uses ``seq_slot`` only for matcher state. With batch size 1
+    the two indices coincide, so a position/slot mixup is invisible. Here the
+    batch order is deliberately not the slot order, one row is unguided, and
+    the counts differ, so a rollback that indexed by ``seq_slot`` would assign
+    the wrong count.
+    """
+    decoder = _make_decoder(max_num_sequences=3)
+    # Two guided rows on slots 0 and 1, plus an unguided row on slot 2.
+    _init_matcher_at_slot(decoder, 0)
+    _init_matcher_at_slot(decoder, 1)
+
+    drafts = [LBRACE, QUOTE, A, QUOTE]  # golden `{` then three grammatical drafts
+    # Batch order [slot 1, unguided, slot 0] -- position i never equals seq_slot.
+    unguided = GuidedRequest(
+        request_id=9,
+        seq_slot=2,
+        is_generation_in_progress_state=True,
+        prev_seq_slot=2,
+        draft_tokens=[],
+    )
+    batch = [_guided_gen_request(1), unguided, _guided_gen_request(0)]
+    _batched_generation_step(decoder, batch, {0: drafts, 1: drafts})
+    assert decoder.num_advanced_tokens[0] == 1 + K
+    assert decoder.num_advanced_tokens[1] == 1 + K
+
+    # Distinct counts per batch position: slot 1 keeps 2 tokens, slot 0 keeps 1.
+    decoder.rollback_rejected_batch(torch.tensor([2, 3, 1], dtype=torch.int32, device="cuda"))
+    torch.cuda.synchronize()
+
+    rolled = decoder.requests_hostfunc.requests
+    # Position 0 (slot 1) took count 2, position 2 (slot 0) took count 1. If the
+    # counts were indexed by seq_slot instead, position 0 would read count[1]=3.
+    assert rolled[0].num_accepted_draft_tokens == min(2, 1 + K) - 1  # == 1
+    assert rolled[2].num_accepted_draft_tokens == min(1, 1 + K) - 1  # == 0
+    # The unguided row is skipped, so its count (3) is never applied.
+    assert rolled[1].num_accepted_draft_tokens is None
+
+    # Matcher state followed the slot, not the batch position: continue slot 1
+    # from its 2-token prefix `{"` and confirm the grammar masks EOS.
+    continuation = [LBRACE, QUOTE, A, QUOTE, COLON, ONE, ONE, ONE]
+    logits = _target_step(decoder, _guided_gen_request(1), continuation[2:6])
+    assert decoder.num_advanced_tokens[1] == 1 + K
+    assert logits[0, EOS] == float("-inf")
 
 
 class _RecordingGuidedDecoder:
