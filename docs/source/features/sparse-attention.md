@@ -87,7 +87,7 @@ the selector, metadata, cache management, and backend integration.
 
 | Parameter | Token-sparse | Block-sparse |
 |---|---|---|
-| GPU architecture | SM100 and SM103 | SM100, SM103, and SM107 |
+| GPU architecture | SM100 and SM103 | SM100 and SM103 |
 | Compute phase | Packed prefill and generation, including linear draft tokens | Packed prefill and generation, including linear multi-query and mixed batches |
 | Attention type | MQA and GQA | MQA and GQA |
 | Head counts | Q heads must be divisible by KV heads; no other discrete limit | Q heads must be divisible by KV heads; no other discrete limit |
