@@ -714,6 +714,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     kv_cache = Mock(num_committed_tokens=2)
     manager = object.__new__(KVCacheManagerV2)
     manager.conversation_manager = None
+    manager.kv_connector_manager = None
     manager.enable_block_reuse = True
     manager._has_cp_helix = False
     manager.kv_cache_map = {} if fresh_cache else {request.py_request_id: kv_cache}
@@ -1225,6 +1226,7 @@ def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     manager._can_publish_block_reuse = True
     manager.block_reuse_policy = policy
     manager.conversation_manager = None
+    manager.kv_connector_manager = None
     manager.kv_cache_map = {}
     return manager
 
@@ -1336,6 +1338,7 @@ class _ContextRequest:
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
     context_current_position: int = 0
+    py_connector_served_position: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
     multimodal_positions: None = None

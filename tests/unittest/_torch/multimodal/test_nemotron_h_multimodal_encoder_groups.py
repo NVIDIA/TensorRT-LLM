@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Encoder-group tests for `NemotronH_Nano_VL_V2` with stubbed vision /
+"""Encoder-group tests for `NemotronHMultimodalModel` with stubbed vision /
 sound encoders.
 
 Runs in pre-merge CI — no weights required. Exercises the three
@@ -14,7 +14,7 @@ the class:
 * `_encode_image_group` / `_encode_video_group` wrap each incoming
   param in a single-modality virtual param (`modality_type` legacy tag
   set), which is the workaround for
-  `NanoV2VLVisionEncoder.forward`'s exactly-one-of-image/video
+  `NemotronHVisionEncoder.forward`'s exactly-one-of-image/video
   assertion.
 * `_encode_video_group` stashes per-video EVS retained-token counts on
   the caller's `multimodal_data` for the downstream `merge_evs_mm_embeds`.
@@ -27,7 +27,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from tensorrt_llm._torch.models.modeling_nemotron_nano import NemotronH_Nano_VL_V2
+from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import NemotronHMultimodalModel
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
@@ -55,14 +55,14 @@ def _marker_tensor(marker: int, n: int, dim: int = 4) -> torch.Tensor:
     return t
 
 
-def _model_with_stubs() -> NemotronH_Nano_VL_V2:
+def _model_with_stubs() -> NemotronHMultimodalModel:
     """Bypass `__init__` and inject stubbed encoders.
 
     Stubbed `vision_encoder` reads `marker` + `rows` off the virtual param's
     bucket and returns marker tensors. Stubbed `_encode_audio` does the same
     for audio inputs.
     """
-    m = NemotronH_Nano_VL_V2.__new__(NemotronH_Nano_VL_V2)
+    m = NemotronHMultimodalModel.__new__(NemotronHMultimodalModel)
 
     def _vision(
         virtuals: List[MultimodalParams],
