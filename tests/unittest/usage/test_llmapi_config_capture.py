@@ -585,44 +585,10 @@ def test_collect_llm_api_config_propagates_unexpected_errors(monkeypatch):
         collect_llm_api_config_payloads(_ExampleConfig())
 
 
-def test_field_wrapper_preserves_callable_json_schema_extra_with_metadata():
-    """Preserve callable json_schema_extra when adding status/telemetry metadata.
-
-    The schema callable still runs for Pydantic JSON schema generation, while
-    the collector can read the attached TRT-LLM metadata without executing it.
-    """
-
-    def mark_schema(schema: dict[str, object]) -> dict[str, object]:
-        schema["original"] = True
-        return {"returned": True}
-
-    field = Field(
-        default=1,
-        status="beta",
-        telemetry=True,
-        json_schema_extra=mark_schema,
-    )
-    schema: dict[str, object] = {}
-    assert callable(field.json_schema_extra)
-    field.json_schema_extra(schema)
-
-    assert schema == {
-        "original": True,
-        "returned": True,
-        "status": "beta",
-        "telemetry": {},
-    }
-
-    class _CallableExtraConfig(StrictBaseModel):
-        value: int = Field(
-            default=1,
-            telemetry=True,
-            json_schema_extra=mark_schema,
-        )
-
-    config, meta = _loads_payloads(_CallableExtraConfig())
-    assert config == {"value": 1}
-    assert meta["capture_succeeded"] is True
+@pytest.mark.parametrize("metadata", ({"status": "beta"}, {"telemetry": True}))
+def test_field_wrapper_rejects_callable_json_schema_extra_with_metadata(metadata):
+    with pytest.raises(TypeError, match="json_schema_extra must be a dict"):
+        Field(default=1, json_schema_extra=lambda schema: None, **metadata)
 
 
 def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
