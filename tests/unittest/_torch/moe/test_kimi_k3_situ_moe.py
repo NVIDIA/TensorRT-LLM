@@ -1753,6 +1753,69 @@ def _quantize_expert_to_nvfp4(w1, w2, w3, input_scale):
     return out
 
 
+# Derived from the NVFP4 error budget, NOT fitted to a measurement.
+#
+# One NVFP4 round trip of Gaussian data -- the e2m1 grid {0,.5,1,1.5,2,3,4,6}
+# under a per-16 e4m3 block scale -- costs eps = 0.0950 relative L2. Both the
+# model and the kernel agree on that: the checkpoint weights here round-trip at
+# 0.09515 / 0.09510 / 0.09512.
+#
+# Quantization error does not amplify through a dot product of random data, so
+# N independent stages compose as sqrt(N)*eps. With both references built from
+# the dequantized checkpoint the weight stages cancel and three remain: the
+# activation reaching the gate, the activation reaching the up projection --
+# independent because they pass through different weight matrices, and SiTU
+# multiplies them -- and the FC1->FC2 intermediate. So the floor is
+#
+#     sqrt(3) * 0.0950 = 0.1645
+#
+# Measured 2026-09-17 over 6 seeds x {CUTLASS, TRTLLM, CUTEDSL}: 0.1613 to
+# 0.1656, i.e. 0.980 to 1.006 of the prediction, with the norm ratio in
+# 0.9992..1.0035. The budget is confirmed, not calibrated.
+#
+# 0.20 is that floor plus ~21% of engineering headroom against a +-2% spread.
+# It catches a SiTU scaled wrong by >=11.4%, since a scale error s shows up as
+# sqrt(s**2 + 0.1645**2). It also sits under the plain-SwiGLU distance
+# (>=0.2050 measured), though catching that is the ordering assertion's job.
+#
+# IF THIS FIRES, SUSPECT AN EXTRA QUANTIZATION STAGE BEFORE SUSPECTING THE
+# BOUND: sqrt(4)*eps is 0.190 and sqrt(5)*eps is 0.212. The leading digit here
+# is engineering judgement; the exponent is arithmetic. Do not move it.
+_SITU_NVFP4_REL_L2_MAX = 0.20
+
+
+def _dequantize_expert_bank(bank):
+    """The expert weights the kernel actually sees, back in float32.
+
+    A golden built from the ORIGINAL bf16 weights differs from the kernel by
+    the whole 4-bit quantization error -- measured at 54% relative L2 on this
+    configuration, which is an order of magnitude larger than any activation
+    bug it is meant to expose. That leaves only an ordering comparison, and an
+    ordering comparison cannot see a mis-scaled SiTU at all. Reading the
+    checkpoint tensors back instead puts the same weights on both sides, so
+    what remains is the kernel's own arithmetic and an absolute bound becomes
+    meaningful.
+
+    This mirrors ``e2m1_and_ufp8_scale_batches`` in
+    ``tests/unittest/_torch/thop/serial/test_moe.py``; the layout arguments
+    follow ``_quantize_expert_to_nvfp4``, which stores UE4M3 block scales
+    (``sfUseUE8M0=False`` -> ``sfType=1``) already de-swizzled by
+    ``block_scale_interleave_reverse`` (-> ``isSfSwizzledLayout=False``).
+    """
+
+    def deq(name):
+        return torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+            bank[f"{name}.weight"].cpu(),
+            bank[f"{name}.weight_scale"].cpu().reshape(-1),
+            bank[f"{name}.weight_scale_2"].cpu().float().reshape(1),
+            _NVFP4_GROUP_SIZE,
+            1,
+            False,
+        ).cuda()
+
+    return deq("w1"), deq("w2"), deq("w3")
+
+
 @nvfp4_moe_supported
 @pytest.mark.parametrize(
     "moe_backend,input_scale",
@@ -1917,7 +1980,19 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
 
     torch.manual_seed(91)
     x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
-    act_scale = float(x.abs().max().float() / (448 * 6))
+    # input_scale=1.0 because that is what inference runs: every one of the
+    # 247296 *.input_scale entries in nvidia/Kimi-K3-NVFP4, across 92 shards,
+    # is exactly 1.0 (scanned 2026-09-17).
+    #
+    # This used to derive amax/(448*6), a value no checkpoint produces. There
+    # the kernel lands systematically 36% short of the golden -- measured norms
+    # 263.02 against 412.49 -- which is the open activation-scale finding
+    # test_nvfp4_experts_match_situ_reference carries as a strict xfail. At
+    # input_scale=1.0 the norms agree to 1.004. So the activation this test
+    # used was both unrepresentative of inference and contaminated by an
+    # unrelated defect, and the cosine assertion could not see the 36% at all,
+    # cosine being scale-invariant.
+    act_scale = 1.0
     w1 = [
         torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
         for _ in range(num_experts)
@@ -1938,10 +2013,17 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     router_logits = gate.compute_logits(x)
     actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
 
+    # Both references read the weights BACK OUT of the checkpoint tensors, so
+    # they see the same 4-bit values the kernel was loaded with. Against the
+    # original bf16 weights the quantization error alone is ~54% relative L2,
+    # which swamps every bug this test is for.
+    dq = [_dequantize_expert_bank(b) for b in bank]
+    w1q, w2q, w3q = ([d[i] for d in dq] for i in range(3))
+
     situ = _situ_reference_moe(
-        x, router_logits, gate.routing_method, w1, w2, w3, beta=4.0, linear_beta=25.0
+        x, router_logits, gate.routing_method, w1q, w2q, w3q, beta=4.0, linear_beta=25.0
     )
-    swiglu = _plain_swiglu_reference_moe(x, router_logits, gate.routing_method, w1, w2, w3)
+    swiglu = _plain_swiglu_reference_moe(x, router_logits, gate.routing_method, w1q, w2q, w3q)
 
     def score(ref):
         cos = torch.nn.functional.cosine_similarity(actual.flatten(), ref.flatten(), dim=0)
@@ -1950,18 +2032,37 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
 
     situ_cos, situ_l2 = score(situ)
     swiglu_cos, swiglu_l2 = score(swiglu)
-    # Printed, not yet asserted on: the bounds below are set from measured
-    # spread rather than guessed, so the numbers have to be visible first.
+    # rel_l2**2 == r**2 - 2*r*cos + 1 with r the norm ratio, so printing r and
+    # cosine splits the asserted number into a pure-magnitude and a
+    # pure-direction half: r off with cosine intact is a scaling fault, the
+    # reverse is the wrong activation.
+    norm_ratio = (torch.linalg.vector_norm(actual) / torch.linalg.vector_norm(situ)).item()
     print(
         f"NVFP4[{moe_backend}] kernel vs SiTU ref:         "
-        f"cosine={situ_cos:.6f} rel_l2={situ_l2:.6f}\n"
+        f"cosine={situ_cos:.6f} rel_l2={situ_l2:.6f} |k|/|ref|={norm_ratio:.6f}\n"
         f"NVFP4[{moe_backend}] kernel vs plain SwiGLU ref: "
         f"cosine={swiglu_cos:.6f} rel_l2={swiglu_l2:.6f}"
     )
+    # Which reference it is nearer: the diagnosis. Says what went wrong, not
+    # whether something did -- and being scale-free it accepts a SiTU output
+    # scaled by any constant, so it cannot be the only assertion.
     assert situ_cos > swiglu_cos, (
         f"the NVFP4 {moe_backend} kernel matches a plain SwiGLU reference better "
         f"than the SiTU one (situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the "
         f"quantized path is not applying SiTU"
+    )
+    # The gate. rel_l2 rather than cosine because cosine is scale-invariant:
+    # a correct SiTU multiplied by two still scores 1.0, so an epilogue that
+    # applies a scale twice passes the ordering check above untouched.
+    assert situ_l2 < _SITU_NVFP4_REL_L2_MAX, (
+        f"the NVFP4 {moe_backend} kernel is {situ_l2:.6f} relative L2 from the "
+        f"SiTU reference, over the {_SITU_NVFP4_REL_L2_MAX} bound whose floor "
+        f"is sqrt(3)*0.0950 = 0.1645. Both references use the dequantized "
+        f"checkpoint weights, so 4-bit weight error is already cancelled. "
+        f"|k|/|ref|={norm_ratio:.6f} and cosine={situ_cos:.6f} split this: a "
+        f"norm ratio away from 1.0 with cosine intact is a scaling fault, "
+        f"which cosine alone cannot see. If both look right, the residual has "
+        f"gained a quantization stage -- sqrt(4)*0.0950 is 0.190"
     )
 
 
