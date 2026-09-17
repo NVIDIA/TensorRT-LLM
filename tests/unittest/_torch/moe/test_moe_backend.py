@@ -1441,6 +1441,8 @@ def test_cutlass_w4a16_unaligned_cols_raise_diagnostic(num_cols: int) -> None:
     assert "w3_w1_weight" in message
     assert str(num_cols) in message
     assert "tp_size=2" in message
+
+
 @pytest.mark.gpu
 def test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants(
     monkeypatch: pytest.MonkeyPatch,
