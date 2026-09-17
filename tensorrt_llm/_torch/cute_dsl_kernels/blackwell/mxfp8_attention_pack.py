@@ -164,11 +164,11 @@ def v_kernel(x: cute.Tensor, out: cute.Tensor, sf: cute.Tensor):
         for i in cutlass.range_constexpr(8):
             global_values[i] = cutlass.BFloat16(0)
         if s < x.shape[2]:
-            packet = cute.zipped_divide(x[b, h, s, None], (8,))[(None,), (cutlass.Int64(d0) // 8,)]
-            cute.copy(load_atom, packet, global_values)
+            global_load_packet = cute.zipped_divide(x[b, h, s, None], (8,))[(None,), (cutlass.Int64(d0) // 8,)]
+            cute.copy(load_atom, global_load_packet, global_values)
         address = 2 * (sl * 64 + ((d0 // 2) ^ ((sl // 8) * 8))) + d0 % 2
-        packet = cute.zipped_divide(src, (8,))[(None,), (address // 8,)]
-        cute.copy(load_atom, global_values, packet)
+        shared_store_packet = cute.zipped_divide(src, (8,))[(None,), (address // 8,)]
+        cute.copy(load_atom, global_values, shared_store_packet)
     cute.arch.sync_threads()
     values = cute.make_rmem_tensor((8,), cutlass.BFloat16)
     pairs = cute.recast_tensor(values, cutlass.Uint32)
@@ -197,12 +197,12 @@ def v_kernel(x: cute.Tensor, out: cute.Tensor, sf: cute.Tensor):
         d0 = (tid % 16) * 8
         if s < x.shape[2]:
             address = 4 * (sl * 32 + ((d0 // 4) ^ ((sl // 8) * 8))) + d0 % 4
-            packet = cute.zipped_divide(dst, (8,))[(None,), (address // 8,)]
-            cute.copy(store_atom, packet, global_octets)
-            packet = cute.zipped_divide(out[b, h, s, None], (8,))[
+            shared_load_packet = cute.zipped_divide(dst, (8,))[(None,), (address // 8,)]
+            cute.copy(store_atom, shared_load_packet, global_octets)
+            global_store_packet = cute.zipped_divide(out[b, h, s, None], (8,))[
                 (None,), (cutlass.Int64(d0) // 8,)
             ]
-            cute.copy(store_atom, global_octets, packet)
+            cute.copy(store_atom, global_octets, global_store_packet)
 
 
 @cute.jit
