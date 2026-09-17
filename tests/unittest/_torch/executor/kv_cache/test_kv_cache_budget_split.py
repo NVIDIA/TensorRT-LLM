@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig, MTPDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1070,7 +1070,13 @@ class TestExternalDrafterKvDtype:
             def get_num_attention_layers(self):
                 return TestExternalDrafterKvDtype.DRAFT_LAYERS
 
-        target_model_config = SimpleNamespace(is_encoder_decoder=False)
+        # pretrained_config is read on the target (non-draft) cost path by
+        # _derive_v2_layer_type_attention_windows. Empty on purpose: with no
+        # layer_types it returns None, so the single-window default stands and
+        # this test keeps measuring only the draft dtype.
+        target_model_config = SimpleNamespace(
+            is_encoder_decoder=False, pretrained_config=SimpleNamespace()
+        )
         draft_model_config = DraftModelConfig()
         seen_draft_model_configs = []
 
@@ -1094,14 +1100,15 @@ class TestExternalDrafterKvDtype:
         c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
         c._mapping.is_last_pp_rank.return_value = True
-        # The real enum, not Mock(): a bare Mock answers True to EVERY
-        # predicate, so use_one_engine() and is_mtp_vanilla() both fire and the
-        # code walks branches an external drafter never takes. DSPARK satisfies
-        # is_external_drafter() via is_parallel_draft() and nothing else.
-        c._speculative_config = SimpleNamespace(
-            spec_dec_mode=SpeculativeDecodingMode.DSPARK,
-            max_draft_len=4,
-        )
+        # The real config, not Mock() and not a SimpleNamespace: a bare Mock
+        # answers True to EVERY predicate, so use_one_engine() and
+        # is_mtp_vanilla() both fire and the code walks branches an external
+        # drafter never takes; a SimpleNamespace instead needs a new attribute
+        # stubbed every time the cost path reads one more field of the spec
+        # config (max_total_draft_tokens, tokens_per_gen_step, ...). DSparkDecodingConfig
+        # derives all of them and satisfies is_external_drafter() via
+        # is_parallel_draft() and nothing else.
+        c._speculative_config = DSparkDecodingConfig(max_draft_len=4)
         c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
         c._draft_model_engine = None
         c._draft_config = draft_model_config
@@ -1163,8 +1170,12 @@ class TestExternalDrafterKvDtype:
 
         inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
         c, draft_model_config, _ = self._creator(mocker, inherited)
-        # A real non-external mode, not a patched predicate: MTP_EAGLE shares the
-        # target's KV layout, which is exactly the case this asserts is untouched.
-        c._speculative_config.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
+        # A real non-external config, not a patched predicate:
+        # MTP_EAGLE_ONE_MODEL shares the target's KV layout, exactly the case
+        # this asserts is untouched. Swapped whole rather than by assigning
+        # spec_dec_mode, which MTPDecodingConfig derives from
+        # num_nextn_predict_layers and does not accept being set.
+        c._speculative_config = MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=4)
+        assert c._speculative_config.spec_dec_mode == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
 
         assert c._get_draft_kv_model_config() is draft_model_config
