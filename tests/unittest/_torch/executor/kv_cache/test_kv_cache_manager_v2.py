@@ -873,8 +873,10 @@ def test_full_attention_warmup_respects_allocated_budget(
             manager.free_resources(request)
 
 
+@pytest.mark.parametrize("max_seq_len", [None, 1], ids=["sufficient", "insufficient"])
 def test_full_attention_budget_supports_cuda_graph_warmup(
     _budget_limited_full_attention_manager: KVCacheManagerV2,
+    max_seq_len: int | None,
 ) -> None:
     manager = _budget_limited_full_attention_manager
     # Exercise the real graph request builder against the allocated pool budget.
@@ -893,9 +895,32 @@ def test_full_attention_budget_supports_cuda_graph_warmup(
     )
     resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
 
-    batch = PyTorchModelEngine._create_cuda_graph_warmup_request(
-        engine, resources, batch_size=manager.max_batch_size, draft_len=manager.max_draft_len
-    )
+    with (
+        patch.object(
+            manager, "get_num_available_tokens", wraps=manager.get_num_available_tokens
+        ) as get_available_tokens,
+        patch.object(manager, "free_resources", wraps=manager.free_resources) as free_resources,
+    ):
+        batch = PyTorchModelEngine._create_cuda_graph_warmup_request(
+            engine,
+            resources,
+            batch_size=manager.max_batch_size,
+            draft_len=manager.max_draft_len,
+            max_seq_len=max_seq_len,
+        )
+        if max_seq_len == 1:
+            # The one-token budget cannot hold both the prompt and V2's extra
+            # generation token. Short requests must be allocated, then freed.
+            get_available_tokens.assert_called_once_with(
+                token_num_upper_bound=1,
+                batch_size=manager.max_batch_size,
+                max_num_draft_tokens=manager.max_draft_len,
+            )
+            assert batch is None
+            assert free_resources.call_count == manager.max_batch_size - 1
+            assert not manager.kv_cache_map
+            return
+
     assert batch is not None
     requests = list(batch.generation_requests)
     try:
