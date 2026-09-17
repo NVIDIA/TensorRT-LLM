@@ -539,6 +539,194 @@ def test_mla_context_softmax_stats_units(q_scaling):
         kv_cache_manager.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_mla_chunked_prefill_output_matches_single_shot():
+    """Chunked prefill must merge to the output the single-shot path produces.
+
+    The statistics test above checks what the kernel exports, and the dispatch
+    test checks which method gets called; neither runs the merge. A wrong
+    `merge_attention_for_mla` -- or an exported max in the wrong units, which is
+    what this PR fixes -- still passes both. So drive the real module over a
+    context whose prefix is already cached, once with chunked prefill on and
+    once off, and require the two outputs to agree: with chunked prefill off the
+    same attention is computed in a single shot over the whole cached KV, so it
+    is an independent reference for the merged result.
+
+    The rope config gives q_scaling = 1/mscale^2 = 0.771, the DeepSeek-V3 style
+    value under which the scale bug is visible at all.
+    """
+    import weakref
+
+    from tensorrt_llm._torch.attention.backends.interface import \
+        AttentionRuntimeFeatures
+    from tensorrt_llm._torch.attention.mla import MLA
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_heads = 8
+    qk_nope_head_dim, qk_rope_head_dim, v_head_dim = 128, 64, 128
+    kv_lora_rank, q_lora_rank = 512, 1536
+    hidden_size = num_heads * v_head_dim
+    cached_len, new_len = 512, 96
+    kv_tokens_per_block = 32
+    # 512 cached tokens in 64-token chunks: eight chunks, so the merge runs
+    # seven times rather than degenerating into a copy.
+    chunk_size = 64
+    expected_chunks = 8
+
+    AttentionCls = get_attention_backend("TRTLLM")
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    rope_config = RopeConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
+        rope_scaling={
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 4.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn",
+        },
+        max_position_embeddings=8192,
+        rope_theta=10000.0,
+        qk_rope_head_dim=qk_rope_head_dim,
+        model_type="deepseek_v3",
+    )
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.yarn,
+        rope=RopeParams.from_config(rope_config),
+        is_neox=False,
+    )
+
+    extra_attrs = {}
+    model_config = ModelConfig(mapping=mapping)
+    model_config.extra_attrs = extra_attrs
+
+    torch.manual_seed(1234)
+    mla = MLA(
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=v_head_dim,
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        predicted_tokens_per_seq=1,
+        max_position_embeddings=8192,
+        bias=False,
+        pos_embd_params=pos_embd_params,
+        layer_idx=0,
+        dtype=dtype,
+        config=model_config,
+    ).cuda()
+    # TRT-LLM linear layers allocate their weights empty and expect them to be
+    # loaded, so fill them: small values keep the bf16 activations in range.
+    with torch.no_grad():
+        for name, param in mla.named_parameters():
+            if "norm" in name:
+                param.fill_(1.0)
+            else:
+                param.uniform_(-0.05, 0.05)
+
+    # The fix only matters when q_scaling != 1; fail loudly if the rope config
+    # above ever stops producing that.
+    assert mla.mha.q_scaling == pytest.approx(0.7713206, rel=1e-4)
+
+    total_len = cached_len + new_len
+    torch.manual_seed(0)
+    hidden_states = torch.empty([total_len, hidden_size], dtype=dtype,
+                                device=device).uniform_(-1, 1)
+    # Give each chunk of the prefix its own magnitude. The merge weights chunks
+    # by exp(max_i - max), so an exported max in the wrong units cancels out
+    # when every chunk peaks at the same value -- which is exactly what
+    # uniformly random content produces. Spreading the per-chunk maxima is what
+    # makes the merge, and therefore the units of the max, observable.
+    for chunk_idx, start in enumerate(range(0, cached_len, chunk_size)):
+        hidden_states[start:start + chunk_size] *= 1.0 + 0.5 * chunk_idx
+    position_ids = torch.arange(total_len, dtype=torch.int,
+                                device=device).unsqueeze(0)
+
+    def run(chunked: bool) -> torch.Tensor:
+        """Prefill the prefix, then the tail with the prefix served from cache."""
+        kv_cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=kv_lora_rank + qk_rope_head_dim,
+            tokens_per_block=kv_tokens_per_block,
+            max_seq_len=total_len,
+            max_batch_size=1,
+            mapping=mapping,
+            dtype=str_dtype_to_binding(torch_dtype_to_str(dtype)),
+        )
+        try:
+            req = LlmRequest(
+                request_id=0,
+                max_new_tokens=1,
+                input_tokens=[1] * total_len,
+                sampling_config=SamplingConfig(
+                    SamplingParams()._get_sampling_config()),
+                is_streaming=False,
+            )
+            req.paged_kv_block_ids = []
+            kv_cache_manager.impl.add_sequence_batch([(0, total_len, 1)], [req])
+
+            def metadata(num_tokens, num_cached, features):
+                md = AttentionCls.Metadata(
+                    seq_lens=torch.tensor([num_tokens], dtype=torch.int),
+                    request_ids=[0],
+                    max_num_requests=1,
+                    num_contexts=1,
+                    prompt_lens=[num_tokens],
+                    max_num_tokens=total_len,
+                    kv_cache_manager=kv_cache_manager,
+                    kv_cache_params=KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=[num_cached],
+                    ),
+                    mapping=mapping,
+                    enable_context_mla_with_cached_kv=True,
+                    runtime_features=features,
+                )
+                md.prepare()
+                extra_attrs["attention_metadata"] = weakref.ref(md)
+                return md
+
+            plain = AttentionRuntimeFeatures(chunked_prefill=False)
+            # Pass one: fill the cache with the prefix. Single shot either way.
+            md = metadata(cached_len, 0, plain)
+            out = hidden_states.new_empty(
+                [cached_len, mla.num_heads_tp * mla.v_head_dim])
+            mla.forward_impl(position_ids[:, :cached_len],
+                             hidden_states[:cached_len], md, attn_output=[out])
+
+            # Pass two: the tail, attending over the cached prefix.
+            features = AttentionRuntimeFeatures(
+                chunked_prefill=chunked,
+                chunk_size=chunk_size,
+                chunked_prefill_buffer_batch_size=1,
+            ) if chunked else plain
+            md = metadata(new_len, cached_len, features)
+            if chunked:
+                assert md.chunked_loop_num == expected_chunks, (
+                    f"expected {expected_chunks} chunks, got {md.chunked_loop_num}")
+            out = hidden_states.new_empty(
+                [new_len, mla.num_heads_tp * mla.v_head_dim])
+            mla.forward_impl(position_ids[:, cached_len:],
+                             hidden_states[cached_len:], md, attn_output=[out])
+            return out.float().clone()
+        finally:
+            kv_cache_manager.shutdown()
+
+    merged = run(chunked=True)
+    single_shot = run(chunked=False)
+    torch.testing.assert_close(merged, single_shot, rtol=4e-2, atol=4e-2)
+
+
 @pytest.mark.parametrize(
     "sm_version,expected_path",
     [
