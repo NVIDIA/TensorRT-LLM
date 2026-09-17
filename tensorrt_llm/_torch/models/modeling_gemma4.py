@@ -541,6 +541,8 @@ class Gemma4Attention(QKNormRoPEAttention):
         attn_metadata: AttentionMetadata,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         attention_mask_data: Optional[torch.Tensor] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if attention_mask_data is not None:
@@ -549,8 +551,11 @@ class Gemma4Attention(QKNormRoPEAttention):
                 (FlashInferAttentionMetadata, TrtllmAttentionMetadata),
             ), "Only FlashInfer and TRTLLM backends support custom attention masks."
             assert attention_mask == CustomAttentionMask.CUSTOM
-        # Custom-mask (multimodal) prefill uses the Triton prefill fallback,
-        # which consumes BF16 q/k/v — keep the unfused prep for those calls.
+        assert (variable_window_token_starts is None) == (variable_window_token_ends is None), (
+            "Variable-window starts and ends must be provided together."
+        )
+        # Dense custom masks use the Triton fallback, which consumes BF16
+        # q/k/v. Variable-window masks run in TRTLLM-Gen and allow fused prep.
         self._fused_prep_blocked = attention_mask_data is not None
         return super().forward(
             position_ids=position_ids,
@@ -559,6 +564,8 @@ class Gemma4Attention(QKNormRoPEAttention):
             attention_mask=attention_mask,
             attention_window_size=self.attention_window_size,
             attention_mask_data=attention_mask_data,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
             **kwargs,
         )
 
@@ -912,6 +919,8 @@ class Gemma4DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         per_layer_input: Optional[torch.Tensor] = None,
         pre_normed: Optional[torch.Tensor] = None,
         **kwargs,
@@ -944,6 +953,8 @@ class Gemma4DecoderLayer(DecoderLayer):
             if attention_mask_data is not None
             else PredefinedAttentionMask.CAUSAL,
             attention_mask_data=attention_mask_data,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
             **kwargs,
         )
         # Fused post_attention RMSNorm + residual add (one kernel instead of
@@ -1221,6 +1232,8 @@ class Gemma4TextModel(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         local_attention_mask_data: Optional[torch.Tensor] = None,
+        local_variable_window_token_starts: Optional[torch.Tensor] = None,
+        local_variable_window_token_ends: Optional[torch.Tensor] = None,
         ple_input_ids: Optional[torch.IntTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -1253,6 +1266,12 @@ class Gemma4TextModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 attention_mask_data=(
                     local_attention_mask_data if decoder_layer.is_sliding else None
+                ),
+                variable_window_token_starts=(
+                    local_variable_window_token_starts if decoder_layer.is_sliding else None
+                ),
+                variable_window_token_ends=(
+                    local_variable_window_token_ends if decoder_layer.is_sliding else None
                 ),
                 per_layer_input=per_layer_input,
                 pre_normed=pre_normed,
@@ -1300,8 +1319,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
-        The TRTLLM attention backend uses trtllm-gen for the regular attention
-        phases and a Triton context phase for bidirectional multimodal masks.
+        On Blackwell, the TRTLLM attention backend uses trtllm-gen variable
+        windows for bidirectional multimodal masks. Earlier architectures use
+        the existing Triton custom-mask context path.
         External shared-KV MTP still requires FlashInfer attention metadata.
         """
         speculative_config = getattr(llm_args, "speculative_config", None)
@@ -1445,6 +1465,85 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             token_offset = context_end
         return torch.cat(context_mask_list, dim=0).contiguous()
 
+    def get_context_variable_window(
+        self,
+        mm_token_type_ids: torch.Tensor,
+        effective_sliding_window: Optional[int] = None,
+        prefix_len: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build inclusive KV bounds for each packed context query token."""
+        extend_len = mm_token_type_ids.numel()
+        positions = torch.arange(
+            prefix_len,
+            prefix_len + extend_len,
+            device=mm_token_type_ids.device,
+            dtype=torch.int32,
+        )
+        if effective_sliding_window is None:
+            starts = torch.zeros_like(positions)
+        else:
+            starts = torch.clamp(positions - effective_sliding_window + 1, min=0)
+        ends = positions.clone()
+
+        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+        previous_types = torch.cat((mm_token_type_ids.new_full((1,), -1), mm_token_type_ids[:-1]))
+        next_types = torch.cat((mm_token_type_ids[1:], mm_token_type_ids.new_full((1,), -1)))
+        blob_starts = is_vision & (mm_token_type_ids != previous_types)
+        blob_ends = is_vision & (mm_token_type_ids != next_types)
+
+        local_positions = torch.arange(
+            extend_len, device=mm_token_type_ids.device, dtype=torch.int32
+        )
+        start_candidates = torch.where(blob_starts, local_positions, -1)
+        vision_starts = torch.cummax(start_candidates, dim=0).values + prefix_len
+        end_candidates = torch.where(blob_ends, local_positions, extend_len)
+        vision_ends = (
+            torch.flip(
+                torch.cummin(torch.flip(end_candidates, dims=(0,)), dim=0).values,
+                dims=(0,),
+            )
+            + prefix_len
+        )
+
+        starts = torch.where(is_vision, torch.minimum(starts, vision_starts), starts)
+        ends = torch.where(is_vision, torch.maximum(ends, vision_ends), ends)
+        return starts.contiguous(), ends.contiguous()
+
+    def get_attention_variable_window(
+        self,
+        mm_token_type_ids: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        effective_sliding_window: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build packed variable-window bounds for all context requests."""
+        num_contexts = attn_metadata.num_contexts
+        assert num_contexts > 0
+        context_lens = attn_metadata.context_lens.tolist()
+        if (
+            attn_metadata.kv_cache_params is not None
+            and attn_metadata.kv_cache_params.num_cached_tokens_per_seq is not None
+        ):
+            cached_token_lens = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
+                :num_contexts
+            ]
+        else:
+            cached_token_lens = [0] * num_contexts
+
+        starts_list = []
+        ends_list = []
+        token_offset = 0
+        for context_len, prefix_len in zip(context_lens, cached_token_lens, strict=True):
+            context_end = token_offset + context_len
+            starts, ends = self.get_context_variable_window(
+                mm_token_type_ids[token_offset:context_end],
+                effective_sliding_window=effective_sliding_window,
+                prefix_len=prefix_len,
+            )
+            starts_list.append(starts)
+            ends_list.append(ends)
+            token_offset = context_end
+        return torch.cat(starts_list).contiguous(), torch.cat(ends_list).contiguous()
+
     def _forward_speculative(
         self,
         output: torch.Tensor,
@@ -1484,6 +1583,16 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             resource_manager=resource_manager,
         )
 
+    def _supports_variable_window_attention(self, attn_metadata: TrtllmAttentionMetadata) -> bool:
+        sliding_layer = next((layer for layer in self.model.layers if layer.is_sliding), None)
+        if sliding_layer is None:
+            return False
+        return sliding_layer.self_attn.attn._is_variable_window_kernel_available(
+            dtype=self.config.torch_dtype,
+            tokens_per_block=attn_metadata.tokens_per_block,
+            use_paged_context_fmha=attn_metadata.use_paged_context_fmha,
+        )
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1499,13 +1608,35 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         **kwargs,
     ) -> torch.Tensor:
         local_attention_mask_data = None
+        local_variable_window_token_starts = None
+        local_variable_window_token_ends = None
         # Only build bidirectional masks when use_bidirectional_attention is
         # set to "vision" (26B, 31B).  E2B/E4B have this as None and should
         # use standard causal attention even for multimodal tokens. Gemma4
         # applies multimodal bidirectionality only to sliding-window layers;
         # full-attention layers retain their normal causal mask.
         use_bidir = getattr(self.config, "use_bidirectional_attention", None)
-        if mm_token_type_ids is not None and use_bidir == "vision":
+        if (
+            mm_token_type_ids is not None
+            and use_bidir == "vision"
+            and is_sm_100f()
+            and isinstance(attn_metadata, TrtllmAttentionMetadata)
+            and attn_metadata.num_contexts > 0
+            and self._supports_variable_window_attention(attn_metadata)
+        ):
+            (
+                local_variable_window_token_starts,
+                local_variable_window_token_ends,
+            ) = self.get_attention_variable_window(
+                mm_token_type_ids=mm_token_type_ids,
+                attn_metadata=attn_metadata,
+                effective_sliding_window=self.config.sliding_window,
+            )
+        elif (
+            mm_token_type_ids is not None
+            and use_bidir == "vision"
+            and attn_metadata.num_contexts > 0
+        ):
             local_attention_mask_data = self.get_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,
@@ -1518,6 +1649,8 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             local_attention_mask_data=local_attention_mask_data,
+            local_variable_window_token_starts=local_variable_window_token_starts,
+            local_variable_window_token_ends=local_variable_window_token_ends,
             ple_input_ids=kwargs.pop("ple_input_ids", None),
             **kwargs,
         )

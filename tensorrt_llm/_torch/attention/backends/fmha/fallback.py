@@ -82,6 +82,10 @@ class FallbackFmha(Fmha):
         del k, v, phase
         if q is not None and q.dtype == torch.float8_e4m3fn:
             return False
+        has_variable_window_starts = forward_args.variable_window_token_starts is not None
+        has_variable_window_ends = forward_args.variable_window_token_ends is not None
+        if has_variable_window_starts != has_variable_window_ends:
+            return False
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
             return False
         if not forward_args.update_kv_cache and not metadata.is_cross:
@@ -159,6 +163,8 @@ class FallbackFmha(Fmha):
             mask_type=forward_args.mask_type,
             attention_input_type=int(forward_args.attention_input_type),
             attention_window_size=forward_args.attention_window_size,
+            variable_window_token_starts=forward_args.variable_window_token_starts,
+            variable_window_token_ends=forward_args.variable_window_token_ends,
             chunked_prefill_buffer_batch_size=forward_args.chunked_prefill_buffer_batch_size,
             mrope_rotary_cos_sin=forward_args.mrope_rotary_cos_sin,
             mrope_position_deltas=forward_args.mrope_position_deltas,

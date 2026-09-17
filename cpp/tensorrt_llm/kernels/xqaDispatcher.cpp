@@ -295,10 +295,9 @@ bool XqaDispatcher::isSupported()
         // Align with ExportCubin: only PagedKv kernels are built with numTokensPerPage > 0.
         // ContiguousKv must use 0 so hash matches registered cubins.
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.isPagedKv ? mFixedParams.numTokensPerBlock : 0;
-        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
-        // the kernel is supported.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
-        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+        tllmRunnerParams.mChunkedAttentionSize = 0;
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
         // Problem size fields used by FMHA kernel selection (computeNumCtas). Must be non-zero to avoid
         // integer divide-by-zero when mMultiCtasKvMode is true. Actual launch uses real sizes from runImpl.
         tllmRunnerParams.mBatchSize = 1;
@@ -513,11 +512,27 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = params.trtllm_gen_jit_warmup_max_seq_len_q;
         tllmRunnerParams.mJITWarmupMaxSeqLenKv = params.trtllm_gen_jit_warmup_max_seq_len_kv;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
-        // The sliding window attention size.
-        tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
+        bool const usesSlidingWindow = params.cyclic_attention_window_size > 0
+            && params.cyclic_attention_window_size != INT_MAX
+            && tllmRunnerParams.mMaxSeqLenKv > params.cyclic_attention_window_size;
+        if (usesSlidingWindow)
+        {
+            tllmRunnerParams.mLeftSlidingWindow = params.cyclic_attention_window_size - 1;
+            tllmRunnerParams.mRightSlidingWindow = 0;
+        }
+        else
+        {
+            tllmRunnerParams.mLeftSlidingWindow = -1;
+            tllmRunnerParams.mRightSlidingWindow = -1;
+        }
         // The chunked attention size.
         // The generation-phase chunked attention is disabled for now.
-        tllmRunnerParams.mChunkedAttentionSize = params.chunked_attention_size;
+        bool const usesChunkedAttention = !isSpecDecTree && params.chunked_attention_size > 0
+            && params.chunked_attention_size != INT_MAX
+            && params.chunked_attention_size < tllmRunnerParams.mMaxSeqLenKv;
+        tllmRunnerParams.mChunkedAttentionSize = usesChunkedAttention ? params.chunked_attention_size : 0;
+        TLLM_CHECK_WITH_INFO(!(usesChunkedAttention && usesSlidingWindow),
+            "Chunked attention size and sliding window size should not be used together.");
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenKv);
         tllmRunnerParams.mScaleQ = params.q_scaling;
@@ -526,9 +541,32 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
-        tllmRunnerParams.mIsSpecDecTree = params.is_spec_dec_tree && params.multi_query_tokens;
-        tllmRunnerParams.mMaskType
-            = tllmRunnerParams.mIsSpecDecTree ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
+        tllmRunnerParams.mIsSpecDecTree = isSpecDecTree;
+        if (isSpecDecTree)
+        {
+            if (usesSlidingWindow)
+            {
+                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCustom;
+            }
+            else
+            {
+                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Custom;
+            }
+        }
+        else if (usesChunkedAttention)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+            tllmRunnerParams.mLeftSlidingWindow = -1;
+            tllmRunnerParams.mRightSlidingWindow = -1;
+        }
+        else if (usesSlidingWindow)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+        }
+        else
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        }
         tllmRunnerParams.mLayerIdx = params.layer_idx;
         tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
