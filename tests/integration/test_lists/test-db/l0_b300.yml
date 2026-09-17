@@ -78,6 +78,7 @@ l0_b300:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[TRTLLM]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_allow_list_matches_what_the_backends_declare
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_situ_betas_reach_the_kernel_cache_key
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[nan_beta]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[nan_linear]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[inf_beta]

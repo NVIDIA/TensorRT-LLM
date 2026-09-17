@@ -1005,8 +1005,16 @@ def _make_routed_moe(
     num_experts=_TP_EXPERTS,
     moe_backend="TRTLLM",
     routed_quant_config=None,
+    gate_softcap=4.0,
+    linear_softcap=25.0,
 ):
-    """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
+    """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping.
+
+    The soft-caps are parameters rather than constants so a test can build two
+    layers that differ in nothing else; they are trace-time constants inside
+    the CuteDSL epilogue, so that is the only way to ask whether they reach the
+    kernel cache key.
+    """
     from transformers.configuration_utils import PretrainedConfig
 
     from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
@@ -1017,8 +1025,8 @@ def _make_routed_moe(
     pretrained_config.hidden_size = _TP_HIDDEN
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = torch.bfloat16
-    pretrained_config.activation_situ_beta = 4.0
-    pretrained_config.activation_situ_linear_beta = 25.0
+    pretrained_config.activation_situ_beta = gate_softcap
+    pretrained_config.activation_situ_linear_beta = linear_softcap
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         mapping=Mapping(),
@@ -1041,7 +1049,7 @@ def _make_routed_moe(
         communication_method=None,
         # Mirror KimiK3MoERuntime exactly: one activation for every backend,
         # naming the two soft-caps rather than the ABI registers they land in.
-        activation=SiTuActivation(gate_softcap=4.0, linear_softcap=25.0),
+        activation=SiTuActivation(gate_softcap=gate_softcap, linear_softcap=linear_softcap),
     )
     moe = create_moe(**moe_kwargs).cuda()
     assert isinstance(moe, ConfigurableMoE)
@@ -1410,7 +1418,9 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
     return bank
 
 
-def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
+def _make_nvfp4_moe(
+    gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS", gate_softcap=4.0, linear_softcap=25.0
+):
     """NVFP4 + SiTU routed MoE on either FP4 backend.
 
     Both take the same ``SiTuActivation`` carrier; CUTLASS serves it as an
@@ -1427,6 +1437,8 @@ def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
         num_experts=num_experts,
         moe_backend=moe_backend,
         routed_quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=_NVFP4_GROUP_SIZE),
+        gate_softcap=gate_softcap,
+        linear_softcap=linear_softcap,
     )
 
 
@@ -2069,6 +2081,106 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
         f"norm ratio away from 1.0 with cosine intact is a scaling fault, "
         f"which cosine alone cannot see. If both look right, the residual has "
         f"gained a quantization stage -- sqrt(4)*0.0950 is 0.190"
+    )
+
+
+@nvfp4_moe_supported
+def test_cutedsl_situ_betas_reach_the_kernel_cache_key():
+    """Two beta pairs, one process: the second must not reuse the first kernel.
+
+    The CuteDSL betas are trace-time ``const_expr``, folded into the compiled
+    epilogue rather than passed at launch, so a layer that changes them needs a
+    different kernel. ``unique_id()`` lists them for exactly that reason. If
+    they ever fall out of it the autotuner hands back the kernel it compiled
+    for the previous betas, and nothing raises -- the second layer simply
+    returns the first layer's soft-caps applied to its own inputs.
+
+    Both layers therefore run in one process, in cache order, and each output
+    is checked against the reference for ITS OWN betas. Asserting only that the
+    two outputs differ would pass if the second were wrong in some other way.
+
+    The betas are what varies, not the activation magnitude: measured from the
+    checkpoint, production g and u sit at sigma 0.10..0.23, so inflating the
+    activation would move the test away from inference rather than toward it.
+
+    (2.0, 10.0) is the second pair because the residual grows as the caps
+    tighten, and it is the last one the sqrt(3)*eps budget still covers --
+    measured rel_l2 against each pair's own reference, with the output norm
+    beside it:
+
+        (4.0, 25.0)  0.1644  0.999x floor  |out| 414
+        (2.0, 10.0)  0.1674  1.017x        |out| 323   <- used here
+        (0.5,  2.0)  0.1869  1.136x        |out|  90
+        (0.25, 1.0)  0.2185  1.328x        |out|  33
+
+    The growth is not explained. Sharper clipping does make the FC1->FC2
+    intermediate quantize slightly worse, but that accounts for ~3% of it, not
+    33%; below beta=1 the excess in absolute terms stops tracking the output
+    norm. Rather than assert an unexplained number, this picks a pair the
+    budget covers -- 27% apart from the production output, far outside
+    allclose, which is all the cache question needs.
+    """
+    _skip_if_backend_unavailable("CUTEDSL")
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+
+    torch.manual_seed(91)
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    w1 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w3 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w2 = [
+        torch.randn(hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], 1.0) for e in range(num_experts)]
+    dq = [_dequantize_expert_bank(b) for b in bank]
+    w1q, w2q, w3q = ([d[i] for d in dq] for i in range(3))
+    router_logits = gate.compute_logits(x)
+
+    outputs = {}
+    for gate_softcap, linear_softcap in ((4.0, 25.0), (2.0, 10.0)):
+        moe = _make_nvfp4_moe(
+            gate,
+            num_experts=num_experts,
+            moe_backend="CUTEDSL",
+            gate_softcap=gate_softcap,
+            linear_softcap=linear_softcap,
+        )
+        _load_nvfp4_bank_for(moe, bank, "CUTEDSL")
+        actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+        expected = _situ_reference_moe(
+            x,
+            router_logits,
+            gate.routing_method,
+            w1q,
+            w2q,
+            w3q,
+            beta=gate_softcap,
+            linear_beta=linear_softcap,
+        )
+        rel_l2 = (
+            torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected)
+        ).item()
+        print(f"CUTEDSL SiTU betas=({gate_softcap}, {linear_softcap}): rel_l2={rel_l2:.6f}")
+        assert rel_l2 < _SITU_NVFP4_REL_L2_MAX, (
+            f"betas=({gate_softcap}, {linear_softcap}) gave rel_l2={rel_l2:.6f} against "
+            f"its own SiTU reference. If the first pair passed and this one did not, "
+            f"the kernel compiled for the first betas was reused -- check that "
+            f"unique_id() still carries situ_beta and situ_linear_beta"
+        )
+        outputs[(gate_softcap, linear_softcap)] = actual
+
+    first, second = outputs.values()
+    assert not torch.allclose(first, second), (
+        "beta pairs (4.0, 25.0) and (2.0, 10.0) produced identical output, so the "
+        "second layer ran the first layer's compiled epilogue: the soft-caps are "
+        "no longer part of the kernel cache key"
     )
 
 
