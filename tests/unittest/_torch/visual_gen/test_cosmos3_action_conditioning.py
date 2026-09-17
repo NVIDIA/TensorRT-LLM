@@ -1,14 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""L1/T1: compiled action timestep insertion vs Framework's BF16 store boundary."""
+"""L1/T1: timestep frequencies and action conditioning vs Framework's arithmetic."""
+
+import math
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    TimestepEmbedder,
     _add_action_timestep_embedding,
 )
+
+
+def test_timestep_frequencies_are_constructed_in_fp32() -> None:
+    """L1: Framework's FP32 sinusoid recipe, before any checkpoint weights are loaded."""
+    module = TimestepEmbedder(hidden_size=32)
+    half = module.frequency_embedding_size // 2
+    expected = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
+    assert module.freqs.dtype == torch.float32
+    torch.testing.assert_close(module.freqs, expected, atol=0, rtol=0)
+    rounded = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.bfloat16) / half).float()
+    assert not torch.equal(module.freqs, rounded)
+    # Materialization moves buffers without changing dtype; post-load keeps the time MLP FP32.
+    module.float()
+    torch.testing.assert_close(module.freqs, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compilation required")

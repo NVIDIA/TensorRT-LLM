@@ -485,7 +485,6 @@ class TimestepEmbedder(nn.Module):
         hidden_size,
         frequency_embedding_size=256,
         max_period=10000,
-        target_dtype=torch.bfloat16,
     ):
         super().__init__()
         self.mlp = TimestepEmbedding(
@@ -496,7 +495,7 @@ class TimestepEmbedder(nn.Module):
 
         half = frequency_embedding_size // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=target_dtype) / half
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         )
         self.register_buffer("freqs", freqs, persistent=False)
 
@@ -508,7 +507,6 @@ class TimestepEmbedder(nn.Module):
         torch.nn.init.trunc_normal_(self.mlp.linear_2.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, t):
-        # use .float() here if acc loss
         args = t[:, None] * self.freqs[None]
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         t_emb = self.mlp(t_freq)
@@ -1195,8 +1193,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             self.llm2audio = nn.Linear(self.hidden_size, self.audio_dim)
             self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
-        # try timestep embedder in float32 if acc loss
-        self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=torch.bfloat16)
+        self.time_embedder = TimestepEmbedder(self.hidden_size)
 
         self.gen_layers = nn.ModuleList(
             [
