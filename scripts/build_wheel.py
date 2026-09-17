@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import platform
 import re
@@ -116,6 +117,34 @@ def get_build_dir(build_dir, build_type, build_root=None, out_of_tree=False):
     else:
         build_dir = Path(build_dir).resolve()
     return build_dir
+
+
+# Records the fingerprint of the cmake configure arguments used by the last
+# configure of a build dir, so a later invocation with different arguments
+# reconfigures instead of silently building the old configuration.
+CONFIGURE_FINGERPRINT_FILENAME = ".cmake_configure_args.sha256"
+
+
+def configure_args_fingerprint(args: Sequence[str]) -> str:
+    """Stable sha256 hex digest over the configure-affecting cmake arguments.
+
+    The arguments are sorted first so that ordering differences (e.g. the
+    set() expansion of --extra-cmake-vars) don't change the fingerprint.
+    """
+    return hashlib.sha256("\n".join(sorted(args)).encode()).hexdigest()
+
+
+def stored_configure_fingerprint(build_dir) -> Optional[str]:
+    """Fingerprint recorded by the last cmake configure, or None.
+
+    None also covers build dirs created before fingerprints were recorded;
+    those keep the previous skip behavior until the next configure runs and
+    records one.
+    """
+    fingerprint_file = Path(build_dir) / CONFIGURE_FINGERPRINT_FILENAME
+    if not fingerprint_file.exists():
+        return None
+    return fingerprint_file.read_text().strip() or None
 
 
 def clear_folder(folder_path):
@@ -1031,6 +1060,34 @@ def main(*,
         cmake_def_args.append(
             f"-DTRTLLM_VERSION_H_INCLUDE_DIR={build_dir}/generated-include")
 
+    # Fingerprint the configure-affecting arguments so a flag change (e.g.
+    # --cuda_architectures, --nvrtc_dynamic_linking, --extra-cmake-vars) on
+    # an already-configured build dir forces a reconfigure instead of
+    # silently building the old configuration. The conan toolchain path is
+    # excluded: it is derived from build_dir and constant per build dir.
+    configure_fingerprint = configure_args_fingerprint(cmake_def_args + [
+        cmake_cuda_architectures,
+        cmake_generator,
+        f'-DCMAKE_BUILD_TYPE="{build_type}"',
+        f'-DBUILD_PYT="{build_pyt}"',
+        f'-DBUILD_DEEP_EP="{build_deep_ep}"',
+        f'-DBUILD_DEEP_GEMM="{build_deep_gemm}"',
+        f'-DBUILD_FLASH_MLA="{build_flash_mla}"',
+        f'-DNVTX_DISABLE="{disable_nvtx}"',
+        f'-DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}',
+        f'-DBUILD_WHEEL_TARGETS="{";".join(targets)}"',
+        f'-DPython_EXECUTABLE={venv_python}',
+        f'-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}',
+    ])
+    if not (clean or first_build or configure_cmake or configure_only):
+        stored_fingerprint = stored_configure_fingerprint(build_dir)
+        if (stored_fingerprint is not None
+                and stored_fingerprint != configure_fingerprint):
+            print(f"cmake arguments changed since last configure "
+                  f"({stored_fingerprint[:8]} -> {configure_fingerprint[:8]});"
+                  f" reconfiguring")
+            configure_cmake = True
+
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
             # Conan writes a CMakeUserPresets.json convenience file next to
@@ -1061,6 +1118,9 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+            (build_dir /
+             CONFIGURE_FINGERPRINT_FILENAME).write_text(configure_fingerprint +
+                                                        "\n")
 
         if configure_only:
             return
