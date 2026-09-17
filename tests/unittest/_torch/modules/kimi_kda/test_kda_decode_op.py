@@ -609,9 +609,9 @@ def _profile_decode_backend(kwargs: dict) -> str:
 
 @torch.no_grad()
 @pytest.mark.parametrize("num_heads", SUPPORTED_HEADS)
-def test_sm103_selector_dispatches_each_supported_head_at_boundary(num_heads: int) -> None:
-    if torch.cuda.get_device_capability(0) != (10, 3):
-        pytest.skip("compact-head selector sweep is tuned only for SM103")
+def test_selector_dispatches_each_supported_head_at_boundary(num_heads: int) -> None:
+    if torch.cuda.get_device_capability(0) != (10, 3) and num_heads != 64:
+        pytest.skip("full selector sweep requires SM103; H=64 also covers SM100")
 
     compact_batch = COMPACT_WORK_THRESHOLD // num_heads
     compact_args = _make_direct_decode_args(
@@ -640,20 +640,27 @@ def test_selector_preserves_legacy_compact_heads_off_sm103() -> None:
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("batch_size", "indexed_state", "expected_backend"),
-    [(1, False, "compact"), (2, True, "many")],
+    ("num_heads", "batch_size", "indexed_state", "expected_backend"),
+    [
+        (96, 1, False, "compact"),
+        (96, 2, True, "many"),
+        (64, 1, False, "compact"),
+        (64, 2, True, "compact"),
+        (64, 3, True, "many"),
+    ],
 )
-def test_sm103_selector_is_cuda_graph_safe(
+def test_selector_is_cuda_graph_safe(
+    num_heads: int,
     batch_size: int,
     indexed_state: bool,
     expected_backend: str,
 ) -> None:
-    if torch.cuda.get_device_capability(0) != (10, 3):
-        pytest.skip("compact-head selector sweep is tuned only for SM103")
+    if torch.cuda.get_device_capability(0) != (10, 3) and num_heads != 64:
+        pytest.skip("full selector sweep requires SM103; H=64 also covers SM100")
 
     args = _make_direct_decode_args(
         batch_size,
-        96,
+        num_heads,
         indexed_state=indexed_state,
     )
     assert _profile_decode_backend(args) == expected_backend
