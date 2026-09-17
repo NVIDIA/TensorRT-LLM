@@ -49,7 +49,7 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
@@ -2147,7 +2147,7 @@ class fp8SwapABGemmRunner(TunableRunner):
     # every process startup.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
     )
 
@@ -2190,6 +2190,104 @@ class fp8SwapABGemmRunner(TunableRunner):
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
         return output
+
+
+class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
+    """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_jit_warmup_buckets), ),
+        constraint_specs=(ConstraintSpec(
+            1, 0, lambda input_shapes: input_shapes[0][0]), ),
+        exclude_from_cache=True,
+    )
+
+    def __init__(self, output_dtype: torch.dtype,
+                 disable_ue8m0_cast: bool) -> None:
+        self.output_dtype = output_dtype
+        self.disable_ue8m0_cast = disable_ue8m0_cast
+
+    def unique_id(self):
+        return (
+            self.output_dtype,
+            self.disable_ue8m0_cast,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        del tactic
+        activation, activation_scale, weight, weight_scale = inputs
+        scale_m_aligned = fp4_utils.pad_up(activation_scale.size(0), 4)
+        if activation_scale.stride() != (1, scale_m_aligned):
+            # Dynamic autotuning recreates constrained integer tensors with a
+            # contiguous layout. Restore the MN-major packed-scale stride that
+            # the real quantizers return and DeepGemm requires.
+            normalized_scale = torch.empty_strided(
+                activation_scale.shape, (1, scale_m_aligned),
+                dtype=activation_scale.dtype,
+                device=activation_scale.device)
+            normalized_scale.copy_(activation_scale)
+            activation_scale = normalized_scale
+        output = torch.empty(
+            (activation.size(0), weight.size(0)),
+            device=activation.device,
+            dtype=self.output_dtype,
+        )
+        deep_gemm.fp8_gemm_nt(
+            (activation, activation_scale),
+            (weight, weight_scale),
+            output,
+            disable_ue8m0_cast=self.disable_ue8m0_cast,
+        )
+        return output
+
+
+@torch.library.custom_op("trtllm::fp8_prequantized_swap_ab_gemm",
+                         mutates_args=())
+def fp8_prequantized_swap_ab_gemm(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    runner = Fp8PrequantizedSwapABGemmRunner(output_dtype, disable_ue8m0_cast)
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::fp8_prequantized_swap_ab_gemm",
+        [runner],
+        Fp8PrequantizedSwapABGemmRunner.tuning_config,
+        [activation, activation_scale, weight, weight_scale],
+    )
+    return runner(
+        inputs=[activation, activation_scale, weight, weight_scale],
+        tactic=best_tactic,
+    )
+
+
+@fp8_prequantized_swap_ab_gemm.register_fake
+def _(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    del activation_scale, weight_scale, disable_ue8m0_cast
+    return activation.new_empty((activation.size(0), weight.size(0)),
+                                dtype=output_dtype)
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
@@ -2242,12 +2340,17 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
-# The runner is used to trigger deepgemm jit during autotune.
+# The runner is used to trigger deepgemm jit during autotune. Only Hopper has
+# work to do: on SM100 this GEMM dispatches to TrtllmGenGemmRunner's prebuilt
+# cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
+    # Without exclude_from_cache, a warm disk cache short-circuits tuning and
+    # the JIT warmup never runs.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         tune_max_num_tokens=4096,
+        exclude_from_cache=True,
     )
 
     def get_valid_tactics(
