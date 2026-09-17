@@ -58,7 +58,13 @@ class _GenerationTagExtension(jinja2.ext.Extension):
 @lru_cache(maxsize=128)
 def _referenced_template_variables(template_source: str) -> frozenset[str] | None:
     """Find possible reads; return None when static analysis is incomplete."""
-    env = jinja2.Environment(extensions=[jinja2.ext.loopcontrols, _GenerationTagExtension])
+    # This environment only parses templates into an AST (env.parse below); it
+    # never renders, so autoescape has no effect here. Enable it anyway for the
+    # secure default (bandit B701).
+    env = jinja2.Environment(
+        autoescape=True,
+        extensions=[jinja2.ext.loopcontrols, _GenerationTagExtension],
+    )
     try:
         ast = env.parse(template_source)
     except jinja2.TemplateSyntaxError:
