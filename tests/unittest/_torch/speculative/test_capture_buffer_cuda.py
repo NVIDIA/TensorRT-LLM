@@ -13,6 +13,13 @@ from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
+# The fixture allocates bfloat16 capture buffers on cuda at setup time, so gate
+# the whole module rather than let a CPU-only (or non-bf16) run fail there.
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
+    reason="allocates bfloat16 capture/replay buffers on cuda",
+)
+
 
 @pytest.fixture(params=["dflash", "dspark"])
 def metadata(request: pytest.FixtureRequest):
