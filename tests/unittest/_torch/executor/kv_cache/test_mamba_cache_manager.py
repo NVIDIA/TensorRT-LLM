@@ -446,8 +446,8 @@ def test_v2_manager_rejects_model_type_kwarg() -> None:
 @pytest.mark.parametrize(
     ("use_v2", "enable_block_reuse", "expected"),
     [
-        (True, False, NemotronHybridCacheManagerV2),
-        (True, True, NemotronHybridCacheManagerV2),
+        (True, False, Qwen35HybridCacheManagerV2),
+        (True, True, Qwen35HybridCacheManagerV2),
         (False, True, CppMambaHybridCacheManager),
         ("auto", True, CppMambaHybridCacheManager),
     ],
@@ -671,7 +671,7 @@ def test_hybrid_cache_manager_factory_routes_explicit_v2_disagg(monkeypatch, bac
                 backend=backend, transceiver_runtime="PYTHON"
             ),
         )
-        is NemotronHybridCacheManagerV2
+        is Qwen35HybridCacheManagerV2
     )
 
 
@@ -865,7 +865,7 @@ def test_qwen3_gdn_replay_uses_v2_preference(
     )
 
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected_v2
-    expected_manager = NemotronHybridCacheManagerV2 if expected_v2 else CppMambaHybridCacheManager
+    expected_manager = Qwen35HybridCacheManagerV2 if expected_v2 else CppMambaHybridCacheManager
     assert (
         get_kv_cache_manager_cls(
             _hybrid_model_config(),
