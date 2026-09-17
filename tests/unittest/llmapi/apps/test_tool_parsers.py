@@ -5769,7 +5769,7 @@ class TestXing4_0ToolParser(BaseToolParserTestClass):
                     "location": "Paris"
                 },
             ),
-            parse_streaming_increment_partial_bot_token="Hello <tool_ca",
+            parse_streaming_increment_partial_bot_token="<tool_ca",
             undefined_tool=("<tool_call>"
                             '{"name":"undefined_func", '
                             '"arguments":{}}'
@@ -5790,6 +5790,16 @@ class TestXing4_0ToolParser(BaseToolParserTestClass):
         assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
         assert result.calls[0].tool_index == 0
 
+    def test_detect_and_parse_malformed_tool(self, sample_tools, parser,
+                                             tool_parser_test_cases):
+        """Malformed blocks stay in normal_text instead of being dropped."""
+        text = tool_parser_test_cases.detect_and_parse_malformed_tool
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 0
+        assert result.normal_text == text
+
     def test_streaming_same_tool_twice_sequential_indices(
             self, sample_tools, parser):
         """Each streamed call gets a unique sequential tool_index."""
@@ -5803,6 +5813,54 @@ class TestXing4_0ToolParser(BaseToolParserTestClass):
 
         assert [call.tool_index for call in first.calls] == [0]
         assert [call.tool_index for call in second.calls] == [1]
+        assert first.calls[0].name == "get_weather"
+        assert json.loads(first.calls[0].parameters) == {"location": "Paris"}
+        assert second.calls[0].name == "get_weather"
+        assert json.loads(second.calls[0].parameters) == {"location": "Paris"}
+
+    def test_streaming_undefined_tool_sequential_index(self, sample_tools,
+                                                       parser):
+        """Streaming an undefined tool still emits a sequential index.
+
+        Unlike ``detect_and_parse`` (which reports ``tool_index == -1``),
+        the streaming path logs the undefined name and keeps the unique
+        sequential ``current_tool_id`` so clients can still correlate the
+        call with its response slot.
+        """
+        block = ("<tool_call>"
+                 '{"name":"undefined_func", '
+                 '"arguments":{"arg":"value"}}'
+                 "</tool_call>")
+
+        first = parser.parse_streaming_increment(block, sample_tools)
+        second = parser.parse_streaming_increment(block, sample_tools)
+
+        assert [call.tool_index for call in first.calls] == [0]
+        assert [call.tool_index for call in second.calls] == [1]
+        assert first.calls[0].name == "undefined_func"
+        assert json.loads(first.calls[0].parameters) == {"arg": "value"}
+
+    def test_factory_registration(self):
+        """The parser is registered under its own name in the factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert "xing4_0" in ToolParserFactory.parsers
+        assert isinstance(ToolParserFactory.create_tool_parser("xing4_0"),
+                          Xing4_0ToolParser)
+
+    def test_auto_detect_from_model_type(self, tmp_path):
+        """`--tool_parser auto` maps a xing4_0 config.json to this parser."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
+            ToolParserFactory, resolve_auto_tool_parser)
+        model_dir = tmp_path / "Xing4.0"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "xing4_0"}))
+
+        parser_name = resolve_auto_tool_parser(str(model_dir))
+        assert parser_name == "xing4_0"
+        assert isinstance(ToolParserFactory.create_tool_parser(parser_name),
+                          Xing4_0ToolParser)
 
     def test_finish_flushes_partial_marker(self, sample_tools, parser):
         """A buffered partial opening marker is flushed at end of stream."""

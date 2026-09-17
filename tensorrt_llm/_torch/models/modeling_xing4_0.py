@@ -363,7 +363,7 @@ class Xing4_0WeightLoader(DeepseekV3WeightLoader):
             module.fn.data.copy_(weights[mapping_key][:].to(torch.float32).contiguous())
             module.base.data.copy_(weights[bias_key][:].to(torch.float32).contiguous())
             module.scale.data.copy_(
-                torch.cat([weights[key][:].reshape(1) for key in alpha_keys])
+                torch.cat([weights[key].reshape(1) for key in alpha_keys])
                 .to(torch.float32)
                 .contiguous()
             )

@@ -193,18 +193,23 @@ class Xing4_0ToolParser(BaseToolParser):
         )
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        idx = text.find(self.bot_token)
-        if idx == -1:
-            return StreamingParseResult(normal_text=text, calls=[])
-
-        normal_text = text[:idx]
         tool_indices = self._get_tool_indices(tools) if tools else {}
         calls: list[ToolCallItem] = []
+        normal_text_parts: list[str] = []
+        consumed = 0
         try:
             for call_idx, match in enumerate(TOOL_CALL_REGEX.finditer(text)):
                 tool_name, arguments = _parse_payload(match.group(1), tools)
                 if not tool_name:
+                    # Keep malformed blocks in the normal text, matching the
+                    # streaming path's behavior.
+                    logger.warning(
+                        "Failed to extract any tool call from %r.",
+                        match.group(0),
+                    )
                     continue
+                normal_text_parts.append(text[consumed : match.start()])
+                consumed = match.end()
                 if tool_indices and tool_name not in tool_indices:
                     logger.warning(
                         "Model attempted to call undefined function: %s",
@@ -222,7 +227,8 @@ class Xing4_0ToolParser(BaseToolParser):
             logger.exception("Failed to extract Xing4.0 tool call spec")
             return StreamingParseResult(normal_text=text, calls=[])
 
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        normal_text_parts.append(text[consumed:])
+        return StreamingParseResult(normal_text="".join(normal_text_parts), calls=calls)
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         self._buffer += new_text
