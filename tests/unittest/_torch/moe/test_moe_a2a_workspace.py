@@ -11,6 +11,8 @@ import torch
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided as a2a
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(params=[False, True], ids=["fence", "cft"])
 def comm(request):
@@ -89,6 +91,39 @@ def test_lazy_reservation_guards_following_dispatch(comm):
     assert comm._check_dispatch_region([payload], 32) <= offset
     with pytest.raises(ValueError, match="overlaps"):
         comm._check_dispatch_region([torch.empty((0, 1024))], 32)
+
+
+@pytest.mark.parametrize("offset_delta", [-128, 128])
+def test_dispatch_rejects_native_offset(comm, monkeypatch, offset_delta):
+    """A native/Python layout disagreement must not publish a dispatched phase."""
+    comm._reserve_combine_region(128, torch.bfloat16)
+    comm.mnnvl_mem = SimpleNamespace(mapped=True)
+    comm.workspace = torch.empty(0, dtype=torch.uint8)
+    comm.ep_rank, comm.top_k, comm.num_experts = 0, 8, 256
+    comm._rank_mask_enabled = False
+    comm._force_cft = None
+    comm.cft_max_batch_for_dispatch = 128
+    comm.invalid_token_expert_id = -1
+    comm._workspace_lifecycle.coordinator = MagicMock()
+    comm._workspace_lifecycle.watchdog_for = MagicMock(return_value=None)
+    monkeypatch.setattr(a2a, "reject_rank_mask_cuda_graph_capture", MagicMock())
+    hidden = torch.empty((1, 128), dtype=torch.bfloat16)
+    slots = torch.zeros((1, 8), dtype=torch.int32)
+    scales = torch.ones((1, 8))
+    payloads = [hidden, slots, scales]
+    expected_end = comm._check_dispatch_region(payloads, 1)
+    native_dispatch = MagicMock(
+        return_value=(payloads, expected_end + offset_delta, torch.empty(0))
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_dispatch", native_dispatch, raising=False)
+
+    with pytest.raises(RuntimeError, match="native A2A dispatch layout disagrees"):
+        comm.dispatch(hidden, None, slots, scales, [1] * comm.ep_size)
+
+    native_dispatch.assert_called_once()
+    assert comm._dispatch_state["phase"] == "idle"
+    assert "dispatch_payload_end" not in comm._dispatch_state
+    assert "combine_payload_offset" not in comm._dispatch_state
 
 
 @pytest.mark.parametrize("use_cft", [False, True])
