@@ -922,6 +922,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             )
         )
 
+    def get_pending_transfer_requests(self) -> Dict[int, LlmRequest]:
+        """Snapshot requests whose pages are still owned by connector transfers."""
+        requests: Dict[int, LlmRequest] = {}
+        for transfers in (
+            self.new_async_requests,
+            self.pending_async_requests,
+            self.local_finished_async_requests,
+        ):
+            requests.update(transfers.loading)
+            requests.update(transfers.saving)
+        return requests
+
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ) -> None:

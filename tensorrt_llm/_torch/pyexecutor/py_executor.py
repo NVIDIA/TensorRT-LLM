@@ -13,8 +13,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
-                    Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, NoReturn,
+                    Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -138,10 +138,17 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
-# Bound the prepared-batch wait when an ADP async load leaves no room for a
-# compute dummy. This deadline must not be disabled: peers cannot advance.
-_KV_CONNECTOR_LOAD_TIMEOUT_SEC = 60.0
+# Bound outstanding ADP transfers across iterations, even while other work
+# can run. Expiration retains DMA-owned pages and requires process restart.
+_KV_CONNECTOR_TRANSFER_TIMEOUT_SEC = 60.0
 _KV_CONNECTOR_CONTROL_GRACE_SEC = 1.0
+
+
+@dataclasses.dataclass
+class _KvConnectorTransferDeadline:
+    expires_at: float
+    reason: str = "Timed out waiting for an ADP KV connector transfer"
+
 
 # Environment variable to control the benchmark disagg fill target.
 BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME = "TLLM_BENCHMARK_REQ_QUEUES_SIZE"
@@ -861,6 +868,8 @@ class PyExecutor:
         self._event_loop_completed = False
         self._fatal_error: Optional[BaseException] = None
         self._kv_connector_failed = False
+        self._kv_connector_deadlines: dict[int,
+                                           _KvConnectorTransferDeadline] = {}
         self._error_budget = ErrorBudget()
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
@@ -1304,7 +1313,7 @@ class PyExecutor:
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
-    def _event_loop_wrapper(self):
+    def _event_loop_wrapper(self) -> None:
         crashed = False
         self._event_loop_completed = False
         try:
@@ -1330,6 +1339,12 @@ class PyExecutor:
             # tells peers nothing, so a crash after that point -- the single
             # most common trigger for this kill -- still strands them.
             crashed = not self._event_loop_completed
+            if (crashed
+                    and getattr(self, "enable_attention_dp", False) and getattr(
+                        self, "kv_connector_manager", None) is not None):
+                # A callback can fail outside the synchronized start/poll gates.
+                # Mark retention before cleanup wakes shutdown callers.
+                self._kv_connector_failed = True
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -1637,6 +1652,9 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
+        if (self.enable_attention_dp and self.kv_connector_manager is not None
+                and self.kv_connector_manager.get_pending_transfer_requests()):
+            self._kv_connector_failed = True
         if self._kv_connector_failed:
             # A connector failure does not prove DMA has stopped. Keep the
             # registered pools alive for process teardown instead of returning
@@ -3873,18 +3891,16 @@ class PyExecutor:
         # boundary so a failed owner still joins its peers' failure vote.
         loading_context: list[LlmRequest] = []
         error: Optional[str] = None
-        stop_reason: Optional[str] = None
         try:
             loading_context = self._kv_connector_prepare_batch(scheduled_batch)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
 
-        deadline = time.monotonic() + _KV_CONNECTOR_LOAD_TIMEOUT_SEC
         while True:
             waiting = bool(loading_context and scheduled_batch.batch_size == 0)
             if waiting and error is None:
                 try:
-                    self._kv_connector_terminate_requests()
+                    self._kv_connector_terminate_requests(synchronize=False)
                     scheduled_batch.reset_context_requests([
                         req for req in loading_context
                         if req.state == LlmRequestState.CONTEXT_INIT
@@ -3900,62 +3916,78 @@ class PyExecutor:
                             torch.cuda.current_stream())
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
-                if waiting and time.monotonic() >= deadline and error is None:
-                    error = stop_reason or (
-                        "Timed out waiting for an ADP KV connector load "
-                        f"after {_KV_CONNECTOR_LOAD_TIMEOUT_SEC:g}s")
-
-            local_status = [int(waiting), int(error is not None)]
-            statuses = (self.dist.tp_allgather_int64(local_status).tolist()
-                        if self.dist.tp_size > 1 else [local_status])
-            if any(failed for _, failed in statuses):
-                errors = (self.dist.tp_allgather(error)
-                          if self.dist.tp_size > 1 else [error])
-                owner, message = next((rank, message)
-                                      for rank, message in enumerate(errors)
-                                      if message)
-                self._kv_connector_failed = True
-                # Raise on every rank through _event_loop_wrapper's fatal
-                # error propagation/watchdog. _handle_errors would recycle
-                # request pages while the connector may still DMA into them.
-                raise RuntimeError(
-                    f"KV connector failed on ADP owner {owner}: {message}. "
-                    "Process restart is required; pending transfer resources "
-                    "were not released.")
-            if not any(pending for pending, _ in statuses):
+            if not self._kv_connector_sync_status(waiting, error):
                 return
+            time.sleep(0.001)
 
-            # Control sentinels normally wait for the next scheduling pass.
-            # Inspect them only in recovery, without consuming new work or
-            # changing the broadcaster's order. Rank 0 may own no blocked
-            # request, so distribute its shutdown/cancellation intent too.
-            canceled_ids = (
-                set(self.canceled_req_ids)
-                | self.executor_request_queue.pending_cancellation_ids())
-            control = (self.is_shutdown
-                       or not self.executor_request_queue.active, canceled_ids)
+    def _kv_connector_fail(self, error: str) -> NoReturn:
+        self._kv_connector_failed = True
+        raise RuntimeError(
+            f"KV connector failed: {error}. Process restart is required; "
+            "pending transfer resources were not released.")
+
+    def _kv_connector_sync_status(self,
+                                  waiting: bool,
+                                  error: Optional[str] = None) -> bool:
+        """Vote at a rank-aligned gate, including idle and dummy-only iterations."""
+        pending = self.kv_connector_manager.get_pending_transfer_requests()
+        now = time.monotonic()
+        for request_id in list(self._kv_connector_deadlines):
+            if request_id not in pending:
+                del self._kv_connector_deadlines[request_id]
+        for request_id in pending:
+            deadline = self._kv_connector_deadlines.get(request_id)
+            if deadline is None:
+                deadline = _KvConnectorTransferDeadline(
+                    now + _KV_CONNECTOR_TRANSFER_TIMEOUT_SEC)
+                self._kv_connector_deadlines[request_id] = deadline
+            if now >= deadline.expires_at and error is None:
+                error = f"{deadline.reason} (request {request_id})"
+
+        canceled_ids = (set(self.canceled_req_ids)
+                        |
+                        self.executor_request_queue.pending_cancellation_ids())
+        shutdown = self.is_shutdown or not self.executor_request_queue.active
+        local_status = [
+            int(waiting),
+            int(error is not None),
+            int(bool(pending)),
+            int(shutdown or bool(canceled_ids))
+        ]
+        statuses = (self.dist.tp_allgather_int64(local_status).tolist()
+                    if self.dist.tp_size > 1 else [local_status])
+        if any(status[1] for status in statuses):
+            errors = (self.dist.tp_allgather(error)
+                      if self.dist.tp_size > 1 else [error])
+            owner, message = next((rank, message)
+                                  for rank, message in enumerate(errors)
+                                  if message)
+            self._kv_connector_fail(f"ADP owner {owner}: {message}")
+
+        # Only exchange Python control payloads when transfers and control
+        # requests coexist. Rank zero may own no transfer itself.
+        has_pending = any(status[2] for status in statuses)
+        has_control = any(status[3] for status in statuses)
+        if has_pending and has_control:
+            control = (shutdown, canceled_ids)
             controls = (self.dist.tp_allgather(control)
                         if self.dist.tp_size > 1 else [control])
-            if any(shutdown for shutdown, _ in controls):
-                stop_reason = "Shutdown requested during ADP KV connector recovery"
-            elif waiting:
-                all_canceled = set().union(*(ids for _, ids in controls))
-                blocked_ids = {
-                    req.parent_request_id if req.is_child else req.py_request_id
-                    for req in loading_context
-                }
-                if blocked_ids & all_canceled:
-                    stop_reason = (
-                        "Cancellation requested for a pending ADP KV "
-                        "connector load; the worker cannot abort DMA")
-            if stop_reason:
-                # Let a healthy transfer drain before escalating a control
-                # request to process failure. Repeated observations must not
-                # extend this grace period or the original load deadline.
-                deadline = min(
-                    deadline,
-                    time.monotonic() + _KV_CONNECTOR_CONTROL_GRACE_SEC)
-            time.sleep(0.001)
+            stop_all = any(stop for stop, _ in controls)
+            all_canceled = set().union(*(ids for _, ids in controls))
+            for request_id, request in pending.items():
+                client_id = (request.parent_request_id
+                             if request.is_child else request.py_request_id)
+                if stop_all or client_id in all_canceled:
+                    deadline = self._kv_connector_deadlines[request_id]
+                    expires_at = now + _KV_CONNECTOR_CONTROL_GRACE_SEC
+                    if expires_at < deadline.expires_at:
+                        deadline.expires_at = expires_at
+                        deadline.reason = (
+                            "Shutdown requested during ADP KV connector recovery"
+                            if stop_all else
+                            "Cancellation requested for a pending ADP KV connector transfer"
+                        )
+        return any(status[0] for status in statuses)
 
     def _kv_connector_prepare_batch(
             self, scheduled_batch: ScheduledRequests) -> list[LlmRequest]:
@@ -3981,11 +4013,24 @@ class PyExecutor:
             return loading_context
         return []
 
-    def _kv_connector_terminate_requests(self):
-        if self.kv_connector_manager:
+    def _kv_connector_terminate_requests(self,
+                                         *,
+                                         synchronize: bool = True) -> None:
+        if self.kv_connector_manager is None:
+            return
+        error: Optional[str] = None
+        try:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
                 self._release_transfer(req)
+        except Exception as exc:
+            if not self.enable_attention_dp or not synchronize:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+        if self.enable_attention_dp and synchronize:
+            # Both executor loops call this once per iteration on every owner,
+            # even when no batch could run. Recovery polls use their own gate.
+            self._kv_connector_sync_status(False, error)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -7538,10 +7583,11 @@ class PyExecutor:
                 f"in-iter encode.\n{traceback.format_exc()}")
 
     def _forward_step(
-            self,
-            scheduled_requests: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
+        self,
+        scheduled_requests: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        num_accepted_tokens_device: Optional[torch.Tensor] = None
+    ) -> Optional[dict[str, object]]:
         ExpertStatistic.set_iter(self.iter_counter)
 
         num_ctx_tokens = sum(req.context_chunk_size
@@ -7594,6 +7640,11 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(
                 f"Encountered an error in forward function: {error_msg}")
+            if self.enable_attention_dp and self.kv_connector_manager is not None:
+                # Layer hooks and wait_for_save can fail after submitting DMA.
+                # This rank may be inside model collectives, so fail through
+                # the crash supervisor, without another connector collective.
+                self._kv_connector_fail(error_msg)
             self._handle_errors(error_msg)
             return None
 
@@ -7804,6 +7855,14 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+        connector = getattr(self, "kv_connector_manager", None)
+        if self.enable_attention_dp and connector is not None:
+            pending = connector.get_pending_transfer_requests()
+            if self._kv_connector_failed or (pending and
+                                             (requests is None
+                                              or any(req.request_id in pending
+                                                     for req in requests))):
+                self._kv_connector_fail(error_msg)
         multi_rank_adp = (self.enable_attention_dp
                           and self.dist.world_size != 1)
         # ``fatal_is_collective_aligned`` is set only by the synchronized caller
@@ -7968,6 +8027,12 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        connector = getattr(self, "kv_connector_manager", None)
+        if (self.enable_attention_dp and connector is not None
+                and connector.has_pending_transfers(request.request_id)):
+            self._kv_connector_fail(
+                f"Attempted to release request {request.request_id} with pending DMA"
+            )
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)

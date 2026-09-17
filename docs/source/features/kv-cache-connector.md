@@ -324,14 +324,21 @@ the transfer proceeds. If the owner has no dummy capacity or sequence slot,
 it polls local transfer completion until at least one request is ready, then
 runs the already-prepared batch. Owners exchange readiness and failure status
 at an executor gate during this fallback; their V2 allocations and connector
-plans are preserved. The wait is bounded to 60 seconds. Shutdown or cancellation
-of a blocked load shortens the remaining wait to at most one second, allowing
-a healthy transfer to drain normally. A timeout or backend exception fails the
-whole executor through its rank-synchronized error path. Pending transfer memory is
-retained for process teardown; restarting the process is required because the
-generic connector API cannot abort DMA safely. Workers must keep asynchronous
-start/poll callbacks nonblocking; a callback that itself hangs remains subject
-to the executor's hang detector.
+plans are preserved. Each outstanding asynchronous load or save has a persistent
+60-second deadline, checked during normal iterations as well as this recovery
+loop. Dummy or unrelated compute does not reset that deadline. Shutdown or
+cancellation shortens the remaining wait to at most one second, allowing a
+healthy transfer to drain normally. These checks run at the next polling gate;
+they cannot interrupt a running forward pass or blocking callback.
+
+A timeout or polling exception fails all owners through a rank-synchronized
+gate. Exceptions inside forward/layer hooks fail through the executor's crash
+supervisor, since peers may still be inside model collectives. Ordinary error
+cleanup cannot release a request with pending connector transfers. Pending
+transfer memory is retained for process teardown; restarting the process is
+required because the generic connector API cannot abort DMA safely. Workers
+must keep asynchronous start/poll callbacks nonblocking; a callback that itself
+hangs remains subject to the executor's hang detector.
 
 ADP requires `KVCacheManagerV2`; an explicit V1 selection is rejected before
 connector construction, and an automatic selection that resolves to V1 is
