@@ -50,3 +50,12 @@ GPT-OSS/120B-MXFP4:
   - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8
     accuracy: 65.0
+moonshotai/Kimi-K3:
+  # The official 93.5 result used a 65,536-token output budget, which would make the test take much
+  # longer to complete; CI uses 32,768 output tokens instead as a result.
+  # The below is the official quality reference, not the expected shortened-run score.
+  # The hypothesis harness lowers 93.5 to an 85.234 acceptance threshold; expected accuracy with the
+  # 32K budget is 90.404%. Using that score as the reference would lower the gate even further,
+  # allowing larger regressions. If repeated 32K runs cannot reliably clear 85.234, revisit the
+  # token cap rather than weaken the provider's official quality reference.
+  - accuracy: 93.5

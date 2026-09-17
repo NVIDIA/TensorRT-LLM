@@ -4688,8 +4688,15 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
-    )
+        "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
+        "coalesces a request's scattered per-block KV for a single multi-rail "
+        "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
+        "the per-block path, >0 enables bounce at that capacity. By default "
+        "two buffers of this size are allocated (one for send, one for recv); "
+        "with agent_bounce_buffer_enable a single shared buffer is allocated "
+        "instead and the size should be a power of two (256/512/1024). "
+        "Requires the Python (v2) transceiver (transceiver_runtime); the C++ "
+        "transceiver does not support bounce and ignores this field.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -4697,9 +4704,77 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Transfer each completed prefill chunk's KV cache while later chunks "
         "compute. Requires Python NIXL, generation-first scheduling, chunked "
         "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
-        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
-        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent "
+        "bounce selected by agent_bounce_buffer_enable is allowed) or "
+        "Mamba/hybrid cache, and block reuse disabled or set to all_reusable. "
+        "Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
+
+    agent_bounce_buffer_enable: bool = Field(
+        default=False,
+        description=
+        "Run the KV-cache bounce in the C++ transfer agent instead of the "
+        "Python transceiver, using one shared kv_cache_bounce_size_mb buffer "
+        "(use a power of two). Set this identically on context and "
+        "generation; kv_cache_bounce_size_mb matters only when its usable "
+        "capacity (rounded down to a power of two) is below max_chunk_size; "
+        "both sides must then clamp to the same chunk cap, otherwise the pair "
+        "falls back to standard NIXL. By default only writes with "
+        "many small descriptors (>= 1024, <= 16 KiB average, i.e. "
+        "head-mismatch layouts) take the path; head-matched layouts (MLA, "
+        "symmetric TP) stay on standard NIXL unless agent_bounce_params "
+        "relaxes the gate. Requires the Python (v2) transceiver; see the "
+        "disaggregated-serving docs.")
+
+    agent_bounce_params: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see "
+        "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
+        "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
+        "Precedence: this dict > environment variable > built-in default. "
+        "Requires agent_bounce_buffer_enable. request_timeout_ms and the "
+        "effective max_chunk_size (after the arena clamp) must match between "
+        "context and generation. "
+        "max_average_descriptor_size=0 stops outbound routing only (arena, "
+        "handshake and inbound scatter stay active); set "
+        "agent_bounce_buffer_enable=False to turn the feature off.")
+
+    @field_validator('agent_bounce_params', mode='before')
+    @classmethod
+    def coerce_agent_bounce_params_to_str(cls, v):
+        """Coerce agent_bounce_params values to strings (YAML often yields ints/bools)."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"agent_bounce_params must be a dict of str to str, got "
+                f"{type(v).__name__}")
+        return {str(k): str(val) for k, val in v.items()}
+
+    @model_validator(mode='after')
+    def validate_bounce_config(self) -> 'CacheTransceiverConfig':
+        if self.agent_bounce_buffer_enable and self.kv_cache_bounce_size_mb == 0:
+            raise ValueError(
+                "agent_bounce_buffer_enable selects the C++ transfer-agent "
+                "bounce implementation, but kv_cache_bounce_size_mb is 0 "
+                "(bounce disabled); set a positive capacity.")
+        if self.agent_bounce_params:
+            if not self.agent_bounce_buffer_enable:
+                raise ValueError(
+                    "agent_bounce_params only applies to the C++ transfer-agent "
+                    "bounce implementation; set agent_bounce_buffer_enable=True "
+                    "or drop the params.")
+            # Lazy: importing tensorrt_llm._torch at module scope is circular.
+            from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
+                AGENT_BOUNCE_PARAM_KEYS
+            unknown = sorted(
+                set(self.agent_bounce_params) - AGENT_BOUNCE_PARAM_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown agent_bounce_params key(s) {unknown}; valid keys "
+                    f"are {sorted(AGENT_BOUNCE_PARAM_KEYS)}.")
+        return self
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
@@ -6036,12 +6111,17 @@ class TorchLlmArgs(BaseLlmArgs):
     use_cute_dsl_bf16_bmm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        "If true, use CuTe DSL BF16 BMM on Blackwell (SM100/SM103) and Rubin (SM107), "
+        "including the DeepSeek-V4 o_a projection on Rubin when DSL support and "
+        "dimension alignment permit. Defaults to false; automatically enabled "
+        "with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
     use_cute_dsl_bf16_gemm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
+        "If true, use CuTe DSL BF16 persistent GEMM for Linear layers on Blackwell "
+        "(SM100/SM103) and Rubin (SM107) when supported. Defaults to false; "
+        "automatically enabled with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
 
     # PrivateVars
@@ -6778,7 +6858,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if (not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
                 and self.pipeline_parallel_size > 1 and is_sm_100f()):
             logger.info("Automatically enabling CuTe DSL BF16 BMM and GEMM for "
-                        "SM100/SM103 PP.")
+                        "SM100/SM103/SM107 with pipeline_parallel_size > 1.")
             self.use_cute_dsl_bf16_bmm = True
             self.use_cute_dsl_bf16_gemm = True
 
@@ -6788,7 +6868,7 @@ class TorchLlmArgs(BaseLlmArgs):
             if sm < 100:
                 raise ValueError(
                     f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
-                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"supported on SM >= 100 (Blackwell or newer), but current device has "
                     f"sm {sm}.")
         return self
 

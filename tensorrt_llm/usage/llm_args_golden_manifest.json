@@ -115,6 +115,11 @@
       "path": "batch_wait_timeout_ms"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "cache_transceiver_config.agent_bounce_buffer_enable"
+    },
+    {
       "allowed_values": [
         "DEFAULT",
         "UCX",

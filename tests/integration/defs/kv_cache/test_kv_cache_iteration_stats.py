@@ -43,6 +43,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..conftest import llm_models_root
 
 MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+# Pin the host tier for all scenarios so cold-pool field coverage is deterministic.
+HOST_CACHE_SIZE = 64 << 20
 
 ALL_FIELDS = [
     # Instantaneous gauges — primary (GPU) pool
@@ -147,10 +149,15 @@ def find_kv_entries(stats_list):
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def llm_instance():
-    """Create a shared LLM instance for all tests in this module."""
+    """Share one V2 LLM with a fixed host tier across all eight scenarios."""
     llm = LLM(
         model=MODEL,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=True, iteration_stats_interval=1),
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            iteration_stats_interval=1,
+            host_cache_size=HOST_CACHE_SIZE,
+        ),
         enable_iter_perf_stats=True,
         return_perf_metrics=True,
     )
@@ -401,6 +408,11 @@ class TestKvCacheIterationStats:
             ki = s.get("kvCacheIterationStats")
             if ki:
                 entries_with_kv += 1
+                assert s.get("kvCacheIterationStatsByPoolGroup"), "missing V2 hot-pool stats"
+                # The explicit host tier ensures cold-field coverage is not vacuous.
+                assert s.get("kvCacheIterationStatsByColdPoolGroup"), "missing V2 cold-pool stats"
+                if entries_with_kv == 1:
+                    print(f"  V2 cold-pool stats: {s['kvCacheIterationStatsByColdPoolGroup']}")
                 # V2 reports secondary gauges by cold pool group, not by window.
                 for ws, v in ki.items():
                     missing_fields = NON_SECONDARY_FIELDS - v.keys()
@@ -414,6 +426,9 @@ class TestKvCacheIterationStats:
                     assert not missing_fields, (
                         f"Missing kvCacheIterationStatsByColdPoolGroup fields for group {group}: "
                         f"{sorted(missing_fields)}"
+                    )
+                    assert v["secondaryMaxNumBlocks"] > 0, (
+                        f"Cold group {group} reports no secondary capacity: {v}"
                     )
 
         print(f"  Entries with kvCacheIterationStats: {entries_with_kv}/{len(all_collected)}")
@@ -481,7 +496,12 @@ def main():
     print("Starting LLM with block_reuse + iteration_stats_interval=1")
     llm = LLM(
         model=MODEL,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=True, iteration_stats_interval=1),
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            iteration_stats_interval=1,
+            host_cache_size=HOST_CACHE_SIZE,
+        ),
         enable_iter_perf_stats=True,
         return_perf_metrics=True,
     )
