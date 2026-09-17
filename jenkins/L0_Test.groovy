@@ -145,7 +145,7 @@ RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim()
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
-REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x", "gr100-ts1"]
 
 // Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
 // Recognised failure patterns are tagged with scope=SLURM or BOTH in the
@@ -1374,7 +1374,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                                 dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                             }
                         }
-                        if (fileExists('/home/scratch.trt_llm_data_ci')) {
+                        if (stageName.contains("VR200") && fileExists('/mnt/cifs/home/scratch.trt_llm_data')) {
+                            dockerArgs += " -v /mnt/cifs/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
+                        } else if (fileExists('/home/scratch.trt_llm_data_ci')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
                         } else if (fileExists('/home/scratch.trt_llm_data')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
@@ -6323,6 +6325,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // Disable RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1 and RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2 due to some nodes are offline temporarily.
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        "GR100-PyTorch-Post-Merge-1": ["gr100-ts1", "l0_gr100", 1, 1],
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
@@ -6485,6 +6488,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
+        "VR200-PyTorch-Post-Merge-1": ["auto:vr200-x1", "l0_vr200", 1, 1],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
