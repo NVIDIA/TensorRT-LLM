@@ -93,28 +93,44 @@ def validate_models(models: typing.Any) -> list[str]:
             )
 
         name = model_entry.get("name")
-        if not isinstance(name, str) or not name.strip():
-            errors.append(f"{entry_label}: missing non-empty string 'name'.")
+        name_ok = isinstance(name, str) and bool(name) and name == name.strip()
+        if not name_ok:
+            if not isinstance(name, str) or not name.strip():
+                errors.append(f"{entry_label}: missing non-empty string 'name'.")
+            else:
+                errors.append(
+                    f"{entry_label}: 'name' must not have leading or trailing whitespace."
+                )
 
         yaml_extra = model_entry.get("yaml_extra")
-        if not isinstance(yaml_extra, list) or not all(
-            isinstance(item, str) and item.strip() for item in yaml_extra
-        ):
-            errors.append(f"{entry_label}: 'yaml_extra' must be a list of non-empty strings.")
+        yaml_extra_ok = isinstance(yaml_extra, list) and all(
+            isinstance(item, str) and bool(item) and item == item.strip() for item in yaml_extra
+        )
+        if not yaml_extra_ok:
+            errors.append(
+                f"{entry_label}: 'yaml_extra' must be a list of non-empty strings "
+                "without leading or trailing whitespace."
+            )
 
         config_id = model_entry.get("config_id", DEFAULT_CONFIG_ID)
-        if not isinstance(config_id, str) or not config_id.strip():
-            errors.append(f"{entry_label}: 'config_id' must be a non-empty string when provided.")
+        config_id_ok = (
+            isinstance(config_id, str) and bool(config_id) and config_id == config_id.strip()
+        )
+        if not config_id_ok:
+            if not isinstance(config_id, str) or not config_id.strip():
+                errors.append(
+                    f"{entry_label}: 'config_id' must be a non-empty string when provided."
+                )
+            else:
+                errors.append(
+                    f"{entry_label}: 'config_id' must not have leading or trailing whitespace."
+                )
 
-        if not isinstance(name, str) or not name.strip():
-            continue
-        if not isinstance(config_id, str) or not config_id.strip():
+        if not name_ok or not config_id_ok:
             continue
 
         seen_model_configs[(name, config_id)].append(index)
-        if isinstance(yaml_extra, list) and all(
-            isinstance(item, str) and item.strip() for item in yaml_extra
-        ):
+        if yaml_extra_ok:
             yaml_signature = tuple(yaml_extra)
             seen_model_yaml_configs[(name, yaml_signature)].append((index, config_id))
 
