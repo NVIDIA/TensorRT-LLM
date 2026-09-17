@@ -484,9 +484,19 @@ class DFlashForCausalLM(nn.Module):
             self._dflash_flash_attention = get_dflash_flash_attention()
         elif self.dflash_attention_backend == "TRTLLM":
             self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
-        else:
+        elif self.dflash_attention_backend == "FA4":
             self._dflash_fa4_fwd = get_dflash_fa4_fwd()
             self._dflash_paged_append = get_dflash_paged_append()
+        else:
+            # Not the user's typo -- check_valid_attention_backend rejected
+            # those above. This is a subclass that widened
+            # _supported_attention_backends without adding the branch that
+            # loads the ops, which a bare else would answer by silently
+            # handing it FA4's.
+            raise ValueError(
+                f"{type(self).__name__} allows attention_backend="
+                f"{self.dflash_attention_backend!r} but loads no op set for it."
+            )
         self._dflash_trtllm_gen_workspace = None
         self._dflash_trtllm_gen_counters = None
         self.register_buffer("_dflash_batch_indices", None, persistent=False)
@@ -925,6 +935,7 @@ class DFlashForCausalLM(nn.Module):
         self.mlp_convs = mlp_convs
         self.candidate_selector = selector
         return {k: v for k, v in weights.items() if k not in consumed}
+
     #: Tensors the wrapper itself owns: not in draft_model_full, built from the
     #: checkpoint in load_weights, and required.
     WRAPPER_OWNED_WEIGHTS = ("fc.weight", "hidden_norm.weight")
