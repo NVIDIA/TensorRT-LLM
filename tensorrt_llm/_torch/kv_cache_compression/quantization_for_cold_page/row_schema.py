@@ -46,7 +46,7 @@ RopePrecision = Literal["auto", "quantized", "lossless"]
 Family = Literal["deepseek_v4", "mla", "gqa"]
 
 SPAN_ALIGNMENT_ELEMENTS = 16
-"""Every span length is a multiple of this, so a quantized run always starts on an NVFP4 scale group."""
+"""Row strides and the quantized run's start and length are multiples of this NVFP4 scale-group size."""
 
 _DEFAULT_ROPE_PRECISION: Mapping[str, Precision] = {
     "deepseek_v4": "lossless",
@@ -180,13 +180,16 @@ class ColdPagePolicy:
         stride = buffer.row_stride_elements
         if stride is None or stride <= 0 or not buffer.spans:
             raise ValueError(f"{where}: a quantized buffer needs a positive row stride and spans")
+        if stride % SPAN_ALIGNMENT_ELEMENTS:
+            raise ValueError(
+                f"{where}: row stride {stride} must be a multiple of {SPAN_ALIGNMENT_ELEMENTS}"
+            )
         spans = sorted(buffer.spans, key=lambda span: span.start)
         cursor = 0
         for span in spans:
-            if span.start != cursor or span.length <= 0 or span.length % SPAN_ALIGNMENT_ELEMENTS:
+            if span.start != cursor or span.length <= 0:
                 raise ValueError(
-                    f"{where}: spans {spans} must tile the {stride}-element row in order "
-                    f"with lengths that are multiples of {SPAN_ALIGNMENT_ELEMENTS}"
+                    f"{where}: spans {spans} must tile the {stride}-element row in order"
                 )
             cursor = span.end
         if cursor != stride:
@@ -215,6 +218,12 @@ class ColdPagePolicy:
                 "kernel quantizes one run per row and preserves the elements around it"
             )
         _, start, length = quantized[0]
+        if start % SPAN_ALIGNMENT_ELEMENTS or length % SPAN_ALIGNMENT_ELEMENTS:
+            raise ValueError(
+                f"{where}: the quantized run [{start}, {start + length}) must start and end on "
+                f"{SPAN_ALIGNMENT_ELEMENTS}-element NVFP4 scale groups; with rope_precision="
+                f"{self.rope_precision_for(family)!r} the RoPE span of this model does not"
+            )
         return RowGeometry(
             quantized_run_start_elements=start,
             quantized_run_elements=length,
@@ -297,11 +306,8 @@ def rotary_dim(text: object, head_dim: int) -> int | None:
         if factor is None and isinstance(rope_parameters, Mapping):
             factor = rope_parameters.get("partial_rotary_factor")
         value = head_dim if factor is None else int(round(head_dim * float(factor)))
-    if not 0 <= value <= head_dim or value % SPAN_ALIGNMENT_ELEMENTS:
-        raise ValueError(
-            f"RoPE covers {value} of {head_dim} head elements; NVFP4 cold pages need a "
-            f"multiple of {SPAN_ALIGNMENT_ELEMENTS} within the row"
-        )
+    if not 0 <= value <= head_dim:
+        raise ValueError(f"RoPE covers {value} of {head_dim} head elements")
     return value
 
 

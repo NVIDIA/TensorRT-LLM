@@ -80,10 +80,11 @@ def _partial_rotary_config(partial_rotary_factor=0.25, model_type="qwen3_5"):
 def _geometry(buffer):
     """(run start, run length, row stride) in elements."""
 
+    geometry = buffer.geometry
     return (
-        buffer.quantized_run_start_elements,
-        buffer.quantized_run_elements,
-        buffer.raw_row_stride_elements,
+        geometry.quantized_run_start_elements,
+        geometry.quantized_run_elements,
+        geometry.raw_row_stride_elements,
     )
 
 
@@ -1174,7 +1175,7 @@ def test_lossless_layout_uses_resolved_hot_buffer_bytes() -> None:
     )
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager().create_cold_page_codec(
+        _manager(pretrained_config=_mla_config(16, 0)).create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(0,),
@@ -1481,7 +1482,8 @@ def test_mla_lossless_keeps_rope_suffix() -> None:
     [
         ("auto", (0, 448, 512), 12288),
         ("lossless", (0, 448, 512), 12288),
-        ("quantized", (0, 512, 512), 10880),
+        # quantized: 8192 B packed + 1024 B scales + 2176 B opaque indexer.
+        ("quantized", (0, 512, 512), 11392),
     ],
 )
 def test_deepseek_v4_rope_precision_modes(rope_precision, geometry, cold_page_bytes) -> None:
@@ -1503,6 +1505,11 @@ def test_deepseek_v4_rope_precision_modes(rope_precision, geometry, cold_page_by
         {8: {"deepseek_v4_compress": 32 * 512, "deepseek_v4_indexer_compress": 32 * 68}},
     )
     assert metadata.cold_page_bytes == cold_page_bytes
+    run_start, run, stride = geometry
+    assert metadata.integers[0].tolist() == [0, 0, 1, 32, run, stride, run_start]
+    packed, scales = 32 * run // 2, 32 * run // 16
+    lossless = 32 * (stride - run)
+    assert metadata.wide[:2, 3].tolist() == [0, packed + scales + lossless]
 
 
 def test_full_rotary_key_rejects_lossless_rope() -> None:
@@ -1553,8 +1560,31 @@ def test_rotary_dim_ladder() -> None:
     assert rotary_dim(SimpleNamespace(partial_rotary_factor=0.25), 256) == 64
     assert rotary_dim(SimpleNamespace(rope_parameters={"partial_rotary_factor": 0.25}), 256) == 64
     assert rotary_dim(SimpleNamespace(rope_parameters={"full_attention": {}}), 256) is None
-    with pytest.raises(ValueError, match="multiple of 16"):
-        rotary_dim(SimpleNamespace(partial_rotary_factor=0.1), 128)
+    # A RoPE width that is not a scale-group multiple only matters when it has
+    # to become a run boundary, so rotary_dim() reports it unchanged.
+    assert rotary_dim(SimpleNamespace(partial_rotary_factor=0.1), 128) == 13
+
+
+def test_unaligned_rope_width_merges_when_quantized_and_fails_when_lossless() -> None:
+    config = SimpleNamespace(model_type="odd_rope", partial_rotary_factor=0.1)
+    native, _ = _native()
+    _create(
+        _manager(pretrained_config=config),
+        _cache_config((0, "attention")),
+        native,
+        num_kv_heads_per_layer=(8,),
+        head_dim_per_layer=(128,),
+    )
+    assert [_geometry(buffer) for buffer in _layouts(native)[0].buffers] == [(0, 128, 128)] * 2
+
+    with pytest.raises(ValueError, match="scale groups"):
+        _create(
+            _manager(pretrained_config=config, rope_precision="lossless"),
+            _cache_config((0, "attention")),
+            native,
+            num_kv_heads_per_layer=(8,),
+            head_dim_per_layer=(128,),
+        )
 
 
 def test_partial_rotary_is_read_from_the_text_config_of_a_composite_model() -> None:

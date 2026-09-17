@@ -1420,10 +1420,18 @@ TEST_P(Nvfp4ColdPageRopePrecisionTest, MlaLatentRowKeepsLosslessSuffix)
     runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 64, 512}, 576, 0, 2.0F, 0.5F);
 }
 
-// Both sides at once, with a run that spans several tiles and a non-unit global scale.
+// Both sides at once with a row (12 half-groups) that does not divide the CTA iteration, plus a
+// non-unit global scale.
 TEST_P(Nvfp4ColdPageRopePrecisionTest, PrefixAndSuffixInOneRow)
 {
     runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 33, 96}, 160, 32, 2.0F, 0.5F);
+}
+
+// 2200 half-groups exceed one 2048-half-group tile, so the nonzero run start is applied to
+// groups whose first half-group is not zero in every tile loop.
+TEST_P(Nvfp4ColdPageRopePrecisionTest, NonzeroRunStartAcrossTiles)
+{
+    runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 1100, 16}, 48, 16);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4ColdPageRopePrecisionTest,

@@ -300,10 +300,12 @@ the byte layout:
 - **Schema** (`row_schema.py`): what each hot row means. A `LayerSchema` lists
   every buffer of a KVCM layer; a buffer is either opaque (copied byte-for-byte)
   or a row of `nope` and `rope` spans. Schemas come from an ordered table of
-  resolvers that each see the whole layer list: `deepseek_v4` claims layers by
-  their `deepseek_v4_*` roles, `mla` claims key-only layers with the
-  `kv_lora_rank + qk_rope_head_dim` geometry, and `gqa` claims the rest. A
-  resolver may return `EXCLUDE` to leave a layer to KVCM's default lossless codec.
+  resolvers; each resolver sees the layers no earlier resolver claimed.
+  `deepseek_v4` claims layers by their `deepseek_v4_*` roles; `mla` claims every
+  key-only layer and requires the `kv_lora_rank + qk_rope_head_dim` geometry,
+  failing closed on anything else (for example the packed `fp8_ds_mla` rows);
+  `gqa` claims the rest. A resolver may return `EXCLUDE` to leave a layer to
+  KVCM's default lossless codec.
 - **Policy** (`ColdPagePolicy`): which precision each span kind gets. NoPE is
   always quantized; RoPE follows `rope_precision`. After precision resolution,
   adjacent spans of the same precision merge into the kernel's row contract: one

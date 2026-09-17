@@ -3916,7 +3916,8 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         "best ratio; 'lossless' copies it byte-for-byte from the active cache "
         "for the best accuracy; 'auto' keeps the per-model default (lossless "
         "for DeepSeek-V4 compressed rows, quantized elsewhere). Models whose "
-        "K rows are fully rotated cannot use 'lossless'.")
+        "K rows are fully rotated, or that declare per-layer-type RoPE (for "
+        "example Gemma4), cannot use 'lossless'.")
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,

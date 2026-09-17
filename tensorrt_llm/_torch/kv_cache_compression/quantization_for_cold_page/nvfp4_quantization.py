@@ -26,7 +26,14 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 from ...pyexecutor.resource_manager import DataType
 from .quantization_for_cold_page import ColdPageQuantizationCompression
-from .row_schema import EXCLUDE, ColdPagePolicy, LayerSchema, ResolverContext, resolve_layer_schemas
+from .row_schema import (
+    EXCLUDE,
+    ColdPagePolicy,
+    LayerSchema,
+    ResolverContext,
+    RowGeometry,
+    resolve_layer_schemas,
+)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -117,25 +124,39 @@ class _Nvfp4BufferLayout:
 
     role: str
     scales: _Nvfp4Scales | None = None
-    quantized_run_start_elements: int = 0
-    quantized_run_elements: int = 0
-    raw_row_stride_elements: int = 0
+    geometry: RowGeometry | None = None
+
+    def __post_init__(self) -> None:
+        if (self.scales is None) != (self.geometry is None):
+            raise ValueError("a quantized buffer needs both scales and a row geometry")
 
     @property
     def is_quantized(self) -> bool:
-        return self.scales is not None
+        return self.geometry is not None
+
+    def _run(self) -> RowGeometry:
+        assert self.geometry is not None, "opaque buffers have no row geometry"
+        return self.geometry
+
+    @property
+    def quantized_run_start_elements(self) -> int:
+        return self._run().quantized_run_start_elements
+
+    @property
+    def quantized_run_elements(self) -> int:
+        return self._run().quantized_run_elements
+
+    @property
+    def raw_row_stride_elements(self) -> int:
+        return self._run().raw_row_stride_elements
 
     @property
     def lossless_prefix_elements(self) -> int:
-        return self.quantized_run_start_elements
+        return self._run().lossless_prefix_elements
 
     @property
     def lossless_suffix_elements(self) -> int:
-        return (
-            self.raw_row_stride_elements
-            - self.quantized_run_start_elements
-            - self.quantized_run_elements
-        )
+        return self._run().lossless_suffix_elements
 
     # Cold-page byte accounting for `rows` hot rows of this buffer.
 
@@ -340,11 +361,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             scale_pair = scales.get(buffer.scale_key, _IDENTITY_NVFP4_SCALE)
             quantized.append(
                 _Nvfp4BufferLayout(
-                    role=buffer.role,
-                    scales=_Nvfp4Scales(*scale_pair),
-                    quantized_run_start_elements=geometry.quantized_run_start_elements,
-                    quantized_run_elements=geometry.quantized_run_elements,
-                    raw_row_stride_elements=geometry.raw_row_stride_elements,
+                    role=buffer.role, scales=_Nvfp4Scales(*scale_pair), geometry=geometry
                 )
             )
         return _Nvfp4LayerLayout(
