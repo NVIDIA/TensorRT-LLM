@@ -245,9 +245,11 @@ class GatedMLP(nn.Module):
 
     def _can_fuse_swiglu_fp8_quant(self) -> bool:
         """Check whether down projection can consume fused SwiGLU FP8 output."""
-        # Parameterized variants such as MiniMax M3 SwiGLU-OAI install a
-        # custom activation callable and must keep the unfused implementation.
-        if not (self.activation == F.silu
+        # silu_and_mul_fp8_quantize_1x128_packed_ue8m0 takes the limit but has
+        # no alpha/beta, so a parameterized SwiGLU must stay unfused. MiniMax
+        # M3 SwiGLU-OAI reaches here with plain F.silu plus swiglu_alpha and
+        # swiglu_beta, so the activation check alone does not exclude it.
+        if not (self.activation == F.silu and self._is_plain_swiglu()
                 and self.down_proj.has_fp8_block_scales):
             return False
         if get_sm_version() == 107:

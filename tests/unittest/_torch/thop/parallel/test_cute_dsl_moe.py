@@ -1592,6 +1592,7 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     num_experts = 256
     num_local_experts = num_experts // ep_size
 
+    torch.manual_seed(20260727 + tile_size)
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
     token_selected_experts = token_selected_experts.to(torch.int32)
@@ -1618,16 +1619,14 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
     num_valid_permuted_tokens = total_num_padded_tokens.item()
 
-    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
-        torch.bfloat16
-    )
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size * 2, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)

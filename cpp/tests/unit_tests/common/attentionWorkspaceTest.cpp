@@ -103,7 +103,7 @@ size_t expectedUnfusedContextWorkspace(bool crossAttention)
 size_t getUnfusedContextWorkspace(tcop::AttentionOp const& op)
 {
     return op.getWorkspaceSizeForContext(
-        nvinfer1::DataType::kHALF, kBatchSize, kInputSequenceLength, kCrossKvLength, kPackedTokenCount);
+        tensorrt_llm::DataType::kHALF, kBatchSize, kInputSequenceLength, kCrossKvLength, kPackedTokenCount);
 }
 
 } // namespace

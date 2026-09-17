@@ -31,7 +31,6 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     project_sparse_attn_output,
 )
 from tensorrt_llm._torch.attention.mla import MLA, _is_cute_dsl_fp8_bmm_available
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
 from tensorrt_llm._utils import get_sm_version
@@ -188,9 +187,10 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         pretrained_config=pretrained_config,
         sparse_attention_config=sparse_config,
         quant_config=quant_config,
+        # Mirror the production predicate exactly, so the test does not enable
+        # the cute-dsl path on a box where the DSL package is absent.
         use_cute_dsl_blockscaling_mm=(
-            dtype_str == "fp8"
-            and (sm_version in (100, 103) or (sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE))
+            dtype_str == "fp8" and _is_cute_dsl_fp8_bmm_available(sm_version)
         ),
     )
 
