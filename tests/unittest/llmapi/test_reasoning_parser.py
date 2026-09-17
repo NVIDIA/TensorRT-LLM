@@ -795,6 +795,15 @@ def test_nano_v3_reasoning_parser_stream(delta_texts: list, content: list,
         (["reasoning", "<tool_call>data"], "", "", {
             "force_nonempty_content": True
         }),
+        # A stream that ends on a complete tag: the tag is a delimiter,
+        # not model output.
+        (["a", R1_END], "", "", None),
+        (["a", R1_END], "a", "", {
+            "force_nonempty_content": True
+        }),
+        ([R1_START], "", "", {
+            "enable_thinking": False
+        }),
     ])
 def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
                                          finish_reasoning: str,
