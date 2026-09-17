@@ -1038,13 +1038,14 @@ class TestExternalDrafterKvDtype:
     """The draft budget must be charged at the dtype the draft pool is ALLOCATED in.
 
     ``kv_cache_config.dtype: fp8`` stamps the target's fp8 KV algo onto an
-    external drafter's ModelConfig, but the drafter keeps a bf16 pool (dflash
-    rejects an fp8 pool and falls back to a max_seq_len-dense private arena).
-    The allocation path dropped the inherited algo; the cost path did not, so
-    the split charged 2880 B/token for a pool costing 5760, handed the draft
-    manager half the tokens the target got, and the GEN worker died in
-    ``_prepare_draft_resources`` at ~50% target utilization -- fatal to every
-    rank, because the capacity scheduler admits on the target pool alone.
+    external drafter's ModelConfig, but the drafter keeps a bf16 pool. The
+    allocation path dropped the inherited algo; the cost path did not, so the
+    split charged 2880 B/token for a pool costing 5760 and handed the draft
+    manager half the tokens the target got.
+
+    The GEN worker then died in ``_prepare_draft_resources`` at ~50% target
+    utilization, fatal to every rank: the capacity scheduler admits on the target
+    pool alone.
     """
 
     # MLA drafter: kv_lora_rank 512 + qk_rope_head_dim 64 = 576, kv_factor 1,

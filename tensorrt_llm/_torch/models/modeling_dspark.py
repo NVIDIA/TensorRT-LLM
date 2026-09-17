@@ -1097,12 +1097,11 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
 def _runtime_position_cap(model_config, pretrained_config, slack: int = 0) -> int:
     """Fallback RoPE table length: the served length, not the advertised one.
 
-    Both drafter families build a position table, and both were sized from the
-    checkpoint's max_position_embeddings. K3 advertises 1,048,576, which costs
-    ~256 MiB per rank as complex64 -- built via full-size fp32 cos/sin, so
-    ~768 MiB transient -- while the context cache is bounded by the runtime
-    max_seq_len. Only the table length is affected; YaRN's correction range is
-    computed from original_max_position_embeddings and does not move.
+    Both drafter families size a position table from the checkpoint's
+    max_position_embeddings. K3 advertises 1,048,576: ~256 MiB per rank as
+    complex64, ~768 MiB transient via full-size fp32 cos/sin, while the context
+    cache is bounded by the runtime max_seq_len. Only the table length moves;
+    YaRN's correction range comes from original_max_position_embeddings.
 
     Shrinking the table this way is also what made its bound matter: sized from
     max_position_embeddings it could not be indexed past, sized from
@@ -1343,13 +1342,11 @@ class DSv4DSparkDraftModel(nn.Module):
     def _dspark_freqs_table(self, device: torch.device) -> torch.Tensor:
         """Return the plain-RoPE table cached for ``(device, cap)``.
 
-        Sized from the ceiling the worker publishes once it knows the runtime
-        one, because that is what the decode positions actually reach: they come
-        from the target's position_ids, and py_executor_creator raises the
-        engine's max_seq_len past model_config's value without writing it back.
-        ``_freqs_cap`` is the fallback for direct construction in tests, where no
-        worker runs. MLADSparkForCausalLM reads the same attribute in
-        ``_mla_freqs_cis``.
+        Sized from the ceiling the worker publishes once it knows the runtime one,
+        because that is what decode positions reach: they come from the target's
+        position_ids, and py_executor_creator raises the engine's max_seq_len past
+        model_config's without writing it back. ``_freqs_cap`` is the fallback for
+        direct construction in tests; _mla_freqs_cis reads the same attribute.
         """
         cap = int(getattr(self, "_runtime_position_ceiling", None) or self._freqs_cap)
         key = (str(device), cap)
@@ -2386,10 +2383,9 @@ class _MLABlockFixup(NamedTuple):
 
     The block's own latents are written into the pool at ``ctx_len + j``. Those
     slots belong to this request -- the draft KV manager adds
-    ``max(draft_len, max_total_draft_tokens)`` tokens to every generation request
-    each step (resource_manager.py:1060) -- and the accepted tokens overwrite
-    them next step, so the write is transient. Same thing the GQA drafter's
-    TRTLLM backend does (modeling_dflash.py append_paged_kv_cache).
+    ``max(draft_len, max_total_draft_tokens)`` tokens per generation request each
+    step (resource_manager.py:1060) -- and the accepted tokens overwrite them next
+    step. Same thing the GQA drafter's TRTLLM backend does.
 
     In-block causality then leaves query j seeing block keys 0..j, so only the
     strict upper triangle needs fixing up. Every field depends on ctx_len, the
@@ -2502,12 +2498,11 @@ def _resolve_dspark_mla_rope_params(pretrained_config, model_config=None, slack:
 class _DSparkHeadMixin:
     """The DSpark head set, shared by the GQA and MLA drafter wrappers.
 
-    DSpark is DFlash plus three things, and only these three are common to both
-    backbone shapes: the vanilla Markov intra-block logit bias, the
-    ``shift_label`` slot convention (block slot j predicts draft token j+1, so
-    slot 0 holds the anchor) and the confidence head. The block decode itself
-    has nothing in common between the shapes, which is why this is a mixin and
-    not a base class.
+    DSpark is DFlash plus three things common to both backbone shapes: the
+    vanilla Markov intra-block logit bias, the ``shift_label`` slot convention
+    (block slot j predicts draft token j+1, so slot 0 holds the anchor) and the
+    confidence head. The block decode has nothing in common between the shapes,
+    which is why this is a mixin and not a base class.
 
     Confidence-scheduled verification is not implemented yet: ``confidence_proj``
     is loaded but unused, and drafting always proposes the full K tokens.
@@ -2647,13 +2642,14 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     Adds the DSpark head set (see :class:`_DSparkHeadMixin`) on top of the
     DFlash block decode.
 
-    Named for the attention shape, not for a model: the backbone is whatever
-    the drafter config resolves to through the model registry, and the
-    inherited block decode works for every GQA family the DFlash drafters
-    already cover (qwen3, llama, gpt_oss, ...). A per-model subclass would be
-    empty. The GQA precondition is inherited, not introduced here -- see
-    ``DFlashForCausalLM._validate_gqa_shape``. The MLA-backboned drafter is the
-    sibling :class:`MLADSparkForCausalLM`, not a subclass of this.
+    Named for the attention shape, not a model: the backbone is whatever the
+    drafter config resolves to, and the inherited block decode covers every GQA
+    family the DFlash drafters already do (qwen3, llama, gpt_oss, ...), so a
+    per-model subclass would be empty. The GQA precondition is inherited from
+    ``DFlashForCausalLM._validate_gqa_shape``, not introduced here.
+
+    The MLA-backboned drafter is the sibling :class:`MLADSparkForCausalLM`, not a
+    subclass of this.
 
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
@@ -2689,14 +2685,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     ``spec_config.attention_backend`` selects among this class's own three
     block-decode implementations, not among the shared DFlash worker op sets:
 
-    ``CUTEDSL``  one cute-dsl pass with ``kv_bounds``, no fixup
-                 (``_cute_dsl_block_decode``). Paged only. What ``AUTO`` picks
-                 on a build that can run it.
-    ``TRTLLM``   flashinfer's trtllm-gen absorbed-MLA paged decode plus the
-                 upper-triangle fixup (``_mla_paged_attention``).
-    ``VANILLA``  the eager torch reference. It is also what the other two
-                 degrade to on the unpaged arena, where there are no page
-                 tables to hand a kernel.
+    ``CUTEDSL``  one cute-dsl pass with ``kv_bounds``, no fixup; paged only, AUTO's pick.
+    ``TRTLLM``   trtllm-gen absorbed-MLA paged decode + upper-triangle fixup.
+    ``VANILLA``  the eager torch reference; where the other two land unpaged.
 
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
@@ -2851,11 +2842,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         """Reject a shape the kernel cannot serve, here, naming the reason.
 
         Without this the rejection is silent until it is not: ``get_valid_tactics``
-        returns [] (cute_dsl_custom_ops.py:8508), the AutoTuner falls back to its
-        -1 sentinel, and ``forward`` compiles an unvalidated config -- so a draft
-        pool with ``tokens_per_block=256`` (``128 % 256 != 0``,
-        mla_decode_fp16.py:3798) surfaces as a CUTLASS error out of the fifth
-        drafter layer rather than as the configuration problem it is.
+        returns [] (cute_dsl_custom_ops.py:8508), the AutoTuner falls back to its -1
+        sentinel, and ``forward`` compiles an unvalidated config -- so a draft pool
+        with ``tokens_per_block=256`` (``128 % 256 != 0``, mla_decode_fp16.py:3798)
+        surfaces as a CUTLASS error out of the fifth drafter layer.
 
         Page size is the only operand here that is not fixed by the checkpoint,
         and it comes from the draft KV pool, so this cannot move to __init__.
@@ -2904,13 +2894,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size):
         """One cute-dsl MLA decode over context AND block, no fixup.
 
-        The trtllm-gen path has to split the work: its q_len semantics are
-        causal, so query i cannot see block positions j > i, and the strict
-        upper triangle is recovered eagerly afterwards and merged by LSE. The
-        cute-dsl kernel takes ``kv_bounds`` -- a per-query-token KV length that
-        REPLACES the implicit causal bound (mla_decode_fp16.py:400-407) -- so
-        filling it with ctx_len + block_size makes every block position visible
-        to every other in one pass and deletes the fixup outright.
+        The trtllm-gen path splits the work: its q_len semantics are causal, so
+        query i cannot see block positions j > i, and the strict upper triangle is
+        recovered eagerly and merged by LSE. The cute-dsl kernel takes ``kv_bounds``,
+        a per-query-token KV length REPLACING the implicit causal bound
+        (mla_decode_fp16.py:400-407), so one pass sees all of it and the fixup goes.
 
         No fallback: what the kernel cannot serve raises. Build-level
         availability is checked at construction through
@@ -2974,12 +2962,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         full visibility). Its LSE is base 2 (also measured: exact against
         ``log2(sum exp)``, 1.84 off against the natural log).
 
-        The block's own latents go into the pool first, at ``ctx_len + j``
-        (see _MLABlockFixup). With ``seq_lens = ctx_len + block_size`` the kernel
-        covers context AND block, and in-block causality leaves only the block's
-        strict upper triangle -- 8 keys, attended eagerly against ``blk_kv`` and
-        merged by log-sum-exp. The room those writes need is reserved by
-        ``dflash_allocated_ctx_limit``.
+        The block's own latents go into the pool first, at ``ctx_len + j`` (see
+        _MLABlockFixup). With ``seq_lens = ctx_len + block_size`` the kernel covers
+        context AND block, and in-block causality leaves only the strict upper
+        triangle -- 8 keys, attended eagerly against ``blk_kv`` and merged by
+        log-sum-exp. ``dflash_allocated_ctx_limit`` reserves the room.
 
         Returns the latent-space output ``[B, block, heads, kv_lora_rank]``.
         """
@@ -3044,12 +3031,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     def _mla_freqs_cis(self, device):
         """Adjacent-pair YaRN table, cached. See build_dspark_mla_yarn_freqs_cis.
 
-        Sized from the ceiling the worker publishes once it knows the runtime
-        one (_runtime_position_ceiling, set in DFlashWorker._lazy_init_ctx_buffers
-        before any forward), because that is the value ctx_len is clamped to and
-        it is strictly above model_config.max_seq_len whenever spec decoding is
-        on. The config-derived cap is the fallback for direct construction in
-        tests, where no worker runs.
+        Sized from the ceiling the worker publishes once it knows the runtime one
+        (_runtime_position_ceiling, set in DFlashWorker._lazy_init_ctx_buffers before
+        any forward), because that is what ctx_len is clamped to and it exceeds
+        model_config.max_seq_len whenever spec decoding is on. The config cap is the
+        fallback for direct construction in tests.
         """
         rope = dict(self._mla_rope_params)
         runtime_cap = self._runtime_position_ceiling

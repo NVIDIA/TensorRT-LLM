@@ -1729,19 +1729,17 @@ class KvCacheCreator:
     def _get_draft_kv_model_config(self) -> ModelConfig:
         """The draft ModelConfig describing the KV pool as it is ALLOCATED.
 
-        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8
-        KV algo onto every loaded model, including a standalone drafter. The
-        drafter stores and reads its pool in its weights dtype (DFlash
-        validates a bf16 pool and otherwise falls back to the max_seq_len-dense
-        private arena, which OOMs at long context), so the pool dtype must
-        follow the drafter, not the target.
+        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8 KV
+        algo onto every loaded model, including a standalone drafter. The drafter
+        stores and reads its pool in its weights dtype (DFlash validates a bf16 pool
+        and otherwise falls back to the max_seq_len-dense private arena, which OOMs at
+        long context), so the pool dtype must follow the drafter.
 
-        Every consumer of draft KV bytes must go through here. If the budget
-        split and the allocation read different dtypes, the split charges fp8
-        bytes for a bf16 pool and the draft manager gets HALF the target's
-        tokens. The capacity scheduler admits on the target pool alone, so the
-        draft pool cannot backpressure -- past ~50% target utilization it raises
-        "Draft KV cache context resize failed", fatal to every rank.
+        Every consumer of draft KV bytes must go through here. If the budget split
+        and the allocation read different dtypes, the split charges fp8 bytes for a
+        bf16 pool and the draft manager gets HALF the target's tokens. The capacity
+        scheduler admits on the target pool alone, so past ~50% target utilization it
+        raises "Draft KV cache context resize failed", fatal to every rank.
         """
         effective_draft_config = self._get_effective_draft_config()
         # Narrower than is_external_drafter(), matching

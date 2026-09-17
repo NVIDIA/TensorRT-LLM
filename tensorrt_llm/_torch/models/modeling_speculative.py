@@ -96,12 +96,11 @@ def markov_prev_embeddings(prev_tokens: torch.Tensor,
                            markov_w1: torch.Tensor) -> torch.Tensor:
     """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
 
-    The anchor is the last accepted token, which on the one-model rejection
-    path comes from flashinfer's ``chain_speculative_sampling``: it pads
-    non-accepted positions with ``-1`` and returns an out-of-range id for a row
-    whose ``relu(target - draft)`` residual has no mass. Mask like
-    ``modules/embedding.py`` does for the target embedding, so such a row
-    contributes no bias instead of tripping a device-side assert.
+    The anchor is the last accepted token, which on the one-model rejection path
+    comes from flashinfer's ``chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1`` and returns an out-of-range id for a row whose
+    ``relu(target - draft)`` residual has no mass. Mask like modules/embedding.py
+    does, so such a row contributes no bias instead of tripping a device assert.
 
     Args:
         prev_tokens: previous token ids (draft vocab), any shape.
