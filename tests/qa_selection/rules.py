@@ -18,8 +18,7 @@
 
 A rule is keyed by the `reason=` string of a `pytest.mark.skipif` decorator in
 the integration conftest. Its condition draws on a closed vocabulary of
-`MachineProfile` fields and operators, both validated at load. A reason absent
-from the file has no rule and is never deselected.
+`MachineProfile` fields and operators, both validated at load.
 """
 
 import json
@@ -28,12 +27,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterator, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, Optional, Set, Tuple
 
 from .machines import MachineProfile
-
-NUMERIC_OPERATORS = ("lt", "le", "gt", "ge", "eq", "ne")
-STRING_OPERATORS = ("eq", "ne", "contains", "not_contains")
 
 
 class RuleConfigError(ValueError):
@@ -52,6 +48,9 @@ class MachineCondition:
 
     Built from a `skip_when` object, e.g. `{"sm": {"lt": 90}}`.
     """
+
+    NUMERIC_OPERATORS = ("lt", "le", "gt", "ge", "eq", "ne")
+    STRING_OPERATORS = ("eq", "ne", "contains", "not_contains")
 
     # Operators each MachineProfile field accepts.
     FIELD_OPERATORS = {
@@ -117,8 +116,9 @@ class MachineCondition:
 
 @dataclass(frozen=True)
 class SkipRule:
-    """One skipif decorator, identified by its reason string."""
+    """One skipif decorator: matched by its reason, identified by its name."""
 
+    decorator: str
     reason: str
     condition: MachineCondition
 
@@ -127,20 +127,27 @@ class SkipRule:
         """Validate one `rules` entry and build a rule from it."""
         where = f"{source}: rule #{index}"
         RuleConfigError.check(isinstance(entry, dict), f"{where} must be an object")
-        unknown = entry.keys() - {"reason", "note", "skip_when"}
+        unknown = entry.keys() - {"decorator", "reason", "note", "skip_when"}
         RuleConfigError.check(
             not unknown, f"{where} has unknown keys: {', '.join(sorted(unknown))}"
         )
 
+        decorator = entry.get("decorator")
+        RuleConfigError.check(
+            isinstance(decorator, str) and decorator,
+            f"{where}: decorator must be a non-empty string, got {decorator!r}",
+        )
+
+        where = f"{source}: rule {decorator}"
         reason = entry.get("reason")
         RuleConfigError.check(
             isinstance(reason, str) and reason,
             f"{where}: reason must be a non-empty string, got {reason!r}",
         )
 
-        where = f"{source}: rule {reason!r}"
         RuleConfigError.check("skip_when" in entry, f"{where} has no skip_when")
         return cls(
+            decorator=decorator,
             reason=reason,
             condition=MachineCondition.from_mapping(where, entry["skip_when"]),
         )
@@ -176,12 +183,18 @@ class SkipRuleTable(Mapping):
         )
 
         rules: Dict[str, SkipRule] = {}
+        named: Set[str] = set()
         for index, entry in enumerate(entries, start=1):
             rule = SkipRule.from_mapping(source, index, entry)
             RuleConfigError.check(
                 rule.reason not in rules, f"{source}: duplicate reason {rule.reason!r}"
             )
+            RuleConfigError.check(
+                rule.decorator not in named,
+                f"{source}: duplicate decorator {rule.decorator}",
+            )
             rules[rule.reason] = rule
+            named.add(rule.decorator)
         return cls(rules)
 
     def __getitem__(self, reason: str) -> SkipRule:
@@ -194,9 +207,9 @@ class SkipRuleTable(Mapping):
         return len(self._rules)
 
     @property
-    def reasons(self) -> FrozenSet[str]:
-        """Every reason string this file declares."""
-        return frozenset(self._rules)
+    def decorators(self) -> FrozenSet[str]:
+        """Every `skip_*` name this file declares a rule for."""
+        return frozenset(rule.decorator for rule in self._rules.values())
 
 
 @lru_cache(maxsize=1)
