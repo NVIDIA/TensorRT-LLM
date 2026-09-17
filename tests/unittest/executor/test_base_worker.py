@@ -1,4 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +22,63 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 model_path = llm_models_root() / default_model_name
+
+
+@pytest.mark.cpu_only
+def test_get_startup_metrics_promotes_model_engine_stages() -> None:
+    worker = object.__new__(BaseWorker)
+    worker._is_pytorch_backend = True
+    worker.engine = SimpleNamespace(
+        metrics={
+            "worker_start_seconds": 0.5,
+            "initial_model_engine": {
+                "total_warmup_seconds": 2.5
+            },
+            "final_model_engine": {
+                "total_warmup_seconds": 3.5
+            },
+            "initial_draft_model_engine": {
+                "total_warmup_seconds": 1.0
+            },
+            "final_draft_model_engine": {
+                "total_warmup_seconds": 1.25
+            },
+        },
+        model_engine=SimpleNamespace(
+            metrics={"must_not_be_reported": 1.0},
+            model_loader=SimpleNamespace(
+                metrics={"total_model_loading_seconds": 1.5}),
+        ),
+        draft_model_engine=SimpleNamespace(
+            metrics={"must_not_be_reported": 1.0},
+            model_loader=SimpleNamespace(
+                metrics={"total_model_loading_seconds": 0.75}),
+        ),
+    )
+
+    assert worker.get_startup_metrics() == {
+        "initial_model_engine": {
+            "total_warmup_seconds": 2.5
+        },
+        "final_model_engine": {
+            "total_warmup_seconds": 3.5
+        },
+        "initial_draft_model_engine": {
+            "total_warmup_seconds": 1.0
+        },
+        "final_draft_model_engine": {
+            "total_warmup_seconds": 1.25
+        },
+        "py_executor": {
+            "worker_start_seconds": 0.5
+        },
+        "model_loader": {
+            "total_model_loading_seconds": 1.5
+        },
+        "draft_model_loader": {
+            "total_model_loading_seconds": 0.75
+        },
+    }
 
 
 @pytest.mark.cpu_only
