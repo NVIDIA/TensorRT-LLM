@@ -25,11 +25,6 @@ reaches the KV cache allocator, so the fork/join runtime would still fail.
 Model: Qwen3-4B.
 """
 
-import gc
-
-import pytest
-import torch
-
 from ..conftest import llm_models_root, skip_no_rubin
 
 # Qwen3-4B: dense GQA, so attention arrives as a single mixed call -- the path
@@ -50,15 +45,6 @@ MIXED_LENGTH_PROMPTS = [
     "Once upon a time in a land far far away there lived a brave knight who fought dragons every day",
     "A",
 ]
-
-
-@pytest.fixture(autouse=True)
-def _gc_cleanup():
-    """Free GPU memory between tests."""
-    yield
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def _generate(model_path, prompts, *, localized: bool):
