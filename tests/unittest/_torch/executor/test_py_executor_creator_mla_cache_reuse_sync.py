@@ -374,6 +374,9 @@ def test_move_model_engine_metrics_moves_and_clears():
     py_executor_creator._move_model_engine_metrics(
         py_executor, model_engine, "initial", draft_model_engine
     )
+    assert model_engine.metrics == {}
+    assert draft_model_engine.metrics == {}
+
     model_engine.metrics["total_warmup_seconds"] = 3.5
     draft_model_engine.metrics["total_warmup_seconds"] = 2.0
     py_executor_creator._move_model_engine_metrics(
