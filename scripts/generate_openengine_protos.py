@@ -43,9 +43,6 @@ _GENERATED_INIT_CONTENT = (
 # Stable ownership contract for generated directories; do not rename.
 _OWNERSHIP_MARKER_NAME = ".openengine-generated"
 _OWNERSHIP_MARKER_CONTENT = "Owned by scripts/generate_openengine_protos.py; safe to replace.\n"
-# Compatibility token emitted before generated directories had a dedicated
-# ownership marker. Keep this stable so retained output can migrate forward.
-_LEGACY_OWNERSHIP_MARKER = '"""Private OpenEngine bindings generated during the build."""'
 _GENERATOR_DISTRIBUTIONS = {
     "grpcio": "grpcio",
     "grpcio_tools": "grpcio-tools",
@@ -275,12 +272,7 @@ def _publish_generated_output(staged_output: Path, output_dir: Path) -> None:
         if not output_dir.is_dir():
             raise RuntimeError(f"Refusing to replace non-directory output path: {output_dir}")
         ownership_marker = output_dir / _OWNERSHIP_MARKER_NAME
-        legacy_init = output_dir / "__init__.py"
         owned_output = ownership_marker.is_file() and not ownership_marker.is_symlink()
-        if legacy_init.is_file() and not legacy_init.is_symlink():
-            owned_output = owned_output or _LEGACY_OWNERSHIP_MARKER in legacy_init.read_text(
-                encoding="utf-8", errors="replace"
-            )
         if not owned_output:
             raise RuntimeError(
                 f"Refusing to replace {output_dir}: it is not owned by the OpenEngine generator"

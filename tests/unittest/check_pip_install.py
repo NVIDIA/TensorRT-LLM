@@ -157,8 +157,12 @@ def verify_openengine_distribution() -> None:
         "server",
     )
     expected_files = {
+        "tensorrt_llm/grpc/openengine/_generated/__init__.py",
+        *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.py"
+          for name in proto_names),
         *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.pyi"
           for name in proto_names),
+        "tensorrt_llm/grpc/openengine/_generated/openengine_pb2_grpc.py",
         "tensorrt_llm/grpc/openengine/proto/LICENSE",
         "tensorrt_llm/grpc/openengine/proto/manifest.json",
         *(f"tensorrt_llm/grpc/openengine/proto/openengine/v1/{name}.proto"

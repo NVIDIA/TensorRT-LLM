@@ -39,29 +39,6 @@ def test_publish_refuses_to_replace_an_unowned_directory(tmp_path):
     assert staged_output.is_dir()
 
 
-def test_publish_replaces_legacy_output_after_init_metadata_changes(tmp_path):
-    generator = _load_generator()
-    staged_output = tmp_path / "staged"
-    staged_output.mkdir()
-    (staged_output / "generated.py").write_text("new\n", encoding="utf-8")
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-    legacy_init = (
-        "# An older generated copyright header.\n\n"
-        '"""Private OpenEngine bindings generated during the build."""\n'
-    )
-    assert legacy_init != generator._GENERATED_INIT_CONTENT
-    (output_dir / "__init__.py").write_text(legacy_init, encoding="utf-8")
-    stale_file = output_dir / "stale.py"
-    stale_file.write_text("stale\n", encoding="utf-8")
-
-    generator._publish_generated_output(staged_output, output_dir)
-
-    assert (output_dir / "generated.py").read_text(encoding="utf-8") == "new\n"
-    assert (output_dir / generator._OWNERSHIP_MARKER_NAME).is_file()
-    assert not stale_file.exists()
-
-
 def test_main_replaces_an_output_symlink_without_touching_its_target(tmp_path, monkeypatch):
     generator = _load_generator()
     symlink_target = tmp_path / "target"
