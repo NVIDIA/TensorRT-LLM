@@ -6384,7 +6384,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
-        "DGX_B200-8_GPUs-PyTorch-M3-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_8gpu", 1, 1, 8, 1, true],
+        "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
         "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         // Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and
         // pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the
