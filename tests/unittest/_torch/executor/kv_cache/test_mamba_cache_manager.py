@@ -3759,6 +3759,78 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     assert mgr.prev_num_accepted_tokens[2] == 5
 
 
+def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
+    """The conv half of the KDA state crosses ctx->gen in bf16.
+
+    ``extract_mamba_kv_cache_params`` forces the KDA delta-rule (ssm) pool to
+    fp32 but leaves the short-convolution pool at the model dtype, so what the
+    context rank serializes and the generation rank restores for the conv slot
+    is bf16 while the SA replay caches the generation rank rebuilds from it are
+    fp32. Seeding must widen the restored rows losslessly, keep the logical
+    shape, leave the restored bf16 pool itself untouched so the decode path
+    reuses exactly what was transferred, and clear only the draft scratch of
+    the seeded slots.
+    """
+    torch.manual_seed(0)
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = True
+    mgr.local_num_mamba_layers = 2
+    mgr.conv_state_shape = [6, 4]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr._request_id_to_state_index = {101: 1, 202: 3}
+    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+    # The restored (transferred) conv pool, in the dtype the transceiver moves.
+    mgr.all_conv_states = [(torch.randn(4, 6, 4) * 0.1).to(torch.bfloat16) for _ in range(2)]
+    restored = [conv.clone() for conv in mgr.all_conv_states]
+
+    def dim_contiguous_conv_cache() -> torch.Tensor:
+        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+
+    mgr.kda_conv_q = dim_contiguous_conv_cache()
+    mgr.kda_conv_k = dim_contiguous_conv_cache()
+    mgr.kda_conv_v = dim_contiguous_conv_cache()
+    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
+    mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
+    mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+
+    mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    for layer_offset, conv_state in enumerate(mgr.all_conv_states):
+        assert conv_state.dtype is torch.bfloat16
+        for slot in (1, 3):
+            for replay_buffer, start in (
+                (mgr.kda_conv_q, 0),
+                (mgr.kda_conv_k, 2),
+                (mgr.kda_conv_v, 4),
+            ):
+                # fp32 replay cache, logical shape unchanged by the widening.
+                assert replay_buffer.dtype is torch.float32
+                seeded = replay_buffer[layer_offset, slot, :, :4]
+                assert seeded.shape == (2, 4)
+                # bf16 -> fp32 is lossless, so the restored values must survive
+                # the widening bit for bit.
+                torch.testing.assert_close(
+                    seeded,
+                    conv_state[slot, start : start + 2, :].float(),
+                    rtol=0,
+                    atol=0,
+                )
+                assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
+            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
+            assert mgr.prev_num_accepted_tokens[slot] == 0
+        # Slots no request restored keep their pre-seed contents.
+        for slot in (0, 2):
+            assert (mgr.kda_conv_q[layer_offset, slot] == 7.0).all()
+            assert (mgr.kda_qkg_cache[layer_offset, slot] == 7.0).all()
+        # The restored bf16 pool is read-only here: plain decode (speculation
+        # off) reuses exactly the state the transfer wrote.
+        torch.testing.assert_close(conv_state, restored[layer_offset], rtol=0, atol=0)
+    assert mgr.prev_num_accepted_tokens[0] == 5
+    assert mgr.prev_num_accepted_tokens[2] == 5
+
+
 @skip_no_cuda
 def test_v2_hybrid_static_dynamic_tree_capacity():
     spec_config = MTPDecodingConfig(

@@ -131,8 +131,8 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
-  # KDA runtime: host-derived prefill metadata, bf16 state pool round-trip,
-  # and bf16 state pool round-trip.
+  # KDA runtime: host-derived prefill metadata and the bf16 state pool
+  # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
