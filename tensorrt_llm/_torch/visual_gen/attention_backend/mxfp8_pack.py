@@ -31,6 +31,9 @@ def metadata_eligible(x: torch.Tensor) -> bool:
         and x.is_cuda
         and x.shape[3] == 128
         and x.shape[2] >= 4096
+        # CUDA grid = (four CTAs per 128-row tile, batch * heads, 1).
+        and (x.shape[2] + 127) // 128 * 4 <= 2**31 - 1
+        and x.shape[0] * x.shape[1] <= 65535
         and all(n > 0 for n in x.shape)
         and x.stride(-1) == 1
         and all(s > 0 and s % 8 == 0 for s in x.stride()[:-1])

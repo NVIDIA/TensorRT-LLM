@@ -22,6 +22,7 @@ import pytest
 import torch
 from torch._dynamo.backends.registry import lookup_backend
 from torch._dynamo.utils import counters
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tensorrt_llm._torch.visual_gen.attention_backend import cudnn, mxfp8_pack
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -326,3 +327,23 @@ def test_mxfp8_pack_cudnn_consumer(kv_sequence: int) -> None:
     for reference, result in zip(expected, actual, strict=True):
         assert torch.isfinite(reference).all().item() and torch.isfinite(result).all().item()
         assert torch.equal(reference.view(torch.uint8), result.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        pytest.param((1, 65535, 4096, 128), True, id="grid_y_max"),
+        pytest.param((1, 65536, 4096, 128), False, id="grid_y_overflow"),
+        pytest.param((256, 256, 4096, 128), False, id="grid_y_product_overflow"),
+        pytest.param((1, 1, ((2**31 - 1) // 4) * 128, 128), True, id="grid_x_max"),
+        pytest.param((1, 1, ((2**31 - 1) // 4) * 128 + 1, 128), False, id="grid_x_overflow"),
+        pytest.param((2, 40, 32760, 128), True, id="wan_480p"),
+        pytest.param((2, 40, 75600, 128), True, id="wan_720p"),
+    ],
+)
+def test_mxfp8_pack_grid_bounds(shape: tuple[int, int, int, int], expected: bool) -> None:
+    """Check launch bounds using CUDA metadata without allocating large tensors."""
+    with FakeTensorMode(), patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
+        x = torch.empty(shape, device="cuda:0", dtype=torch.bfloat16)
+        assert x.untyped_storage().device.type == "meta"
+        assert mxfp8_pack.metadata_eligible(x) is expected
