@@ -986,7 +986,7 @@ class TestFinishReasons:
     @pytest.mark.parametrize("new_token, expect_finished", [(13, True), (17, True), (99, False)])
     def test_single_step_greedy_honors_every_single_token_stop_word(
         self, new_token: int, expect_finished: bool
-    ):
+    ) -> None:
         """Each single-token stop word must stop generation, not just the first.
 
         The harmony / GPT-OSS serving path passes two of them (``<|return|>``
@@ -1021,6 +1021,10 @@ class TestFinishReasons:
         sampler.update_requests(state)
 
         assert request.is_finished == expect_finished
+        if expect_finished:
+            # Pins STOP_WORDS as the reason: the budget above rules out LENGTH,
+            # and none of the parametrized tokens is ``end_id``, ruling out END_ID.
+            assert not request.is_finished_due_to_length
 
     class RequestCase:
         MAX_NEW_TOKENS = 10
