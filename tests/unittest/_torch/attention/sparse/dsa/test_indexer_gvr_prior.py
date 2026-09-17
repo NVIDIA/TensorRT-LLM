@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
-from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm._torch.modules.top_k import _MAX_RADIX_BLOCKS_PER_ROW, TopK, TopKImplementation
 
 
 @pytest.mark.parametrize(
@@ -100,6 +100,14 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         kv_lens_cuda_runtime=torch.full((num_contexts + num_generations,), 16),
         gen_indexer_kv_lens_cuda_runtime=torch.full((num_generations,), 16),
         kv_lens_row_reorder=None,
+        # The native CUDA Radix decode path asserts the caller-owned aux
+        # workspaces are present before handing them to TopK.
+        radix_aux_indices=torch.empty(
+            (num_generations or 1, _MAX_RADIX_BLOCKS_PER_ROW, topk), dtype=torch.int32
+        ),
+        radix_aux_logits=torch.empty(
+            (num_generations or 1, _MAX_RADIX_BLOCKS_PER_ROW, topk), dtype=torch.float32
+        ),
     )
     # Keep distinct storage so the caller test catches use of the host twin.
     metadata.seq_lens_cuda = metadata.seq_lens.clone()
@@ -150,6 +158,9 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         index_topk=topk,
         layer_idx=7,
         _enable_heuristic_topk=True,
+        # The GVR emission closed loop has its own coverage; this test only
+        # pins prior ownership, so keep emission off.
+        use_gvr_emission=False,
         mtp_index_share=False,
         use_fp4=False,
         use_cute_dsl_paged_mqa_logits=False,

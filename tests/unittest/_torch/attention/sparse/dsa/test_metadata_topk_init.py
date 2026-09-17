@@ -41,7 +41,7 @@ def test_topk_flags_initialized_before_buffer_allocation(
     )
     metadata.is_cuda_graph = False
     enabled = enable_heuristic and sm_version >= 100
-    self_sampling_supported = enabled and dsl_available and sm_version in (100, 103, 107)
+    self_sampling_supported = enabled and dsl_available and sm_version in (100, 103)
     temporal_supported = enabled and dsl_available and sm_version in (100, 103)
 
     def check_flags(*, capture_graph: bool) -> None:
@@ -95,6 +95,8 @@ def test_temporal_gvr_allocates_real_prior_buffers(num_local_layers: int) -> Non
     metadata.max_draft_tokens = 3
     metadata.num_sms = 16
     metadata.enable_context_mla_with_cached_kv = False
+    # object.__new__ skips __init__, which is where this default is set.
+    metadata._radix_rows_per_sequence = 1
     with (
         patch.object(dsa_metadata.TrtllmAttentionMetadata, "__post_init__"),
         patch.object(metadata, "create_buffers_for_mla_rope_append"),
@@ -110,29 +112,3 @@ def test_temporal_gvr_allocates_real_prior_buffers(num_local_layers: int) -> Non
     assert metadata.gvr_prior_indices.is_cuda
     assert torch.count_nonzero(metadata.gvr_prior_indices).item() == 0
     assert metadata.kv_lens_row_reorder_buffer.shape == (4,)
-
-
-def test_selfsampling_warmup_ignores_retired_hinted_env(monkeypatch) -> None:
-    """Warm the hint-free launcher even when the retired hinted switch is set."""
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-        gvr_topk_decode_self_sampling_host as host,
-    )
-
-    metadata = object.__new__(dsa_metadata.DSAtrtllmAttentionMetadata)
-    metadata.enable_gvr_topk = True
-    metadata.use_self_sampling_topk = True
-    metadata.kv_cache_manager = Mock()
-    metadata.sparse_mla_topk = 512
-    metadata._indexer_compress_ratio = 4
-    metadata.sparse_metadata_params = SimpleNamespace(use_cute_dsl_paged_mqa_logits=True)
-    metadata.get_indexer_max_seq_len = Mock(return_value=8192)
-    monkeypatch.setenv("TRTLLM_GVR_V2_HINTED", "1")
-    with (
-        patch.object(dsa_metadata, "IS_CUTLASS_DSL_AVAILABLE", True),
-        patch.object(dsa_metadata, "get_sm_version", return_value=107),
-        patch.object(host, "warmup_varlen") as warmup,
-    ):
-        metadata.warmup_selfsampling_topk(next_n=4, batch_sizes=[64])
-    warmup.assert_called_once()
-    assert warmup.call_args.kwargs["hint_free"] is True
-    assert 256 in warmup.call_args.kwargs["num_rows_list"]
