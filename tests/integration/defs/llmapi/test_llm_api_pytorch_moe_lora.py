@@ -123,8 +123,8 @@ def _run_routed_expert_multi_lora(
     """Serve a MoE checkpoint with routed-expert LoRA and assert it applies.
 
     Each measured request runs in its own call, asserting that every adapter
-    moves the first token's logprob away from the no-LoRA value and that no two
-    adapters land on the same one. One request per call because the
+    moves its logprob sequence away from the no-LoRA sequence and that no two
+    adapters produce the same sequence. One request per call because the
     routed-expert GEMM selects its tactic from the token count of the forward
     pass: rows sharing a batch with different neighbours get different -- by
     design -- results, which no threshold can be set below. With a CUDA graph the
