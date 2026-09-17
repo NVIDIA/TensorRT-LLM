@@ -118,6 +118,23 @@ def test_fingerprint_tracks_the_source_directory(build_wheel):
     ) != build_wheel.configure_args_fingerprint(base + ['-S "/work/b/cpp"'])
 
 
+def test_user_override_of_a_builtin_wins_in_command_order(build_wheel):
+    # The configure command passes built-in definitions before cmake_def_args,
+    # so a user override (e.g. --extra-cmake-vars BUILD_PYT=OFF) is applied
+    # after the built-in default and wins. The fingerprint must be built in the
+    # same order so its last-wins reflects the user value, not the built-in;
+    # otherwise a user override could leave the fingerprint unchanged.
+    builtin_then_user = build_wheel.configure_args_fingerprint(
+        ['-DBUILD_PYT="ON"', "-DBUILD_PYT=OFF"]
+    )
+    assert builtin_then_user == build_wheel.configure_args_fingerprint(
+        ["-DBUILD_PYT=OFF"]
+    )  # user value wins
+    assert builtin_then_user != build_wheel.configure_args_fingerprint(
+        ['-DBUILD_PYT="ON"']
+    )  # built-in is shadowed, not kept
+
+
 # The reconfigure decision (configure_reason) is the flow the guard drives:
 # whether a fingerprint change forces a cmake configure. main() itself needs a
 # full toolchain, so the behavior is pinned here on the decision instead.
