@@ -7,9 +7,6 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import (get_mxfp4_support_error_message,
-                                            get_sm_version_from_torch,
-                                            is_mxfp4_supported)
 
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
@@ -40,26 +37,6 @@ __all__ = [
     "resolve_moe_impl",
     "WIDEEP_DEPRECATION_MESSAGE",
 ]
-
-
-def _validate_fp4_quant_config_support(
-        quant_config: Optional[QuantConfig]) -> None:
-    """Reject FP4 quantization the current GPU architecture cannot run.
-
-    Raised here, at layer construction, rather than from the kernel launch
-    deep inside the first forward pass.
-    """
-    if quant_config is None:
-        return
-
-    quant_mode = quant_config.layer_quant_mode
-    if not (quant_mode.has_nvfp4() or quant_mode.has_w4a8_nvfp4_fp8()
-            or quant_mode.has_mxfp4()):
-        return
-
-    sm = get_sm_version_from_torch()
-    if not is_mxfp4_supported(sm, quant_mode):
-        raise ValueError(get_mxfp4_support_error_message(sm, quant_mode))
 
 
 def create_moe_backend(
@@ -360,9 +337,6 @@ def create_moe(
     assert intermediate_size is not None, (
         "intermediate_size must be provided or model_config.pretrained_config "
         "must expose moe_intermediate_size / intermediate_size")
-
-    quant_config = override_quant_config or model_config.quant_config
-    _validate_fp4_quant_config_support(quant_config)
 
     # Pass the same shapes / activation package the layer will be built with.
     moe_cls = resolve_moe_cls(
