@@ -23,7 +23,7 @@ import random
 import time
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
@@ -5199,6 +5199,54 @@ class TestPoolRebalance(TestKVCacheManagerV2):
                     KVCacheManagerConfig(
                         **base_kwargs, pool_rebalance=PoolRebalanceConfig(**override)
                     )
+
+    def test_replace_preserves_pool_rebalance(self) -> None:
+        """dataclasses.replace() on a config must carry pool_rebalance over.
+
+        KVCacheManagerV2._build_cache_config rebuilds the config it just built with
+        replace(config, layers=...), so anything replace() drops never reaches the
+        manager. Under the C++ backend the binding replaces the Python dataclass and
+        replace() is keyed on the __dataclass_fields__ spec advertised in
+        tensorrt_llm/runtime/kv_cache_manager_v2/__init__.py: a field missing from
+        that spec is silently reset to its constructor default.
+        """
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=1024)],
+            ),
+        ]
+        # All exactly representable, so the round trip through the binding's float
+        # ratio_tolerance and double fields compares equal.
+        rebalance = PoolRebalanceConfig(
+            min_sampled_kv_caches=7,
+            cooldown_secs=3.5,
+            target_ratio_update_interval=11,
+            ratio_tolerance=0.5,
+            moving_average_decay=0.5,
+        )
+        config = KVCacheManagerConfig(
+            tokens_per_block=self._TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+            layers=layers,
+            pool_rebalance=rebalance,
+        )
+
+        rebuilt = replace(config, layers=layers)
+
+        for field, expected in (
+            ("min_sampled_kv_caches", 7),
+            ("cooldown_secs", 3.5),
+            ("target_ratio_update_interval", 11),
+            ("ratio_tolerance", 0.5),
+            ("moving_average_decay", 0.5),
+        ):
+            with self.subTest(field):
+                self.assertEqual(
+                    getattr(rebuilt.pool_rebalance, field),
+                    expected,
+                    f"replace() dropped pool_rebalance.{field}",
+                )
 
     def _close_one_cache(self, capacity: int, *, dummy: bool, cache_id: int) -> None:
         """Create, size and close one KV cache, optionally marked as a dummy.
