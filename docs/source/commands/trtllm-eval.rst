@@ -34,6 +34,11 @@ The following tasks are currently supported:
      - accuracy
      - 4,096
      - 256
+   * - GSM8K (InferenceX protocol)
+     - QA; regex matching
+     - accuracy
+     - 4,096
+     - 12,288
    * - GPQA
      - QA; multiple choice
      - accuracy
@@ -77,6 +82,9 @@ Here are some examples:
 
    # Evaluate Llama-3.1-8B-Instruct on GSM8K
    trtllm-eval --model meta-llama/Llama-3.1-8B-Instruct gsm8k
+
+   # Evaluate a model on GSM8K under the InferenceX protocol (12,288-token generation budget)
+   trtllm-eval --model <model> --max_seq_len 16384 gsm8k_inferencex
 
    # Evaluate Llama-3.3-70B-Instruct on GPQA Diamond
    trtllm-eval --model meta-llama/Llama-3.3-70B-Instruct gpqa_diamond

@@ -384,6 +384,7 @@ def test_feed_forward_moe_wrappers_combine_routed_and_shared_lora() -> None:
         gate=MagicMock(return_value=torch.zeros(2, 2)),
         experts=MagicMock(return_value=routed.clone()),
         shared_experts=m3_shared,
+        routed_output_is_global=False,
         event_dict=MagicMock(),
         aux_stream=object(),
         allreduce=None,

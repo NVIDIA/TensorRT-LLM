@@ -731,7 +731,8 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         # The 9% / 8% tiers replace the old single ">10000 -> 7%" bucket (the
         # 28672 / 65536 cases exceeded 7%); the 5% tier replaces the old
         # "<=10000 -> 3%" bucket (the 8448 case exceeded 3%). swiglu_gptoss_style
-        # keeps its own 5% / atol=0.1 band when error_accumulation stays <=10000.
+        # keeps its own 6% / atol=0.1 band when error_accumulation stays <=10000,
+        # matching the dedicated clamp-heavy MiniMax-M3 numerical test.
         top_k = getattr(self.routing_method, "top_k", 1)
         error_accumulation = self.intermediate_size * top_k
         if error_accumulation > 20000:
@@ -739,7 +740,7 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         elif error_accumulation > 10000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.92)
         elif self.swiglu_gptoss_style:
-            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
+            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
         elif error_accumulation > 5000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.95)
         else:

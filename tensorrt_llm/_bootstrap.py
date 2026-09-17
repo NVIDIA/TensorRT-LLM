@@ -16,9 +16,10 @@
 
 Two phases, in this order, both driven from ``tensorrt_llm/__init__.py``:
 
-1. :func:`_prepare_environment` -- DLL search path, Python-library preload and
-   vendored ``triton_kernels`` precedence.  It must run *before* ``torch`` and
-   before any TensorRT-LLM shared object is loaded.
+1. :func:`_prepare_environment` -- process environment defaults, DLL search
+   path, Python-library preload and vendored ``triton_kernels`` precedence.  It
+   must run *before* ``torch`` and before any TensorRT-LLM shared object is
+   loaded.
 2. :func:`_init` -- custom-op library loading and MPI initialization.  It runs
    after the package's own imports have completed.
 
@@ -43,6 +44,12 @@ from pathlib import Path
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 
 _inited = False
+
+
+def _set_numexpr_thread_default() -> None:
+    # TRT-LLM uses NumExpr only for scalar checkpoint formulas. Avoid creating
+    # its helper pool unless the embedding application explicitly opts in.
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
 def _add_trt_llm_dll_directory():
@@ -112,6 +119,7 @@ def _setup_vendored_triton_kernels():
 
 def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
+    _set_numexpr_thread_default()
     _add_trt_llm_dll_directory()
     _preload_python_lib()
     _setup_vendored_triton_kernels()
