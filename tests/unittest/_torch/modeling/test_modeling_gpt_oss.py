@@ -4,6 +4,7 @@
 import json
 import os
 import shutil
+from unittest import mock
 
 import pytest
 import torch
@@ -17,7 +18,8 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
+from tensorrt_llm._torch.models.modeling_gpt_oss import (GptOssForCausalLM,
+                                                         MLPBlock)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import \
     KvCacheConfig as BindingsKvCacheConfig
@@ -272,3 +274,46 @@ def test_gpt_oss_xqa_kernel_selection():
     assert not has_mmha, (
         "GPT-OSS-20B decode launched MMHA kernel instead of XQA. "
         f"See NVBug 5720470. Captured CUDA kernels: {all_kernels}")
+
+
+def _make_gate_only_mlp_block() -> MLPBlock:
+    block = MLPBlock.__new__(MLPBlock)
+    torch.nn.Module.__init__(block)
+    block.layer_idx = 0
+    block.gate = mock.MagicMock()
+    block.gate.weight = torch.zeros(4, 8, dtype=torch.bfloat16)
+    block.gate.bias = torch.zeros(4, dtype=torch.bfloat16)
+    return block
+
+
+@pytest.mark.parametrize("sm_version", [90, 100, 103, 107])
+def test_compute_gate_output_uses_tinygemm2_on_sm100_family(sm_version):
+    block = _make_gate_only_mlp_block()
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    with mock.patch(
+            "tensorrt_llm._torch.models.modeling_gpt_oss.get_sm_version",
+            return_value=sm_version), \
+            mock.patch.object(torch.ops, "trtllm") as trtllm_ops:
+        block.compute_gate_output(x)
+    args = trtllm_ops.tinygemm2.call_args.args
+    assert trtllm_ops.tinygemm2.call_count == 1
+    assert args[0] is x and args[1] is block.gate.weight
+    assert args[2] is block.gate.bias
+    block.gate.assert_not_called()
+
+
+@pytest.mark.parametrize("sm_version,lora_params", [(107, {
+    "layer": 0
+}), (120, None)])
+def test_compute_gate_output_falls_back_to_gate(sm_version, lora_params):
+    block = _make_gate_only_mlp_block()
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    with mock.patch(
+            "tensorrt_llm._torch.models.modeling_gpt_oss.get_sm_version",
+            return_value=sm_version), \
+            mock.patch.object(torch.ops, "trtllm") as trtllm_ops:
+        block.compute_gate_output(x, lora_params=lora_params)
+    trtllm_ops.tinygemm2.assert_not_called()
+    call = block.gate.call_args
+    assert block.gate.call_count == 1 and call.args[0] is x
+    assert call.kwargs == {"lora_params": lora_params, "layer_idx": 0}

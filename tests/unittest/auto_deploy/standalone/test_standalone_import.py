@@ -217,3 +217,19 @@ class TestStandaloneImport:
             """,
         )
         assert result.returncode == 0, f"Failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+
+    def test_is_sm_100f_fallback_boundaries(self, standalone_env):
+        """Verify the standalone is_sm_100f shim matches the canonical 100 <= sm < 110 range."""
+        result = _run_standalone(
+            standalone_env,
+            """
+            from tensorrt_llm._torch.auto_deploy._compat import TRTLLM_AVAILABLE, is_sm_100f
+            assert not TRTLLM_AVAILABLE
+            expected = {99: False, 100: True, 103: True, 107: True, 109: True, 110: False}
+            for sm, want in expected.items():
+                got = is_sm_100f(sm)
+                assert got is want, f"is_sm_100f({sm}) = {got}, want {want}"
+            print("OK: is_sm_100f fallback boundaries")
+            """,
+        )
+        assert result.returncode == 0, f"Failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
