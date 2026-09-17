@@ -56,7 +56,7 @@ def nvfp4_gemm(
     #
     # Only for 2-D operands, and only for *under*-length. Anything else about
     # the shapes -- wrong rank, zero rows, K disagreement -- the op rejects
-    # itself and loudly, and pre-empting that here would swap its RuntimeError
+    # itself and loudly, and preempting that here would swap its RuntimeError
     # for an AssertionError that says less. Over-length is not the hazard
     # either: the kernel never reads past what the swizzle addresses, and the
     # contract already says the padding bytes may hold anything.
