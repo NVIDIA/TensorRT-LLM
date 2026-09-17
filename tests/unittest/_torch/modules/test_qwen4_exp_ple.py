@@ -768,6 +768,8 @@ def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> 
 
 
 def test_empty_attention_dp_rank_participates_in_embedding_collectives(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules.qwen4_exp import ple as qwen4_exp_ple
+
     config = SimpleNamespace(
         hidden_size=4,
         hc_count=2,
@@ -795,15 +797,52 @@ def test_empty_attention_dp_rank_participates_in_embedding_collectives(monkeypat
         all_rank_num_tokens=[physical_tokens, physical_tokens],
         is_cuda_graph=True,
     )
-    embedding_calls = []
-
-    def fake_embed(ngram_ids, *, physical_tokens, all_rank_num_tokens):
-        embedding_calls.append((ngram_ids.shape, physical_tokens, all_rank_num_tokens))
-        return torch.empty(
-            (0, module.ple_embedding.ngram_heads, module.ple_embedding.head_dim_per_ngram)
+    embedding = module.ple_embedding
+    with torch.no_grad():
+        embedding.ngram_embedding.weight.copy_(
+            torch.arange(
+                embedding.ngram_embedding.weight.numel(),
+                dtype=embedding.ngram_embedding.weight.dtype,
+            ).reshape_as(embedding.ngram_embedding.weight)
+            + 1
         )
+    remote_ids = torch.full(
+        (physical_tokens, embedding.ngram_heads),
+        embedding.vocab_end_index,
+        dtype=torch.long,
+    )
+    collective_calls = []
 
-    monkeypatch.setattr(module.ple_embedding, "embed", fake_embed)
+    def fake_allgather(input_ids, actual_mapping, dim, sizes):
+        assert actual_mapping is mapping
+        assert dim == 0
+        assert sizes is None
+        assert input_ids.shape == (physical_tokens, embedding.ngram_heads)
+        assert torch.count_nonzero(input_ids) == 0
+        collective_calls.append(("allgather", input_ids.shape))
+        return torch.cat((input_ids, remote_ids))
+
+    def fake_reducescatter(partial, actual_mapping, dim, sizes):
+        assert actual_mapping is mapping
+        assert dim == 0
+        assert sizes is None
+        assert partial.shape == (
+            2 * physical_tokens,
+            embedding.ngram_heads,
+            embedding.head_dim_per_ngram,
+        )
+        expected_local = embedding.ngram_embedding.weight[0].expand(
+            physical_tokens,
+            embedding.ngram_heads,
+            embedding.head_dim_per_ngram,
+        )
+        torch.testing.assert_close(partial[:physical_tokens], expected_local)
+        assert torch.count_nonzero(partial[physical_tokens:]) == 0
+        collective_calls.append(("reducescatter", partial.shape))
+        return partial[:physical_tokens]
+
+    monkeypatch.setattr(qwen4_exp_ple, "allgather", fake_allgather)
+    monkeypatch.setattr(qwen4_exp_ple, "reducescatter", fake_reducescatter)
     hidden_states = torch.empty((physical_tokens, config.hidden_size * config.hc_count))
     conv_state = torch.zeros((1, *module.conv_state_shape))
     ngram_context = torch.full(
@@ -811,15 +850,28 @@ def test_empty_attention_dp_rank_participates_in_embedding_collectives(monkeypat
         config.eos_token_id,
         dtype=torch.long,
     )
+    conv_state_before = conv_state.clone()
+    ngram_context_before = ngram_context.clone()
 
     output = module(hidden_states, metadata, conv_state, ngram_context)
 
-    assert embedding_calls == [
+    assert collective_calls == [
         (
-            torch.Size([0, module.ple_embedding.ngram_heads]),
-            physical_tokens,
-            [physical_tokens, physical_tokens],
-        )
+            "allgather",
+            torch.Size([physical_tokens, embedding.ngram_heads]),
+        ),
+        (
+            "reducescatter",
+            torch.Size(
+                [
+                    2 * physical_tokens,
+                    embedding.ngram_heads,
+                    embedding.head_dim_per_ngram,
+                ]
+            ),
+        ),
     ]
+    torch.testing.assert_close(conv_state, conv_state_before)
+    torch.testing.assert_close(ngram_context, ngram_context_before)
     assert output.shape == hidden_states.shape
     assert torch.count_nonzero(output) == 0

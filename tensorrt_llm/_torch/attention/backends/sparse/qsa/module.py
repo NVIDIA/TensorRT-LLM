@@ -404,6 +404,18 @@ def select_qsa_paged_tokens(
 class QSASparseHooks(AttentionSparseHooks):
     """Keep the QSA side cache current and replace dense attention when useful."""
 
+    def __init__(self) -> None:
+        self._num_sparse_prefill_dispatches = 0
+
+    @property
+    def num_sparse_prefill_dispatches(self) -> int:
+        """Return exact sparse prefill calls observed by this layer.
+
+        The count includes graph capture and warmup calls. Runtime diagnostics
+        should compare snapshots when attributing calls to live requests.
+        """
+        return self._num_sparse_prefill_dispatches
+
     def forward(
         self,
         attention: "Attention",
@@ -660,6 +672,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 output = attention.apply_output_gate(output, output_gate)
             return output
 
+        self._num_sparse_prefill_dispatches += 1
         index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
         if index_cache is None:
             raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")

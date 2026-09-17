@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DFlashDecodingConfig,
     DSparkDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
     MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
-    PrefillCudaGraphBackend, SamplingParams, SchedulerConfig,
+    PrefillCudaGraphBackend, SamplingParams, SchedulerConfig, SchedulingParams,
     SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
@@ -5898,13 +5898,27 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                                                 detokenize=False,
                                                 add_special_tokens=False)
 
+        scheduling_params = (SchedulingParams(attention_dp_rank=0,
+                                              attention_dp_relax=False)
+                             if enable_attention_dp else None)
+
+        def parity_output(llm: LLM, token_id: int,
+                          prompt_length: int) -> list[int]:
+            output = llm.generate([[token_id] * prompt_length],
+                                  sampling_params=parity_sampling_params,
+                                  scheduling_params=scheduling_params)[0]
+            return output.outputs[0].token_ids
+
         def parity_outputs(llm: LLM) -> list[list[int]]:
-            results = []
-            for token_id, prompt_length in ((17, 1536), (23, 6144)):
-                output = llm.generate([[token_id] * prompt_length],
-                                      sampling_params=parity_sampling_params)[0]
-                results.append(output.outputs[0].token_ids)
-            return results
+            return [
+                parity_output(llm, token_id, prompt_length)
+                for token_id, prompt_length in ((17, 1536), (23, 6144))
+            ]
+
+        def prefill_graph_stats(llm: LLM) -> dict:
+            replies = llm._collective_rpc("get_prefill_cuda_graph_stats")
+            assert len(replies) == 1
+            return replies[0]
 
         eager_parity = None
         if prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
@@ -5933,7 +5947,21 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                 disable_mm_encoder=disable_mm_encoder) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if eager_parity is not None:
-                assert parity_outputs(llm) == eager_parity
+                before = prefill_graph_stats(llm)
+                short_output = parity_output(llm, 17, 1536)
+                after_short = prefill_graph_stats(llm)
+                long_output = parity_output(llm, 23, 6144)
+                after_long = prefill_graph_stats(llm)
+                assert [short_output, long_output] == eager_parity
+                assert after_long["captured_token_buckets"] == [2048, 8192]
+                assert (after_short["replay_counts"][2048]
+                        > before["replay_counts"].get(2048, 0))
+                assert (after_long["replay_counts"][8192]
+                        > after_short["replay_counts"].get(8192, 0))
+                assert (after_short["qsa_sparse_prefill_dispatches"] ==
+                        before["qsa_sparse_prefill_dispatches"])
+                assert (after_long["qsa_sparse_prefill_dispatches"]
+                        > after_short["qsa_sparse_prefill_dispatches"])
             if cover_guided_decoding:
                 assert_guided_decoding_regex(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
@@ -6016,7 +6044,6 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(70000)
     @pytest.mark.skip_less_host_memory(131072)
-    @pytest.mark.threadleak(enabled=False)
     def test_nvfp4_adp4_mtp3_trtllm_ple_offload_breakable_prefill_cuda_graph(
             self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
         """NVFP4, MTP3 and PLE offload with breakable prefill CUDA graphs."""

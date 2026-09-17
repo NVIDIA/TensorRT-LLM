@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure-Python guard tests for MPI sleep/wakeup and collective_rpc.
+"""Pure-Python guard tests for worker controls and collective_rpc.
 
 No GPU or model weights required; all CUDA/MPI/ZMQ machinery is bypassed
 via object.__new__ + manual attribute injection.
@@ -1602,8 +1602,41 @@ class TestSingleRankLockAcquired:
 
 
 # ---------------------------------------------------------------------------
-# GenerationExecutorProxy / GenerationExecutorRpcProxy collective_rpc()
+# BaseWorker diagnostics and proxy collective_rpc()
 # ---------------------------------------------------------------------------
+
+
+def test_worker_reports_stable_empty_prefill_graph_stats():
+    """Disabled and non-PyTorch workers preserve the diagnostics schema."""
+    expected = {
+        "captured_token_buckets": [],
+        "replay_counts": {},
+        "qsa_sparse_prefill_dispatches": 0,
+    }
+    worker = _make_worker()
+    assert worker.get_prefill_cuda_graph_stats() == expected
+
+    worker._is_pytorch_backend = False
+    assert worker.get_prefill_cuda_graph_stats() == expected
+
+
+def test_worker_reports_rank_local_prefill_graph_stats():
+    """The worker aggregates BCG and sparse-QSA counters without GPU work."""
+    worker = _make_worker()
+    runner = SimpleNamespace(captured_token_buckets=[2048, 8192], replay_counts={2048: 2, 8192: 1})
+    model = MagicMock()
+    model.modules.return_value = [
+        SimpleNamespace(sparse_attn_hooks=SimpleNamespace(num_sparse_prefill_dispatches=3)),
+        SimpleNamespace(sparse_attn_hooks=SimpleNamespace(num_sparse_prefill_dispatches=5)),
+        SimpleNamespace(),
+    ]
+    worker.engine.model_engine = SimpleNamespace(breakable_cuda_graph_runner=runner, model=model)
+
+    assert worker.get_prefill_cuda_graph_stats() == {
+        "captured_token_buckets": [2048, 8192],
+        "replay_counts": {2048: 2, 8192: 1},
+        "qsa_sparse_prefill_dispatches": 8,
+    }
 
 
 @pytest.mark.parametrize("cls", ["ipc", "rpc"])
@@ -1626,6 +1659,17 @@ class TestProxyCollectiveRpcGuards:
             p = _make_proxy(cls, model_world_size=2, rpc_client=mock_client)
             result = p.collective_rpc(method_name, args=(["kv_cache"],))
             assert result == ["ok"]
+
+    def test_multirank_allows_rank_local_prefill_graph_stats(self, cls):
+        """Rank-local prefill graph diagnostics may be queried through rank 0."""
+        expected = {"captured_token_buckets": [2048, 8192]}
+        mock_call = MagicMock()
+        mock_call.remote.return_value = expected
+        mock_client = MagicMock()
+        mock_client.get_prefill_cuda_graph_stats.return_value = mock_call
+        proxy = _make_proxy(cls, model_world_size=4, rpc_client=mock_client)
+
+        assert proxy.collective_rpc("get_prefill_cuda_graph_stats") == [expected]
 
     def test_multirank_raises_for_non_allowlisted_method(self, cls):
         """Non-allowlisted methods still raise NotImplementedError for world_size > 1."""

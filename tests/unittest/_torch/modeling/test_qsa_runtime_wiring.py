@@ -165,6 +165,100 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
     assert output is None
 
 
+@pytest.mark.parametrize(
+    "num_contexts,max_kv_len,expected_dispatches,expect_sparse_output",
+    ((1, 4, 0, False), (0, 8, 0, True), (1, 8, 1, True)),
+    ids=("below-threshold", "decode", "exact-sparse-prefill"),
+)
+def test_qsa_sparse_prefill_dispatch_counter(
+    monkeypatch: pytest.MonkeyPatch,
+    num_contexts: int,
+    max_kv_len: int,
+    expected_dispatches: int,
+    expect_sparse_output: bool,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels, module
+
+    head_dim = 4
+    num_heads = 4
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata._num_tokens = 1
+    metadata._num_contexts = num_contexts
+    metadata._seq_lens = torch.ones(1, dtype=torch.int32)
+    metadata.kv_lens_runtime = torch.tensor([max_kv_len], dtype=torch.int32)
+    metadata.qsa_req_idx_per_token = torch.zeros(1, dtype=torch.int32)
+    metadata.qsa_logical_positions = torch.tensor([max_kv_len - 1], dtype=torch.int64)
+    metadata.qsa_sequence_lengths = torch.tensor([max_kv_len], dtype=torch.int32)
+    metadata.qsa_visible_blocks = torch.ones(1, dtype=torch.int32)
+    metadata.qsa_topk_indices = torch.zeros((1, 7), dtype=torch.int32)
+    metadata.qsa_topk_row_starts = torch.zeros(1, dtype=torch.int32)
+    metadata.qsa_block_table = torch.arange(max_kv_len, dtype=torch.int32).unsqueeze(0)
+    kv_pool = torch.zeros((max_kv_len, 2, 1, 1, head_dim))
+    index_cache = torch.zeros((max_kv_len, 1, 1, head_dim))
+    metadata.kv_cache_manager = SimpleNamespace(
+        dtype=DataType.BF16,
+        tokens_per_block=1,
+        get_buffers=lambda *args, **kwargs: kv_pool,
+        get_index_k_buffer=lambda *args, **kwargs: index_cache,
+    )
+
+    indexer = SimpleNamespace(
+        project_and_update_cache=lambda *args, **kwargs: torch.zeros((1, num_heads, head_dim)),
+        top_k=None,
+    )
+    attention = SimpleNamespace(
+        head_dim=head_dim,
+        num_heads=num_heads,
+        num_key_value_heads=1,
+        q_scaling=1.0,
+        layer_idx=0,
+        indexer=indexer,
+        sparse_params=QSASparseParams(
+            index_n_heads=num_heads,
+            index_kv_heads=1,
+            index_head_dim=head_dim,
+            token_topk=4,
+            compress_ratio=4,
+            seq_len_threshold=4,
+        ),
+        split_qkv=lambda *args: (
+            torch.zeros((1, num_heads, head_dim)),
+            torch.zeros((1, 1, head_dim)),
+            torch.zeros((1, 1, head_dim)),
+        ),
+    )
+    monkeypatch.setattr(kernels, "qsa_supports_head_dims", lambda *args: True)
+    monkeypatch.setattr(
+        module,
+        "select_qsa_paged_tokens",
+        lambda *args, **kwargs: torch.zeros((1, 7), dtype=torch.int32),
+    )
+    monkeypatch.setattr(module, "qsa_sparse_gqa", lambda **kwargs: kwargs["q"])
+    hooks = QSASparseHooks()
+
+    output = hooks.forward(
+        attention=attention,
+        q=torch.zeros((1, head_dim)),
+        k=None,
+        v=None,
+        attn_metadata=metadata,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_window_size=None,
+        attention_mask_data=None,
+        mrope_config=None,
+        attention_sinks=None,
+        relative_attention_bias=None,
+        relative_attention_max_distance=0,
+        has_lora=False,
+        output_gate=None,
+        qsa_index_hidden_states=torch.zeros((1, head_dim)),
+        qsa_position_ids=torch.zeros(1, dtype=torch.int32),
+    )
+
+    assert (output is not None) == expect_sparse_output
+    assert hooks.num_sparse_prefill_dispatches == expected_dispatches
+
+
 @pytest.mark.parametrize("in_graph", [False, True], ids=["padded-warmup", "capture"])
 def test_qsa_fixed_output_bridge_captures_index_projection(
     monkeypatch: pytest.MonkeyPatch,

@@ -61,9 +61,14 @@ __all__ = [
 # Methods that are explicitly implemented for multi-rank MPI/IPC executor
 # deployments and may be called via collective_rpc even when world_size > 1.
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
-# communicator started in PyExecutor.start_worker(); rank-0 is the entry
-# point, so routing through the rank-0 RPC shim is correct.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+# communicator started in PyExecutor.start_worker(). Prefill graph diagnostics
+# are explicitly rank-local. Rank 0 is the entry point for all three, so routing
+# through the rank-0 RPC shim is correct.
+_MULTI_RANK_COORDINATED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+_MULTI_RANK_RANK_LOCAL_METHODS: frozenset[str] = frozenset(
+    {"get_prefill_cuda_graph_stats"})
+_MULTI_RANK_ALLOWED_METHODS = (_MULTI_RANK_COORDINATED_METHODS
+                               | _MULTI_RANK_RANK_LOCAL_METHODS)
 
 
 def _check_collective_rpc_guard(
@@ -90,8 +95,9 @@ def _check_collective_rpc_guard(
         raise NotImplementedError(
             f"MPI collective_rpc does not support model_world_size > 1 for "
             f"method '{method}'; use the Ray executor for general multi-rank "
-            "deployments, or use sleep()/wakeup() which handle multi-rank "
-            "coordination internally.")
+            "deployments. The MPI shim supports only sleep()/wakeup(), which "
+            "coordinate internally, and get_prefill_cuda_graph_stats(), "
+            "which reads rank 0 only.")
     if unique_reply_rank is not None or target_ranks is not None:
         raise NotImplementedError(
             "unique_reply_rank and target_ranks are not supported; "
@@ -1186,11 +1192,13 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         Rank-0 RPC shim used for uniform dispatch from
         :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`.  Most methods
-        require ``model_world_size == 1``; ``sleep`` and ``wakeup`` are
+        require ``model_world_size == 1``. ``sleep`` and ``wakeup`` are
         explicitly allowed for multi-rank deployments because
         :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.sleep` and
         :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.wakeup` handle
-        cross-rank coordination internally via the control communicator.
+        cross-rank coordination internally via the control communicator;
+        ``get_prefill_cuda_graph_stats`` is allowed because it is explicitly
+        rank-local.
 
         Args:
             method: Name of the worker method to invoke.
@@ -1208,9 +1216,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         Raises:
             RuntimeError: If the RPC client has not been initialised yet.
             NotImplementedError: If ``model_world_size > 1`` and the method
-                is not in the allowed-methods set (currently ``sleep`` and
-                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
-                are provided.
+                is not in the allowed-methods set, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
         """
         if self.rpc_client is None:
             raise RuntimeError(
