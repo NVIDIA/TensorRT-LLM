@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -405,7 +405,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
         // enable tiled kernels on Ampere/Ada
-        if ((isSm89 || isSm120f) && mFixedParams.dataType == DATA_TYPE_E4M3)
+        if (isSm89 && mFixedParams.dataType == DATA_TYPE_E4M3)
         {
             // so far Ada QMMA only supports non-tiled kernels.
             mLaunchParams.granular_tiling = false;
