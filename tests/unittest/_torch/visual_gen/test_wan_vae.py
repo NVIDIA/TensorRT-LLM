@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
     WanCausalConv3d,
     WanConv2d,
     WanResidualBlock,
+    WanRMSNorm,
     WanVAE,
     WanVAEConfig,
     _decode_chunk_slices,
@@ -51,6 +52,25 @@ DEVICE = "cuda"
 # computation, isolated from bf16 rounding noise that differs by memory layout
 # (our channels_last vs diffusers' contiguous). Production runs the VAE in bf16.
 DTYPE = torch.float32
+
+
+def test_wan_rms_norm_precision_contract():
+    """Pin BF16 reference rounding while retaining the FP16 underflow guard."""
+    generator = torch.Generator().manual_seed(42)
+    pixels = torch.randn((1, 160, 1, 8, 8), generator=generator)
+    pixels[:, :, :, 0, 0] = 0
+    normalize = torch.nn.functional.normalize
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        layer = WanRMSNorm(160, images=False).to(dtype=dtype)
+        x = pixels.to(dtype=dtype, memory_format=torch.channels_last_3d)
+        norm_input = x.float() if dtype == torch.float16 else x
+        expected = normalize(norm_input, dim=1).to(dtype) * layer.scale * layer.gamma
+        with patch("torch.nn.functional.normalize", wraps=normalize) as spy:
+            actual = layer(x)
+        assert spy.call_count == 1
+        assert spy.call_args.args[0].dtype == norm_input.dtype
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize(
