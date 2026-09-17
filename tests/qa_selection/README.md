@@ -31,6 +31,29 @@ decorator — so it is the rule's identifier.
 Keying on it means no new markers, no edits to test sources, and no hardware access. The
 decorators in `conftest.py` remain the single source of architecture truth.
 
+### …and why every rule also names its decorator
+
+Matching on prose is unavoidable. *Identifying* a rule by prose is not, so every entry carries
+a required `decorator` field, listed first:
+
+```json
+{
+  "decorator": "skip_no_hopper",
+  "reason": "This test is only  supported in Hopper architecture",
+  "skip_when": {"sm": {"ne": 90}}
+}
+```
+
+Nothing in `selector.py` reads it — a collected mark carries only its `kwargs`, so `reason`
+stays the only key selection can match on. Its purpose is the drift check: an identifier is
+stable under the edit the check exists to catch, which turns *"this rule matches nothing"*
+into *"`skip_no_hopper`'s reason is now **X** — paste it in"*.
+
+> **The named-decorator invariant.** A rule must name a **module-level** decorator, never a
+> one-off inline `skipif`: a skip worth curating is a skip worth naming. An inline `skipif`
+> duplicating a named decorator's condition is a vocabulary bypass — adopt the name, never
+> add a second rule for the synonym.
+
 ### The cost: an unversioned contract
 
 Reason strings are prose in another file. Rewording one silently disables its rule, and the
@@ -48,12 +71,25 @@ the conftest pulls in torch and tensorrt_llm and shells out to `nvidia-smi`, non
 hook has. It scans the whole `tests/integration/defs` tree, so it keeps working if the
 decorators move out of `conftest.py`.
 
-Its two directions are deliberately asymmetric:
+It resolves each rule through the `decorator` it names, then compares reasons. The failures
+are kept separate because their remedies differ:
 
-- **A rule matching no decorator is an error.** The rule is dead, nothing says so, and
-  selection silently over-selects.
-- **A decorator with no rule is only reported.** Selection already keeps the test and
-  records the reason, so the cost is a wasted slot, not a wrong answer.
+| what it finds | verdict | what it prints |
+|---|---|---|
+| decorator exists, reason differs | **error** | both strings, JSON-quoted and paste-ready |
+| decorator gone (renamed or deleted) | **error** | remove the rule, or restore the decorator |
+| reason found only on an inline `skipif` | **error** | name it at module level, or drop the rule |
+| decorator has no literal `reason=` | reported | nothing to compare statically |
+| decorator with no rule | reported | the decorator and its reason |
+
+The first three are errors for one reason: the rule can never match a collected mark again, so
+leaving it is a silent no-op and its tests ship to every machine. The third exists so that a
+rule anchored to an inline `skipif` is diagnosed rather than mistaken for a deleted one — which
+is what makes the invariant above enforceable rather than advisory.
+
+The last row is the only asymmetry, and it is deliberate: **the table is curated, not an
+inventory.** Selection already keeps an unruled test and records its reason, so the cost is a
+wasted slot, not a wrong answer — see [What is not modelled](#what-is-not-modelled).
 
 ## Marker precedence
 
@@ -83,21 +119,73 @@ The asymmetry is intentional: failing closed would drop the test silently and re
 false green, while failing open costs one wasted slot and is visible in the report.
 `Selector(..., strict_unknown=True)` turns it into an error, for auditing.
 
+**Unknown is not the same as unkeyable.** A `skipif` written with no `reason=` at all is kept
+silently and is *not* recorded there: `unknown_skipif` means "a string that could be given a
+rule", and a keyless mark has none to give under any future edit. Recording it would make
+`strict_unknown` demand a rule that cannot be written. No call site under
+`tests/integration/defs` omits `reason=` today; surfacing one belongs to the reporting layer,
+which sees the bare mark *and* the node id.
+
 ## What is not modelled
 
-These bound achievable recall. They are limitations by construction, not defects.
+A rule answers one question: *can this machine type run this test?* So it must turn on a
+permanent property of the hardware. Anything that depends on the allocation, the run-time
+environment, or a bug that will be fixed does not belong in the table, however easy it would
+be to express. These bound achievable recall — limitations by construction, not defects.
 
 | skip | why |
 |---|---|
 | `skip_no_nvls` | NVLS is a capability check across every *visible device*, so it depends on the allocation, not the machine type |
 | `skip_nvlink_inactive` | NVLink activity depends on how many GPUs the job received; a 1-GPU allocation on an 8-GPU node has no peer |
 | `skip_ray` | keys off `TLLM_DISABLE_MPI`, an execution mode chosen at run time |
+| `skip_no_mxfp4_swizzle` | a bug gate (nvbugs/5446119), not a capability gate — it describes a defect on H20 that will be fixed, so curating it would tie this table to a bug's lifecycle |
 | `skip_less_host_memory` | host memory is not in the catalogue; inside a container `psutil` reports the cgroup limit, not the node |
 | `skip_fp8_pre_ada`, `skip_fp4_pre_blackwell` | imperative `pytest.skip()` inside test bodies — they carry no mark at all, so collection cannot see them |
 | skips raised inside fixtures | same: nothing to read at collection time |
 
 All of these are still skipped at run time on the allocated node. Selection simply does not
 predict them.
+
+### Deferred: the SM107 sites
+
+Four tests are gated by an inline `skipif` whose condition is byte-identical to
+`skip_no_rubin` — a decorator that already has a rule — but whose reason string differs:
+
+```python
+@pytest.mark.skipif(get_sm_version() != 107, reason="fine-grained sync requires SM107")
+```
+
+| site in `accuracy/test_llm_api_pytorch.py` | test |
+|---|---|
+| `:1310` | `TestDeepSeekV3Lite::test_nvfp4_fine_grained_sync` |
+| `:3965` | `TestQwen3_30B_A3B::test_w4a8_mxfp4_fine_grained_sync` |
+| `:3994` | `TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync` |
+| `:4654` | `TestGPTOSS::test_w4_1gpu_fine_grained_sync` |
+
+Per the invariant the fix is to adopt `@skip_no_rubin`, not to add a rule for the synonym.
+**That adoption is deliberately deferred**, because the two strings do not say the same thing
+even though they select the same hardware today:
+
+| | `skip_no_rubin` | `fine-grained sync requires SM107` |
+|---|---|---|
+| claim | this test is **only supported** on Rubin | this **feature** needs SM107 |
+| why `!= 107` today | Rubin support is still landing | fine-grained sync is genuinely SM107-only |
+
+Merging them now erases that distinction exactly when it starts to matter: as Rubin support
+completes the support gate is expected to relax, while a genuinely SM107-only feature must not
+relax with it. Which site is which is knowable today and unrecoverable after a merge.
+
+**The cost, so it reads as a choice and not an oversight:** the 24 `*fine_grained_sync*` entries
+of `llm_function_core.txt` stay undecidable — dispatched to every non-Rubin machine, occupying a
+slot, skipping on the node. Bounded and reversible.
+
+**The reminder regenerates itself.** That string has no rule, so every selection run lists it
+under unknown reasons with its count; nothing depends on rereading this section. The drift check
+stays green, because an inline `skipif` with no rule is not a failure.
+
+**Revisit when Rubin support is complete**, deciding per site: support-gated sites adopt
+`skip_no_rubin`; a genuinely feature-gated one keeps a distinct decorator, *named* at module
+level so it can be curated.
 
 ## MPI world size
 
@@ -122,12 +210,18 @@ the one that knows it.
 
 ## Changing a rule
 
-1. Edit `rules.json`. `skip_when` accepts six `MachineProfile` fields and ten operators,
-   both validated at load, so a typo fails immediately naming the legal set.
-2. Run `python scripts/check_qa_selection_rules.py`. Exit 0 means no drift.
+A rule starts from a decorator name, not from a reason string.
 
-Copy reason strings **byte for byte** from the decorator, including anything that looks
-like a typo.
+1. **Pick the `skip_*` to curate.** It must already exist at module level under
+   `tests/integration/defs`; if the skip is written inline at a test, name it there first.
+2. **Add the entry to `rules.json`**, `decorator` first, then its `reason` copied **byte for
+   byte** — including anything that looks like a typo. `skip_when` accepts six
+   `MachineProfile` fields and ten operators, both validated at load, so a mistake fails
+   immediately naming the legal set.
+3. **Run `python scripts/check_qa_selection_rules.py`.** Exit 0 means no drift.
+
+Repairing drift is the same loop in reverse: the check has already printed the decorator's
+current reason, JSON-quoted, so paste it over the rule's `reason` and re-run.
 
 ## Machine profiles
 

@@ -38,8 +38,6 @@ from typing import Any, Iterator, List, Mapping, Optional, Sequence, Tuple
 from .machines import MachineProfile
 from .rules import SkipRuleTable, default_rule_table
 
-NO_REASON = "<skipif with no reason= keyword>"
-
 
 class UnknownSkipRuleError(LookupError):
     """A skipif reason string has no rule, under strict handling."""
@@ -152,8 +150,9 @@ class Selector:
             # never the target, and is never read.
             reason = mark.skipif_reason
             if reason is None:
-                unknown.append(NO_REASON)
-            elif reason not in self.rules:
+                # Unkeyable, not unknown: no rule could ever name this mark.
+                continue
+            if reason not in self.rules:
                 unknown.append(reason)
             elif self.rules[reason].blocks(self.profile):
                 blockers.append(reason)
