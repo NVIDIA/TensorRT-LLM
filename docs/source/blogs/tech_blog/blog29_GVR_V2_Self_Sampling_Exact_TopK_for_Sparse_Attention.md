@@ -288,9 +288,7 @@ The minimum column retains individual regressions. Figure 1 shows the model-leve
 
 #### The Gains Extend Beyond an Average
 
-The comparison changes with the model and shape. Figure 1 shows HPC-ops closest on V3.2 and a larger DeepSelect FP32 gap there. The heatmaps resolve those averages into the row-length and batch regions where each advantage appears.
-
-Figure 7 locates the SGLang gains across the full length–batch grid.
+The gains over SGLang and DeepSelect FP32 vary with the model and shape. Figure 7 compares GVR V2 with SGLang, and Figure 8 compares it with DeepSelect FP32. Together, the heatmaps show where each advantage appears across row lengths and batch sizes.
 
 ![Three heatmaps of GVR V2 speedup over SGLang for every captured row-length bucket and all eleven batch sizes, averaged geometrically across layers.](../media/gvr_v2/sglang_map.svg)
 
