@@ -425,6 +425,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Bootstrap and advance per-slot decode state without host synchronization."""
         old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
+        # Padding and ADP-idle requests have no persistent decode position.
+        # Their shared scratch row must not grow across graph replays.
+        old = torch.where(slots == self._scratch_slot, torch.zeros_like(old), old)
         start_pos = old + num_accepted_tokens
         self._ctx_len[slots] = start_pos
         self._valid_len[slots] = torch.clamp(
