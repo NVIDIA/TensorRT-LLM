@@ -82,6 +82,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "NemotronHPuzzleForCausalLM",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Nano_VL_V2",
+        "NemotronH_Omni_Reasoning_V3",
         "NemotronNASForCausalLM",
         "Olmo3ForCausalLM",
         "OpenELMForCausalLM",

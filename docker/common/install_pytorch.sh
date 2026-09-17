@@ -13,9 +13,7 @@ fi
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
-# TODO(dlfw-26.08): bump together with requirements.txt's torch/triton pins once public
-# torch>=2.13.0 and a matching public triton are released (torch==2.13.0 needs triton==3.7.1).
-TORCH_VERSION="2.12.0"
+TORCH_VERSION="2.13.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -80,7 +78,7 @@ install_from_pypi() {
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
     pip3 uninstall -y torch torchvision
-    pip3 install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu130
+    pip3 install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu132
 }
 
 case "$1" in
