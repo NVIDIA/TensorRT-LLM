@@ -351,7 +351,14 @@ class Xing4_0WeightLoader(DeepseekV3WeightLoader):
                 or bias_key not in weights
                 or any(key not in weights for key in alpha_keys)
             ):
-                continue
+                raise ValueError(
+                    f"mHC module '{name}' has no loadable weights in the "
+                    f"checkpoint: expected either '{fn_key}'/'{base_key}'/"
+                    f"'{scale_key}' or '{mapping_key}'/'{bias_key}'/"
+                    f"{list(alpha_keys)}, but none of them was found. "
+                    "Leaving the mHC parameters uninitialized would silently "
+                    "produce garbage hidden states."
+                )
 
             module.fn.data.copy_(weights[mapping_key][:].to(torch.float32).contiguous())
             module.base.data.copy_(weights[bias_key][:].to(torch.float32).contiguous())

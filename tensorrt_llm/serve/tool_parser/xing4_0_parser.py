@@ -137,6 +137,17 @@ def _parse_payload(
     payload: str,
     tools: Sequence[Any] | None,
 ) -> tuple[str, dict[str, Any]]:
+    payload = payload.strip()
+
+    # Top-level JSON payload (the format ``structure_info()`` emits and the
+    # one guided/named tool-choice flows produce): {"name": .., "arguments": ..}
+    if payload.startswith("{"):
+        parsed = _deserialize(payload)
+        if isinstance(parsed, Mapping) and parsed.get("name"):
+            arguments = parsed.get("arguments", parsed.get("parameters"))
+            name = str(parsed["name"])
+            return name, dict(arguments) if isinstance(arguments, Mapping) else {}
+
     tool_name, params_text, json_text = _split_payload(payload, tools)
     arguments = _json_arguments(json_text) if json_text else {}
 
@@ -190,7 +201,7 @@ class Xing4_0ToolParser(BaseToolParser):
         tool_indices = self._get_tool_indices(tools) if tools else {}
         calls: list[ToolCallItem] = []
         try:
-            for match in TOOL_CALL_REGEX.finditer(text):
+            for call_idx, match in enumerate(TOOL_CALL_REGEX.finditer(text)):
                 tool_name, arguments = _parse_payload(match.group(1), tools)
                 if not tool_name:
                     continue
@@ -199,9 +210,10 @@ class Xing4_0ToolParser(BaseToolParser):
                         "Model attempted to call undefined function: %s",
                         tool_name,
                     )
+                    call_idx = -1
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices.get(tool_name, -1),
+                        tool_index=call_idx,
                         name=tool_name,
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
@@ -272,11 +284,13 @@ class Xing4_0ToolParser(BaseToolParser):
                     tool_name,
                 )
 
+            # A unique sequential index per streamed call, including repeated
+            # calls to the same tool; ``tool_indices`` is only used above for
+            # tool-name validation.
             self.current_tool_id += 1
-            tool_index = tool_indices.get(tool_name, self.current_tool_id)
             calls.append(
                 ToolCallItem(
-                    tool_index=tool_index,
+                    tool_index=self.current_tool_id,
                     name=tool_name,
                     parameters=json.dumps(arguments, ensure_ascii=False),
                 )
@@ -286,3 +300,14 @@ class Xing4_0ToolParser(BaseToolParser):
             normal_text="".join(normal_text_parts),
             calls=calls,
         )
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush buffered text when the stream ends without closing markers.
+
+        A partial opening marker or a truncated tool-call block would
+        otherwise be silently dropped.
+        """
+        remaining, self._buffer = self._buffer, ""
+        if remaining:
+            return StreamingParseResult(normal_text=remaining)
+        return StreamingParseResult()

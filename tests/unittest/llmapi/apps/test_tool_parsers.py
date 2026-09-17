@@ -44,6 +44,7 @@ from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
+from tensorrt_llm.serve.tool_parser.xing4_0_parser import Xing4_0ToolParser
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
 from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
@@ -5721,3 +5722,108 @@ class TestUnparsedToolCallWarning:
             for call in mock_logger.warning_once.call_args_list
         ]
         assert keys == [self._PARSER_NAME, self._OTHER_PARSER_NAME]
+
+
+class TestXing4_0ToolParser(BaseToolParserTestClass):
+    """Test suite for Xing4_0ToolParser class."""
+
+    def make_parser(self):
+        return Xing4_0ToolParser()
+
+    def make_tool_parser_test_cases(self) -> ToolParserTestCases:
+        return ToolParserTestCases(
+            has_tool_call_true=("Sure. <tool_call>"
+                                '{"name":"get_weather", '
+                                '"arguments":{"location":"Paris"}}'
+                                "</tool_call>"),
+            detect_and_parse_single_tool=(
+                "<tool_call>get_weather"
+                "<param_key>location</param_key>"
+                '<param_value>Paris</param_value>'
+                "</tool_call>",
+                "",
+                "get_weather",
+                {
+                    "location": "Paris"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                "<tool_call>get_weather"
+                "<param_key>location</param_key>"
+                '<param_value>Paris</param_value>'
+                "</tool_call>"
+                "<tool_call>search_web"
+                "<param_key>query</param_key>"
+                '<param_value>weather</param_value>'
+                "</tool_call>",
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool="<tool_call></tool_call>",
+            detect_and_parse_with_parameters_key=(
+                "<tool_call>"
+                '{"name":"get_weather", '
+                '"parameters":{"location":"Paris"}}'
+                "</tool_call>",
+                "get_weather",
+                {
+                    "location": "Paris"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="Hello <tool_ca",
+            undefined_tool=("<tool_call>"
+                            '{"name":"undefined_func", '
+                            '"arguments":{}}'
+                            "</tool_call>"),
+        )
+
+    def test_detect_and_parse_structure_info_roundtrip(self, sample_tools,
+                                                       parser):
+        """detect_and_parse parses the format structure_info() emits."""
+        info = parser.structure_info()("get_weather")
+        text = info.begin + '{"location":"Paris"}' + info.end
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+        assert result.calls[0].tool_index == 0
+
+    def test_streaming_same_tool_twice_sequential_indices(
+            self, sample_tools, parser):
+        """Each streamed call gets a unique sequential tool_index."""
+        block = ("<tool_call>get_weather"
+                 "<param_key>location</param_key>"
+                 '<param_value>Paris</param_value>'
+                 "</tool_call>")
+
+        first = parser.parse_streaming_increment(block, sample_tools)
+        second = parser.parse_streaming_increment(block, sample_tools)
+
+        assert [call.tool_index for call in first.calls] == [0]
+        assert [call.tool_index for call in second.calls] == [1]
+
+    def test_finish_flushes_partial_marker(self, sample_tools, parser):
+        """A buffered partial opening marker is flushed at end of stream."""
+        result = parser.parse_streaming_increment("Hello <tool", sample_tools)
+        assert result.normal_text == "Hello "
+
+        flushed = parser.finish(sample_tools)
+
+        assert flushed.normal_text == "<tool"
+        assert len(flushed.calls) == 0
+
+    def test_finish_flushes_truncated_block(self, sample_tools, parser):
+        """A truncated tool-call block is flushed as normal text."""
+        truncated = ("<tool_call>"
+                     '{"name":"get_weather", '
+                     '"arguments":{"location":"Par')
+        result = parser.parse_streaming_increment("Text. " + truncated,
+                                                  sample_tools)
+        assert result.normal_text == "Text. "
+
+        flushed = parser.finish(sample_tools)
+
+        assert flushed.normal_text == truncated
+        assert len(flushed.calls) == 0

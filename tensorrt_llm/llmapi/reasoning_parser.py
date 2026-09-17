@@ -412,6 +412,12 @@ class Xing4_0ReasoningParser(BaseReasoningParser):
         else:
             self._parser = IdentityReasoningParser(
                 chat_template_kwargs=chat_template_kwargs, )
+        # Streaming state for a possible leading ``<think>`` marker: hold
+        # text back until it can no longer grow into the marker, mirroring
+        # the leading-tag strip in :meth:`parse`.
+        self._thinking_enabled = thinking_enabled
+        self._lead_buffer = ""
+        self._lead_pending = True
 
     def parse(self, text: str) -> ReasoningParserResult:
         if text.startswith(self.reasoning_start):
@@ -419,9 +425,35 @@ class Xing4_0ReasoningParser(BaseReasoningParser):
         return self._parser.parse(text)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        if self._lead_pending:
+            self._lead_buffer += delta_text
+            if self.reasoning_start.startswith(self._lead_buffer):
+                # Could still grow into a leading ``<think>`` marker.
+                return ReasoningParserResult()
+            self._lead_pending = False
+            text, self._lead_buffer = self._lead_buffer, ""
+            if text.startswith(self.reasoning_start):
+                text = text[len(self.reasoning_start):]
+                if not text:
+                    return ReasoningParserResult()
+            return self._parser.parse_delta(text)
         return self._parser.parse_delta(delta_text)
 
     def finish(self) -> ReasoningParserResult:
+        if self._lead_pending:
+            # Stream ended while the leading text could still have grown
+            # into ``<think>``. A complete marker is a delimiter and is
+            # dropped; an incomplete fragment is ordinary output attributed
+            # to the block it was withheld in.
+            self._lead_pending = False
+            text, self._lead_buffer = self._lead_buffer, ""
+            if text.startswith(self.reasoning_start):
+                text = text[len(self.reasoning_start):]
+            if not text:
+                return ReasoningParserResult()
+            if self._thinking_enabled:
+                return ReasoningParserResult(reasoning_content=text)
+            return ReasoningParserResult(content=text)
         return self._parser.finish()
 
 

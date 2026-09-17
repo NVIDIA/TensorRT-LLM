@@ -215,6 +215,52 @@ def test_xing4_0_reasoning_parser_streams_when_thinking():
             for result in results] == ["hid", "den", ""]
 
 
+def test_xing4_0_reasoning_parser_streams_strips_leading_start_tag():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("xing4_0")
+
+    deltas = [R1_START, f"hidden{R1_END}visible"]
+    results = [reasoning_parser.parse_delta(delta) for delta in deltas]
+
+    assert [result.content for result in results] == ["", "visible"]
+    assert [result.reasoning_content for result in results] == ["", "hidden"]
+
+
+def test_xing4_0_reasoning_parser_streams_start_tag_split_across_chunks():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("xing4_0")
+
+    deltas = ["<th", f"ink>hidden{R1_END}visible"]
+    results = [reasoning_parser.parse_delta(delta) for delta in deltas]
+
+    assert results[0].content == "" and results[0].reasoning_content == ""
+    assert results[1].content == "visible"
+    assert results[1].reasoning_content == "hidden"
+
+
+def test_xing4_0_reasoning_parser_streams_passes_through_other_text():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("xing4_0")
+
+    result = reasoning_parser.parse_delta("visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == ""
+
+
+def test_xing4_0_reasoning_parser_streams_finish_flushes_lead_buffer():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("xing4_0")
+
+    result = reasoning_parser.parse_delta("<th")
+    assert result.content == "" and result.reasoning_content == ""
+
+    flushed = reasoning_parser.finish()
+
+    assert flushed.reasoning_content == "<th"
+
+    # A complete leading marker is a delimiter and is dropped.
+    delimiter_parser = ReasoningParserFactory.create_reasoning_parser("xing4_0")
+    delimiter_parser.parse_delta(R1_START)
+    assert delimiter_parser.finish().reasoning_content == ""
+
+
 TOOL_START = "<|tool_calls_section_begin|>"
 
 
