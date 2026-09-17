@@ -66,6 +66,18 @@ def _is_multi_gpu(stage_name: str) -> bool:
     return bool(_MULTI_GPU_RE.search(stage_name)) and "Post-Merge" not in stage_name
 
 
+def _dedicated_rule_stages(
+    pairs: list[tuple[object, RuleResult]], stages: dict[str, Stage]
+) -> set[str]:
+    """Return rule-contributed stages that are not backed by test-db YAMLs."""
+    return {
+        stage
+        for _, rule_result in pairs
+        for stage in rule_result.affected_stages
+        if stage not in stages
+    }
+
+
 def _rule_kept_entries(block, prefix_to_waives: dict[str, set[str]]) -> set[str]:
     """Entries a rule's block_filters would keep."""
     kept: set[str] = set()
@@ -242,9 +254,14 @@ def apply_coverage_tier(
             f"coverage: {len(residual)} core file(s), {n_impacted} impacted test(s), "
             f"{cov.n_untrusted} untrusted; nothing removable (all impacted / untrusted / not-in-DB){nd}"
         )
+    # Rules such as DocsRule and AgentFlowRule contribute dedicated stages
+    # that are not represented by test-db YAMLs and therefore are absent from
+    # ``stages``. Preserve them when Tier 2 replaces the Tier-1 stage set.
+    dedicated_rule_stages = _dedicated_rule_stages(pairs, stages)
     result = CoverageTierResult(
         # single-GPU only; multi-GPU re-added in Groovy under MULTI_GPU_FILE_CHANGED gate
-        affected_stages={s for s in stages if not _is_multi_gpu(s)} - dropped,
+        affected_stages=({s for s in stages if not _is_multi_gpu(s)} - dropped)
+        | dedicated_rule_stages,
         removed=removed,
         dropped=dropped,
         reason=reason,

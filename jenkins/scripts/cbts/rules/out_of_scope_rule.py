@@ -31,6 +31,11 @@ from blocks import Stage, YAMLIndex
 
 from .base import PRInputs, Rule, RuleResult
 
+# Exact files that affect repository metadata or external gates, but not the
+# pre-merge test stages CBTS selects. Do not widen this to `.github/`: workflow
+# changes can alter CI execution and must keep falling back.
+OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (".github/CODEOWNERS",)
+
 # Path prefixes whose changes neither pre-merge nor post-merge L0 consumes.
 # - tests/integration/test_lists/qa/   : QA test lists, run by separate
 #   nightly QA workflows.
@@ -59,10 +64,8 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "jenkins/scripts/cbts/",
 )
 
-# Path suffixes (extensions) with no test-execution impact, anywhere in
-# the tree.
-# - `.md`: docs only, not loaded by any test.
 # Excluded on purpose:
+# - `.md` / `.rst`: DocsRule routes documentation changes to CPU-Build_Docs.
 # - `.txt`: requirements.txt / constraints.txt are runtime-relevant.
 # - `.png` / `.jpg` / `.jpeg` / `.gif` / `.svg` / `.webp`: image files
 #   under `examples/visual_gen/` are real test fixtures (e.g.
@@ -70,13 +73,12 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
 #   `tests/unittest/_torch/visual_gen/`). Since location alone cannot
 #   distinguish a fixture from a doc diagram, image edits fall back to
 #   baseline rather than being claimed as noop here.
-OUT_OF_SCOPE_SUFFIXES: tuple[str, ...] = (".md",)
 
 
 def is_out_of_scope(path: str) -> bool:
-    if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
+    if path in OUT_OF_SCOPE_EXACT_PATHS:
         return True
-    if path.endswith(OUT_OF_SCOPE_SUFFIXES):
+    if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
         return True
     return False
 
