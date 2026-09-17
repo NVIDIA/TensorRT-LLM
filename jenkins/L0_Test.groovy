@@ -6647,23 +6647,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         56,
         14
     )
-    // 2 Nodes: gen1 (2 nodes, 8 GPUs) + NO ctx fleet = 8 GPUs.
-    // Same con4301 config as the 14-node stage above, run as gen_only_no_context:
-    // the gen worker fabricates its own KV blocks, so the 12 ctx workers whose only
-    // job was feeding it are not launched at all (56 GPUs -> 8, -86%).
-    //
-    // The name deliberately omits "Disagg-": disaggMultiNodeMode is
-    // stageName.contains("Disagg-PerfSanity") with no node-count or mode condition,
-    // and it is what picks the launch-script template below. gen_only_no_context has
-    // a disaggregated *topology* but takes the aggregated *launch path* -- one pytest
-    // owning the gen worker, the proxy and the client, exactly as ctx_only does -- so
-    // it must land in aggMultiNodeMode and get aggregated/slurm_launch_draft.sh.
-    //
-    // splits must stay 1. This stage is 2 nodes, so the launch script prefixes pytest
-    // with trtllm-llmapi-launch; cases run serially in one stage would share that
-    // launcher instance and the previous case's state would survive into the next
-    // one, ending in OOM. jenkins/scripts/perf/submit.py enforces exactly one
-    // selected test per split group and raises on both zero and many.
+    // DeepSeek-V4-Pro 8k1k con4301 gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
