@@ -59,6 +59,7 @@ l0_a10:
   - unittest/inputs/test_multimodal.py
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/inputs/test_prefix_token_cache.py
+  - unittest/_torch/modeling/test_minimaxm3_vl_prefix_token_cache.py
   - unittest/inputs/test_video_decode.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py

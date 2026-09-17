@@ -42,6 +42,9 @@ feature you turned on.
 
 - Each `DefaultInputProcessor` owns its own cache, so cached ids are never
   shared across tokenizers.
+- MiniMax-M3 has its own input processor (`MiniMaxM3VLInputProcessor`) and wires the
+  same cache, with the same eligibility rules, into its text-only path; requests with
+  images or videos take the HF processor path unchanged.
 - The cache requires a fast (Rust-backed) tokenizer, because it relies on
   character offsets. With a slow tokenizer the cache is disabled with a warning.
 - The cache is used only when the tokenizer would be called exactly as the
