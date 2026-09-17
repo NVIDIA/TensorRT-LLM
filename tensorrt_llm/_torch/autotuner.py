@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import ast
 import contextlib
 import copy
@@ -6,13 +9,17 @@ import fcntl
 import inspect
 import itertools
 import json
+import math
 import os
+import threading
 import time
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, FrozenSet, Iterable, List, Optional,
+                    Set, Tuple, Union)
 
 import torch
 from cuda.bindings import driver
@@ -27,6 +34,12 @@ from tensorrt_llm.mapping import Mapping
 
 # Unique tag to avoid collisions with other comms
 PP_COMM_TAG_AUTOTUNING = 30000
+_TORCH_PROFILER_TIMER_KEY = "torch_profiler"
+_CUDA_EVENT_FALLBACK_TIMER_KEY = "cuda_event_fallback"
+
+
+class _TorchProfilerUnavailableError(RuntimeError):
+    """Raised when Kineto/CUPTI cannot provide CUDA timing activities."""
 
 
 class DistributedTuningStrategy(enum.Enum):
@@ -136,6 +149,72 @@ class TuningConfig:
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
+
+
+_NVMMH_CANONICAL_FIELDS = frozenset(
+    {"tile", "cluster", "swizzle", "cta_order", "split_k"})
+_NVMMH_FIELD_ALIASES = {
+    "cta_tile": "tile",
+    "mma_tiler": "tile",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class NvMMHConfig:
+    """Immutable nvMatmulHeuristics tactic-search policy.
+
+    ``fields`` accepts either an iterable of field names or a comma-separated
+    string. Field names are normalized once at construction so every consumer
+    observes one complete, validated policy snapshot. ``tile`` and ``cluster``
+    are coupled because nvMatmulHeuristics models their joint configuration.
+    """
+
+    enabled: bool = False
+    fields: FrozenSet[str] = frozenset({"tile", "cluster"})
+    max_tactics: int = 5
+
+    def __post_init__(self) -> None:
+        """Validate policy values and normalize aliases and coupled search fields."""
+        if not isinstance(self.enabled, bool):
+            raise ValueError("NvMMHConfig.enabled must be a bool")
+        if isinstance(self.max_tactics,
+                      bool) or not isinstance(self.max_tactics, int):
+            raise ValueError("NvMMHConfig.max_tactics must be an integer")
+        if self.max_tactics < 1:
+            raise ValueError("NvMMHConfig.max_tactics must be at least 1")
+
+        fields = self.fields
+        if isinstance(fields, str):
+            raw_fields: Iterable[str] = fields.split(",")
+        else:
+            try:
+                raw_fields = iter(fields)
+            except TypeError as error:
+                raise ValueError(
+                    "NvMMHConfig.fields must be an iterable of strings or a "
+                    "comma-separated string") from error
+
+        normalized_fields = set()
+        for field_name in raw_fields:
+            if not isinstance(field_name, str):
+                raise ValueError(
+                    "NvMMHConfig.fields entries must all be strings")
+            field_name = field_name.strip().lower()
+            if not field_name:
+                continue
+            normalized_fields.add(
+                _NVMMH_FIELD_ALIASES.get(field_name, field_name))
+
+        unknown_fields = normalized_fields - _NVMMH_CANONICAL_FIELDS
+        if unknown_fields:
+            raise ValueError("Unknown NvMMHConfig fields: "
+                             f"{sorted(unknown_fields)}; expected a subset of "
+                             f"{sorted(_NVMMH_CANONICAL_FIELDS)}")
+
+        # The 2-SM encoding models the joint CTA tile and cluster shape.
+        if normalized_fields & {"tile", "cluster"}:
+            normalized_fields.update({"tile", "cluster"})
+        object.__setattr__(self, "fields", frozenset(normalized_fields))
 
 
 @dataclass(unsafe_hash=True)
@@ -256,6 +335,40 @@ class TunableRunner(ABC):
             Any: The unique id of the runner, which can be converted to a string for the cache key.
         """
         return tuple(self.__dict__.values())
+
+    def use_torch_profiler(self, tactic: Any) -> bool:
+        """Whether this tactic should prefer Kineto/CUPTI timing.
+
+        The default keeps the existing globaltimer/CUDA-event path. Runners
+        that prefer CUPTI timing override this per-tactic hook; AutoTuner
+        falls back to CUDA events when CUPTI is unavailable.
+        """
+        return False
+
+    def profiling_timer_cache_key(self) -> Optional[str]:
+        """Return a cache discriminator when timing changes tactic ranking."""
+        return None
+
+    def tactic_search_cache_key(self) -> Optional[Tuple[Any, ...]]:
+        """Return a cache discriminator when tactic generation changes.
+
+        Runners whose candidate set depends on process-wide search policy
+        should override this hook with a stable, versioned tuple. The search
+        discriminator is composed before the profiling-timer discriminator.
+        """
+        return None
+
+
+class CuteDSLTunableRunner(TunableRunner):
+    """Marker base for CuTe DSL runners that prefer CUPTI timing."""
+
+    def use_torch_profiler(self, tactic: Any) -> bool:
+        """Prefer CUDA activity timing for every CuTe DSL tactic."""
+        return True
+
+    def profiling_timer_cache_key(self) -> Optional[str]:
+        """Separate CUPTI-ranked tactics from legacy timer cache entries."""
+        return _TORCH_PROFILER_TIMER_KEY
 
 
 @contextlib.contextmanager
@@ -489,6 +602,7 @@ class AutoTunerProfilingCache:
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
         apply_map_to_tuning_buckets: bool = True,
+        allow_timer_fallback: bool = False,
     ) -> Tuple[bool, int, int, Dict[str, Any], OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
 
@@ -505,12 +619,39 @@ class AutoTunerProfilingCache:
             runner_id is the index in the current runners list
         """
         for idx, r in enumerate(runners):
-            if (cache_key := self.get_cache_key(
-                    custom_op, r, input_shapes, tuning_config,
-                    apply_map_to_tuning_buckets)) in self.cache:
-                # Return the current index in runners list, not the cached runner_id
-                cached_runner_id, tactic, min_time = self.cache[cache_key]
-                return True, idx, tactic, min_time
+            cache_keys = [
+                self.get_cache_key(
+                    custom_op,
+                    r,
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets,
+                )
+            ]
+            # A fresh inference process has not probed CUPTI yet. It may reuse
+            # an explicitly tagged CUDA-event fallback entry when no preferred
+            # CUPTI entry exists. Tuning mode leaves this disabled so a
+            # CUPTI-capable process re-profiles instead of reusing event-ranked
+            # tactics.
+            if (allow_timer_fallback
+                    and not AutoTuner._torch_profiler_unavailable and
+                    r.profiling_timer_cache_key() == _TORCH_PROFILER_TIMER_KEY):
+                cache_keys.append(
+                    self.get_cache_key(
+                        custom_op,
+                        r,
+                        input_shapes,
+                        tuning_config,
+                        apply_map_to_tuning_buckets,
+                        timer_key_override=_CUDA_EVENT_FALLBACK_TIMER_KEY,
+                    ))
+
+            for cache_key in cache_keys:
+                if cache_key in self.cache:
+                    # Return the current index in runners list, not the cached
+                    # runner_id.
+                    cached_runner_id, tactic, min_time = self.cache[cache_key]
+                    return True, idx, tactic, min_time
 
         return False, *self.fallback_entry()
 
@@ -521,8 +662,10 @@ class AutoTunerProfilingCache:
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
         apply_map_to_tuning_buckets: bool = True,
+        timer_key_override: Optional[str] = None,
     ) -> Tuple:
-        return (
+        """Combine operation, runner, shapes, search policy, and timing backend."""
+        cache_key = (
             custom_op,
             runner.__class__.__name__,
             str(runner.unique_id()),
@@ -534,6 +677,16 @@ class AutoTunerProfilingCache:
                 apply_map_to_tuning_buckets,
             ),
         )
+        tactic_search_key = runner.tactic_search_cache_key()
+        if tactic_search_key is not None:
+            cache_key += (tactic_search_key, )
+        timer_key = (runner.profiling_timer_cache_key()
+                     if timer_key_override is None else timer_key_override)
+        if (timer_key_override is None
+                and timer_key == _TORCH_PROFILER_TIMER_KEY
+                and AutoTuner._torch_profiler_unavailable):
+            timer_key = _CUDA_EVENT_FALLBACK_TIMER_KEY
+        return cache_key if timer_key is None else cache_key + (timer_key, )
 
     def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
@@ -913,8 +1066,16 @@ class AutoTuner:
     """
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
+    _nvmmh_config = NvMMHConfig()
+    _nvmmh_policy_lock = threading.RLock()
+    _nvmmh_policy_owners: weakref.WeakSet = weakref.WeakSet()
+    # CUPTI availability is process-wide. Keep the failure sticky across
+    # AutoTuner instances so every tactic does not repeat the same failed
+    # profiler initialization before falling back to CUDA events.
+    _torch_profiler_unavailable = False
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
+        """Initialize profiling settings, distributed state, statistics, and caches."""
         # Increase log level for AutoTuner associated logger`
         self._log_level_to_info = os.getenv(
             "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", '0') == '1'
@@ -924,10 +1085,13 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
+        self._last_profile_timer: Optional[str] = None
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
-        # Timing backend: globaltimer kernel vs cuda events.
+        # Default timing backend: globaltimer kernel vs CUDA events. CuTe DSL
+        # runners prefer torch.profiler/CUPTI and fall back to CUDA events when
+        # CUPTI is unavailable in the current process.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
         #   "globaltimer" -> force globaltimer
         #   "cuda_event"  -> force cuda events
@@ -960,6 +1124,78 @@ class AutoTuner:
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
+
+    @property
+    def nvmmh_config(self) -> NvMMHConfig:
+        """Return the current immutable NVMMH policy snapshot."""
+        return AutoTuner._nvmmh_config
+
+    def configure_nvmmh(
+        self,
+        config: Optional[NvMMHConfig] = None,
+        *,
+        enabled: Optional[bool] = None,
+        fields: Optional[Union[str, Iterable[str]]] = None,
+        max_tactics: Optional[int] = None,
+    ) -> NvMMHConfig:
+        """Atomically install a validated NVMMH tactic-search policy.
+
+        Pass either a complete ``NvMMHConfig`` or keyword updates to the
+        current policy. Validation happens before the single config reference
+        is replaced, so an invalid update leaves the previous policy intact.
+        Every ``AutoTuner`` instance shares this process-wide policy, which is
+        intentionally persistent across ``autotune`` contexts, instance
+        construction, and profiling-cache clears. Active model engines pin
+        this policy: a differing update raises without changing any state.
+        """
+        with AutoTuner._nvmmh_policy_lock:
+            keyword_values = (
+                enabled,
+                fields,
+                max_tactics,
+            )
+            if config is not None:
+                if any(value is not None for value in keyword_values):
+                    raise ValueError(
+                        "Pass either config or NVMMH keyword settings, not both"
+                    )
+                if not isinstance(config, NvMMHConfig):
+                    raise TypeError("config must be an NvMMHConfig")
+                new_config = config
+            else:
+                current = AutoTuner._nvmmh_config
+                new_config = NvMMHConfig(
+                    enabled=current.enabled if enabled is None else enabled,
+                    fields=current.fields if fields is None else fields,
+                    max_tactics=(current.max_tactics
+                                 if max_tactics is None else max_tactics),
+                )
+
+            if new_config == AutoTuner._nvmmh_config:
+                return AutoTuner._nvmmh_config
+            if AutoTuner._nvmmh_policy_owners:
+                raise ValueError(
+                    "All active model engines in one process must use the same "
+                    "autotuner_nvmmh_config; clean up existing engines before "
+                    "changing the policy.")
+            AutoTuner._nvmmh_config = new_config
+            return new_config
+
+    def _acquire_nvmmh_policy(self, owner: object, config: NvMMHConfig) -> None:
+        """Pin one policy until the owning engine is cleaned up or collected.
+
+        Weak ownership also releases failed, partially initialized engines.
+        Registering an owner and validating its policy share the configuration
+        lock, so concurrent engine construction cannot replace a pinned policy.
+        """
+        with AutoTuner._nvmmh_policy_lock:
+            self.configure_nvmmh(config)
+            AutoTuner._nvmmh_policy_owners.add(owner)
+
+    def _release_nvmmh_policy(self, owner: object) -> None:
+        """Release an engine's policy pin without resetting the current policy."""
+        with AutoTuner._nvmmh_policy_lock:
+            AutoTuner._nvmmh_policy_owners.discard(owner)
 
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.
@@ -1011,7 +1247,7 @@ class AutoTuner:
                 yield tuple(runner_tactic_pairs)
 
         def _generate_context_tactics_lists(self):
-            """Generate all valid tactic combinations."""
+            """Generate all runner-valid tactic combinations."""
             if not self._captured_contexts:
                 raise RuntimeError(
                     "No context available for testing.\n"
@@ -1027,11 +1263,14 @@ class AutoTuner:
                 inputs = context['inputs']
                 kwargs = context.get('kwargs', {})
 
-                # Collect all valid (runner, tactic) combinations for this context
+                profile = OptimizationProfile()
+
+                # Collect the same runner-valid tactic combinations considered
+                # by normal autotuning for this context.
                 tactics_lists = []
                 for runner_idx, runner in enumerate(runners):
                     valid_tactics = runner.get_valid_tactics(
-                        inputs, OptimizationProfile(), **kwargs)
+                        inputs, profile, **kwargs)
                     for tactic in valid_tactics:
                         tactics_lists.append((runner_idx, tactic))
                 context_tactics_lists.append(tactics_lists)
@@ -1146,7 +1385,9 @@ class AutoTuner:
                     runners,
                     input_shapes,
                     tuning_config,
-                    apply_map_to_tuning_buckets=True))
+                    apply_map_to_tuning_buckets=True,
+                    allow_timer_fallback=not self.is_tuning_mode,
+                ))
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -1229,7 +1470,14 @@ class AutoTuner:
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
         _, runner_id, tactic, _ = self.profiling_cache.search_cache(
-            custom_op, runners, input_shapes, tuning_config)
+            custom_op,
+            runners,
+            input_shapes,
+            tuning_config,
+            # Non-profiling distributed ranks receive the selected cache entry
+            # but do not inherit the profiling process's CUPTI failure latch.
+            allow_timer_fallback=True,
+        )
 
         tuning_end_time = time.perf_counter()
         self.stats.tuned_op_time_cost[
@@ -1244,6 +1492,7 @@ class AutoTuner:
         input_tensors: List[torch.Tensor],
         profile: OptimizationProfile,
         tuning_config: TuningConfig,
+        _inputs_prepared: bool = False,
         **kwargs,
     ) -> float:
         """Profile runners and select the best tactic.
@@ -1256,8 +1505,9 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
+        torch_profiler_was_available = not AutoTuner._torch_profiler_unavailable
         # If the inputs_pre_hook is provided, it will be called before profiling.
-        if tuning_config.inputs_pre_hook is not None:
+        if tuning_config.inputs_pre_hook is not None and not _inputs_prepared:
             input_tensors = tuning_config.inputs_pre_hook(input_tensors)
 
         # Pre-walk the runners so we know the total candidate (runner, tactic)
@@ -1381,6 +1631,32 @@ class AutoTuner:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
 
+        if (torch_profiler_was_available
+                and AutoTuner._torch_profiler_unavailable):
+            # At least one timing used the CUDA-event fallback after this sweep
+            # began. Discard every measurement from the mixed-backend sweep and
+            # re-profile the complete candidate set. The process-wide latch
+            # forces every CUPTI-preferring candidate onto CUDA events during
+            # the retry.
+            self._debug_logger(
+                f"[Autotuner] Re-profiling all tactics for custom_op={custom_op} "
+                "with CUDA events after CUPTI became unavailable.")
+            retry_result = self._profile_runners(
+                custom_op,
+                runners,
+                input_tensors,
+                profile,
+                tuning_config,
+                _inputs_prepared=True,
+                **kwargs,
+            )
+            return (
+                retry_result[0],
+                retry_result[1],
+                retry_result[2],
+                retry_result[3] or has_tuning_failure_occurred,
+            )
+
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
             cache_key = self.profiling_cache.get_cache_key(
@@ -1424,6 +1700,38 @@ class AutoTuner:
 
         return sizes
 
+    @staticmethod
+    def _torch_profiler_elapsed_time_ms(prof, repeat: int) -> float:
+        """Return summed CUDA activity time per launch in milliseconds."""
+        total_cuda_us = sum(
+            float(event.device_time_total or 0.0) for event in prof.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA and (
+                event.device_time_total or 0.0) > 0)
+        if not math.isfinite(total_cuda_us) or total_cuda_us <= 0:
+            raise _TorchProfilerUnavailableError(
+                "torch.profiler/CUPTI reported no CUDA activity while "
+                "profiling a CuTe DSL tactic")
+        return total_cuda_us / max(1, int(repeat)) / 1000.0
+
+    @staticmethod
+    def _is_torch_profiler_unavailable_error(error: Exception) -> bool:
+        """Whether an exception reports a Kineto/CUPTI backend failure."""
+        if isinstance(error, _TorchProfilerUnavailableError):
+            return True
+        message = str(error).lower()
+        return "cupti" in message or "kineto" in message
+
+    @classmethod
+    def _disable_torch_profiler(cls, error: Exception) -> None:
+        """Latch a process-wide CUPTI failure and report the CUDA-event fallback."""
+        cls._torch_profiler_unavailable = True
+        logger.warning_once(
+            "[Autotuner] torch.profiler/CUPTI is unavailable; falling back "
+            "to CUDA-event timing for CuTe DSL tactics in this process. "
+            f"Error: {error}",
+            key=("autotuner", "warning_torch_profiler_cuda_event_fallback"),
+        )
+
     def _profile_single_kernel(
         self,
         runner: TunableRunner,
@@ -1457,36 +1765,11 @@ class AutoTuner:
         short_profile_threshold_ms = 1
 
         avg_time = float('inf')
+        use_torch_profiler = runner.use_torch_profiler(tactic)
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
-            graph = torch.cuda.CUDAGraph()
-
-            if self._use_global_timer:
-                start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
-                end_ts = torch.empty(1, dtype=torch.int64, device='cuda')
-
-                def record_start():
-                    record_global_timer(start_ts.data_ptr(), stream)
-
-                def record_end():
-                    record_global_timer(end_ts.data_ptr(), stream)
-
-                def elapsed_time():
-                    # GPU %globaltimer counts in ns; convert to ms to match the
-                    # units of Torch.cuda.Event.elapsed_time()
-                    return (end_ts.item() - start_ts.item()) / 1e6
-            else:
-                start_evt = torch.cuda.Event(enable_timing=True)
-                end_evt = torch.cuda.Event(enable_timing=True)
-
-                def record_start():
-                    start_evt.record()
-
-                def record_end():
-                    end_evt.record()
-
-                def elapsed_time():
-                    return start_evt.elapsed_time(end_evt)
+            """Measure repeated launches on one stream using the selected timer."""
+            graph = torch.cuda.CUDAGraph() if use_cuda_graph else None
 
             with torch.cuda.stream(stream):
                 if use_cuda_graph:
@@ -1504,6 +1787,90 @@ class AutoTuner:
                     # Currently only AllReduce will use this strategy, and only MPI parallel will enable tuning.
                     self._dist.tp_barrier()
 
+                def launch_profiled_work():
+                    """Replay the captured batch or launch the same batch eagerly."""
+                    if use_cuda_graph:
+                        graph.replay()
+                    else:
+                        for r in range(repeat):
+                            runner(
+                                input_tensor_batches[r %
+                                                     len(input_tensor_batches)],
+                                tactic=tactic,
+                                **kwargs,
+                            )
+
+                if use_torch_profiler and not AutoTuner._torch_profiler_unavailable:
+                    profiled_work_started = False
+                    profiled_work_completed = False
+                    try:
+                        with torch.profiler.profile(
+                                activities=[
+                                    torch.profiler.ProfilerActivity.CUDA
+                                ],
+                                acc_events=True,
+                                record_shapes=False,
+                                profile_memory=False,
+                                with_stack=False,
+                        ) as prof:
+                            profiled_work_started = True
+                            launch_profiled_work()
+                            # CuTe DSL fused kernels may launch auxiliary
+                            # streams; wait for every device stream before
+                            # closing CUPTI.
+                            torch.cuda.synchronize()
+                            profiled_work_completed = True
+                        return self._torch_profiler_elapsed_time_ms(
+                            prof, repeat)
+                    except Exception as error:
+                        # A runner or CUDA synchronization failure is a real
+                        # tactic failure. Do not hide it behind the timing
+                        # fallback, even if it occurred inside the profiler
+                        # context.
+                        if profiled_work_started and not profiled_work_completed:
+                            raise
+                        if not self._is_torch_profiler_unavailable_error(error):
+                            raise
+                        self._disable_torch_profiler(error)
+
+                # CUPTI was unavailable either earlier in this process or in
+                # the attempt above. Re-run this measurement with the legacy
+                # CUDA-event timer, irrespective of _use_global_timer.
+                force_cuda_event = use_torch_profiler
+
+                if not force_cuda_event and self._use_global_timer:
+                    start_ts = torch.empty(1, dtype=torch.int64, device="cuda")
+                    end_ts = torch.empty(1, dtype=torch.int64, device="cuda")
+
+                    def record_start():
+                        """Record the start of the measured interval on the profiling stream."""
+                        record_global_timer(start_ts.data_ptr(), stream)
+
+                    def record_end():
+                        """Record the end of the measured interval on the profiling stream."""
+                        record_global_timer(end_ts.data_ptr(), stream)
+
+                    def elapsed_time():
+                        """Return the recorded profiling interval in milliseconds."""
+                        # GPU %globaltimer counts in ns; convert to ms to match
+                        # the units of torch.cuda.Event.elapsed_time().
+                        return (end_ts.item() - start_ts.item()) / 1e6
+                else:
+                    start_evt = torch.cuda.Event(enable_timing=True)
+                    end_evt = torch.cuda.Event(enable_timing=True)
+
+                    def record_start():
+                        """Record the start of the measured interval on the profiling stream."""
+                        start_evt.record()
+
+                    def record_end():
+                        """Record the end of the measured interval on the profiling stream."""
+                        end_evt.record()
+
+                    def elapsed_time():
+                        """Return the recorded profiling interval in milliseconds."""
+                        return start_evt.elapsed_time(end_evt)
+
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
                 if use_cuda_graph:
                     delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
@@ -1511,17 +1878,7 @@ class AutoTuner:
                     delay_kernel(self.stream_delay_micro_secs, stream)
 
                 record_start()
-
-                if use_cuda_graph:
-                    graph.replay()
-                else:
-                    for r in range(repeat):
-                        runner(
-                            input_tensor_batches[r % len(input_tensor_batches)],
-                            tactic=tactic,
-                            **kwargs,
-                        )
-
+                launch_profiled_work()
                 record_end()
                 stream.synchronize()
 
@@ -1546,9 +1903,14 @@ class AutoTuner:
             avg_time = pure_profile(stream, self.repeat)
 
         shapes = self._get_input_sizes(inputs)
+        timer_name = (_CUDA_EVENT_FALLBACK_TIMER_KEY if use_torch_profiler
+                      and AutoTuner._torch_profiler_unavailable else
+                      _TORCH_PROFILER_TIMER_KEY if use_torch_profiler else
+                      "globaltimer" if self._use_global_timer else "cuda_event")
+        self._last_profile_timer = timer_name
         self._debug_logger(
-            f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
-        )
+            f"[Autotuner] Profiled runner={runner}, tactic={tactic}, "
+            f"shapes={shapes}, timer={timer_name}: {avg_time:.6f}ms.")
 
         return avg_time
 

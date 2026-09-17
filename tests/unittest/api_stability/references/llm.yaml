@@ -255,6 +255,10 @@ methods:
         annotation: bool
         default: True
         status: prototype
+      autotuner_nvmmh_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.AutoTunerNvMMHConfig]
+        default: null
+        status: prototype
       use_fine_grained_sync:
         annotation: bool
         default: False

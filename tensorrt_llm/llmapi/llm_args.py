@@ -5599,6 +5599,34 @@ _TORCH_LLMARGS_REMOVED_ARG_CHECKS: Dict[str, Callable[[Any], None]] = {
 TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
 
 
+class AutoTunerNvMMHConfig(StrictBaseModel):
+    """Enabled nvMatmulHeuristics policy for CuTe DSL search reduction."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fields: Tuple[Literal[
+        "tile", "cluster", "swizzle", "cta_order", "split_k"], ...] = Field(
+            default=("tile", "cluster"),
+            description=
+            "Tactic fields selected by NVMMH. Tile and cluster are coupled.")
+
+    max_tactics: PositiveInt = Field(
+        default=5,
+        strict=True,
+        description=
+        "Maximum number of NVMMH-ranked tile/cluster signatures to retain.")
+
+    @field_validator('fields')
+    @classmethod
+    def normalize_fields(cls, fields: Tuple[str, ...]) -> Tuple[str, ...]:
+        selected = set(fields)
+        if selected & {"tile", "cluster"}:
+            selected.update({"tile", "cluster"})
+        return tuple(field for field in ("tile", "cluster", "swizzle",
+                                         "cta_order", "split_k")
+                     if field in selected)
+
+
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
     generation_config: Literal["auto", "trtllm"] = Field(
@@ -5902,6 +5930,12 @@ class TorchLlmArgs(BaseLlmArgs):
         default=True,
         description=
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
+        status="prototype")
+
+    autotuner_nvmmh_config: Optional[AutoTunerNvMMHConfig] = Field(
+        default=None,
+        description=
+        "nvMatmulHeuristics policy used to reduce the CuTe DSL autotuner search space. A mapping enables NVMMH; null disables it.",
         status="prototype")
 
     use_fine_grained_sync: bool = Field(

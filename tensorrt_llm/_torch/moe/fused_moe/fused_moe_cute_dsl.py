@@ -24,8 +24,9 @@ import torch.nn.functional as F
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                          OptimizationProfile, TunableRunner, TuningConfig)
+from ...autotuner import (AutoTuner, ConstraintSpec, CuteDSLTunableRunner,
+                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                          TuningConfig)
 from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from ...cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -327,7 +328,7 @@ class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
         return x, new_token_selected_experts, *others
 
 
-class CuteDslFusedMoENvfp4Runner(TunableRunner):
+class CuteDslFusedMoENvfp4Runner(CuteDSLTunableRunner):
     tuning_config_cache = dict()
 
     def __init__(self,
@@ -534,7 +535,7 @@ class CuteDslFusedMoEBF16InputsHelper(GroupedGemmInputsHelper):
         return x, new_token_selected_experts, *others
 
 
-class CuteDslFusedMoEBF16Runner(TunableRunner):
+class CuteDslFusedMoEBF16Runner(CuteDSLTunableRunner):
     """Autotuner runner for BF16/FP16 MoE on Rubin (SM107).
 
     Selects tile_size from {64, 128, 256} and delegates to run_moe_bf16_impl.
