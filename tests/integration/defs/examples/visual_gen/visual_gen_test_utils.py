@@ -123,7 +123,6 @@ def _build_single_device_feature_args(
         AttentionConfig,
         CompilationConfig,
         CudaGraphConfig,
-        Nvfp4GemmConfig,
         ParallelConfig,
         QuantAttentionConfig,
         TorchCompileConfig,
@@ -164,9 +163,6 @@ def _build_single_device_feature_args(
             resolutions=[resolution],
             num_frames=[num_frames],
         ),
-        nvfp4_gemm_config=Nvfp4GemmConfig(allowed_backends=["cutlass"])
-        if features.quantization == "NVFP4"
-        else Nvfp4GemmConfig(),
         attention_config=attention_config,
         parallel_config=ParallelConfig(
             parallel_vae_size=1,
@@ -208,7 +204,6 @@ def _assert_resolved_single_device_feature_config(
     assert config.dynamic_weight_quant is expected_dynamic_quantization
     if features.quantization == "NVFP4":
         assert config.force_dynamic_quantization is expected_dynamic_quantization
-        assert config.nvfp4_gemm_config.allowed_backends == ["cutlass"]
 
     assert config.torch_compile.enable_autotune
 
@@ -550,22 +545,28 @@ def _lpips_deterministic_algorithms(*, fully_eager=False):
 
 @contextlib.contextmanager
 def _fixed_nvfp4_quantization_backend(features):
-    """Pin NVFP4 activation quantization to the TRT-LLM implementation.
+    """Pin NVFP4 golden runs to deterministic TRT-LLM and CUTLASS paths.
 
     VisualGen normally autotunes between the TRT-LLM and FlashInfer activation
-    quantizers. Static accuracy cases disable GEMM autotuning separately; this
-    context only fixes the activation-quantization implementation.
+    quantizers and among several GEMM backends. Those performance choices can
+    vary between processes, while fixed accuracy goldens require a stable
+    numerical path. Backend selection and parity are covered by the NVFP4
+    operator unit tests.
     """
     if features.quantization != "NVFP4":
         yield
         return
 
     from tensorrt_llm._torch.custom_ops import torch_custom_ops
+    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
     previous_flashinfer_available = torch_custom_ops.IS_FLASHINFER_AVAILABLE
+    extra_attrs = dict(get_model_extra_attrs() or {})
+    extra_attrs["nvfp4_gemm_allowed_backends"] = ["cutlass"]
     try:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = False
-        yield
+        with model_extra_attrs(extra_attrs):
+            yield
     finally:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = previous_flashinfer_available
 
