@@ -18,7 +18,7 @@ from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
-from tensorrt_llm.sampling_params import LogprobMode
+from tensorrt_llm.sampling_params import EmbeddingBias, LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig
 
@@ -907,6 +907,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            embedding_bias: Optional[EmbeddingBias] = None,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -914,8 +915,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                                     None)
         # Owned entirely on the Python side: the TorchSampler is the only
         # consumer, so the C++ request no longer carries a copy.
-        self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
-            "embedding_bias", None)
+        self.py_embedding_bias = embedding_bias
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
@@ -1564,7 +1564,7 @@ def executor_request_to_llm_request(
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
-        embedding_bias=executor_request.embedding_bias,
+        embedding_bias=getattr(executor_request, "py_embedding_bias", None),
         stop_words_list=stop_words_list,
         position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config
