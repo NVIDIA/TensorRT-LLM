@@ -248,7 +248,7 @@ TEST(KvCacheManagerV2HostMemTest, HonoursCommitUnitLargerThanAlignment)
     constexpr size_t kUnit = size_t{32} << 20;
     ASSERT_GT(kUnit, HostMem::kAlignment);
 
-    HostMem memory(4 * kUnit, 2 * kUnit, kUnit);
+    HostMem memory(4 * kUnit, 2 * kUnit, HostMemBackingOptions{kUnit});
     EXPECT_EQ(memory.size(), 2 * kUnit);
     auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
     std::memset(bytes, 0x3C, 2 * kUnit);
@@ -269,7 +269,7 @@ TEST(KvCacheManagerV2HostMemTest, SlotPoolAlignsToCommitUnit)
     // A slot size that divides kAlignment but not the larger unit, so a pool
     // rounding to the wrong one produces a size HostMem rejects.
     constexpr size_t kSlotSize = 1 << 20;
-    HostSlotPool pool(kSlotSize, SlotCount{3}, /*vmSize=*/unit * 4, unit);
+    HostSlotPool pool(kSlotSize, SlotCount{3}, /*vmSize=*/unit * 4, HostMemBackingOptions{unit});
     EXPECT_GE(pool.numSlots(), SlotCount{3});
     EXPECT_NE(std::get<MemAddress>(pool.slotAddress(SlotId{0})), MemAddress{0});
 }
@@ -283,7 +283,7 @@ TEST(KvCacheManagerV2HostMemTest, ResizeBeyondReservationIsRejected)
     HostMem memory(kMax, size_t{4} << 20);
     MemAddress const base = memory.address();
 
-    EXPECT_EQ(memory.maxSize(), kMax);
+    EXPECT_EQ(memory.vmSize(), kMax);
     EXPECT_NO_THROW(memory.resize(kMax));
     EXPECT_THROW(memory.resize(kMax + HostMem::kAlignment), std::exception);
 
@@ -337,7 +337,7 @@ TEST(KvCacheManagerV2HostMemTest, DeferredFillIsUsableAfterWaitUsable)
     // satisfied by the first commit.
     constexpr size_t kSize = size_t{3} * (512 << 20);
 
-    HostMem memory(kSize, kSize, /*waitForFill=*/false);
+    HostMem memory(kSize, kSize, HostMemBackingOptions{}, /*waitForFill=*/false);
     ASSERT_NE(memory.address(), 0U);
 
     // Walk the range in ascending order, exactly as the slot allocator does.
@@ -363,7 +363,7 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
     constexpr size_t kSize = 64 << 20;
     constexpr int kThreads = 16;
 
-    HostMem memory(kSize, kSize, /*waitForFill=*/false);
+    HostMem memory(kSize, kSize, HostMemBackingOptions{}, /*waitForFill=*/false);
     std::atomic<int> done{0};
 
     std::vector<std::thread> waiters;
@@ -378,8 +378,7 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
                 // against the fill worker but not against the other waiters, so
                 // sharing one byte would be a data race even writing equal
                 // values, and would say nothing about the rest of the range.
-                *reinterpret_cast<unsigned char*>(memory.address() + kSize - 1 - i)
-                    = static_cast<unsigned char>(i);
+                *reinterpret_cast<unsigned char*>(memory.address() + kSize - 1 - i) = static_cast<unsigned char>(i);
                 done.fetch_add(1, std::memory_order_relaxed);
             });
     }
@@ -390,8 +389,8 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
     EXPECT_EQ(done.load(), kThreads);
     for (int i = 0; i < kThreads; ++i)
     {
-        EXPECT_EQ(*reinterpret_cast<unsigned char const*>(memory.address() + kSize - 1 - i),
-            static_cast<unsigned char>(i))
+        EXPECT_EQ(
+            *reinterpret_cast<unsigned char const*>(memory.address() + kSize - 1 - i), static_cast<unsigned char>(i))
             << "byte written by waiter " << i << " did not survive";
     }
 }

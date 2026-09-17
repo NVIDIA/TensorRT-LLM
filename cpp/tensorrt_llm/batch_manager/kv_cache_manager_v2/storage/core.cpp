@@ -371,13 +371,13 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
-HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, size_t commitUnit)
+HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options)
     : SlotPoolBase(slotSize)
-    , mCommitUnit(commitUnit)
+    , mCommitUnit(options.commitUnit)
     // The pool does not wait for the fill: HostPoolGroup blocks per allocation
     // on only the range it hands out, so serving can start before the whole
     // tier is committed.
-    , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots), commitUnit, /*waitForFill=*/false)
+    , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots), options, /*waitForFill=*/false)
 {
 }
 
@@ -612,8 +612,8 @@ GpuPoolGroup::GpuPoolGroup(
 // HostPoolGroup
 // ---------------------------------------------------------------------------
 
-HostPoolGroup::HostPoolGroup(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize, size_t commitUnit)
+HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
+    HostMemBackingOptions const& options)
     : PoolGroupBase(numSlots)
 {
     TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "HostPoolGroup: slotSizeList must not be empty");
@@ -625,7 +625,7 @@ HostPoolGroup::HostPoolGroup(
     {
         double const sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
         auto const poolVmSize = static_cast<size_t>(static_cast<double>(groupVmSize) * sizeRatio);
-        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, poolVmSize, commitUnit));
+        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, poolVmSize, options));
     }
 }
 
@@ -742,8 +742,9 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 // ---------------------------------------------------------------------------
 
 HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota, size_t commitUnit)
-    : mCommitUnit(commitUnit)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota,
+    HostMemBackingOptions const& options)
+    : mOptions(options)
     // Resolved once here so the bound the pools reserve against is the same one
     // a later resize is checked against.
     , mMaxQuota(maxQuota.value_or(hostTotalMemory()))
@@ -753,7 +754,7 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(std::make_unique<HostPoolGroup>(
-            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mMaxQuota, commitUnit));
+            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mMaxQuota, mOptions));
     }
 }
 
@@ -780,7 +781,7 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator, size_t commitUnit)
+    PooledPhysMemAllocator* gpuPhysMemAllocator, HostMemBackingOptions const& options)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
@@ -793,7 +794,7 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {
-                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList, cfg.maxQuota, commitUnit);
+                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList, cfg.maxQuota, options);
             }
             else
             {

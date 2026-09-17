@@ -41,7 +41,7 @@ protected:
         // Forces primary context creation; the VMM backing queries the current
         // device in its constructor.
         ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
-        mBacking = createHostMemBacking(GetParam(), kCommitUnit);
+        mBacking = createHostMemBacking(GetParam(), HostMemBackingOptions{kCommitUnit});
         // Deliberately larger than the allocation unit, so the span a case
         // commits in differs from the unit the backing allocates in.
         mChunkSize = mBacking->commitGranularity() * kUnitsPerChunk;

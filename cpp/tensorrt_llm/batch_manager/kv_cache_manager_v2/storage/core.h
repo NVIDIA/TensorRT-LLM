@@ -290,7 +290,7 @@ public:
     //! vmSize is the address space reserved up front, and so the bound on every
     //! later resize. Reserving it all at once is what keeps the base address
     //! fixed, as it does for GpuSlotPool.
-    HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, size_t commitUnit);
+    HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options);
 
     SlotCount numSlots() const noexcept override;
     void destroy() override;
@@ -437,7 +437,7 @@ public:
     //! can reserve more than groupVmSize in total. Host groups hold exactly one
     //! pool today, which makes the two equal.
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
-        size_t commitUnit = HostMem::kAlignment);
+        HostMemBackingOptions const& options = {});
 
     Slot allocate() override;
     std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
@@ -629,7 +629,7 @@ public:
     //! is also what pool sizes are quantized to.
     HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota = std::nullopt,
-        size_t commitUnit = HostMem::kAlignment);
+        HostMemBackingOptions const& options = {});
 
     CacheTier cacheTier() const noexcept override
     {
@@ -638,7 +638,7 @@ public:
 
     size_t poolSizeGranularity() const noexcept override
     {
-        return mCommitUnit;
+        return mOptions.commitUnit;
     }
 
     //! Always set: an unset configured maxQuota resolves to the host memory the
@@ -649,7 +649,7 @@ public:
     }
 
 private:
-    size_t mCommitUnit = HostMem::kAlignment;
+    HostMemBackingOptions mOptions;
     size_t mMaxQuota = 0;
 };
 
@@ -678,6 +678,6 @@ private:
 //! quota and fixed for the tier's lifetime.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, size_t commitUnit = HostMem::kAlignment);
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {});
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
