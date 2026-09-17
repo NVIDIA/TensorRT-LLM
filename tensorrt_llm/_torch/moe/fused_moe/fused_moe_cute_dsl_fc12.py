@@ -400,8 +400,21 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         weight_view: NvFp4WeightView,
         enable_alltoall: bool = False,
         tile_size: int = 128,
+        recv_expert_count: Optional[torch.Tensor] = None,
+        deep_ep_expert_capacity: Optional[int] = None,
+        use_count_native_expert_metadata: bool = False,
     ) -> torch.Tensor:
         """Single fused FC1+FC2 op (replaces the parent's two-op sequence)."""
+        # The shared CuteDslFusedMoENvfp4Runner.forward always forwards the
+        # DeepEP direct-metadata knobs. This backend never enables that path
+        # (can_use_deep_ep_direct_metadata() stays False), so they must arrive
+        # unset; anything else means the runner and the backend disagree.
+        assert recv_expert_count is None and deep_ep_expert_capacity is None, (
+            "CuteDslFc12FusedMoE does not consume DeepEP expert-major metadata"
+        )
+        assert not use_count_native_expert_metadata, (
+            "CuteDslFc12FusedMoE does not support count-native DeepEP metadata"
+        )
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
