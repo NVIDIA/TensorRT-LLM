@@ -40,12 +40,7 @@ ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 
 def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
-    """Cache slot index reserved for MRoPE dummy/no-delta requests.
-
-    Single source of truth for this sentinel so the engine's write path
-    (model_engine.py) and the CUDA graph replay fill path below agree on
-    which slot permanently reads back a zero delta.
-    """
+    """Cache slot index reserved for MRoPE dummy/no-delta requests."""
     return max_num_tokens * pp_size
 
 
