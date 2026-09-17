@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -146,6 +146,8 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     {
         // Packed QKV input layout, [B, S, H * D + H_kv * D + H_kv * Dv].
         mKernelParams.qkv_ptr = runnerParams.qkvPtr;
+        // Packed-QKV kernels also read the cumulative KV lengths.
+        mKernelParams.cu_kv_seqlens = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
         mKernelParams.q_stride_in_bytes = mKernelParams.k_stride_in_bytes = mKernelParams.v_stride_in_bytes
             = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize
                     + mFixedParams.numKvHeads * mFixedParams.headSize
