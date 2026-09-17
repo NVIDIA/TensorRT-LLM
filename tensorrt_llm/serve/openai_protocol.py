@@ -49,7 +49,7 @@ from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
                       NonNegativeInt, PositiveInt, field_validator,
-                      model_validator)
+                      model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -192,6 +192,30 @@ class SpeculativeDecodingStats(OpenAIBaseModel):
         description="Maximum draft length per step, when the run has a fixed "
         "bound. None under draft_len_schedule, where the bound varies by batch "
         "size.")
+
+
+class _OmitsAbsentSpecDecodeStats(OpenAIBaseModel):
+    """Drops ``speculative_decoding`` from serialized output when it is absent.
+
+    Per-request spec-decode stats are off by default, so without this every
+    response on the paths that serialize with a plain ``model_dump()`` -- the
+    non-streaming chat and completions responses, and the completions stream
+    (``exclude_unset=False``) -- would gain ``"speculative_decoding": null`` for
+    every user, whether or not they enabled ``per_request_spec_decode_stats``.
+
+    Scoped to this one field on purpose. Blanket ``exclude_none`` would also
+    strip unrelated optional fields that clients may rely on being present, and
+    the dump calls are spread across the serving layer rather than funnelled
+    through one place where an ``exclude=`` argument could be applied.
+    """
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_spec_decode_stats(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("speculative_decoding",
+                                               ...) is None:
+            data.pop("speculative_decoding", None)
+        return data
 
 
 class StreamOptions(OpenAIBaseModel):
@@ -338,7 +362,7 @@ class CompletionLogProbs(OpenAIBaseModel):
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
-class CompletionResponseChoice(OpenAIBaseModel):
+class CompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -371,7 +395,7 @@ class CompletionResponse(OpenAIBaseModel):
     prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
 
 
-class CompletionResponseStreamChoice(OpenAIBaseModel):
+class CompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -903,7 +927,7 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: Optional[List[ChatCompletionLogProbsContent]] = None
 
 
-class ChatCompletionResponseChoice(OpenAIBaseModel):
+class ChatCompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     message: ChatMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
@@ -943,7 +967,7 @@ class DeltaMessage(OpenAIBaseModel):
     tool_calls: Optional[List[DeltaToolCall]] = None
 
 
-class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+class ChatCompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     delta: DeltaMessage
     logprobs: Optional[ChatCompletionLogProbs] = None

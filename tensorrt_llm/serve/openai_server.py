@@ -3205,7 +3205,14 @@ class OpenAIServer(_VideoRoutesMixin):
                              tracing.extract_trace_headers(raw_request.headers))
 
             postproc_args = ChatCompletionPostprocArgs.from_request(request)
-            self._apply_spec_decode_stats_opt_in(postproc_args)
+            # No spec-decode opt-in here on purpose. The Harmony handlers build
+            # their choices in harmony_adapter, which carries no per-request
+            # spec-decode data at all -- avg_decoded_tokens_per_iter is absent
+            # from that path too -- so setting the flag would configure
+            # something nothing reads. Extending Harmony should cover both
+            # fields together; handle_non_streaming_response would need the
+            # GenerationResult threaded through, as it currently receives only
+            # the outputs.
             postproc_params = PostprocParams(
                 post_processor=chat_harmony_streaming_post_processor
                 if request.stream else chat_harmony_post_processor,
