@@ -1249,13 +1249,12 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
 
 
 def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
-    """NVFP4 + SiTU routed MoE on either FP4 backend.
+    """NVFP4 + SiTU routed MoE on a supported FP4 backend.
 
-    Both take the same ``SiTuActivation`` carrier; CUTLASS serves it as an
-    ``ActivationType`` its kernels branch on, TRTLLM-Gen with the fused
-    ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins (group-16 block scales).
-    ``_make_routed_moe`` already mirrors both of KimiK3MoERuntime's branches,
-    so the backend is the only variable.
+    All take the same ``SiTuActivation`` carrier. CUTLASS branches on the
+    ``ActivationType`` in its kernels, TRTLLM-Gen selects the fused
+    ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins, and FC12 specializes its
+    Rubin fused epilogue. The backend is the only variable.
     """
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -1714,7 +1713,20 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    [
+        "CUTLASS",
+        "TRTLLM",
+        pytest.param(
+            "CUTEDSL_FC12",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available() or get_sm_version() != 107,
+                reason="FC12 requires Rubin (SM107)",
+            ),
+        ),
+    ],
+)
 def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
@@ -1726,12 +1738,12 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     wrong in exactly the way the GSM8K collapse showed, while every
     shape-and-buffer check stayed green.
 
-    Run for both FP4 backends: CUTLASS resolves SiTU through the activation
-    enum, TRTLLM-Gen through a distinct fused-cubin family
-    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``). A silent fallback is a different
-    failure on each, and this comparison is tolerance-free, so it catches
-    both -- including the degenerate all-zero FC1 output, which scores 0
-    against both references and so fails the assertion below.
+    Run for all supported FP4 backends: CUTLASS resolves SiTU through the
+    activation enum, TRTLLM-Gen through a distinct fused-cubin family
+    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``), and FC12 through its Rubin fused
+    epilogue. A silent fallback is a different failure on each, and this
+    comparison is tolerance-free, so it also catches the degenerate all-zero
+    FC1 output, which scores 0 against both references and fails below.
 
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
@@ -1741,7 +1753,7 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
 
     torch.manual_seed(91)
     x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
-    act_scale = float(x.abs().max().float() / (448 * 6))
+    act_scale = 1.0 if moe_backend == "CUTEDSL_FC12" else float(x.abs().max().float() / (448 * 6))
     w1 = [
         torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
         for _ in range(num_experts)
@@ -1757,10 +1769,33 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
 
     moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend=moe_backend)
+    if moe_backend == "CUTEDSL_FC12":
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
+            TrtllmCutedslFusedFc12Nvfp4Impl,
+        )
+
+        assert type(moe.backend) is TrtllmCutedslFusedFc12Nvfp4Impl
     _load_nvfp4_bank_for(moe, bank, moe_backend)
 
     router_logits = gate.compute_logits(x)
     actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+    assert torch.isfinite(actual).all()
+
+    if moe_backend == "CUTEDSL_FC12":
+        # Warm up on a side stream before capture; compilation and tuning
+        # must finish before CUDA Graph records the fused op.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                moe.forward(x, router_logits, all_rank_num_tokens=None)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = moe.forward(x, router_logits, all_rank_num_tokens=None)
+        for _ in range(2):
+            graph.replay()
+            torch.testing.assert_close(captured.float(), actual, rtol=0.02, atol=0.02)
 
     situ = _situ_reference_moe(
         x, router_logits, gate.routing_method, w1, w2, w3, beta=4.0, linear_beta=25.0
@@ -1787,6 +1822,19 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
         f"the SiTU one (situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the "
         f"quantized path is not applying SiTU"
     )
+
+    if moe_backend == "CUTEDSL_FC12":
+        # The unfixed FC12 kernel runs ordinary SwiGLU, not SwiGLU with the
+        # SiTU constants misinterpreted as sigmoid scale / linear bias.
+        plain_swiglu = _swiglu_reference_moe(
+            x, router_logits, gate.routing_method, w1, w2, w3, alpha=1.0, beta=0.0
+        )
+        plain_cos, plain_l2 = score(plain_swiglu)
+        distance_situ = torch.linalg.vector_norm(actual - situ)
+        distance_swiglu = torch.linalg.vector_norm(actual - plain_swiglu)
+        print(f"FC12 plain SwiGLU: cosine={plain_cos:.6f}, rel_l2={plain_l2:.6f}")
+        assert situ_l2 < 0.30
+        assert distance_situ < distance_swiglu
 
 
 def test_fp8_block_scaled_dequantization():
