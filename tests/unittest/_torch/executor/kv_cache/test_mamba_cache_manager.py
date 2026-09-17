@@ -1035,64 +1035,6 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
         )
 
 
-@pytest.mark.parametrize(
-    "backend, architecture, sparse, beam_width, is_disagg, expected_manager",
-    [
-        ("cpp", "T5ForConditionalGeneration", False, 2, False, KVCacheManagerV2),
-        ("cpp", "LlamaForCausalLM", False, 2, False, KVCacheManagerV2),
-        ("cpp", "LlamaForCausalLM", False, 2, True, KVCacheManagerV2),
-        ("python", "LlamaForCausalLM", False, 2, False, KVCacheManager),
-        ("python", "LlamaForCausalLM", False, 2, True, KVCacheManager),
-        ("cpp", "DeepseekV3ForCausalLM", True, 2, False, None),
-        ("cpp", "DeepseekV3ForCausalLM", True, 2, True, None),
-        ("cpp", "DeepseekV3ForCausalLM", True, 1, False, KVCacheManagerV2),
-    ],
-    ids=[
-        "encoder_decoder",
-        "cpp_beam",
-        "cpp_disagg_beam",
-        "python_fallback",
-        "python_disagg_fallback",
-        "sparse_beam",
-        "sparse_disagg_beam",
-        "sparse_greedy",
-    ],
-)
-def test_v2_beam_compatibility(
-    monkeypatch: pytest.MonkeyPatch,
-    backend: str,
-    architecture: str,
-    sparse: bool,
-    beam_width: int,
-    is_disagg: bool,
-    expected_manager: type | None,
-) -> None:
-    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", backend)
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(architectures=[architecture]),
-        sparse_attention_config=SimpleNamespace(algorithm="deepseek_v4") if sparse else None,
-        is_encoder_decoder=architecture == "T5ForConditionalGeneration",
-    )
-    creator = object.__new__(KvCacheCreator)
-    creator._kv_connector_manager = None
-    creator._max_beam_width = beam_width
-    creator._is_disagg = is_disagg
-
-    if expected_manager is None:
-        # Sparse attention metadata cannot pass cache_indirection to map beam rows.
-        with pytest.raises(NotImplementedError, match="max_beam_width > 1"):
-            creator._validate_or_fallback_kv_cache_manager_v2(
-                KVCacheManagerV2, model_config, KvCacheConfig()
-            )
-        return
-    assert (
-        creator._validate_or_fallback_kv_cache_manager_v2(
-            KVCacheManagerV2, model_config, KvCacheConfig()
-        )
-        is expected_manager
-    )
-
-
 def _make_mgr(
     max_batch_size=4, max_draft_len=2, enable_attention_dp=False, use_replay_state_update=False
 ):

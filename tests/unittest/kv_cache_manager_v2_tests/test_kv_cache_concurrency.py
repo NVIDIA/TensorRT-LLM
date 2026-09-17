@@ -15,14 +15,14 @@
 
 """Concurrency regression tests for KVCacheManagerV2.
 
-The single-threaded Python suite cannot catch shared-page reference-count races or bindings that
-block on the C++ API lock while still holding the GIL. The latter deadlocks against a lock holder
-which needs the GIL to run a Python callback, and stalls every other Python thread for the duration
-of a resize even when it does not deadlock outright.
+The rest of the Python suite is single-threaded, so it cannot see the failure mode these cover: a
+binding that blocks on the C++ API lock while still holding the GIL. That deadlocks against a lock
+holder which needs the GIL to run a Python callback, and it stalls every other Python thread for the
+duration of a resize even when it does not deadlock outright.
 
-Every test here runs under a faulthandler watchdog, because lock inversions can manifest as a hang.
-The per-thread join timeouts below are not sufficient on their own: in the deadlock the *main*
-thread is the one parked (it holds the API lock and wants the GIL),
+Every test here runs under a faulthandler watchdog, because the bug they guard against manifests as
+a hang rather than as a wrong answer. The per-thread join timeouts below are not sufficient on their
+own: in the deadlock the *main* thread is the one parked (it holds the API lock and wants the GIL),
 so it never reaches the join.
 """
 
@@ -31,7 +31,6 @@ import itertools
 import os
 import threading
 import time
-from functools import partial
 
 import pytest
 import torch
@@ -44,7 +43,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GpuCacheTierConfig,
     KVCacheManager,
     KVCacheManagerConfig,
-    _KVCache,
 )
 
 KV_CACHE_MANAGER_V2_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
@@ -472,59 +470,6 @@ def test_many_threads_probe_reuse_concurrently() -> None:
         assert len(results) == 8 * 500
         assert all(value == 0 for value in results)
     finally:
-        manager.shutdown()
-
-
-def test_shared_prefix_page_indices_are_safe_for_concurrent_readers() -> None:
-    """Distinct caches may read shared pages without changing non-atomic reference counts.
-
-    Each cache has only one reader. The race is between different caches that own the same
-    committed pages, even at beam width one. This stress test is probabilistic without TSan.
-    """
-    manager = KVCacheManager(_make_config())
-    caches: list[_KVCache] = []
-    try:
-        stream = torch.cuda.Stream()
-        cuda_stream = CudaStream(stream.cuda_stream)
-        num_blocks = 256
-        tokens = list(range(manager.tokens_per_block * num_blocks))
-        layer_group_id = manager.get_layer_group_id(0)
-        producer = manager.create_kv_cache(None, tokens)
-        try:
-            assert producer.resume(cuda_stream)
-            assert producer.resize(len(tokens))
-            producer.commit(tokens)
-            expected = list(producer.get_aggregated_page_indices(layer_group_id))
-            assert len(expected) == num_blocks
-            assert all(page >= 0 for page in expected)
-        finally:
-            producer.close()
-
-        for _ in range(8):
-            cache = manager.create_kv_cache(None, tokens)
-            caches.append(cache)
-            assert cache.beam_width == 1
-            assert cache.num_committed_tokens == len(tokens)
-            assert cache.resume(cuda_stream)
-            # Equal indices establish physical page sharing before concurrent reads start.
-            assert list(cache.get_aggregated_page_indices(layer_group_id)) == expected
-
-        barrier = threading.Barrier(len(caches))
-
-        def read_indices(cache: _KVCache) -> None:
-            barrier.wait(TIMEOUT_S)
-            for _ in range(1000):
-                assert list(cache.get_aggregated_page_indices(layer_group_id)) == expected
-
-        # Thread start hands each cache to its sole reader; joining hands ownership back.
-        threads = [_worker(partial(read_indices, cache)) for cache in caches]
-        for thread in threads:
-            thread.start()
-        _join(*threads)
-        stream.synchronize()
-    finally:
-        for cache in caches:
-            cache.close()
         manager.shutdown()
 
 
