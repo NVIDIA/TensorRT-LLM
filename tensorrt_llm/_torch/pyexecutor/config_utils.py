@@ -1074,6 +1074,17 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type == "muse_spark":
+        # Muse Spark Open export composite config: nested text/vision/audio
+        # sub-configs describing the same model the flat "musespark_open_omni"
+        # config describes. Translate to the flat in-tree config (which
+        # cross-checks every derivable field against what the runtime
+        # implements) and route to the existing omni model, mirroring the
+        # kimi_k3 composite handling above. The weight spelling differs too;
+        # the model's own loader renames it (musespark_open_format.py).
+        from tensorrt_llm._torch.configs import MuseSparkOpenConfig
+        model_config = MuseSparkOpenConfig.from_open_format(config_dict)
+        model_config.architectures = ["MuseSparkOpenOmniForCausalLM"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

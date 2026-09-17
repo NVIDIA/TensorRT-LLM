@@ -29,7 +29,7 @@ above it (``patch_size``, ``patch_temporal``, ``downsample_factor``) plus
 preserved verbatim.
 """
 
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from transformers.configuration_utils import PretrainedConfig
@@ -253,6 +253,192 @@ def layer_window(
     return None
 
 
+def _require(mapping: Dict[str, Any], key: str, expected: Any, why: str) -> None:
+    """Reject an open-format field whose value the runtime cannot honor.
+
+    A missing key passes: every checked field has exactly one value the runtime
+    implements, so absence and agreement are the same statement. A present but
+    different value is a different model and must fail here, not load quietly.
+    """
+    actual = mapping.get(key, expected)
+    if actual != expected:
+        raise ValueError(
+            f"Muse Spark Open format: {key}={actual!r} but the runtime implements "
+            f"{expected!r} ({why})"
+        )
+
+
+def _derive_nope_schedule(
+    layer_types: Sequence[str],
+    layer_rope_theta: Sequence[float],
+    sliding_window: Optional[int],
+    rope_theta: float,
+) -> Tuple[int, List[int]]:
+    """Invert per-layer ``layer_types``/``layer_rope_theta`` to the source form.
+
+    The open export publishes the attention schedule extensionally; the runtime
+    implements it as a rule (``every_n_layers_nope`` + ``global_attn_cfg``,
+    indexed through :func:`nope_offset`). This inverts the extensional form:
+    NoPE layers are where ``layer_rope_theta`` is 0, their spacing is
+    ``every_n_layers_nope``, and each residue class of the shifted index gets
+    one ``global_attn_cfg`` entry. The caller re-derives ``layer_types`` from
+    the result and compares, so an inconsistent schedule cannot slip through --
+    this function only has to find the parameters, not to prove them.
+    """
+    num_layers = len(layer_types)
+    if len(layer_rope_theta) != num_layers:
+        raise ValueError(
+            f"Muse Spark Open format: layer_rope_theta has {len(layer_rope_theta)} entries "
+            f"for {num_layers} layers"
+        )
+    nope_layers = [i for i, theta in enumerate(layer_rope_theta) if theta == 0]
+    if not nope_layers:
+        raise ValueError("Muse Spark Open format: no NoPE layers (layer_rope_theta has no 0)")
+    for i, theta in enumerate(layer_rope_theta):
+        if theta != 0 and theta != rope_theta:
+            raise ValueError(
+                f"Muse Spark Open format: layer {i} rope theta {theta} != the model-wide "
+                f"rope_theta {rope_theta}; per-layer theta values have no home in the "
+                "flat config"
+            )
+    # NoPE layers sit every ``every_n_layers_nope`` layers counted from the
+    # last layer backwards (see layer_uses_rope). Their spacing is the period.
+    spacings = {b - a for a, b in zip(nope_layers, nope_layers[1:])}
+    if len(nope_layers) > 1 and len(spacings) != 1:
+        raise ValueError(
+            f"Muse Spark Open format: NoPE layers {nope_layers} are not equally spaced; "
+            "the periodic schedule the runtime implements cannot express this"
+        )
+    every_n = spacings.pop() if spacings else num_layers - nope_layers[0]
+    if nope_layers[-1] != num_layers - 1:
+        raise ValueError(
+            f"Muse Spark Open format: the last layer ({num_layers - 1}) is not NoPE; "
+            "the runtime's backward-counted schedule always ends on one"
+        )
+
+    offset = nope_offset(num_layers, every_n)
+    global_attn_cfg: List[Optional[int]] = [None] * every_n
+    for i, layer_type in enumerate(layer_types):
+        if layer_type == FULL_ATTENTION:
+            entry = 0
+        elif layer_type == SLIDING_ATTENTION:
+            if not sliding_window:
+                raise ValueError(
+                    "Muse Spark Open format: sliding_attention layers but no sliding_window"
+                )
+            entry = int(sliding_window)
+        else:
+            raise ValueError(
+                f"Muse Spark Open format: unknown layer_types entry {layer_type!r} at layer {i}"
+            )
+        slot = (i + offset) % every_n
+        if global_attn_cfg[slot] is None:
+            global_attn_cfg[slot] = entry
+        elif global_attn_cfg[slot] != entry:
+            raise ValueError(
+                f"Muse Spark Open format: layers in residue class {slot} mix attention "
+                "scopes; the periodic schedule the runtime implements cannot express this"
+            )
+    if any(entry is None for entry in global_attn_cfg):
+        raise ValueError(
+            "Muse Spark Open format: not every global_attn_cfg slot is populated by "
+            f"{num_layers} layers with period {every_n}"
+        )
+    return every_n, list(global_attn_cfg)
+
+
+def _vision_config_from_open_format(config_dict: Dict[str, Any]) -> MuseSparkOpenVisionConfig:
+    """Translate the open export's ``vision_config`` to the runtime's tower config.
+
+    The open layout renames ``downsample_factor`` to ``merge_size`` and
+    ``norm_eps`` to ``layer_norm_eps``, expresses the attention schedule as
+    ``layer_types`` instead of ``sparse_attention_factor``, publishes the
+    positional-embedding grid instead of ``image_size``, and hoists the two
+    projector widths to the top level (``out_hidden_size``,
+    ``projector_hidden_size``).
+    """
+    vision = dict(config_dict.get("vision_config") or {})
+    if not vision:
+        raise ValueError("Muse Spark Open format: config has no vision_config")
+
+    num_layers = int(vision["num_hidden_layers"])
+    layer_types = list(vision.get("layer_types") or [])
+    if len(layer_types) != num_layers:
+        raise ValueError(
+            f"Muse Spark Open format: vision layer_types has {len(layer_types)} entries "
+            f"for {num_layers} layers"
+        )
+    full_layers = [i for i, t in enumerate(layer_types) if t == FULL_ATTENTION]
+    if not full_layers:
+        raise ValueError("Muse Spark Open format: vision tower has no full-attention layer")
+    # The first full layer under the reference schedule is index factor-1.
+    factor = full_layers[0] + 1
+    expected = [
+        FULL_ATTENTION
+        if layer_uses_full_vision_attention(i, num_layers, factor)
+        else "window_attention"
+        for i in range(num_layers)
+    ]
+    if layer_types != expected:
+        raise ValueError(
+            "Muse Spark Open format: vision layer_types do not follow the "
+            f"sparse_attention_factor={factor} schedule the runtime implements"
+        )
+
+    rope_parameters = vision.get("rope_parameters") or {}
+    _require(rope_parameters, "rope_type", "axial", "the tower's 2D RoPE form")
+
+    pos_emb_height = int(vision.get("pos_emb_height", 32))
+    pos_emb_width = int(vision.get("pos_emb_width", pos_emb_height))
+    if pos_emb_height != pos_emb_width:
+        raise ValueError(
+            f"Muse Spark Open format: vision pos_emb grid {pos_emb_height}x{pos_emb_width} "
+            "is not square; the tower interpolates from a square grid"
+        )
+
+    merge_size = int(vision.get("merge_size", 2))
+    return MuseSparkOpenVisionConfig(
+        hidden_size=int(vision["hidden_size"]),
+        num_hidden_layers=num_layers,
+        num_attention_heads=int(vision["num_attention_heads"]),
+        intermediate_size=int(vision["intermediate_size"]),
+        norm_eps=float(vision.get("layer_norm_eps", 1e-5)),
+        patch_size=int(vision["patch_size"]),
+        image_size=pos_emb_height * int(vision["patch_size"]),
+        patch_temporal=int(vision.get("patch_temporal", 2)),
+        downsample_factor=merge_size,
+        video_downsample_factor=merge_size,
+        sparse_attention_factor=factor,
+        rope_theta=float(rope_parameters.get("rope_theta", 10000.0)),
+        hidden_act=str(vision.get("hidden_act", "gelu")),
+        vision_output_dim=int(config_dict["out_hidden_size"]),
+        projector_input_dim=int(config_dict["projector_hidden_size"]),
+    )
+
+
+def _check_audio_config_matches_encoder(
+    audio_config: Optional[Dict[str, Any]], hidden_size: int
+) -> None:
+    """Reject an ``audio_config`` the fixed wav_ae tower cannot realize.
+
+    The runtime's audio encoder hardcodes its stage plan
+    (``MuseSparkOpenAudioEncoder`` defaults); the open export publishes the same
+    plan as data. There is nothing to translate -- only to verify, so a
+    re-export with a different tower fails at config time instead of at the
+    weight walk.
+    """
+    audio = dict(audio_config or {})
+    if not audio:
+        raise ValueError("Muse Spark Open format: config has no audio_config")
+    _require(audio, "patch_sizes", [16, 6, 5, 4], "the wav_ae patchify plan")
+    _require(audio, "hidden_sizes", [256, 512, 1024, 2048], "the wav_ae stage widths")
+    _require(audio, "depths", [2, 2, 2, 2], "the wav_ae blocks per stage")
+    _require(audio, "conv_kernel_size", 7, "the wav_ae depthwise kernel")
+    _require(audio, "hidden_act", "gelu", "the wav_ae activation")
+    _require(audio, "mlp_ratio", 4.0, "the wav_ae MLP width ratio")
+    _require(audio, "out_hidden_size", hidden_size, "the decoder width the tower emits")
+
+
 class MuseSparkOpenConfig(PretrainedConfig):
     model_type = "musespark_open_omni"
 
@@ -431,6 +617,165 @@ class MuseSparkOpenConfig(PretrainedConfig):
             kwargs["torch_dtype"] = torch.bfloat16
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    @classmethod
+    def from_open_format(cls, config_dict: Dict[str, Any]) -> "MuseSparkOpenConfig":
+        """Build the flat config from the open-export ``muse_spark`` layout.
+
+        The open export re-publishes the identical model in HF composite form:
+        ``model_type: muse_spark`` with nested ``text_config`` /
+        ``vision_config`` / ``audio_config``, per-layer ``layer_types`` +
+        ``layer_rope_theta`` instead of ``global_attn_cfg`` +
+        ``every_n_layers_nope``, and renamed scalar knobs. This translates that
+        layout into the exact flat config the runtime was written against and
+        cross-checks every derivable quantity, so a re-export that changes the
+        model (not just the spelling) fails here instead of loading wrong.
+
+        Deliberately dropped fields, none of which carry information the
+        runtime uses:
+
+        * ``text_config.intermediate_size`` (16384): the dense-FFN width for
+          ``mlp_layer_types == "dense"`` layers, of which this model has none
+          (asserted). The flat config's ``intermediate_size`` is the routed
+          expert width, derived from ``moe_intermediate_size``.
+        * ``quantization_config``: the same information ships in
+          ``hf_quant_config.json``, which is the copy TRT-LLM reads
+          (``ModelConfig.from_pretrained``). Keeping a second copy on the
+          config would hand the modelopt-config path two sources to disagree.
+        * ``transformers_version``, ``initializer_range``: bookkeeping.
+        """
+        text = dict(config_dict.get("text_config") or {})
+        if not text:
+            raise ValueError("Muse Spark Open format: config has no text_config")
+        # The class constructor defaults torch_dtype to bfloat16; the open
+        # export states the same at the top level. A different export dtype
+        # must not be silently overridden by that default.
+        _require(config_dict, "dtype", "bfloat16", "the export dtype the runtime assumes")
+
+        num_hidden_layers = int(text["num_hidden_layers"])
+        hidden_size = int(text["hidden_size"])
+        head_dim = int(text["head_dim"])
+
+        _require(text, "hidden_act", "silu", "the decoder FFNs are gated SiLU (swiglu)")
+        _require(text, "attention_bias", False, "the runtime attention has no bias")
+        _require(text, "attention_dropout", 0.0, "the runtime attention has no dropout")
+        _require(text, "num_shared_experts", 0, "the MoE has no shared expert")
+        if set(text.get("mlp_layer_types") or []) != {"sparse"}:
+            raise ValueError(
+                "Muse Spark Open format: expected every mlp_layer_types entry to be "
+                f"'sparse', got {sorted(set(text.get('mlp_layer_types') or []))}; a dense "
+                "FFN layer has no home in the flat config"
+            )
+
+        rope_theta = float((text.get("rope_parameters") or {}).get("rope_theta", 500000.0))
+        every_n_layers_nope, global_attn_cfg = _derive_nope_schedule(
+            text["layer_types"],
+            text["layer_rope_theta"],
+            text.get("sliding_window"),
+            rope_theta,
+        )
+
+        # ``sigmoid(g / 0.3)``'s temperature is a checkpoint property the
+        # runtime hardcodes (MuseSparkOpenGatedResidual.TEMPERATURE); a checkpoint
+        # trained with another value must not load silently.
+        _require(text, "residual_gate_temperature", 0.3, "the gated-residual temperature")
+
+        moe = {
+            "topk": int(text["num_experts_per_tok"]),
+            "num_experts": int(text["num_local_experts"]),
+            "route_scale": float(text.get("routed_scaling_factor", 1.0)),
+            "override_routed_hidden_dim": int(text["moe_intermediate_size"]),
+        }
+        moe_hidden_size = int(text["moe_hidden_size"])
+        if moe_hidden_size <= 0 or hidden_size % moe_hidden_size:
+            raise ValueError(
+                f"Muse Spark Open format: hidden_size {hidden_size} is not a whole "
+                f"multiple of moe_hidden_size {moe_hidden_size}"
+            )
+        moe["compression_factor"] = hidden_size // moe_hidden_size
+
+        # metap ships as its consequence: output_multiplier == (hidden /
+        # base_width) ** -0.5. Invert it and cross-check the round-trip.
+        output_multiplier = float(text["output_multiplier"])
+        base_width = hidden_size * output_multiplier**2
+        if abs(base_width - round(base_width)) > 1e-6:
+            raise ValueError(
+                f"Muse Spark Open format: output_multiplier {output_multiplier} does not "
+                f"invert to an integral metap base_width (got {base_width})"
+            )
+        metap = {"base_width": float(round(base_width)), "m_emb": 1.0}
+
+        vision_config = _vision_config_from_open_format(config_dict)
+        _check_audio_config_matches_encoder(config_dict.get("audio_config"), hidden_size)
+
+        flat = cls(
+            vocab_size=int(text["vocab_size"]),
+            hidden_size=hidden_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=int(text["num_attention_heads"]),
+            num_key_value_heads=int(text["num_key_value_heads"]),
+            head_dim=head_dim,
+            max_position_embeddings=int(text["max_position_embeddings"]),
+            rms_norm_eps=float(text["rms_norm_eps"]),
+            rms_post_norm_eps=float(text["post_norm_eps"]),
+            rope_theta=rope_theta,
+            every_n_layers_nope=every_n_layers_nope,
+            global_attn_cfg=global_attn_cfg,
+            moe=moe,
+            metap=metap,
+            output_soft_cap_temp=float(text["final_logit_softcapping"]),
+            tie_word_embeddings=bool(text.get("tie_word_embeddings", False)),
+            vision_config=vision_config,
+            bos_token_id=text.get("bos_token_id"),
+            eos_token_id=text.get("eos_token_id"),
+            pad_token_id=text.get("pad_token_id"),
+        )
+
+        # The audio tower is gated on this dict exactly as in the source model;
+        # the open export asserts the same fixed tower via audio_config above.
+        flat.audio_perception_modality_args = {
+            "encoder_family": "wav_ae",
+            "use_patch_encoder": False,
+            "input_mode": "wav",
+            "next_audio_token": 201471,
+            "empty_audio_token": 201472,
+        }
+        flat.use_audio_perception = True
+
+        # Round-trip checks: the flat config re-derives the per-layer schedule
+        # and the two scalar multipliers from what was passed above; they must
+        # reproduce the open config's own statements exactly.
+        if flat.layer_types != list(text["layer_types"]):
+            raise ValueError(
+                "Muse Spark Open format: derived layer_types disagree with the "
+                "checkpoint's layer_types; the attention schedule is not the "
+                f"every_n_layers_nope={every_n_layers_nope} / "
+                f"global_attn_cfg={global_attn_cfg} form the runtime implements"
+            )
+        expected_rope = [theta != 0 for theta in text["layer_rope_theta"]]
+        if flat.use_rope_per_layer != expected_rope:
+            raise ValueError(
+                "Muse Spark Open format: derived RoPE schedule disagrees with layer_rope_theta"
+            )
+        qk_scale_factor = float(text["qk_scale_factor"])
+        if abs(qk_scale_factor - flat.scale_query_by) > 1e-9 * abs(flat.scale_query_by):
+            raise ValueError(
+                f"Muse Spark Open format: qk_scale_factor {qk_scale_factor} != the "
+                f"runtime's query pre-scale {flat.scale_query_by}"
+            )
+        if abs(output_multiplier - flat.metap_multiplier) > 1e-9 * abs(flat.metap_multiplier):
+            raise ValueError(
+                f"Muse Spark Open format: output_multiplier {output_multiplier} != the "
+                f"derived metap multiplier {flat.metap_multiplier}"
+            )
+
+        # The open export moves the patch marker to ``image_token_id`` (its chat
+        # template emits ``<|patch|>`` where the old one wrote ``<image>``); the
+        # ids themselves are unchanged, and the flat defaults already carry them.
+        _require(config_dict, "image_token_id", flat.patch_token_id, "the <|patch|> marker id")
+        _require(config_dict, "video_token_id", flat.video_token_id, "the <|video|> marker id")
+        _require(config_dict, "audio_token_id", flat.audio_token_id, "the <|audio|> marker id")
+        return flat
 
     def unquantized_layers(self, exclude_modules: Optional[List[str]]) -> List[int]:
         """Decoder layers whose experts are stored unquantized.
