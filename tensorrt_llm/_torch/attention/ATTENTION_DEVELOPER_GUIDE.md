@@ -580,8 +580,6 @@ Key test files:
 
 - `tests/unittest/_torch/attention/test_attention.py`
 - `tests/unittest/_torch/attention/test_attention_mla.py`
-- `tests/unittest/_torch/attention/test_fmha_manager.py`
-- `tests/unittest/_torch/attention/test_combined_fmha.py`
 - `tests/unittest/_torch/attention/test_vanilla_attention.py`
 - `tests/unittest/_torch/attention/test_flashinfer_attention.py`
 - `tests/unittest/_torch/attention/kernels/`
