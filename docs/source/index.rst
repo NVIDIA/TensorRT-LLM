@@ -107,6 +107,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/dev-containers.md
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
+   developer-guide/kv-cache-residency.md
    developer-guide/kv-cache-cold-page-codec.md
    developer-guide/kv-cache-compression-development.md
    developer-guide/sparse-attention-development-guide.md
