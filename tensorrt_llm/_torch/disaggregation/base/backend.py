@@ -189,8 +189,9 @@ class Cancelled:
 Outcome = Union[Delivered, Failed, Cancelled]
 """How one delivery ended. ``None`` rather than a member means it has not ended yet.
 
-Latch which member it is, not the object: ``reports_pending`` turns from true to false over time, so
-a stored outcome carries a stale one.
+The logical member and its cause are committed at the task/session transition;
+polling only observes that decision. ``reports_pending`` can still change, so a
+stored outcome carries stale report progress, not a different logical result.
 
 ``reports_pending`` asks one question and only one: is a report this transfer was owed still to
 arrive. Receiving waits on the writers' reports, sending on word about its own writes.
@@ -218,6 +219,7 @@ class Attempt(Protocol):
 
         A failure is reported as soon as it is known, which may be before every report is in --
         that second question is carried by the outcome itself.
+        The logical result is stable and does not depend on when the first poll occurs.
         """
         ...
 

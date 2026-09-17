@@ -232,6 +232,74 @@ class TaskStatus(Enum):
     ERROR = "ERROR"
 
 
+@dataclass(frozen=True)
+class _LogicalOutcome:
+    """A committed delivery decision, independent of physical/report progress."""
+
+    status: SessionStatus
+    reason: str = ""
+    by_peer: bool = False
+
+
+class _LogicalOutcomes:
+    """Arbitrate task completion against session failure/cancellation at event time.
+
+    A failed or cancelled session ends only pending tasks. Already committed
+    results, including their original cause, never change. No task, request or
+    backend handle is retained here: memory ownership remains a separate concern.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._terminal: Optional[_LogicalOutcome] = None
+        self._results: list[Optional[_LogicalOutcome]] = []
+
+    def add_task(self) -> int:
+        with self._lock:
+            index = len(self._results)
+            self._results.append(self._terminal)
+            return index
+
+    def get(self, index: int) -> Optional[_LogicalOutcome]:
+        with self._lock:
+            return self._results[index]
+
+    def complete(self, index: int) -> None:
+        with self._lock:
+            if self._results[index] is None:
+                self._results[index] = _LogicalOutcome(SessionStatus.TRANSFERRED)
+
+    def fail(self, error: Exception) -> None:
+        self._end(_LogicalOutcome(SessionStatus.ERROR, reason=str(error)))
+
+    def cancel(self, by_peer: bool) -> None:
+        self._end(_LogicalOutcome(SessionStatus.CANCELLED, by_peer=by_peer))
+
+    def _end(self, outcome: _LogicalOutcome) -> None:
+        with self._lock:
+            if self._terminal is not None:
+                return
+            self._terminal = outcome
+            for index, result in enumerate(self._results):
+                if result is None:
+                    self._results[index] = self._terminal
+
+
+class _LogicalTask:
+    def __init__(self) -> None:
+        self._logical_outcomes = _LogicalOutcomes()
+        self._logical_index = self._logical_outcomes.add_task()
+
+    def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
+        """Join the session before this task is exposed to a worker or caller."""
+        self._logical_outcomes = outcomes
+        self._logical_index = outcomes.add_task()
+
+    @property
+    def logical_outcome(self) -> Optional[_LogicalOutcome]:
+        return self._logical_outcomes.get(self._logical_index)
+
+
 class _ReceiveOperationOwner:
     """Track destination access independently from a task's logical result."""
 
@@ -477,8 +545,9 @@ class _PhysicalOperation:
     status: Optional[object] = None
 
 
-class SendTaskBase:
+class SendTaskBase(_LogicalTask):
     def __init__(self, params: DisaggregatedParams):
+        super().__init__()
         self.status = TaskStatus.INIT
         self._event = threading.Event()
         self._exception: Optional[Exception] = None
@@ -490,11 +559,13 @@ class SendTaskBase:
         self._physical_operations: dict[int, _PhysicalOperation] = {}
 
     def fail(self, exc: Exception) -> None:
+        self._logical_outcomes.fail(exc)
         self._exception = exc
         self.status = TaskStatus.ERROR
         self._event.set()
 
     def complete(self) -> None:
+        self._logical_outcomes.complete(self._logical_index)
         self.status = TaskStatus.TRANSFERRED
         self._event.set()
 
@@ -1957,11 +2028,11 @@ class TxSession(TxSessionBase):
         self._reported_aux_peer_ranks: set[int] = set()
         self._has_last_slice = False
         self.lock = threading.Lock()
+        self._logical_outcomes = _LogicalOutcomes()
 
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
-        self._cancel_exception: Optional[Exception] = None
         self.transfer_start_time = None
         self.transfer_end_time = None
         # Must be last: makes session visible to listener thread,
@@ -2021,6 +2092,7 @@ class TxSession(TxSessionBase):
                 prompt_len=self._base_args.prompt_len,
             )
             task._unique_rid = self.disagg_request_id
+            task.bind_logical_outcomes(self._logical_outcomes)
             self.kv_tasks.append(task)
             self._has_last_slice |= chunk.is_last
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
@@ -2045,6 +2117,7 @@ class TxSession(TxSessionBase):
                 params = self._base_args.params
                 task = AuxSendTask(params, self.aux_slot)
                 task._unique_rid = self.disagg_request_id
+                task.bind_logical_outcomes(self._logical_outcomes)
                 self.aux_task = task
         self._report_unsubmitted_aux_failures(aux_failures)
         if terminal_error is not None:
@@ -2144,19 +2217,16 @@ class TxSession(TxSessionBase):
     def cancel_local(self, by_peer: bool = False) -> bool:
         aux_failures: list[RecvReqInfo] = []
         with self.lock:
-            # Only an earlier cancel refuses: a failed session may still have peers touching memory,
-            # and they are told to stop here. Which ending a piece reports is latched by its handle,
-            # so it does not depend on this.
+            # A later cancellation must still notify peers after logical failure.
+            # The logical arbiter preserves whichever outcome already committed.
             if self._terminal_status == SessionStatus.CANCELLED:
                 return False
+            self._logical_outcomes.cancel(by_peer)
             self._terminal_status = SessionStatus.CANCELLED
             # Who asked is not recoverable later, and the two differ: the peer asking is a transfer
             # error, our own side asking is an ordinary end.
             self.cancelled_by_peer = by_peer
             exc = RuntimeError(f"TxSession {self.disagg_request_id} cancelled")
-            # Kept so a task failed by the line below is recognisable as cancelled rather than
-            # broken; its own status cannot say which, since both end it the same way.
-            self._cancel_exception = exc
             for task in self.kv_tasks:
                 if task.status == TaskStatus.INIT:
                     task.fail(exc)
@@ -2268,6 +2338,7 @@ class TxSession(TxSessionBase):
                         self._exception = RuntimeError(
                             "required auxiliary transfer was not dispatched"
                         )
+                        self._logical_outcomes.fail(self._exception)
                         self._terminal_status = SessionStatus.ERROR
                 return WaitResult.FAILED
             result = wait_for_task(self.aux_task)
@@ -2286,6 +2357,7 @@ class TxSession(TxSessionBase):
         aux_failures: list[RecvReqInfo] = []
         with self.lock:
             self._exception = RuntimeError(msg)
+            self._logical_outcomes.fail(self._exception)
             self._terminal_status = SessionStatus.ERROR
             for task in self.kv_tasks:
                 if not task.is_done:
@@ -2328,7 +2400,7 @@ class TxSession(TxSessionBase):
             logger.warning(f"TxSession.__del__: exception during close: {e}")
 
 
-class KVRecvTask:
+class KVRecvTask(_LogicalTask):
     def __init__(
         self,
         unique_rid: Optional[int],
@@ -2337,6 +2409,7 @@ class KVRecvTask:
         params: DisaggregatedParams,
         aux_slot: Optional[int],
     ):
+        super().__init__()
         self._event = threading.Event()
         self.slice_id = slice_id
         self.status = TaskStatus.INIT
@@ -2354,6 +2427,7 @@ class KVRecvTask:
         self._ownership_state_lock: Optional[threading.Lock] = None
 
     def fail(self, exc: Exception) -> None:
+        self._logical_outcomes.fail(exc)
         if self._ownership_state_lock is None:
             self._exception = exc
             self.status = TaskStatus.ERROR
@@ -2366,12 +2440,14 @@ class KVRecvTask:
 
     def complete(self) -> None:
         if self._ownership_state_lock is None:
+            self._logical_outcomes.complete(self._logical_index)
             self.status = TaskStatus.TRANSFERRED
             self._event.set()
             return
         with self._ownership_state_lock:
             if self.status == TaskStatus.ERROR:
                 return
+            self._logical_outcomes.complete(self._logical_index)
             self.status = TaskStatus.TRANSFERRED
             self._event.set()
 
@@ -3058,7 +3134,6 @@ class RxSession(RxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
-        self._cancel_exception: Optional[Exception] = None
         self.transfer_start_time = None
         self.transfer_end_time = None
         self.kv_cache_size_bytes: int = 0
@@ -3077,6 +3152,7 @@ class RxSession(RxSessionBase):
         # publication wins the state transition.
         self._publication_lock = threading.Lock()
         self.lock = threading.Lock()
+        self._logical_outcomes = _LogicalOutcomes()
         try:
             self._receiver.setup_session(self)
         except Exception:
@@ -3122,6 +3198,7 @@ class RxSession(RxSessionBase):
 
     def _record_ownership_evidence_error(self, error: Exception) -> None:
         """Record a fatal ownership-evidence error and close receiver admission."""
+        self._logical_outcomes.fail(error)
         self._exception = error
         if self._terminal_status is None:
             self._terminal_status = SessionStatus.ERROR
@@ -3222,6 +3299,7 @@ class RxSession(RxSessionBase):
             params,
             aux_slot=self.aux_slot,
         )
+        task.bind_logical_outcomes(self._logical_outcomes)
         self._kv_tasks.append(task)
         self._receiver.dispatch_task(task)
 
@@ -3238,6 +3316,7 @@ class RxSession(RxSessionBase):
                 params,
                 aux_slot=self.aux_slot,
             )
+            task.bind_logical_outcomes(self._logical_outcomes)
             task.begin_publication()
             self._kv_tasks.append(task)
             return task
@@ -3256,6 +3335,7 @@ class RxSession(RxSessionBase):
     def fail_admission(self, error: Exception) -> None:
         """Fail logical admission without releasing possibly published destinations."""
         with self.lock:
+            self._logical_outcomes.fail(error)
             self._exception = error
             if self._terminal_status is None:
                 self._terminal_status = SessionStatus.ERROR
@@ -3368,10 +3448,10 @@ class RxSession(RxSessionBase):
                         instance_name=instance_name,
                         instance_rank=instance_rank,
                     ):
-                        # Runs on the scatter worker thread for the bounced path. Touches only this
-                        # task's own status/_event/_perf_timer (no RxSession.lock, no shared session
-                        # state), so it is lock-free. complete() sets status before _event, keeping
-                        # wait_complete's status-first poll correct.
+                        # Runs on the scatter worker thread for the bounced path. Do not acquire
+                        # RxSession.lock here: the non-bounced path invokes this callback inline
+                        # while already holding it. Task outcome/ownership locks are independent.
+                        # complete() sets status before _event for wait_complete's status-first poll.
                         if self._enforce_physical_ownership:
                             task.finish_local_completion()
                         if not success:
@@ -3395,8 +3475,8 @@ class RxSession(RxSessionBase):
                             )
                         task.complete()
                         # Transfer end for perf/time-sync: only meaningful once every slice has
-                        # landed. Plain attribute write (atomic under the GIL); on_done must stay
-                        # lock-free, and consumers only read it after wait_complete succeeds.
+                        # landed. Plain attribute write (atomic under the GIL); consumers only read
+                        # it after wait_complete succeeds.
                         if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
                             self.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
                         logger.debug(
@@ -3486,12 +3566,14 @@ class RxSession(RxSessionBase):
                     self._exception = RuntimeError(
                         f"Session {self.request_id} received too many aux transfers"
                     )
+                    self._logical_outcomes.fail(self._exception)
                     if self._terminal_status is None:
                         self._terminal_status = SessionStatus.ERROR
                     logger.error(str(self._exception))
             elif status == AgentResult.FAILED:
                 self._aux_status = TaskStatus.ERROR
                 self._exception = RuntimeError(f"Session {self.request_id} aux transfer failed")
+                self._logical_outcomes.fail(self._exception)
                 if self._terminal_status is None:
                     self._terminal_status = SessionStatus.ERROR
             else:
@@ -3547,19 +3629,16 @@ class RxSession(RxSessionBase):
     def cancel_local(self, by_peer: bool = False) -> bool:
         """Commit cancellation under the same lock used for publication."""
         with self.lock:
-            # Only an earlier cancel refuses: a failed session may still have peers touching memory,
-            # and they are told to stop here. Which ending a piece reports is latched by its handle,
-            # so it does not depend on this.
+            # A later cancellation must still notify peers after logical failure.
+            # The logical arbiter preserves whichever outcome already committed.
             if self._terminal_status == SessionStatus.CANCELLED:
                 return False
+            self._logical_outcomes.cancel(by_peer)
             self._terminal_status = SessionStatus.CANCELLED
             # Who asked is not recoverable later, and the two differ: the peer asking is a transfer
             # error, our own side asking is an ordinary end.
             self.cancelled_by_peer = by_peer
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
-            # Kept so a task failed by the loop below is recognisable as cancelled rather than
-            # broken; its own status cannot say which, since both end it the same way.
-            self._cancel_exception = exc
             for task in self._kv_tasks:
                 rid_slice = (self.disagg_request_id, task.slice_id)
                 if task.status == TaskStatus.INIT:
