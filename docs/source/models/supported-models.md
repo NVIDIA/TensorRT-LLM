@@ -96,7 +96,7 @@ statuses for the same architecture in the two matrices.
 [^17]: Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain `DFlash`.
 [^18]: NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model's multi-token verification and cache-management paths and may be untested or explicitly restricted.
 [^19]: KV cache reuse for hybrid recurrent-attention models requires an explicit recurrent-state snapshot policy, such as `kv_cache_config.mamba_state_config.periodic_snapshot_interval`; the model default disables reuse when no snapshot policy is configured.
-[^21]: Supports text, image and video inputs and one-model MTP with 1 to 5 draft tokens. Requires `transformers==5.17.0` as documented in the deployment guide, whose `Glm5NextProcessor` performs the image and video preprocessing. Supports FP8 KV cache and attention data parallelism with MTP. Beam search is not supported; disaggregated serving requires the Python NIXL transceiver; KV cache block reuse requires `kv_cache_config.mamba_state_config.periodic_snapshot_interval`. See the [deployment guide](../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.md).
+[^21]: Supports text, image, and video inputs, MTP (including with attention data parallelism), and FP8 KV cache. Requires `transformers==5.17.0`. Beam search is not supported. See the [GLM-5.3-Flash deployment guide](../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.md) for setup and feature-specific requirements.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
