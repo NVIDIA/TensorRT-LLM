@@ -24,6 +24,7 @@ default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 model_path = llm_models_root() / default_model_name
 
 
+@pytest.mark.cpu_only
 def test_get_startup_metrics_promotes_model_engine_stages():
     worker = object.__new__(BaseWorker)
     worker._is_pytorch_backend = True
