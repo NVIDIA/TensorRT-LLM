@@ -83,18 +83,23 @@ def _stub_receiver():
     return receiver
 
 
-def _receiving_from(writers: int, rid: int = 7) -> tuple[RxSession, TaskHandle]:
+def _receiving_from(
+    writers: int, rid: int = 7, *, owns_transfers: bool = False
+) -> tuple[RxSession, TaskHandle]:
     """One piece published to ``writers`` peers, and the handle the caller polls it through."""
+    receiver = _stub_receiver()
+    receiver._enforce_physical_ownership = owns_transfers
     session = RxSession(
         request_id=rid,
         params=DisaggregatedParams(disagg_request_id=rid),
-        receiver=_stub_receiver(),
+        receiver=receiver,
         prompt_len=TOKENS,
     )
     session.receive(_sole_piece())
     task = session._kv_tasks[0]
     task.expected_transfers = writers
-    session.mark_transferring(task.slice_id)
+    cohort = set(range(writers)) if owns_transfers else None
+    session.mark_transferring(task.slice_id, cohort)
     return session, TaskHandle(session, task, TOKENS)
 
 
@@ -255,20 +260,16 @@ def test_closing_leaves_the_tasks_where_they_were():
     assert handle.poll() is None
 
 
-def test_a_task_that_counts_nothing_falls_back_to_its_own_state():
-    """With no count to read, the handle reads the state it does have."""
-    session = SimpleNamespace(
-        status=SessionStatus.ERROR,
-        exception=RuntimeError("peer died"),
-        cancelled_by_peer=False,
-    )
-    task = SimpleNamespace(status=TaskStatus.TRANSFERRING, _exception=None)
-    handle = TaskHandle(session, task, TOKENS)
+def test_report_progress_remains_separate_from_a_committed_failure():
+    session, handle = _receiving_from(1)
+    task = session._kv_tasks[0]
+    task.fail(RuntimeError("peer died"))
 
     assert handle.poll().reports_pending is True
 
-    task.status = TaskStatus.ERROR
+    _report(session, 0, AgentResult.SUCCESS)
     assert handle.poll().reports_pending is False
+    assert isinstance(handle.poll(), Failed)
 
 
 def test_a_send_task_owes_until_every_peer_write_is_done():
@@ -351,7 +352,7 @@ def test_a_siblings_failure_does_not_reopen_a_delivered_piece():
     """Pieces share a session, so its verdict moves after one of them has already ended."""
     task = KVRecvTask(9, _sole_piece(), 0, DisaggregatedParams(disagg_request_id=9), aux_slot=None)
     task.expected_transfers = 1
-    task.status = TaskStatus.TRANSFERRED
+    task.complete()
     task.note_writer_report(0, True)
     session = SimpleNamespace(
         status=SessionStatus.TRANSFERRED,
@@ -479,7 +480,7 @@ def test_a_piece_that_landed_is_delivered_even_if_the_request_was_cancelled():
     )
     task.expected_transfers = 1
     task.note_writer_report(0, True)
-    task.status = TaskStatus.TRANSFERRED
+    task.complete()
     session = SimpleNamespace(
         status=SessionStatus.CANCELLED,
         exception=None,
@@ -636,7 +637,9 @@ def test_a_send_session_reads_a_parked_cancel_as_the_peers_too():
     )
 
     assert session.status is SessionStatus.CANCELLED
-    task = SimpleNamespace(status=TaskStatus.TRANSFERRING, _exception=None)
+    sender.dispatch_task = MagicMock()
+    session.send(_sole_piece())
+    task = session.kv_tasks[0]
     outcome = TaskHandle(session, task, TOKENS).poll()
     assert isinstance(outcome, Cancelled)
     assert outcome.by_peer is True
@@ -713,9 +716,13 @@ def _sending_pieces(count: int = 1) -> tuple[Sender, TxSession]:
 
 
 @pytest.mark.parametrize("by_peer", [False, True])
-def test_queued_sender_abort_preserves_the_committed_cancellation(by_peer: bool) -> None:
+@pytest.mark.parametrize("queued_status", [TaskStatus.INIT, TaskStatus.TRANSFERRING])
+def test_queued_sender_abort_preserves_the_committed_cancellation(
+    by_peer: bool, queued_status: TaskStatus
+) -> None:
     sender, session = _sending_pieces()
     task = session.kv_tasks[0]
+    task.status = queued_status
     session.cancel_local(by_peer=by_peer)
     # Execute the real worker's pre-submission abort branch after cancellation won.
     empty = SimpleNamespace(size=0)
@@ -781,3 +788,74 @@ def test_delivered_outcome_precedes_later_session_terminal_events(ending: str) -
 
     assert isinstance(handle.poll(), Delivered)
     assert handle.poll().token_end == TOKENS
+
+
+def test_delivered_sender_piece_survives_a_direct_sibling_failure_without_polling() -> None:
+    _, session = _sending_pieces(2)
+    delivered, failed = session.kv_tasks
+    delivered.complete()
+
+    failed.fail(RuntimeError("sibling failed later"))
+
+    assert isinstance(TaskHandle(session, delivered, TOKENS).poll(), Delivered)
+    assert isinstance(TaskHandle(session, failed, TOKENS).poll(), Failed)
+
+
+@pytest.mark.parametrize("owns_transfers", [False, True])
+@pytest.mark.parametrize("scatter_succeeded", [False, True])
+@pytest.mark.parametrize("cancel_first", [False, True])
+def test_scatter_callback_and_cancel_commit_in_event_order(
+    monkeypatch: pytest.MonkeyPatch,
+    owns_transfers: bool,
+    scatter_succeeded: bool,
+    cancel_first: bool,
+) -> None:
+    from tensorrt_llm._torch.disaggregation.native import bounce
+
+    session, handle = _receiving_from(1, owns_transfers=owns_transfers)
+    deferred = []
+    monkeypatch.setattr(bounce, "scatter_write_result", lambda *args: deferred.append(args[-1]))
+    _report(session, 0, AgentResult.SUCCESS)
+    assert len(deferred) == 1
+    assert handle.poll() is None
+    if owns_transfers:
+        assert session.resources_drained() is False
+
+    ready, resume, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def finish_scatter() -> None:
+        ready.set()
+        if resume.wait(timeout=5):
+            deferred[0](scatter_succeeded)
+            finished.set()
+
+    worker = threading.Thread(target=finish_scatter)
+    worker.start()
+    try:
+        assert ready.wait(timeout=5)
+        if cancel_first:
+            session.cancel_local(by_peer=True)
+            assert isinstance(handle.poll(), Cancelled)
+            if owns_transfers:
+                assert session.resources_drained() is False
+        resume.set()
+        assert finished.wait(timeout=5)
+        if not cancel_first:
+            session.cancel_local(by_peer=True)
+    finally:
+        resume.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    for observer in (handle, TaskHandle(session, session._kv_tasks[0], TOKENS)):
+        outcome = observer.poll()
+        if cancel_first:
+            assert isinstance(outcome, Cancelled)
+            assert outcome.by_peer is True
+        elif scatter_succeeded:
+            assert isinstance(outcome, Delivered)
+        else:
+            assert isinstance(outcome, Failed)
+            assert "bounce scatter failed" in outcome.reason
+    if owns_transfers:
+        assert session.resources_drained() is True
