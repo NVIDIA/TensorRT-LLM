@@ -376,6 +376,7 @@ llm_perf_core:
     ranges:
       system_gpu_count:
         gte: 4
+        lte: 4
       compute_capability:
         gte: 10.7
         lte: 10.7
