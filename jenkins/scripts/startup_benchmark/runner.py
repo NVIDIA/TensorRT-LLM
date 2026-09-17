@@ -294,6 +294,58 @@ def child_pids(pid: int) -> list[int]:
     return result
 
 
+def _reap_exited_children() -> list[dict[str, int]]:
+    reaped = []
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return reaped
+        if pid == 0:
+            return reaped
+        reaped.append({"pid": pid, "exit_code": os.waitstatus_to_exitcode(status)})
+
+
+def _child_process_details(pid: int) -> dict:
+    details = {"pid": pid}
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        command, _, fields = stat.partition("(")[2].rpartition(")")
+        fields = fields.split()
+        details.update(
+            command=command,
+            state=fields[0],
+            ppid=int(fields[1]),
+            start_time_ticks=int(fields[19]),
+        )
+    except (OSError, ValueError, IndexError) as error:
+        details["inspection_error"] = f"{type(error).__name__}: {error}"
+    return details
+
+
+def _check_child_processes(stage: str, checks: list[dict]) -> bool:
+    # Only call before launching the server: no Popen owns an exit status here.
+    # Reap zombies and allow brief exit races without overlooking live children.
+    evidence = {"stage": stage, "reaped_children": [], "remaining_children": []}
+    checks.append(evidence)
+    observed = False
+    deadline = time.monotonic() + 1
+    while True:
+        reaped = _reap_exited_children()
+        evidence["reaped_children"].extend(reaped)
+        pids = child_pids(os.getpid())
+        observed |= bool(reaped or pids)
+        evidence["remaining_children"] = [_child_process_details(pid) for pid in sorted(set(pids))]
+        if not pids:
+            return observed
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Unexpected benchmark child processes at {stage}: "
+                f"{json.dumps(evidence['remaining_children'], sort_keys=True)}"
+            )
+        time.sleep(0.05)
+
+
 def signal_children(sig: int) -> None:
     # Kill only verified direct children. Their descendants are adopted by this
     # subreaper and handled on the next pass; never signal a stale/reused PID.
@@ -412,6 +464,7 @@ def run_trial(
         "identity": identity,
         "metrics": {},
         "cache": {},
+        "process_checks": [],
         "policy": {"requested": requested, "effective": "unknown", "complete": False},
         "launch_to_ready_seconds": None,
         "error": None,
@@ -461,11 +514,17 @@ def run_trial(
         expected_metadata = identity.get("checkpoint_metadata_fingerprint")
         if expected_metadata is not None and expected_metadata != metadata_fingerprint(directories):
             raise ValueError("Checkpoint config/index changed between trials")
-        result["cache"] = evict_and_verify(
-            files, exclusive=args.exclusive_node, reset_command=args.cache_reset_command
-        )
-        if child_pids(os.getpid()):
-            raise RuntimeError("Cache-reset helper left running descendants")
+        _check_child_processes("before_cache_reset", result["process_checks"])
+        for attempt in range(2):
+            result["cache"] = evict_and_verify(
+                files, exclusive=args.exclusive_node, reset_command=args.cache_reset_command
+            )
+            if not _check_child_processes("after_cache_reset", result["process_checks"]):
+                break
+            # A child may have accessed weights during verification. Repeat only
+            # after it has exited; never launch against potentially rewarmed pages.
+            if attempt == 1:
+                raise RuntimeError("Repeated child-process activity during cache verification")
         with log_path.open("w") as log:
             started = time.monotonic()
             process = subprocess.Popen(

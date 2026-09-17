@@ -75,6 +75,13 @@ the eviction step, **not verification**. No shell, implicit sudo, global
 
 Linux child-subreaper/PID-fd teardown must prove all trial descendants have exited
 before proceeding. Failed teardown aborts the campaign before another eviction.
+Before and after each cache reset, the runner reaps exited children and allows
+up to one second for transient children to exit. Remaining live or unverifiable
+children block launch; `result.json` records process-check stages, reaped PIDs/exit
+codes and remaining PIDs, parent PIDs, states, command names and start times.
+If children exit during cache verification, eviction/verification is repeated
+once after quiescence; repeated child activity fails closed. This does not weaken
+the cold-cache checks or include cache preparation in startup timings.
 Use Python 3.10+ on modern Linux for execution; planning/collection need no GPUs.
 
 ## Profiles

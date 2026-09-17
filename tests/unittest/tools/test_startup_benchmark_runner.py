@@ -283,6 +283,42 @@ def test_missing_proc_visibility_fails_closed(monkeypatch: pytest.MonkeyPatch) -
         runner.child_pids(runner.os.getpid())
 
 
+@pytest.mark.parametrize("termination", [(0, 0), ChildProcessError()])
+def test_child_reaper_drains_exit_statuses_without_blocking(
+    monkeypatch: pytest.MonkeyPatch, termination: tuple[int, int] | Exception
+) -> None:
+    waitpid = Mock(side_effect=[(123, 7 << 8), (456, signal.SIGKILL), termination])
+    monkeypatch.setattr(runner.os, "waitpid", waitpid)
+    assert runner._reap_exited_children() == [
+        {"pid": 123, "exit_code": 7},
+        {"pid": 456, "exit_code": -signal.SIGKILL},
+    ]
+    assert all(call.args == (-1, runner.os.WNOHANG) for call in waitpid.call_args_list)
+
+
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_child_diagnostics_preserve_identity_or_inspection_error(
+    monkeypatch: pytest.MonkeyPatch, unreadable: bool
+) -> None:
+    stat = Mock()
+    stat.read_text.return_value = "123 (worker (with parentheses)) S 42 " + "0 " * 17 + "999"
+    if unreadable:
+        stat.read_text.side_effect = PermissionError("unreadable stat")
+    monkeypatch.setattr(runner, "Path", Mock(return_value=stat))
+    details = runner._child_process_details(123)
+    if unreadable:
+        assert details["pid"] == 123
+        assert "PermissionError" in details["inspection_error"]
+    else:
+        assert details == {
+            "pid": 123,
+            "ppid": 42,
+            "state": "S",
+            "command": "worker (with parentheses)",
+            "start_time_ticks": 999,
+        }
+
+
 @pytest.mark.parametrize("owned", [True, False])
 def test_signal_children_checks_parent_and_closes_pidfd(
     monkeypatch: pytest.MonkeyPatch, owned: bool
@@ -411,6 +447,67 @@ def test_detached_worker_is_adopted_and_reaped_in_isolated_driver(tmp_path: Path
     assert "adopted worker reaped" in result.stdout
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc child-process regression")
+@pytest.mark.parametrize("mode", ["zombie", "live"])
+def test_child_guard_in_isolated_driver(mode: str) -> None:
+    # Fork only inside the driver: the guard must never reap pytest's children.
+    driver = textwrap.dedent("""
+        import os, signal, sys
+        from pathlib import Path
+        sys.path.insert(0, sys.argv[1])
+        import runner
+        mode = sys.argv[2]
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(write_fd)
+            if mode == 'live':
+                os.read(read_fd, 1)
+            os.close(read_fd)
+            os._exit(7)
+        os.close(read_fd)
+        checks = []
+        try:
+            if mode == 'zombie':
+                os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                assert runner._child_process_details(pid)['state'] == 'Z'
+                assert runner._check_child_processes('before_cache_reset', checks)
+                assert checks[0]['reaped_children'] == [{'pid': pid, 'exit_code': 7}]
+                assert not checks[0]['remaining_children']
+                assert not Path(f'/proc/{pid}').exists()
+            else:
+                try:
+                    runner._check_child_processes('after_cache_reset', checks)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError('Live child passed the launch guard')
+                details = checks[0]['remaining_children'][0]
+                assert details['pid'] == pid and details['ppid'] == os.getpid()
+                assert details['state'] != 'Z'
+                assert details['command'] and details['start_time_ticks'] > 0
+                os.kill(pid, 0)
+            print('child guard verified')
+        finally:
+            os.close(write_fd)
+            if pid in runner.child_pids(os.getpid()):
+                os.kill(pid, signal.SIGKILL)
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", driver, str(_SCRIPT_DIR), mode],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "child guard verified" in result.stdout
+
+
 @pytest.fixture
 def trial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace:
     model = tmp_path / "model"
@@ -447,6 +544,8 @@ def trial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
     state.manifest_mock = Mock(return_value=manifest)
     state.evict = Mock(return_value={"verified": True, "backend_cache_verified": False})
     state.stop = Mock()
+    state.children = Mock(return_value=[])
+    state.waitpid = Mock(side_effect=ChildProcessError())
     state.ready = Mock(return_value=("127.0.0.1:1234", 0.25))
     state.process = Mock(pid=100, returncode=None)
     state.opener = Mock()
@@ -464,7 +563,8 @@ def trial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
     monkeypatch.setattr(runner, "evict_and_verify", state.evict)
     monkeypatch.setattr(runner, "runtime_cache_environment", state.runtime_cache)
     monkeypatch.setattr(runner, "stop_server", state.stop)
-    monkeypatch.setattr(runner, "child_pids", Mock(return_value=[]))
+    monkeypatch.setattr(runner, "child_pids", state.children)
+    monkeypatch.setattr(runner.os, "waitpid", state.waitpid)
     monkeypatch.setattr(runner, "wait_ready", state.ready)
     monkeypatch.setattr(runner.subprocess, "Popen", state.launch)
     monkeypatch.setattr(
@@ -602,15 +702,120 @@ def test_prelaunch_error_is_recorded_without_starting_process(trial: argparse.Na
     trial.stop.assert_called_once_with(None)
 
 
-def test_cache_helper_descendants_block_launch(
-    trial: argparse.Namespace, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("policy", ["native", "rank_striped_read_ahead"])
+def test_exited_children_are_reaped_before_reset_for_both_policies(
+    trial: argparse.Namespace, policy: str
 ) -> None:
-    monkeypatch.setattr(runner, "child_pids", Mock(return_value=[123]))
+    trial.variant["config"]["checkpoint_io_policy"] = policy
+    trial.policy = _policy(
+        requested=policy, selected=policy, effective=policy, activated=policy != "native"
+    )
+    statuses = iter([(123, 0), (456, 3 << 8)])
+    trial.waitpid.side_effect = lambda *args: next(statuses, (0, 0))
     result = _run_trial(trial)
-    assert result["status"] == "failed"
-    assert "descendants" in result["error"]
+    assert result["status"] == "passed"
+    assert result["process_checks"][0] == {
+        "stage": "before_cache_reset",
+        "reaped_children": [{"pid": 123, "exit_code": 0}, {"pid": 456, "exit_code": 3}],
+        "remaining_children": [],
+    }
+    trial.evict.assert_called_once()
+    trial.launch.assert_called_once()
+    assert json.loads(trial.result_path.read_text()) == result
+
+
+@pytest.mark.parametrize("stage", ["before_cache_reset", "after_cache_reset"])
+@pytest.mark.parametrize("unverifiable", [False, True])
+def test_remaining_children_block_reset_or_launch_with_diagnostics(
+    trial: argparse.Namespace, monkeypatch: pytest.MonkeyPatch, stage: str, unverifiable: bool
+) -> None:
+    details = (
+        {"pid": 123, "inspection_error": "PermissionError: stat denied"}
+        if unverifiable
+        else {"pid": 123, "ppid": 42, "state": "S", "command": "helper", "start_time_ticks": 9}
+    )
+    monkeypatch.setattr(runner, "_child_process_details", Mock(return_value=details))
+    clock = [0.0]
+    sleep = Mock(side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    trial.children.side_effect = lambda *args: (
+        [123] if stage == "before_cache_reset" or trial.evict.called else []
+    )
+    result = _run_trial(trial)
+    assert result["status"] == "failed" and stage in result["error"]
+    assert result["process_checks"][-1] == {
+        "stage": stage,
+        "reaped_children": [],
+        "remaining_children": [details],
+    }
+    assert 0 < clock[0] <= 1.05
+    assert trial.evict.call_count == (stage == "after_cache_reset")
     trial.launch.assert_not_called()
     trial.stop.assert_called_once_with(None)
+    assert json.loads(trial.result_path.read_text()) == result
+
+
+def test_child_exit_between_reaping_and_enumeration_is_rechecked(
+    trial: argparse.Namespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trial.children.side_effect = [[123], []]
+    trial.waitpid.side_effect = [(0, 0), (123, 0), (0, 0)]
+    monkeypatch.setattr(
+        runner, "_child_process_details", Mock(return_value={"pid": 123, "state": "Z"})
+    )
+    sleep = Mock()
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    checks = []
+    assert runner._check_child_processes("before_cache_reset", checks)
+    assert checks[0]["reaped_children"] == [{"pid": 123, "exit_code": 0}]
+    assert checks[0]["remaining_children"] == []
+    sleep.assert_called_once()
+
+
+@pytest.mark.parametrize("repeated_activity", [False, True])
+def test_post_reset_child_activity_repeats_eviction_before_launch(
+    trial: argparse.Namespace, repeated_activity: bool
+) -> None:
+    reaped_attempts = set()
+
+    def waitpid(*args: object) -> tuple[int, int]:
+        attempt = trial.evict.call_count
+        if attempt and attempt not in reaped_attempts and (attempt == 1 or repeated_activity):
+            reaped_attempts.add(attempt)
+            return (123 + attempt, 0)
+        return (0, 0)
+
+    trial.waitpid.side_effect = waitpid
+    events = Mock()
+    events.attach_mock(trial.evict, "evict")
+    events.attach_mock(trial.launch, "launch")
+    result = _run_trial(trial)
+    assert trial.evict.call_count == 2
+    assert [check["stage"] for check in result["process_checks"]] == [
+        "before_cache_reset",
+        "after_cache_reset",
+        "after_cache_reset",
+    ]
+    assert result["process_checks"][1]["reaped_children"] == [{"pid": 124, "exit_code": 0}]
+    if repeated_activity:
+        assert result["status"] == "failed" and "Repeated" in result["error"]
+        trial.launch.assert_not_called()
+    else:
+        assert result["status"] == "passed"
+        assert [call[0] for call in events.mock_calls] == ["evict", "evict", "launch"]
+    assert json.loads(trial.result_path.read_text()) == result
+
+
+@pytest.mark.parametrize("operation", ["waitpid", "children"])
+def test_child_inspection_oserror_fails_closed(trial: argparse.Namespace, operation: str) -> None:
+    getattr(trial, operation).side_effect = OSError("inspection failed")
+    result = _run_trial(trial)
+    assert result["status"] == "failed" and "inspection failed" in result["error"]
+    assert result["process_checks"][0]["stage"] == "before_cache_reset"
+    trial.evict.assert_not_called()
+    trial.launch.assert_not_called()
+    assert json.loads(trial.result_path.read_text()) == result
 
 
 def test_draft_path_is_expanded_in_server_config(
