@@ -190,7 +190,7 @@ class RepositoryReferenceIndex:
         paths: list[Path] | None = None
         try:
             result = subprocess.run(
-                ["git", "grep", "-l", "-z", "-F", text, "--", "*.py"],
+                ["git", "grep", "--untracked", "-l", "-z", "-F", text, "--", "*.py"],
                 cwd=self.repo_root,
                 capture_output=True,
                 check=False,
@@ -224,7 +224,9 @@ class RepositoryReferenceIndex:
         target_leaf = target_module.rpartition(".")[2]
         referenced: set[str] = set()
         for module in self._modules_containing(target_leaf):
-            if module.path == defining_path or referenced == names:
+            if referenced == names:
+                break
+            if module.path == defining_path:
                 continue
             try:
                 parsed = _ParsedModule(

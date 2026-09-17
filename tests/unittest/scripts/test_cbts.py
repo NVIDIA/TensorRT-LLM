@@ -417,6 +417,37 @@ def test_replaced_effectful_assignment_remains_fail_closed() -> None:
     assert analysis.limitation == "unresolved import replacement"
 
 
+@pytest.mark.parametrize("body", ("", "# explanatory comment"))
+def test_added_module_noop_line_is_ignored(body: str) -> None:
+    source = f"VALUE = 521\n{body}\n"
+    diff = f"@@ -1 +1,2 @@\n VALUE = 521\n+{body}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.changed_bindings
+
+
+@pytest.mark.parametrize("body", ("", "# obsolete comment"))
+def test_deleted_module_noop_line_is_ignored(body: str) -> None:
+    source = "VALUE = 521\n"
+    diff = f"@@ -1,2 +1 @@\n VALUE = 521\n-{body}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.changed_bindings
+
+
+def test_added_decorator_line_remains_fail_closed() -> None:
+    source = "@decorate\ndef consumer():\n    return 1\n"
+    diff = "@@ -1,0 +1 @@\n+@decorate\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
+
+
 def test_postponed_annotated_literal_is_resolved() -> None:
     source = "from __future__ import annotations\n\n_CACHE: dict[str, object] = {}\n"
     diff = "@@ -2,0 +3 @@\n+_CACHE: dict[str, object] = {}\n"
@@ -539,12 +570,12 @@ def test_function_alias_marks_caller_graph_incomplete() -> None:
 
 @pytest.fixture()
 def reference_root(tmp_path: Path) -> Path:
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, timeout=60)
     return tmp_path
 
 
 def _stage_reference_files(reference_root: Path) -> None:
-    subprocess.run(["git", "add", "-A"], cwd=reference_root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=reference_root, check=True, timeout=60)
 
 
 def test_repository_reference_index_follows_import_relationships(
@@ -614,6 +645,20 @@ def test_repository_reference_index_tracks_direct_import_module(
     )
 
     assert references == {"VALUE", "OTHER"}
+
+
+def test_repository_reference_index_finds_untracked_module(reference_root: Path) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\n")
+    _stage_reference_files(reference_root)
+    (package / "consumer.py").write_text("from pkg.owner import VALUE\n")
+
+    references = RepositoryReferenceIndex(reference_root).external_references(
+        "pkg/owner.py", {"VALUE"}
+    )
+
+    assert references == {"VALUE"}
 
 
 def test_repository_reference_index_reports_direct_importers(tmp_path: Path) -> None:
