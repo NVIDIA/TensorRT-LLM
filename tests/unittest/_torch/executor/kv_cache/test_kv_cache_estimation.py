@@ -1122,6 +1122,7 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator._mapping = Mock()
     creator._speculative_config = Mock()
     creator._disable_overlap_scheduler = False
+    creator._llm_args = SimpleNamespace(enable_locality_domains=False)
 
     effective_draft_config = Mock()
     effective_draft_config.pretrained_config.torch_dtype = "bfloat16"

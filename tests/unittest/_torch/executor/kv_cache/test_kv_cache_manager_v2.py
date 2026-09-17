@@ -717,6 +717,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     )
     kv_cache = Mock(num_committed_tokens=2)
     manager = object.__new__(KVCacheManagerV2)
+    manager.impl = SimpleNamespace(num_locality_domains=1)
     manager.conversation_manager = None
     manager.kv_connector_manager = None
     manager.enable_block_reuse = True
@@ -2557,6 +2558,7 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
     buffer[guard_page] = float("nan")  # the guard sentinel
 
     manager = object.__new__(KVCacheManagerV2)
+    manager.impl = SimpleNamespace(num_locality_domains=1)
     manager.layer_offsets = {0: 0}
     manager.layer_to_pool_mapping_dict = {0: 0}
     manager.get_buffers = lambda layer_idx, kv_layout="NHD": buffer
