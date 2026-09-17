@@ -153,16 +153,8 @@ class SolAttention(AttentionBackend):
             num_kv_heads=self.num_kv_heads,
             dtype=dtype,
         )
-        # Whether the CuTe DSL dense kernel can serve this device, decided once
-        # here rather than lazily on the first call. Neither a kernel bug nor a
-        # torch.compile bug is involved; this is about graph structure. A lazy
-        # decision needs attribute mutation inside `_dense`, which forces
-        # `@torch.compiler.disable` on it, and that moves the whole dense step
-        # out of the compiled graph. The dense CUTEDSL baseline keeps its dense
-        # step inside the graph, so the two then differ on every dense step:
-        # measured LPIPS 0.4044 compiled against 0.2112 eager. Deciding here
-        # keeps `_dense` traceable and the dense step in the same place as the
-        # baseline's.
+        # Resolve availability once at construction to keep capability checks
+        # and attribute initialization out of `_dense` during torch.compile tracing.
         self._cute_dense_ok = _cute_dense_available()
         if not self._cute_dense_ok:
             logger.warning_once(
