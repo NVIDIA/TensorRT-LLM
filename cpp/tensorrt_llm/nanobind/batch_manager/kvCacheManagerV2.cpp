@@ -1678,6 +1678,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
+    nb::class_<kv::ColdBufferLayout>(m, "ColdBufferLayout")
+        .def_prop_ro("life_cycle_id", [](kv::ColdBufferLayout const& self) { return self.lifeCycleId.value(); })
+        .def_ro("offset", &kv::ColdBufferLayout::offset)
+        .def_ro("size", &kv::ColdBufferLayout::size)
+        .def_ro("expansion", &kv::ColdBufferLayout::expansion);
+
     // HostSourceView borrows mapped table storage; obtaining a view never refreshes it.
     nb::class_<kv::HostSourceView>(m, "HostSourceView")
         .def_ro("max_requests", &kv::HostSourceView::maxRequests)
@@ -1837,8 +1843,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
+        .def(
+            "_bind_host_source_row", [](kv::KvCache& self, int row) { self.manager().bindHostSourceRow(self, row); },
+            nb::arg("row"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
-            "_host_source_slot", [](kv::KvCache const& self) { return self.manager().hostSourceSlot(self); },
+            "_host_source_ref", [](kv::KvCache const& self) { return self.manager().hostSourceRef(self); },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "_host_source_row", [](kv::KvCache const& self) { return self.manager().hostSourceSlot(self); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resume",
@@ -2068,6 +2080,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
+    mIntrospection.def(
+        "refresh_host_source_table", [](kv::KvCacheManager& manager) { manager.refreshHostSourceTableForTest(); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "create_test_padding_cold_page_codec",
         [](std::map<int, size_t> coldPageBytesByLayer) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
@@ -2414,16 +2429,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
-        .def("_reserve_host_source_table", &kv::KvCacheManager::reserveHostSourceTable, nb::arg("max_requests"),
+        .def("_host_buffer_layout", &kv::KvCacheManager::hostBufferLayout, nb::arg("buffer"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("_initialize_host_source_table", &kv::KvCacheManager::initializeHostSourceTable, nb::arg("max_requests"),
             nb::arg("max_pages"), nb::arg("max_beams") = 1, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("_host_source_view", &kv::KvCacheManager::hostSourceView, nb::call_guard<nb::gil_scoped_release>())
-        .def("_refresh_host_source_table", &kv::KvCacheManager::refreshHostSourceTable,
-            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "_acquire_host_sources",
-            [](kv::KvCacheManager& self, kv::CudaStream stream)
-            { return self.acquireHostSources(reinterpret_cast<CUstream>(stream)); },
-            nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
+            [](kv::KvCacheManager& self, std::vector<kv::HostSourceRow> const& rows, kv::CudaStream stream)
+            { return self.acquireHostSources(rows, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("rows"), nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "__init__",
             [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager,

@@ -20,11 +20,14 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -33,6 +36,10 @@ class KvCache;
 class KvCacheManager;
 class HostPageRead;
 class StorageManager;
+class Page;
+
+//! IndexMapper request row and the generation expected by this batch.
+using HostSourceRow = std::pair<int, uint64_t>;
 
 //! Borrowed metadata only. No KV ownership, model layout, allocation, or transfer.
 //! CPU pointers refer to mapped pinned memory; gpuAddress() gives their CUDA aliases.
@@ -74,7 +81,7 @@ struct HostSourceView
 
 //! Separate from the non-owning view: holds HostPageRead handles through one submitted GPU use.
 //! close() records completion. Releasing the last request owner can also run synchronous cleanup.
-//! Close before changing table metadata.
+//! Close before changing the batch's rows. Other request rows remain independent.
 class HostSourceRead
 {
 public:
@@ -90,6 +97,7 @@ private:
     CUstream mStream;
     // Keep request destructors from changing the table while the scope is open.
     std::vector<std::shared_ptr<KvCache>> mRequests;
+    std::vector<HostSourceRow> mRows;
     std::vector<std::unique_ptr<HostPageRead>> mPages;
 };
 
@@ -106,27 +114,63 @@ public:
         return mView;
     }
 
-    void addRequest(KvCache& cache);
+    //! No row allocator here: the executor supplies its existing IndexMapper row. -1 releases it.
+    void bindRequest(KvCache& cache, int row);
     void setRequestId(KvCache& cache, std::optional<RequestIdType> id);
     void removeRequest(KvCache const& cache);
     int requestSlot(KvCache const& cache) const;
+    HostSourceRow requestRef(KvCache const& cache) const;
     void checkCapacity(KvCache const& cache, int capacity) const;
-    void beginUpdate();
+    // Page updates include shared users. range limits append updates; other structural changes rebuild this request.
+    void beginUpdate(
+        KvCache* cache, std::optional<BlockOrdinal> ordinal, std::optional<std::pair<int, int>> range = std::nullopt);
     void endUpdate();
-    void refresh();
-    std::unique_ptr<HostSourceRead> acquire(std::shared_ptr<KvCacheManager> owner, CUstream stream);
-    void finishRead(CachedCudaEvent event);
+    void refreshForTest();
+    std::unique_ptr<HostSourceRead> acquire(
+        std::shared_ptr<KvCacheManager> owner, std::vector<HostSourceRow> const& rows, CUstream stream);
+    void finishRead(std::vector<HostSourceRow> const& rows, CachedCudaEvent event);
     void waitForReaders();
 
 private:
-    void fill();
-    void clearSources();
+    struct RequestRow
+    {
+        KvCache* cache = nullptr;
+        int openReaders = 0;
+        std::vector<CachedCudaEvent> readEvents;
+        std::unordered_set<size_t> entries;
+        std::unordered_set<size_t> pending;
+        std::unordered_set<size_t> published;
+    };
+
+    struct Source
+    {
+        Page const* key; // Only used to remove the reverse index; never dereferenced.
+        WeakPtr<Page> page;
+        int coverage;
+    };
+
+    void updatePools();
+    void rebuildRow(int row);
+    void rebuildRange(int row, int begin, int end);
+    void eraseEntry(size_t index);
+    void publish(size_t index);
+    void clearEntry(size_t index);
+    void eraseEntries(int row);
+    void waitForRow(int row);
+    int rowForEntry(size_t index) const noexcept;
     size_t numEntries() const noexcept;
     StorageManager& mStorage;
     std::unique_ptr<HostMem> mMemory;
     HostSourceView mView{};
-    std::vector<KvCache*> mRequests;
-    std::vector<CachedCudaEvent> mReadEvents;
+    std::vector<RequestRow> mRows;
+    std::unordered_map<KvCache const*, int> mRequestRows;
+    std::unordered_map<size_t, Source> mSources;
+    std::unordered_map<Page const*, std::unordered_set<size_t>> mPageEntries;
+    std::unordered_set<int> mDirtyRows;
+    std::unordered_map<int, std::pair<int, int>> mDirtyRanges;
+    std::unordered_set<size_t> mDirtyEntries;
+    std::vector<CachedCudaEvent> mEmptyReadEvents;
+    bool mPoolsDirty = false;
     int mOpenReaders = 0;
     int mUpdateDepth = 0;
 };

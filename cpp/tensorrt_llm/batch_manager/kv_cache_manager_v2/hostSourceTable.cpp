@@ -110,8 +110,10 @@ HostSourceTable::HostSourceTable(
     allocate(mView.completedTokens, entries);
     allocate(mView.poolMetadata, pools);
     TLLM_CHECK(offset <= mMemory->size());
-    mRequests.resize(maxRequests, nullptr);
-    fill();
+    mRows.resize(maxRequests);
+    std::fill_n(writable(mView.slotIds), numEntries(), -1);
+    std::fill_n(writable(mView.hostLevels), numEntries(), -1);
+    updatePools();
 }
 
 HostSourceTable::~HostSourceTable()
@@ -124,103 +126,206 @@ size_t HostSourceTable::numEntries() const noexcept
     return static_cast<size_t>(mView.maxRequests) * mView.maxBeams * mView.numLifeCycles * mView.maxPages;
 }
 
+int HostSourceTable::rowForEntry(size_t index) const noexcept
+{
+    return static_cast<int>(index / (static_cast<size_t>(mView.maxBeams) * mView.numLifeCycles * mView.maxPages));
+}
+
 int HostSourceTable::requestSlot(KvCache const& cache) const
 {
-    auto const it = std::find(mRequests.begin(), mRequests.end(), &cache);
-    return it == mRequests.end() ? -1 : static_cast<int>(it - mRequests.begin());
+    auto const it = mRequestRows.find(&cache);
+    return it == mRequestRows.end() ? -1 : it->second;
+}
+
+HostSourceRow HostSourceTable::requestRef(KvCache const& cache) const
+{
+    int const row = requestSlot(cache);
+    return {row, row < 0 ? 0 : mView.generations[row]};
 }
 
 void HostSourceTable::checkCapacity(KvCache const& cache, int capacity) const
 {
-    if (cache.id
-        && (static_cast<int64_t>(capacity) > static_cast<int64_t>(mView.maxPages) * mView.tokensPerBlock
-            || cache.beamWidth().value() > mView.maxBeams))
-    {
-        throw std::out_of_range("Request exceeds the reserved host source table capacity");
-    }
+    if (static_cast<int64_t>(capacity) > static_cast<int64_t>(mView.maxPages) * mView.tokensPerBlock
+        || cache.beamWidth().value() > mView.maxBeams)
+        throw std::out_of_range("Request exceeds the manager's host source limits");
 }
 
-void HostSourceTable::addRequest(KvCache& cache)
+void HostSourceTable::bindRequest(KvCache& cache, int row)
 {
-    setRequestId(cache, cache.id);
+    if (row == -1)
+    {
+        removeRequest(cache);
+        return;
+    }
+    if (row < 0 || row >= mView.maxRequests || !cache.id || cache.isClosed())
+        throw std::invalid_argument("Bind a live request with an ID to a valid IndexMapper row");
+    checkCapacity(cache, cache.capacity());
+    if (requestSlot(cache) == row)
+        return;
+    if (mRows[row].cache)
+        throw LogicError("Host source row is still bound to another request");
+    waitForRow(row);
+    if (mView.generations[row] == std::numeric_limits<uint64_t>::max())
+        throw LogicError("Host source generation exhausted");
+    removeRequest(cache);
+    ++writable(mView.generations)[row];
+    mRows[row].cache = &cache;
+    mRequestRows.emplace(&cache, row);
+    writable(mView.requestIds)[row] = *cache.id;
+    writable(mView.requestValid)[row] = 1;
+    rebuildRow(row);
 }
 
 void HostSourceTable::setRequestId(KvCache& cache, std::optional<RequestIdType> id)
 {
-    int const oldSlot = requestSlot(cache);
-    if (id == cache.id && (oldSlot >= 0 || !id))
-    {
+    if (cache.id == id)
         return;
-    }
-    if (!id || cache.isClosed())
-    {
+    int const row = requestSlot(cache);
+    if (!id)
         removeRequest(cache);
-        cache.id = id;
-        return;
-    }
-    if (static_cast<int64_t>(cache.capacity()) > static_cast<int64_t>(mView.maxPages) * mView.tokensPerBlock
-        || cache.beamWidth().value() > mView.maxBeams)
+    else if (row >= 0)
     {
-        throw std::out_of_range("Request exceeds the reserved host source table capacity");
+        waitForRow(row);
+        if (mView.generations[row] == std::numeric_limits<uint64_t>::max())
+            throw LogicError("Host source generation exhausted");
+        ++writable(mView.generations)[row];
+        writable(mView.requestIds)[row] = *id;
     }
-    for (auto const* existing : mRequests)
-    {
-        if (existing && existing != &cache && existing->id == id)
-        {
-            throw std::invalid_argument("Host source table request IDs must be unique");
-        }
-    }
-    auto const it = oldSlot >= 0 ? mRequests.begin() + oldSlot : std::find(mRequests.begin(), mRequests.end(), nullptr);
-    if (it == mRequests.end())
-    {
-        throw std::out_of_range("No free request slot in the host source table");
-    }
-    auto const slot = it - mRequests.begin();
-    auto& generation = writable(mView.generations)[slot];
-    if (generation == std::numeric_limits<uint64_t>::max())
-    {
-        throw LogicError("Host source request generation exhausted");
-    }
-    ++generation;
     cache.id = id;
-    *it = &cache;
+}
+
+void HostSourceTable::clearEntry(size_t index)
+{
+    writable(mView.slotIds)[index] = -1;
+    writable(mView.hostLevels)[index] = -1;
+    writable(mView.completedTokens)[index] = 0;
+    mRows[rowForEntry(index)].published.erase(index);
+}
+
+void HostSourceTable::eraseEntry(size_t index)
+{
+    auto const source = mSources.find(index);
+    if (source == mSources.end())
+        return;
+    auto it = mPageEntries.find(source->second.key);
+    it->second.erase(index);
+    if (it->second.empty())
+        mPageEntries.erase(it);
+    mSources.erase(source);
+    clearEntry(index);
+    auto& state = mRows[rowForEntry(index)];
+    state.entries.erase(index);
+    state.pending.erase(index);
+}
+
+void HostSourceTable::eraseEntries(int row)
+{
+    auto& entries = mRows[row].entries;
+    while (!entries.empty())
+        eraseEntry(*entries.begin());
 }
 
 void HostSourceTable::removeRequest(KvCache const& cache)
 {
-    int const slot = requestSlot(cache);
-    if (slot >= 0)
-    {
-        mRequests[slot] = nullptr;
-    }
+    int const row = requestSlot(cache);
+    if (row < 0)
+        return;
+    waitForRow(row);
+    eraseEntries(row);
+    mRows[row].cache = nullptr;
+    mRequestRows.erase(&cache);
+    writable(mView.requestValid)[row] = 0;
+    writable(mView.requestIds)[row] = 0;
+    mDirtyRows.erase(row);
+    mDirtyRanges.erase(row);
+}
+
+void HostSourceTable::waitForRow(int row)
+{
+    auto& state = mRows[row];
+    if (state.openReaders != 0)
+        throw LogicError("Close host source readers before changing their request rows");
+    for (auto const& event : state.readEvents)
+        event.synchronize();
+    state.readEvents.clear();
 }
 
 void HostSourceTable::waitForReaders()
 {
     if (mOpenReaders != 0)
-    {
-        throw LogicError("Close host source readers before changing the table");
-    }
-    for (auto const& event : mReadEvents)
-    {
+        throw LogicError("Close host source readers before changing pools or shutting down");
+    for (int row = 0; row < mView.maxRequests; ++row)
+        waitForRow(row);
+    for (auto const& event : mEmptyReadEvents)
         event.synchronize();
-    }
-    mReadEvents.clear();
+    mEmptyReadEvents.clear();
 }
 
-void HostSourceTable::clearSources()
+void HostSourceTable::beginUpdate(
+    KvCache* cache, std::optional<BlockOrdinal> ordinal, std::optional<std::pair<int, int>> range)
 {
-    std::fill_n(writable(mView.slotIds), numEntries(), -1);
-    std::fill_n(writable(mView.hostLevels), numEntries(), -1);
-    std::fill_n(writable(mView.completedTokens), numEntries(), 0);
-}
-
-void HostSourceTable::beginUpdate()
-{
-    if (mUpdateDepth == 0)
+    if (!cache)
     {
         waitForReaders();
-        clearSources();
+        mPoolsDirty = true;
+    }
+    else
+    {
+        int const row = requestSlot(*cache);
+        if (row >= 0)
+            waitForRow(row);
+        std::unordered_set<size_t> affected;
+        if (ordinal)
+        {
+            // An unbound request may still back up a prefix shared by bound requests.
+            if (ordinal->value() >= 0 && *ordinal < cache->numBlocks())
+            {
+                for (auto const& beam : cache->blocks()[*ordinal].pages)
+                    for (auto const& entry : beam)
+                    {
+                        auto const& page = blockPageGetPage(entry);
+                        if (!page)
+                            continue;
+                        auto const users = mPageEntries.find(page.get());
+                        if (users != mPageEntries.end())
+                            affected.insert(users->second.begin(), users->second.end());
+                    }
+            }
+        }
+        else if (row >= 0)
+        {
+            // Request structure changes do not modify another request's immutable prefix.
+            if (range)
+            {
+                for (int page = range->first; page < range->second; ++page)
+                    for (int beam = 0; beam < mView.maxBeams; ++beam)
+                        for (int lc = 0; lc < mView.numLifeCycles; ++lc)
+                        {
+                            auto const index = mView.pageIndex(row, beam, lc, page);
+                            if (mSources.count(index))
+                                affected.insert(index);
+                        }
+            }
+            else
+                affected = mRows[row].entries;
+        }
+        // Validate all shared users before changing any metadata, so a rejected update leaves it intact.
+        for (auto const index : affected)
+            waitForRow(rowForEntry(index));
+        mDirtyEntries.insert(affected.begin(), affected.end());
+        for (auto const index : affected)
+            clearEntry(index);
+        if (row >= 0 && range)
+        {
+            auto [it, inserted] = mDirtyRanges.emplace(row, *range);
+            if (!inserted)
+            {
+                it->second.first = std::min(it->second.first, range->first);
+                it->second.second = std::max(it->second.second, range->second);
+            }
+        }
+        else if (row >= 0 && !ordinal)
+            mDirtyRows.insert(row);
     }
     ++mUpdateDepth;
 }
@@ -228,34 +333,49 @@ void HostSourceTable::beginUpdate()
 void HostSourceTable::endUpdate()
 {
     TLLM_CHECK(mUpdateDepth > 0);
-    if (--mUpdateDepth == 0)
+    if (--mUpdateDepth != 0)
+        return;
+    if (mPoolsDirty)
     {
-        fill();
+        updatePools();
+        mPoolsDirty = false;
     }
+    for (auto const row : mDirtyRows)
+        rebuildRow(row);
+    for (auto const& [row, range] : mDirtyRanges)
+        if (!mDirtyRows.count(row))
+            rebuildRange(row, range.first, range.second);
+    mDirtyRows.clear();
+    mDirtyRanges.clear();
+    for (auto const index : mDirtyEntries)
+    {
+        if (mSources.count(index))
+            publish(index);
+    }
+    mDirtyEntries.clear();
 }
 
-void HostSourceTable::refresh()
+void HostSourceTable::refreshForTest()
 {
     if (mUpdateDepth != 0)
-    {
-        throw LogicError("Cannot refresh host sources during a lifecycle update");
-    }
+        throw LogicError("Cannot refresh during a lifecycle update");
     waitForReaders();
-    fill();
+    // Test-only event polling. Production polls just the pending entries in the acquired batch.
+    for (auto& row : mRows)
+    {
+        auto const pending = row.pending;
+        for (auto const index : pending)
+            publish(index);
+    }
 }
 
-void HostSourceTable::fill()
+void HostSourceTable::updatePools()
 {
-    clearSources();
-    std::fill_n(writable(mView.requestValid), mView.maxRequests, 0);
-    std::fill_n(writable(mView.requestIds), mView.maxRequests, 0);
     std::fill_n(writable(mView.poolMetadata), static_cast<size_t>(mView.numLevels) * mView.numLifeCycles * 4, 0);
     for (CacheLevel level{1}; level < mStorage.numCacheLevels(); ++level)
     {
         if (mStorage.cacheTier(level) != CacheTier::HOST_MEM)
-        {
             continue;
-        }
         for (LifeCycleId lc{0}; lc < mStorage.numLifeCycles(); ++lc)
         {
             auto const group = mStorage.getPoolGroupIndex(level, lc);
@@ -274,97 +394,130 @@ void HostSourceTable::fill()
             }
         }
     }
-    for (int row = 0; row < mView.maxRequests; ++row)
+}
+
+void HostSourceTable::rebuildRow(int row)
+{
+    eraseEntries(row);
+    rebuildRange(row, 0, mRows[row].cache ? mRows[row].cache->numBlocks().value() : 0);
+}
+
+void HostSourceTable::rebuildRange(int row, int begin, int end)
+{
+    // Remove only the changed ordinals, including any pages removed by a capacity decrease.
+    for (int page = begin; page < end; ++page)
+        for (int beam = 0; beam < mView.maxBeams; ++beam)
+            for (int lc = 0; lc < mView.numLifeCycles; ++lc)
+                eraseEntry(mView.pageIndex(row, beam, lc, page));
+    auto const* cache = mRows[row].cache;
+    if (!cache)
+        return;
+    checkCapacity(*cache, cache->capacity());
+    for (BlockOrdinal ordinal{begin}; ordinal < cache->numBlocks() && ordinal.value() < end; ++ordinal)
     {
-        auto const* cache = mRequests[row];
-        if (!cache)
+        auto const& beams = cache->blocks()[ordinal].pages;
+        for (BeamIndex beam{0}; beam < beams.size(); ++beam)
         {
-            continue;
-        }
-        writable(mView.requestIds)[row] = *cache->id;
-        writable(mView.requestValid)[row] = 1;
-        for (BlockOrdinal ordinal{0}; ordinal < cache->numBlocks(); ++ordinal)
-        {
-            auto const& beams = cache->blocks()[ordinal].pages;
-            for (BeamIndex beam{0}; beam < beams.size(); ++beam)
+            for (LifeCycleId lc{0}; lc < mStorage.numLifeCycles(); ++lc)
             {
-                for (LifeCycleId lc{0}; lc < mStorage.numLifeCycles(); ++lc)
-                {
-                    auto const& page = blockPageGetPage(beams[beam][lc]);
-                    if (!page || !std::holds_alternative<AttnLifeCycle>(mStorage.getLifeCycle(lc)))
-                    {
-                        continue;
-                    }
-                    auto const& copy = page->hostCopy();
-                    if (!copy || !copy->ready())
-                    {
-                        continue;
-                    }
-                    int coverage = std::clamp(cache->historyLength() - ordinal.value() * mView.tokensPerBlock, 0,
-                        std::min(mView.tokensPerBlock, copy->validTokens()));
-                    if (page->isCommitted())
-                    {
-                        coverage = std::min(coverage, static_cast<CommittedPage const&>(*page).numTokensInBlock);
-                    }
-                    if (coverage == 0)
-                    {
-                        continue;
-                    }
-                    auto const index = mView.pageIndex(row, beam.value(), lc.value(), ordinal.value());
-                    writable(mView.slotIds)[index] = copy->slotId().value();
-                    writable(mView.hostLevels)[index] = copy->level().value();
-                    writable(mView.completedTokens)[index] = coverage;
-                }
+                auto const& page = blockPageGetPage(beams[beam][lc]);
+                if (!page || !std::holds_alternative<AttnLifeCycle>(mStorage.getLifeCycle(lc)))
+                    continue;
+                int coverage = std::clamp(
+                    cache->historyLength() - ordinal.value() * mView.tokensPerBlock, 0, mView.tokensPerBlock);
+                if (page->isCommitted())
+                    coverage = std::min(coverage, static_cast<CommittedPage const&>(*page).numTokensInBlock);
+                auto const index = mView.pageIndex(row, beam.value(), lc.value(), ordinal.value());
+                mSources.emplace(index, Source{page.get(), page, coverage});
+                mPageEntries[page.get()].insert(index);
+                mRows[row].entries.insert(index);
+                publish(index);
             }
         }
     }
 }
 
-std::unique_ptr<HostSourceRead> HostSourceTable::acquire(std::shared_ptr<KvCacheManager> owner, CUstream stream)
+void HostSourceTable::publish(size_t index)
+{
+    auto const& source = mSources.at(index);
+    auto const page = source.page.lock();
+    auto& state = mRows[rowForEntry(index)];
+    state.pending.erase(index);
+    clearEntry(index);
+    if (!page || !page->hostCopy() || source.coverage == 0)
+        return;
+    auto const& copy = page->hostCopy();
+    if (!copy->ready())
+    {
+        if (copy->validTokens() > 0)
+            state.pending.insert(index);
+        return;
+    }
+    writable(mView.slotIds)[index] = copy->slotId().value();
+    writable(mView.hostLevels)[index] = copy->level().value();
+    writable(mView.completedTokens)[index] = std::min(source.coverage, copy->validTokens());
+    state.published.insert(index);
+}
+
+std::unique_ptr<HostSourceRead> HostSourceTable::acquire(
+    std::shared_ptr<KvCacheManager> owner, std::vector<HostSourceRow> const& rows, CUstream stream)
 {
     checkOutsideCapture(stream);
-    if (mOpenReaders == 0)
+    if (mUpdateDepth != 0)
+        throw LogicError("Cannot read during a lifecycle update");
+    std::unordered_set<int> seenRows;
+    for (auto const& [row, generation] : rows)
     {
-        refresh();
+        if (row < 0 || row >= mView.maxRequests || !mRows[row].cache || mView.generations[row] != generation
+            || !seenRows.insert(row).second)
+            throw std::invalid_argument("Host source batch contains a stale, invalid, or duplicate row");
     }
     auto read = std::unique_ptr<HostSourceRead>(new HostSourceRead(std::move(owner), stream));
     ++mOpenReaders;
     std::unordered_set<HostPageCopy*> seen;
-    for (int row = 0; row < mView.maxRequests; ++row)
+    for (auto const& ref : rows)
     {
-        auto const* cache = mRequests[row];
-        if (!cache)
+        auto& state = mRows[ref.first];
+        if (state.openReaders == 0)
         {
-            continue;
+            waitForRow(ref.first);
+            auto const pending = state.pending;
+            for (auto const index : pending)
+                publish(index);
         }
-        for (BlockOrdinal ordinal{0}; ordinal < cache->numBlocks(); ++ordinal)
+        read->mRequests.push_back(state.cache->shared_from_this());
+        read->mRows.push_back(ref);
+        ++state.openReaders;
+        for (auto const index : state.published)
         {
-            auto const& beams = cache->blocks()[ordinal].pages;
-            for (BeamIndex beam{0}; beam < beams.size(); ++beam)
-            {
-                for (LifeCycleId lc{0}; lc < mStorage.numLifeCycles(); ++lc)
-                {
-                    auto const index = mView.pageIndex(row, beam.value(), lc.value(), ordinal.value());
-                    if (mView.completedTokens[index] == 0)
-                    {
-                        continue;
-                    }
-                    auto const& copy = blockPageGetPage(beams[beam][lc])->hostCopy();
-                    if (seen.insert(copy.get()).second)
-                    {
-                        read->mPages.push_back(std::make_unique<HostPageRead>(read->mOwner, copy, stream));
-                    }
-                }
-            }
+            auto const page = mSources.at(index).page.lock();
+            TLLM_CHECK(page && page->hostCopy());
+            auto const& copy = page->hostCopy();
+            if (seen.insert(copy.get()).second)
+                read->mPages.push_back(std::make_unique<HostPageRead>(read->mOwner, copy, stream));
         }
     }
     return read;
 }
 
-void HostSourceTable::finishRead(CachedCudaEvent event)
+void HostSourceTable::finishRead(std::vector<HostSourceRow> const& rows, CachedCudaEvent event)
 {
     TLLM_CHECK(mOpenReaders > 0);
-    mReadEvents.push_back(std::move(event));
+    if (rows.empty())
+    {
+        // Keep only unfinished uses; empty batches still borrow pool metadata and table storage.
+        mEmptyReadEvents.erase(std::remove_if(mEmptyReadEvents.begin(), mEmptyReadEvents.end(),
+                                   [](auto const& prior) { return prior.queryComplete(); }),
+            mEmptyReadEvents.end());
+        mEmptyReadEvents.push_back(event);
+    }
+    for (auto const& [row, generation] : rows)
+    {
+        auto& state = mRows[row];
+        TLLM_CHECK(state.openReaders > 0 && mView.generations[row] == generation);
+        state.readEvents.push_back(event);
+        --state.openReaders;
+    }
     --mOpenReaders;
 }
 
@@ -372,10 +525,6 @@ HostSourceRead::HostSourceRead(std::shared_ptr<KvCacheManager> owner, CUstream s
     : mOwner(std::move(owner))
     , mStream(stream)
 {
-    for (auto* cache : mOwner->mLivingKvCaches)
-    {
-        mRequests.push_back(cache->shared_from_this());
-    }
 }
 
 HostSourceRead::~HostSourceRead()
@@ -406,7 +555,8 @@ void HostSourceRead::close()
         page->close();
     }
     mPages.clear();
-    owner->mHostSources->finishRead(CachedCudaEvent(reinterpret_cast<CudaStream>(mStream)));
+    owner->mHostSources->finishRead(mRows, CachedCudaEvent(reinterpret_cast<CudaStream>(mStream)));
+    mRows.clear();
     mRequests.clear();
     mOwner.reset();
 }

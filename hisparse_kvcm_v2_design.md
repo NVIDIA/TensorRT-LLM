@@ -135,9 +135,12 @@ remain the allocation unit. Selecting one token from a 64-token page should fetc
 
 Keep the model's existing scoring and top-K settings:
 
-1. `SelectionPolicy` returns request/layer/lifecycle IDs, positions, and valid entries.
+1. `SelectedEntries` borrows logical positions and DSA's existing `req_idx_per_token` and `kv_lens_cuda`.
 2. The copy code fetches duplicate selections once, preserving the order attention expects.
-3. The host layout supports reads of selected entries in the model's existing KV format.
+3. `EntryFormat`, keyed by `BufferId` (layer and `DataRole`), describes tensor shapes, dtypes,
+   entry axes, and compression. KVCM and the codec supply physical placement.
+4. The codec exposes byte-preserving random access for each buffer, or host-source setup rejects
+   it. The default codec provides this layout; models do not repeat pool or coalesced offsets.
 
 Extra lossy compression needs separate accuracy tests. Whole-page codecs may need changes to
 support these small reads.
@@ -167,28 +170,33 @@ Hold needed pages to prevent dropping their data. Also keep active host addresse
 alone still allows movement. Restore any needed disk data to host before decode; GPU fetches
 cannot read disk.
 
-**KVCM owns one `HostSourceTable`.** Reserve its request, beam, and page limits before creating
-requests or capturing a graph. Its mapped, pinned memory has fixed addresses until manager
-shutdown. For each request slot it stores the request ID and a reuse generation. For each
-beam, layer group, and block it stores the retained host slot, host level, and completed token
-count. Pool metadata gives the host base address, slot size, capacity, and pool group.
+**KVCM owns one `HostSourceTable`.** Its mapped pinned memory has fixed addresses until shutdown.
+The executor derives its size from existing `IndexMapper`, beam, and page-table limits. Each
+request uses its existing `IndexMapper` row, with a generation that changes on reuse. There is
+no second row allocator or GPU request-ID search. Early index release clears the row even if
+KV transfer keeps the request alive; the host copies remain owned by its pages.
 
-KVCM updates these records with the request and page lifecycle. Pending or invalid copies have
-no published slot and zero coverage. Refresh polls backup events without waiting for the backup;
-only completed copies become visible. Commit and prefix reuse follow the actual shared page.
-Suspend keeps retained sources; resume replaces sources when it copies a partial prefix into a
-new writable page. Close clears the row before its slot can be reused.
+The table records request IDs for diagnostics, row generations, retained host slots, completed
+token counts, and host-pool metadata. Batches pass explicit row-and-generation pairs. The future
+kernel checks these directly. KVCM supplies lifecycle and pool mapping; the cold-page codec
+supplies each buffer's byte offset and size through its random-access layout.
 
-`HostSourceView` only borrows the table's addresses and dimensions. It owns no memory, builds no
-second table, allocates no storage, and copies no data. Keep model-specific `EntryLayout` separate:
-KVCM reports completed **tokens**; the model layout defines stored entries, strides, and scales.
+Updates follow changed requests and pages. Backup and invalidation update the affected page and
+its shared-prefix users. Append updates touch the tail and newly stale pages; other structural
+changes rebuild only the affected request. Acquisition polls
+only pending copies in the batch; there is no production full-table refresh. Pending or stale
+copies stay absent. Suspend keeps retained sources; a writable partial-prefix clone starts with
+no host source. Close or index release clears the row before reuse.
 
-Before GPU use, acquire a table read scope. It refreshes completed sources and protects them
-with existing `HostPageRead` handles. Close the scope after submitting GPU work, including graph
-replay. Its completion event protects the table and host slots. Table changes are rejected while
-a read scope is open; after close, CPU updates wait for its GPU work before changing mapped
-metadata. This is a scheduler boundary, not a per-layer operation. The view itself is not a
-lifetime guard. A captured graph must acquire a fresh read scope for each replay.
+`HostSourceView` only borrows addresses and dimensions. It allocates and copies nothing.
+`EntryFormat` stays separate and contains no pool IDs, lifecycle IDs, or storage offsets.
+Completed coverage counts input tokens; the model format defines how many form one stored entry.
+
+Before GPU use, acquire `HostSourceRead` for the batch's rows and generations. It keeps only those
+requests and their published copies alive, using existing `HostPageRead` protection. Close it
+after submission. Changes to those rows wait for completed GPU reads; unrelated rows can change
+independently. Pool changes and shutdown wait for all readers. Acquire and close outside capture,
+with a fresh scope for each graph replay. The borrowed view itself is not a lifetime guard.
 See [host-source table usage](docs/source/developer-guide/kv-cache-host-copies.md#host-source-table).
 
 > **KVCM owner review:** confirm copy validity, safe reuse, fixed host addresses, partial pages,
@@ -199,7 +207,7 @@ See [host-source table usage](docs/source/developer-guide/kv-cache-host-copies.m
 ### 3.4 Find GPU hits, fetch misses, and give attention its indices
 
 **Pass logical selections directly to `ensure_resident()`, backed by HiSparse's
-`load_cache_to_device_buffer_kernel`.** Its inputs are `SelectedEntries`, a separate `EntryLayout`,
+`load_cache_to_device_buffer_kernel`.** Its inputs are `SelectedEntries`, model `EntryFormat` and codec buffer layouts,
 KVCM's `HostSourceView` protected by a read scope, and mutable GPU-cache state. It handles:
 
 1. Validate selection IDs and bounds.
@@ -249,15 +257,15 @@ This follows the [generalization principle](hisparse_design_principle.md).
 
 **Each layer writes new KV, prepares selected KV on GPU, and runs attention.**
 
-Reserve table and cache capacity before graph capture. Before each replay, update request IDs,
-lengths, and valid rows, including padding. Acquire a KVCM host-source read scope for that replay
+Initialize host sources from manager limits before graph capture. Before each replay, update batch
+rows/generations and existing DSA metadata, including padding. Acquire a batch host-source read scope
 and close it after submission. Host source addresses must stay valid until the reads finish.
 
 Each layer runs these steps on GPU:
 
 1. **Write** new KV and scoring data. Wait for prior uses before overwriting a slot.
 2. **Select** the KV to read. IndexShare layers can share a selection but need their own KV.
-3. **Fetch** missing KV by passing the selection, `EntryLayout`, `HostSourceView`, and GPU-cache state directly
+3. **Fetch** missing KV by passing the selection, model format, codec layout, `HostSourceView`, and GPU-cache state directly
   to `ensure_resident()`. New KV can use its protected GPU copy while backup is pending.
 4. **Run attention** using the returned indices, after the required copies finish.
 

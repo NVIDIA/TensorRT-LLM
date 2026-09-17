@@ -21,7 +21,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..selection import SelectedEntries, SelectionContext
+from ..selection import SelectedEntries
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -29,7 +29,7 @@ from .indexer import (
 )
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSAParams
-from .selection import DSASelectionPolicy, select_dsa_topk
+from .selection import make_dsa_selection, select_dsa_topk
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -176,17 +176,21 @@ class DSATrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         metadata: DSAtrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-        context: SelectionContext,
+        host_source_rows: torch.Tensor,
+        host_source_generations: torch.Tensor,
     ) -> SelectedEntries:
-        """Expose logical DSA selections for the selected-entry cache path.
+        """Expose logical top-K with DSA's existing request mapping and KV lengths.
 
-        The caller supplies KVCM IDs, query-to-request rows, and causal entry
-        bounds. IndexShare shares positions; context still names this KV layer.
-        This entry point replaces sparse_attn_predict on that path: do not call
-        both for the same query. Model cache wiring follows in the HiSparse task.
+        The future caller supplies IndexMapper rows and their generations. Call
+        this instead of sparse_attn_predict for the same query. Model cache wiring
+        follows in the HiSparse task.
         """
-        return DSASelectionPolicy().select(
-            self.select_logical_topk(q, metadata, forward_args), context
+        return make_dsa_selection(
+            self.select_logical_topk(q, metadata, forward_args),
+            metadata,
+            host_source_rows,
+            host_source_generations,
+            is_generation=forward_args.attention_input_type == AttentionInputType.generation_only,
         )
 
     def sparse_attn_predict(

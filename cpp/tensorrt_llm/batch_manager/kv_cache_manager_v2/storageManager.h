@@ -257,6 +257,9 @@ public:
     PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
 
+    //! Returns codec-owned byte offsets, checked against KVCM's buffer/lifecycle mapping.
+    ColdBufferLayout hostBufferLayout(BufferId const& buffer) const;
+
     // Describe every hot-tier pool group: slot count, slot descriptor and per-pool base
     // addresses. Used to configure the cold-page codec and exposed through KvCacheManager.
     TypedVec<PoolGroupIndex, PoolGroupDesc> poolGroupDescs() const;

@@ -9,10 +9,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa.selection import (
-    DSASelectionPolicy,
+    make_dsa_selection,
     select_dsa_topk,
 )
-from tensorrt_llm._torch.attention.backends.sparse.selection import SelectionContext
 
 
 @pytest.mark.parametrize("generation", [False, True])
@@ -23,7 +22,13 @@ def test_logical_boundary(generation: bool, shared: bool) -> None:
     if shared:
         shared_topk[1 if generation else 0].copy_(positions[0])
     metadata = SimpleNamespace(
-        num_ctx_tokens=1, num_tokens=2, shared_topk_indices=shared_topk, in_mtp_draft_loop=False
+        num_ctx_tokens=1,
+        num_tokens=2,
+        num_seqs=2,
+        req_idx_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([5, 9], dtype=torch.int32),
+        shared_topk_indices=shared_topk,
+        in_mtp_draft_loop=False,
     )
     indexer = Mock(mtp_index_share=False)
     indexer.forward_from_projected.return_value = positions
@@ -32,17 +37,23 @@ def test_logical_boundary(generation: bool, shared: bool) -> None:
     logical = select_dsa_topk(
         None if shared else indexer, q, metadata, intermediates, is_generation=generation
     )
-    context = SelectionContext(
-        torch.tensor([123]),
-        torch.tensor([0], dtype=torch.int32),
-        torch.tensor([5], dtype=torch.int32),
-        7,
-        3,
-    )
-    selected = DSASelectionPolicy().select(logical, context)
+    rows = torch.tensor([3, 0], dtype=torch.int32)
+    generations = torch.tensor([12, 7], dtype=torch.uint64)
+    selected = make_dsa_selection(logical, metadata, rows, generations, is_generation=generation)
     assert selected.positions.tolist() == [[4, 1, 4, -1]]
     assert selected.positions is logical
-    assert selected.context is context
+    context = selected.context
+    assert (
+        context.req_idx_per_token.data_ptr()
+        == metadata.req_idx_per_token[1 if generation else 0 :].data_ptr()
+    )
+    assert context.kv_lens_cuda.data_ptr() == metadata.kv_lens_cuda.data_ptr()
+    assert context.host_source_rows is rows
+    assert context.host_source_generations is generations
+    # Phase slicing preserves absolute batch indices; generation does not rebase them.
+    assert context.req_idx_per_token.tolist() == [1 if generation else 0]
+    metadata.kv_lens_cuda[1] = 10
+    assert context.kv_lens_cuda.tolist() == [5, 10]
     assert shared_topk[1 if generation else 0].tolist() == positions[0].tolist()
     assert shared_topk[0 if generation else 1].tolist() == [-1] * 4
     if shared:

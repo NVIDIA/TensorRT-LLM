@@ -333,6 +333,16 @@ class _Status(enum.Enum):
 
 IndexSeq = array.array[int] | memoryview[int]
 
+class ColdBufferLayout:
+    @property
+    def life_cycle_id(self) -> LifeCycleId: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def expansion(self) -> int: ...
+
 class HostSourceView:
     """C++ backend: borrowed mapped table arrays; valid until manager shutdown.
 
@@ -385,7 +395,10 @@ class _HostSourceRead:
 
 class _KVCache:
     @property
-    def _host_source_slot(self) -> int: ...
+    def _host_source_row(self) -> int: ...
+    @property
+    def _host_source_ref(self) -> tuple[int, int]: ...
+    def _bind_host_source_row(self, row: int) -> None: ...
     Status: ClassVar[Type[_Status]]
     id: Any
     def __init__(
@@ -575,13 +588,15 @@ def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
     """
 
 class KVCacheManager:
-    def _reserve_host_source_table(
+    def _initialize_host_source_table(
         self, max_requests: int, max_pages: int, max_beams: int = 1
     ) -> None: ...
     @property
     def _host_source_view(self) -> HostSourceView: ...
-    def _refresh_host_source_table(self) -> None: ...
-    def _acquire_host_sources(self, cuda_stream: CudaStream) -> _HostSourceRead: ...
+    def _acquire_host_sources(
+        self, rows: Sequence[tuple[int, int]], cuda_stream: CudaStream
+    ) -> _HostSourceRead: ...
+    def _host_buffer_layout(self, buffer: BufferId) -> ColdBufferLayout: ...
     def __init__(
         self,
         config: KVCacheManagerConfig,

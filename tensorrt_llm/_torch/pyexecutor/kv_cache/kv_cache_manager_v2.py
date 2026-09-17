@@ -1717,6 +1717,7 @@ class KVCacheManagerV2(BaseResourceManager):
             f"max_beam_width={max_beam_width})"
         )
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
+        self._host_sources_initialized = False
         self._early_freed_index_requests: set[int] = set()
         self._prepare_page_table_tensor(index_mapper_capacity)
 
@@ -4591,6 +4592,26 @@ class KVCacheManagerV2(BaseResourceManager):
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
+    def initialize_host_sources(self) -> None:
+        """Initialize optional host-source metadata from this manager's existing limits.
+
+        Call once before CUDA graph capture. This adds no model wiring or GPU cache.
+        Existing and future requests use their IndexMapper rows; early index release
+        unbinds the row while the request's retained host copies can stay alive.
+        """
+        if self._host_sources_initialized:
+            return
+        if KV_CACHE_MANAGER_V2_BACKEND != "cpp":
+            raise NotImplementedError("Host sources require the C++ KVCM V2 backend")
+        capacity = self.index_mapper.size() + self.index_mapper.num_free_slots()
+        self.impl._initialize_host_source_table(
+            capacity, self.max_blocks_per_seq, self.max_beam_width
+        )
+        self._host_sources_initialized = True
+        for request_id, cache in self.kv_cache_map.items():
+            if request_id not in self._early_freed_index_requests:
+                cache._bind_host_source_row(self.index_mapper.get_index(request_id))
+
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
 
@@ -4605,6 +4626,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # mirrored, and the target may release the same request twice.
             return
         if kv_cache is not None:
+            if self._host_sources_initialized:
+                kv_cache._bind_host_source_row(-1)
             for i in range(self.max_beam_width):
                 for pool_idx in range(self.num_pools):
                     kv_cache.set_base_page_index_buf(i, pool_idx, None)
@@ -5177,6 +5200,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()
         index = self.index_mapper.add_new_sequence(request_id)
+        if self._host_sources_initialized:
+            kv_cache._bind_host_source_row(index)
         for i in range(self.max_beam_width):
             for pool_idx in range(self.num_pools):
                 buffer: torch.Tensor = self.host_kv_cache_block_offsets[

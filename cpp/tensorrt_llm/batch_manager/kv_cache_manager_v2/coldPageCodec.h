@@ -74,6 +74,16 @@ struct alignas(8) PageIndexPair
 static_assert(sizeof(PageIndexPair) == 8);
 static_assert(std::is_trivially_copyable_v<PageIndexPair>);
 
+//! Byte-preserving random access to one BufferId inside a cold page.
+//! A codec that transforms/reorders bytes must return false unless it can expose this representation.
+struct ColdBufferLayout
+{
+    LifeCycleId lifeCycleId{0};
+    size_t offset = 0;
+    size_t size = 0;
+    int expansion = 1; //!< Native buffers per logical page, supplied by KVCM.
+};
+
 //! Transforms KV pages between hot multi-pool and cold single-blob representations.
 class IKvCacheColdPageCodec
 {
@@ -92,6 +102,10 @@ public:
 
     //! Returns the fixed cold-page size for a layer group. Zero indicates failure or an unknown layer group.
     [[nodiscard]] virtual size_t queryColdPageBytes(LayerGroupId layerGroupId) const noexcept = 0;
+
+    //! Optional random access. Offsets are relative to the cold slot; bytes have the original buffer format.
+    //! The default returns false. Whole-page encode/decode remain supported without random access.
+    [[nodiscard]] virtual bool queryBufferLayout(BufferId const& buffer, ColdBufferLayout& layout) const noexcept;
 
     //! Returns the representative layer-group ID used for cross-lifecycle batching.
     //!

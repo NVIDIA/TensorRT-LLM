@@ -374,56 +374,48 @@ If the algorithm needs extra tensors beyond the main KV cache:
 
 ## Selected KV interfaces
 
-The internal interfaces in `backends/sparse/selection.py` and `kv_layout.py`
-describe selected KV before host offload is connected to models. They keep one
-existing `KvCache` per request. Model layouts are separate from KVCM's non-owning
-`HostSourceView`.
+The internal types in `backends/sparse/selection.py` and `kv_layout.py` describe
+selected KV before model offload is connected. They keep one `KvCache` per request.
 
 | Type | What it carries |
 | --- | --- |
-| `SelectionPolicy` | Adapts model selections to logical entries. |
-| `SelectionContext` | Request IDs, query-to-request rows, KVCM layer/lifecycle IDs, and per-query valid lengths. |
+| `SelectionContext` | Borrowed `req_idx_per_token`, `kv_lens_cuda`, and explicit host-source rows/generations. |
 | `SelectedEntries` | Logical positions and an optional validity mask, in attention order. |
-| `EntryLayout` | Entries per page and byte spans for KV, scales, or other entry data. |
-| `HostSourceView` (C++ KVCM) | Borrowed addresses for request IDs/generations, retained host slots, completed token counts, and host-pool metadata. |
+| `EntryFormat` | Model buffer identity (`BufferId`/`DataRole`), component tensor shapes/dtypes/entry axes, and tokens per entry. |
+| `ColdBufferLayout` (C++ KVCM/codec) | Lifecycle, byte offset and size within a cold slot, and native-buffer expansion. |
+| `HostSourceView` (C++ KVCM) | Borrowed row generations, retained host slots, completed token counts, and host-pool metadata. |
 
-`DSATrtllmAttention.select_kv()` exposes DSA top-K before the ordinary GPU
-page-table conversion. It also supports shared indexer output. The caller
-supplies `SelectionContext` for the layer whose KV will be read. The existing
-`sparse_attn_predict()` path still returns ordinary physical indices; call one
-entry point per query.
+`DSATrtllmAttention.select_kv()` exposes logical top-K before page-table conversion.
+It borrows DSA's existing query-to-request mapping and sequence lengths, including
+runtime length updates. Context/decode slicing preserves absolute batch indices.
+The caller supplies `IndexMapper` rows and their generations, not another set of
+request IDs to search on GPU. IndexShare still shares top-K positions. The ordinary
+`sparse_attn_predict()` path is unchanged; call one entry point per query.
 
-Positions count tokens, or native compressed entries. For example, compression
-by four gives four entries in a 16-token page. The model adapter supplies the
-number of completed entries each query may read, including its causal limit.
-Positions already use stored-entry units; do not divide them by the compression ratio again.
-Duplicates keep their columns. Negative positions, positions outside the valid
-length, and masked entries are invalid.
+Positions count tokens or native compressed entries. For compression by four,
+a 16-token page holds four entries. Positions already use entry units. The
+selector enforces causal bounds. The future consumer also checks sequence length,
+row generation, masks, and completed host coverage. Duplicates keep their columns.
 
-Build the layout from the **host** pool/slot sizes and buffer offsets, plus the model's
-entry format. The default cold-page codec joins GPU pools into one host pool;
-see [retained host copies](kv-cache-host-copies.md#host-layout-and-disk-restore). Do not infer entry stride from total buffer size. A component
-names one byte span per entry: its pool, offset in the slot, byte stride, and
-byte count. Use separate components for separate scale regions or heads when
-needed. For component `c`, the host byte offset is:
+`EntryFormat` describes model data only. For example, a component can be a
+`[entries, heads, channels]` KV tensor with entry axis 0, followed by a scale
+tensor. Head-major data can use entry axis 1. KVCM supplies lifecycle/pool mapping
+and buffer expansion; the codec supplies buffer offsets in host slots. Models
+must not reconstruct physical layouts. Opaque codecs remain usable for whole-page
+transfers but are rejected when random-access host sources are enabled.
+See [codec layouts](kv-cache-host-copies.md#host-layout-and-disk-restore).
 
-```text
-page = position // entries_per_page
-entry = position % entries_per_page
-offset = host_slot[request, page] * pool_slot_bytes[c.pool_index]
-         + c.offset + entry * c.stride
-```
+KVCM updates the `HostSourceTable` incrementally. `HostSourceView` never builds
+another table or protects memory. Setup derives capacity from existing manager
+limits. Use `HostSourceRead` for the batch's row-and-generation pairs before each
+GPU use; it polls pending copies and protects only that batch. Completed coverage
+counts input tokens; the model format defines conversion to stored entries.
+See [host-source usage](kv-cache-host-copies.md#host-source-table).
 
-KVCM owns and updates the `HostSourceTable`; the view never builds a second table.
-Pending and stale copies are absent. Completed coverage counts input tokens;
-the model adapter converts it to stored entries according to `EntryLayout`.
-Reserve table capacity before graph capture and use a table read scope for each
-GPU use. See [host-source table usage](kv-cache-host-copies.md#host-source-table).
-
-The planned HiSparse path passes `SelectedEntries`, `EntryLayout`, `HostSourceView`,
-and mutable GPU-cache state directly to `ensure_resident()`. HiSparse owns hit lookup,
-LRU replacement, and fetching. Attention runs after the required copies, with
-selected slots protected until attention finishes. Step 5 implements this path later.
+The planned HiSparse `ensure_resident()` takes `SelectedEntries`, `EntryFormat`,
+KVCM/codec layouts, `HostSourceView`, and mutable GPU-cache state directly. It
+performs the single hit lookup, LRU replacement, and fetching, returning indices
+protected through attention. Step 5 remains unimplemented.
 
 A valid selection stays valid on a GPU miss. Fetch it from completed host data;
 report unavailable selected data instead of discarding it. A ready GPU hit can

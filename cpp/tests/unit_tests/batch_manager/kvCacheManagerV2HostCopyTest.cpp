@@ -175,8 +175,9 @@ protected:
     {
         mCache->close();
         mCache.reset();
-        mManager->reserveHostSourceTable(maxRequests, maxPages);
+        mManager->initializeHostSourceTable(maxRequests, maxPages);
         mCache = mManager->createKvCache({}, {}, RequestIdType{41});
+        mManager->bindHostSourceRow(*mCache, 0);
         EXPECT_TRUE(mCache->resume(mStream));
         EXPECT_TRUE(mCache->resize(std::max(8, history), history));
         return mManager->hostSourceView();
@@ -511,13 +512,13 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTablePublishesOnlyCompletedPrefix
     StreamGate gate(mStream);
     fill();
     mCache->backupToHost(kSparse, kPage, 2);
-    mManager->refreshHostSourceTable();
+    mManager->refreshHostSourceTableForTest();
     EXPECT_EQ(view.slotIds[index], -1);
     EXPECT_EQ(view.hostLevels[index], -1);
     EXPECT_EQ(view.completedTokens[index], 0);
     gate.release();
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
-    mManager->refreshHostSourceTable();
+    mManager->refreshHostSourceTableForTest();
     EXPECT_EQ(view.slotIds[index], page()->hostCopy()->slotId().value());
     EXPECT_EQ(view.completedTokens[index], 2);
     EXPECT_EQ(view.hostLevels[index], 1);
@@ -536,7 +537,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTablePublishesOnlyCompletedPrefix
     fill(0x70);
     mCache->backupToHost(kSparse, kPage, 4);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
-    auto read = mManager->acquireHostSources(mStream);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
     EXPECT_EQ(view.slotIds[index], slot);
     EXPECT_EQ(view.completedTokens[index], 4);
     EXPECT_THROW(mCache->invalidateHostCopy(kSparse, kPage), LogicError);
@@ -587,12 +588,13 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableFollowsCommitAndSharedPrefix
     EXPECT_EQ(view.slotIds[first], -1);
     auto other = mManager->createKvCache({}, TokenSpan{tokens.data(), 16}, RequestIdType{42});
     auto const cleanup = FuncGuard([&]() { other->close(); });
+    mManager->bindHostSourceRow(*other, 1);
     EXPECT_EQ(mManager->hostSourceSlot(*other), 1);
     auto const second = view.pageIndex(1, 0, kSparse.value(), kPage.value());
     EXPECT_EQ(view.slotIds[second], -1);
     gate.release();
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
-    mManager->refreshHostSourceTable();
+    mManager->refreshHostSourceTableForTest();
     EXPECT_EQ(view.slotIds[first], slot);
     EXPECT_EQ(view.slotIds[second], slot);
     EXPECT_TRUE(other->resume(mStream));
@@ -619,6 +621,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableDoesNotCarryPartialSourceInt
     mCache->commit(TokenSpan{tokens.data(), 6}, true);
     auto other = mManager->createKvCache({}, TokenSpan{tokens.data(), 6}, RequestIdType{42});
     auto const cleanup = FuncGuard([&]() { other->close(); });
+    mManager->bindHostSourceRow(*other, 1);
     auto const first = view.pageIndex(0, 0, kSparse.value(), kPage.value());
     auto const second = view.pageIndex(1, 0, kSparse.value(), kPage.value());
     EXPECT_EQ(view.completedTokens[second], 2);
@@ -632,11 +635,13 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableDoesNotCarryPartialSourceInt
 TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableClearsRowsBeforeRequestSlotReuse)
 {
     auto const view = enableHostSources(6, 1, 2);
-    EXPECT_THROW(mManager->reserveHostSourceTable(1, 2), std::exception);
+    EXPECT_THROW(mManager->initializeHostSourceTable(1, 2), std::exception);
     EXPECT_THROW(mCache->resize(12, 6), std::out_of_range);
     EXPECT_EQ(mCache->capacity(), 8);
-    EXPECT_THROW(mManager->createKvCache({}, {}, RequestIdType{41}), std::invalid_argument);
-    EXPECT_THROW(mManager->createKvCache({}, {}, RequestIdType{42}), std::out_of_range);
+    auto overflow = mManager->createKvCache({}, {}, RequestIdType{42});
+    EXPECT_THROW(mManager->bindHostSourceRow(*overflow, 0), LogicError);
+    EXPECT_THROW(mManager->bindHostSourceRow(*overflow, 1), std::invalid_argument);
+    overflow->close();
     fill();
     mCache->backupToHost(kSparse, kPage, 2);
     auto pageRead = mCache->acquireHostCopy(kSparse, kPage);
@@ -650,6 +655,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableClearsRowsBeforeRequestSlotR
     EXPECT_ANY_THROW(mManager->shutdown()); // The existing per-page read still protects its source.
     auto other = mManager->createKvCache({}, {}, RequestIdType{41});
     auto const cleanup = FuncGuard([&]() { other->close(); });
+    mManager->bindHostSourceRow(*other, 0);
     EXPECT_EQ(mManager->hostSourceSlot(*other), 0);
     EXPECT_EQ(view.requestIds[0], 41);
     EXPECT_EQ(view.generations[0], generation + 1);
@@ -682,7 +688,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableTracksIdentityChangesWithout
     fill();
     mCache->backupToHost(kSparse, kPage, 2);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
-    mManager->refreshHostSourceTable();
+    mManager->refreshHostSourceTableForTest();
     auto const index = view.pageIndex(0, 0, kSparse.value(), 1);
     auto const slot = view.slotIds[index];
     auto const generation = view.generations[0];
@@ -695,12 +701,14 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableTracksIdentityChangesWithout
     EXPECT_EQ(view.requestValid[0], 0);
     EXPECT_EQ(view.slotIds[index], -1);
     mCache->setId(RequestIdType{44});
+    mManager->bindHostSourceRow(*mCache, 0);
     EXPECT_EQ(view.requestIds[0], 44);
     EXPECT_EQ(view.generations[0], generation + 2);
     EXPECT_EQ(view.slotIds[index], slot);
     auto other = mManager->createKvCache({}, {}, RequestIdType{45});
     auto const cleanup = FuncGuard([&]() { other->close(); });
-    EXPECT_THROW(mCache->setId(RequestIdType{45}), std::invalid_argument);
+    mManager->bindHostSourceRow(*other, 1);
+    EXPECT_THROW(mManager->bindHostSourceRow(*other, 0), LogicError);
     EXPECT_EQ(view.requestIds[0], 44);
     EXPECT_EQ(view.slotIds[index], slot);
 }
@@ -714,11 +722,11 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableWaitsForClosedCrossStreamRea
     cudaStream_t readStream{};
     ASSERT_EQ(cudaStreamCreateWithFlags(&readStream, cudaStreamNonBlocking), cudaSuccess);
     auto const freeStream = FuncGuard([&]() { cudaStreamDestroy(readStream); });
-    auto read = mManager->acquireHostSources(readStream);
-    auto anotherRead = mManager->acquireHostSources(mStream);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, readStream);
+    auto anotherRead = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
     StreamGate gate(readStream);
     read->close();
-    EXPECT_THROW(mManager->refreshHostSourceTable(), LogicError);
+    EXPECT_THROW(mManager->refreshHostSourceTableForTest(), LogicError);
     anotherRead->close();
     std::promise<void> started;
     auto startedFuture = started.get_future();
@@ -754,7 +762,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableAddressesStayFixedAcrossGrap
     int32_t* deviceCount = nullptr;
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&deviceCount), sizeof(int32_t)), cudaSuccess);
     auto const freeDevice = FuncGuard([&]() { cudaFree(deviceCount); });
-    auto read = mManager->acquireHostSources(mStream);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
     auto const source = reinterpret_cast<void const*>(view.gpuAddress(view.completedTokens + index));
     ASSERT_EQ(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeThreadLocal), cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(deviceCount, source, sizeof(int32_t), cudaMemcpyDefault, mStream), cudaSuccess);
@@ -771,7 +779,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableAddressesStayFixedAcrossGrap
     ASSERT_EQ(cudaMemcpy(&count, deviceCount, sizeof(count), cudaMemcpyDeviceToHost), cudaSuccess);
     EXPECT_EQ(count, 2);
     mCache->invalidateHostCopy(kSparse, kPage);
-    read = mManager->acquireHostSources(mStream);
+    read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
     ASSERT_EQ(cudaGraphLaunch(exec, mStream), cudaSuccess);
     read->close();
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
@@ -779,10 +787,214 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableAddressesStayFixedAcrossGrap
     EXPECT_EQ(count, 0);
     EXPECT_EQ(view.completedTokens, mManager->hostSourceView().completedTokens);
     mCache->close();
-    auto emptyRead = mManager->acquireHostSources(mStream);
+    auto emptyRead = mManager->acquireHostSources({}, mStream);
     EXPECT_THROW(mManager->shutdown(), LogicError);
     emptyRead->close();
     EXPECT_NO_THROW(mManager->shutdown());
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableReusesExplicitRowsAndRejectsOldGenerations)
+{
+    auto const view = enableHostSources(6);
+    fill();
+    mCache->backupToHost(kSparse, kPage, 2);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    mManager->bindHostSourceRow(*mCache, 3);
+    auto const oldRef = mManager->hostSourceRef(*mCache);
+    EXPECT_EQ(oldRef.first, 3);
+    auto const slot = view.slotIds[view.pageIndex(3, 0, kSparse.value(), 1)];
+    ASSERT_GE(slot, 0);
+    mManager->bindHostSourceRow(*mCache, -1); // Prefill transfer can outlive its IndexMapper row.
+    EXPECT_EQ(view.requestValid[3], 0);
+    EXPECT_TRUE(page()->hostCopy());
+    auto other = mManager->createKvCache({}, {}, RequestIdType{42});
+    auto const cleanup = FuncGuard([&]() { other->close(); });
+    mManager->bindHostSourceRow(*other, 3);
+    EXPECT_GT(mManager->hostSourceRef(*other).second, oldRef.second);
+    EXPECT_THROW(mManager->acquireHostSources({oldRef}, mStream), std::invalid_argument);
+    EXPECT_THROW(mManager->acquireHostSources({{4, 1}}, mStream), std::invalid_argument);
+    auto const ref = mManager->hostSourceRef(*other);
+    EXPECT_THROW(mManager->acquireHostSources({ref, ref}, mStream), std::invalid_argument);
+    mManager->bindHostSourceRow(*mCache, 2);
+    EXPECT_EQ(view.slotIds[view.pageIndex(2, 0, kSparse.value(), 1)], slot);
+    EXPECT_EQ(view.slotIds[view.pageIndex(3, 0, kSparse.value(), 1)], -1);
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableReadsAndPollsOnlyTheBatch)
+{
+    auto const view = enableHostSources(6);
+    auto other = mManager->createKvCache({}, {}, RequestIdType{42});
+    auto const cleanup = FuncGuard([&]() { other->close(); });
+    mManager->bindHostSourceRow(*other, 1);
+    ASSERT_TRUE(other->resume(mStream));
+    ASSERT_TRUE(other->resize(8, 6));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    StreamGate gate(mStream);
+    other->backupToHost(kSparse, kPage, 2);
+    auto const second = view.pageIndex(1, 0, kSparse.value(), 1);
+    EXPECT_EQ(view.completedTokens[second], 0);
+    gate.release();
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
+    EXPECT_EQ(view.completedTokens[second], 0); // Unrelated pending copy was not polled.
+    EXPECT_NO_THROW(other->invalidateHostCopy(kSparse, kPage));
+    EXPECT_NO_THROW(other->close());            // The scope holds no unrelated request or page.
+    read->close();
+    EXPECT_EQ(view.requestValid[1], 0);
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableBackupUpdatesExistingSharedRows)
+{
+    auto const view = enableHostSources();
+    fill();
+    std::vector<TokenIdExt> tokens;
+    for (int i = 0; i < 16; ++i)
+        tokens.emplace_back(i);
+    mCache->commit(TokenSpan{tokens.data(), 16});
+    auto other = mManager->createKvCache({}, TokenSpan{tokens.data(), 16}, RequestIdType{42});
+    auto const cleanup = FuncGuard([&]() { other->close(); });
+    mManager->bindHostSourceRow(*other, 1);
+    auto const first = view.pageIndex(0, 0, kSparse.value(), 1);
+    auto const second = view.pageIndex(1, 0, kSparse.value(), 1);
+    EXPECT_EQ(view.completedTokens[second], 0);
+    mManager->bindHostSourceRow(*mCache, -1);
+    mCache->backupToHost(kSparse, kPage, 4);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*other)}, mStream);
+    EXPECT_EQ(view.completedTokens[second], 4);
+    EXPECT_EQ(view.slotIds[second], page()->hostCopy()->slotId().value());
+    read->close();
+    mManager->bindHostSourceRow(*mCache, 0);
+    auto firstRead = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
+    EXPECT_EQ(view.slotIds[first], view.slotIds[second]);
+    firstRead->close();
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceCodecOwnsOffsetsAcrossPoolsAndCoalescedLayers)
+{
+    auto const view = enableHostSources();
+    fill();
+    mCache->backupToHost(kSparse, kPage, 4);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
+    auto const* host = reinterpret_cast<unsigned char const*>(page()->hostCopy()->address());
+    auto const descs = mManager->storage().poolGroupDescs();
+    auto const group = mManager->storage().getPoolGroupIndex(kSparse);
+    auto const& desc = descs[group];
+    size_t poolOffset = 0;
+    for (PoolIndex pool{0}; pool < desc.pools.size(); ++pool)
+    {
+        for (auto const& variant : desc.slotDesc.variants)
+        {
+            if (variant.lifeCycleId != kSparse)
+                continue;
+            auto const& buffers = variant.coalescedBuffers[pool];
+            size_t offset = poolOffset;
+            for (auto const& buffer : buffers.bufferIds)
+            {
+                auto const layout = mManager->hostBufferLayout(buffer);
+                EXPECT_EQ(layout.lifeCycleId, kSparse);
+                EXPECT_EQ(layout.offset, offset);
+                EXPECT_EQ(layout.size, buffers.singleBufferSize);
+                EXPECT_EQ(layout.expansion, 1);
+                EXPECT_EQ(host[layout.offset], 0x40 + pool.value());
+                EXPECT_EQ(host[layout.offset + layout.size - 1], 0x40 + pool.value());
+                offset += buffers.singleBufferSize;
+            }
+        }
+        poolOffset += desc.pools[pool].slotBytes;
+    }
+    EXPECT_EQ(poolOffset, view.poolMetadata[(view.numLifeCycles + kSparse.value()) * 4 + 1]);
+    EXPECT_THROW(mManager->hostBufferLayout(BufferId{99, "key"}), std::out_of_range);
+    read->close();
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableAppendUpdatesOnlyChangedOrdinals)
+{
+    auto const view = enableHostSources();
+    fill();
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    StreamGate gate(mStream);
+    mCache->backupToHost(kSparse, kPage, 4);
+    auto const oldPage = view.pageIndex(0, 0, kSparse.value(), 1);
+    EXPECT_EQ(view.completedTokens[oldPage], 0);
+    gate.release();
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    ASSERT_TRUE(mCache->resize(20, 17));
+    EXPECT_EQ(view.completedTokens[oldPage], 0); // Append does not revisit earlier pending pages.
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
+    EXPECT_EQ(view.completedTokens[oldPage], 4);
+    read->close();
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableResizeClearsNewlyStaleWindowPages)
+{
+    auto config = hostConfig();
+    std::get<AttentionLayerConfig>(config.layers[1]).slidingWindowSize = 8;
+    std::get<AttentionLayerConfig>(config.layers[2]).slidingWindowSize = 8;
+    reset(std::move(config), {}, 8);
+    auto const view = enableHostSources(8);
+    mCache->stopCommitting();
+    fill();
+    mCache->backupToHost(kSparse, kPage, 4);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
+    auto const index = view.pageIndex(0, 0, kSparse.value(), 1);
+    EXPECT_EQ(view.completedTokens[index], 4);
+    read->close();
+    ASSERT_TRUE(mCache->resize(20, 16));
+    EXPECT_EQ(view.completedTokens[index], 0);
+    EXPECT_EQ(view.slotIds[index], -1);
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableClosingSharedRequestLeavesOtherReaderValid)
+{
+    auto const view = enableHostSources();
+    fill();
+    mCache->backupToHost(kSparse, kPage, 4);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<TokenIdExt> tokens;
+    for (int i = 0; i < 16; ++i)
+        tokens.emplace_back(i);
+    mCache->commit(TokenSpan{tokens.data(), 16});
+    auto other = mManager->createKvCache({}, TokenSpan{tokens.data(), 16}, RequestIdType{42});
+    auto const cleanup = FuncGuard([&]() { other->close(); });
+    mManager->bindHostSourceRow(*other, 1);
+    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*other)}, mStream);
+    EXPECT_NO_THROW(mCache->close());
+    EXPECT_EQ(view.requestValid[0], 0);
+    EXPECT_EQ(view.completedTokens[view.pageIndex(1, 0, kSparse.value(), 1)], 4);
+    read->close();
+}
+
+TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableEmptyReadCompletionProtectsShutdown)
+{
+    enableHostSources();
+    mCache->close();
+    auto read = mManager->acquireHostSources({}, mStream);
+    StreamGate gate(mStream);
+    read->close();
+    std::promise<void> started;
+    auto startedFuture = started.get_future();
+    auto shutdown = std::async(std::launch::async,
+        [&]()
+        {
+            if (cudaSetDevice(0) != cudaSuccess)
+                throw std::runtime_error("Cannot set worker CUDA device");
+            started.set_value();
+            mManager->shutdown();
+        });
+    auto const cleanup = FuncGuard(
+        [&]()
+        {
+            gate.release();
+            if (shutdown.valid())
+                shutdown.wait();
+        });
+    startedFuture.wait();
+    EXPECT_EQ(shutdown.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    gate.release();
+    EXPECT_NO_THROW(shutdown.get());
 }
 
 } // namespace

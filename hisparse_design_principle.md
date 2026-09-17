@@ -49,11 +49,12 @@ rather than an adaptation if reused as-is.
 
 Use these interfaces:
 
-- **`SelectionPolicy`** — returns logical entries selected by the model.
-- **`EntryLayout`** — describes the model's entry bytes and scales.
+- **`SelectedEntries`** — borrows model positions and existing batch metadata.
+- **`EntryFormat`** — describes model tensor shapes, dtypes, entry axes, and compression,
+  keyed by `BufferId`/`DataRole`. KVCM and the codec supply physical layout.
 - **`HostSourceView`** — borrows KVCM's host-source table. KVCM owns its locations
   and completed token counts; read scopes protect the table and host copies.
-- **`ensure_resident()`** — takes logical selections, separate `EntryLayout` and `HostSourceView`, and
+- **`ensure_resident()`** — takes logical selections, separate model formats, codec layouts, and `HostSourceView`, and
   mutable GPU-cache state directly. HiSparse finds hits, replaces GPU copies with
   LRU, fetches misses, and returns indices protected through attention.
 

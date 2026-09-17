@@ -240,7 +240,7 @@ void KvCache::backupToHost(
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this, ordinal);
     auto page = hostCopyPage(group, ordinal, beam);
     if (hostLevel <= kHotLevel || hostLevel >= storageManager()->numCacheLevels()
         || storageManager()->cacheTier(hostLevel) != CacheTier::HOST_MEM)
@@ -279,7 +279,7 @@ void KvCache::invalidateHostCopy(LayerGroupId group, BlockOrdinal ordinal, BeamI
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this, ordinal);
     auto const& page = hostCopyPage(group, ordinal, beam);
     if (page->isCommitted() || !std::holds_alternative<SharedPageLock>(mBlocks[ordinal].pages[beam][group]))
         throw LogicError("Invalidate only a writable, GPU-locked request page");
@@ -291,7 +291,7 @@ void KvCache::offloadToHost(LayerGroupId group, BlockOrdinal ordinal, BeamIndex 
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this, ordinal);
     auto const& page = hostCopyPage(group, ordinal, beam);
     storageManager()->offloadPageToHost(*page, writtenTokensInPage(*page, ordinal));
 }
@@ -307,7 +307,7 @@ void KvCache::setResidencyWindow(LayerGroupId group, std::optional<int> windowSi
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
     if (mStatus == Status::CLOSED)
         throw LogicError("Cannot change residency of a closed cache");
     auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles().getLifeCycle(group));
@@ -406,7 +406,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
 
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kHotLevel);
@@ -639,7 +639,7 @@ bool KvCache::prefetch(CacheLevel target)
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
     CacheLevel const numTiers = storageMgr.numCacheLevels();
@@ -679,7 +679,7 @@ void KvCache::suspend()
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(_checkSanity());
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
@@ -732,7 +732,7 @@ void KvCache::close()
     if (mStatus == Status::CLOSED)
         return;
 
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
 
     discardPendingStats();
     stopCommitting();
@@ -765,7 +765,7 @@ void KvCache::setId(std::optional<RequestIdType> requestId)
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
     mManager->setHostSourceRequestId(*this, requestId);
 }
 
@@ -1216,7 +1216,6 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 {
     KVCM2_API_GUARD();
     auto const lock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(mBlocks.size() == BlockOrdinal{divUp(mCapacity, mTokensPerBlock)});
 
@@ -1234,6 +1233,26 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         throw std::invalid_argument("History length cannot exceed capacity");
 
     mManager->checkHostSourceCapacity(*this, newCap);
+
+    // Append/resize changes the tail and any newly stale window pages. Keep older host metadata intact.
+    // Scratch reuse can remap earlier pages, so that less common path rebuilds the request.
+    std::optional<std::pair<int, int>> sourceRange;
+    if (mManager->hasHostSources() && !mEnableSwaScratchReuse)
+    {
+        int first = mHistoryLength / mTokensPerBlock;
+        for (auto [lcId, lc] : mManager->lifeCycles())
+        {
+            if (auto const* attn = std::get_if<AttnLifeCycle>(&lc); attn && attn->windowSize)
+            {
+                auto const oldStale = attn->getStaleRange(mHistoryLength, mTokensPerBlock);
+                auto const newStale = attn->getStaleRange(newHist, mTokensPerBlock);
+                if (oldStale != newStale)
+                    first = std::min(first, oldStale.end.value());
+            }
+        }
+        sourceRange = std::make_pair(first, divUp(std::max(mCapacity, newCap), mTokensPerBlock));
+    }
+    auto const sourceUpdate = mManager->updateHostSources(this, std::nullopt, sourceRange);
 
     // Scratch reuse: enforce constraint.
     bool enableScratch = mEnableSwaScratchReuse;
@@ -1948,7 +1967,7 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
     KVCM2_API_GUARD();
     TLLM_CHECK(isActive());
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
     if (mBeamWidth != BeamIndex{1})
         throw LogicError("Not implemented yet for beam search");
     if (tokens.size() == 0)
@@ -2030,7 +2049,7 @@ void KvCache::stopCommitting()
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
-    auto const sourceUpdate = mManager->updateHostSources();
+    auto const sourceUpdate = mManager->updateHostSources(this);
     TLLM_CHECK_DEBUG(mStatus != Status::CLOSED);
     if (mCommitState == CommitState::USER_STOP)
         return;

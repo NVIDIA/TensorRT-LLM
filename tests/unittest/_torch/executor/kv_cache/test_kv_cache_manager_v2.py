@@ -2406,3 +2406,54 @@ def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
 
     assert len(fake_logger.messages) == 1
     assert "unavailable" in fake_logger.messages[0]
+
+
+def test_host_sources_use_index_mapper_capacity_rows_and_early_release() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._host_sources_initialized = False
+    manager.max_blocks_per_seq = 16
+    manager.max_beam_width = 1
+    manager.num_pools = 2
+    manager.is_draft = False
+    manager.index_mapper = kv_cache_v2_module.IndexMapper(5, 1)
+    manager.impl = Mock()
+    first, transferring = Mock(), Mock()
+    first_row = manager.index_mapper.add_new_sequence(41)
+    manager.index_mapper.add_new_sequence(42)
+    manager.index_mapper.remove_sequence(42)
+    manager.kv_cache_map = {41: first, 42: transferring}
+    manager._early_freed_index_requests = {42}
+    with patch.object(kv_cache_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "cpp"):
+        manager.initialize_host_sources()
+        manager.initialize_host_sources()
+    manager.impl._initialize_host_source_table.assert_called_once_with(5, 16, 1)
+    first._bind_host_source_row.assert_called_once_with(first_row)
+    transferring._bind_host_source_row.assert_not_called()
+
+    # Index release must clear the source row before the allocator can reuse it.
+    def release_row(row: int) -> None:
+        assert row == -1
+        assert manager.index_mapper.get_index(41) == first_row
+
+    first._bind_host_source_row.side_effect = release_row
+    manager.release_index_slot(41)
+    assert manager.index_mapper.add_new_sequence(43) == first_row
+    assert manager.kv_cache_map[41] is first
+    first.close.assert_not_called()
+
+
+def test_new_request_binds_existing_index_mapper_row_for_host_sources() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._host_sources_initialized = True
+    manager.index_mapper = kv_cache_v2_module.IndexMapper(3, 1)
+    manager.index_mapper.add_new_sequence(7)  # Row zero already belongs to another request.
+    manager.kv_cache_map = {}
+    manager.is_draft = False
+    manager.max_beam_width = 1
+    manager.num_pools = 1
+    manager.host_kv_cache_block_offsets = torch.zeros((1, 3, 1, 8), dtype=torch.int32)
+    manager.impl = Mock()
+    cache = manager._create_kv_cache(41, None, None)
+    cache._bind_host_source_row.assert_called_once_with(manager.index_mapper.get_index(41))
+    assert manager.index_mapper.get_index(41) == 1
+    assert manager.kv_cache_map[41] is cache

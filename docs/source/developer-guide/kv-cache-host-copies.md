@@ -80,91 +80,93 @@ This protects addresses as well as page contents.
 
 ## Host-source table
 
-The C++ manager owns one optional `HostSourceTable`. It uses mapped pinned
-memory, readable by the GPU, with fixed addresses until manager shutdown.
-Reserve its limits before creating requests or capturing graphs:
+The C++ manager owns one optional `HostSourceTable` in mapped pinned memory.
+Its addresses stay fixed until shutdown. The executor's `initialize_host_sources()`
+takes no capacity settings: it uses the existing `IndexMapper` capacity,
+`max_blocks_per_seq`, and `max_beam_width`. Call it before graph capture.
 
-```python
-manager._reserve_host_source_table(max_requests=32, max_pages=2048, max_beams=1)
-view = manager._host_source_view
-```
-
-`HostSourceView` borrows that storage. Getting a view does not refresh, copy,
-allocate, or protect data. Its arrays are read-only NumPy views; corresponding
-`*_address` properties give CUDA addresses for kernels. Keep the manager alive
-while using them and discard the view after shutdown. `EntryLayout` is a
-separate model object and is not stored in this table.
+Each request uses its existing `IndexMapper` row. The native binding
+`cache._bind_host_source_row(row)` connects that row; it does not allocate another.
+The native initialization API receives the executor's limits (standalone tests
+supply their own limits). No GPU request-ID lookup is needed.
 
 | Array | Shape and meaning |
 | --- | --- |
-| `request_ids`, `generations`, `request_valid` | `[max_requests]`. A live request with an ID gets a row; validity is separate so every uint64 ID is supported. Reusing a row increments its generation, even if the request ID repeats. |
+| `request_ids`, `generations`, `request_valid` | `[max_requests]`. Request ID for diagnostics, row generation, and validity. Generation increases on row reuse or ID change. |
 | `slot_ids`, `host_levels`, `completed_tokens` | `[max_requests, max_beams, num_life_cycles, max_pages]`. Retained host slot, host tier, and completed token prefix. An absent source is `(-1, -1, 0)`. |
-| `pool_metadata` | `[num_levels, num_life_cycles, 4]`. GPU-readable pool base, bytes per slot, pool capacity in bytes, and pool-group index. Non-host tiers contain zeros. The cold-page codec has one host pool per lifecycle. |
+| `pool_metadata` | `[num_levels, num_life_cycles, 4]`. GPU-readable base, slot bytes, pool bytes, and pool-group index. Non-host tiers contain zeros. Each cold page occupies one pool slot. |
 
-`cache._host_source_slot` identifies the row. Anonymous caches have no row.
-Requests cannot exceed the reserved limits or share a live request ID. KVCM
-rejects these cases instead of reallocating the table. Consumers must check
-row validity, request identity/generation, page bounds, and completed coverage.
-Changing `cache.id` updates its table row and generation too; assigning `None`
-removes the row until an ID is assigned again.
+`HostSourceView` borrows these arrays. Getting a view does not allocate, copy,
+refresh, or protect data. Arrays are read-only NumPy views; `*_address` properties
+give CUDA addresses. Keep the manager alive and discard borrowed views after shutdown.
 
-KVCM updates the table on backup, invalidation, offload, commit, prefix reuse,
-suspend/resume, and close. Suspend keeps retained sources. A writable clone of
-a partial reused page starts without a host source. Close clears all source
-entries before a request row can be reused. Shared prefixes remain visible to
-other requests that still hold the page. Releasing the final copy leaves no
-published source.
+`cache._host_source_ref` returns `(row, generation)`. A batch passes these pairs
+in the same order as its existing request metadata. The future kernel checks
+row validity and generation directly. `EntryFormat` remains separate model data.
 
-Backup completion is polled at refresh or the next lifecycle update. Call
-`manager._refresh_host_source_table()` to publish newly completed backups;
-it does not wait for those backups. Pending and invalid copies stay absent.
-Coverage is capped by both request history and the page's written prefix.
-It counts input tokens, not model-specific compressed entries.
+A request can outlive its row: disaggregated prefill may release its index while
+KV transfer continues. `release_index_slot()` unbinds the host-source row first;
+retained host copies stay on the request's pages. Rebinding uses the new row and
+generation. Assigning `cache.id = None` also unbinds; assigning a new ID alone
+does not choose a row. Close clears the row before another request can bind it.
 
-Before GPU work, including each graph replay, acquire a read scope:
+Backup, invalidation, and offload update the affected page and its shared-prefix
+users. Append updates touch only the tail and newly stale pages. Other structural changes,
+such as commit and resume, rebuild only the changed request. Suspend keeps sources; cloning a writable partial prefix does
+not inherit its old source. Pool metadata changes only when pools change.
+Completed coverage is capped by the request history and committed page coverage.
+It counts input tokens, including for compressed model entries.
+
+Read acquisition polls only pending copies in the requested batch. It never
+waits for backup completion and never publishes pending or invalid copies.
+`_introspection.refresh_host_source_table(manager)` is a test helper. The manager's
+production interface has no manual refresh method.
+
+Acquire one batch read scope before each GPU submission or graph replay:
 
 ```python
-read = manager._acquire_host_sources(stream)
+view = manager._host_source_view
+rows = [cache._host_source_ref for cache in batch_caches]
+read = manager._acquire_host_sources(rows, stream)
 try:
-    # Future consumer: SelectedEntries + EntryLayout + view.
-    # Submit all GPU reads (or graph replay) on stream here.
+    # Future ensure_resident consumes selections, model format, codec layout,
+    # this borrowed view, and mutable GPU-cache state.
+    # Submit GPU reads or graph replay on stream here.
     pass
 finally:
     read.close()
 ```
 
-Acquisition refreshes the table and uses `HostPageRead` handles to protect all
-published sources. It also keeps requests alive until the scope closes, so
-dropping a Python request reference cannot change the table during a read.
-Concurrent scopes share the same unchanged table. Close records completion;
-if it releases the last owner of a request, that request's cleanup waits for
-completion. Lifecycle changes and explicit
-refresh are rejected while any scope is open. After close, changing the mapped
-table waits for its readers' GPU completion. Do this at the scheduler boundary,
-outside capture, not once per attention layer. Pending copies may complete
-during a read scope but are published only after that scope ends.
+`HostSourceRead` retains only these requests and uses `HostPageRead` handles for
+their published copies. Unrelated requests can change or close. Shared pages
+retain their normal read protection. Changes to a protected row are rejected
+while its scope is open; after close they wait for the GPU completion event.
+Pool changes and shutdown require all scopes to close. If closing a scope drops
+the last request owner, request cleanup may wait for completion.
 
-The existing per-page reader still works independently and can outlive request
-close. Neither read API implements GPU hit lookup, LRU, refetch, or model wiring.
+Acquire and close outside graph capture, once per batch submission. Overlapping
+scopes for the same row use its unchanged metadata; pending copies are published
+on a later acquisition after those scopes close. A per-page reader can still
+outlive request close. Neither read API performs GPU hit lookup, LRU, or refetch.
 
 ## Host layout and disk restore
 
-The default cold-page codec joins the GPU page's pool slots into one host slot,
-in pool order. For a buffer in GPU pool `p`, its host offset within a page is:
+Model `EntryFormat` is keyed by `BufferId` (layer ID and `DataRole`). It describes
+component tensor shapes, dtypes, entry axes, and tokens per entry. Components can
+include KV and scale tensors. It contains no lifecycle, pool, slot-size, or
+coalesced-buffer offset fields.
 
-```text
-sum(GPU slot sizes for pools before p) + buffer offset within GPU pool p
-```
+Use `manager._host_buffer_layout(BufferId(...))` for physical layout. KVCM validates
+the codec's `ColdBufferLayout` and returns the lifecycle, byte offset and size within
+a cold slot, and number of native model buffers per logical page (`expansion`).
+The view supplies that lifecycle's host pool base, slot size, and pool group.
+The future consumer combines these with the model format to locate entry bytes.
 
-For `EntryLayout`, use the host pool group, one host pool (`pool_index = 0`),
-this offset plus the model's entry offset, and the model's byte stride and size.
-Include scale bytes and coalesced layer offsets. Native compressed models must
-convert completed token coverage to completed stored entries using their own
-layout rules.
-
-A custom cold-page codec defines its own host layout. Its encoded bytes are
-not automatically addressable as selected entries; the adapter must supply a
-matching layout or decode them first.
+The default codec concatenates hot pool slots in pool order. It computes buffer
+offsets once from KVCM's coalesced-buffer descriptors. Models must not repeat that
+calculation. A custom codec can implement `queryBufferLayout()` only if it exposes
+byte-preserving random access to each buffer. Otherwise host-source initialization
+rejects it clearly; its existing whole-page encode/decode API remains available.
 
 If a page is on disk, `backupToHost()` first restores that page through the
 existing codec to GPU, then creates its retained host copy. This needs room for

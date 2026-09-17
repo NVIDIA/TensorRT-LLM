@@ -185,6 +185,7 @@ else:
     GpuCacheTierConfig = _cpp.GpuCacheTierConfig
     ExpandedBuffer = _cpp.ExpandedBuffer
     HostCacheTierConfig = _cpp.HostCacheTierConfig
+    ColdBufferLayout = _cpp.ColdBufferLayout
     HostSourceView = _cpp.HostSourceView
     KVCacheDesc = _cpp.KVCacheDesc
     KVCacheCreatedData = _cpp.KVCacheCreatedData

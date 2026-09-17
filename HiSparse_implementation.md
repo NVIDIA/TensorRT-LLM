@@ -69,18 +69,18 @@ with prefix reuse disabled. Full-history sparse KV must retain old unselected da
 
 **Depends on:** 1 for final review; can run alongside 2.
 
-**Status:** Implemented. `SelectionPolicy` and the DSA adapter keep logical top-K positions
-before GPU page-table conversion. `SelectionContext` carries request/layer/lifecycle IDs and
-per-query valid lengths. Positions keep their order and duplicates.
+**Status:** Implemented. Logical DSA top-K positions keep their order and duplicates.
+`SelectionContext` borrows DSA's existing `req_idx_per_token` and `kv_lens_cuda`, plus explicit
+host-source rows and generations. No separate selection policy or request-ID lookup is needed.
 
-`EntryLayout` describes KV and scale bytes, including compressed entries. It stays separate
-from KVCM's `HostSourceView`, which borrows the host-source table added in step 4. These
-interfaces do not move KV or protect memory. HiSparse takes logical selections directly and
-owns GPU lookup and fetching in step 5. Model wiring follows in 7, 9, and 10.
+`EntryFormat`, keyed by `BufferId`/`DataRole`, describes model tensor shapes, dtypes, entry axes,
+and compression. KVCM owns lifecycle and pool mapping; the codec supplies byte offsets and sizes.
+Opaque codecs are rejected when host sources are enabled. `HostSourceView` borrows KVCM's table.
+These interfaces do not move KV. HiSparse will perform the single GPU hit lookup in step 5.
+Model wiring follows in 7, 9, and 10.
 
-**Validation:** 22 selection/layout and DSA tests passed on CPU using isolated source imports.
-Coverage includes identity, order, masks, invalid metadata, layout bounds, context/decode,
-and IndexShare. GPU lookup, fetching, and graph execution will be validated in step 5.
+**Validation:** 25 selection/format and DSA tests passed on CPU. They cover borrowed metadata,
+order, masks, invalid formats, context/decode, and IndexShare. GPU lookup and fetching remain part of step 5.
 Full package and model inference validation remain pending.
 
 See [the interface guide](docs/source/developer-guide/sparse-attention-development-guide.md#selected-kv-interfaces).
@@ -96,12 +96,12 @@ host copies and write invalidation. Mark host copies valid after backup finishes
 sources until safe reuse. Keep active host addresses fixed: holding a page alone does not prevent
 movement. Restore needed disk data to host before decode.
 
-**Validation:** On GB300, 59 C++ tests passed under CUDA memcheck with zero errors. Eight focused
-Python host-source tests passed. Coverage includes pending/completed copies, partial pages,
-invalidation, offload, shared prefixes, request-slot reuse, ID changes, fixed table addresses,
-metadata reads during CUDA graph replay, cross-stream readers, pool resize, and cleanup. Existing tests also cover
-KV round trips, host exhaustion, rejected copies, and disk restore. Validation uses rebuilt
-C++ components and bindings; full-wheel and model inference checks remain pending.
+**Validation:** 68 native tests passed under CUDA memcheck with zero errors; 12 focused Python
+host-source tests and two executor row tests passed. Coverage includes pending/completed copies, partial pages,
+invalidation, offload, shared prefixes, explicit row reuse, stale generations, fixed addresses,
+graph metadata reads, batch-scoped readers, codec offsets, unsupported codecs, and cleanup.
+Validation uses rebuilt C++ components and bindings. The two executor tests ran with isolated
+source methods and the rebuilt `IndexMapper`; full-package and model inference checks remain pending.
 
 The new methods are `backupToHost`, `invalidateHostCopy`, `offloadToHost`, and
 `acquireHostCopy`. They use the configured host tier's budget and codec. Read handles
@@ -109,15 +109,17 @@ keep addresses alive through GPU use; live copies prevent host pool movement. Of
 reuses the host slot, and later full-page GPU restoration keeps that host copy.
 Disk restore uses one full GPU page before creating a retained host copy.
 
-KVCM also owns a fixed-size, GPU-readable `HostSourceTable`: request IDs and generations,
-retained host slots, completed token coverage, and host-pool metadata. Reserve it before
-creating requests or capturing graphs. `HostSourceView` borrows its addresses without
-allocating or copying; pass the model's `EntryLayout` separately.
+KVCM owns a fixed-size, GPU-readable `HostSourceTable`. The executor derives capacity from its
+existing limits and binds existing `IndexMapper` rows. Early index release clears a row without
+releasing the request's host copies. Generations reject stale references when a row is reused.
+`HostSourceView` borrows addresses without allocating or copying.
 
-Lifecycle changes update the table. Refresh publishes completed backups; pending or stale
-copies remain absent. A table read scope uses `HostPageRead` to protect sources through GPU
-completion. Mapped metadata stays unchanged during a read. These are storage interfaces;
-GPU caching, refetch, LRU, and model wiring remain unimplemented.
+Page changes update affected entries and shared users. Append updates touch the tail and newly
+stale pages; other structural changes rebuild only the affected request. Read acquisition polls
+pending copies and protects published sources for the batch.
+Unrelated requests remain usable. Manual event polling is test-only. `HostSourceRead` and
+`HostPageRead` preserve CUDA-event and lifetime protection. GPU caching, refetch, LRU, and model
+wiring remain unimplemented.
 
 See [host-copy usage and layout](docs/source/developer-guide/kv-cache-host-copies.md).
 
@@ -129,10 +131,10 @@ See [host-copy usage and layout](docs/source/developer-guide/kv-cache-host-copie
 
 **Work:** Use SGLang's [HiSparse kernels][hisparse-kernel] directly behind `ensure_resident()`.
 
-- Accept `SelectedEntries`, `EntryLayout`, `HostSourceView`, and mutable GPU-cache state directly.
+- Accept `SelectedEntries`, model `EntryFormat`, KVCM/codec layouts, `HostSourceView`, and GPU-cache state directly.
 - Integrate `load_cache_to_device_buffer_kernel` for GPU lookup, LRU replacement, host copies,
   and attention indices. Record the upstream revision and preserve its license.
-- Check host readiness, request IDs, capacity, duplicate/padded selections, layouts/scales,
+- Check host readiness, row generations, capacity, duplicate/padded selections, layouts/scales,
   and active readers on GPU. Support short sequences starting from an empty cache.
 - Support newest entries and shared miss plans through `copy_cache_planned_kernel`.
   Keep each layer's KV and read protection separate; release protection after attention.

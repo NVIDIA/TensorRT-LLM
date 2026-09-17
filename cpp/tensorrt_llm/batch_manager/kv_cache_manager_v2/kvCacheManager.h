@@ -126,28 +126,34 @@ public:
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
-    //! Internal opt-in. Reserve fixed metadata storage before creating requests or capturing graphs.
-    //! Requests with an ID get a stable row until close(); anonymous caches are not published.
-    void reserveHostSourceTable(int maxRequests, int maxPages, int maxBeams = 1);
+    //! Internal setup: dimensions come from the executor's IndexMapper and page-table limits.
+    void initializeHostSourceTable(int maxRequests, int maxPages, int maxBeams = 1);
     HostSourceView hostSourceView() const;
-    void refreshHostSourceTable();
-    std::unique_ptr<HostSourceRead> acquireHostSources(CUstream stream);
-    int hostSourceSlot(KvCache const& cache) const;
 
-    //! Internal lifecycle hooks, under the exclusive API lock. Nesting is supported.
-    [[nodiscard]] auto updateHostSources()
+    //! Internal query under the API lock; avoid metadata work when the feature is disabled.
+    bool hasHostSources() const noexcept
+    {
+        return mHostSources != nullptr;
+    }
+
+    void refreshHostSourceTableForTest();
+    std::unique_ptr<HostSourceRead> acquireHostSources(std::vector<HostSourceRow> const& rows, CUstream stream);
+    void bindHostSourceRow(KvCache& cache, int row);
+    int hostSourceSlot(KvCache const& cache) const;
+    HostSourceRow hostSourceRef(KvCache const& cache) const;
+    ColdBufferLayout hostBufferLayout(BufferId const& buffer) const;
+
+    //! Internal lifecycle hooks under the exclusive lock. Null cache means a pool update.
+    [[nodiscard]] auto updateHostSources(KvCache* cache = nullptr, std::optional<BlockOrdinal> ordinal = std::nullopt,
+        std::optional<std::pair<int, int>> range = std::nullopt)
     {
         if (mHostSources)
-        {
-            mHostSources->beginUpdate();
-        }
+            mHostSources->beginUpdate(cache, ordinal, range);
         return FuncGuard(
             [this]()
             {
                 if (mHostSources)
-                {
                     mHostSources->endUpdate();
-                }
             });
     }
 

@@ -15,16 +15,23 @@ if TYPE_CHECKING:
     from .metadata import DSAtrtllmAttentionMetadata
 
 
-class DSASelectionPolicy:
-    """Borrow top-K positions, including IndexShare output, without copying or sorting."""
-
-    def select(
-        self,
-        positions: torch.Tensor,
-        context: SelectionContext,
-        valid_mask: torch.Tensor | None = None,
-    ) -> SelectedEntries:
-        return SelectedEntries(context, positions, valid_mask)
+def make_dsa_selection(
+    positions: torch.Tensor,
+    metadata: DSAtrtllmAttentionMetadata,
+    host_source_rows: torch.Tensor,
+    host_source_generations: torch.Tensor,
+    *,
+    is_generation: bool,
+) -> SelectedEntries:
+    """Borrow DSA's existing batch mapping and lengths; do not build duplicate tensors."""
+    start = metadata.num_ctx_tokens if is_generation else 0
+    context = SelectionContext(
+        metadata.req_idx_per_token[start : start + positions.shape[0]],
+        metadata.kv_lens_cuda[: metadata.num_seqs],
+        host_source_rows,
+        host_source_generations,
+    )
+    return SelectedEntries(context, positions)
 
 
 def select_dsa_topk(

@@ -753,4 +753,18 @@ TEST(KvCacheManagerV2ColdPageTest, RecursiveFallenPageMergeResortsByPriority)
     EXPECT_EQ(lowestPriorityPage->cacheLevel, kHotLevel);
 }
 
+TEST(KvCacheManagerV2ColdPageTest, OpaqueCodecRejectsRandomAccessWithoutDisablingWholePages)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(
+        makeSplitColdGroupingConfig(), nullptr, std::make_unique<SplitColdPageCodec>(false));
+    EXPECT_THROW(manager->hostBufferLayout(BufferId{0, "key"}), LogicError);
+    EXPECT_THROW(manager->initializeHostSourceTable(2, 8), LogicError);
+    // An opaque codec still supports the existing whole-page cache API.
+    auto cache = manager->createKvCache();
+    EXPECT_EQ(cache->status(), KvCache::Status::SUSPENDED);
+    cache->close();
+    manager->shutdown();
+}
+
 } // namespace

@@ -397,3 +397,16 @@ The implementation should cover at least:
 - Layer-group pool-ratio projection across different hot and cold pool-group mappings.
 - Hot-only constraint floors and structural cold-tier minima.
 - Consumptive Python ownership transfer on both successful and failed construction attempts.
+
+## Random access for sparse host sources
+
+Whole-page encode/decode does not imply that a kernel can read one token directly.
+A codec may optionally implement `queryBufferLayout(BufferId, ColdBufferLayout&)`.
+Return true only for byte-preserving access to the original model buffer, giving
+its lifecycle, byte offset, and size within the cold slot. The default returns
+false. The concatenating codec derives this layout from KVCM's buffer descriptors.
+KVCM checks lifecycle, size, and slot bounds and supplies native-buffer expansion.
+
+Enabling `HostSourceTable` rejects codecs without this support. Existing whole-page
+transfers keep working. Model `EntryFormat` describes tensor contents; it does not
+repeat codec offsets or pool geometry. See [retained host sources](kv-cache-host-copies.md).

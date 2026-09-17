@@ -3,7 +3,6 @@
 """Logical sparse selections, before any GPU cache lookup."""
 
 from dataclasses import dataclass
-from typing import Protocol
 
 import torch
 
@@ -20,34 +19,32 @@ def check_tensor(
 
 @dataclass(frozen=True)
 class SelectionContext:
-    """Identity and bounds for a batch of queries, all tensors on the selection device.
+    """Borrow existing batch metadata and explicit host-source row references.
 
-    request_ids: int64 [requests], stable request IDs, not batch slot numbers.
-    request_indices: int32 [queries], maps each query to a request_ids row.
-    valid_lengths: int32 [queries], number of entries this query may read. The model
-        supplies causal bounds and counts only completed compressed entries.
-    layer_id: KVCM layer ID, which can differ from the model layer number.
-    life_cycle_id: KVCM-assigned lifecycle ID, not the residencyGroup setting.
+    req_idx_per_token: int32 [queries], DSA's existing query-to-batch mapping.
+    kv_lens_cuda: int32 [requests], DSA's existing sequence lengths (input tokens).
+    host_source_rows: int32 [requests], existing IndexMapper rows, or -1 for padding.
+    host_source_generations: uint64 [requests], row generations for this batch.
 
-    Update tensor contents before graph replay when requests or lengths change.
-    IDs must distinguish live request lifetimes. Padding uses request index -1.
+    Generation checks reject stale row reuse without GPU request-ID lookup.
+    The selector enforces each query's causal bound. The future cache path also
+    checks sequence length and completed host coverage. All tensors are borrowed;
+    update graph inputs before replay and keep them unchanged through GPU use.
     """
 
-    request_ids: torch.Tensor
-    request_indices: torch.Tensor
-    valid_lengths: torch.Tensor
-    layer_id: int
-    life_cycle_id: int
+    req_idx_per_token: torch.Tensor
+    kv_lens_cuda: torch.Tensor
+    host_source_rows: torch.Tensor
+    host_source_generations: torch.Tensor
 
     def __post_init__(self) -> None:
-        if self.layer_id < 0 or self.life_cycle_id < 0:
-            raise ValueError("Layer and lifecycle IDs must be nonnegative")
-        if self.request_ids.ndim != 1 or self.request_indices.ndim != 1:
-            raise ValueError("Request IDs and query-to-request indices must be vectors")
-        device = self.request_indices.device
-        check_tensor(self.request_ids, (self.request_ids.numel(),), torch.int64, device)
-        check_tensor(self.request_indices, (self.request_indices.numel(),), torch.int32, device)
-        check_tensor(self.valid_lengths, self.request_indices.shape, torch.int32, device)
+        if self.req_idx_per_token.ndim != 1 or self.kv_lens_cuda.ndim != 1:
+            raise ValueError("Query-to-request indices and KV lengths must be vectors")
+        device = self.req_idx_per_token.device
+        check_tensor(self.req_idx_per_token, self.req_idx_per_token.shape, torch.int32, device)
+        check_tensor(self.kv_lens_cuda, self.kv_lens_cuda.shape, torch.int32, device)
+        check_tensor(self.host_source_rows, self.kv_lens_cuda.shape, torch.int32, device)
+        check_tensor(self.host_source_generations, self.kv_lens_cuda.shape, torch.uint64, device)
 
 
 @dataclass(frozen=True)
@@ -70,24 +67,11 @@ class SelectedEntries:
     def __post_init__(self) -> None:
         if (
             self.positions.ndim != 2
-            or self.positions.shape[0] != self.context.request_indices.numel()
+            or self.positions.shape[0] != self.context.req_idx_per_token.numel()
         ):
             raise ValueError("Positions must have one row per query")
         check_tensor(
-            self.positions, self.positions.shape, torch.int32, self.context.request_ids.device
+            self.positions, self.positions.shape, torch.int32, self.context.req_idx_per_token.device
         )
         if self.valid_mask is not None:
             check_tensor(self.valid_mask, self.positions.shape, torch.bool, self.positions.device)
-
-
-class SelectionPolicy(Protocol):
-    """Adapt a model selector's output without resolving physical storage."""
-
-    def select(
-        self,
-        positions: torch.Tensor,
-        context: SelectionContext,
-        valid_mask: torch.Tensor | None = None,
-    ) -> SelectedEntries:
-        """Keep model selection order and use model-provided entry bounds."""
-        ...

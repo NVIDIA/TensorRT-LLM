@@ -145,32 +145,25 @@ pages and performs final commit-state bookkeeping.
 
 ### Host-source table
 
-- `KvCacheManager` optionally owns a fixed-capacity, mapped `HostSourceTable`.
-  Reserve it before requests and graph capture; never resize its arrays.
-  `HostSourceView` borrows these arrays and contains no model `EntryLayout`.
-- Lifecycle mutations use `updateHostSources()` under the exclusive API lock.
-  The nested guard clears old sources before mutation and rebuilds from the
-  actual request pages afterward, including rollback paths. Extend these hooks
-  when adding a new API that changes pages, coverage, request identity, or pools.
-- Publish only completed retained copies, capped by request and page coverage.
-  Refresh polls CUDA events; it does not wait for pending backups. Request rows
-  keep their identity through suspend and increment their generation on reuse.
-- `HostSourceRead` pins published sources using `HostPageRead`. Close it after
-  submitting GPU use, outside graph capture. Table updates reject open scopes
-  and wait for closed scopes' GPU work before writing mapped metadata. A view
-  is not a lifetime guard; each graph replay needs a fresh read scope.
-
-### Page status
-
-- `LOCKED`: required on GPU; neither eviction nor dropping is permitted.
-- `HELD`: eviction is allowed, but dropping is not.
-- `DROPPABLE`: both eviction and dropping are allowed.
-
-The `PageHolder`, `UniqPageLock`, and `SharedPageLock` types implement these
-transitions. CUDA ready/finish events are part of their correctness contract:
-they establish write completion, migration ordering, and safe reuse across
-streams. A stream change for an active cache intentionally synchronizes the
-new stream with the old one.
+- `KvCacheManager` owns optional fixed mapped metadata. The executor derives capacity
+  from existing IndexMapper, page-table, and beam limits. Bind existing IndexMapper
+  rows explicitly; never add a second row allocator or GPU request-ID lookup.
+- Row-and-generation pairs name a batch's sources. Unbind before early index release;
+  retained pages may outlive that row. Generation changes reject stale reuse.
+- `updateHostSources(cache, ordinal)` updates that page and shared users. Structural
+  changes rebuild only the affected request; append uses only the changed range.
+  Pool changes use the global guard.
+  Extend these hooks for new APIs that change request pages or host copies.
+- Read acquisition polls only pending copies in the requested rows and publishes
+  completed coverage. Manual polling is named `refreshHostSourceTableForTest` and
+  must not appear in production callers. Never wait for pending backups to publish.
+- `HostSourceView` borrows storage; `HostSourceRead` protects batch rows with existing
+  `HostPageRead` handles. Open scopes block changes to those rows, not unrelated rows.
+  Closed scopes' CUDA events protect metadata until completion. Pool changes and
+  shutdown require all readers to close. Acquire and close outside graph capture.
+- Physical offsets belong to the codec's `queryBufferLayout`, validated by KVCM.
+  Opaque codecs remain valid for whole-page transfers but cannot enable random-access
+  host sources. Model `EntryFormat` contains no lifecycle or pool placement.
 
 ## Ownership and lifetime
 

@@ -180,15 +180,17 @@ void KvCacheManager::shutdown()
     mStorage->destroy();
 }
 
-void KvCacheManager::reserveHostSourceTable(int maxRequests, int maxPages, int maxBeams)
+void KvCacheManager::initializeHostSourceTable(int maxRequests, int maxPages, int maxBeams)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    _checkNoLivingKvCaches("reserve_host_source_table()");
     if (mHostSources)
     {
         throw LogicError("Host source table is already reserved; its addresses must stay fixed");
     }
+    // Reject opaque codecs only when random-access host sources are requested.
+    for (auto const& buffer : allBufferIds())
+        mStorage->hostBufferLayout(buffer);
     mHostSources = std::make_unique<HostSourceTable>(*mStorage, tokensPerBlock(), maxRequests, maxPages, maxBeams);
 }
 
@@ -198,31 +200,32 @@ HostSourceView KvCacheManager::hostSourceView() const
     auto const apiLock = lockShared();
     if (!mHostSources)
     {
-        throw LogicError("Reserve the host source table first");
+        throw LogicError("Initialize the host source table first");
     }
     return mHostSources->view();
 }
 
-void KvCacheManager::refreshHostSourceTable()
+void KvCacheManager::refreshHostSourceTableForTest()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     if (!mHostSources)
     {
-        throw LogicError("Reserve the host source table first");
+        throw LogicError("Initialize the host source table first");
     }
-    mHostSources->refresh();
+    mHostSources->refreshForTest();
 }
 
-std::unique_ptr<HostSourceRead> KvCacheManager::acquireHostSources(CUstream stream)
+std::unique_ptr<HostSourceRead> KvCacheManager::acquireHostSources(
+    std::vector<HostSourceRow> const& rows, CUstream stream)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     if (!mHostSources)
     {
-        throw LogicError("Reserve the host source table first");
+        throw LogicError("Initialize the host source table first");
     }
-    return mHostSources->acquire(shared_from_this(), stream);
+    return mHostSources->acquire(shared_from_this(), rows, stream);
 }
 
 int KvCacheManager::hostSourceSlot(KvCache const& cache) const
@@ -232,9 +235,32 @@ int KvCacheManager::hostSourceSlot(KvCache const& cache) const
     return mHostSources ? mHostSources->requestSlot(cache) : -1;
 }
 
+void KvCacheManager::bindHostSourceRow(KvCache& cache, int row)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (!mHostSources || &cache.manager() != this)
+        throw LogicError("Initialize this manager's host source table before binding its requests");
+    mHostSources->bindRequest(cache, row);
+}
+
+HostSourceRow KvCacheManager::hostSourceRef(KvCache const& cache) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    return mHostSources ? mHostSources->requestRef(cache) : HostSourceRow{-1, 0};
+}
+
+ColdBufferLayout KvCacheManager::hostBufferLayout(BufferId const& buffer) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    return mStorage->hostBufferLayout(buffer);
+}
+
 void KvCacheManager::checkHostSourceCapacity(KvCache const& cache, int capacity) const
 {
-    if (mHostSources)
+    if (mHostSources && mHostSources->requestSlot(cache) >= 0)
     {
         mHostSources->checkCapacity(cache, capacity);
     }
@@ -244,7 +270,6 @@ void KvCacheManager::clearReusableBlocks()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    auto const sourceUpdate = updateHostSources();
     _checkNoLivingKvCaches("clear_reusable_blocks()");
     TLLM_CHECK_DEBUG(mRadixTree);
     mRadixTree->clear();
@@ -268,7 +293,6 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    auto const sourceUpdate = updateHostSources();
     if (!priorityCb)
     {
         priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };
@@ -910,32 +934,15 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
 void KvCacheManager::registerKvCache(KvCache* kvc)
 {
     auto const apiLock = lockExclusive();
-    auto const sourceUpdate = updateHostSources();
-    if (mHostSources)
-    {
-        mHostSources->addRequest(*kvc);
-    }
-    auto rollback = FuncGuard(
-        [&]()
-        {
-            if (mHostSources)
-            {
-                mHostSources->removeRequest(*kvc);
-            }
-        });
     mLivingKvCaches.insert(kvc);
-    rollback.cancel();
     ++mNumCreatedKvCaches;
 }
 
 void KvCacheManager::unregisterKvCache(KvCache* kvc)
 {
     auto const apiLock = lockExclusive();
-    auto const sourceUpdate = updateHostSources();
     if (mHostSources)
-    {
         mHostSources->removeRequest(*kvc);
-    }
     mLivingKvCaches.erase(kvc);
 }
 

@@ -1,73 +1,57 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Model entry layouts, passed separately from KVCM's borrowed HostSourceView.
+"""Model entry formats; physical placement belongs to KVCM and the cold-page codec."""
 
-KVCM owns host locations, token coverage, and storage protection. EntryLayout
-only describes the model's stored entries, byte offsets, strides, and scales.
-The future ensure_resident() path takes both alongside logical selections.
-"""
+from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferId
 
 
 @dataclass(frozen=True)
 class EntryComponent:
-    """One byte span per entry, such as K, V, residuals, or quantization scales.
+    """A contiguous tensor within one model buffer, such as KV or quantization scales.
 
-    Offsets and strides are bytes, relative to a host pool's page slot. Use more
-    than one component for head-major data or a separate scale region. The model
-    supplies this layout; buffer size alone does not reveal the entry stride.
+    Components appear in storage order. shape and entry_axis describe the model's
+    tensor format (for example NHD or HND), independent of pool placement.
     """
 
     name: str
-    pool_index: int
-    offset: int
-    stride: int
-    size: int
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    entry_axis: int
 
     def __post_init__(self) -> None:
-        if (
-            not self.name
-            or min(self.pool_index, self.offset) < 0
-            or self.size <= 0
-            or self.stride < self.size
-        ):
-            raise ValueError("Components need a name, nonnegative offsets, and stride >= size > 0")
+        if not self.name or not self.shape or min(self.shape) <= 0:
+            raise ValueError("Components need a name and positive tensor dimensions")
+        if not isinstance(self.dtype, torch.dtype) or not 0 <= self.entry_axis < len(self.shape):
+            raise ValueError("Components need a dtype and a valid entry axis")
 
 
 @dataclass(frozen=True)
-class EntryLayout:
-    """One KVCM layer's selected-entry layout within a lifecycle's pool group.
+class EntryFormat:
+    """Model-only format for one BufferId (layer_id, DataRole).
 
-    entries_per_page counts stored entries, not necessarily input tokens. For
-    compression by 4, a 16-token page holds 4 entries; positions are already in
-    compressed-entry units. Scale bytes travel with the entry they describe.
-    Pool sizes are bytes per slot from KVCM's storage layout. Component offsets
-    include KVCM's buffer offset within that slot (including coalesced layers).
+    tokens_per_entry describes model compression; 1 means ordinary token entries.
+    Components describe one native model buffer. KVCM supplies any expansion into
+    several native buffers per logical page, and the codec supplies their location.
+    There are no pool IDs, lifecycle IDs, slot sizes, or coalesced-buffer offsets here.
     """
 
-    layer_id: int
-    life_cycle_id: int
-    pool_group_index: int
-    entries_per_page: int
-    pool_slot_bytes: tuple[int, ...]
+    buffer_id: BufferId
     components: tuple[EntryComponent, ...]
+    tokens_per_entry: int = 1
 
     def __post_init__(self) -> None:
-        if (
-            min(self.layer_id, self.life_cycle_id, self.pool_group_index) < 0
-            or self.entries_per_page <= 0
-        ):
-            raise ValueError("Layout IDs must be nonnegative and entries_per_page positive")
-        if not self.components or not self.pool_slot_bytes or min(self.pool_slot_bytes) <= 0:
-            raise ValueError("Layout needs components and positive pool slot sizes")
-        if len({c.name for c in self.components}) != len(self.components):
-            raise ValueError("Component names must be unique")
-        for c in self.components:
-            if c.pool_index >= len(self.pool_slot_bytes):
-                raise ValueError("Component refers to an unknown pool")
-            if (
-                c.offset + (self.entries_per_page - 1) * c.stride + c.size
-                > self.pool_slot_bytes[c.pool_index]
-            ):
-                raise ValueError("Component extends beyond its pool slot")
+        layer_id, role = self.buffer_id
+        if layer_id < 0 or not role or self.tokens_per_entry <= 0:
+            raise ValueError("Format needs a valid BufferId and positive tokens_per_entry")
+        if not self.components or len({c.name for c in self.components}) != len(self.components):
+            raise ValueError("Format needs components with unique names")
+        if len({c.shape[c.entry_axis] for c in self.components}) != 1:
+            raise ValueError("Components must describe the same number of entries")
