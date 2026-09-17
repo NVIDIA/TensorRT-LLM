@@ -1480,20 +1480,20 @@ def run_varlen(
     selection (streaming main / clustered register-resident) is a pure
     function of the capture-stable launcher key.
     """
-    if logits.dtype is torch.bfloat16:
-        from . import gvr_topk_decode_self_sampling_bf16_host
-
-        return gvr_topk_decode_self_sampling_bf16_host.run_varlen_bf16(
-            logits,
-            kv_lens,
-            indices,
-            next_n=next_n,
-            compress_ratio=compress_ratio,
-            values=values,
-            max_seq_len=max_seq_len,
-            workspace=workspace,
-        )
     if logits.dtype is not torch.float32:
+        if logits.dtype is torch.bfloat16:
+            from . import gvr_topk_decode_self_sampling_bf16_host
+
+            return gvr_topk_decode_self_sampling_bf16_host.run_varlen_bf16(
+                logits,
+                kv_lens,
+                indices,
+                next_n=next_n,
+                compress_ratio=compress_ratio,
+                values=values,
+                max_seq_len=max_seq_len,
+                workspace=workspace,
+            )
         raise RuntimeError(f"logits must be float32 or bfloat16 (got {logits.dtype})")
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
