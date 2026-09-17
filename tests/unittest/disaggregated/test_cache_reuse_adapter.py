@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CacheReuseAdapter, _create_kv_slice SWA trim, and Sender token-start derivation."""
+"""Tests for CacheReuseAdapter, _create_chunk SWA trim, and Sender token-start derivation."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -180,7 +180,7 @@ class TestTrimReceiverWindowHead:
 
 
 # ---------------------------------------------------------------------------
-# _create_kv_slice: the block list spans prompt_len, excluding the extra KV
+# _create_chunk: the block list spans prompt_len, excluding the extra KV
 # slots speculative decoding reserves.
 # ---------------------------------------------------------------------------
 
@@ -195,7 +195,7 @@ def _build_transceiver_for_kv_slice(
     cached_tokens: int = 0,
     is_generation_only: bool = False,
 ):
-    """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
+    """Stub a KvCacheTransceiverV2 so _create_chunk runs without dist setup.
 
     Wires only the attributes the method touches:
       - reuse adapter: tokens_per_block, per-layer-group cached count, block ids
@@ -253,7 +253,7 @@ class TestCreateKvSliceBlockSpan:
         transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
         tpb = transceiver._reuse_adapter.tokens_per_block
 
-        kv_slice = transceiver._create_kv_slice(req)
+        kv_slice = transceiver._create_chunk(req)
 
         assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
 
@@ -268,7 +268,7 @@ class TestCreateKvSliceBlockSpan:
         assert prompt_len % tpb == 0
         assert (prompt_len + num_extra_kv_tokens + tpb - 1) // tpb == prompt_len // tpb + 1
 
-        kv_slice = transceiver._create_kv_slice(req)
+        kv_slice = transceiver._create_chunk(req)
 
         assert kv_slice.block_ids_per_layer_groups[0].size == prompt_len // tpb
 
@@ -279,7 +279,7 @@ class TestCreateKvSliceBlockSpan:
         )
         tpb = transceiver._reuse_adapter.tokens_per_block
 
-        kv_slice = transceiver._create_kv_slice(req)
+        kv_slice = transceiver._create_chunk(req)
 
         assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
 
@@ -291,7 +291,7 @@ class TestCreateKvSliceBlockSpan:
             sliding_window_size=16,
         )
 
-        kv_slice = transceiver._create_kv_slice(req)
+        kv_slice = transceiver._create_chunk(req)
 
         np.testing.assert_array_equal(
             kv_slice.block_ids_per_layer_groups[0],
@@ -315,7 +315,7 @@ class TestCreateKvSliceBlockSpan:
             is_generation_only=True,
         )
 
-        kv_slice = transceiver._create_kv_slice(req)
+        kv_slice = transceiver._create_chunk(req)
 
         np.testing.assert_array_equal(
             kv_slice.block_ids_per_layer_groups[0],
@@ -346,7 +346,7 @@ class TestCreateKvSliceBlockSpan:
             is_generation_only=True,
         )
 
-        kv_slice = transceiver._create_kv_slice(req)
+        kv_slice = transceiver._create_chunk(req)
 
         np.testing.assert_array_equal(
             kv_slice.block_ids_per_layer_groups[0],
@@ -443,12 +443,12 @@ class TestAdapterPerLayerGroup:
 
 
 # ---------------------------------------------------------------------------
-# _create_kv_slice SWA block trim: window-trim + cache-skip via per-layer cached.
+# _create_chunk SWA block trim: window-trim + cache-skip via per-layer cached.
 # ---------------------------------------------------------------------------
 
 
 def _swa_trim(block_ids, prompt_len, tpb, window_size, cached_tokens, is_gen_only=True):
-    """Replicate the SWA branch of KvCacheTransceiverV2._create_kv_slice.
+    """Replicate the SWA branch of KvCacheTransceiverV2._create_chunk.
 
     Inputs:
       block_ids: list possibly containing stale entries (V1 pre-eviction view).
@@ -476,7 +476,7 @@ def _swa_trim(block_ids, prompt_len, tpb, window_size, cached_tokens, is_gen_onl
 
 
 class TestSwaTrim:
-    """Window-trim + cache-skip in _create_kv_slice's SWA path.
+    """Window-trim + cache-skip in _create_chunk's SWA path.
 
     Setup: tpb=8, prompt_len=32 → total_blocks=4; window=16 → stale_end=2.
     """

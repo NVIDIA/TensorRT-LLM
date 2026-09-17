@@ -259,6 +259,21 @@ class NemotronHMOE(nn.Module):
                     override_quant_config = cfg
                     break
 
+        # Last, so it overrides the per-layer entry above: an override is
+        # authoritative over anything __post_init__ wrote, so this stands in
+        # for both quantization passes and exclusion runs second. Otherwise an
+        # excluded layer keeps the per-layer format and loads quantized weights
+        # the checkpoint left in bf16. No trailing dot -- unlike the weight-form
+        # keys above, exclusion matches module names.
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        global_quant_config = model_config.quant_config
+        if (global_quant_config is not None
+                and global_quant_config.is_module_excluded_from_quantization(
+                    f"model.layers.{layer_idx}.mixer.experts")):
+            override_quant_config = QuantConfig(
+                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+
         # Setup MoE experts.
         self.experts = create_moe(
             routing_method=self.gate.routing_method,

@@ -105,6 +105,40 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
+def kv_cache_manager_v2_incompatible_features(
+        max_beam_width: Optional[int]) -> List[str]:
+    """Runtime features a V2 manager cannot serve.
+
+    ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
+    V2 manager to ``KVCacheManager`` when this list is non-empty, and rejects the
+    model families that require V2 outright. ``resolved_kv_cache_manager_is_v2``
+    reads the same list so that callers sizing pools from the manager version
+    cannot disagree with the selection itself.
+
+    A KV connector is deliberately not a trigger: it is served through the pool
+    layout registration path and no longer forces a fallback. It is not taken as
+    a parameter either, so a future caller cannot reintroduce the demotion by
+    passing it.
+    """
+    incompat: List[str] = []
+    if max_beam_width is not None and max_beam_width > 1:
+        incompat.append("max_beam_width > 1")
+    return incompat
+
+
+def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
+                                    max_beam_width: Optional[int]) -> bool:
+    """Whether the executor will actually hold a V2 manager.
+
+    ``use_kv_cache_manager_v2`` is a request, not the outcome: model loading has
+    already resolved ``"auto"``, but a plain model is still demoted to V1 at
+    manager-selection time when its runtime features are V2-incompatible. Sizing
+    a pool from the request would leave V2 geometry on a V1 executor.
+    """
+    return (kv_cache_config.use_kv_cache_manager_v2 is True
+            and not kv_cache_manager_v2_incompatible_features(max_beam_width))
+
+
 def _resolve_disagg_transceiver_route(
     cache_transceiver_config: Optional[CacheTransceiverConfig],
 ) -> tuple[Optional[str], Optional[str]]:
@@ -119,6 +153,13 @@ def _resolve_disagg_transceiver_route(
         # defaults use the global C++ fallback, matching transceiver creation.
         runtime = None
     return backend, runtime
+
+
+def is_disagg_enabled(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> bool:
+    """Whether this executor participates in disaggregated serving."""
+    return (cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None)
 
 
 def get_kv_cache_manager_cls(
@@ -737,6 +778,7 @@ class KvCacheCreator:
             model_engine)
         self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
                                                   KVCacheManagerV2)
+        self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
@@ -791,11 +833,8 @@ class KvCacheCreator:
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             sparse_attn_config = model_config.sparse_attention_config
-            # The KV connector is supported through the pool layout
-            # registration path, so it no longer forces a fallback.
-            incompat: List[str] = []
-            if self._max_beam_width is not None and self._max_beam_width > 1:
-                incompat.append("max_beam_width > 1")
+            incompat = kv_cache_manager_v2_incompatible_features(
+                self._max_beam_width)
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Never silently replace a sparse V2 manager with V1. Some
@@ -928,14 +967,18 @@ class KvCacheCreator:
             effective_draft_config = self._get_effective_draft_config()
             draft_kv_cache_config = self._get_one_model_draft_kv_cache_config(
                 kv_cache_config, self._max_seq_len)
+            # Resolve draft manager class from draft config — may differ
+            # from target (e.g. hybrid target + plain transformer draft).
+            draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+                effective_draft_config,
+                draft_kv_cache_config,
+                is_disagg=self._is_disagg,
+                cache_transceiver_config=self._cache_transceiver_config)
+            draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
+                draft_kv_cache_manager_cls, effective_draft_config,
+                draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
-                # Resolve draft manager class from draft config — may differ
-                # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    is_disagg=self._is_disagg)
                 return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
                                                     effective_draft_config,
                                                     draft_kv_cache_config,
@@ -943,7 +986,7 @@ class KvCacheCreator:
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 return self._per_manager_cache_cost(
-                    self._kv_cache_manager_cls,
+                    draft_kv_cache_manager_cls,
                     effective_draft_config,
                     draft_kv_cache_config,
                     num_layers=self._get_num_draft_layers(),
@@ -1576,6 +1619,7 @@ class KvCacheCreator:
             enable_locality_domains=self._llm_args.enable_locality_domains,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_events_config=None
             if estimating_kv_cache or model_engine.is_draft_model else
             self._llm_args.kv_cache_config.kv_events_config,
@@ -1762,7 +1806,10 @@ class KvCacheCreator:
                 f"draft manager: {draft_kv_config.max_attention_window}")
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+            effective_draft_config,
+            draft_kv_config,
+            is_disagg=self._is_disagg,
+            cache_transceiver_config=self._cache_transceiver_config)
         draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
@@ -1797,6 +1844,7 @@ class KvCacheCreator:
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
             enable_locality_domains=self._llm_args.enable_locality_domains,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
@@ -2178,6 +2226,7 @@ class KvCacheCreator:
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
             CacheType.CROSS,
         )
@@ -2498,6 +2547,7 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
+        disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False) -> KVCacheManager:
@@ -2671,6 +2721,8 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs[
+            "disable_overlap_scheduler"] = disable_overlap_scheduler
         # V2 builds the block-reuse cache key of a multimodal token run from
         # the vocabulary size. Resolve it here rather than per-branch: the
         # manager needs it whenever block reuse can meet multimodal input,
@@ -2850,8 +2902,7 @@ def _create_kv_cache_manager(
 
         # Tree attention: replay assumes linear token sequence.
         if (spec_config is not None
-                and (getattr(spec_config, 'eagle_choices', None) is not None
-                     or getattr(spec_config, 'use_dynamic_tree', False))):
+                and getattr(spec_config, 'use_dynamic_tree', False)):
             logger.info("Replay kernel incompatible with tree attention; "
                         "using legacy MTP path")
             use_replay = False
@@ -2959,8 +3010,7 @@ def _create_kv_cache_manager(
 
         # Tree attention: replay assumes a linear token sequence.
         if (spec_config is not None
-                and (getattr(spec_config, 'eagle_choices', None) is not None
-                     or getattr(spec_config, 'use_dynamic_tree', False))):
+                and getattr(spec_config, 'use_dynamic_tree', False)):
             logger.info("GDN replay kernel incompatible with tree attention; "
                         "using legacy MTP path")
             use_replay = False
@@ -3216,11 +3266,9 @@ def compute_max_num_sequences(mapping: Mapping,
                               enable_overlap_headroom: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    ``enable_overlap_headroom`` is intentionally opt-in. Disaggregated
-    attention-DP needs a second non-PP slot set because the V2 scheduler can
-    backfill seats before the overlap scheduler releases the previous
-    iteration's terminal slots. Pipeline parallelism already sizes the pool
-    by ``pp_size``.
+    ``enable_overlap_headroom`` is intentionally opt-in; see
+    ``should_enable_overlap_headroom``. Pipeline parallelism already sizes the
+    pool by ``pp_size``.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
@@ -3228,6 +3276,26 @@ def compute_max_num_sequences(mapping: Mapping,
         num_micro_batches = (2 if enable_overlap_headroom
                              and not disable_overlap_scheduler else 1)
     return max_batch_size * num_micro_batches
+
+
+def resolve_max_num_sequences(model_engine,
+                              mapping: Mapping,
+                              max_batch_size: int,
+                              llm_args,
+                              max_num_sequences: Optional[int] = None) -> int:
+    """Resolve the seat-pool size, preferring an explicit value, then the
+    engine's published pool, then a fresh ``compute_max_num_sequences``."""
+    if max_num_sequences is not None:
+        return max_num_sequences
+    engine_seats = getattr(model_engine, "max_num_seq_slots", None)
+    if engine_seats is not None:
+        return engine_seats
+    return compute_max_num_sequences(mapping,
+                                     max_batch_size,
+                                     llm_args.disable_overlap_scheduler,
+                                     enable_overlap_headroom=getattr(
+                                         model_engine,
+                                         "_enable_overlap_headroom", False))
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
@@ -3254,15 +3322,57 @@ def should_enable_non_overlap_adp_forward_intent(
             and disable_overlap_scheduler)
 
 
-def should_enable_disagg_adp_overlap_headroom(
-        mapping: Mapping,
-        cache_transceiver_config: Optional[CacheTransceiverConfig],
-        disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to non-PP disaggregated attention-DP."""
-    is_disagg = (cache_transceiver_config is not None
-                 and cache_transceiver_config.backend is not None)
-    return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
+def should_enable_overlap_headroom(mapping: Mapping,
+                                   disable_overlap_scheduler: bool,
+                                   kv_cache_manager_is_v2: bool,
+                                   is_hybrid: bool = False,
+                                   has_mrope_delta_cache: bool = False) -> bool:
+    """Gate the extra micro-batch of sequence slots.
+
+    True only where a retiring request and the replacement that took its place
+    can own a seat at the same time: attention DP, non-PP, overlap-on, V2 and
+    non-hybrid.
+
+    Widening the pool is only safe when every ``py_seq_slot``-indexed pool is
+    sized from ``compute_max_num_sequences``. Two model families size one from
+    something else instead, so they keep the single-micro-batch pool:
+
+    * ``is_hybrid``: ``MambaCacheManager`` re-derives its own capacity as
+      ``max_batch_size * pp_size``, which a doubled non-PP pool would exhaust.
+    * ``has_mrope_delta_cache``: Qwen2/2.5-VL and Qwen3-VL hold
+      ``max_num_tokens * pp_size + 1`` MRoPE deltas while indexing them by
+      ``py_seq_slot``, relying on ``max_batch_size <= max_num_tokens`` to stay in
+      bounds. The top entry is the reserved dummy slot, so a doubled pool first
+      aliases the dummy -- silently giving padded requests a real request's
+      delta -- and then indexes past the end.
+    """
+    if is_hybrid or has_mrope_delta_cache or not kv_cache_manager_is_v2:
+        return False
+    return (mapping.enable_attention_dp and not mapping.has_pp()
             and not disable_overlap_scheduler)
+
+
+def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
+                                            kv_cache_manager) -> None:
+    """Fail at startup if the KV index pool cannot cover the seat pool.
+
+    The check is one-sided on purpose: an index pool narrower than the seat pool
+    silently defers admitted requests, while a wider one is legitimate. Managers
+    that do not publish an integer ``max_admissible_sequences`` are skipped.
+    """
+    admissible = getattr(kv_cache_manager, "max_admissible_sequences", None)
+    if not isinstance(admissible, int):
+        return
+    if admissible >= max_num_sequences:
+        return
+    raise ValueError(
+        f"{type(kv_cache_manager).__name__} can lease KV cache indices for "
+        f"{admissible} concurrent sequences but the executor's sequence-slot "
+        f"pool holds {max_num_sequences}: the index pool is smaller than the "
+        "seat pool, so admitted requests would be silently deferred one at a "
+        "time (nvbug 6627795). The seat pool must come from "
+        "_util.compute_max_num_sequences and the index pool must cover it; a "
+        "shortfall means one of them was re-derived from max_batch_size.")
 
 
 def create_py_executor_instance(
@@ -3300,15 +3410,18 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
-    if max_num_sequences is None:
-        max_num_sequences = compute_max_num_sequences(
-            mapping, max_batch_size, llm_args.disable_overlap_scheduler)
+    is_disagg = is_disagg_enabled(cache_transceiver_config)
+
+    max_num_sequences = resolve_max_num_sequences(
+        model_engine,
+        mapping,
+        max_batch_size,
+        llm_args,
+        max_num_sequences=max_num_sequences)
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
-    is_disagg = (cache_transceiver_config is not None
-                 and cache_transceiver_config.backend is not None)
     for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
@@ -3466,6 +3579,7 @@ def create_py_executor_instance(
         if isinstance(model_engine, PyTorchModelEngine):
             model_engine._init_cuda_graph_lora_manager(lora_config)
 
+    validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
@@ -3685,22 +3799,17 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(
-    mapping: Mapping,
     *,
     max_seq_len: int,
-    max_batch_size: int,
     speculative_config: SpeculativeConfig,
     max_beam_width: int,
     disable_overlap_scheduler: bool,
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
-    max_num_sequences: Optional[int] = None,
+    max_num_sequences: int,
 ):
     # The sampler's per-slot state is indexed by sequence slots, so it must
     # be sized identically to the executor's slot pool.
-    if max_num_sequences is None:
-        max_num_sequences = compute_max_num_sequences(
-            mapping, max_batch_size, disable_overlap_scheduler)
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
@@ -3732,10 +3841,15 @@ def instantiate_sampler(
     enable_async_worker = (confidential_compute_enabled()
                            or llm_args.sampler_force_async_worker)
 
-    sampler_args = create_torch_sampler_args(
+    max_num_sequences = resolve_max_num_sequences(
+        engine,
         mapping,
+        max_batch_size,
+        llm_args,
+        max_num_sequences=max_num_sequences)
+
+    sampler_args = create_torch_sampler_args(
         max_seq_len=engine.max_seq_len,
-        max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,

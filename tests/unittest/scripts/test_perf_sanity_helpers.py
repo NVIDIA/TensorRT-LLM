@@ -850,14 +850,15 @@ def test_sentinel_timeout_falls_back_to_current_gen_logs(
         "wait_for_gen_log_sentinels",
         lambda self: False,
     )
-    parse_calls: list[tuple[str, int, list[int]]] = []
+    parse_calls: list[tuple[str, int, list[int], object]] = []
 
     def parse_device_step_time(
         output_dir: str,
         num_gen_servers: int,
         start_offsets: list[int],
+        end_offsets: list[int] | None = None,
     ) -> perf_sanity._DeviceStepTimeStats:
-        parse_calls.append((output_dir, num_gen_servers, start_offsets))
+        parse_calls.append((output_dir, num_gen_servers, start_offsets, end_offsets))
         return perf_sanity._DeviceStepTimeStats(mean=7.25, median=7.2, std=0.115, p75=7.3, p99=7.42)
 
     monkeypatch.setattr(
@@ -868,7 +869,7 @@ def test_sentinel_timeout_falls_back_to_current_gen_logs(
 
     commands._append_gen_worker_device_step_time(pending, outputs)
 
-    assert parse_calls == [(str(tmp_path), 2, [10, 20])]
+    assert parse_calls == [(str(tmp_path), 2, [10, 20], None)]
     expected = (
         "Average Per Iter Device Step Time (ms): 7.25\n"
         "Median Per Iter Device Step Time (ms): 7.2000\n"
@@ -1306,7 +1307,7 @@ def test_every_written_line_parses_and_none_shadows_another(
 
     metrics: dict[str, float] = {}
     for line in outputs[0].split("\n"):
-        for name, regex in perf_sanity.GEN_ONLY_PERF_METRIC_LOG_QUERIES.items():
+        for name, regex in perf_sanity.DEVICE_STEP_TIME_LOG_QUERIES.items():
             if name in metrics:
                 continue
             match = regex.search(line)
@@ -1314,37 +1315,44 @@ def test_every_written_line_parses_and_none_shadows_another(
                 metrics[name] = float(match.group(1))
                 break
 
-    assert set(metrics) == set(perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS)
+    assert set(metrics) == set(perf_sanity.DEVICE_STEP_TIME_METRICS)
     assert metrics["mean_gen_worker_per_iter_device_step_time"] == pytest.approx(7.17, abs=0.01)
     assert metrics["std_gen_worker_per_iter_device_step_time"] > 0.0
 
 
 def test_every_device_step_time_metric_is_a_minimize_metric() -> None:
     """A metric absent from both lists raises ValueError in check_regression."""
-    for name in perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS:
+    for name in perf_sanity.DEVICE_STEP_TIME_METRICS:
         assert f"d_{name}" in perf_sanity.MINIMIZE_METRICS
 
 
-def test_add_perf_metric_value_skips_absent_statistics() -> None:
-    """TypeCheckForOpenSearchDB rejects both None and int for a d_ key."""
+@pytest.mark.parametrize("benchmark_mode", perf_sanity.DEVICE_STEP_TIME_MODES)
+def test_add_perf_metric_value_skips_absent_statistics(benchmark_mode: str) -> None:
+    """TypeCheckForOpenSearchDB rejects both None and int for a d_ key.
+
+    Parametrized over every mode in DEVICE_STEP_TIME_MODES -- not just
+    gen_only -- so this pins the positive side of the widening: if the tuple
+    is ever narrowed back to ("gen_only",), this test starts failing for the
+    dropped mode instead of staying silently green.
+    """
     metrics = dict.fromkeys(perf_sanity.PERF_METRIC_LOG_QUERIES, 1.0)
     metrics["mean_gen_worker_per_iter_device_step_time"] = 7
 
     new_data: dict = {}
-    perf_sanity.add_perf_metric_value(new_data, metrics, False, "gen_only")
+    perf_sanity.add_perf_metric_value(new_data, metrics, False, benchmark_mode)
 
     assert new_data["d_mean_gen_worker_per_iter_device_step_time"] == 7.0
     assert isinstance(new_data["d_mean_gen_worker_per_iter_device_step_time"], float)
     assert "d_p99_gen_worker_per_iter_device_step_time" not in new_data
 
 
-def test_add_perf_metric_value_omits_the_family_outside_gen_only() -> None:
-    """e2e and ctx_only never emit these lines, so they must not be uploaded."""
+def test_add_perf_metric_value_omits_the_family_outside_device_step_time_modes() -> None:
+    """ctx_only isn't in DEVICE_STEP_TIME_MODES, so it must not be uploaded."""
     metrics = dict.fromkeys(perf_sanity.PERF_METRIC_LOG_QUERIES, 1.0)
     metrics["mean_gen_worker_per_iter_device_step_time"] = 7.0
 
     new_data: dict = {}
-    perf_sanity.add_perf_metric_value(new_data, metrics, False, "e2e")
+    perf_sanity.add_perf_metric_value(new_data, metrics, False, "ctx_only")
 
     assert not [key for key in new_data if "gen_worker_per_iter" in key]
 
@@ -1362,5 +1370,5 @@ def test_every_gated_metric_is_checkable() -> None:
 
 def test_every_gated_metric_is_actually_emitted() -> None:
     """A gated metric the log never carries is skipped by 'not in new_data'."""
-    emitted = {f"d_{name}" for name in perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS}
+    emitted = {f"d_{name}" for name in perf_sanity.DEVICE_STEP_TIME_METRICS}
     assert set(perf_sanity.GEN_ONLY_REGRESSION_METRICS) <= emitted
