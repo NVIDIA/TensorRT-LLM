@@ -159,7 +159,6 @@ full:DGX_H100/kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareSche
 full:DGX_H100/kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[python-scheduler] SKIP (KVCM V2 prefix scheduling timeout; pending https://github.com/NVIDIA/TensorRT-LLM/pull/19202)
 full:DGX_H100/kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke SKIP (KVCM V2 prefix scheduling timeout; pending https://github.com/NVIDIA/TensorRT-LLM/pull/19202)
 full:DGX_H100/unittest/_torch/multi_gpu/test_linear.py::test_row_linear[2-unbalanced] SKIP (https://nvbugs/6793964)
-full:DGX_H100/unittest/_torch/speculative/hw_agnostic/test_draft_len_schedule.py::test_correctness_across_batch_sizes[model_drafter-schedule1] SKIP (KVCM V2 dynamic draft warmup shape mismatch; pending https://github.com/NVIDIA/TensorRT-LLM/pull/19204)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap SKIP (https://nvbugs/6276923)
