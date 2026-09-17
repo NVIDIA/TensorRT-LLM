@@ -5,9 +5,9 @@
 # cc171fbad0266e8eaabb031f4d3858557a23d7e8:
 # python/sglang/kernels/ops/diffusion/norm/wan_rmsnorm_silu_triton.py
 # Kernel arithmetic and launch configuration are unchanged. The surrounding
-# registration and decoder-only opt-in dispatch are adapted for TensorRT-LLM.
+# registration and decoder-only automatic dispatch are adapted for TensorRT-LLM.
 
-"""Experimental BF16 Wan decoder RMSNorm + SiLU for dense channels-last input."""
+"""BF16 Wan decoder RMSNorm + SiLU for eligible SM100 channels-last input."""
 
 from __future__ import annotations
 

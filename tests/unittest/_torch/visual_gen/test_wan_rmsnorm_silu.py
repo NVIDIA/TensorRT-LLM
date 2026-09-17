@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dispatch/lifecycle and numerical tests for the opt-in BF16 Wan decoder path."""
+"""Dispatch/lifecycle and numerical tests for automatic BF16 Wan decoder selection."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -39,23 +39,6 @@ def _metadata_input(norm: wan_vae.WanRMSNorm) -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "1", " 1 "])
-def test_experimental_override(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
-    key = vae_loader.TLLM_WAN_VAE_FUSED_RMSNORM_SILU
-    if value is None:
-        monkeypatch.delenv(key, raising=False)
-    else:
-        monkeypatch.setenv(key, value)
-    assert vae_loader._use_fused_rmsnorm_silu() is (value is not None and value.strip() == "1")
-
-
-@pytest.mark.parametrize("value", ["yes", "2", "-1", "true"])
-def test_invalid_override(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv(vae_loader.TLLM_WAN_VAE_FUSED_RMSNORM_SILU, value)
-    with pytest.raises(ValueError, match="must be 0 or 1"):
-        vae_loader._use_fused_rmsnorm_silu()
-
-
 def test_dispatch_metadata_and_singleton_strides() -> None:
     norm = _prepared_norm()
     x = _metadata_input(norm)
@@ -63,6 +46,7 @@ def test_dispatch_metadata_and_singleton_strides() -> None:
         torch.no_grad(),
         mock.patch.object(torch.cuda, "current_device", return_value=x.device.index),
         mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
     ):
         assert wan_vae._can_fuse_wan_norm_silu(norm, x, F.silu)
         x.stride = lambda: (999, 1, 777, 768, 256)
@@ -80,6 +64,8 @@ def test_dispatch_metadata_and_singleton_strides() -> None:
         "compiling",
         "capturing",
         "other_device",
+        "sm90",
+        "sm103",
         "requires_grad",
         "cpu",
         "fp32",
@@ -160,6 +146,11 @@ def test_unsupported_dispatch_uses_native(case: str) -> None:
                 "current_device",
                 return_value=-1 if case == "other_device" else x.device.index,
             ),
+            mock.patch.object(
+                torch.cuda,
+                "get_device_capability",
+                return_value={"sm90": (9, 0), "sm103": (10, 3)}.get(case, (10, 0)),
+            ),
         ):
             assert not wan_vae._can_fuse_wan_norm_silu(norm, x, activation)
     finally:
@@ -206,8 +197,11 @@ def test_decoder_buffers_are_nonpersistent_and_reused() -> None:
     state_keys = set(vae.state_dict())
     # Exercise allocation/registration with real CPU tensors, standing in for
     # final CUDA placement. This does not claim actual CUDA lifecycle coverage.
-    with mock.patch.object(
-        torch.Tensor, "is_cuda", new_callable=mock.PropertyMock, return_value=True
+    with (
+        mock.patch.object(
+            torch.Tensor, "is_cuda", new_callable=mock.PropertyMock, return_value=True
+        ),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
     ):
         wan_vae._prepare_wan_decoder_norm_silu(vae)
         selected = (vae.decoder.block.norm1, vae.decoder.block.norm2, vae.decoder.norm_out)
@@ -242,6 +236,8 @@ def test_unprepared_cpu_model_does_not_allocate_buffers() -> None:
 def test_cuda_matches_native_error_bound(channels: int, frames: int, case: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the BF16 fused kernel")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("Automatic fused selection is limited to SM100")
     norm = wan_vae.WanRMSNorm(channels, images=False).to(device="cuda", dtype=torch.bfloat16).eval()
     norm._silu_zero_bias = torch.zeros(channels, device="cuda", dtype=torch.bfloat16)
     torch.manual_seed(42)
@@ -288,11 +284,7 @@ def test_cuda_matches_native_error_bound(channels: int, frames: int, case: str) 
 
 
 @pytest.mark.parametrize("route", ["ordinary", "dynamic_fp4", "packed_fp4", "packed_dequant"])
-@pytest.mark.parametrize("enabled", ["0", "1"])
-def test_loader_prepares_only_ordinary_bf16(
-    monkeypatch: pytest.MonkeyPatch, route: str, enabled: str
-) -> None:
-    monkeypatch.setenv(vae_loader.TLLM_WAN_VAE_FUSED_RMSNORM_SILU, enabled)
+def test_loader_prepares_only_ordinary_bf16(route: str) -> None:
     checkpoint_is_fp4 = route in ("packed_fp4", "packed_dequant")
     algo = vae_loader.QuantAlgo.NVFP4 if route in ("dynamic_fp4", "packed_fp4") else None
     quant = SimpleNamespace(quant_algo=algo)
@@ -313,7 +305,24 @@ def test_loader_prepares_only_ordinary_bf16(
             vae_loader.load_wan_vae("unused-checkpoint", torch.device("cpu"), quant_config=quant)
             is loaded
         )
-    if route == "ordinary" and enabled == "1":
+    if route == "ordinary":
         prepare.assert_called_once_with(loaded)
     else:
         prepare.assert_not_called()
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 3)])
+def test_other_architectures_do_not_prepare(capability: tuple[int, int]) -> None:
+    vae = _vae_ownership_fixture()
+    with (
+        mock.patch.object(
+            torch.Tensor, "is_cuda", new_callable=mock.PropertyMock, return_value=True
+        ),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
+    ):
+        wan_vae._prepare_wan_decoder_norm_silu(vae)
+    assert all(
+        norm._silu_zero_bias is None
+        for norm in vae.modules()
+        if isinstance(norm, wan_vae.WanRMSNorm)
+    )

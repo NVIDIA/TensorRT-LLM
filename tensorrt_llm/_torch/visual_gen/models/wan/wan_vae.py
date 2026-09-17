@@ -1122,6 +1122,7 @@ def _can_fuse_wan_norm_silu(
         or not x.is_cuda
         or x.device.index != torch.cuda.current_device()
         or torch.cuda.is_current_stream_capturing()
+        or torch.cuda.get_device_capability(x.device) != (10, 0)
         or x.dtype != torch.bfloat16
         or x.ndim != 5
         or any(size <= 0 for size in x.shape)
@@ -1922,7 +1923,7 @@ class WanVAE(nn.Module):
 def _prepare_wan_decoder_norm_silu(vae: WanVAE) -> None:
     """Prepare decoder-only buffers after loading and final device/dtype placement.
 
-    This experimental path leaves encoder/attention norms and checkpoint keys
+    This SM100 path leaves encoder/attention norms and checkpoint keys
     unchanged. Buffers follow subsequent module device/dtype moves. Unsupported
     dtypes/devices use native operations; no allocation occurs during forward.
     """
@@ -1938,6 +1939,7 @@ def _prepare_wan_decoder_norm_silu(vae: WanVAE) -> None:
             and not norm.training
             and norm.gamma.is_cuda
             and norm.gamma.dtype == torch.bfloat16
+            and torch.cuda.get_device_capability(norm.gamma.device) == (10, 0)
             and norm.gamma.numel() in (256, 512, 1024)
             and norm._silu_zero_bias is None
         ):
