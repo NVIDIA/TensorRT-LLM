@@ -49,7 +49,7 @@ def _receiving(h: CoordinatorHarness, rid: int, started_at: float) -> TransferRe
     return req
 
 
-# -- CS-1 collectives under rank skew ----------------------------------------
+# -- Collectives under rank skew ---------------------------------------------
 
 
 def test_timeout_drain_exchanges_a_flag_and_each_rank_fails_its_own_requests() -> None:
