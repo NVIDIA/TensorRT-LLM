@@ -59,7 +59,7 @@ llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 print(llm.startup_metrics)
 ```
 
-A typical result has the following structure:
+A typical result has the following structure (values are illustrative):
 
 ```json
 {
@@ -163,8 +163,10 @@ stages.
 | `kv_cache_cleanup_seconds` | Check and clear invalid KV cache values produced during warmup. |
 | `total_warmup_seconds` | Complete model-engine warmup, including KV cache cleanup. |
 
-The `model_loader` property contains timings for loading the main LLM weights. If a draft model is used,
-additional fields `draft_checkpoint_preparation_seconds` and `draft_weight_population_seconds` will appear.
+The `model_loader` property contains timings for loading the main LLM weights, including
+`checkpoint_finalization_seconds` for checkpoint-session synchronization and cleanup after weight population.
+If a draft model is used, additional fields `draft_checkpoint_preparation_seconds`,
+`draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds` will appear.
 A `draft_model_loader` property can also appear in the deprecated two-model MTP setting.
 The `py_executor.model_engine_creation_seconds` timing includes the total `model_loader` timing.
 
@@ -172,7 +174,7 @@ The `py_executor.model_engine_creation_seconds` timing includes the total `model
 |--------|-------------|
 | `checkpoint_preparation_seconds` | Time spent warming up, parsing and preparing checkpoint tensors for the model. Some checkpoint formats can populate model storage directly during this phase. |
 | `weight_population_seconds` | Time spent copying prepared checkpoint tensors into model parameters on GPUs. This metric can be absent for formats that populate weights directly during the above checkpoint preparation phase. |
-| `checkpoint_finalization_seconds` | Time spent finalizing the checkpoint session after weight population. This includes loader-specific synchronization and cleanup; rank-striped read-ahead includes waiting for peer ranks and stopping background readers. |
+| `checkpoint_finalization_seconds` | Time spent finalizing the checkpoint session after weight population. This includes loader-specific synchronization and cleanup. |
 | `draft_checkpoint_preparation_seconds` | Checkpoint preparation time for draft weights loaded as part of the model loader. |
 | `draft_weight_population_seconds` | Weight population time for draft weights loaded as part of the model loader. |
 | `draft_checkpoint_finalization_seconds` | Checkpoint finalization time for draft weights loaded as part of the model loader. |

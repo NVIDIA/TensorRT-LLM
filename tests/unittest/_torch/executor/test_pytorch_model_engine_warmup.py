@@ -1354,5 +1354,6 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method.use_native_autotuner)
         self.assertFalse(method.needs_native_autotune)
 
+
 if __name__ == "__main__":
     unittest.main()
