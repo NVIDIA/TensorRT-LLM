@@ -3007,6 +3007,75 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         )
 
+    def _get_slot_role_view(
+        self,
+        layer_idx: int,
+        roles: tuple[DataRole, ...],
+        *,
+        dtype: torch.dtype,
+        page_shape: list[int],
+    ) -> torch.Tensor:
+        """View adjacent equal-sized roles as [slots, roles, *page_shape].
+
+        Unlike a packed page view, this retains the physical lifecycle-slot
+        stride when other layers or roles share the same pool. The caller
+        supplies the registered role shape and dtype; expanded page mappings
+        cannot be represented by this view.
+        """
+        if not roles:
+            raise ValueError("A slot view requires at least one role")
+        layer_offset = self.layer_offsets[layer_idx]
+        first_role = roles[0]
+        address = self.impl.get_mem_pool_base_address(
+            layer_offset, first_role, PageIndexMode.SHARED
+        )
+        page_stride = self.impl.get_page_stride(layer_offset, first_role)
+        expected_stride = math.prod(page_shape) * dtype.itemsize
+        if page_stride != expected_stride:
+            raise RuntimeError(
+                f"Slot-view page stride mismatch: expected {expected_stride}, got {page_stride}"
+            )
+        for offset, role in enumerate(roles[1:], start=1):
+            role_address = self.impl.get_mem_pool_base_address(
+                layer_offset, role, PageIndexMode.SHARED
+            )
+            if (
+                role_address != address + offset * page_stride
+                or self.impl.get_page_stride(layer_offset, role) != page_stride
+            ):
+                raise RuntimeError(f"Slot-view roles are not adjacent equal-sized pages: {roles}")
+
+        converter = self.impl.get_page_index_converter(layer_offset, first_role)
+        scale = int(converter.scale)
+        if scale < len(roles):
+            raise RuntimeError(
+                f"Invalid slot-view page-index scale: {scale} for {len(roles)} roles"
+            )
+        if int(converter.expansion) != 1:
+            raise RuntimeError("Slot views do not support expanded page indices")
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, first_role)
+        num_pages_with_offset = page_upper + int(converter.layer_offset)
+        if num_pages_with_offset % scale != 0:
+            raise RuntimeError("Slot-view page mapping is inconsistent")
+        view = convert_to_torch_tensor(
+            TensorWrapper(address, dtype, [num_pages_with_offset // scale, scale, *page_shape])
+        )
+        return view[:, : len(roles)]
+
+    def _get_attention_slot_mapping(self, layer_idx: int) -> tuple[int, int]:
+        """Return an attention layer's block-table pool and unexpanded slot scale."""
+        local_idx = self.layer_offsets[layer_idx]
+        pool_id = self.layer_to_pool_mapping_dict[local_idx]
+        if pool_id >= self.num_attention_op_pools:
+            raise RuntimeError(f"KV pool {pool_id} is not represented in the attention block table")
+        converter = self.impl.get_page_index_converter(local_idx, Role.KEY)
+        scale = int(converter.scale)
+        if scale <= 0:
+            raise RuntimeError(f"Invalid attention page-index scale: {scale}")
+        if int(converter.expansion) != 1:
+            raise RuntimeError("Attention slot mapping does not support expanded page indices")
+        return pool_id, scale
+
     def get_index_k_buffer(
         self,
         layer_idx: int,

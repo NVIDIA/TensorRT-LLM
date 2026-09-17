@@ -21,9 +21,9 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+from tensorrt_llm._utils import (confidential_compute_enabled, is_sm_100f,
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -51,9 +51,7 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
-from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
-                           extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
@@ -67,6 +65,7 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
+from .kv_cache.mamba_cache_manager.legacy import warn_legacy_mamba_cache_manager
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -119,6 +118,13 @@ def _resolve_disagg_transceiver_route(
         # defaults use the global C++ fallback, matching transceiver creation.
         runtime = None
     return backend, runtime
+
+
+def _select_legacy_mamba_manager(manager_cls):
+    implementation = ("python" if issubclass(
+        manager_cls, MixedMambaHybridCacheManager) else "cpp")
+    warn_legacy_mamba_cache_manager(implementation, manager_cls.__name__)
+    return manager_cls
 
 
 def get_kv_cache_manager_cls(
@@ -193,10 +199,10 @@ def get_kv_cache_manager_cls(
                 logger.info(
                     "Using CppMambaHybridCacheManager for Kimi K3 hybrid "
                     "model (block reuse enabled)")
-                return CppMambaHybridCacheManager
+                return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
             logger.info(
                 "Using MixedMambaHybridCacheManager for Kimi K3 hybrid model")
-            return MixedMambaHybridCacheManager
+            return _select_legacy_mamba_manager(MixedMambaHybridCacheManager)
 
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
@@ -232,12 +238,14 @@ def get_kv_cache_manager_cls(
                         "and transceiver_runtime='PYTHON' requires "
                         "use_kv_cache_manager_v2=True.")
                 if kv_cache_config.enable_block_reuse:
-                    return CppMambaHybridCacheManager
+                    return _select_legacy_mamba_manager(
+                        CppMambaHybridCacheManager)
                 if runtime == "PYTHON" and backend == "NIXL":
                     logger.info("Python transceiver detected; using "
                                 "MixedMambaHybridCacheManager for hybrid model")
-                    return MixedMambaHybridCacheManager
-                return CppMambaHybridCacheManager
+                    return _select_legacy_mamba_manager(
+                        MixedMambaHybridCacheManager)
+                return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
 
         if use_py_mamba_cache_manager() and not is_disagg:
             if use_v2:
@@ -252,7 +260,7 @@ def get_kv_cache_manager_cls(
                     "TRTLLM_USE_PY_MAMBA to use the configured cache manager.")
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
+            return _select_legacy_mamba_manager(MixedMambaHybridCacheManager)
         env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
         if env_override is not None:
             env_override = env_override.upper()
@@ -272,7 +280,8 @@ def get_kv_cache_manager_cls(
                     "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED "
                     "overrides the default Mamba cache manager to "
                     "MixedMambaHybridCacheManager.")
-                return MixedMambaHybridCacheManager
+                return _select_legacy_mamba_manager(
+                    MixedMambaHybridCacheManager)
             if env_override == 'CPP':
                 if use_v2:
                     raise ValueError(
@@ -282,14 +291,14 @@ def get_kv_cache_manager_cls(
                     "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP "
                     "overrides the default Mamba cache manager to "
                     "CppMambaHybridCacheManager.")
-                return CppMambaHybridCacheManager
+                return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
             logger.warning(
                 f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
                 "Expected 'CPP' or 'MIXED'. Using the configured "
                 "KV cache manager default.")
 
         if not use_v2:
-            return CppMambaHybridCacheManager
+            return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
 
         if (kv_cache_config.enable_block_reuse
                 and kv_cache_config.enable_kv_pool_rebalance):
@@ -300,7 +309,19 @@ def get_kv_cache_manager_cls(
         if sparse_attn_algorithm == "qsa":
             return get_sparse_attn_kv_cache_manager(
                 sparse_attn_config, use_kv_cache_manager_v2=True)
-        return MambaHybridCacheManagerV2
+        if is_kimi_linear(config):
+            from ..modules.kimi_kda.cache_manager import \
+                KimiK3HybridCacheManagerV2
+            return KimiK3HybridCacheManagerV2
+        if is_qwen4_exp(config):
+            from ..modules.qwen4_exp.cache_manager import \
+                Qwen4ExpHybridCacheManagerV2
+            return Qwen4ExpHybridCacheManagerV2
+        if is_qwen3_hybrid(config):
+            from ..modules.fla.cache_manager import Qwen35HybridCacheManagerV2
+            return Qwen35HybridCacheManagerV2
+        from ..modules.mamba.cache_manager import NemotronHybridCacheManagerV2
+        return NemotronHybridCacheManagerV2
     elif sparse_attn_config is not None:
         if sparse_attn_algorithm == "qsa":
             # The QSA manager extends the hybrid manager because it must retain
@@ -2446,29 +2467,6 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
-def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
-                                    is_draft: bool):
-    """Align target-only PLE state with a target/draft cache layout."""
-    if is_draft:
-        return None
-
-    params = extract_qwen4_exp_ple_cache_params(config)
-    num_target_layers = len(params.ple_layer_mask)
-    if num_target_layers > total_layers:
-        raise ValueError(
-            "PLE layer mask cannot exceed the hybrid cache layout: "
-            f"got {num_target_layers}, expected at most {total_layers}")
-    if num_target_layers == total_layers:
-        return params
-
-    # Unified one-model caches append attention-only MTP layers.
-    return dataclasses.replace(
-        params,
-        ple_layer_mask=params.ple_layer_mask + [False] *
-        (total_layers - num_target_layers),
-    )
-
-
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2720,22 +2718,15 @@ def _create_kv_cache_manager(
         # manager's own internal gate (`tp_size = 1 if enable_attention_dp
         # else tp_size`, then num_heads / n_groups / conv_dim divide by
         # it), so the params pass through unscaled.
-        # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
-        # kernel can run here, allocate the per-slot replay caches instead
-        # of the legacy per-step intermediate verification buffers. The
-        # kernel replays accepted drafts from these caches and commits
-        # states in place, replacing the intermediate-buffer + promotion
-        # flow for KDA layers.
+        from ..modules.kimi_kda.cache_manager import select_kda_replay_state
+
         kimi_extra_kwargs = {}
-        kda_replay_manager_types = (MixedMambaHybridCacheManager,
-                                    MambaHybridCacheManagerV2)
-        if (spec_config is not None
-                and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
-            from ..modules.kimi_kda._kda_kernels import \
-                is_kda_mtp_verify_available
-            if is_kda_mtp_verify_available():
-                kimi_extra_kwargs["kda_replay_num_spec"] = (
-                    spec_config.tokens_per_gen_step - 1)
+        if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            replay = select_kda_replay_state(spec_config=spec_config,
+                                             manager_cls=kv_cache_manager_cls)
+            if replay is not None:
+                kimi_extra_kwargs[
+                    "kda_replay_num_spec"] = replay.num_speculative_tokens
         # KDA's conv state is a [Q | K | V] concatenation whose three sections
         # have identical width, i.e. the qwen3_next section layout.
         kimi_extra_kwargs.update(
@@ -2822,54 +2813,17 @@ def _create_kv_cache_manager(
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
 
-        # Replay state update kernel for MTP: default on for sm >= 80; gates
-        # below disable it for incompatible feature combinations.  Cpp cache
-        # manager doesn't expose use_replay_state_update, so the wrapper
-        # property's getattr default keeps replay off there automatically.
-        sm = get_sm_version()
         stochastic_rounding = getattr(
             quant_config, 'mamba_ssm_stochastic_rounding',
             False) if quant_config is not None else False
+        from ..modules.mamba.cache_manager import select_mamba2_state
 
-        use_replay = spec_config is not None and sm >= 80
-        if spec_config is None:
-            logger.info(
-                "Replay kernel requires speculative decoding; using non-replay path"
-            )
-
-        # Block reuse (prefix caching): replay leaves SSM state at a
-        # checkpoint after speculation. The next decode step replays forward
-        # to correct it. If block reuse feeds that stale state into a new
-        # prefill, the correction never happens.
-        # Currently we only save and reuse context tokens so this does not affect.
-
-        # Tree attention: replay assumes linear token sequence.
-        if (spec_config is not None
-                and (getattr(spec_config, 'eagle_choices', None) is not None
-                     or getattr(spec_config, 'use_dynamic_tree', False))):
-            logger.info("Replay kernel incompatible with tree attention; "
-                        "using legacy MTP path")
-            use_replay = False
-
-        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs 100 <= sm < 120.
-        # Flashinfer has a SW fallback at any SM.
-        if (stochastic_rounding
-                and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and (sm < 100 or sm in (120, 121))):
-            logger.info("Replay kernel Philox requires 100 <= sm < 120; "
-                        "using legacy MTP path for stochastic rounding support")
-            use_replay = False
-
-        # Use replay algorithm for mamba (default is on).
-        enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
-                                                '1') == '0'
-        if enforce_disable_replay:
-            logger.info(
-                "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
-            use_replay = False
-        else:
-            logger.info(
-                "Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
+        use_replay = None
+        if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            use_replay = select_mamba2_state(
+                spec_config=spec_config,
+                ssm_cache_dtype=mamba_params.mamba_ssm_cache_dtype,
+                stochastic_rounding=stochastic_rounding).uses_replay
 
         # Stochastic-rounding seeds must live on the cache manager (not be
         # re-created with torch.randint per forward) whenever SR can fire
@@ -2937,76 +2891,23 @@ def _create_kv_cache_manager(
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
-        # Replay state update for GDN MTP: mirrors the nemotron_hybrid gating
-        # above, minus the Mamba2-specific stochastic-rounding/Philox gate.
-        # The GDN replay kernel does a plain cast on checkpoint commit, so
-        # quantized SSM cache dtypes stay on the legacy path.
-        sm = get_sm_version()
-        use_replay = spec_config is not None and sm >= 80
-        if spec_config is None:
-            logger.info(
-                "GDN replay kernel requires speculative decoding; using "
-                "non-replay path")
-        elif spec_config.tokens_per_gen_step > 8:
-            logger.info("GDN cached replay supports at most 8 tokens per "
-                        "generation step; using non-replay path")
-            use_replay = False
+        from ..modules.fla.cache_manager import select_gdn_replay_state
 
-        # Tree attention: replay assumes a linear token sequence.
-        if (spec_config is not None
-                and (getattr(spec_config, 'eagle_choices', None) is not None
-                     or getattr(spec_config, 'use_dynamic_tree', False))):
-            logger.info("GDN replay kernel incompatible with tree attention; "
-                        "using legacy MTP path")
-            use_replay = False
-
-        if mamba_params.mamba_ssm_cache_dtype not in (torch.float32,
-                                                      torch.bfloat16,
-                                                      torch.float16):
-            logger.info(
-                "GDN replay kernel does not support quantized SSM cache "
-                f"dtype {mamba_params.mamba_ssm_cache_dtype}; using legacy "
-                "MTP path")
-            use_replay = False
-
-        # Replay is enabled by default for eligible GDN MTP workloads.
-        if not is_gdn_replay_enabled():
-            use_replay = False
-
-        # GDN replay supports the contiguous C++ V1 state pool and the indirect
-        # per-layer state views exposed by V2. Mixed/Python does not expose an
-        # all-layer commit, so keep that manager but use non-replay MTP.
-        replay_manager_types = (CppMambaHybridCacheManager,
-                                MambaHybridCacheManagerV2)
-        if use_replay and not issubclass(kv_cache_manager_cls,
-                                         replay_manager_types):
-            logger.info("GDN replay requires C++ V1 or V2 Mamba cache manager; "
-                        f"{kv_cache_manager_cls.__name__} was selected, so the "
-                        "non-replay MTP path will be used")
-            use_replay = False
-        logger.info("GDN replay state update: " +
-                    ("ENABLED" if use_replay else "DISABLED"))
+        use_replay = None
+        if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            use_replay = select_gdn_replay_state(
+                spec_config=spec_config,
+                ssm_cache_dtype=mamba_params.mamba_ssm_cache_dtype,
+                manager_cls=kv_cache_manager_cls) is not None
 
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
-        if getattr(sparse_attention_config, "algorithm", None) == "qsa":
-            # Resolve the side-cache shape from the same checkpoint geometry
-            # used to construct the QSA index projection.
-            mamba_manager_extra_kwargs.update(
-                sparse_attention_config=sparse_attention_config,
-                pretrained_config=config,
-            )
         if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
                                                MambaHybridCacheManagerV2):
-            ple_cache_params = _get_qwen4_exp_ple_cache_params(
-                config,
-                total_layers=len(mamba_layer_mask),
-                is_draft=is_draft,
-            )
-            if ple_cache_params is not None:
-                mamba_manager_extra_kwargs[
-                    "qwen4_exp_ple_cache_params"] = ple_cache_params
+            mamba_manager_extra_kwargs.update(
+                pretrained_config=config,
+                sparse_attention_config=sparse_attention_config)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
