@@ -610,7 +610,7 @@ class SuffixAutomatonManager(BaseResourceManager):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         """Prepare SA states for new context and disagg-generation requests."""
         for req in scheduled_batch.context_requests:
-            # Disaggregated serving: the executor's _prepare_disagg_gen_init
+            # Disaggregated serving: the executor's _prepare_disagg_gen_resources
             # also routes DISAGG_GENERATION_INIT requests through
             # prepare_resources as context_requests_last_chunk, BEFORE the
             # context server's first generated token has arrived (it is only
@@ -651,7 +651,7 @@ class SuffixAutomatonManager(BaseResourceManager):
                 # confirms the automaton is built in the GENERATION schedule
                 # with the full history (prompt + ctx first token, i.e.
                 # len(history) == prompt_len + 1), not in the premature
-                # context-phase pass at _prepare_disagg_gen_init.
+                # context-phase pass at _prepare_disagg_gen_resources.
                 trtllm_logger.debug(
                     f"[SA] disagg gen-init: request {req.request_id} automaton "
                     f"built in generation schedule from {len(history)} history "
