@@ -14,6 +14,7 @@ llm_perf_core:
 # 9: H100, B200, B300, RTX6000-Server test cases
 # 10: B200, B300, RTX6000-Server test cases
 # 11: RTX-6000 Server test cases
+# 12: VR200 single-node test cases
 # ===============================================================================
 
 
@@ -368,3 +369,19 @@ llm_perf_core:
   # 2000-token decode of each request; does not fit the 60min default here.
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:8-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:8-tp:8-gpus:8]
+
+
+# 12: VR200 single-node test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+      compute_capability:
+        gte: 10.7
+        lte: 10.7
+  tests:
+  #deepseek_v4_pro_fp4 (1.6T MoE, sparse MLA + mHC, FP4+FP8 mixed). The
+  #rough 0.8-0.9TB weight footprint fits in 4x288GB Rubin HBM, but not 4xB200.
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:8192,1024-reqs:1024-con:512-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:1000,2000-reqs:512-con:256-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-float4-maxbs:128-maxnt:8448-input_output_len:8192,1024-reqs:10-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120) #min_latency
