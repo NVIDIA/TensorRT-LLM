@@ -13,7 +13,7 @@ By NVIDIA TensorRT-LLM Team
 
 Selecting 1,024 INT32 indices from 131,072 FP32 scores writes just **4 KiB of output**, yet one complete read of the scores moves **512 KiB**. Every additional full-row pass pays that input cost again. For a sparse-attention indexer, finding the Top-K boundary can therefore cost far more than emitting the winners.
 
-GVR V2 makes each full-row pass more useful without depending on the previous decode step to predict the current one. **Self-sampling estimates where the current row's Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.** Together, they concentrate exact refinement on the small group of scores still competing for the final slots.
+GVR V2 makes each full-row pass more useful without depending on the previous decode step to predict the current one. **Self-sampling estimates where the current row's Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.** Together, they concentrate exact refinement on the small group of scores still competing for the final slots. The sampling idea builds on Floyd–Rivest SELECT, adapted to the memory traffic and parallel execution costs of GPU Top-K.
 
 On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM radix CUDA and 1.66× over SGLang v2**, with **2.01× over FlashInfer, 2.37× over DeepSelect FP32, and 1.55× over HPC-ops FP32**. The workloads span DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers. The SGLang result includes planning; the transform-only comparison is **1.42×**.
 
@@ -25,6 +25,7 @@ On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM 
 
 ## Table of Contents
 
+- [From Floyd–Rivest SELECT to GPU Top-K](#from-floydrivest-select-to-gpu-top-k)
 - [From GVR V1 to V2: Why Move Beyond Temporal Hints?](#from-gvr-v1-to-v2-why-move-beyond-temporal-hints)
 - [Self-Sampling: Calibrate the Search to This Row](#self-sampling-calibrate-the-search-to-this-row)
 - [Multi-Thresholding: Make Each Full-Row Pass Count](#multi-thresholding-make-each-full-row-pass-count)
@@ -34,6 +35,29 @@ On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM 
 - [Decode and Prefill in TensorRT-LLM](#decode-and-prefill-in-tensorrt-llm)
 - [Conclusion](#conclusion)
 - [Further Reading](#further-reading)
+
+## From Floyd–Rivest SELECT to GPU Top-K
+
+GVR V2's self-sampling was inspired by Floyd and Rivest's 1975 paper, [*Expected Time Bounds for Selection*](https://people.csail.mit.edu/rivest/pubs/FR75a.pdf). Its theoretical SELECT algorithm draws a random sample, chooses two sample order statistics to bracket the desired rank, partitions the full input, and continues exactly in the partition containing that rank. If the bracket misses, selection continues in the appropriate outer partition. Sampling reduces expected work without making the answer approximate.
+
+The classical expected comparison bound for ascending rank $i$ among $n$ elements is
+
+$$
+n+\min(i,n-i)+o(n).
+$$
+
+This belongs to a comparison model with random-sampling assumptions; the original treatment assumes distinct keys. [Kiwiel's later analysis](https://arxiv.org/abs/cs/0312055) establishes rigorous bounds for SELECT variants, including repeated keys. These results motivate **using sample ranks to narrow an exact selection problem**.
+
+GVR V2 carries that principle into a different cost model:
+
+| Design choice | Floyd–Rivest theoretical SELECT | GVR V2 streaming |
+| :--- | :--- | :--- |
+| Primary objective | Expected element comparisons | Kernel latency: input passes, memory traffic, and parallel work |
+| Calibration | Random sample and sample order statistics | Regularly spaced, coalesced sample and histogram quantiles |
+| Remaining selection | Exact partitioning and recursive selection | Exact bin counts, crossing-bin refinement, and recovery |
+| Result | An element at the requested rank | An exact set of $K$ indices, without requiring sorted output |
+
+On a GPU, doing more work on chip can be worthwhile if it avoids another full-row read. V2 therefore couples sampling to candidate capacity, coalesced loads, and multi-threshold counts; its launch families balance that work against synchronization and available parallelism. **The inherited idea is sample-guided exact selection; the optimization target is GPU execution cost.** V2's deterministic sampling policy does not inherit SELECT's randomized comparison bound. Its exactness follows from full-row accounting and exact refinement or recovery, while its performance is evaluated below.
 
 ## From GVR V1 to V2: Why Move Beyond Temporal Hints?
 
@@ -47,15 +71,17 @@ It seeks an admission threshold with enough survivors to contain Top-K, but few 
 
 ### A Biased Sample with Variable Value
 
-Temporal hints are a **biased sample**: they inspect current scores at positions selected as winners in the previous step. When temporal overlap is high and stable, that bias is valuable because the sample concentrates on the upper tail. In inference traces examined during V1 development, however, the hit rate—the fraction of previous-step selected indices retained in the current Top-K—varied from **nearly 0% to about 90%** across models, layers, and decode steps. A low-overlap sample can provide little useful information about the current tail.
+Temporal hints are a **biased sample** of current scores at previous winners' positions. High, stable overlap makes that bias useful. Figure 2 shows why it is an unreliable assumption across layers and decode steps.
 
-The kernel cannot know that exact hit rate before finding the current Top-K. Verification can reveal that a proposed threshold is poor, but by then the hint gather and some selection work have already been paid for. Hint quality therefore cannot serve as a cheap, advance decision about whether the temporal shortcut is worth taking.
+![Temporal Top-K overlap for DeepSeek-V3.2 and DeepSeek-V4 Pro. Upper panels distinguish retained and new selections; lower panels show raw overlap across three layers, including abrupt drops despite a high average.](../media/gvr_v2/temporal_overlap.svg)
 
-This variability affects the whole design. Robust selection must cover weak hints with conservative admission, additional count queries, candidate-capacity checks, and exact recovery. A wider range of hint quality puts more pressure on those mechanisms: retries add full-row reads, and managing the safe paths adds overhead. The cost reduces average speedup and contributes to latency variation, even when favorable steps are very fast. Exact fallback protects correctness; its cost still matters to serving performance.
+*Figure 2. Temporal overlap on SWE-bench-64K workloads. Blue marks previous winners retained after coordinate alignment; orange marks new selections. V3.2 shifts prior indices by +1, while V4 Pro keeps compressed-bin coordinates. Upper panels show position crops; lower curves measure full-domain overlap across layers and steps, with means in parentheses. Even a high-mean layer can suffer an abrupt collapse.*
 
-V2 instead calibrates from regularly spaced, coalesced samples of the **current row**, removing dependence on temporal overlap and the dependent read through old indices. Multi-thresholding then extracts many exact population counts from each full-row classification pass. The two ideas address complementary costs: unreliable initial calibration and repeated scalar threshold queries. The goal is a stronger practical performance floor and a better average, rather than relying on consistently favorable temporal overlap. This is a design objective, not a fixed worst-case latency guarantee.
+The hit rate is the fraction of the current Top-K covered by the aligned previous selection. Its true value is known only after the current selection is established. Verification can expose a poor threshold, but the hint gather and initial work have already been paid for. Conservative admission, repeated counts, capacity checks, and exact recovery keep weak hints safe; their overhead and extra reads reduce average speedup and make latency less predictable.
 
-V1 also used a histogram during local refinement after candidate collection. The distinction is where that information becomes available: V2 makes multi-threshold population information central to verification, so it can pass an already identified crossing to refinement.
+V2 calibrates from the **current row**, removing dependence on temporal overlap and the read through old indices. Multi-thresholding addresses the other major cost: repeated scalar threshold queries. Together, they target a stronger practical performance floor and better average latency, without a fixed worst-case latency guarantee.
+
+V1 already used a histogram for local refinement. V2 moves multi-threshold population information into verification, so refinement starts from an identified crossing bin.
 
 ### A Hint That Crosses Framework Boundaries
 
@@ -74,7 +100,7 @@ V1's prior also has a lifecycle outside the kernel. Prefill lacks the same previ
 
 ![V1's temporal bias makes threshold quality depend on changing overlap; V2 calibrates from the current row with no temporal prior. Beside these flows, measured bars compare temporal R0, tiered temporal GVR, and V2.](../media/gvr_v2/evolution.svg)
 
-*Figure 2. The design shift removes dependence on temporal overlap and prior state while making each verification pass more informative. Original V1 uses scalar threshold search; later temporal R0 and tiered implementations add broader verification and execution specialization. The bars compare those later temporal implementations with V2 over radix CUDA.*
+*Figure 3. The design shift removes dependence on temporal overlap and prior state while making each verification pass more informative. Original V1 uses scalar threshold search; later temporal R0 and tiered implementations add broader verification and execution specialization. The bars compare those later temporal implementations with V2 over radix CUDA.*
 
 Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA; V2 reaches **4.93×**. V2 is **1.91× faster than temporal R0** and **1.42× faster than tiered temporal GVR**, combining current-row sampling, multi-threshold verification, and specialized execution paths.
 
@@ -96,11 +122,11 @@ provide three anchors:
 - **Upper anchor $T_K$:** estimate the neighborhood of rank $K$; together with $T$, it defines the upper classification bound $H$ (`HIC` in the implementation).
 - **Lower floor $T_{\mathrm{floor}}$:** admit a larger population if the first estimate is too aggressive (`TSH` in the implementation).
 
-Sample budgets, safety margins, and capacity clamps depend on the launch family. The estimate requires neither independent random samples nor a known analytical distribution; exact verification handles a poor estimate.
+The proportional ranks connect the small sample to the full-row selection target. Unlike SELECT's recursively selected sample pivots, V2 estimates these anchors from histogram bins and budgets them around candidate capacity. Sample sizes, safety margins, and capacity clamps depend on the launch family. The estimate requires neither independent random samples nor a known analytical distribution; exact verification handles a poor estimate.
 
 ![Self-sampling, exact multi-threshold counts, and crossing-bin refinement, with three verification outcomes: refine, lower admission, or exact recovery.](../media/gvr_v2/algorithm.svg)
 
-*Figure 3. The sample histogram estimates a bracket; the verification histogram counts the complete admitted population. The lower panel shows how verification controls refinement and recovery. Bin heights and the 980/73/44 example are illustrative; exact recovery depends on the kernel family.*
+*Figure 4. The sample histogram estimates a bracket; the verification histogram counts the complete admitted population. The lower panel shows how verification controls refinement and recovery. Bin heights and the 980/73/44 example are illustrative; exact recovery depends on the kernel family.*
 
 ## Multi-Thresholding: Make Each Full-Row Pass Count
 
@@ -137,7 +163,7 @@ The histogram discretizes the search region, not the selected scores. Exact comp
 
 ### How Verification Preserves Exactness
 
-**The sample focuses the bins; exact bin counts make the sample safe.** A useful bracket keeps the crossing small, while multi-threshold verification avoids a separate full-row query for every trial boundary. Figure 3 distinguishes the resulting paths: refine a complete admitted set, lower admission when too few scores survive, or recover exactly when staging or bracket checks fail.
+**The sample focuses the bins; exact bin counts make the sample safe.** A useful bracket keeps the crossing small, while multi-threshold verification avoids a separate full-row query for every trial boundary. Figure 4 distinguishes the resulting paths: refine a complete admitted set, lower admission when too few scores survive, or recover exactly when staging or bracket checks fail.
 
 Two mechanisms have different jobs. The **admission ladder**—the primary threshold, lower floor, and conservative sentinel—widens the candidate region. The **verification bin boundaries** locate rank $K$ within that region. Non-split streaming can rescan at a lower threshold; split-row streaming can stage down to the lower floor within its scan. Overflow requires complete-set or whole-row exact recovery.
 
@@ -192,11 +218,11 @@ The minimum column retains individual regressions. Figure 1 shows the model-leve
 
 The comparison changes with the model and shape. Figure 1 shows HPC-ops closest on V3.2 and a larger DeepSelect FP32 gap there. The heatmaps resolve those averages into the row-length and batch regions where each advantage appears.
 
-Figure 4 locates the SGLang gains across the full length–batch grid.
+Figure 5 locates the SGLang gains across the full length–batch grid.
 
 ![Three heatmaps of GVR V2 speedup over SGLang for every captured row-length bucket and all eleven batch sizes, averaged geometrically across layers.](../media/gvr_v2/sglang_map.svg)
 
-*Figure 4. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 4 and 5 share the same color scale; row lengths are rounded in the axis labels.*
+*Figure 5. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 5 and 6 share the same color scale; row lengths are rounded in the axis labels.*
 
 Long rows at intermediate batch sizes show particularly strong gains: **V4 Pro reaches 4.67× at $N=262{,}127$, $B=64$**. This is the strongest shape-average result in the grid; most regions are around 1.3–2.0×.
 
@@ -204,7 +230,7 @@ DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long
 
 ![Three heatmaps of GVR V2 speedup over DeepSelect FP32 across row lengths and all eleven batch sizes, using the same color scale as the SGLang comparison.](../media/gvr_v2/deepselect_map.svg)
 
-*Figure 5. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 4: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
+*Figure 6. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 5: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
 
 For **V3.2, the gain reaches 7.66× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.23×** and **4.34×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.996×).
 
@@ -226,7 +252,7 @@ These patterns identify useful operating regions. The native API contracts below
 
 ![Cold kernel latency for all six implementations versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
-*Figure 6. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. Solid and dashed lines distinguish benchmark runs. Both axes are logarithmic; 1K means 1,024.*
+*Figure 7. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. Solid and dashed lines distinguish benchmark runs. Both axes are logarithmic; 1K means 1,024.*
 
 At $B=1$, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At $B=1024$, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.
 
@@ -243,7 +269,7 @@ W=BN,\qquad Q_{\min}=4B(N+K)\ \text{bytes},\qquad
 I=\frac{W}{Q_{\min}}=\frac{N}{4(N+K)}.
 $$
 
-Here one unit of work is one **abstract comparison per input score**. This is a common normalization for every implementation, not its measured instruction count. Since $1\le K\le N$, ideal Top-K intensity stays within **$0.125\le I\lt 0.25$ compare/byte**.
+Here one unit of work is one **abstract comparison per input score**. This is a common normalization for every implementation, not its measured instruction count or SELECT's expected comparison formula. Since $1\le K\le N$, ideal Top-K intensity stays within **$0.125\le I\lt 0.25$ compare/byte**.
 
 The theoretical and calibrated B200 roofs, in Tcompare/s, are
 
@@ -252,17 +278,17 @@ P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
 P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
 $$
 
-The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 7A.
+The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 8A.
 
 ![A clean two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2 and five baselines at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
-*Figure 7.* A: the full theoretical and calibrated roofs. B: Pareto curves in the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
+*Figure 8.* A: the full theoretical and calibrated roofs. B: Pareto curves in the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
 
 ### Compare Pareto Curves and Reachable Rates
 
-Each operator's **Pareto curve** in Figure 7B traces useful throughput across intensities at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 6 retains the contrasting single-row view, and Figures 4 and 5 cover all 11 batch sizes.
+Each operator's **Pareto curve** in Figure 8B traces useful throughput across intensities at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 7 retains the contrasting single-row view, and Figures 5 and 6 cover all 11 batch sizes.
 
-The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a percentage. The table compares **average / peak reachable rate** along each Pareto curve. The average weights the plotted intensity points equally; the peak is their maximum. Both use the same layer-averaged timings as Figure 7B.
+The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a percentage. The table compares **average / peak reachable rate** along each Pareto curve. The average weights the plotted intensity points equally; the peak is their maximum. Both use the same layer-averaged timings as Figure 8B.
 
 | Operator | V4 Flash | V4 Pro | V3.2 |
 | :--- | ---: | ---: | ---: |
@@ -293,7 +319,7 @@ TensorRT-LLM separates phase-specific row metadata from shared selection logic. 
 
 ![Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes.](../media/gvr_v2/integration.svg)
 
-*Figure 8. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
+*Figure 9. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
 
 The adapters preserve each phase's indexing semantics. Decode derives valid prefixes from device KV lengths, multi-token prediction offsets, and compression. Prefill receives `[start, end)` in compressed columns and returns indices relative to `start`. Both write INT32 indices into caller-owned output, with identity indices and `-1` padding for short rows.
 
@@ -344,6 +370,11 @@ The performance maps show the gains across shapes, and the Pareto curves relate 
 ## Further Reading
 
 [Benchmark methodology and figure reproduction](../media/gvr_v2/README.md) are available separately.
+
+Selection background:
+
+- [Floyd and Rivest, *Expected Time Bounds for Selection* (1975)](https://people.csail.mit.edu/rivest/pubs/FR75a.pdf), *Communications of the ACM* 18(3), 165–172: the sampling-based selection idea behind V2's calibration.
+- [Kiwiel, *Randomized Selection with Quintary Partitions*](https://arxiv.org/abs/cs/0312055): rigorous analysis of SELECT variants and repeated-key handling.
 
 Implementation milestones:
 
