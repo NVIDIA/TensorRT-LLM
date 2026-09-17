@@ -70,27 +70,26 @@ enum WideField : std::uint32_t
 
 enum IntegerField : std::uint32_t
 {
-    kColdPaddingBytes,     // Number of alignment bytes to clear at
-                           // kColdPaddingOffset.
-    kTransform,            // Selects NVFP4 conversion or a byte-exact lossless copy.
-    kNumKvHeads,           // Number of KV-head row groups represented by this buffer.
-    kTokensPerPage,        // Number of token or compressed-entry rows per KV head in one
-                           // Page.
-    kQuantizedElements,    // Number of elements in each row's NVFP4 run.
-    kRawRowStrideElements, // Element stride between rows in the hot Page.
-    // Trailing bytes preserved after each row's NVFP4 run; zero when the run
-    // reaches the end of the row.
-    kLosslessSuffixBytesPerRow,
-    // Leading elements preserved before each row's NVFP4 run (a RoPE prefix);
-    // zero when the run starts the row.
-    kQuantizedRowOffsetElements,
+    kColdPaddingBytes, // Number of alignment bytes to clear at
+                       // kColdPaddingOffset.
+    kTransform,        // Selects NVFP4 conversion or a byte-exact lossless copy.
+    kNumKvHeads,       // Number of KV-head row groups represented by this buffer.
+    kTokensPerPage,    // Number of token or compressed-entry rows per KV head in one
+                       // Page.
+    // Each hot row holds one NVFP4 run; every element before or after it is
+    // preserved byte-for-byte. The run is (start, length) within a row of
+    // kRawRowStrideElements elements: the lossless prefix is [0, start) and the
+    // lossless suffix is [start + length, stride).
+    kQuantizedRunElements,      // Length of the NVFP4 run in elements.
+    kRawRowStrideElements,      // Element stride between rows in the hot Page.
+    kQuantizedRunStartElements, // First element of the NVFP4 run; zero when the run starts the row.
 };
 
 // The Python codec builds these tables column by column; keep the enum widths
 // and the exported table widths in lock step.
 static_assert(kColdPaddingOffset + 1U == kNvfp4ColdPageWideFields, "WideField and the wide table width differ");
 static_assert(
-    kQuantizedRowOffsetElements + 1U == kNvfp4ColdPageIntegerFields, "IntegerField and the integer table width differ");
+    kQuantizedRunStartElements + 1U == kNvfp4ColdPageIntegerFields, "IntegerField and the integer table width differ");
 
 enum ScaleField : std::uint32_t
 {
@@ -106,10 +105,9 @@ struct Nvfp4ColdPageKernelParams
 {
     std::int32_t numKvHeads;
     std::int32_t tokensPerPage;
-    std::int32_t quantizedElements;
+    std::int32_t quantizedRunElements;
     std::int32_t rawRowStrideElements;
-    std::int32_t losslessSuffixBytesPerRow;
-    std::int32_t quantizedRowOffsetElements;
+    std::int32_t quantizedRunStartElements;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -205,9 +203,9 @@ __device__ Nvfp4ColdPageBuffer loadBuffer(std::uint32_t index, Nvfp4ColdPageWide
         static_cast<std::size_t>(w[kRawBytes]), static_cast<std::size_t>(w[kColdDataOffset]),
         static_cast<std::size_t>(w[kColdScaleOffset]), static_cast<std::size_t>(w[kColdPaddingOffset]),
         static_cast<std::uint32_t>(i[kColdPaddingBytes]), static_cast<Nvfp4ColdPageTransform>(i[kTransform]),
-        {i[kNumKvHeads], i[kTokensPerPage], i[kQuantizedElements], i[kRawRowStrideElements],
-            i[kLosslessSuffixBytesPerRow], i[kQuantizedRowOffsetElements], s[kNvfp4ScaleOrigQuant],
-            s[kNvfp4ScaleQuantOrig], s[kFp8ScaleOrigQuant], s[kFp8ScaleQuantOrig]}};
+        {i[kNumKvHeads], i[kTokensPerPage], i[kQuantizedRunElements], i[kRawRowStrideElements],
+            i[kQuantizedRunStartElements], s[kNvfp4ScaleOrigQuant], s[kNvfp4ScaleQuantOrig], s[kFp8ScaleOrigQuant],
+            s[kFp8ScaleQuantOrig]}};
 }
 
 // A partially quantized buffer stores each row's lossless bytes (prefix, then
@@ -216,19 +214,27 @@ __device__ constexpr std::size_t coldLosslessOffset(Nvfp4ColdPageBuffer const& b
 {
     return buffer.coldScaleOffset
         + static_cast<std::size_t>(buffer.params.numKvHeads) * static_cast<std::size_t>(buffer.params.tokensPerPage)
-        * static_cast<std::size_t>(buffer.params.quantizedElements) / kElementsPerScaleGroup;
+        * static_cast<std::size_t>(buffer.params.quantizedRunElements) / kElementsPerScaleGroup;
 }
 
 template <typename T>
 __host__ __device__ constexpr std::size_t losslessPrefixBytesPerRow(Nvfp4ColdPageKernelParams const& params)
 {
-    return static_cast<std::size_t>(params.quantizedRowOffsetElements) * sizeof(T);
+    return static_cast<std::size_t>(params.quantizedRunStartElements) * sizeof(T);
+}
+
+template <typename T>
+__host__ __device__ constexpr std::size_t losslessSuffixBytesPerRow(Nvfp4ColdPageKernelParams const& params)
+{
+    return static_cast<std::size_t>(
+               params.rawRowStrideElements - params.quantizedRunStartElements - params.quantizedRunElements)
+        * sizeof(T);
 }
 
 template <typename T>
 __host__ __device__ constexpr std::size_t losslessBytesPerRow(Nvfp4ColdPageKernelParams const& params)
 {
-    return losslessPrefixBytesPerRow<T>(params) + static_cast<std::size_t>(params.losslessSuffixBytesPerRow);
+    return losslessPrefixBytesPerRow<T>(params) + losslessSuffixBytesPerRow<T>(params);
 }
 
 __device__ OffloadBufferTask resolveOffloadTask(
@@ -279,7 +285,7 @@ __host__ __device__ constexpr std::uint32_t compactStageBytesForHalfGroups(std::
 __host__ __device__ constexpr std::uint32_t halfGroupCount(Nvfp4ColdPageKernelParams const& params)
 {
     return static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage)
-        * (static_cast<std::uint32_t>(params.quantizedElements) / kElementsPerHalfGroup);
+        * (static_cast<std::uint32_t>(params.quantizedRunElements) / kElementsPerHalfGroup);
 }
 
 // Map one compact group back to a possibly strided row in the runtime Page.
@@ -289,15 +295,15 @@ __host__ __device__ constexpr std::uint32_t rawGroupElementOffset(
 {
     // Most models store fully quantized, contiguous rows. Keep that common path
     // free of integer division and modulo. A full-row run has no prefix.
-    if (params.rawRowStrideElements == params.quantizedElements)
+    if (params.rawRowStrideElements == params.quantizedRunElements)
     {
         return group * kElementsPerGroup;
     }
-    auto const groupsPerRow = static_cast<std::uint32_t>(params.quantizedElements) / kElementsPerGroup;
+    auto const groupsPerRow = static_cast<std::uint32_t>(params.quantizedRunElements) / kElementsPerGroup;
     auto const row = group / groupsPerRow;
     auto const groupInRow = group % groupsPerRow;
     return row * static_cast<std::uint32_t>(params.rawRowStrideElements)
-        + static_cast<std::uint32_t>(params.quantizedRowOffsetElements) + groupInRow * kElementsPerGroup;
+        + static_cast<std::uint32_t>(params.quantizedRunStartElements) + groupInRow * kElementsPerGroup;
 }
 
 // Cap a buffer tile at shared-memory capacity without splitting a scale group.
@@ -439,8 +445,8 @@ __device__ void copyLosslessRowBytesToCold(
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
     std::size_t const prefixBytes = losslessPrefixBytesPerRow<T>(params);
-    std::size_t const runBytes = static_cast<std::size_t>(params.quantizedElements) * sizeof(T);
-    std::size_t const suffixBytes = static_cast<std::size_t>(params.losslessSuffixBytesPerRow);
+    std::size_t const runBytes = static_cast<std::size_t>(params.quantizedRunElements) * sizeof(T);
+    std::size_t const suffixBytes = losslessSuffixBytesPerRow<T>(params);
     std::size_t const coldRowBytes = prefixBytes + suffixBytes;
     if (prefixBytes != 0U)
     {
@@ -465,8 +471,8 @@ __device__ void restoreLosslessRowBytesFromCold(
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
     std::size_t const prefixBytes = losslessPrefixBytesPerRow<T>(params);
-    std::size_t const runBytes = static_cast<std::size_t>(params.quantizedElements) * sizeof(T);
-    std::size_t const suffixBytes = static_cast<std::size_t>(params.losslessSuffixBytesPerRow);
+    std::size_t const runBytes = static_cast<std::size_t>(params.quantizedRunElements) * sizeof(T);
+    std::size_t const suffixBytes = losslessSuffixBytesPerRow<T>(params);
     std::size_t const coldRowBytes = prefixBytes + suffixBytes;
     if (prefixBytes != 0U)
     {
@@ -862,7 +868,7 @@ __device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, OnboardBuf
     }
     cp_async_wait_group<0>();
 
-    // quantizedElements % 16 makes packed intervals exact uint2 scale groups.
+    // quantizedRunElements % 16 makes packed intervals exact uint2 scale groups.
     for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + threadIdx.x; pair < packedPairBytes / sizeof(uint2);
          pair += blockDim.x)
     {

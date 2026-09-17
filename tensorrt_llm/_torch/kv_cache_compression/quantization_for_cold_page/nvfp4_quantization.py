@@ -41,7 +41,7 @@ _ELEMENTS_PER_HALF_GROUP = 8
 _MAX_HALF_GROUPS_PER_TILE = 2048
 _MAX_BUFFERS_PER_LAUNCH = 256
 _WIDE_FIELDS = 6
-_INTEGER_FIELDS = 8
+_INTEGER_FIELDS = 7
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
@@ -58,27 +58,27 @@ class _Nvfp4Scales:
 @dataclass(frozen=True)
 class _Nvfp4BufferLayout:
     """One hot buffer. ``scales`` is None for a byte-exact lossless copy; a
-    quantized buffer encodes ``quantized_elements`` of each
-    ``raw_row_stride_elements``-element row as NVFP4, starting at element
-    ``quantized_row_offset_elements``, and preserves the elements before and
-    after that run byte-for-byte."""
+    quantized buffer encodes one NVFP4 run per ``raw_row_stride_elements``-element
+    row, ``quantized_run_elements`` long and starting at element
+    ``quantized_run_start_elements``; every element before or after the run is
+    preserved byte-for-byte."""
 
     role: str
     scales: _Nvfp4Scales | None = None
-    quantized_row_offset_elements: int = 0
-    quantized_elements: int = 0
+    quantized_run_start_elements: int = 0
+    quantized_run_elements: int = 0
     raw_row_stride_elements: int = 0
 
     @property
     def lossless_prefix_elements(self) -> int:
-        return self.quantized_row_offset_elements
+        return self.quantized_run_start_elements
 
     @property
     def lossless_suffix_elements(self) -> int:
         return (
             self.raw_row_stride_elements
-            - self.quantized_row_offset_elements
-            - self.quantized_elements
+            - self.quantized_run_start_elements
+            - self.quantized_run_elements
         )
 
 
@@ -253,8 +253,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 _Nvfp4BufferLayout(
                     role=buffer.role,
                     scales=_Nvfp4Scales(*scale_pair),
-                    quantized_row_offset_elements=geometry.quantized_row_offset_elements,
-                    quantized_elements=geometry.quantized_elements,
+                    quantized_run_start_elements=geometry.quantized_run_start_elements,
+                    quantized_run_elements=geometry.quantized_run_elements,
                     raw_row_stride_elements=geometry.raw_row_stride_elements,
                 )
             )
@@ -337,10 +337,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             # quantized buffer's scales followed by its lossless row bytes,
             # then the opaque buffers, then alignment padding.
             def packed_bytes(buffer: _Nvfp4BufferLayout) -> int:
-                return rows * buffer.quantized_elements // _ELEMENTS_PER_BYTE
+                return rows * buffer.quantized_run_elements // _ELEMENTS_PER_BYTE
 
             def scale_and_lossless_bytes(buffer: _Nvfp4BufferLayout) -> int:
-                scale_bytes = rows * buffer.quantized_elements // _ELEMENTS_PER_SCALE
+                scale_bytes = rows * buffer.quantized_run_elements // _ELEMENTS_PER_SCALE
                 lossless_bytes = (
                     rows
                     * (buffer.lossless_prefix_elements + buffer.lossless_suffix_elements)
@@ -366,7 +366,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 if raw_base <= 0 or raw_bytes <= 0 or raw_bytes > raw_slot_bytes:
                     raise ValueError("Cold-page hot buffer has invalid address or size")
 
-                suffix_bytes_per_row = 0
                 if is_compressed:
                     expected_raw_bytes = rows * buffer.raw_row_stride_elements * element_bytes
                     if raw_bytes != expected_raw_bytes:
@@ -379,12 +378,11 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     scale_offset = scale_cursor
                     data_cursor += packed_bytes(buffer)
                     scale_cursor += scale_and_lossless_bytes(buffer)
-                    half_groups = rows * buffer.quantized_elements // _ELEMENTS_PER_HALF_GROUP
+                    half_groups = rows * buffer.quantized_run_elements // _ELEMENTS_PER_HALF_GROUP
                     max_half_groups_per_tile = max(
                         max_half_groups_per_tile,
                         min(half_groups, _MAX_HALF_GROUPS_PER_TILE),
                     )
-                    suffix_bytes_per_row = buffer.lossless_suffix_elements * element_bytes
                 else:
                     data_offset = cursor
                     scale_offset = 0
@@ -408,10 +406,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         transform,
                         layout.num_kv_heads if is_compressed else 0,
                         layout.tokens_per_page if is_compressed else 0,
-                        buffer.quantized_elements if is_compressed else 0,
+                        buffer.quantized_run_elements if is_compressed else 0,
                         buffer.raw_row_stride_elements if is_compressed else 0,
-                        suffix_bytes_per_row,
-                        buffer.quantized_row_offset_elements if is_compressed else 0,
+                        buffer.quantized_run_start_elements if is_compressed else 0,
                     ]
                 )
                 buffer_scales = buffer.scales if is_compressed else _Nvfp4Scales(1.0, 1.0)
@@ -482,9 +479,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             codec_state.runtime_type,
             cold_base,
             stream,
-            metadata.wide.shape[1],
-            metadata.integers.shape[1],
-            metadata.scales.shape[1],
         )
 
     def decode_cold_pages(
@@ -511,7 +505,4 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             codec_state.runtime_type,
             cold_base,
             stream,
-            metadata.wide.shape[1],
-            metadata.integers.shape[1],
-            metadata.scales.shape[1],
         )

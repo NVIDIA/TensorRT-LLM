@@ -118,16 +118,20 @@ EXCLUDE = _Exclude()
 class RowGeometry:
     """Kernel row shape: one quantized run with optional lossless prefix and suffix."""
 
-    quantized_row_offset_elements: int
-    quantized_elements: int
+    quantized_run_start_elements: int
+    quantized_run_elements: int
     raw_row_stride_elements: int
+
+    @property
+    def lossless_prefix_elements(self) -> int:
+        return self.quantized_run_start_elements
 
     @property
     def lossless_suffix_elements(self) -> int:
         return (
             self.raw_row_stride_elements
-            - self.quantized_row_offset_elements
-            - self.quantized_elements
+            - self.quantized_run_start_elements
+            - self.quantized_run_elements
         )
 
 
@@ -190,8 +194,8 @@ class ColdPagePolicy:
             )
         _, start, length = quantized[0]
         return RowGeometry(
-            quantized_row_offset_elements=start,
-            quantized_elements=length,
+            quantized_run_start_elements=start,
+            quantized_run_elements=length,
             raw_row_stride_elements=stride,
         )
 

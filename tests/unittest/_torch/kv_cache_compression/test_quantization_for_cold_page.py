@@ -78,9 +78,11 @@ def _partial_rotary_config(partial_rotary_factor=0.25, model_type="qwen3_5"):
 
 
 def _geometry(buffer):
+    """(run start, run length, row stride) in elements."""
+
     return (
-        buffer.quantized_row_offset_elements,
-        buffer.quantized_elements,
+        buffer.quantized_run_start_elements,
+        buffer.quantized_run_elements,
         buffer.raw_row_stride_elements,
     )
 
@@ -355,7 +357,6 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
     assert metadata.integers[:2, 0].tolist() == [0, 0]
     assert metadata.integers[:2, 5].tolist() == [128, 128]
     assert metadata.integers[:2, 6].tolist() == [0, 0]
-    assert metadata.integers[:2, 7].tolist() == [0, 0]
 
 
 def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
@@ -462,9 +463,6 @@ def test_provider_forwards_a_4096_page_batch_through_one_native_call() -> None:
             1,
             0x3000,
             0x5000,
-            6,
-            8,
-            4,
         )
 
 
@@ -483,7 +481,7 @@ def test_codec_state_metadata_stays_on_cpu_with_non_cpu_default_device() -> None
         metadata = _configure_default_lifecycle(native, raw_bytes=2048)
     for tensor, dtype, shape in (
         (metadata.wide, torch.int64, (256, 6)),
-        (metadata.integers, torch.int32, (256, 8)),
+        (metadata.integers, torch.int32, (256, 7)),
         (metadata.scales, torch.float32, (256, 4)),
     ):
         assert tensor.device.type == "cpu"
@@ -878,8 +876,8 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
     assert metadata.cold_page_bytes == cold_page_bytes
     assert metadata.wide[:2, 3].tolist() == [0, indexer_offset]
     assert metadata.wide[:2, 4].tolist() == [7168, 0]
-    assert metadata.integers[0].tolist() == [0, 0, 1, 32, 448, 512, 64 * element_bytes, 0]
-    assert metadata.integers[1].tolist() == [0, 1, 0, 0, 0, 0, 0, 0]
+    assert metadata.integers[0].tolist() == [0, 0, 1, 32, 448, 512, 0]
+    assert metadata.integers[1].tolist() == [0, 1, 0, 0, 0, 0, 0]
 
     sections = (
         (0, 7168),
@@ -1435,8 +1433,8 @@ def test_partial_rotary_lossless_keeps_key_prefix_and_quantizes_value_fully() ->
     assert metadata.cold_page_bytes == 2528
     assert metadata.wide[:2, 3].tolist() == [0, 768]
     assert metadata.wide[:2, 4].tolist() == [1792, 1792 + 96 + 512]
-    assert metadata.integers[0].tolist() == [0, 0, 2, 4, 192, 256, 0, 64]
-    assert metadata.integers[1].tolist() == [0, 0, 2, 4, 256, 256, 0, 0]
+    assert metadata.integers[0].tolist() == [0, 0, 2, 4, 192, 256, 64]
+    assert metadata.integers[1].tolist() == [0, 0, 2, 4, 256, 256, 0]
 
 
 @pytest.mark.parametrize("rope_precision", ["auto", "quantized"])
@@ -1475,7 +1473,7 @@ def test_mla_lossless_keeps_rope_suffix() -> None:
     metadata = _configure_lifecycle(native, {0: {"key": 64 * 576}})
     # 16384 B packed + 2048 B scales + 4096 B lossless RoPE = 352 B per row.
     assert metadata.cold_page_bytes == 22528
-    assert metadata.integers[0].tolist() == [0, 0, 1, 64, 512, 576, 64, 0]
+    assert metadata.integers[0].tolist() == [0, 0, 1, 64, 512, 576, 0]
 
 
 @pytest.mark.parametrize(
@@ -1678,7 +1676,7 @@ def test_policy_row_geometry_rejects_two_quantized_runs_and_bad_tiling() -> None
         "mla",
         where="test",
     )
-    assert (merged.quantized_row_offset_elements, merged.quantized_elements) == (0, 512)
+    assert (merged.quantized_run_start_elements, merged.quantized_run_elements) == (0, 512)
     assert merged.lossless_suffix_elements == 64
 
 
