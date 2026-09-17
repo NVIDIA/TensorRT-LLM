@@ -256,10 +256,11 @@ the names but not the submodule paths, so all five files importing them
 failed at import. They now use the canonical path.
 
 The lesson generalizes: with no pin, a target's contact with private engine
-surface is checked only by running it. Each target declares that surface as
-`REQUIRED_TRTLLM_OPS`, `test_modeling_v2_target_contract.py` asserts every name
-in it exists, and the first-forward metadata field check catches the rest --
-which turns a drifting engine from a wrong answer into a loud failure.
+surface is checked only by running it. The step contract check does that by
+calling `_build_step_args` on the metadata it was handed, which reads every
+field the target consumes -- so a rename upstream becomes a loud failure rather
+than a wrong answer. Declaring the same surface a second time, as a list of
+names beside the code that reads it, only adds something to forget to update.
 
 ## Two facts this migration surfaced about upstream
 

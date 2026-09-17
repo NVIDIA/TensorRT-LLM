@@ -55,6 +55,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
@@ -89,17 +90,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.add import add
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.concat import concat
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.copy_ import copy_
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.embedding import embedding
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.empty import empty
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.expand import expand
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.pad import pad
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.reshape import reshape
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.split import split
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.transpose import transpose
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.view_dtype import view_dtype
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -118,73 +108,6 @@ from . import weights as _weights
 # the code, so pinning it is meaningless; the architecture does not.
 _SM = (10, 3)
 
-
-#: Every trtllm op this target reaches for, in its forward and in the weight
-#: load. Declared here, asserted in tests/unittest/_torch/modeling_v2: a symbol
-#: that does not exist is a fact of the build, and the place to find that out
-#: is a machine with the extension built rather than every import of this
-#: module.
-REQUIRED_TRTLLM_OPS = (
-    "cublas_mm",
-    "bmm_out",
-    "nvfp4_gemm",
-    "flashinfer_rmsnorm",
-    "flashinfer_fused_add_rmsnorm",
-    "flashinfer_silu_and_mul",
-    "fp4_quantize",
-    "noaux_tc_op",
-    "fp4_block_scale_moe_runner",
-    "fused_moe",
-    "mla_rope_generation",
-    "mla_rope_append_paged_kv_assign_q",
-    "load_paged_kv_cache_for_mla",
-    "allgather",
-    "reducescatter",
-    # Not a forward call: the load-time expert/scale relayout in weights.py
-    # depends on it, so it belongs to the same contract.
-    "block_scale_interleave",
-)
-
-# Metadata fields consumed each step (sourcing mirrors the in-tree
-# FallbackFmha for this trtllm version; existence checked at first forward).
-# The tail group is read only by the first-forward contract check: this
-# target holds those features at the MLA columns' inert values, and the
-# asserts make that honest instead of silently dropping an enabled feature.
-_STEP_FIELDS = (
-    "all_rank_num_tokens",
-    "kv_lens_cuda_runtime",
-    "kv_lens_runtime",
-    "host_total_kv_lens",
-    "prompt_lens_cuda_runtime",
-    "prompt_lens_cpu_runtime",
-    "host_request_types_runtime",
-    "kv_cache_block_offsets",
-    "host_kv_cache_pool_pointers",
-    "host_kv_cache_pool_mapping",
-    "effective_workspace",
-    "tokens_per_block",
-    "max_num_requests",
-    "max_context_length",
-    "max_seq_len",
-    "num_contexts",
-    "num_ctx_tokens",
-    "num_seqs",
-    "trtllm_gen_jit_warmup",
-    "effective_beam_width",
-    "cache_indirection",
-    "block_ids_per_seq",
-    "is_cross",
-    "is_spec_decoding_enabled",
-    "use_spec_decoding",
-    "flash_mla_tile_scheduler_metadata",
-    "flash_mla_num_splits",
-    # Both are engine-prepared per-instance constants (max_num_sequences
-    # defaults to max_num_requests; the tree-mask flag is set from
-    # is_spec_dec_dynamic_tree, and this target's MTP is a linear tree), so
-    # they project like the rest.
-    "max_num_sequences",
-    "force_prepare_spec_dec_tree_mask",
-)
 
 # The cached-prefix context group. The engine only creates these attributes
 # when it prepares the metadata for MLA context over reused blocks — under
@@ -761,7 +684,11 @@ class ModelingV2Core(DecoderModel):
         self._rope_positions = 0
         self._side_stream: torch.cuda.Stream | None = None
         self._cached_ctx = False
-        self._step_contract_checked = False
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
+        # rather than per forward, and False for the whole life of a served
+        # engine. "pending" rather than "enabled" because the check runs once
+        # -- everything it looks at is fixed at engine construction.
+        self._contract_pending = step_contract_enabled()
 
     def _rope_tables(self, device, positions: int) -> dict:
         """The duplicated-layout GPT-J rope table the MLA ops read: per
@@ -866,7 +793,7 @@ class ModelingV2Core(DecoderModel):
                     # expands the latent attention output. Both are views of
                     # the row-regrouped kv_b_proj.
                     kvb[:hn].reshape(self.heads, self.nope, self.kv_lora),
-                    transpose(kvb[hn:].reshape(self.heads, self.v_dim, self.kv_lora), 1, 2),
+                    torch.transpose(kvb[hn:].reshape(self.heads, self.v_dim, self.kv_lora), 1, 2),
                     kvb.t(),
                     w[f"l{i}_o"].t(),
                     w[f"l{i}_norm2"],
@@ -932,9 +859,9 @@ class ModelingV2Core(DecoderModel):
                     w[f"l{i}_router"].t(),
                     w[f"l{i}_router_bias"],
                     w[f"l{i}_fc1_w"],
-                    view_dtype(w[f"l{i}_fc1_s"], torch.float8_e4m3fn),
+                    w[f"l{i}_fc1_s"].view(torch.float8_e4m3fn),
                     w[f"l{i}_fc2_w"],
-                    view_dtype(w[f"l{i}_fc2_s"], torch.float8_e4m3fn),
+                    w[f"l{i}_fc2_s"].view(torch.float8_e4m3fn),
                     # output1_scale_scalar, output1_scale_gate_scalar,
                     # output2_scale_scalar — the FC1 alpha, that alpha times
                     # the per-expert FC2 activation global scale, and the FC2
@@ -985,7 +912,7 @@ class ModelingV2Core(DecoderModel):
             "kva": w["mtp_kva"].t(),
             "kv_norm": w["mtp_kv_norm"],
             "k_b": kvb[:hn].reshape(self.heads, self.nope, self.kv_lora),
-            "v_b_t": transpose(kvb[hn:].reshape(self.heads, self.v_dim, self.kv_lora), 1, 2),
+            "v_b_t": torch.transpose(kvb[hn:].reshape(self.heads, self.v_dim, self.kv_lora), 1, 2),
             "kvb": kvb.t(),
             "o": w["mtp_o"].t(),
             "norm2": w["mtp_norm2"],
@@ -999,15 +926,23 @@ class ModelingV2Core(DecoderModel):
         }
 
     def _check_step_contract(self, md, position_ids) -> None:
-        """First-forward fail-fast: the metadata fields this target consumes
-        must exist (private trtllm surface, pinned by version), the paged
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
+        asks for it: the metadata fields this target consumes must exist
+        (private trtllm surface), the paged
         latent pool must be the single pool the MLA entries are certified
         over at the page size their fp8 column covers, the rope table must
         cover every position the engine admits, and every feature this target
         holds inert must actually be off. Everything checked is fixed at
         engine construction — once per model instance is sound."""
-        missing = [name for name in _STEP_FIELDS if not hasattr(md, name)]
-        assert not missing, f"metadata fields missing: {missing}"
+        # Calling the projection is the check: it reads every metadata field
+        # this target consumes, so a rename or removal upstream surfaces
+        # here rather than mid-forward. Deriving it this way is the point --
+        # a hand-kept list of the same names drifts silently the first time
+        # _build_step_args gains a field and nobody updates the copy.
+        try:
+            _build_step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         # position_ids is not consumed: the MLA ops derive each context
         # token's position from its row index within the sequence and each
         # generation token's from sequence_length - 1. Checked anyway so a
@@ -1084,7 +1019,7 @@ class ModelingV2Core(DecoderModel):
             "whole spec_decoding_* group at its inert values, which is only "
             "valid while the Blackwell linear-tree gating keeps it off"
         )
-        self._step_contract_checked = True
+        self._contract_pending = False
 
     def _dp_rows(self, md, num_tokens: int) -> int:
         """The uniform row count every rank pads its token block to before the
@@ -1158,7 +1093,7 @@ class ModelingV2Core(DecoderModel):
             "spec_metadata reached the trunk; the shell owns the draft loop and must not forward it"
         )
         md = attn_metadata
-        if not self._step_contract_checked:
+        if self._contract_pending:
             self._check_step_contract(md, position_ids)
         # Read after the contract check: that is where a table too short for
         # the engine's admitted max_seq_len is regrown.
@@ -1181,7 +1116,7 @@ class ModelingV2Core(DecoderModel):
 
         if inputs_embeds is None:
             assert input_ids is not None
-            h = embedding(input_ids, self.w["embed"])
+            h = nn.functional.embedding(input_ids, self.w["embed"])
         else:
             h = inputs_embeds
         num_tokens = h.shape[0]
@@ -1214,8 +1149,8 @@ class ModelingV2Core(DecoderModel):
         dp_rows = self._dp_rows(md, num_tokens)
         pad_rows = dp_rows - num_tokens
 
-        attn_out = empty([num_tokens, self.heads * self.v_dim], dt, dev)
-        attn_ctx, attn_gen = split(attn_out, [tc, gen], 0)
+        attn_out = torch.empty([num_tokens, self.heads * self.v_dim], dtype=dt, device=dev)
+        attn_ctx, attn_gen = torch.split(attn_out, [tc, gen], 0)
         x = flashinfer_rmsnorm(h, self.w["l0_norm1"], self.eps)
         residual = h
         for i in range(self.num_layers):
@@ -1235,11 +1170,11 @@ class ModelingV2Core(DecoderModel):
             # latent, up-project to the per-head [nope | rope] rows.
             q = cublas_mm(flashinfer_rmsnorm(cublas_mm(x, w_qa), w_q_norm, self.eps), w_qb)
             kva = cublas_mm(x, w_kva)
-            ckv_raw, k_pe = split(kva, [self.kv_lora, self.rope], -1)
+            ckv_raw, k_pe = torch.split(kva, [self.kv_lora, self.rope], -1)
             ckv = flashinfer_rmsnorm(ckv_raw, w_kv_norm, self.eps)
-            latent = concat([ckv, k_pe], -1)
-            q_ctx, q_gen = split(q, [tc, gen], 0)
-            latent_ctx, latent_gen = split(latent, [tc, gen], 0)
+            latent = torch.cat([ckv, k_pe], -1)
+            q_ctx, q_gen = torch.split(q, [tc, gen], 0)
+            latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
             if tc:
                 if self._cached_ctx:
@@ -1305,7 +1240,7 @@ class ModelingV2Core(DecoderModel):
                         "a context sequence arrived with a cached KV prefix "
                         "while the cached-KV metadata surface is off"
                     )
-                    ckv_full, _ = split(ckv, [tc, gen], 0)
+                    ckv_full, _ = torch.split(ckv, [tc, gen], 0)
                     k_pe_full = None
                     latent_arg = latent_ctx
                 tkv = ctx_kv_tokens
@@ -1313,25 +1248,25 @@ class ModelingV2Core(DecoderModel):
                 # FMHA hard-codes V's row stride as the full packed width and
                 # reads the column block, so V must stay this split view.
                 kv = cublas_mm(ckv_full, w_kvb)
-                k_nope, v_view = split(kv, [self.heads * self.nope, self.heads * self.v_dim], -1)
-                k = empty([tkv, self.heads, self.qk_dim], dt, dev)
-                k_nope_dst, k_pe_dst = split(k, [self.nope, self.rope], -1)
-                copy_(k_nope_dst, reshape(k_nope, [tkv, self.heads, self.nope]))
+                k_nope, v_view = torch.split(
+                    kv, [self.heads * self.nope, self.heads * self.v_dim], -1
+                )
+                k = torch.empty([tkv, self.heads, self.qk_dim], dtype=dt, device=dev)
+                k_nope_dst, k_pe_dst = torch.split(k, [self.nope, self.rope], -1)
+                k_nope_dst.copy_(torch.reshape(k_nope, [tkv, self.heads, self.nope]))
                 if k_pe_full is not None:
                     # k_pe came back from the pool already rotated; every
                     # query head shares it. On the fresh-prefill flavor the
                     # rope slice is left uninitialized instead — that call
                     # overwrites it in place from latent_cache.
-                    copy_(
-                        k_pe_dst,
-                        expand(
-                            reshape(k_pe_full, [tkv, 1, self.rope]),
-                            [tkv, self.heads, self.rope],
-                        ),
+                    k_pe_dst.copy_(
+                        torch.reshape(k_pe_full, [tkv, 1, self.rope]).expand(
+                            [tkv, self.heads, self.rope]
+                        )
                     )
                 thop_attention(
                     q=q_ctx,
-                    k=reshape(k, [tkv, self.heads * self.qk_dim]),
+                    k=torch.reshape(k, [tkv, self.heads * self.qk_dim]),
                     v=v_view,
                     output=attn_ctx,
                     latent_cache=latent_arg,
@@ -1360,10 +1295,10 @@ class ModelingV2Core(DecoderModel):
                 )
 
             if gen:
-                q3 = reshape(q_gen, [gen, self.heads, self.qk_dim])
-                q_nope, q_pe = split(q3, [self.nope, self.rope], -1)
-                fused_q = empty([gen, self.heads, self.lat_dim], dt, dev)
-                fq_nope, _ = split(fused_q, [self.kv_lora, self.rope], -1)
+                q3 = torch.reshape(q_gen, [gen, self.heads, self.qk_dim])
+                q_nope, q_pe = torch.split(q3, [self.nope, self.rope], -1)
+                fused_q = torch.empty([gen, self.heads, self.lat_dim], dtype=dt, device=dev)
+                fq_nope, _ = torch.split(fused_q, [self.kv_lora, self.rope], -1)
                 # Absorbed q: (q_nope @ W_k_nope) is what the latent-space
                 # dot product needs. Over an fp8 pool the next call **reads**
                 # this half to build the quantized query, so this BMM must
@@ -1371,18 +1306,20 @@ class ModelingV2Core(DecoderModel):
                 # one stream, which is what makes that safe. (On a bf16 pool
                 # they write disjoint halves and may overlap; assembling from
                 # that reading and switching to an fp8 cache is a silent race.)
-                bmm_out(transpose(q_nope, 0, 1), k_b, transpose(fq_nope, 0, 1))
-                cu_q = empty([gen + 1], torch.int32, dev)
-                cu_kv = empty([gen + 1], torch.int32, dev)
-                counter = empty([1], torch.uint32, dev)
+                bmm_out(torch.transpose(q_nope, 0, 1), k_b, torch.transpose(fq_nope, 0, 1))
+                cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+                cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+                counter = torch.empty([1], dtype=torch.uint32, device=dev)
                 # The fp8 decode triple: the quantized query the FMHA reads
                 # instead of fused_q, and the two folded softmax/output scales
                 # it takes instead of either kv scale tensor. All three are
                 # written by the call below from q_scaling, the MLA dims and
                 # the read-side factor (None = 1.0).
-                quant_q = empty([gen, self.heads, self.lat_dim], torch.float8_e4m3fn, dev)
-                bmm1_scale = empty([2], torch.float32, dev)
-                bmm2_scale = empty([1], torch.float32, dev)
+                quant_q = torch.empty(
+                    [gen, self.heads, self.lat_dim], dtype=torch.float8_e4m3fn, device=dev
+                )
+                bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
+                bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
                 mla_rope_generation(
                     fused_q,
                     q_pe,
@@ -1425,9 +1362,9 @@ class ModelingV2Core(DecoderModel):
                     self.v_dim,
                     True,
                 )
-                lat_out = empty([gen, self.heads * self.kv_lora], dt, dev)
+                lat_out = torch.empty([gen, self.heads * self.kv_lora], dtype=dt, device=dev)
                 thop_attention(
-                    q=reshape(fused_q, [gen, self.heads * self.lat_dim]),
+                    q=torch.reshape(fused_q, [gen, self.heads * self.lat_dim]),
                     k=None,
                     v=None,
                     output=lat_out,
@@ -1462,9 +1399,9 @@ class ModelingV2Core(DecoderModel):
                     **self._call,
                 )
                 bmm_out(
-                    transpose(reshape(lat_out, [gen, self.heads, self.kv_lora]), 0, 1),
+                    torch.transpose(torch.reshape(lat_out, [gen, self.heads, self.kv_lora]), 0, 1),
                     v_b_t,
-                    transpose(reshape(attn_gen, [gen, self.heads, self.v_dim]), 0, 1),
+                    torch.transpose(torch.reshape(attn_gen, [gen, self.heads, self.v_dim]), 0, 1),
                 )
 
             # Replicated o_proj over this rank's own tokens: complete as it
@@ -1506,7 +1443,11 @@ class ModelingV2Core(DecoderModel):
                 # space exactly once: every rank routes the identical full
                 # token set, so a token's top-8 ids agree across ranks and
                 # each id falls in exactly one window.
-                o_pad = o if not pad_rows else pad(o, [0, 0, 0, pad_rows])
+                o_pad = (
+                    o
+                    if not pad_rows
+                    else nn.functional.pad(o, [0, 0, 0, pad_rows], mode="constant", value=0.0)
+                )
                 o_all = allgather(o_pad, None, self.dp_group)
                 # The expert call is chunked to `_MOE_MAX_T` rows: the
                 # gathered set reaches 4 * max_num_tokens and both the runner's
@@ -1514,7 +1455,7 @@ class ModelingV2Core(DecoderModel):
                 # Every token is independent through routing, quantization and
                 # the expert GEMMs, so the chunks are the whole call, re-joined.
                 parts = []
-                for chunk in split(o_all, _moe_chunk_sizes(o_all.shape[0]), 0):
+                for chunk in torch.split(o_all, _moe_chunk_sizes(o_all.shape[0]), 0):
                     # Raw bf16 logits: noaux_tc_op applies the sigmoid
                     # itself, and its weight dtype follows the logits, so
                     # bf16 in means the MoE runner's bf16 topk_weights need
@@ -1538,7 +1479,7 @@ class ModelingV2Core(DecoderModel):
                             None,
                             None,
                             xq,
-                            view_dtype(xsf, torch.float8_e4m3fn),
+                            xsf.view(torch.float8_e4m3fn),
                             fc1_w,
                             fc1_s,
                             None,
@@ -1566,20 +1507,22 @@ class ModelingV2Core(DecoderModel):
                             topk_ids,
                         )[0]
                     )
-                routed_all = parts[0] if len(parts) == 1 else concat(parts, 0)
+                routed_all = parts[0] if len(parts) == 1 else torch.cat(parts, 0)
                 # The four windows' partials over the whole token set sum to
                 # the layer's routed output; the scatter hands this rank back
                 # exactly its own rows. bf16 in: the op sums, and it sums
                 # float8 as raw bytes.
                 routed_pad = reducescatter(routed_all, None, self.dp_group)
                 routed = (
-                    routed_pad if not pad_rows else split(routed_pad, [num_tokens, pad_rows], 0)[0]
+                    routed_pad
+                    if not pad_rows
+                    else torch.split(routed_pad, [num_tokens, pad_rows], 0)[0]
                 )
                 # Join: the add is the first reader of `shared` on this stream,
                 # and `shared` stays referenced until then, so the branch's
                 # allocations cannot be recycled underneath it.
                 main.wait_stream(side)
-                mlp_out = add(routed, shared)
+                mlp_out = torch.add(routed, shared)
             flashinfer_fused_add_rmsnorm(mlp_out, residual, next_norm[i], self.eps)
             x = mlp_out
         return x
@@ -1678,10 +1621,14 @@ class MTPLayer:
         core = self.core
         dp_rows = _mtp_dp_rows(all_rank_num_tokens, core.rank, core.dp_size, rows)
         pad_rows = dp_rows - rows
-        x_pad = x if not pad_rows else pad(x, [0, 0, 0, pad_rows])
+        x_pad = (
+            x
+            if not pad_rows
+            else nn.functional.pad(x, [0, 0, 0, pad_rows], mode="constant", value=0.0)
+        )
         x_all = allgather(x_pad, None, core.dp_group)
         parts = []
-        for chunk in split(x_all, _moe_chunk_sizes(x_all.shape[0]), 0):
+        for chunk in torch.split(x_all, _moe_chunk_sizes(x_all.shape[0]), 0):
             logits = cublas_mm(chunk, mw["router"], None, torch.float32)
             topk_w, topk_ids = noaux_tc_op(
                 logits,
@@ -1707,9 +1654,9 @@ class MTPLayer:
                     activation_type=_FUSED_MOE_ACT_SWIGLU,
                 )[0]
             )
-        routed_all = parts[0] if len(parts) == 1 else concat(parts, 0)
+        routed_all = parts[0] if len(parts) == 1 else torch.cat(parts, 0)
         routed_pad = reducescatter(routed_all, None, core.dp_group)
-        return routed_pad if not pad_rows else split(routed_pad, [rows, pad_rows], 0)[0]
+        return routed_pad if not pad_rows else torch.split(routed_pad, [rows, pad_rows], 0)[0]
 
     def forward(
         self,
@@ -1724,9 +1671,10 @@ class MTPLayer:
         mw, rope = core._mtp, core._rope
         assert mw is not None and rope is not None, "load_weights must run before the draft loop"
         assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-        assert core._step_contract_checked, (
+        assert not core._contract_pending, (
             "the trunk's first-forward contract check has not run; the shell "
-            "calls the core before the worker, so this cannot be reached first"
+            "calls the core before the worker, so this cannot be reached first. "
+            "Vacuous when the check is off, which is the only time it is free"
         )
         md = attn_metadata
         step = _build_step_args(md)
@@ -1772,26 +1720,26 @@ class MTPLayer:
         # config stub or manifest declares that.
         layer_idx = core.num_layers
 
-        e = embedding(input_ids, embed_tokens)
+        e = nn.functional.embedding(input_ids, embed_tokens)
         en = flashinfer_rmsnorm(e, mw["enorm"], core.eps)
         hn = flashinfer_rmsnorm(hidden_states, mw["hnorm"], core.eps)
         halves = [en, hn] if _MTP_EMBED_BLOCK_FIRST else [hn, en]
-        x = cublas_mm(concat(halves, -1), mw["eh"])
+        x = cublas_mm(torch.cat(halves, -1), mw["eh"])
 
         residual = x
         xn = flashinfer_rmsnorm(x, mw["norm1"], core.eps)
-        attn_out = empty([rows, core.heads * core.v_dim], dt, dev)
-        attn_ctx, attn_gen = split(attn_out, [tc, gen], 0)
+        attn_out = torch.empty([rows, core.heads * core.v_dim], dtype=dt, device=dev)
+        attn_ctx, attn_gen = torch.split(attn_out, [tc, gen], 0)
         q = cublas_mm(
             flashinfer_rmsnorm(cublas_mm(xn, mw["qa"]), mw["q_norm"], core.eps),
             mw["qb"],
         )
         kva = cublas_mm(xn, mw["kva"])
-        ckv_raw, k_pe = split(kva, [core.kv_lora, core.rope], -1)
+        ckv_raw, k_pe = torch.split(kva, [core.kv_lora, core.rope], -1)
         ckv = flashinfer_rmsnorm(ckv_raw, mw["kv_norm"], core.eps)
-        latent = concat([ckv, k_pe], -1)
-        q_ctx, q_gen = split(q, [tc, gen], 0)
-        latent_ctx, latent_gen = split(latent, [tc, gen], 0)
+        latent = torch.cat([ckv, k_pe], -1)
+        q_ctx, q_gen = torch.split(q, [tc, gen], 0)
+        latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
         if tc:
             # A context request reaches the draft loop at step 0 only, fed
@@ -1847,26 +1795,24 @@ class MTPLayer:
                     "a context sequence arrived with a cached KV prefix while "
                     "the cached-KV metadata surface is off"
                 )
-                ckv_full, _ = split(ckv, [tc, gen], 0)
+                ckv_full, _ = torch.split(ckv, [tc, gen], 0)
                 k_pe_full = None
                 latent_arg = latent_ctx
             tkv = ctx_kv_tokens
             kv = cublas_mm(ckv_full, mw["kvb"])
-            k_nope, v_view = split(kv, [core.heads * core.nope, core.heads * core.v_dim], -1)
-            k = empty([tkv, core.heads, core.qk_dim], dt, dev)
-            k_nope_dst, k_pe_dst = split(k, [core.nope, core.rope], -1)
-            copy_(k_nope_dst, reshape(k_nope, [tkv, core.heads, core.nope]))
+            k_nope, v_view = torch.split(kv, [core.heads * core.nope, core.heads * core.v_dim], -1)
+            k = torch.empty([tkv, core.heads, core.qk_dim], dtype=dt, device=dev)
+            k_nope_dst, k_pe_dst = torch.split(k, [core.nope, core.rope], -1)
+            k_nope_dst.copy_(torch.reshape(k_nope, [tkv, core.heads, core.nope]))
             if k_pe_full is not None:
-                copy_(
-                    k_pe_dst,
-                    expand(
-                        reshape(k_pe_full, [tkv, 1, core.rope]),
-                        [tkv, core.heads, core.rope],
-                    ),
+                k_pe_dst.copy_(
+                    torch.reshape(k_pe_full, [tkv, 1, core.rope]).expand(
+                        [tkv, core.heads, core.rope]
+                    )
                 )
             thop_attention(
                 q=q_ctx,
-                k=reshape(k, [tkv, core.heads * core.qk_dim]),
+                k=torch.reshape(k, [tkv, core.heads * core.qk_dim]),
                 v=v_view,
                 output=attn_ctx,
                 latent_cache=latent_arg,
@@ -1892,17 +1838,19 @@ class MTPLayer:
             )
 
         if gen:
-            q3 = reshape(q_gen, [gen, core.heads, core.qk_dim])
-            q_nope, q_pe = split(q3, [core.nope, core.rope], -1)
-            fused_q = empty([gen, core.heads, core.lat_dim], dt, dev)
-            fq_nope, _ = split(fused_q, [core.kv_lora, core.rope], -1)
-            bmm_out(transpose(q_nope, 0, 1), mw["k_b"], transpose(fq_nope, 0, 1))
-            cu_q = empty([gen + 1], torch.int32, dev)
-            cu_kv = empty([gen + 1], torch.int32, dev)
-            counter = empty([1], torch.uint32, dev)
-            quant_q = empty([gen, core.heads, core.lat_dim], torch.float8_e4m3fn, dev)
-            bmm1_scale = empty([2], torch.float32, dev)
-            bmm2_scale = empty([1], torch.float32, dev)
+            q3 = torch.reshape(q_gen, [gen, core.heads, core.qk_dim])
+            q_nope, q_pe = torch.split(q3, [core.nope, core.rope], -1)
+            fused_q = torch.empty([gen, core.heads, core.lat_dim], dtype=dt, device=dev)
+            fq_nope, _ = torch.split(fused_q, [core.kv_lora, core.rope], -1)
+            bmm_out(torch.transpose(q_nope, 0, 1), mw["k_b"], torch.transpose(fq_nope, 0, 1))
+            cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+            cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+            counter = torch.empty([1], dtype=torch.uint32, device=dev)
+            quant_q = torch.empty(
+                [gen, core.heads, core.lat_dim], dtype=torch.float8_e4m3fn, device=dev
+            )
+            bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
+            bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
             mla_rope_generation(
                 fused_q,
                 q_pe,
@@ -1945,9 +1893,9 @@ class MTPLayer:
                 core.v_dim,
                 True,
             )
-            lat_out = empty([gen, core.heads * core.kv_lora], dt, dev)
+            lat_out = torch.empty([gen, core.heads * core.kv_lora], dtype=dt, device=dev)
             thop_attention(
-                q=reshape(fused_q, [gen, core.heads * core.lat_dim]),
+                q=torch.reshape(fused_q, [gen, core.heads * core.lat_dim]),
                 k=None,
                 v=None,
                 output=lat_out,
@@ -1976,9 +1924,9 @@ class MTPLayer:
                 **core._call,
             )
             bmm_out(
-                transpose(reshape(lat_out, [gen, core.heads, core.kv_lora]), 0, 1),
+                torch.transpose(torch.reshape(lat_out, [gen, core.heads, core.kv_lora]), 0, 1),
                 mw["v_b_t"],
-                transpose(reshape(attn_gen, [gen, core.heads, core.v_dim]), 0, 1),
+                torch.transpose(torch.reshape(attn_gen, [gen, core.heads, core.v_dim]), 0, 1),
             )
 
         o = cublas_mm(attn_out, mw["o"])
@@ -1988,7 +1936,7 @@ class MTPLayer:
         # The layer's output is the residual stream itself, un-normalized:
         # `shared_head` owns the module's norm, and the runtime feeds this
         # tensor straight back in as the next draft step's `h`.
-        return add(residual, add(routed, shared))
+        return torch.add(residual, torch.add(routed, shared))
 
 
 class DraftModel:
@@ -2131,7 +2079,7 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
         # catalog's row-lookup entry (torch.nn.functional.embedding), used here
         # for what it is — `hidden[gather_ids]`.
         logits = self.logits_processor.forward(
-            embedding(spec_metadata.gather_ids, hidden),
+            nn.functional.embedding(spec_metadata.gather_ids, hidden),
             self.lm_head,
             attn_metadata,
             True,
