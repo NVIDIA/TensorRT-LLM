@@ -647,6 +647,9 @@ class FP4MQALogitsKernel:
         self.emit_block_meta_deferred = (
             emit_block_meta and not emit_hit_stats and not emit_seed_counts
         )
+        # plain build: each tile's logits store is deferred into the next
+        # tile's TMEM-load shadow (emitting builds place block_max there)
+        self.defer_logits = not emit_block_meta
         # emit_seed_counts (requires emit_block_meta): per row, count
         # stored logits >= each of the T=3 caller-provided thresholds.
         # Counts are computed on the POST-conversion value over valid
@@ -3058,6 +3061,12 @@ class FP4MQALogitsKernel:
                 # loop-carried: the deferred logits / block_max flushes read
                 # the last tile's position after the loop
                 kv_pos = cutlass.Int32(0)
+                # deferred logits store (plain build): the previous tile's
+                # values are stored under the next tile's first TMEM load
+                lg_pend = cute.make_rmem_tensor(next_n, self.output_dtype)
+                lg_row = cutlass.Int32(0)
+                lg_pos = cutlass.Int32(0)
+                lg_on = cutlass.Int32(0)
                 if cutlass.const_expr(self.emit_block_meta):
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
@@ -3258,6 +3267,10 @@ class FP4MQALogitsKernel:
 
                     # --- First sub-tile LDTM ---
                     cute.copy(tc_0, tTR_0[(None, None, None, 0, 0)], tTR_rAcc)
+                    if cutlass.const_expr(self.defer_logits):
+                        if lg_on != cutlass.Int32(0):
+                            for _t in cutlass.range_constexpr(next_n):
+                                mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
                     if cutlass.const_expr(self.emit_block_meta_deferred):
                         # previous tile's block_max under this tile's TMEM
                         # load; all 32 lanes store the warp-uniform value
@@ -3446,6 +3459,8 @@ class FP4MQALogitsKernel:
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = stored_t
+                        elif cutlass.const_expr(self.defer_logits):
+                            lg_pend[t] = stored_t
                         else:
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = stored_t
@@ -3837,11 +3852,18 @@ class FP4MQALogitsKernel:
                                 hacc_sum[t] = hacc_sum[t] + seladd
                                 hacc_cnt[t] = hacc_cnt[t] + meta_hit
 
-                    if cutlass.const_expr(self.use_batched_store):
+                    if cutlass.const_expr(self.use_batched_store and self.defer_logits):
+                        for t in cutlass.range_constexpr(next_n):
+                            lg_pend[t] = result_arr[t]
+                    elif cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
+                    if cutlass.const_expr(self.defer_logits):
+                        lg_row = q_idx * next_n
+                        lg_pos = kv_pos
+                        lg_on = cutlass.Int32(1)
 
                     if cutlass.const_expr(self.dynamic_sched):
                         left = left - cutlass.Int32(1)
@@ -3881,6 +3903,10 @@ class FP4MQALogitsKernel:
                         # Update while-loop condition
                         has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.defer_logits):
+                    if lg_on != cutlass.Int32(0):
+                        for _t in cutlass.range_constexpr(next_n):
+                            mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
                 if cutlass.const_expr(self.emit_block_meta_deferred):
                     # flush the last tile's pending block_max (WG 0); a
                     # segment ending mid-row skipped the tail mask, so mask here
@@ -3961,6 +3987,12 @@ class FP4MQALogitsKernel:
                 # loop-carried: the deferred logits / block_max flushes read
                 # the last tile's position after the loop
                 kv_pos = cutlass.Int32(0)
+                # deferred logits store (plain build): the previous tile's
+                # values are stored under the next tile's first TMEM load
+                lg_pend = cute.make_rmem_tensor(next_n, self.output_dtype)
+                lg_row = cutlass.Int32(0)
+                lg_pos = cutlass.Int32(0)
+                lg_on = cutlass.Int32(0)
                 if cutlass.const_expr(self.emit_block_meta):
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
@@ -4164,6 +4196,10 @@ class FP4MQALogitsKernel:
 
                     # --- First sub-tile LDTM (WG1) ---
                     cute.copy(tc_1, tTR_1[(None, None, None, 0, 0)], tTR_rAcc)
+                    if cutlass.const_expr(self.defer_logits):
+                        if lg_on != cutlass.Int32(0):
+                            for _t in cutlass.range_constexpr(next_n):
+                                mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
                     if cutlass.const_expr(self.emit_block_meta_deferred):
                         # previous tile's block_max under this tile's TMEM
                         # load; all 32 lanes store the warp-uniform value
@@ -4344,6 +4380,8 @@ class FP4MQALogitsKernel:
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = stored_t
+                        elif cutlass.const_expr(self.defer_logits):
+                            lg_pend[t] = stored_t
                         else:
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = stored_t
@@ -4735,11 +4773,18 @@ class FP4MQALogitsKernel:
                                 hacc_sum[t] = hacc_sum[t] + seladd
                                 hacc_cnt[t] = hacc_cnt[t] + meta_hit
 
-                    if cutlass.const_expr(self.use_batched_store):
+                    if cutlass.const_expr(self.use_batched_store and self.defer_logits):
+                        for t in cutlass.range_constexpr(next_n):
+                            lg_pend[t] = result_arr[t]
+                    elif cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
+                    if cutlass.const_expr(self.defer_logits):
+                        lg_row = q_idx * next_n
+                        lg_pos = kv_pos
+                        lg_on = cutlass.Int32(1)
 
                     if cutlass.const_expr(self.dynamic_sched):
                         left = left - cutlass.Int32(1)
@@ -4779,6 +4824,10 @@ class FP4MQALogitsKernel:
                         # Update while-loop condition
                         has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.defer_logits):
+                    if lg_on != cutlass.Int32(0):
+                        for _t in cutlass.range_constexpr(next_n):
+                            mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
                 if cutlass.const_expr(self.emit_block_meta_deferred):
                     # flush the last tile's pending block_max (WG 1); a
                     # segment ending mid-row skipped the tail mask, so mask here
