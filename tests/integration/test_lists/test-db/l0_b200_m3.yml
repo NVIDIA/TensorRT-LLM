@@ -28,3 +28,9 @@ l0_b200_m3:
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
+  - unittest/_torch/test_connector_adp.py
+  - unittest/_torch/test_connector_shared_pool.py
+  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[False-kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[True-kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[False-kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[True-kv_cache_manager_v2]
