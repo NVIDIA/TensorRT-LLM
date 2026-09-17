@@ -585,10 +585,19 @@ def test_collect_llm_api_config_propagates_unexpected_errors(monkeypatch):
         collect_llm_api_config_payloads(_ExampleConfig())
 
 
-@pytest.mark.parametrize("metadata", ({"status": "beta"}, {"telemetry": True}))
+@pytest.mark.parametrize(
+    "metadata", ({"status": "beta"}, {"telemetry": True}, {"telemetry": False})
+)
 def test_field_wrapper_rejects_callable_json_schema_extra_with_metadata(metadata):
     with pytest.raises(TypeError, match="json_schema_extra must be a dict"):
         Field(default=1, json_schema_extra=lambda schema: None, **metadata)
+
+
+def test_field_wrapper_preserves_callable_json_schema_extra_without_metadata():
+    class _Config(StrictBaseModel):
+        value: int = Field(default=1, json_schema_extra=lambda schema: schema.update(marker=True))
+
+    assert _Config.model_json_schema()["properties"]["value"]["marker"] is True
 
 
 def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
