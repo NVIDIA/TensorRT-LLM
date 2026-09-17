@@ -23,9 +23,11 @@ anonymous quota being per-IP and exhausted by shared CI egress.
 The selected architecture DBs are merged locally through the compact coverage
 schema, producing the one DB consumed by `main.py`.
 
-Two entry points. `--print-selection` prints the selection metadata and stops.
-`--prepare DIR` goes on to download, unpack, and merge the winner, drop that
-JSON beside it, and print the two paths consumed by CBTS.
+Three entry points. `--resolve-build` prints the newest (or explicitly pinned)
+build metadata without checking or downloading the PR diff. `--print-selection`
+also checks diff compatibility and stops. `--prepare DIR` downloads, unpacks,
+and merges the winner, drops that JSON beside it, and prints the two paths
+consumed by CBTS.
 """
 
 from __future__ import annotations
@@ -363,7 +365,7 @@ def _selection_accepts_pr_diff(
         return True
     sel["coverage_decline_reason"] = (
         "coverage tier declined: Tier-2 residual does not apply cleanly to "
-        f"latest DB commit {sel['commit'][:10]} ({sel['patch_apply_status']})"
+        f"selected DB commit {sel['commit'][:10]} ({sel['patch_apply_status']})"
     )
     sel["coverage_decline_category"] = f"compatibility_{sel['patch_apply_status']}"
     print(f"[artifact] {sel['coverage_decline_reason']}", file=sys.stderr)
@@ -423,19 +425,50 @@ def select_tarball(
     return None
 
 
-def measure_drift(sel: dict, pr_head: Optional[str]) -> dict:
-    """Add PR-base relation metadata to a pinned selection, in place."""
-    sel.setdefault("base_commit", None)
-    sel.setdefault("drift", None)
-    sel.setdefault("drift_status", "unknown")
-    if not pr_head or not sel.get("commit"):
-        return sel
-    base = merge_base(pr_head)
-    if not base:
-        return sel
-    sel["base_commit"] = base
-    sel["drift"], sel["drift_status"] = drift(sel["commit"], base)
-    return sel
+def select_build(
+    build: int,
+    pr_base_commit: str,
+    expected_commit: Optional[str] = None,
+    artifact_base: str = ARTIFACT_BASE,
+) -> Optional[dict]:
+    """Resolve and validate one explicitly pinned coverage build."""
+    urls = tarball_urls(build, artifact_base)
+    if not all(_exists(url) for url in urls):
+        print(f"[artifact] pinned build {build}: coverage pair is incomplete", file=sys.stderr)
+        return None
+    commit = build_commit(build, artifact_base)
+    if not commit:
+        print(f"[artifact] pinned build {build}: commit unknown", file=sys.stderr)
+        return None
+    if expected_commit is not None and commit != expected_commit:
+        print(
+            f"[artifact] pinned build {build}: commit changed from {expected_commit} to {commit}",
+            file=sys.stderr,
+        )
+        return None
+    distance, status = drift(commit, pr_base_commit)
+    if distance is None:
+        print(
+            f"[artifact] pinned build {build}: topology against the PR base unknown",
+            file=sys.stderr,
+        )
+        return None
+    if status not in ("ahead", "behind", "identical"):
+        print(
+            f"[artifact] pinned build {build}: relation to the PR base is {status or 'unknown'}",
+            file=sys.stderr,
+        )
+        return None
+    return {
+        "url": urls[0],
+        "urls": urls,
+        "build": build,
+        "commit": commit,
+        "base_commit": pr_base_commit,
+        "drift": distance,
+        "drift_status": status,
+        "lag": compare_distance(commit),
+    }
 
 
 def describe(sel: dict) -> str:
@@ -492,6 +525,8 @@ def prepare(
     dest_dir: str,
     pr_head: Optional[str],
     relevant_paths: list[str],
+    build: Optional[int] = None,
+    expected_commit: Optional[str] = None,
 ) -> Optional[dict]:
     """Resolve, download, and merge the DB pair; `{path, meta}` or None on failure.
 
@@ -505,7 +540,11 @@ def prepare(
     if not pr_base_commit:
         print("[artifact] could not resolve the PR base commit", file=sys.stderr)
         return None
-    sel = select_tarball(pr_base_commit)
+    sel = (
+        select_build(build, pr_base_commit, expected_commit=expected_commit)
+        if build is not None
+        else select_tarball(pr_base_commit)
+    )
     if sel is None:
         return None
     compatible = _selection_accepts_pr_diff(
@@ -568,6 +607,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument(
+        "--resolve-build",
+        action="store_true",
+        help="resolve and print build metadata without checking or downloading the PR diff",
+    )
+    ap.add_argument(
         "--print-selection",
         action="store_true",
         help="resolve and print {urls, build, commit, lag, base_commit, drift, "
@@ -575,6 +619,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     ap.add_argument(
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
+    )
+    ap.add_argument(
+        "--expected-commit",
+        default=None,
+        help="require an explicitly pinned build to retain this coverage commit",
     )
     ap.add_argument(
         "--prepare",
@@ -587,7 +636,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--pr-head",
         default=None,
         help="required PR head revision; its merge base measures DB drift and defines "
-        "the diff checked against the latest coverage revision",
+        "the diff checked against the selected coverage revision",
     )
     ap.add_argument(
         "--paths-json",
@@ -596,14 +645,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    if not args.print_selection and not args.prepare:
-        ap.error("one of --print-selection / --prepare is required")
+    if sum((args.resolve_build, args.print_selection, args.prepare is not None)) != 1:
+        ap.error("exactly one of --resolve-build / --print-selection / --prepare is required")
+    if args.expected_commit is not None and args.build is None:
+        ap.error("--expected-commit requires --build")
 
     if args.prepare:
         relevant_paths = _load_paths_json(args.paths_json)
         if relevant_paths is None:
             return 1
-        ready = prepare(args.prepare, args.pr_head, relevant_paths)
+        ready = prepare(
+            args.prepare,
+            args.pr_head,
+            relevant_paths,
+            build=args.build,
+            expected_commit=args.expected_commit,
+        )
         if ready is None:
             return 1
         print(json.dumps(ready))
@@ -612,31 +669,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.pr_head:
         print("[artifact] --pr-head is required", file=sys.stderr)
         return 1
-    relevant_paths = _load_paths_json(args.paths_json)
-    if relevant_paths is None:
-        return 1
     pr_base_commit = merge_base(args.pr_head)
     if not pr_base_commit:
         return 1
 
     if args.build is not None:
-        urls = tarball_urls(args.build)
-        if not all(_exists(url) for url in urls):
-            return 1
-        commit = build_commit(args.build)
-        best = {
-            "url": urls[0],
-            "urls": urls,
-            "build": args.build,
-            "commit": commit,
-            "lag": compare_distance(commit) if commit else None,
-        }
-        measure_drift(best, args.pr_head)
-        if best["drift"] is None or best["drift_status"] not in ("ahead", "behind", "identical"):
-            return 1
+        best = select_build(
+            args.build,
+            pr_base_commit,
+            expected_commit=args.expected_commit,
+        )
     else:
         best = select_tarball(pr_base_commit)
     if best is None:
+        return 1
+    if args.resolve_build:
+        print(json.dumps(best))
+        return 0
+
+    relevant_paths = _load_paths_json(args.paths_json)
+    if relevant_paths is None:
         return 1
     if not _selection_accepts_pr_diff(best, pr_base_commit, args.pr_head, relevant_paths):
         return 1
