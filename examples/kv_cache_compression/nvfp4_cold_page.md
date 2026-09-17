@@ -349,15 +349,14 @@ Bytes per hot row at FP8, NoPE and V always NVFP4:
 |---|---|---|
 | MLA 576-element latent row (DeepSeek-V3.x, GLM-5.2, Kimi-K2) | 324 B (1.78x) | 352 B (1.64x) |
 | DeepSeek-V4 compressed row (512 elements per 4 tokens) | 288 B (1.78x) | 316 B (1.62x) |
-| Qwen3.5 / Qwen3-Next K + V (256 elements each, 64 rotated at the row start) | 288 B (1.78x) | not yet supported, see below |
+| Qwen3.5 / Qwen3-Next K + V (256 elements each, 64 rotated at the row start) | 288 B (1.78x) | 316 B (1.62x) |
 
 `lossless` is rejected where it cannot apply: models whose K rows are fully
-rotated (Qwen3, Llama, GPT-OSS) have no NoPE part left to quantize; models with
-per-layer-type RoPE (Gemma4) have no single row shape; and partial-rotary GQA
-rows (Qwen3.5, Qwen3-Next) keep their RoPE at the start of the row, which the
-cold-page kernel does not yet preserve. These models use `quantized`, which is
-also what `auto` selects for them. The packed `kv_cache_config.dtype="fp8_ds_mla"`
-KV layout is not supported by cold-page quantization in any mode.
+rotated (Qwen3, Llama, GPT-OSS) have no NoPE part left to quantize, and models
+with per-layer-type RoPE (Gemma4) have no single row shape. These models use
+`quantized`, which is also what `auto` selects for them. The packed
+`kv_cache_config.dtype="fp8_ds_mla"` KV layout is not supported by cold-page
+quantization in any mode.
 
 ## Enablement Checklist
 

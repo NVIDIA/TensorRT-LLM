@@ -52,9 +52,10 @@ struct Nvfp4ColdPageKernelParams
 {
     std::int32_t numKvHeads;
     std::int32_t tokensPerPage;
-    std::int32_t headDim;
+    std::int32_t quantizedElements;
     std::int32_t rawRowStrideElements;
     std::int32_t losslessSuffixBytesPerRow;
+    std::int32_t quantizedRowOffsetElements;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -107,14 +108,15 @@ Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPag
                 static_cast<std::int64_t>(buffer.coldScaleOffset), static_cast<std::int64_t>(buffer.coldPaddingOffset)};
         metadata.integers[index] = {static_cast<std::int32_t>(buffer.coldPaddingBytes),
             static_cast<std::int32_t>(buffer.transform), buffer.params.numKvHeads, buffer.params.tokensPerPage,
-            buffer.params.headDim, buffer.params.rawRowStrideElements, buffer.params.losslessSuffixBytesPerRow};
+            buffer.params.quantizedElements, buffer.params.rawRowStrideElements,
+            buffer.params.losslessSuffixBytesPerRow, buffer.params.quantizedRowOffsetElements};
         metadata.scales[index] = {buffer.params.nvfp4ScaleOrigQuant, buffer.params.nvfp4ScaleQuantOrig,
             buffer.params.fp8ScaleOrigQuant, buffer.params.fp8ScaleQuantOrig};
         if (buffer.transform != Nvfp4ColdPageTransform::kLosslessCopy)
         {
             auto const halfGroups = static_cast<std::uint32_t>(buffer.params.numKvHeads)
                 * static_cast<std::uint32_t>(buffer.params.tokensPerPage)
-                * (static_cast<std::uint32_t>(buffer.params.headDim) / 8U);
+                * (static_cast<std::uint32_t>(buffer.params.quantizedElements) / 8U);
             metadata.maxHalfGroupsPerTile = std::max(metadata.maxHalfGroupsPerTile, std::min(halfGroups, 2048U));
         }
     }
@@ -371,7 +373,7 @@ Nvfp4ColdPageKernelParams makeParams(PageGeometry const& geometry = kDefaultGeom
     Nvfp4ColdPageKernelParams params{};
     params.numKvHeads = geometry.numHeads;
     params.tokensPerPage = geometry.tokensPerPage;
-    params.headDim = geometry.headDim;
+    params.quantizedElements = geometry.headDim;
     params.rawRowStrideElements = geometry.headDim;
     params.nvfp4ScaleOrigQuant = role == 0U ? 1.0F : 2.0F;
     params.nvfp4ScaleQuantOrig = role == 0U ? 1.0F : 0.5F;
@@ -1168,6 +1170,144 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
     coldStorage.expectCanaries();
 }
 
+// One buffer whose rows are [lossless prefix][NVFP4 run][lossless suffix]:
+// the shape the RoPE-precision switch produces for partial-rotary GQA K rows
+// (prefix) and MLA latent rows (suffix).
+std::vector<std::uint8_t> makeStridedRawPage(RawKind kind, std::size_t page, std::int32_t rowElements,
+    std::int32_t offsetElements, Nvfp4ColdPageKernelParams const& params, PageGeometry const& geometry)
+{
+    std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
+    std::size_t const elementBytes = rawElementBytes(kind);
+    std::size_t const rowBytes = static_cast<std::size_t>(rowElements) * elementBytes;
+    std::size_t const runBytes = static_cast<std::size_t>(geometry.headDim) * elementBytes;
+    std::size_t const prefixBytes = static_cast<std::size_t>(offsetElements) * elementBytes;
+    auto const run = makeRawPage(kind, page, 0U, params, geometry, InputPattern::kDense);
+    std::vector<std::uint8_t> raw(rows * rowBytes);
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        auto* rowStart = raw.data() + row * rowBytes;
+        for (std::size_t byte = 0; byte < rowBytes; ++byte)
+        {
+            rowStart[byte] = static_cast<std::uint8_t>((41U * row + 23U * byte + 13U * page + 7U) & 0xFFU);
+        }
+        std::memcpy(rowStart + prefixBytes, run.data() + row * runBytes, runBytes);
+    }
+    return raw;
+}
+
+void runPrefixSuffixStridedRoundTrip(RawKind kind, PageGeometry const& geometry, std::int32_t rowElements,
+    std::int32_t offsetElements, float nvfp4ScaleOrigQuant = 1.0F, float nvfp4ScaleQuantOrig = 1.0F)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (!tensorrt_llm::common::isSM100Family())
+    {
+        GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
+    }
+    ASSERT_LE(offsetElements + geometry.headDim, rowElements);
+
+    std::size_t constexpr numPages = 2U;
+    std::size_t constexpr slotCapacity = 8U;
+    std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
+    std::size_t const elementBytes = rawElementBytes(kind);
+    std::size_t const suffixElements = static_cast<std::size_t>(rowElements - offsetElements - geometry.headDim);
+    auto params = makeParams(geometry);
+    params.rawRowStrideElements = rowElements;
+    params.quantizedRowOffsetElements = offsetElements;
+    params.losslessSuffixBytesPerRow = static_cast<std::int32_t>(suffixElements * elementBytes);
+    params.nvfp4ScaleOrigQuant = nvfp4ScaleOrigQuant;
+    params.nvfp4ScaleQuantOrig = nvfp4ScaleQuantOrig;
+    params.fp8ScaleOrigQuant = 1.0F;
+    params.fp8ScaleQuantOrig = 1.0F;
+    std::size_t const rawPageBytes = rows * static_cast<std::size_t>(rowElements) * elementBytes;
+    std::size_t const rawSlotBytes = rawPageBytes + 32U;
+    std::size_t const packed = packedBytes(geometry);
+    std::size_t const scales = scaleBytes(geometry);
+    std::size_t const prefixBytesPerRow = static_cast<std::size_t>(offsetElements) * elementBytes;
+    std::size_t const suffixBytesPerRow = suffixElements * elementBytes;
+    std::size_t const lossless = rows * (prefixBytesPerRow + suffixBytesPerRow);
+    std::size_t const payloadBytes = packed + scales + lossless;
+    std::size_t const coldPageBytes = roundUp(payloadBytes, alignof(uint4));
+    std::uint32_t const paddingBytes = static_cast<std::uint32_t>(coldPageBytes - payloadBytes);
+
+    DeviceRegion rawInput(slotCapacity * rawSlotBytes);
+    DeviceRegion rawOutput(slotCapacity * rawSlotBytes);
+    MappedHostRegion coldStorage(slotCapacity * coldPageBytes);
+    std::array<std::int32_t, numPages> constexpr inputSlots{2, 7};
+    std::array<std::int32_t, numPages> constexpr coldSlots{5, 1};
+    std::array<std::int32_t, numPages> constexpr outputSlots{6, 0};
+    std::array<std::vector<std::uint8_t>, numPages> rawHost;
+    std::array<ReferenceNvfp4, numPages> references;
+    std::vector<PageIndexPair> offloadTasks;
+    std::vector<PageIndexPair> onboardTasks;
+    for (std::size_t page = 0; page < numPages; ++page)
+    {
+        rawHost[page] = makeStridedRawPage(kind, page, rowElements, offsetElements, params, geometry);
+        auto const run = extractRowSpan(rawHost[page], kind, rows, static_cast<std::size_t>(rowElements),
+            static_cast<std::size_t>(offsetElements), static_cast<std::size_t>(geometry.headDim));
+        references[page] = compressReference(run, kind, params, geometry);
+        rawInput.copyFrom(static_cast<std::size_t>(inputSlots[page]) * rawSlotBytes, rawHost[page]);
+        offloadTasks.push_back({coldSlots[page], inputSlots[page]});
+        onboardTasks.push_back({outputSlots[page], coldSlots[page]});
+    }
+
+    auto const makeMetadata = [&](DeviceRegion const& raw)
+    {
+        std::vector<Nvfp4ColdPageTestBuffer> const buffers{{reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes,
+            rawPageBytes, 0U, packed, payloadBytes, paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params}};
+        return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
+    };
+    auto const inputMetadata = makeMetadata(rawInput);
+    auto const outputMetadata = makeMetadata(rawOutput);
+    CudaStream stream;
+    invokeNvfp4ColdPageEncode(offloadTasks.data(), offloadTasks.size(), inputMetadata, coldStorage.data(), stream);
+    invokeNvfp4ColdPageDecode(onboardTasks.data(), onboardTasks.size(), outputMetadata, coldStorage.data(), stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    auto const cold = coldStorage.payload();
+    auto const coldRegion = [&](std::size_t slot, std::size_t offset, std::size_t bytes)
+    {
+        std::size_t const begin = slot * coldPageBytes + offset;
+        return std::vector<std::uint8_t>(cold.begin() + static_cast<std::ptrdiff_t>(begin),
+            cold.begin() + static_cast<std::ptrdiff_t>(begin + bytes));
+    };
+    for (std::size_t page = 0; page < numPages; ++page)
+    {
+        std::size_t const coldSlot = static_cast<std::size_t>(coldSlots[page]);
+        EXPECT_EQ(coldRegion(coldSlot, 0U, packed), references[page].packed);
+        EXPECT_EQ(coldRegion(coldSlot, packed, scales), references[page].scales);
+
+        // Each cold lossless row is [prefix][suffix].
+        auto const coldLossless = coldRegion(coldSlot, packed + scales, lossless);
+        std::vector<std::uint8_t> expectedLossless;
+        auto const prefix = extractRowSpan(rawHost[page], kind, rows, static_cast<std::size_t>(rowElements), 0U,
+            static_cast<std::size_t>(offsetElements));
+        auto const suffix = extractRowSpan(rawHost[page], kind, rows, static_cast<std::size_t>(rowElements),
+            static_cast<std::size_t>(offsetElements + geometry.headDim), suffixElements);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            expectedLossless.insert(expectedLossless.end(), prefix.begin() + row * prefixBytesPerRow,
+                prefix.begin() + (row + 1) * prefixBytesPerRow);
+            expectedLossless.insert(expectedLossless.end(), suffix.begin() + row * suffixBytesPerRow,
+                suffix.begin() + (row + 1) * suffixBytesPerRow);
+        }
+        EXPECT_EQ(coldLossless, expectedLossless);
+        auto const padding = coldRegion(coldSlot, payloadBytes, paddingBytes);
+        EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0U; }));
+
+        // Restored page: NVFP4 round trip in the run, bit-exact prefix and suffix.
+        auto expected = rawHost[page];
+        replaceRowSpan(expected, kind, rows, static_cast<std::size_t>(rowElements),
+            static_cast<std::size_t>(offsetElements), static_cast<std::size_t>(geometry.headDim),
+            decompressReference(references[page], kind, params, geometry));
+        auto const restored
+            = rawOutput.copyToHost(static_cast<std::size_t>(outputSlots[page]) * rawSlotBytes, rawPageBytes);
+        EXPECT_EQ(restored, expected);
+    }
+    rawInput.expectCanaries();
+    rawOutput.expectCanaries();
+    coldStorage.expectCanaries();
+}
+
 struct RoundTripCase
 {
     char const* name;
@@ -1260,6 +1400,31 @@ TEST_P(Nvfp4ColdPageDeepseekV4Test, PartialPhysicalPageTailDoesNotAffectValidNop
 
 INSTANTIATE_TEST_SUITE_P(
     Bfloat16AndFp8, Nvfp4ColdPageDeepseekV4Test, testing::Values(RawKind::kBfloat16, RawKind::kFp8));
+
+class Nvfp4ColdPageRopePrecisionTest : public testing::TestWithParam<RawKind>
+{
+};
+
+// Qwen3.5-style K rows: 64 rotated elements first, 192 NoPE elements quantized.
+TEST_P(Nvfp4ColdPageRopePrecisionTest, PartialRotaryKeyRowKeepsLosslessPrefix)
+{
+    runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{2, 16, 192}, 256, 64);
+}
+
+// MLA latent rows with rope_precision=lossless: 512 NoPE elements quantized, 64 RoPE elements preserved.
+TEST_P(Nvfp4ColdPageRopePrecisionTest, MlaLatentRowKeepsLosslessSuffix)
+{
+    runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 64, 512}, 576, 0, 2.0F, 0.5F);
+}
+
+// Both sides at once, with a run that spans several tiles and a non-unit global scale.
+TEST_P(Nvfp4ColdPageRopePrecisionTest, PrefixAndSuffixInOneRow)
+{
+    runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 33, 96}, 160, 32, 2.0F, 0.5F);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4ColdPageRopePrecisionTest,
+    testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
 
 void runUnaryMlaWithLosslessSideRoundTrip(RawKind kind)
 {

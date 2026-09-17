@@ -41,7 +41,7 @@ _ELEMENTS_PER_HALF_GROUP = 8
 _MAX_HALF_GROUPS_PER_TILE = 2048
 _MAX_BUFFERS_PER_LAUNCH = 256
 _WIDE_FIELDS = 6
-_INTEGER_FIELDS = 7
+_INTEGER_FIELDS = 8
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
@@ -58,18 +58,28 @@ class _Nvfp4Scales:
 @dataclass(frozen=True)
 class _Nvfp4BufferLayout:
     """One hot buffer. ``scales`` is None for a byte-exact lossless copy; a
-    quantized buffer encodes the leading ``quantized_elements`` of each
-    ``raw_row_stride_elements``-element row as NVFP4 and preserves the rest
-    of the row byte-for-byte (the kernel's prefix-quantized row contract)."""
+    quantized buffer encodes ``quantized_elements`` of each
+    ``raw_row_stride_elements``-element row as NVFP4, starting at element
+    ``quantized_row_offset_elements``, and preserves the elements before and
+    after that run byte-for-byte."""
 
     role: str
     scales: _Nvfp4Scales | None = None
+    quantized_row_offset_elements: int = 0
     quantized_elements: int = 0
     raw_row_stride_elements: int = 0
 
     @property
+    def lossless_prefix_elements(self) -> int:
+        return self.quantized_row_offset_elements
+
+    @property
     def lossless_suffix_elements(self) -> int:
-        return self.raw_row_stride_elements - self.quantized_elements
+        return (
+            self.raw_row_stride_elements
+            - self.quantized_row_offset_elements
+            - self.quantized_elements
+        )
 
 
 @dataclass(frozen=True)
@@ -238,21 +248,12 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 continue
             where = f"cold-page layer {schema.layer_id} buffer {buffer.role!r}"
             geometry = self._policy.row_geometry(buffer, schema.family, where=where)
-            if geometry.quantized_row_offset_elements != 0:
-                # The CUDA codec quantizes a row prefix and preserves a row
-                # suffix. A lossless RoPE prefix (partial-rotary GQA rows such
-                # as Qwen3.5) needs kernel support before it can be offered.
-                raise NotImplementedError(
-                    f"{where}: rope_precision={self._policy.position_precision(schema.family)!r} "
-                    f"would keep the first {geometry.quantized_row_offset_elements} elements of "
-                    "each row lossless, but the cold-page kernel only preserves a row suffix. "
-                    "Use 'quantized' or 'auto' for models whose RoPE occupies the start of the K row."
-                )
             scale_pair = scales.get(buffer.scale_key, _IDENTITY_NVFP4_SCALE)
             quantized.append(
                 _Nvfp4BufferLayout(
                     role=buffer.role,
                     scales=_Nvfp4Scales(*scale_pair),
+                    quantized_row_offset_elements=geometry.quantized_row_offset_elements,
                     quantized_elements=geometry.quantized_elements,
                     raw_row_stride_elements=geometry.raw_row_stride_elements,
                 )
@@ -340,7 +341,11 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
 
             def scale_and_lossless_bytes(buffer: _Nvfp4BufferLayout) -> int:
                 scale_bytes = rows * buffer.quantized_elements // _ELEMENTS_PER_SCALE
-                lossless_bytes = rows * buffer.lossless_suffix_elements * element_bytes
+                lossless_bytes = (
+                    rows
+                    * (buffer.lossless_prefix_elements + buffer.lossless_suffix_elements)
+                    * element_bytes
+                )
                 return scale_bytes + lossless_bytes
 
             quantized_buffers = [buffer for buffer in layout.buffers if buffer.scales is not None]
@@ -406,6 +411,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         buffer.quantized_elements if is_compressed else 0,
                         buffer.raw_row_stride_elements if is_compressed else 0,
                         suffix_bytes_per_row,
+                        buffer.quantized_row_offset_elements if is_compressed else 0,
                     ]
                 )
                 buffer_scales = buffer.scales if is_compressed else _Nvfp4Scales(1.0, 1.0)
@@ -476,6 +482,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             codec_state.runtime_type,
             cold_base,
             stream,
+            metadata.wide.shape[1],
+            metadata.integers.shape[1],
+            metadata.scales.shape[1],
         )
 
     def decode_cold_pages(
@@ -502,4 +511,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             codec_state.runtime_type,
             cold_base,
             stream,
+            metadata.wide.shape[1],
+            metadata.integers.shape[1],
+            metadata.scales.shape[1],
         )

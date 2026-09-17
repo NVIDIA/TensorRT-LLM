@@ -18,6 +18,7 @@
 
 #include "bindings.h"
 #include "tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/nvfp4ColdPageKernels.h"
 
 #include <nanobind/nanobind.h>
@@ -38,6 +39,23 @@ namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
 
 namespace tensorrt_llm::nanobind::kv_cache_compression
 {
+
+namespace
+{
+
+void checkNvfp4ColdPageTableWidths(std::int64_t wideFields, std::int64_t integerFields, std::int64_t scaleFields)
+{
+    TLLM_CHECK_WITH_INFO(wideFields == static_cast<std::int64_t>(tensorrt_llm::kernels::kNvfp4ColdPageWideFields)
+            && integerFields == static_cast<std::int64_t>(tensorrt_llm::kernels::kNvfp4ColdPageIntegerFields)
+            && scaleFields == static_cast<std::int64_t>(tensorrt_llm::kernels::kNvfp4ColdPageScaleFields),
+        "NVFP4 cold-page metadata tables have %lld/%lld/%lld columns; this build expects %u/%u/%u",
+        static_cast<long long>(wideFields), static_cast<long long>(integerFields), static_cast<long long>(scaleFields),
+        tensorrt_llm::kernels::kNvfp4ColdPageWideFields, tensorrt_llm::kernels::kNvfp4ColdPageIntegerFields,
+        tensorrt_llm::kernels::kNvfp4ColdPageScaleFields);
+}
+
+} // namespace
+
 namespace
 {
 
@@ -166,11 +184,15 @@ void initBindings(nb::module_& module)
         nb::arg("provider"), nb::arg("codec_state"));
 
     // The Python provider traffics in raw KVCM addresses, so the launcher trampolines take scalar integers.
+    // The three metadata tables are passed by pointer; their column counts are checked against the
+    // compiled kernel ABI so a Python/C++ mismatch fails here instead of misreading the tables.
     module.def("nvfp4_cold_page_encode",
         [](std::int64_t pageIndices, std::int64_t numPages, std::int64_t wide, std::int64_t integers,
             std::int64_t scales, std::int64_t numBuffers, std::int64_t maxHalfGroupsPerTile, std::int64_t coldPageBytes,
-            std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream)
+            std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream, std::int64_t wideFields,
+            std::int64_t integerFields, std::int64_t scaleFields)
         {
+            checkNvfp4ColdPageTableWidths(wideFields, integerFields, scaleFields);
             tensorrt_llm::kernels::invokeNvfp4ColdPageEncode(
                 reinterpret_cast<void const*>(static_cast<std::uintptr_t>(pageIndices)),
                 static_cast<std::size_t>(numPages),
@@ -187,8 +209,10 @@ void initBindings(nb::module_& module)
     module.def("nvfp4_cold_page_decode",
         [](std::int64_t pageIndices, std::int64_t numPages, std::int64_t wide, std::int64_t integers,
             std::int64_t scales, std::int64_t numBuffers, std::int64_t maxHalfGroupsPerTile, std::int64_t coldPageBytes,
-            std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream)
+            std::int64_t runtimeType, std::int64_t coldBase, std::int64_t stream, std::int64_t wideFields,
+            std::int64_t integerFields, std::int64_t scaleFields)
         {
+            checkNvfp4ColdPageTableWidths(wideFields, integerFields, scaleFields);
             tensorrt_llm::kernels::invokeNvfp4ColdPageDecode(
                 reinterpret_cast<void const*>(static_cast<std::uintptr_t>(pageIndices)),
                 static_cast<std::size_t>(numPages),
