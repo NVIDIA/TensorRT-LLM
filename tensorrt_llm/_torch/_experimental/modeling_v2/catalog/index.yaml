@@ -4,9 +4,11 @@
 # unique identifier; the directory encodes the category. Synced manually after
 # catalog changes.
 #
-# The catalog is the complete vocabulary of target modeling code: every call
-# that creates or transforms a tensor must be a catalog entry. Only tensor
-# metadata reads (.shape/.dtype/.device) and Python control flow live outside.
+# The catalog is the vocabulary of target modeling code that is ours: every
+# trtllm op a target calls must be an entry. Native torch calls, tensor
+# metadata reads (.shape/.dtype/.device) and Python control flow live outside,
+# because nothing here would be stating anything about them that torch does
+# not already state better.
 #
 # AN ENTRY SPANS TWO TREES. The contract (.md) and the wrapper (.py) are here;
 # the GPU test is at
@@ -22,11 +24,15 @@
 # importantly they are not duplicates of those -- upstream covers the modules
 # that wrap these ops, these cover the op itself cell by cell.
 #
-# torch/ entries are hand-added thin mirrors of torch callables — upstream
-# owns their correctness, so they carry no contract doc, no test, and no
-# arch/precision certification (absence = unconstrained by design; real dtype
-# limits, e.g. no float8 arithmetic, are noted in the entry docstring).
-# Entries wrapping trtllm ops carry all three.
+# Native torch calls are not entries. This catalog used to mirror eleven of
+# them -- torch.cat, torch.reshape, Tensor.copy_ and so on -- one file each,
+# every file a single forwarding line. They carried no contract doc, no test
+# and no certification, because upstream owns their correctness and there was
+# nothing left for an entry to say. A target now calls torch directly, which
+# is both shorter and the thing a reader already knows how to look up.
+#
+# An entry is therefore always a trtllm op: something whose behaviour is ours
+# to state and ours to prove.
 #
 # ── RECEIPT STATUS: all 19 entries certified on sm_103 ────────────────────
 #
@@ -80,51 +86,6 @@
 
 entries:
   # ─── torch (native callables, trtllm-free) ────────────────────
-  - path: torch/embedding.py
-    impl: torch.nn.functional.embedding
-    summary: "Input-embedding lookup: token ids -> rows of the embedding weight"
-
-  - path: torch/concat.py
-    impl: torch.cat
-    summary: "Concatenate a list of tensors along a dim"
-
-  - path: torch/split.py
-    impl: torch.split
-    summary: "Split a tensor along a dim into equal chunks or explicit sizes"
-
-  - path: torch/add.py
-    impl: torch.add
-    summary: "Elementwise add (residual); torch has no float8 arithmetic"
-
-  - path: torch/reshape.py
-    impl: torch.reshape
-    summary: "Reshape (covers view: returns a view when layout allows)"
-
-  - path: torch/empty.py
-    impl: torch.empty
-    summary: "Uninitialized tensor allocation (scratch/output buffers whose sizing the caller owns)"
-
-  - path: torch/expand.py
-    impl: torch.Tensor.expand
-    summary: "Zero-copy broadcast view over singleton dims (stride-0; unsafe to write through)"
-
-  - path: torch/transpose.py
-    impl: torch.transpose
-    summary: "Zero-copy swap of two dims (strided view; presents [tokens, heads, dim] to a head-batched gemm)"
-
-  - path: torch/view_dtype.py
-    impl: torch.Tensor.view
-    summary: "Bitwise dtype reinterpretation of the same bytes (uint8 scale buffer -> float8_e4m3fn view); no conversion, no copy"
-
-  - path: torch/copy_.py
-    impl: torch.Tensor.copy_
-    summary: "In-place elementwise copy into a tensor or view (canonical slice fill; destroys dst contents)"
-
-  - path: torch/pad.py
-    impl: torch.nn.functional.pad
-    summary: "Constant padding of trailing dims (widening an activation to a kernel's operand width)"
-
-  # ─── norm ──────────────────────────────────────────────────────
   - path: norm/flashinfer_rmsnorm.py
     impl: torch.ops.trtllm.flashinfer_rmsnorm
     summary: "RMS normalization over the last dim with elementwise weight scaling"

@@ -31,11 +31,13 @@ in the built-in static index would fail its staleness assertion.
 from ._router_index import (
     MODELING_V2_ENV,
     MODELING_V2_ROUTERS,
+    MODELING_V2_VALIDATE_ENV,
     ROUTING_BACKENDS,
     ModelingV2Context,
     ModelingV2Mode,
     assert_backend_can_route,
     modeling_v2_resolve,
+    step_contract_enabled,
 )
 
 __all__ = [
@@ -44,6 +46,8 @@ __all__ = [
     "MODELING_V2_ROUTERS",
     "ModelingV2Context",
     "ModelingV2Mode",
+    "MODELING_V2_VALIDATE_ENV",
     "assert_backend_can_route",
     "modeling_v2_resolve",
+    "step_contract_enabled",
 ]

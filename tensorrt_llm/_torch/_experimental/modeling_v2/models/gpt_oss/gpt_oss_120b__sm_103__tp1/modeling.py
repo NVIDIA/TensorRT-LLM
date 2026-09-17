@@ -42,6 +42,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
 )
@@ -61,9 +62,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
     mxfp8_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.embedding import embedding
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.empty import empty
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.reshape import reshape
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -80,67 +78,6 @@ from . import weights as _weights
 # assert is what the version pin used to be. In-tree the version moves with
 # the code, so pinning it is meaningless; the architecture does not.
 _SM = (10, 3)
-
-
-#: Every trtllm op this target reaches for, in its forward and in the weight
-#: load. Declared here, asserted in tests/unittest/_torch/modeling_v2: a symbol
-#: that does not exist is a fact of the build, and the place to find that out
-#: is a machine with the extension built rather than every import of this
-#: module.
-REQUIRED_TRTLLM_OPS = (
-    "fused_qk_norm_rope",
-    "flashinfer_rmsnorm",
-    "flashinfer_fused_add_rmsnorm",
-    "cublas_mm",
-    "mxfp8_quantize",
-    "mxe4m3_mxe2m1_block_scale_moe_runner",
-)
-
-# Metadata fields consumed each step (sourcing mirrors the in-tree
-# FallbackFmha for this trtllm version; existence checked at first forward).
-_STEP_FIELDS = (
-    "kv_lens_cuda_runtime",
-    "kv_lens_runtime",
-    "host_total_kv_lens",
-    "prompt_lens_cuda_runtime",
-    "prompt_lens_cpu_runtime",
-    "host_request_types_runtime",
-    "kv_cache_block_offsets",
-    "host_kv_cache_pool_pointers",
-    "host_kv_cache_pool_mapping",
-    "effective_workspace",
-    "tokens_per_block",
-    "max_num_requests",
-    "max_context_length",
-    "max_seq_len",
-    "num_contexts",
-    "num_ctx_tokens",
-    "trtllm_gen_jit_warmup",
-    "use_paged_context_fmha",
-    "effective_beam_width",
-    "cache_indirection",
-    "block_ids_per_seq",
-    "max_context_q_len_override",
-    "is_cross",
-    "is_spec_decoding_enabled",
-    "use_spec_decoding",
-    "is_spec_dec_tree",
-    "spec_decoding_generation_lengths",
-    "spec_decoding_position_offsets_for_cpp",
-    "spec_decoding_packed_mask",
-    "spec_decoding_bl_tree_mask_offset",
-    "spec_decoding_bl_tree_mask",
-    "max_total_draft_tokens",
-    "spec_bl_tree_first_sparse_mask_offset_kv",
-    "num_sparse_topk",
-    "flash_mla_tile_scheduler_metadata",
-    "flash_mla_num_splits",
-    # Both are engine-prepared per-instance constants (max_num_sequences
-    # defaults to max_num_requests; the tree-mask flag is set from
-    # is_spec_dec_dynamic_tree), so they project like the rest.
-    "max_num_sequences",
-    "force_prepare_spec_dec_tree_mask",
-)
 
 
 def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
@@ -456,7 +393,11 @@ class ModelingV2Core(DecoderModel):
 
         self._layers: list | None = None
         self._call_tensors: dict | None = None
-        self._step_contract_checked = False
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
+        # rather than per forward, and False for the whole life of a served
+        # engine. "pending" rather than "enabled" because the check runs once
+        # -- everything it looks at is fixed at engine construction.
+        self._contract_pending = step_contract_enabled()
 
     def build_layer_views(self) -> None:
         """Post-load derivation: per-layer tuples of column-major GEMM views,
@@ -503,10 +444,12 @@ class ModelingV2Core(DecoderModel):
         self._layers = layers
 
     def _check_step_contract(self, md, position_ids) -> None:
-        """First-forward fail-fast: the metadata fields this target consumes
-        must exist (they are private trtllm surface), and the KV pool layout
-        must be one `thop_attention` is certified over. Everything checked is
-        fixed at engine construction — once per model instance is sound.
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
+        asks for it: the metadata fields this target consumes must exist (they
+        are private trtllm surface), and the KV pool layout must be one
+        `thop_attention` is certified over. Everything checked is fixed at
+        engine construction — once per model instance is sound, and off in a
+        served engine, where the only thing this could still do is fail.
 
         This checkpoint alternates sliding-window and full attention, and
         KVCacheManagerV2 gives each attention-window class its own layer
@@ -515,15 +458,22 @@ class ModelingV2Core(DecoderModel):
         this forward passes the mapping through untouched -- the op reads the
         pool column itself. A third pool would be outside what was measured.
         """
-        missing = [name for name in _STEP_FIELDS if not hasattr(md, name)]
-        assert not missing, f"metadata fields missing: {missing}"
+        # Calling the projection is the check: it reads every metadata field
+        # this target consumes, so a rename or removal upstream surfaces
+        # here rather than mid-forward. Deriving it this way is the point --
+        # a hand-kept list of the same names drifts silently the first time
+        # _build_step_args gains a field and nobody updates the copy.
+        try:
+            _build_step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         assert position_ids.dtype == torch.int32
         pools = {row[0] for row in md.host_kv_cache_pool_mapping.tolist()}
         assert pools <= {0, 1}, (
             f"KV addressing over {len(pools)} pools is not certified "
             f"(thop_attention.md certifies one and two); layer->pool ids {sorted(pools)}"
         )
-        self._step_contract_checked = True
+        self._contract_pending = False
 
     def forward(
         self,
@@ -545,7 +495,7 @@ class ModelingV2Core(DecoderModel):
         assert kwargs.get("spec_metadata") is None, (
             "speculative decoding is not implemented by this target"
         )
-        if not self._step_contract_checked:
+        if self._contract_pending:
             self._check_step_contract(attn_metadata, position_ids)
 
         step = _build_step_args(attn_metadata)
@@ -555,16 +505,18 @@ class ModelingV2Core(DecoderModel):
         full_window = attn_metadata.max_seq_len
         const = self._call_tensors
         no_qk_norm = const["no_qk_norm"]
-        pos = reshape(position_ids, [-1])
+        pos = torch.reshape(position_ids, [-1])
 
         if inputs_embeds is None:
             assert input_ids is not None
-            h = embedding(input_ids, self.w["embed"])
+            h = nn.functional.embedding(input_ids, self.w["embed"])
         else:
             h = inputs_embeds
         num_tokens = h.shape[0]
         dt = h.dtype
-        attn_out = empty([num_tokens, self.heads_q * self.head_dim], dt, h.device)
+        attn_out = torch.empty(
+            [num_tokens, self.heads_q * self.head_dim], dtype=dt, device=h.device
+        )
 
         x = flashinfer_rmsnorm(h, self.w["l0_norm1"], self.eps)
         residual = h

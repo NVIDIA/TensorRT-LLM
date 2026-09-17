@@ -29,6 +29,7 @@ which is the one failure this whole system exists to prevent.
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 
 from ..conftest import llm_models_root
@@ -71,6 +72,17 @@ class TestModelingV2GptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, {"scores_filter": "exact_match,flexible-extract"})
 
-        with LLM(self.MODEL_PATH, **modeling_v2_llm_args("require", monkeypatch)) as llm:
+        # The target checks its step contract on the first forward and only
+        # when asked. Asking here rather than in a unit test is deliberate: the
+        # contract is about metadata this engine prepared -- the field set, the
+        # int32 position ids, the two KV pools this checkpoint's alternating
+        # window sizes produce -- and a synthesized metadata object would be
+        # checking the synthesizer. One forward of the run below pays for it.
+        # It rides with the switch: the check runs where the metadata does,
+        # which is the rank rather than this process.
+        with LLM(
+            self.MODEL_PATH,
+            **modeling_v2_llm_args("require", monkeypatch, **{MODELING_V2_VALIDATE_ENV: "1"}),
+        ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.extra_evaluator_kwargs)
