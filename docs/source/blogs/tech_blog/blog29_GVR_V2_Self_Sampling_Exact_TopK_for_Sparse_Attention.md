@@ -71,13 +71,28 @@ It seeks an admission threshold with enough survivors to contain Top-K, but few 
 
 ### A Biased Sample with Variable Value
 
-Temporal hints are a **biased sample** of current scores at previous winners' positions. High, stable overlap makes that bias useful. Figure 2 shows why it is an unreliable assumption across layers and decode steps.
+Temporal hints are a **biased sample** of current scores at previous winners' positions. The hit rate is the fraction of the current Top-K covered by the aligned previous selection. High, stable overlap makes that bias useful. Figure 2 shows why it is an unreliable assumption across layers and decode steps.
 
 ![Temporal Top-K overlap for DeepSeek-V3.2 and DeepSeek-V4 Pro. Upper panels distinguish retained and new selections; lower panels show raw overlap across three layers, including abrupt drops despite a high average.](../media/gvr_v2/temporal_overlap.svg)
 
 *Figure 2. Temporal overlap on SWE-bench-64K workloads. Blue marks previous winners retained after coordinate alignment; orange marks new selections. V3.2 shifts prior indices by +1, while V4 Pro keeps compressed-bin coordinates. Upper panels show position crops; lower curves measure full-domain overlap across layers and steps, with means in parentheses. Even a high-mean layer can suffer an abrupt collapse.*
 
-The hit rate is the fraction of the current Top-K covered by the aligned previous selection. Its true value is known only after the current selection is established. Verification can expose a poor threshold, but the hint gather and initial work have already been paid for. Conservative admission, repeated counts, capacity checks, and exact recovery keep weak hints safe; their overhead and extra reads reduce average speedup and make latency less predictable.
+Near-64K measurements also expose dependence on the input and layer:
+
+| Indexer | Input | Layers | Mean | P10–P90 | Min–max |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| V4 Pro | SWE-bench | 30 | 71.5% | 60.3–82.6% | 57.1–85.0% |
+| V4 Pro | Random tokens | 30 | 57.9% | 33.6–80.4% | 28.4–86.7% |
+| V4 Flash | SWE-bench | 21 | 62.8% | 53.4–73.3% | 53.2–83.7% |
+| V4 Flash | Random tokens | 21 | 52.8% | 30.7–74.7% | 25.9–81.3% |
+| V3.2 | SWE-bench | 61 | 47.4% | 37.9–59.7% | 5.7–70.7% |
+| V3.2 | Random tokens | 61 | 46.0% | 33.1–62.2% | 6.0–67.9% |
+
+*Distribution of per-layer mean hit rates, with layer IDs matched between inputs within each model. Each layer is averaged over its decode steps and then weighted equally; P10–P90 and min–max describe those layer means, not individual transitions. V3.2 uses +1 alignment.*
+
+V4 Pro's mean changes from **71.5% to 57.9%** between these inputs, and its random-token P10–P90 spans **33.6–80.4%**. V3.2 has similar overall means across inputs, yet its weakest SWE-bench layer averages only **5.7%**. **An average overlap cannot serve as a dependable per-row performance assumption.** The table exposes variation across inputs and layers; Figure 2 adds the abrupt changes within a layer over time.
+
+A row's true hit rate is known only after the current selection is established. Verification can expose a poor threshold, but the hint gather and initial work have already been paid for. Conservative admission, repeated counts, capacity checks, and exact recovery keep weak hints safe; their overhead and extra reads reduce average speedup and make latency less predictable.
 
 V2 calibrates from the **current row**, removing dependence on temporal overlap and the read through old indices. Multi-thresholding addresses the other major cost: repeated scalar threshold queries. Together, they target a stronger practical performance floor and better average latency, without a fixed worst-case latency guarantee.
 
