@@ -175,56 +175,74 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 
 ### Advisory semantic conflict review
 
-CodeRabbit's `Semantic conflict with target branch` pre-merge check in
-`.coderabbit.yaml` looks for behavioral incompatibilities across branches. It is
-best-effort; missing revision/history evidence is Inconclusive. The CodeRabbit
-comment uses warning mode; GitHub Check conclusions are published separately.
+The `CodeRabbit Semantic Conflict Review` workflow performs best-effort semantic
+compatibility analysis for open, non-draft PRs targeting `main` or `release/**`.
+No opt-in label is needed. It compares both branches from their merge base and
+follows affected callers, contracts, configuration, and tests across files.
 
-For a non-draft PR targeting `main`, maintainers can add the
-`ai: semantic-conflict` label to opt into automatic rechecks on PR and main
-updates. The `CodeRabbit Semantic Conflict Review` workflow requests analysis
-and publishes results; its request job succeeding is not an AI verdict. The independent
-`Semantic conflict with target branch` GitHub Check starts neutral while
-awaiting analysis. The workflow publishes CodeRabbit's result only after
-verifying the bot author, requested head/target pair, and merge-base SHA.
-PASS becomes success; a verified FAIL makes both the semantic Check and its
-publishing job fail (red). Inconclusive results stay neutral with a warning
-annotation. Results explain that CodeRabbit can make mistakes, including false
-positives. Keep this advisory Check and workflow non-required: their failures
-then do not block merging. Reviewers can document a false positive and merge
-once the other requirements are met. This workflow does not change repository
-rules; adding it to required checks would make failures block merging.
-Read the result and verify its SHAs still match the live branches.
+- PR creation, reopening, updates, and becoming ready evaluate the threshold;
+  they do not automatically spend an AI call. An hourly scan also evaluates it.
+- The first analysis needs new target commits and either 24 hours since the
+  merge-base commit or at least 30 target commits beyond that base. After a
+  completed PASS/FAIL analysis, count from its target SHA and completion time.
+  PR updates invalidate the old verdict but do not bypass these thresholds.
+- An authorized `ci: full pre-merge approved` label or enabling auto-merge
+  bypasses the threshold. Approval-label authors are checked against the existing
+  `trt-llm-ci-approvers` team using its existing token. All pre-merge requests
+  share a one-hour cooldown, including when the SHA pair changes. A signal
+  during cooldown is skipped; ordinary scans and the post-merge audit remain.
+- Exact revision pairs, including requests still awaiting a reply, are deduplicated.
+  With no completed analysis, new-pair routine requests wait 24 hours to avoid
+  repeated service-failure retries. A missing reply for the same pair requires
+  a manual retry. Workflow dispatch accepts one PR number and bypasses the
+  thresholds, cooldown and deduplication for that PR only.
+- Merge events request a post-merge audit regardless of thresholds or cooldown.
+  The hourly scan recovers merges from the preceding 24 hours. The audit pins
+  the actual merge commit and historical target, including for release PRs;
+  later target updates do not invalidate it. Squash-only rules or the two-parent
+  merge must establish the historical target; ambiguous rebase history is rejected.
+  A pre-merge result/request can be reused only when its head/target pair and
+  GitHub's recorded test-merge tree match the actual merged tree. Otherwise the
+  audit includes the actual merged code in a new analysis request.
 
-Use workflow dispatch with the PR number to retry only that PR, or comment
-`@coderabbitai run pre-merge checks`. Automatic events sweep all opted-in PRs.
-Only requested revision pairs receive published results; unrelated manual
-fixture experiments do not change a PR's semantic Check. Missing results stay
-neutral, and stale results cannot mark a newer pair as passing.
+This dedicated custom check is `off` in `.coderabbit.yaml` during ordinary
+reviews. The workflow explicitly requests `evaluate custom pre-merge check`
+with warning mode and the configured instructions so regular reviews cannot
+bypass the spending policy. CodeRabbit Custom Pre-Merge Checks access is needed.
+Its native Post-Merge Actions only support the default branch; this workflow
+uses an explicit command on the merged PR instead. Acceptance of Actions-bot
+commands, especially on merged/release PRs, requires deployment validation.
+An absent/rejected AI reply remains without a verdict, never a semantic pass.
 
-The custom check requires CodeRabbit Custom Pre-Merge Checks access. This
-advisory pilot does not provide a merge-queue check or block merges.
+The `Semantic conflict with target branch` Check starts neutral. Stale results
+become neutral when the PR event or hourly scan observes a version change.
+The verifier checks the bot identity, most recent trusted request, exact revision
+record, and GitHub merge base. PASS becomes success; FAIL makes the Check and
+publishing job red; Inconclusive remains neutral. A successful request job only
+means orchestration succeeded. Checks on the actual merge SHA use the distinct
+`Semantic conflict audit (post-merge)` name, with a receipt linking the analysis
+on the original PR. Evidence includes code locations and regression scenarios.
 
-Changes to the semantic automation run the separate, read-only `CodeRabbit
-Semantic Review Preview` workflow on `pull_request`, including fork drafts.
-It shows two checks: `Automation tests and result lookup (not AI approval)`
-runs the unit tests and reads real CodeRabbit replies; the `AI` check is green
-only for a verified PASS and red for a verified FAIL. A missing, stale, or
-inconclusive verdict leaves `AI verdict (advisory; skipped = unavailable)`
-skipped (gray).
-The lookup job succeeding is not an AI pass. These tests are not part of
-`Pre-commit Check`. The production request/publish workflow does not run on
-`pull_request`, so its unrelated jobs do not appear in the preview.
+CodeRabbit can make mistakes, including false positives. Keep these checks and
+workflows non-required: their failures then do not block merging. No required
+waiting gate is added, and auto-merge does not wait for this analysis. Audit does
+not revert code or modify branches. Repository rules remain unchanged.
+The thresholds and cooldown limit frequency, not total calls per PR.
 
-Both workflows use the same result verifier. The production publisher loads it
-from the trusted workflow commit; the fork preview has read-only permissions
-and writes no custom Checks. Before the configuration is merged, request
-`@coderabbitai evaluate custom pre-merge check` with `--name "Semantic conflict
-with target branch"`, `--mode warning`, and `--instructions` containing the check
-instructions from `.coderabbit.yaml` and the current head/main SHAs. After the
-reply arrives, rerun the **tests and result lookup** job to refresh its outputs
-and dependent AI check. Rerunning only the AI check reuses the previous outputs.
-Previewing does not validate production event triggers or privileged Check writes.
+Changes to this automation run the separate read-only `CodeRabbit Semantic
+Review Preview` workflow, including fork drafts. `Automation tests and result
+lookup (not AI approval)` runs Node tests and reads actual CodeRabbit replies;
+`AI verdict (advisory; skipped = unavailable)` runs only for a verified current
+PASS/FAIL and is otherwise gray/skipped. `precommit-check.yml` is unchanged.
+
+Both workflows use the same verifier. Privileged jobs load only trusted default
+branch scripts, never PR code. The preview has read-only permissions. Before
+merge, request `@coderabbitai evaluate custom pre-merge check` with the name
+`Semantic conflict with target branch`, `--mode warning`, and `--instructions`
+containing the configured instructions and fixed head/target/merge-base SHAs.
+After the reply arrives, rerun the **tests and result lookup** job; rerunning only
+the AI job reuses old outputs. Preview tests do not establish production trigger,
+permission, command-acceptance or post-merge behavior.
 
 ### Trouble Shooting
 
