@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 _BUILD_WHEEL = Path(__file__).resolve().parents[3] / "scripts" / "build_wheel.py"
 
 
