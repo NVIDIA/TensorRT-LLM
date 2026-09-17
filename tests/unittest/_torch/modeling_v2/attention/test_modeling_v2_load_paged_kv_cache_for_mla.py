@@ -30,10 +30,11 @@ Two configurations are covered:
 
 from typing import List, Optional, Tuple
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (
-    load_paged_kv_cache_for_mla,
+    load_paged_kv_cache_for_mla as op,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -210,7 +211,7 @@ def _call(
     pool_mapping = env.kv_cache_manager.kv_cache_pool_mapping
     assert block_offsets is not None
     assert pool_pointers is not None and pool_mapping is not None
-    compressed_kv, k_pe = load_paged_kv_cache_for_mla(
+    compressed_kv, k_pe = op(
         out_dtype,
         num_contexts,
         total_ctx_kv,
@@ -250,12 +251,9 @@ def _dequant_mirror(
     read_scale: Optional[torch.Tensor],
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """float(e4m3 byte) * kv_scale_quant_orig[0] in fp32, rounded once to
-    out_dtype — the fp8 gather's reference, built from torch alone."""
-    wide = stored.float()
-    if read_scale is not None:
-        wide = wide * read_scale[0]
-    return wide.to(out_dtype)
+    """Delegates to the entry: what the gather is supposed to produce is the
+    entry's claim, and a second copy here would be a second place to fix."""
+    return op.reference(stored, read_scale, out_dtype)
 
 
 def _run_fp8(
@@ -310,8 +308,8 @@ def _assert_fp8_exact(
 ) -> None:
     """Both halves bitwise equal to the fp32-multiply mirror."""
     mirror = _dequant_mirror(stored, read_scale, out_dtype)
-    torch.testing.assert_close(compressed_kv, mirror[:, :KV_LORA_RANK], rtol=0.0, atol=0.0)
-    torch.testing.assert_close(k_pe, mirror[:, KV_LORA_RANK:], rtol=0.0, atol=0.0)
+    op.compare(compressed_kv, mirror[:, :KV_LORA_RANK])
+    op.compare(k_pe, mirror[:, KV_LORA_RANK:])
 
 
 def _raises(fn) -> str:
@@ -341,6 +339,36 @@ def _fp8_env(
         fp8_pool=True,
         max_tokens=max_tokens,
     )
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_certified_cells(cell) -> None:
+    """Every configuration the entry claims, gather against the entry's mirror.
+
+    The tests below say things no cell can -- that a wrong mirror is
+    discriminated, that a write/read scale pair that disagrees still returns
+    plausible numbers, that trailing generation sequences are ignored. This one
+    says the plain thing, and it is parametrized off the entry so that adding a
+    cell there adds a case here.
+    """
+    spec = cell.spec
+    torch.manual_seed(abs(hash(cell.why)) % 2**31)
+    env = _fp8_env(tokens_per_block=spec["tokens_per_block"])
+    try:
+        rids = list(range(len(spec["new"])))
+        ckv, kpe, stored, _, scale_t = _run_fp8(
+            env,
+            request_ids=rids,
+            seq_lens=spec["new"],
+            num_contexts=len(rids),
+            cached_lens=spec["cached"],
+            out_dtype=spec["out_dtype"],
+            read_scale=spec["read_scale"],
+        )
+        assert ckv.shape[0] == sum(c + n for c, n in zip(spec["cached"], spec["new"]))
+        _assert_fp8_exact(ckv, kpe, stored, scale_t, spec["out_dtype"])
+    finally:
+        env.shutdown()
 
 
 def test_fp8_production_config() -> None:

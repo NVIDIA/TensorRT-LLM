@@ -15,6 +15,9 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import fused_moe
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402 — needs the path declared above
+
 assert torch.cuda.is_available(), "fused_moe requires a CUDA device"
 
 DEV = "cuda"
@@ -108,23 +111,34 @@ def test_certified_cells(cell, _r1_weights) -> None:
     x, ids, scales = _make_r1_routing(
         spec["num_tokens"], spec["experts_local"] * spec["ep_size"], seed=spec["num_tokens"]
     )
-    out = fused_moe(
-        x,
-        ids,
-        scales,
-        w31,
-        None,
-        w2,
-        None,
-        torch.bfloat16,
-        [],
-        ep_size=spec["ep_size"],
-        ep_rank=spec["ep_rank"],
-    )[0]
+    with validating(fused_moe):
+        out = fused_moe(
+            x,
+            ids,
+            scales,
+            w31,
+            None,
+            w2,
+            None,
+            torch.bfloat16,
+            [],
+            ep_size=spec["ep_size"],
+            ep_rank=spec["ep_rank"],
+        )[0]
     fused_moe.compare(
         out,
         fused_moe.reference(
-            x, ids, scales, w31, w2, ep_size=spec["ep_size"], ep_rank=spec["ep_rank"]
+            x,
+            ids,
+            scales,
+            w31,
+            None,
+            w2,
+            None,
+            torch.bfloat16,
+            [],
+            ep_size=spec["ep_size"],
+            ep_rank=spec["ep_rank"],
         ),
     )
 
@@ -143,7 +157,9 @@ def test_out_of_range_expert_ids_are_dropped() -> None:
         kept[:, 0] = True
         kept[:, 2:] = True
         dropped_scales = scales * kept
-        fused_moe.compare(y, fused_moe.reference(x, bad, dropped_scales, w31, w2))
+        fused_moe.compare(
+            y, fused_moe.reference(x, bad, dropped_scales, w31, None, w2, None, torch.bfloat16, [])
+        )
 
 
 def test_repeated_expert_ids() -> None:
@@ -155,7 +171,9 @@ def test_repeated_expert_ids() -> None:
     dup = ids.clone()
     dup[:, 1] = dup[:, 0]
     y = fused_moe(x, dup, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-    fused_moe.compare(y, fused_moe.reference(x, dup, scales, w31, w2))
+    fused_moe.compare(
+        y, fused_moe.reference(x, dup, scales, w31, None, w2, None, torch.bfloat16, [])
+    )
 
 
 def test_inputs_untouched_and_deterministic() -> None:
@@ -175,13 +193,16 @@ def test_wrapper_rejects_output_dtype_mismatch() -> None:
     x, ids, scales, w31, w2 = _make(8, 128, 64, 8, 2, seed=41)
     for bad in [torch.float16, torch.float32]:
         try:
-            fused_moe(x, ids, scales, w31, None, w2, None, bad, [])
+            with validating(fused_moe):
+                fused_moe(x, ids, scales, w31, None, w2, None, bad, [])
         except AssertionError:
             continue
         raise AssertionError(f"wrapper accepted output_dtype={bad} for a bf16 input")
     # positive control: the matching dtype still works
     y = fused_moe(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-    fused_moe.compare(y, fused_moe.reference(x, ids, scales, w31, w2))
+    fused_moe.compare(
+        y, fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
+    )
 
 
 def test_op_rejects_unsupported_domains() -> None:
@@ -419,7 +440,9 @@ def test_r1_mtp_expert_relabeling_is_bitwise() -> None:
     w31, w2 = _make_r1_weights(R1_E_LOCAL, seed=2222)
     x, ids, scales = _make_r1_routing(512, R1_E_LOCAL, seed=31337)
     y = fused_moe(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-    fused_moe.compare(y, fused_moe.reference(x, ids, scales, w31, w2))
+    fused_moe.compare(
+        y, fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
+    )
     g = torch.Generator(device=DEV).manual_seed(4)
     perm = torch.randperm(R1_E_LOCAL, device=DEV, generator=g)
     inv = torch.empty_like(perm)
@@ -457,7 +480,13 @@ def test_r1_mtp_autotuned_tactics() -> None:
     for t in (1, 256, 8192):
         x, ids, scales = _make_r1_routing(t, R1_E_LOCAL, seed=t)
         cold = fused_moe(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-        cases[t] = (x, ids, scales, cold, fused_moe.reference(x, ids, scales, w31, w2))
+        cases[t] = (
+            x,
+            ids,
+            scales,
+            cold,
+            fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, []),
+        )
         fused_moe.compare(cold, cases[t][4])
     try:
         x, ids, scales = cases[8192][:3]
@@ -518,7 +547,7 @@ def test_r1_mtp_tactic_space() -> None:
     w31, w2 = _make_r1_weights(R1_E_LOCAL, seed=1234)
     x, ids, scales = _make_r1_routing(256, R1_E_LOCAL, seed=99)
     args = (x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
-    ref = fused_moe.reference(x, ids, scales, w31, w2)
+    ref = fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
     with tuner.capture() as cap:
         fused_moe(*args)
     combos = list(cap)
@@ -544,7 +573,7 @@ def test_r1_mtp_tactic_space() -> None:
     # and at the token count the caller chunks to
     x, ids, scales = _make_r1_routing(8192, R1_E_LOCAL, seed=8192)
     args = (x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
-    ref = fused_moe.reference(x, ids, scales, w31, w2)
+    ref = fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
     with tuner.capture() as cap:
         fused_moe(*args)
     combos = list(cap)

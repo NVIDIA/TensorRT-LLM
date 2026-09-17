@@ -1,81 +1,60 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the flashinfer_silu_and_mul catalog entry."""
+"""GPU test for the flashinfer_silu_and_mul catalog entry.
 
+The entry owns what is certified. This file turns a cell's spec into tensors
+and drives the inputs the guard exists to refuse.
+"""
+
+import pytest
 import torch
-import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
-    flashinfer_silu_and_mul,
+    flashinfer_silu_and_mul as op,
 )
+
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "flashinfer_silu_and_mul requires a CUDA device"
 
 
-def _ref_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    """fp32-accumulated reference: silu(x[..., :d]) * x[..., d:]."""
-    gate, up = x.float().chunk(2, dim=-1)
-    return (F.silu(gate) * up).to(x.dtype)
+def _build(spec, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
 
 
-def _check(x: torch.Tensor) -> None:
-    out = flashinfer_silu_and_mul(x)
-    ref = _ref_silu_and_mul(x)
-    assert out.shape == x.shape[:-1] + (x.shape[-1] // 2,)
-    assert out.dtype == x.dtype
-    torch.testing.assert_close(out, ref)
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
+def test_certified_cells(cell) -> None:
+    x = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    with validating(op):
+        out = op(x)
+    assert out.shape == (*x.shape[:-1], x.shape[-1] // 2)
+    assert out.data_ptr() != x.data_ptr(), "the op must return a new tensor"
+    op.compare(out, op.reference(x))
 
 
-def test_bf16_2d() -> None:
-    torch.manual_seed(0)
-    # decode-like (few tokens) and prefill-like (many tokens) shapes;
-    # last dim is 2 * intermediate_size (gate half then up half)
-    for num_tokens, two_d in [(1, 8192), (4, 28672), (2048, 8192)]:
-        x = torch.randn(num_tokens, two_d, dtype=torch.bfloat16, device="cuda")
-        _check(x)
+@pytest.mark.parametrize(
+    "width,match",
+    [
+        (4095, "must be even"),
+        # 24 bf16 elements is 48 bytes per row, which the op's own row check
+        # accepts; the half is 24 bytes, so the second half starts mid-vector.
+        (24, "16-byte vectors"),
+        # The only width that reaches the third assert: for the half to be a
+        # whole number of 16-byte vectors *and* smaller than one, it has to be
+        # zero. Worth a case anyway -- it is the difference between a guard
+        # that is unreachable and one that is merely narrow.
+        (0, "at least one 16-byte vector"),
+    ],
+)
+def test_guard_refuses_widths_the_kernel_faults_on(width, match) -> None:
+    """A misaligned half kills the CUDA context rather than raising.
 
-
-def test_bf16_3d() -> None:
-    torch.manual_seed(1)
-    x = torch.randn(4, 16, 2048, dtype=torch.bfloat16, device="cuda")
-    _check(x)
-
-
-def test_bf16_edge_sizes() -> None:
-    # 16 is the smallest legal last dim (d = 8 = one vector);
-    # 16400 gives d = 8200 > 8192 = blockDim * vec_size, exercising the
-    # scalar remainder loop after the vectorized loop
-    torch.manual_seed(2)
-    for two_d in [16, 16400]:
-        x = torch.randn(16, two_d, dtype=torch.bfloat16, device="cuda")
-        _check(x)
-
-
-def test_a_misaligned_half_is_rejected_before_dispatch() -> None:
-    """A final dim of 24 passes the op's own check and faults the kernel.
-
-    The op validates the *row* (`shape[-1] * itemsize % 16 == 0`, which 24
-    satisfies at 48 bytes), but the kernel vectorizes over each half
-    separately, and at 24 the second half starts 24 bytes in -- mid-vector.
-    The launch then dies with `CUDA misaligned address`, which poisons the
-    context for everything after it rather than raising something a caller
-    could catch. The wrapper's precondition is what keeps that off the device,
-    so this asserts it raises *without* calling the op.
+    That is why these are `is_valid` and not left to the op: the failure is
+    unrecoverable and its message names neither the op nor the shape.
     """
-    for width in (24, 40, 56):  # d * 2 bytes = 24, 40, 56 -- none a multiple of 16
-        x = torch.randn(4, width, dtype=torch.bfloat16, device="cuda")
-        try:
-            flashinfer_silu_and_mul(x)
-        except AssertionError:
-            continue
-        raise AssertionError(f"shape[-1]={width} should have been rejected before dispatch")
-
-
-def test_an_odd_width_is_rejected() -> None:
-    """There is no half to split at an odd width; the op would truncate."""
-    x = torch.randn(4, 33, dtype=torch.bfloat16, device="cuda")
-    try:
-        flashinfer_silu_and_mul(x)
-    except AssertionError:
-        return
-    raise AssertionError("an odd shape[-1] should have been rejected")
+    x = torch.randn(4, width, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(AssertionError, match=match):
+        with validating(op):
+            op(x)
