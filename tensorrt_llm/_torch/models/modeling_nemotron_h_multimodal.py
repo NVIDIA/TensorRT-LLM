@@ -10,6 +10,7 @@ from typing import (
     ClassVar,
     Dict,
     List,
+    Literal,
     Mapping,
     Optional,
     Sequence,
@@ -584,7 +585,7 @@ def _normalize_vision_weights(weights: Mapping[str, torch.Tensor]) -> Dict[str, 
 
 
 # Source codes are from NemotronH_Nano_VL_V2 modeling.py.
-class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
+class NemotronHVisionEncoder(transformers.PreTrainedModel):
     _supports_flash_attn = True
 
     def __init__(self, model_config: ModelConfig[transformers.PretrainedConfig]):
@@ -905,7 +906,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             video_data = multimodal_data.get("video")
             if (image_data is not None) == (video_data is not None):
                 raise ValueError(
-                    "NanoV2VLVisionEncoder expects exactly one of image / video "
+                    "NemotronHVisionEncoder expects exactly one of image / video "
                     f"per param, got image={image_data is not None}, video={video_data is not None}."
                 )
             if image_data is not None:
@@ -1075,13 +1076,13 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         return num_tubelets, wh
 
 
-class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
-    """EPD-only encoder wrapper for Nano VL image/video handoff.
+class NemotronHMultimodalEncoder(NemotronHVisionEncoder):
+    """EPD-only encoder wrapper for image/video handoff.
 
-    Full Nano V3 can support more modalities through the full model path.
-    This wrapper is only for the mm_encoder_only EPD worker. It returns one
-    vision embedding tensor for image/video inputs and does not run Nano audio
-    or video-audio interleave logic.
+    The full model path can serve more modalities. This wrapper is only for
+    the mm_encoder_only EPD worker. It returns one vision embedding tensor
+    for image/video inputs and does not run the audio or video-audio
+    interleave logic.
     """
 
     def __init__(self, model_config: ModelConfig[transformers.PretrainedConfig], *args, **kwargs):
@@ -1090,15 +1091,15 @@ class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         for param in multimodal_params:
             if param.multimodal_data.get("audio") is not None:
-                # EPD encoder-only handoff does not own the Nano audio encoder.
+                # EPD encoder-only handoff does not own the audio encoder.
                 raise NotImplementedError(
-                    "NanoV2VL MultimodalEncoder currently supports image/video inputs, not audio."
+                    "NemotronHMultimodalEncoder currently supports image/video inputs, not audio."
                 )
             video = param.multimodal_data.get("video")
             if video is not None and video.get("audio") is not None:
                 # TODO(TRTLLM-13129): Add audio support for encoder handoff.
                 raise NotImplementedError(
-                    "NanoV2VL MultimodalEncoder does not yet encode audio extracted from video."
+                    "NemotronHMultimodalEncoder does not yet encode audio extracted from video."
                 )
 
         # One `EncoderGroup` per modality — matches how the parent's
@@ -1114,7 +1115,7 @@ class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
                 )
                 for p in multimodal_params
             ]
-            embeds, _ = super(NanoV2VLMultimodalEncoder, self).forward(views)
+            embeds, _ = super(NemotronHMultimodalEncoder, self).forward(views)
             return torch.cat(embeds, dim=0)
 
         pack = lambda params: {"multimodal_params": params}  # noqa: E731
@@ -1129,7 +1130,9 @@ class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
         ]
 
 
-class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
+class NemotronHMultimodalInputProcessor(
+    BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder
+):
     supports_token_id_mm_expansion: ClassVar[bool] = True
 
     def __init__(
@@ -1235,7 +1238,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 norm_mean=config.norm_mean,
                 norm_std=config.norm_std,
             )
-            logger.info("Dynamic resolution enabled for NanoV2VL input processor")
+            logger.info("Dynamic resolution enabled for Nemotron H multimodal input processor")
 
         # Video temporal compression and sizing config.
         vision_config = getattr(config, "vision_config", config)
@@ -1327,7 +1330,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return self.config.llm_config.vocab_size
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
-        "Return multimodal special token ids for NanoV2VL."
+        "Return multimodal special token ids for Nemotron H multimodal models."
         ids = list(self._img_start_token_ids) + list(self._img_end_token_ids)
         if self._sound_start_token_id is not None:
             ids.extend([self._sound_start_token_id, self._sound_end_token_id])
@@ -1551,9 +1554,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         This is used when processing a tokenized prompt plus multimodal data,
         without calling the full HuggingFace processor. Detects which modality
         is present by scanning for placeholder token IDs and dispatches to the
-        matching per-modality expansion helper. NanoV2VL allows only one
-        modality per request, so this raises `ValueError` if placeholders for
-        more than one modality are found.
+        matching per-modality expansion helper. Nemotron H multimodal models allow
+        only one modality per request, so this raises `ValueError` if
+        placeholders for more than one modality are found.
 
         Args:
             prompt_token_ids (List[int]): The input prompt token IDs with
@@ -1565,7 +1568,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 `find_mm_token_lengths`.
             hf_processor_mm_kwargs (Optional[Dict[str, Any]]): Optional
                 dictionary of HF processor kwargs. Not currently consulted by
-                NanoV2VL's expansion (kept for interface compatibility with
+                the Nemotron H expansion (kept for interface compatibility with
                 other implementations of `expand_prompt_token_ids_for_mm`).
             mm_data (Optional[Dict[str, Any]]): The original
                 `multi_modal_data` dict (`{"image": [...], "video": [...],
@@ -1607,7 +1610,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         active_count = sum([has_image, has_video, has_audio])
         if active_count > 1:
             raise ValueError(
-                "NanoV2VL does not support multiple modalities in the same prompt yet."
+                "Nemotron H multimodal models do not support multiple modalities in the same prompt yet."
             )
         if active_count == 0:
             return prompt_token_ids, None
@@ -1782,7 +1785,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
         Returns:
             List[int]: `[num_frames, num_tiles_per_frame, h, w]`, where
-                `num_tiles_per_frame` is always 1 for NanoV2VL video paths.
+                `num_tiles_per_frame` is always 1 for Nemotron H video paths.
         """
         num_frames = len(video_frames)
         if self.video_target_num_patches is not None:
@@ -2185,7 +2188,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 # prompt-side MM counts would diverge from the vision encoder's output.
                 # Guard against accidental change.
                 assert VIDEO_MAX_NUM_TILES == 1, (
-                    "NanoV2VL video paths assume a single tile per frame; see comment above."
+                    "Nemotron H video paths assume a single tile per frame; see comment above."
                 )
                 self.processor.max_num_tiles = VIDEO_MAX_NUM_TILES
                 try:
@@ -2471,15 +2474,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
         mm_data = inputs.get("multi_modal_data") or {}
         if not mm_data:
-            raise ValueError("multi_modal_data is required for NanoV2VL multimodal handoff")
+            raise ValueError("multi_modal_data is required for Nemotron H multimodal handoff")
         modalities = [name for name, value in mm_data.items() if value is not None]
         if len(modalities) != 1:
             raise ValueError(
-                "NanoV2VL multimodal handoff supports exactly one modality per request"
+                "Nemotron H multimodal handoff supports exactly one modality per request"
             )
         if modalities[0] == "audio":
             raise NotImplementedError(
-                "NanoV2VL multimodal handoff does not support audio-only inputs"
+                "Nemotron H multimodal handoff does not support audio-only inputs"
             )
 
         num_mm_tokens_by_key = find_mm_token_lengths(mm_data, self)
@@ -2754,7 +2757,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return resampled_audios
 
 
-_NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
+_NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     placeholder_map={
         "image": IMAGE_PLACEHOLDER,
         "video": VIDEO_PLACEHOLDER,
@@ -2762,10 +2765,10 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     },
     placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     placeholders_separator="\n",
-    # Nano's chat template counts modalities and emits `<image>*N + <video>*N +
+    # The chat template counts modalities and emits `<image>*N + <video>*N +
     # <so_embedding>*N` regardless of chat-part send order (and produces the
     # numbered `<image N><image>` form for multi-image prompts). Declare that
-    # ordering so `mm_item_order` reflects the prompt Nano's Jinja actually
+    # ordering so `mm_item_order` reflects the prompt the template actually
     # produces, keeping the framework's `mm_item_order == prompt order`
     # invariant intact for mixed-modality requests.
     prompt_modality_order=("image", "video", "audio"),
@@ -2773,30 +2776,30 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 
 
 @support_multimodal_disaggregated
-@register_vision_encoder(NanoV2VLMultimodalEncoder)
+@register_vision_encoder(NemotronHMultimodalEncoder)
 @register_auto_model("NemotronH_Nano_Omni_Reasoning_V3")
 @register_auto_model("NemotronH_Nano_VL_V2")
-# Nemotron 3.5 Super VL: same class, no "Nano" infix, and vision-only (its
-# `sound_config` is null) despite the "Omni" in the architecture name.
+# Nemotron 3.5 Super VL: same class, and vision-only (its `sound_config` is
+# null) despite the "Omni" in the architecture name.
 @register_auto_model("NemotronH_Omni_Reasoning_V3")
 @register_input_processor(
-    NanoV2VLInputProcessor,
+    NemotronHMultimodalInputProcessor,
     model_type="NemotronH_Nano_VL_V2",
-    placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
+    placeholder_metadata=_NEMOTRON_H_MM_PLACEHOLDER_METADATA,
 )
 @register_input_processor(
-    NanoV2VLInputProcessor,
+    NemotronHMultimodalInputProcessor,
     model_type="NemotronH_Nano_Omni_Reasoning_V3",
-    placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
+    placeholder_metadata=_NEMOTRON_H_MM_PLACEHOLDER_METADATA,
 )
 # `model_type`, not architecture: the Nano checkpoints set both to the same
 # string, this one does not.
 @register_input_processor(
-    NanoV2VLInputProcessor,
+    NemotronHMultimodalInputProcessor,
     model_type="nemotron_h_omni",
-    placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
+    placeholder_metadata=_NEMOTRON_H_MM_PLACEHOLDER_METADATA,
 )
-class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
+class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
     _supports_flash_attn = True
 
     def __init__(self, model_config: ModelConfig):
@@ -2822,7 +2825,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         # reassigns self.model_config.pretrained_config to the LLM-only
         # NemotronHConfig, which loses vision_config / sound_config / etc.
         self._mm_model_config = copy.deepcopy(model_config)
-        self.vision_encoder: Optional[NanoV2VLVisionEncoder] = None
+        self.vision_encoder: Optional[NemotronHVisionEncoder] = None
         self.sound_encoder: ProjectedParakeet | None = None
 
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
@@ -2864,7 +2867,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         # Normal workers own encoders. MM E/P handoff uses attached embeddings.
         is_multimodal_encoder_worker = not _is_mm_disagg()
         if self.vision_encoder is None and is_multimodal_encoder_worker:
-            self.vision_encoder = NanoV2VLVisionEncoder(self._mm_model_config).eval().to("cuda")
+            self.vision_encoder = NemotronHVisionEncoder(self._mm_model_config).eval().to("cuda")
         sound_config = getattr(mm_pretrained, "sound_config", None)
         if self.sound_encoder is None and sound_config is not None and is_multimodal_encoder_worker:
             self.sound_encoder = (
@@ -2924,6 +2927,27 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         # (this VL wrapper), not the inner decoder, so delegate to keep block
         # reuse opt-in until a Mamba state snapshot policy is configured.
         return NemotronHForCausalLM.get_model_defaults(llm_args)
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Match the NemotronH backbone's hybrid-state preference.
+
+        Resolved off this wrapper, so the preference has to be restated here
+        or the backbone's is never consulted. `pretrained_config` is ignored:
+        at resolution time it is still the outer multimodal config, whose
+        `hybrid_override_pattern` lives one level down under `llm_config`, so
+        inspecting it would report a non-hybrid model.
+        """
+        return NemotronHForCausalLM.get_preferred_kv_cache_manager_version(pretrained_config)
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Match the NemotronH backbone's Python disaggregated route."""
+        return NemotronHForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
 
     def post_config(self):
         # use llm.config as config for pytorch model engine
@@ -3036,7 +3060,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
             p.multimodal_data.get(m) is not None for p in raw_ctx_params for m in ("image", "video")
         )
         if needs_vision_encoder and self.vision_encoder is None:
-            raise ValueError("Raw image/video inputs require a local NanoV2VL vision encoder.")
+            raise ValueError("Raw image/video inputs require a local Nemotron vision encoder.")
         # Sound encoder is also needed for audio nested under a video's
         # `multimodal_data["video"]["audio"]` — the video group interleaves
         # those rows and would silently drop them if the encoder is missing.
@@ -3046,7 +3070,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
             for p in raw_ctx_params
         )
         if needs_sound_encoder and self.sound_encoder is None:
-            raise ValueError("Raw audio inputs require a local NanoV2VL sound encoder.")
+            raise ValueError("Raw audio inputs require a local Nemotron sound encoder.")
 
     def merge_evs_mm_embeds(
         self,
@@ -3253,7 +3277,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
     def _vision_view(self, param: MultimodalParams, modality: str) -> MultimodalParams:
         """Wrap one param's image or video bucket in a single-modality view.
 
-        `NanoV2VLVisionEncoder.forward` bucket-dispatches on the legacy
+        `NemotronHVisionEncoder.forward` bucket-dispatches on the legacy
         `modality_type` key and emits one row block per param, so a
         mixed-modality param has no valid output shape. Each group
         encoder_fn feeds views of its own modality.

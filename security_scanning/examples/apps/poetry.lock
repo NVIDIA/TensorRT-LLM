@@ -78,15 +78,15 @@ files = [
 
 [[package]]
 name = "httpcore2"
-version = "2.12.0"
+version = "2.13.0"
 description = "A minimal low-level HTTP client."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "sys_platform != \"emscripten\""
 files = [
-    {file = "httpcore2-2.12.0-py3-none-any.whl", hash = "sha256:7e04258ce01013d7d615e5b910a3b27fac937d7a95038227e79652b4ba3b4ceb"},
-    {file = "httpcore2-2.12.0.tar.gz", hash = "sha256:9293522bba0aa7c4c8e9e3f040c16575bd8868e155a77fa30c7a9085a5eae648"},
+    {file = "httpcore2-2.13.0-py3-none-any.whl", hash = "sha256:35ae5be347aa40467b4a5dc032ac67ebb6d27189fc97e8cebcf99616f6a1bb9e"},
+    {file = "httpcore2-2.13.0.tar.gz", hash = "sha256:2adc8be4fb285fbcd6d894298db3b52c177e74b6674eda3a76bd36be3292a3db"},
 ]
 
 [package.dependencies]
@@ -97,30 +97,30 @@ truststore = ">=0.10"
 asyncio = ["anyio (>=4.5.0,<5.0)"]
 http2 = ["h2 (>=3,<5)"]
 socks = ["socksio (==1.*)"]
-trio = ["trio (>=0.33.0,<1.0)"]
+trio = ["trio (>=0.34.0,<1.0)"]
 
 [[package]]
 name = "httpx2"
-version = "2.12.0"
+version = "2.13.0"
 description = "The next generation HTTP client."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "httpx2-2.12.0-py3-none-any.whl", hash = "sha256:cc8b6eecb8661c146b8f89a60e97456ee086e91a784ed31ac450c3a9e613dd36"},
-    {file = "httpx2-2.12.0.tar.gz", hash = "sha256:7631fe9887a8a2275f4a2540e053aa670fcc50742864a9ae7c66e609fdcf12cf"},
+    {file = "httpx2-2.13.0-py3-none-any.whl", hash = "sha256:fc12720cedf72faa26cca6b4ca394e05c894e7d7933fc45cafe767960804e49a"},
+    {file = "httpx2-2.13.0.tar.gz", hash = "sha256:81bd07dc67a3701729ef1f777a3c00c915d4539604fdb5afd327f8682f6b7b44"},
 ]
 
 [package.dependencies]
 anyio = {version = ">=4.10", markers = "sys_platform != \"emscripten\""}
-httpcore2 = {version = "2.12.0", markers = "sys_platform != \"emscripten\""}
+httpcore2 = {version = "2.13.0", markers = "sys_platform != \"emscripten\""}
 httpx2-jsfetch = {version = "*", markers = "sys_platform == \"emscripten\" and python_version >= \"3.12\""}
 idna = ">=3.18"
 truststore = {version = ">=0.10", markers = "sys_platform != \"emscripten\""}
 typing-extensions = {version = ">=4.5.0", markers = "python_version < \"3.13\""}
 
 [package.extras]
-brotli = ["brotli (>=1.2.0) ; platform_python_implementation == \"CPython\"", "brotlicffi (>=1.2.0.0) ; platform_python_implementation != \"CPython\""]
+brotli = ["brotli (>=1.2.0) ; platform_python_implementation == \"CPython\"", "brotlicffi (>=1.2.0.2) ; platform_python_implementation != \"CPython\""]
 cli = ["click (>=8.4.2)", "pygments (==2.*)", "rich (>=10,<16)"]
 http2 = ["h2 (>=3,<5)"]
 socks = ["socksio (==1.*)"]
@@ -286,14 +286,14 @@ files = [
 
 [[package]]
 name = "openai"
-version = "3.13.0"
+version = "3.14.1"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.13.0-py3-none-any.whl", hash = "sha256:e35b1f6fe99245e86e37504d9fad1ad2a363807307c424232c1d849bd0666c8e"},
-    {file = "openai-3.13.0.tar.gz", hash = "sha256:a8f87a9b3b9c08eb446d68bd0a80e8ec907c4c35fdea63f4265c7b34b2de3a60"},
+    {file = "openai-3.14.1-py3-none-any.whl", hash = "sha256:a6758739282f3b1cafe8df1204f7a2f7b1e9edbbcfa41c0efba687448fbc51cf"},
+    {file = "openai-3.14.1.tar.gz", hash = "sha256:2f3423a71af767d9071b059cf6df1e97a721c3a8d19417375ad7993d4df0d346"},
 ]
 
 [package.dependencies]

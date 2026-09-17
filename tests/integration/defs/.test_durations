@@ -977,7 +977,7 @@
    "unittest/_torch/modeling -k \"modeling_gemma4\"": 148.17801886792452,
    "unittest/_torch/modeling -k \"modeling_gpt_oss\"": 117.90059431818182,
    "unittest/_torch/modeling -k \"modeling_llama\"": 116.35982548179872,
-   "unittest/_torch/modeling -k \"modeling_nemotron_nano_v2_vl\"": 377.6396950207469,
+   "unittest/_torch/modeling -k \"modeling_nemotron_h_multimodal\"": 377.6396950207469,
    "unittest/_torch/modeling -k \"modeling_out_of_tree\"": 148.7342861163227,
    "unittest/_torch/modeling -k \"modeling_qwen3\"": 194.1886090225564,
    "unittest/_torch/modeling -k \"modeling_siglip\"": 234.51650191570883,

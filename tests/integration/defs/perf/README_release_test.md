@@ -66,12 +66,7 @@ benchmark_cmd = [
 
 #### Backend Selection
 ```python
-if self._config.backend != "pytorch":
-    benchmark_cmd += [
-        f"--backend=tensorrt", f"--engine_dir={engine_dir}"
-    ]
-else:
-    benchmark_cmd += ["--backend=pytorch"]
+benchmark_cmd += [f"--backend={self._config.backend}"]
 ```
 
 #### Optional Parameter Configuration

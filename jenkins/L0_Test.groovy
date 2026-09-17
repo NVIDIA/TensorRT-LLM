@@ -2477,6 +2477,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     tail -f ${slurmJobLogPath} &
                     tailPid=\$!
 
+                    noLogTimeoutSecs=7200
+                    lastLogSize=-1
+                    lastLogChangeEpoch=\$(date +%s)
+
                     # Wait until Slurm job is done
                     while true; do
                         # Use --allocations to ensure we match the exact job ID and not job steps (like 123.batch, 123.0)
@@ -2489,6 +2493,23 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
                             echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
+                            if [[ \$STATUS == "RUNNING" ]]; then
+                                currentLogSize=0
+                                if [ -f "${slurmJobLogPath}" ]; then
+                                    currentLogSize=\$(stat -c %s "${slurmJobLogPath}" 2>/dev/null || echo 0)
+                                fi
+                                nowEpoch=\$(date +%s)
+                                if [ "\$currentLogSize" != "\$lastLogSize" ]; then
+                                    lastLogSize=\$currentLogSize
+                                    lastLogChangeEpoch=\$nowEpoch
+                                else
+                                    staleSecs=\$((nowEpoch - lastLogChangeEpoch))
+                                    if [ "\$staleSecs" -ge "\$noLogTimeoutSecs" ]; then
+                                        echo "Warning: no new log output for \${staleSecs}s (>= \${noLogTimeoutSecs}s), job \$jobId is likely stuck/timed out. Cancelling it."
+                                        scancel \$jobId || true
+                                    fi
+                                fi
+                            fi
                             sleep 300
                         else
                             echo "Slurm job \$jobId finished with state: \$STATUS"
@@ -5607,17 +5628,13 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 }
 
 
-def checkPipInstall(pipeline, wheel_path, version_override)
+def checkPipInstall(pipeline, wheel_path)
 {
     def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
-    def versionLocal = version_override?.contains("+") ?
-        version_override.substring(version_override.indexOf("+") + 1) : ""
-    withEnv(["TRTLLM_VERSION_LOCAL=${versionLocal}"]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-            cd ${LLM_ROOT}/tests/unittest && \
-            python3 check_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "\${TRTLLM_VERSION_LOCAL}"
-            """)
-    }
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+        cd ${LLM_ROOT}/tests/unittest && \
+        python3 check_pip_install.py --wheel_path ${wheelArtifactLinks}
+        """)
 }
 
 
@@ -5708,7 +5725,8 @@ def runLLMBuild(
     wheel_path="",
     version_override="",
     cpver="cp312",
-    plat_name="")
+    plat_name="",
+    is_dlfw=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -5753,9 +5771,40 @@ def runLLMBuild(
     }
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
-    echo "uploading ${wheelName} to ${cpu_arch}/${wheel_path}"
-    trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
-    def uploadedWheelPath = "${cpu_arch}/${wheel_path}${wheelName}"
+    def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
+    // DLFW publishes the built public-version wheel under its subdirectory. Other
+    // builds continue to publish the built wheel at the original path.
+    def builtWheelUploadPath =
+        is_dlfw ? "${rootWheelUploadPath}dlfw/" : rootWheelUploadPath
+    echo "uploading ${wheelName} to ${builtWheelUploadPath}"
+    trtllm_utils.uploadArtifacts(
+        "tensorrt_llm/build/${wheelName}",
+        "${UPLOAD_PATH}/${builtWheelUploadPath}")
+
+    def uploadedWheelPath = "${builtWheelUploadPath}${wheelName}"
+    def wheelPath = uploadedWheelPath
+    if (is_dlfw) {
+        // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
+        def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
+        if (!matcher.find()) {
+            error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
+        }
+        def dlfwLocalVersion =
+            "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
+        def localWheelPath = sh(
+            returnStdout: true,
+            script: "python3 tensorrt_llm/jenkins/scripts/repack_wheel.py " +
+                "tensorrt_llm/build/${wheelName} ${dlfwLocalVersion} " +
+                "--output-dir tensorrt_llm/build/local-version"
+        ).trim()
+        def localWheelName = localWheelPath.tokenize('/').last()
+        echo "uploading ${localWheelName} to ${rootWheelUploadPath}"
+        trtllm_utils.uploadArtifacts(
+            localWheelPath,
+            "${UPLOAD_PATH}/${rootWheelUploadPath}")
+        wheelPath = "${rootWheelUploadPath}${localWheelName}"
+    }
+
     def kitmakerDryRunMetadata = null
     if (version_override?.contains("+")) {
         echo "Skipping Kitmaker wheel dry run for local version '${version_override}'"
@@ -5795,7 +5844,7 @@ def runLLMBuild(
     }
     checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 
-    return wheelName
+    return wheelPath
 }
 
 
@@ -6357,23 +6406,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
     ]
-    // B200 PerfSanity pre-merge disaggregated (functional-only: perf regressions do not fail CI)
-    // 2 Nodes
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8",
-        "auto:dgx-b200-flex",
-        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
-        1,
-        16,
-        2
-    )
     // B200 PerfSanity post-merge disaggregated
     // 2 Nodes
     x86SlurmTestConfigs += buildStageConfigs(
         "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8-Post-Merge",
         "auto:dgx-b200-flex",
         "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
-        2,
+        3,
         16,
         2
     )
@@ -6431,14 +6470,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
-        // PerfSanity pre-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
+        // PerfSanity pre-merge tests. GB300 x4 capacity is the binding constraint, so
+        // pre-merge gating is one stage on one node: the two DeepSeek-V4-Pro ctx_only cases.
+        "GB300-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 1, 4, 1, true, false],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 6, 6, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
@@ -6473,16 +6514,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         8,
         2
     )
-    // PerfSanity pre-merge disaggregated (functional-only: perf regressions do not fail CI)
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        1,
-        8,
-        2
-    )
     // PerfSanity post-merge disaggregated
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
@@ -6497,7 +6528,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        5,
+        6,
         8,
         2
     )
@@ -6584,21 +6615,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         5
     )
     // GB300 GLM-5 disaggregated (ctx DEP2)
-    // 3 Nodes (pre-merge, functional-only)
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
-        1,
-        12,
-        3
-    )
     // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
-        2,
+        3,
         12,
         3
     )
@@ -6895,17 +6917,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
             def isDlfw = values[4]
-            def packageVersionOverride = versionOverride
-            if (isDlfw) {
-                // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
-                def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
-                if (!matcher.find()) {
-                    error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
-                }
-                packageVersionOverride +=
-                    "+ngcpytorch${matcher.group(1)}${matcher.group(2)}"
-            }
-            def wheelName = ""
+            def wheelPath = ""
             def cpver = "cp312"
             def pyver = "3.12"
             if (key.contains("PY310")) {
@@ -6914,13 +6926,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", packageVersionOverride, cpver, values[7])
+                wheelPath = runLLMBuild(
+                    pipeline, cpu_arch, values[3], "", versionOverride, cpver,
+                    values[7], isDlfw)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
-            // def fullWheelPath = "${cpu_arch}/${wheelName}"
             // sanityRunner("Sanity check") {
-            //     runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
+            //     runPackageSanityCheck(pipeline, wheelPath, values[3], cpver)
             // }
 
             def checkPipStage = false
@@ -6966,14 +6979,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra CUDA 13 PyTorch install Start ######"
-                            // cu130 is PyTorch's only CUDA 13 channel; it runs on the toolkit above
-                            // through CUDA minor version compatibility.
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // This must stay equal to what requirements.txt resolves to from the public
-                            // index, which is the highest public torch its ceiling admits: the wheel under
-                            // test is linked against that libtorch, and a mismatch fails the import with an
-                            // undefined c10 symbol rather than anything that names a version.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            // Must match what requirements.txt resolves to from the public index: the
+                            // wheel under test is linked against that libtorch, and a mismatch fails
+                            // the import with an undefined c10 symbol instead of a version error.
+                            // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
@@ -7003,7 +7013,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             sh "env | sort"
                             trtllm_utils.llmRetry(1, "checkPipInstall", {
                                 timeout(time: 30, unit: 'MINUTES') {
-                                    checkPipInstall(pipeline, "${cpu_arch}", packageVersionOverride)
+                                    checkPipInstall(pipeline, wheelPath)
                                 }
                             })
                         }

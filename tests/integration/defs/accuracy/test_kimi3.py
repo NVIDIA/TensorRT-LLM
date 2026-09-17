@@ -34,6 +34,7 @@ from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import (
     GSM8K,
     ForceTokenLogitsProcessor,
+    GPQADiamond,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length_for_llm,
     assert_guided_decoding_regex,
@@ -54,7 +55,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # so gate on GB300-class device memory. B300 clears this memory gate but
     # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) -- do not
     # schedule these tests on B300; that exclusion is enforced by QA's
-    # platform selection, not by this marker.
+    # platform selection and by the CI stage's gb300-only gpu wildcard,
+    # not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
     @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa", "dspark"])
     def test_w4a16_mxfp4(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,6 +68,11 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         decoding. The reuse mode requires an observed hybrid-cache hit. The SA
         and DSpark modes also guard acceptance length for the two speculative
         decoding techniques advertised in the model-feature matrix.
+
+        The baseline and sa modes run post-merge in the GB300 16-GPU 4-node CI
+        stage (test-db list l0_gb300_multi_nodes_node4_gpu16.yml); all four
+        modes also run in QA's weekly multinode pipeline
+        (qa/llm_function_multinode.txt).
         """
         if mode == "baseline":
             monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
@@ -153,6 +160,55 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                     f"TestKimiK3::test_w4a16_mxfp4[{mode}]",
                     llm,
                 )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_less_device_memory(200000)
+    def test_gpqa_diamond_w4a16_mxfp4(self) -> None:
+        """Run GPQA Diamond on the K3 checkpoint with DEP16."""
+        max_seq_len = GPQADiamond.MAX_INPUT_LEN + GPQADiamond.MAX_OUTPUT_LEN
+        sampling_params = SamplingParams(
+            max_tokens=GPQADiamond.MAX_OUTPUT_LEN,
+            truncate_prompt_tokens=GPQADiamond.MAX_INPUT_LEN,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=16,
+            moe_expert_parallel_size=16,
+            enable_attention_dp=True,
+            max_batch_size=32,
+            max_num_tokens=8192,
+            max_seq_len=max_seq_len,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
+            moe_config=MoeConfig(
+                max_num_tokens=33024,
+                use_low_precision_moe_combine=True,
+            ),
+            # The qualified K3 GPQA configuration used KV cache manager V1.
+            # Like K3 MMMU, GPQA leaves very long generations after shorter
+            # requests finish. V2 has stalled or deadlocked at this shape even
+            # with a host tier and additional cache capacity. Pin V1 until the
+            # V2 x KDA-hybrid long-generation path is qualified.
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.25,
+                tokens_per_block=64,
+                use_kv_cache_manager_v2=False,
+            ),
+        ) as llm:
+            # K3 stores its compressed-tensors quantization configuration in
+            # text_config, so the LLM-args reference matcher sees no quant algo.
+            assert llm.args.quant_config.quant_algo is None
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=sampling_params,
+                # The provider reference and the 90.404% qualification run use
+                # the model's chat template.
+                extra_evaluator_kwargs=dict(apply_chat_template=True),
+            )
 
     def _assert_checkpoint_routing(self) -> None:
         config = load_pretrained_config(self.MODEL_PATH, trust_remote_code=True)

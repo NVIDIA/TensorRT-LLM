@@ -50,7 +50,10 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     create_cache_reuse_adapter,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_pool_view_num_layers,
+)
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -186,11 +189,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_timeout_s=sender_wait_slice_s,
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
-                # Size 0 turns bounce off; the per-transfer size gates are internal (tuned via
-                # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
-                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
                 enforce_physical_ownership=enforce_physical_ownership,
+                # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
+                # routes it to exactly one implementation: the Python bounce below (per-region,
+                # size 0 = off; the per-transfer size gates are internal, tuned via env:
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads) or the C++
+                # transfer-agent staging buffer (bounce v2, one buffer shared by send and recv).
+                bounce=bounce_config_from_size(
+                    0
+                    if cache_transceiver_config.agent_bounce_buffer_enable
+                    else cache_transceiver_config.kv_cache_bounce_size_mb
+                ),
+                agent_buffer_size_mb=(
+                    cache_transceiver_config.kv_cache_bounce_size_mb
+                    if cache_transceiver_config.agent_bounce_buffer_enable
+                    else 0
+                ),
+                agent_bounce_params=cache_transceiver_config.agent_bounce_params,
             )
         )
         if enforce_physical_ownership:
@@ -408,18 +424,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     + tpb
                     - 1
                 ) // tpb
-                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
-                    block_ids,
-                    req.py_beam_width,
-                    allocated_blocks,
-                )
-                if beam0_block_ids.size > allocated_blocks:
-                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
-                    block_ids = (
-                        np.concatenate([beam0_block_ids, tail_block_ids])
-                        if tail_block_ids.size > 0
-                        else beam0_block_ids
-                    )
+                if block_ids.size > allocated_blocks:
+                    block_ids = block_ids[:allocated_blocks]
                 # Current PyExecutor cache managers disable KV-cache token sinks,
                 # so SWA block lists contain an evictable prompt prefix followed
                 # by the speculative scratch tail. If token sinks are enabled,
@@ -438,22 +444,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, prompt_blocks - stale_end)
+                if block_ids.size > expected_valid:
+                    block_ids = (
+                        block_ids[-expected_valid:]
+                        if expected_valid > 0
+                        else np.array([], dtype=np.int64)
+                    )
                 # Skip reused blocks that remain after stale-prefix pruning.
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
                 # Drop the speculative scratch tail; only prompt_len is transferred.
                 if block_ids.size > prompt_blocks:
                     block_ids = block_ids[:prompt_blocks]
-                expected_valid = prompt_blocks
                 cache_skip = cached_per_lg[idx] // tpb
 
-            block_ids = self._trim_packed_beam_block_ids(
-                block_ids,
-                beam_width=req.py_beam_width,
-                total_blocks=prompt_blocks,
-                expected_valid=expected_valid,
-                cache_skip=cache_skip,
-            )
+            if cache_skip > 0:
+                block_ids = (
+                    block_ids[cache_skip:]
+                    if cache_skip < block_ids.size
+                    else np.array([], dtype=np.int64)
+                )
 
             groups.append(block_ids)
 
@@ -485,63 +495,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for pv in lg.pool_views:
                 pool = get_physical_pool(pt, lg_id, pv.pool_idx)
                 if lg.kind == CacheKind.STATE:
-                    # STATE: n=1 (one slot), but transfer covers all layers.
-                    num_layers = len(lg.local_layers)
-                    total += num_layers * pool.slot_bytes
+                    # STATE: n=1 (one slot), but transfer covers all layers of
+                    # the view. The physical slot may hold several roles, so
+                    # size by the view's per-layer bytes, not the pool's slot.
+                    num_layers = get_pool_view_num_layers(pv)
+                    total += num_layers * pv.bytes_per_layer
                 else:
                     # Attention: n blocks, each slot covers all layers.
                     total += n * pool.slot_bytes
         return total
-
-    @staticmethod
-    def _split_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Split 1-D block IDs into beam-0 prefix and appended beam-tail blocks."""
-        if beam_width <= 1 or block_ids.size <= total_blocks:
-            return block_ids, np.array([], dtype=np.int64)
-        tail_count = min(beam_width - 1, block_ids.size - total_blocks)
-        if tail_count <= 0:
-            return block_ids, np.array([], dtype=np.int64)
-        return block_ids[:-tail_count], block_ids[-tail_count:]
-
-    @staticmethod
-    def _trim_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-        expected_valid: int,
-        cache_skip: int,
-    ) -> np.ndarray:
-        """Trim/skip beam-0 blocks while preserving packed beam-tail blocks."""
-        if expected_valid <= 0:
-            return np.array([], dtype=np.int64)
-
-        beam0_block_ids, tail_block_ids = KvCacheTransceiverV2._split_packed_beam_block_ids(
-            block_ids, beam_width, total_blocks
-        )
-
-        if beam0_block_ids.size > expected_valid:
-            beam0_block_ids = (
-                beam0_block_ids[-expected_valid:]
-                if expected_valid > 0
-                else np.array([], dtype=np.int64)
-            )
-            if beam0_block_ids.size == 0:
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if cache_skip > 0:
-            if cache_skip < beam0_block_ids.size:
-                beam0_block_ids = beam0_block_ids[cache_skip:]
-            else:
-                beam0_block_ids = np.array([], dtype=np.int64)
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if tail_block_ids.size == 0:
-            return beam0_block_ids
-        return np.concatenate([beam0_block_ids, tail_block_ids])
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
@@ -1439,9 +1401,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not cfg.enable_pipelined_transfer:
             return False
         blockers = []
-        # Bounce buffers stage a whole request, not individual chunks.
-        if cfg.kv_cache_bounce_size_mb != 0:
-            blockers.append(f"kv_cache_bounce_size_mb={cfg.kv_cache_bounce_size_mb}")
+        # The Python bounce reserves a receiver region for the whole request, not per chunk.
+        # The C++ transfer-agent bounce (agent_bounce_buffer_enable) stages each transfer request
+        # independently below the Python layer, so a pipelined chunk is just another request.
+        if cfg.kv_cache_bounce_size_mb != 0 and not cfg.agent_bounce_buffer_enable:
+            blockers.append(
+                f"the Python bounce buffer (kv_cache_bounce_size_mb="
+                f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
+            )
         if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
             blockers.append("a Mamba/hybrid cache manager")
         # Policies other than all_reusable defer the whole prompt's commit to the final

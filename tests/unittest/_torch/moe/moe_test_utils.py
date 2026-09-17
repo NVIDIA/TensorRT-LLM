@@ -970,8 +970,9 @@ def should_skip_megamoe_cutedsl(
     rather than the host ``Communication.dispatch`` strategies, so the
     only sanctioned ``comm_method`` value here is the explicit
     ``IGNORE`` sentinel used by the EPLB / dedicated MegaMoE multi-GPU
-    test paths. ``DEP`` and ``TEP`` parallel modes are accepted (EPLB
-    requires EP-shard routing); TP modes shard intermediate which
+    test paths. ``DEP`` is accepted generally, while ``TEP`` is limited to
+    the bias-free MiniMax-style SwiGLU package whose model wrapper handles the
+    kernel's already-global routed output. TP modes shard intermediate, which
     would break the per-slot weight layout.
     """
     if backend_type != MoeBackendType.MEGAMOE_CUTEDSL:
@@ -1004,11 +1005,11 @@ def should_skip_megamoe_cutedsl(
     if dtype is not None and dtype != torch.bfloat16:
         return f"MegaMoECuteDsl only supports bfloat16 activations (got dtype={dtype})."
 
-    if swiglu_gptoss_style:
-        return "MegaMoECuteDsl does not support swiglu_gptoss_style"
-
     if moe_tp_size != 1:
         return f"MegaMoECuteDsl is EP-only (got moe_tp_size={moe_tp_size})"
+
+    if parallel_mode == "TEP" and not swiglu_gptoss_style:
+        return "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style SwigluBias"
 
     if model_config is not None:
         hidden_size = model_config.hidden_size
@@ -1176,6 +1177,7 @@ def get_quick_skip_reason(
 
     try:
         backend_cls = get_backend_class(backend_type)
+        is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
         problem = MoEProblem(
             quant=canonical_quant(quant_algo),
             dtype_act=dtype,
@@ -1184,7 +1186,13 @@ def get_quick_skip_reason(
             num_experts=None if model_config is None else model_config.num_experts,
             top_k=None if model_config is None else model_config.top_k,
             swiglu_gptoss_style=swiglu_gptoss_style,
-            bias=swiglu_gptoss_style,
+            bias=swiglu_gptoss_style and not is_minimax_megamoe,
+            activation=(
+                ActivationType.SwigluBias.name if is_minimax_megamoe else ActivationType.Swiglu.name
+            ),
+            activation_constants=(
+                frozenset({"alpha", "beta", "clamp"}) if is_minimax_megamoe else frozenset()
+            ),
         )
         # Multi-rank constraints are checked by the helpers below.
         deployment = MoEDeployment(
