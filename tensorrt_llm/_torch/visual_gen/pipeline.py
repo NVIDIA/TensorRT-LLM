@@ -974,6 +974,22 @@ class BasePipeline(nn.Module):
         noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
         return guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
 
+    def _combine_cfg_branches(self, noise_uncond, noise_cond, guidance_scale, guidance_rescale):
+        """Combine the two CFG branches of one stream into a single prediction.
+
+        ``u + 1.0 * (c - u)`` is the identity in exact arithmetic but not in BF16. A step
+        whose effective scale has fallen back to 1.0 -- outside a ``guidance_interval``, or
+        past a two-stage boundary -- must therefore return the conditional prediction
+        unchanged instead of re-deriving it through the blend. Rescaling is likewise only
+        meaningful once guidance has actually been applied.
+        """
+        if guidance_scale == 1.0:
+            return noise_cond
+        combined = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        if guidance_rescale > 0.0:
+            combined = self._rescale_noise_cfg(combined, noise_cond, guidance_rescale)
+        return combined
+
     @staticmethod
     def _resolve_step_guidance_scale(
         t: torch.Tensor,
@@ -1116,7 +1132,9 @@ class BasePipeline(nn.Module):
         dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
         noise_cond = gather_list[0]
         noise_uncond = gather_list[1]
-        noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        noise_pred = self._combine_cfg_branches(
+            noise_uncond, noise_cond, guidance_scale, guidance_rescale
+        )
 
         # All-gather extra stream noises
         extra_noise_preds = {}
@@ -1126,17 +1144,9 @@ class BasePipeline(nn.Module):
             dist.all_gather(gather_list_extra, noise_local, group=cfg_pg)
             noise_cond_extra = gather_list_extra[0]
             noise_uncond_extra = gather_list_extra[1]
-            extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
-                noise_cond_extra - noise_uncond_extra
+            extra_noise_preds[name] = self._combine_cfg_branches(
+                noise_uncond_extra, noise_cond_extra, guidance_scale, guidance_rescale
             )
-
-            if guidance_rescale > 0.0:
-                extra_noise_preds[name] = self._rescale_noise_cfg(
-                    extra_noise_preds[name], noise_cond_extra, guidance_rescale
-                )
-
-        if guidance_rescale > 0.0:
-            noise_pred = self._rescale_noise_cfg(noise_pred, noise_cond, guidance_rescale)
 
         t_cfg = time.time() - c_start
         return noise_pred, extra_noise_preds, t_transformer, t_cfg
@@ -1190,22 +1200,16 @@ class BasePipeline(nn.Module):
         c_start = time.time()
         if do_cfg:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            noise_pred = self._combine_cfg_branches(
+                noise_pred_uncond, noise_pred_text, guidance_scale, guidance_rescale
+            )
 
             # Apply CFG to extra streams
             for name, noise_extra in extra_noise_preds.items():
                 noise_uncond_extra, noise_text_extra = noise_extra.chunk(2)
-                extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
-                    noise_text_extra - noise_uncond_extra
+                extra_noise_preds[name] = self._combine_cfg_branches(
+                    noise_uncond_extra, noise_text_extra, guidance_scale, guidance_rescale
                 )
-
-                if guidance_rescale > 0.0:
-                    extra_noise_preds[name] = self._rescale_noise_cfg(
-                        extra_noise_preds[name], noise_text_extra, guidance_rescale
-                    )
-
-            if guidance_rescale > 0.0:
-                noise_pred = self._rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale)
 
             t_cfg = time.time() - c_start
         else:
