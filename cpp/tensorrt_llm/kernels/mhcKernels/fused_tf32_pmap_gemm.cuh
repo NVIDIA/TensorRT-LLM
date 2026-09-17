@@ -190,7 +190,7 @@ __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uin
 // coefficient, so keep the pair packed instead of lowering it to two FFMA.
 __device__ __forceinline__ float2 fma_f32x2(float2 const& a, float2 const& b, float2 const& c)
 {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
     float2 result;
     asm volatile("fma.rn.f32x2 %0, %1, %2, %3;"
                  : "=l"(reinterpret_cast<uint64_t&>(result))
@@ -204,7 +204,7 @@ __device__ __forceinline__ float2 fma_f32x2(float2 const& a, float2 const& b, fl
 
 __device__ __forceinline__ float2 mul_f32x2(float2 const& a, float2 const& b)
 {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
     float2 result;
     asm volatile("mul.f32x2 %0, %1, %2;"
                  : "=l"(reinterpret_cast<uint64_t&>(result))

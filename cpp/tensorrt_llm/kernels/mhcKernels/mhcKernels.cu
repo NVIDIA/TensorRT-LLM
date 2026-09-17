@@ -31,7 +31,7 @@ namespace kernels::mhc
 // Phase 2 always updates adjacent bf16 values with the same pre-mix scalar.
 __device__ __forceinline__ float2 mhcFmaF32x2(float2 const& a, float2 const& b, float2 const& c)
 {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
     float2 result;
     asm volatile("fma.rn.f32x2 %0, %1, %2, %3;"
                  : "=l"(reinterpret_cast<uint64_t&>(result))

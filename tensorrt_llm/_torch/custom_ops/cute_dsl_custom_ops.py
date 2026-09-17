@@ -15082,6 +15082,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.scaling_vector_size = scaling_vector_size
                     self.swiglu_limit = swiglu_limit
                     self.activation_type = ActivationType(int(activation_type))
+                    # The fused kernel derives interm_size as fc1_n // 2, so a
+                    # non-gated activation would silently halve the wrong
+                    # dimension and produce wrong output rather than failing.
+                    if self.activation_type not in (ActivationType.Swiglu,
+                                                    ActivationType.SiTu):
+                        raise ValueError(
+                            f"{self.__class__.kernel_class.__name__} supports "
+                            f"gated activations (Swiglu, SiTu) only, but got "
+                            f"{self.activation_type.name}")
                     self.situ_beta = situ_beta
                     self.situ_linear_beta = situ_linear_beta
                     # Used only by the in-op output memset (moved here so the memset
