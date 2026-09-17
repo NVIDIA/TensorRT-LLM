@@ -455,6 +455,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            # A radix probe cannot affect admission once the chunk token budget
+            # is exhausted. Keep scanning: an encoder request may still fit.
+            if (
+                self.chunking_enabled
+                and req.state_value == self._context_init_state_value
+                and not self._has_context_chunk_budget(budget)
+            ):
+                continue
             # Probe context requests before peft_pages_needed and before
             # _try_schedule_context so that a deferral costs nothing: KV pages
             # are allocated inline, so a skip decided after prepare_context
@@ -792,6 +800,16 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return ScheduleAction.SCHEDULED, req_tokens, False
 
+    def _has_context_chunk_budget(self, budget: BudgetTracker) -> bool:
+        remaining = budget.remaining_tokens
+        return remaining is None or (
+            remaining > 0
+            and (
+                self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+                or remaining >= self.chunk_unit_size
+            )
+        )
+
     def _try_schedule_context_chunked(
         self, req: LlmRequest, budget: BudgetTracker
     ) -> tuple[ScheduleAction, int, bool]:
@@ -807,11 +825,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
 
-        if remaining_budget is not None:
-            no_budget = remaining_budget <= 0
-            fcfs_under_min = not force_chunk and remaining_budget < self.chunk_unit_size
-            if no_budget or fcfs_under_min:
-                return ScheduleAction.SKIP, 0, False
+        if not self._has_context_chunk_budget(budget):
+            return ScheduleAction.SKIP, 0, False
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
