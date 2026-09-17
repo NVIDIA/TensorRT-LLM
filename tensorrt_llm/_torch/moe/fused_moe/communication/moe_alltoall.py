@@ -199,33 +199,16 @@ class MoeAlltoAll:
             ep_size, max_num_tokens, eplb_stats_num_experts,
             can_use_cft_counted_writes)
 
-        # Dispatch needs workspace for [ep_size, max_tokens] tokens,
-        # but due to the variety of quantization recipes, we cannot know the exact size, so we conservatively estimate assuming no quantization.
-        # Meanwhile, we consider the alignment requirement as in moeA2ADispatchOp and moeA2ACombineOp.
-        # (Unquantized) token hidden states
-        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        workspace_size = pad_up(workspace_size, 128)
-        # token_selected_experts
-        workspace_size += ep_size * max_num_tokens * top_k * 4
-        workspace_size = pad_up(workspace_size, 128)
-        # token_final_scales
-        workspace_size += ep_size * max_num_tokens * top_k * 4
-        workspace_size = pad_up(workspace_size, 128)
-        # extra payload bytes per token
-        workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
-        workspace_size = pad_up(workspace_size, 128)
-
-        # Required workspace for combine [ep_size, max_tokens] tokens
-        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        workspace_size = pad_up(workspace_size, 128)
-
-        # CFT combine: dedicated combine RECEIVE region C (peer pushes land here;
-        # prepareCombine never touches it -> no proxy aliasing). Same size as the combine region.
-        if can_use_cft_counted_writes:
-            workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-            workspace_size = pad_up(workspace_size, 128)
-
-        return workspace_size
+        # Match the native op's fixed, equally sized payload regions. Region
+        # boundaries use allocation-time capacity, not runtime token counts.
+        tokens = ep_size * max_num_tokens
+        dispatch_size = (pad_up(tokens * hidden_size * element_size, 128) +
+                         2 * pad_up(tokens * top_k * 4, 128) +
+                         pad_up(tokens * extra_payload_bytes_per_token, 128))
+        combine_size = pad_up(tokens * hidden_size * max(element_size, 2), 128)
+        region_size = max(dispatch_size, combine_size)
+        return workspace_size + (3 if can_use_cft_counted_writes else
+                                 2) * region_size
 
     @classmethod
     def _init_constants(cls):
@@ -714,6 +697,14 @@ class MoeAlltoAll:
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before a successful dispatch"
             )
+
+        assert self._METAINFO_INDEX is not None
+        region_size = self._state.combine_payload_offset - int(
+            self.metainfo[self._METAINFO_INDEX["PAYLOAD_DATA_OFFSET_INDEX"]])
+        bytes_needed = self.ep_size * runtime_max_tokens_per_rank * hidden_size * dtype.itemsize
+        if bytes_needed > region_size:
+            raise ValueError(
+                "combine payload exceeds its fixed workspace region")
 
         return torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
             self.workspace,
