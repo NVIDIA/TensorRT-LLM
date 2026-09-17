@@ -1704,10 +1704,18 @@ class KvCacheCreator:
         """
         if not self._is_kv_cache_manager_v2:
             return False
-        if not getattr(self._kv_cache_manager_cls,
-                       "_supports_reuse_match_backoff", False):
+        lookahead = draft_prompt_lookahead(self._speculative_config)
+        if lookahead is None:
             return False
-        return draft_prompt_lookahead(self._speculative_config) is not None
+        if lookahead > 0 and not getattr(self._kv_cache_manager_cls,
+                                         "_supports_reuse_match_backoff",
+                                         False):
+            # The opt-out is about backing the match off by `lookahead` tokens,
+            # which a specialized commit/history protocol (recurrent snapshots,
+            # DSA) cannot express. A zero span asks for no backoff at all, so
+            # every backoff-sized path stays a no-op and the pairing is safe.
+            return False
+        return True
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """

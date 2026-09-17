@@ -339,6 +339,11 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_page_size = 32
         self._ctx_pages_per_slot = 0
         self._ctx_paged_append = None
+        # True only when the drafter reads the draft KV cache manager's pool
+        # AND that manager joins the target's reuse protocol, which is what
+        # makes a reused prefix's drafter K/V still addressable. Set in
+        # _lazy_init_ctx_buffers; read by _store_prefill_context.
+        self._ctx_reuse_addressable = False
         self._dflash_attention_backend = spec_config.attention_backend
 
         # Slot management (Python, updated in prepare() and eager mode)
@@ -766,6 +771,12 @@ class DFlashWorker(SpecWorkerBase):
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len.
                 self._ctx_kv_buf = pool
+                # Only a manager that publishes and matches its own blocks can
+                # hand back a reused prefix's drafter K/V; the private arena and
+                # an unpaired draft pool both start every request at 0.
+                self._ctx_reuse_addressable = bool(
+                    getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False)
+                )
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"
             )
@@ -1023,6 +1034,11 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._req_to_slot[req_id]
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
+            if cur == 0 and first_pos > 0 and self._ctx_reuse_addressable:
+                # Reuse let the target skip [0, first_pos), so only the tail
+                # reaches the capture buffer. The prefix K/V are still in the
+                # paired pool: precompute_context_kv is per-token in (hidden, p).
+                cur = first_pos
             if cur + slen > cap:
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
