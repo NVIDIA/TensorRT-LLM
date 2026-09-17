@@ -15,15 +15,18 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
-from fmha_test_utils import FakeAttention, FakePhasedFmha
+from fmha_test_utils import (
+    FakeAttention,
+    FakePhasedFmha,
+    make_fake_metadata,
+    make_fmha_forward_args,
+)
 
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-)
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType, CustomAttentionMask
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
 
@@ -46,7 +49,7 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
     )
     combined_fmha = CombinedFmha(attn)
     combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
-    metadata = SimpleNamespace(
+    metadata = make_fake_metadata(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),
         num_contexts=2,
@@ -63,7 +66,7 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         is_cross=False,
         is_spec_decoding_enabled=False,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((7, 4)),
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=8,
@@ -80,8 +83,115 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
     assert metadata.effective_workspace.numel() == 8
 
 
-def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
-    attn = FakeAttention(local_layer_idx=3)
+def test_phased_fmha_preserves_packed_nvfp4_output() -> None:
+    events: list[tuple] = []
+    attn = FakeAttention()
+    fmha = FakePhasedFmha(
+        attn,
+        {FmhaPhase.GENERATION},
+        "generation",
+        events,
+    )
+    metadata = make_fake_metadata(
+        effective_workspace=torch.empty(0, dtype=torch.uint8),
+        kv_cache_block_offsets=object(),
+        num_generations=1,
+        kv_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([1], dtype=torch.int32),
+    )
+    output = torch.empty((1, 2), dtype=torch.uint8)
+
+    fmha.forward(
+        torch.empty((1, 4)),
+        None,
+        None,
+        metadata,
+        make_fmha_forward_args(
+            output=output,
+            attention_input_type=AttentionInputType.generation_only,
+        ),
+    )
+
+    assert events[-1] == ("run", "generation", FmhaPhase.GENERATION, 1, 1, 1)
+
+
+def test_phased_fmha_does_not_lower_custom_mask_before_delegation() -> None:
+    events: list[tuple] = []
+    attn = FakeAttention()
+    fmha = FakePhasedFmha(
+        attn,
+        {FmhaPhase.CONTEXT},
+        "context",
+        events,
+    )
+    metadata = make_fake_metadata(
+        effective_workspace=torch.empty(0, dtype=torch.uint8),
+        kv_cache_block_offsets=object(),
+        num_contexts=1,
+        num_ctx_tokens=1,
+        kv_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([1], dtype=torch.int32),
+    )
+
+    fmha.forward(
+        torch.empty((1, 4)),
+        None,
+        None,
+        metadata,
+        make_fmha_forward_args(
+            output=torch.empty((1, 4)),
+            attention_input_type=AttentionInputType.context_only,
+            attention_mask=CustomAttentionMask.CUSTOM,
+            attention_mask_data=torch.ones((1, 1), dtype=torch.bool),
+        ),
+    )
+
+    assert events[-1] == ("run", "context", FmhaPhase.CONTEXT, 1, 1, 1)
+
+
+def test_cross_attention_uses_effective_beam_width() -> None:
+    events: list[tuple] = []
+    attn = FakeAttention()
+    fmha = FakePhasedFmha(
+        attn,
+        {FmhaPhase.GENERATION},
+        "generation",
+        events,
+    )
+    metadata = make_fake_metadata(
+        effective_workspace=torch.empty(0, dtype=torch.uint8),
+        kv_cache_block_offsets=object(),
+        num_generations=2,
+        beam_width=2,
+        is_cross=True,
+        kv_lens_cuda_runtime=torch.tensor([1, 1], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([1, 1], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([1, 1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([1, 1], dtype=torch.int32),
+    )
+
+    fmha.forward(
+        torch.empty((2, 4)),
+        None,
+        None,
+        metadata,
+        make_fmha_forward_args(
+            output=torch.empty((2, 4)),
+            attention_input_type=AttentionInputType.generation_only,
+        ),
+    )
+
+    assert events[-1] == ("run", "generation", FmhaPhase.GENERATION, 2, 2, 2)
+
+
+@pytest.mark.parametrize("local_layer_idx", [0, 3, 7])
+def test_combined_fmha_uses_flattened_v2_page_bound(local_layer_idx: int) -> None:
+    attn = FakeAttention(local_layer_idx=local_layer_idx)
+    attn.layer_idx = 42
     combined_fmha = CombinedFmha(attn)
     calls: list[tuple[int, object]] = []
 
@@ -92,8 +202,15 @@ def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
     kv_cache_manager = object.__new__(KVCacheManagerV2)
     kv_cache_manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
 
-    assert (
-        combined_fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=kv_cache_manager))
-        == 23
+    params = combined_fmha._build_params(
+        torch.empty((1, 4)),
+        None,
+        None,
+        make_fake_metadata(kv_cache_manager=kv_cache_manager),
+        make_fmha_forward_args(output=torch.empty((1, 4))),
+        torch.empty(0, dtype=torch.uint8),
     )
-    assert calls == [(3, Role.KEY)]
+    assert params.layer_idx == 42
+    assert params.local_layer_idx == local_layer_idx
+    assert params.total_num_blocks == 23
+    assert calls == [(local_layer_idx, Role.KEY)]

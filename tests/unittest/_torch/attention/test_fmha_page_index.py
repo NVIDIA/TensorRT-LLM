@@ -2,23 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
+from fmha_test_utils import make_fmha_forward_args
 
 from tensorrt_llm._torch.attention.backends.fmha import (
     flashinfer_trtllm_gen as flashinfer_trtllm_gen_module,
 )
+from tensorrt_llm._torch.attention.backends.fmha import utils as fmha_utils_module
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
-    _get_multi_ctas_kv_counter_size,
 )
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-)
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -96,21 +96,45 @@ def test_phased_fmha_rejects_unknown_kv_cache_manager_type() -> None:
         fmha._get_total_num_blocks(metadata)
 
 
-def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
+def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The kernel keeps one counter per head per decoder sequence. Sizing off the
     # request count alone under-allocates under beam search, but only once the
     # product clears the multi-processor floor, so pick a case that does.
     num_heads, batch, beam, sm_count = 6, 16, 2, 148
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(
+        fmha_utils_module,
+        "get_multi_processor_count_for_device",
+        lambda _device_index: sm_count,
+    )
     needed = num_heads * batch * beam * torch.int32.itemsize
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) < needed
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch * beam, sm_count) >= needed
+    assert get_multi_ctas_kv_counter_size(device, num_heads, batch) < needed
+    assert get_multi_ctas_kv_counter_size(device, num_heads, batch * beam) >= needed
 
 
-def test_multi_ctas_kv_counter_size_keeps_multi_processor_floor() -> None:
+def test_multi_ctas_kv_counter_size_keeps_multi_processor_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     num_heads, batch, sm_count = 6, 1, 148
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) >= (
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(
+        fmha_utils_module,
+        "get_multi_processor_count_for_device",
+        lambda _device_index: sm_count,
+    )
+    assert get_multi_ctas_kv_counter_size(device, num_heads, batch) >= (
         sm_count * torch.int32.itemsize
     )
+
+
+@pytest.mark.parametrize("value, expected", [(None, 0), (0, 0), (8192, 8192)])
+def test_attention_chunk_size_uses_zero_for_native_disabled_value(
+    value: int | None,
+    expected: int,
+) -> None:
+    assert FlashInferTrtllmGenFmha._get_attention_chunk_size(value) == expected
 
 
 def test_prepare_workspace_sizes_counter_for_max_num_sequences(
@@ -120,20 +144,20 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
     max_num_sequences = max_num_requests * beam_width
 
     def check_counter_size_args(
+        actual_device: torch.device,
         actual_num_heads: int,
         actual_max_num_sequences: int,
-        actual_sm_count: int,
     ) -> int:
-        assert (actual_num_heads, actual_max_num_sequences, actual_sm_count) == (
+        assert (actual_device, actual_num_heads, actual_max_num_sequences) == (
+            torch.device("cuda", 0),
             num_heads,
             max_num_sequences,
-            sm_count,
         )
         raise RuntimeError("counter size arguments observed")
 
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen."
-        "_get_multi_ctas_kv_counter_size",
+        "get_multi_ctas_kv_counter_size",
         check_counter_size_args,
     )
 
@@ -149,13 +173,64 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
     with pytest.raises(RuntimeError, match="counter size arguments observed"):
         FlashInferTrtllmGenFmha.prepare_workspace(
             fmha,
-            q=SimpleNamespace(),
+            q=SimpleNamespace(device=torch.device("cuda", 0)),
             k=None,
             v=None,
             metadata=metadata,
             forward_args=SimpleNamespace(),
             workspace=SimpleNamespace(),
         )
+
+
+@pytest.mark.parametrize("max_num_sequences", [32, None, 0])
+@pytest.mark.parametrize("num_gen_tokens", [1, 64])
+def test_prepare_workspace_sizes_generation_for_max_num_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_sequences: int | None,
+    num_gen_tokens: int,
+) -> None:
+    max_num_requests = 16
+    sequence_capacity = max_num_sequences or max_num_requests
+    q = torch.empty((num_gen_tokens, 6 * 64), dtype=torch.float16)
+    workspace = torch.empty(0, dtype=torch.uint8)
+    workspace_size = Mock(return_value=33)
+    monkeypatch.setattr(flashinfer_trtllm_gen_module, "_get_workspace_size", workspace_size)
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module, "get_multi_ctas_kv_counter_size", lambda *args: 0
+    )
+    fmha = SimpleNamespace(
+        attn=SimpleNamespace(num_heads=6, num_kv_heads=2, head_dim=64, rope_dim=64),
+        _multi_processor_count=148,
+        _multi_ctas_kv_counter=torch.empty(0, dtype=torch.uint8),
+        _use_fp8_context_fmha=lambda *args: False,
+    )
+    forward_args = make_fmha_forward_args(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.generation_only,
+    )
+    metadata = SimpleNamespace(
+        max_num_sequences=max_num_sequences,
+        max_num_requests=max_num_requests,
+        max_context_length=16,
+        is_cuda_graph=False,
+    )
+
+    FlashInferTrtllmGenFmha.prepare_workspace(
+        fmha, q, None, None, metadata, forward_args, workspace
+    )
+
+    workspace_size.assert_called_once_with(
+        dtype=q.dtype,
+        num_tokens=max(num_gen_tokens, metadata.max_context_length),
+        num_gen_tokens=max(num_gen_tokens, sequence_capacity),
+        num_heads=6,
+        num_kv_heads=2,
+        head_size=64,
+        max_num_requests=sequence_capacity,
+        rotary_embedding_dim=64,
+        fp8_context_fmha=False,
+    )
+    assert workspace.numel() == 33
 
 
 def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
@@ -221,7 +296,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         num_contexts=2,
     )
     output = torch.empty((batch_size, 2, 4))
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.mixed,
     )
@@ -230,32 +305,82 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(0, dtype=torch.uint8),
-        qkv_input=torch.empty((batch_size, 2, 4)),
-        context_buf=output,
-        sequence_lengths=torch.ones(batch_size, dtype=torch.int32),
+        output=output,
+        qkv_or_q=torch.empty((batch_size, 2, 4)),
+        sequence_length=torch.ones(batch_size, dtype=torch.int32),
         input_seq_length=1,
         num_tokens=batch_size,
         seq_offset=2,
+        num_heads=attn.num_heads,
+        num_kv_heads=attn.num_kv_heads,
+        head_size=attn.head_dim,
+        q_scaling=attn.q_scaling,
+        quant_mode=attn.quant_mode,
+        predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
+        attention_chunk_size=attn.attention_chunk_size,
+        position_embedding_type=attn.position_embedding_type,
+        rope_params=attn.rope_params,
         tokens_per_block=32,
         kv_factor=2,
         total_num_blocks=8,
-        batch_size=batch_size,
+        num_seqs=batch_size,
         num_requests=1,
+        beam_width=metadata.beam_width,
         is_cross=True,
     )
-    fmha = SimpleNamespace(
-        _layout="HND",
-        _enable_pdl=False,
-        USE_SHARED_PAGED_KV_IDX=False,
-        _multi_processor_count=1,
-        _use_fp8_context_fmha=lambda _output, _input_type: False,
-        _get_multi_ctas_kv_counter_buffer=lambda: None,
-    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._layout = "HND"
+    fmha._enable_pdl = False
+    fmha._multi_processor_count = 1
+    fmha._multi_ctas_kv_counter = torch.empty(0, dtype=torch.int32)
+    fmha._attn_ref = lambda: attn
 
     FlashInferTrtllmGenFmha.run_generation(fmha, params)
 
     assert preprocess_calls[0][24] == batch_size
     assert len(decode_calls) == 1
+
+
+def test_flashinfer_mla_generation_uses_phase_sequence_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sequence_length = torch.tensor([99, 7, 19], dtype=torch.int32)[1:]
+    params = FmhaParams(
+        fwd=make_fmha_forward_args(),
+        qkv_or_q=torch.empty((2, 2, 576), dtype=torch.bfloat16),
+        output=torch.empty((2, 2, 512), dtype=torch.bfloat16),
+        workspace=torch.empty(4, dtype=torch.uint8),
+        sequence_length=sequence_length,
+        seq_offset=1,
+        num_seqs=2,
+        num_tokens=2,
+        num_heads=2,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        q_scaling=1.0,
+        max_past_kv_length=19,
+    )
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module.thop,
+        "build_trtllm_gen_kv_cache_metadata",
+        lambda *args: (torch.empty(0), torch.empty((2, 1), dtype=torch.int32), None),
+    )
+    decode = Mock()
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module,
+        "flashinfer",
+        SimpleNamespace(mla=SimpleNamespace(trtllm_batch_decode_with_kv_cache_mla=decode)),
+        raising=False,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._enable_pdl = False
+    fmha._multi_ctas_kv_counter = torch.empty(0, dtype=torch.uint8)
+
+    fmha.run_mla_generation(params)
+
+    decode.assert_called_once()
+    assert decode.call_args.args[7] is sequence_length
 
 
 def _cute_dsl_mla_helix_support(
@@ -292,7 +417,7 @@ def _cute_dsl_mla_helix_support(
         ),
         tokens_per_block=64,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         softmax_stats_tensor=softmax_stats,

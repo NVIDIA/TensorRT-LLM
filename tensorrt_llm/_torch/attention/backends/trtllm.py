@@ -31,7 +31,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1465,8 +1466,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
         )
-        self.position_embedding_type = int(
-            pos_embd_params.type) if pos_embd_params is not None else 0
+        self.position_embedding_type = (pos_embd_params.type
+                                        if pos_embd_params is not None else
+                                        PositionEmbeddingType.learned_absolute)
         self.skip_softmax_stat = torch.zeros(2,
                                              dtype=torch.uint32,
                                              device='cuda')
@@ -1489,13 +1491,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
-        self._fmha_manager: FmhaManager
+        self._fmha_manager: Optional[FmhaManager] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
+    def release(self) -> None:
+        """Release implementation-owned resources before CUDA teardown."""
+        if self._fmha_manager is not None:
+            self._fmha_manager.release()
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
-        self.quant_mode = int(self.quant_config.layer_quant_mode)
+        self.quant_mode = self.quant_config.layer_quant_mode
+        # The op's kernel selection is derived from the quantization mode.
+        self.release()
 
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
@@ -1723,6 +1732,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_mla_enable,
         )
 
+    def out_head_size(self, is_gen_only: bool) -> int:
+        """Per-head width of the attention output for this phase.
+
+        Single source of truth for the output buffer `create_output` allocates and
+        the view a phased FMHA library takes over it; the two must not drift. MLA
+        generation writes the latent (plus the rope part when it is not appended in
+        place), while MLA context writes the already-projected V head.
+        """
+        if not self.is_mla_enable:
+            return self.head_dim
+        if not is_gen_only:
+            return self.v_head_dim
+        return (self.kv_lora_rank if self.rope_append else self.kv_lora_rank +
+                self.qk_rope_head_dim)
+
     def create_output(self, q, *, is_quantize_output: bool,
                       metadata: TrtllmAttentionMetadata,
                       attention_mask: AttentionMask, is_gen_only: bool,
@@ -1736,13 +1760,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_tokens = q.size(0)
         if out_dtype is None:
             out_dtype = q.dtype
-        v_head_size = self.head_dim
-        if self.is_mla_enable:
-            if is_gen_only:
-                v_head_size = self.kv_lora_rank if self.rope_append else (
-                    self.kv_lora_rank + self.qk_rope_head_dim)
-            else:
-                v_head_size = self.v_head_dim
+        v_head_size = self.out_head_size(is_gen_only)
         if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
@@ -1769,8 +1787,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.theta
 
     @property
-    def rope_scale_type(self) -> int:
-        return int(self.rope_params.scale_type)
+    def rope_scale_type(self) -> RotaryScalingType:
+        return self.rope_params.scale_type
 
     @property
     def rope_scale(self) -> float:
@@ -2088,6 +2106,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
+        assert self._fmha_manager is not None
         fmha = self._fmha_manager.select(self, q, k, v, metadata, forward_args)
 
         if fmha is None:

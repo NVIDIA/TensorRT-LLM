@@ -20,6 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from fmha_test_utils import make_fake_metadata, make_fmha_forward_args
 from packaging.version import Version
 
 import tensorrt_llm._torch.attention.backends.fmha.prims_ts as prims_ts_module
@@ -34,7 +35,6 @@ from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
     AttentionInputType,
     PredefinedAttentionMask,
 )
@@ -42,6 +42,11 @@ from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimePa
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
+
+
+def _prepare_workspace(fmha, q, metadata, forward_args, workspace) -> None:
+    """Prepare the whole batch's workspace before splitting it into phases."""
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
 
 
 class _TensorSpec:
@@ -94,6 +99,10 @@ class _Attention:
         self.attention_chunk_size = 0
         self.rope_dim = head_dim
         self.local_layer_idx = 0
+        # `PhasedFmha._build_params` lowers the whole attention configuration.
+        self.layer_idx = 0
+        self.q_lora_rank = 1536 if is_mla else None
+        self.rope_append = True if is_mla else None
         self.rope_params = SimpleNamespace(
             dim=head_dim,
             theta=10000.0,
@@ -103,6 +112,39 @@ class _Attention:
         )
         self.rotary_inv_freq = None
         self.rotary_cos_sin = None
+
+    def get_local_layer_idx(self, metadata: object) -> int:
+        return self.local_layer_idx
+
+    def out_head_size(self, is_gen_only: bool) -> int:
+        if not self.is_mla_enable:
+            return self.head_dim
+        if not is_gen_only:
+            return self.v_head_dim
+        return self.kv_lora_rank if self.rope_append else self.kv_lora_rank + self.qk_rope_head_dim
+
+
+@pytest.mark.parametrize("rope_append,expected_head_size", [(True, 512), (False, 576)])
+def test_mla_fixture_generation_output_size(rope_append: bool, expected_head_size: int) -> None:
+    attn = _Attention(head_dim=576, is_mla=True)
+    attn.rope_append = rope_append
+    fmha = PrimsTSFmha(attn)
+    output = torch.empty((2, attn.num_heads * expected_head_size), dtype=torch.bfloat16)
+
+    params = fmha._build_params(
+        torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        None,
+        None,
+        make_fake_metadata(),
+        make_fmha_forward_args(
+            output=output,
+            attention_input_type=AttentionInputType.generation_only,
+        ),
+        torch.empty(0, dtype=torch.uint8),
+    )
+
+    assert params.output.shape == (2, attn.num_heads, expected_head_size)
+    assert attn.out_head_size(is_gen_only=False) == attn.v_head_dim
 
 
 def _make_v1_manager(**attributes: object) -> KVCacheManager:
@@ -177,7 +219,7 @@ def _support_result(
         q_width += 2 * attn.num_kv_heads * head_dim
     q = _TensorSpec((4, q_width), dtype)
     output_width = attn.num_heads * (512 if is_mla else head_dim)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=_TensorSpec((4, output_width), output_dtype) if has_output else None,
         attention_input_type=attention_input_type,
         attention_mask=PredefinedAttentionMask.CAUSAL,
@@ -322,7 +364,7 @@ def test_is_supported_accepts_and_forwards_phase_keyword(
     monkeypatch.setattr(fmha, "_is_supported_with_reason", support_check)
     q = Mock(spec=torch.Tensor)
     metadata = SimpleNamespace()
-    forward_args = AttentionForwardArgs()
+    forward_args = make_fmha_forward_args()
 
     assert fmha.is_supported(
         q,
@@ -891,7 +933,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         max_seq_len=128,
     )
     output = torch.empty((3, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.context_only,
         attention_window_size=64,
@@ -902,12 +944,12 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(32, dtype=torch.uint8),
-        qkv_input=torch.empty(
+        qkv_or_q=torch.empty(
             (3, (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim),
             dtype=torch.bfloat16,
         ),
-        context_buf=output,
-        sequence_lengths=torch.tensor([33, 64], dtype=torch.int32),
+        output=output,
+        sequence_length=torch.tensor([33, 64], dtype=torch.int32),
         context_lengths=torch.tensor([1, 2], dtype=torch.int32),
         input_seq_length=2,
         max_past_kv_length=64,
@@ -918,7 +960,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         tokens_per_block=32,
         kv_factor=2,
         total_num_blocks=24,
-        batch_size=2,
+        num_seqs=2,
     )
 
     fmha.run_context(params)
@@ -963,7 +1005,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert run_kwargs["validate"] is False
     assert run_args[3] is cu_q_seqlens
     torch.testing.assert_close(seq_lens_kv, torch.tensor([33, 64], dtype=torch.int32))
-    assert seq_lens_kv.data_ptr() == params.sequence_lengths.data_ptr()
+    assert seq_lens_kv.data_ptr() == params.sequence_length.data_ptr()
     assert fixed_block_tables.shape == (2, 4)
     assert fixed_block_tables.stride() == (8, 1)
     assert fixed_block_tables.data_ptr() == block_tables.data_ptr()
@@ -978,7 +1020,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
 
     block_tables[:, 0].add_(1)
     block_tables[:, 1].add_(100)
-    params.sequence_lengths.copy_(torch.tensor([64, 33], dtype=torch.int32))
+    params.sequence_length.copy_(torch.tensor([64, 33], dtype=torch.int32))
     cu_kv_seqlens.copy_(torch.tensor([0, 4, 9], dtype=torch.int32))
     fmha.run_context(params)
 
@@ -1096,7 +1138,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     )
     total_num_blocks = fmha._get_total_num_blocks(metadata)
     output = torch.empty((2, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
@@ -1109,12 +1151,12 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
         meta=metadata,
         fwd=forward_args,
         workspace=workspace,
-        qkv_input=torch.empty(
+        qkv_or_q=torch.empty(
             (2, (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim),
             dtype=torch.bfloat16,
         ),
-        context_buf=output,
-        sequence_lengths=sequence_lengths,
+        output=output,
+        sequence_length=sequence_lengths,
         input_seq_length=1,
         max_past_kv_length=64,
         max_attention_window_size=64,
@@ -1124,7 +1166,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
         tokens_per_block=32,
         kv_factor=2,
         total_num_blocks=total_num_blocks,
-        batch_size=2,
+        num_seqs=2,
         num_requests=2,
     )
 
@@ -1164,7 +1206,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     k_cache, v_cache = run_args[1]
     assert k_cache.shape == v_cache.shape == (6, attn.num_kv_heads, 32, attn.head_dim)
     assert v_cache.storage_offset() - k_cache.storage_offset() == 6 * math.prod(kv_pool.shape[1:])
-    assert run_args[2].data_ptr() == params.sequence_lengths.data_ptr()
+    assert run_args[2].data_ptr() == params.sequence_length.data_ptr()
     fixed_block_tables = run_kwargs["block_tables"]
     assert fixed_block_tables.shape == (2, 4)
     assert fixed_block_tables.stride() == (8, 1)
@@ -1433,7 +1475,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
     )
     output = torch.empty((2, attn.num_heads, 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
@@ -1446,9 +1488,9 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(64, dtype=torch.uint8),
-        qkv_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
-        context_buf=output,
-        sequence_lengths=sequence_lengths,
+        qkv_or_q=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        output=output,
+        sequence_length=sequence_lengths,
         input_seq_length=1,
         max_past_kv_length=64,
         max_attention_window_size=64,
@@ -1458,7 +1500,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         tokens_per_block=32,
         kv_factor=1,
         total_num_blocks=20,
-        batch_size=2,
+        num_seqs=2,
         num_requests=2,
     )
 
@@ -1492,7 +1534,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
     assert run_args[0].shape == (2, 1, attn.num_heads, 576)
-    assert run_args[0].data_ptr() == params.qkv_input.data_ptr()
+    assert run_args[0].data_ptr() == params.qkv_or_q.data_ptr()
     assert run_args[1] is kv_cache
     assert run_kwargs["block_tables"].shape == (2, 3)
     assert run_kwargs["block_tables"].stride() == (6, 1)
@@ -1676,7 +1718,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     )
     total_num_blocks = fmha._get_total_num_blocks(metadata)
     output = torch.empty((2, attn.num_heads, 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
@@ -1689,9 +1731,9 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(96, dtype=torch.uint8),
-        qkv_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
-        context_buf=output,
-        sequence_lengths=sequence_lengths,
+        qkv_or_q=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        output=output,
+        sequence_length=sequence_lengths,
         input_seq_length=1,
         max_past_kv_length=64,
         max_attention_window_size=64,
@@ -1701,7 +1743,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         tokens_per_block=32,
         kv_factor=1,
         total_num_blocks=total_num_blocks,
-        batch_size=2,
+        num_seqs=2,
         num_requests=2,
     )
 
@@ -1727,7 +1769,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
     assert run_args[0].shape == (2, 1, attn.num_heads, 576)
-    assert run_args[0].data_ptr() == params.qkv_input.data_ptr()
+    assert run_args[0].data_ptr() == params.qkv_or_q.data_ptr()
     assert run_args[1] is kv_cache
     torch.testing.assert_close(
         run_kwargs["block_tables"],
@@ -1736,8 +1778,8 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     assert run_kwargs["block_tables"].shape == (2, 3)
     assert run_kwargs["block_tables"].stride() == (6, 1)
     assert run_kwargs["block_tables"].data_ptr() == block_tables.data_ptr()
-    torch.testing.assert_close(run_kwargs["seq_lens"], params.sequence_lengths)
-    assert run_kwargs["seq_lens"].data_ptr() == params.sequence_lengths.data_ptr()
+    torch.testing.assert_close(run_kwargs["seq_lens"], params.sequence_length)
+    assert run_kwargs["seq_lens"].data_ptr() == params.sequence_length.data_ptr()
     assert run_kwargs["out"].shape == (2, 1, attn.num_heads, 512)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(128 + 64))
@@ -1778,21 +1820,14 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
         kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
     )
     output = torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=96,
     )
 
     workspace = torch.empty(0, dtype=torch.uint8)
-    fmha.prepare_workspace(
-        q,
-        None,
-        None,
-        metadata,
-        forward_args,
-        workspace,
-    )
+    _prepare_workspace(fmha, q, metadata, forward_args, workspace)
 
     workspace_size.assert_called_once()
     assert workspace.numel() == 48
@@ -1829,12 +1864,12 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
         kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
     )
     output = torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=96,
     )
-    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    _prepare_workspace(fmha, q, metadata, forward_args, workspace)
 
     stream.synchronize.assert_not_called()
     assert fmha._mla_decode_wrappers[2] is wrapper
@@ -1866,21 +1901,21 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
         tokens_per_block=32,
         kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=96,
     )
     workspace = torch.empty(0, dtype=torch.uint8)
 
-    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    _prepare_workspace(fmha, q, metadata, forward_args, workspace)
     assert workspace.numel() == 32
 
     dense_forward_args = replace(
         forward_args,
         attention_mask=PredefinedAttentionMask.FULL,
     )
-    fmha.prepare_workspace(q, None, None, metadata, dense_forward_args, workspace)
+    _prepare_workspace(fmha, q, metadata, dense_forward_args, workspace)
 
     assert workspace.numel() == 64
 
@@ -1910,20 +1945,15 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
         num_ctx_tokens=0,
         tokens_per_block=32,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((2, 8 * 128), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=128,
     )
     workspace = torch.empty(0, dtype=torch.uint8)
 
-    fmha.prepare_workspace(
-        torch.empty((2, 12 * 128), dtype=torch.bfloat16),
-        None,
-        None,
-        metadata,
-        forward_args,
-        workspace,
+    _prepare_workspace(
+        fmha, torch.empty((2, 12 * 128), dtype=torch.bfloat16), metadata, forward_args, workspace
     )
 
     assert fmha._decode_workspace_offset_bytes == 64
@@ -1970,7 +2000,7 @@ def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(
         num_ctx_tokens=4,
         tokens_per_block=32,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((6, 8 * 128), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=128,
@@ -1978,12 +2008,12 @@ def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(
     q = torch.empty((6, 12 * 128), dtype=torch.bfloat16)
     workspace = torch.empty(1024, dtype=torch.uint8)
 
-    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    _prepare_workspace(fmha, q, metadata, forward_args, workspace)
     first_workspace = fmha._get_decode_workspace(workspace)
     cached_wrapper = Mock()
     fmha._decode_wrappers[2] = cached_wrapper
 
-    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    _prepare_workspace(fmha, q, metadata, forward_args, workspace)
     second_workspace = fmha._get_decode_workspace(workspace)
 
     assert context_layout.call_count == 2
@@ -2017,7 +2047,7 @@ def test_workspace_cannot_grow_during_capture(monkeypatch: pytest.MonkeyPatch) -
         tokens_per_block=32,
         kv_lens_runtime=torch.tensor([64, 96], dtype=torch.int32),
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=torch.empty((2, 8 * 128), dtype=torch.bfloat16),
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=128,
@@ -2027,10 +2057,9 @@ def test_workspace_cannot_grow_during_capture(monkeypatch: pytest.MonkeyPatch) -
         RuntimeError,
         match="PrimTS caller workspace must be sized before CUDA graph capture",
     ):
-        fmha.prepare_workspace(
+        _prepare_workspace(
+            fmha,
             torch.empty((2, 12 * 128), dtype=torch.bfloat16),
-            None,
-            None,
             metadata,
             forward_args,
             torch.empty(16, dtype=torch.uint8),
@@ -2052,24 +2081,18 @@ def test_phased_forward_routes_mixed_batch_to_context_and_generation(
 
     q = torch.empty((5, 128), dtype=torch.bfloat16)
     output = torch.empty((5, attn.num_heads * attn.head_dim), dtype=torch.bfloat16)
-    metadata = SimpleNamespace(
+    metadata = make_fake_metadata(
         kv_cache_block_offsets=torch.empty(1),
         effective_workspace=torch.empty(0, dtype=torch.int8),
         num_contexts=1,
         num_ctx_tokens=3,
         num_generations=2,
-        cache_indirection=None,
-        beam_width=1,
-        tokens_per_block=32,
         kv_lens_cuda_runtime=torch.tensor([3, 65, 97], dtype=torch.int32),
         kv_lens_runtime=torch.tensor([3, 65, 97], dtype=torch.int32),
         prompt_lens_cuda_runtime=torch.tensor([3, 1, 1], dtype=torch.int32),
         prompt_lens_cpu_runtime=torch.tensor([3, 1, 1], dtype=torch.int32),
-        is_spec_decoding_enabled=False,
-        is_cross=False,
-        kv_cache_manager=None,
     )
-    forward_args = AttentionForwardArgs(
+    forward_args = make_fmha_forward_args(
         output=output,
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=128,
@@ -2081,20 +2104,20 @@ def test_phased_forward_routes_mixed_batch_to_context_and_generation(
     context_params = context_calls[0]
     assert context_params.num_tokens == 3
     assert context_params.seq_offset == 0
-    assert context_params.batch_size == 1
+    assert context_params.num_seqs == 1
     assert context_params.num_requests == 1
-    assert context_params.attention_input is not None
-    assert context_params.attention_input.shape[0] == 3
-    assert context_params.context_buf is not None
-    assert context_params.context_buf.shape == (3, attn.num_heads, attn.head_dim)
+    assert context_params.qkv_or_q is not None
+    assert context_params.qkv_or_q.shape[0] == 3
+    assert context_params.output is not None
+    assert context_params.output.shape == (3, attn.num_heads, attn.head_dim)
 
     run_generation.assert_called_once()
     generation_params = generation_calls[0]
     assert generation_params.num_tokens == 2
     assert generation_params.seq_offset == 1
-    assert generation_params.batch_size == 2
+    assert generation_params.num_seqs == 2
     assert generation_params.num_requests == 2
-    assert generation_params.attention_input is not None
-    assert generation_params.attention_input.shape[0] == 2
-    assert generation_params.context_buf is not None
-    assert generation_params.context_buf.shape == (2, attn.num_heads, attn.head_dim)
+    assert generation_params.qkv_or_q is not None
+    assert generation_params.qkv_or_q.shape[0] == 2
+    assert generation_params.output is not None
+    assert generation_params.output.shape == (2, attn.num_heads, attn.head_dim)

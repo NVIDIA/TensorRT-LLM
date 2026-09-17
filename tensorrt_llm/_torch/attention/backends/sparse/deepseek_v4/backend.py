@@ -33,6 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
+from ..params import SparseRuntimeParams
 from .cache_manager import get_token_bytes
 from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, Compressor
 from .indexer import DeepseekV4Indexer
@@ -192,7 +193,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             start_idx = 0
             end_idx = metadata.num_tokens
 
-        sparse_args = forward_args.sparse_runtime_params
+        sparse_args = (
+            SparseRuntimeParams()
+            if forward_args.sparse_runtime_params is None
+            else replace(forward_args.sparse_runtime_params)
+        )
+        forward_args.sparse_runtime_params = sparse_args
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]

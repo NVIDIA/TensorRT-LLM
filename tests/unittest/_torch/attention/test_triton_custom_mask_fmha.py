@@ -16,9 +16,9 @@
 from types import SimpleNamespace
 
 import torch
+from fmha_test_utils import make_fmha_forward_args
 
 from tensorrt_llm._torch.attention.backends.fmha.triton_custom_mask import TritonCustomMaskFmha
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 
 
 def test_triton_custom_mask_rejects_whole_request_probe() -> None:
@@ -29,5 +29,5 @@ def test_triton_custom_mask_rejects_whole_request_probe() -> None:
         None,
         None,
         SimpleNamespace(),
-        AttentionForwardArgs(),
+        make_fmha_forward_args(),
     )

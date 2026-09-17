@@ -136,6 +136,9 @@ class _Attention:
         self.position_embedding_type = PositionEmbeddingType.learned_absolute
         self.attention_chunk_size = 0
 
+    def out_head_size(self, is_gen_only: bool) -> int:
+        return self.head_dim
+
 
 def _contiguous_case():
     attention = _Attention()
@@ -428,9 +431,9 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
         meta=metadata,
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
-        qkv_input=q,
-        context_buf=args.output,
-        sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
+        qkv_or_q=q,
+        output=args.output,
+        sequence_length=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,
         num_requests=2,
@@ -453,7 +456,7 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
     first_inputs = _get_block_sparse_inputs(args)
     fmha.run_generation(params)
     block_tables[:, 0].add_(10)
-    params.sequence_lengths = torch.tensor([130, 194], dtype=torch.int32)
+    params.sequence_length = torch.tensor([130, 194], dtype=torch.int32)
     _set_block_sparse_inputs(
         args,
         BlockSparseForwardInputs(
@@ -504,9 +507,9 @@ def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None
         meta=metadata,
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
-        qkv_input=q,
-        context_buf=args.output,
-        sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
+        qkv_or_q=q,
+        output=args.output,
+        sequence_length=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,
         num_requests=2,

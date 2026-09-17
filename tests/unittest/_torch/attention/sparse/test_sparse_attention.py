@@ -77,9 +77,8 @@ def test_prepare_sparse_runtime_params_from_predictions() -> None:
     attention._sparse_kv_offsets = torch.tensor([0, 1], dtype=torch.int32)
     attention._sparse_attn_indices = torch.tensor([2], dtype=torch.int32)
     attention._sparse_attn_offsets = None
-    forward_args = AttentionForwardArgs(
-        sparse_runtime_params=SparseRuntimeParams(sparse_attn_kv_lens=torch.tensor([3]))
-    )
+    caller_params = SparseRuntimeParams(sparse_attn_kv_lens=torch.tensor([3]))
+    forward_args = AttentionForwardArgs(sparse_runtime_params=caller_params)
 
     runtime_params = prepare_sparse_runtime_params(
         attention, torch.empty(0), None, None, None, forward_args
@@ -90,9 +89,9 @@ def test_prepare_sparse_runtime_params_from_predictions() -> None:
     assert runtime_params.sparse_attn_indices is attention._sparse_attn_indices
     assert runtime_params.sparse_attn_offsets is None
     assert runtime_params.sparse_attn_indices_block_size == 1
-    assert (
-        runtime_params.sparse_attn_kv_lens is forward_args.sparse_runtime_params.sparse_attn_kv_lens
-    )
+    assert runtime_params.sparse_attn_kv_lens is caller_params.sparse_attn_kv_lens
+    assert runtime_params is not caller_params
+    assert caller_params.sparse_kv_indices is None
 
 
 def test_sparse_attn_hook_registration() -> None:
@@ -161,11 +160,17 @@ def test_prepare_sparse_runtime_params_without_predictions(sparse_params) -> Non
     attention = TrtllmAttention.__new__(TrtllmAttention)
     attention.sparse_params = sparse_params
 
-    runtime_params = prepare_sparse_runtime_params(
-        attention, torch.empty(0), None, None, None, AttentionForwardArgs()
+    forward_args = AttentionForwardArgs()
+    assert forward_args.sparse_runtime_params is None
+    q = torch.empty(0)
+    runtime_params = prepare_sparse_runtime_params(attention, q, None, None, None, forward_args)
+    next_runtime_params = prepare_sparse_runtime_params(
+        attention, q, None, None, None, forward_args
     )
 
     assert runtime_params == SparseRuntimeParams()
+    assert next_runtime_params == SparseRuntimeParams()
+    assert next_runtime_params is not runtime_params
 
 
 def test_prepare_sparse_runtime_params_runs_index_hooks_once() -> None:
@@ -267,8 +272,27 @@ def test_block_sparse_attn_predict_override_composes_with_index_predictors() -> 
     attention.block_sparse_attn_predict.assert_called_once_with(q, k, v, metadata, forward_args)
 
 
-def test_attention_forward_args_default_to_empty_sparse_runtime_params() -> None:
-    assert AttentionForwardArgs().sparse_runtime_params == SparseRuntimeParams()
+def test_sparse_prediction_hooks_share_per_call_runtime_params() -> None:
+    attention = TrtllmAttention.__new__(TrtllmAttention)
+    attention.sparse_params = None
+    carriers = []
+
+    def predict(q, k, metadata, forward_args):
+        runtime_params = forward_args.sparse_runtime_params
+        assert isinstance(runtime_params, SparseRuntimeParams)
+        carriers.append(runtime_params)
+        runtime_params.aux_kv_cache_pool_ptr = 1234
+        return None, None
+
+    attention.sparse_attn_predict = Mock(side_effect=predict)
+    for forward_args in (AttentionForwardArgs(), AttentionForwardArgs()):
+        assert forward_args.sparse_runtime_params is None
+        runtime_params = prepare_sparse_runtime_params(
+            attention, torch.empty(0), None, None, None, forward_args
+        )
+        assert runtime_params is carriers[-1]
+        assert runtime_params.aux_kv_cache_pool_ptr == 1234
+    assert carriers[0] is not carriers[1]
 
 
 class _StopAfterShapeValidation(Exception):

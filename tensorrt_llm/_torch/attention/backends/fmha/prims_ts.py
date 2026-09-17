@@ -665,7 +665,6 @@ class PrimsTSFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
     ) -> None:
-        del k, v
         block_offsets = metadata.kv_cache_block_offsets
         if block_offsets is None:
             raise RuntimeError("PrimTS requires paged KV-cache block offsets.")
@@ -838,9 +837,9 @@ class PrimsTSFmha(PhasedFmha):
         )
 
     def run_context(self, params: FmhaParams) -> None:
-        if params.qkv_input is None or params.context_buf is None:
+        if params.qkv_or_q is None or params.output is None:
             raise RuntimeError("PrimTS context requires QKV input and an output buffer.")
-        if params.sequence_lengths is None or params.context_lengths is None:
+        if params.sequence_length is None or params.context_lengths is None:
             raise RuntimeError("PrimTS context requires sequence and context lengths.")
         if self._multi_processor_count is None:
             raise RuntimeError("PrimTS context workspace was not prepared.")
@@ -864,9 +863,9 @@ class PrimsTSFmha(PhasedFmha):
             _max_kv_len,
             window_left,
         ) = thop.trtllm_gen_context_preprocess(
-            params.qkv_input,
+            params.qkv_or_q,
             params.workspace,
-            params.sequence_lengths,
+            params.sequence_length,
             params.context_lengths,
             meta.kv_cache_block_offsets,
             meta.host_kv_cache_pool_pointers,
@@ -887,7 +886,7 @@ class PrimsTSFmha(PhasedFmha):
             params.max_attention_window_size,
             params.cyclic_attention_window_size,
             params.num_tokens,
-            params.batch_size,
+            params.num_seqs,
             params.input_seq_length,
             params.max_past_kv_length,
             rope_params.dim,
@@ -926,24 +925,24 @@ class PrimsTSFmha(PhasedFmha):
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
         max_seq_len_q = int(meta.max_context_length)
         max_kv_len = int(meta.max_seq_len)
-        fixed_block_tables = self._get_fixed_block_tables(block_tables, params.batch_size)
+        fixed_block_tables = self._get_fixed_block_tables(block_tables, params.num_seqs)
         seq_lens_kv = self._get_sequence_lengths(
-            params.sequence_lengths,
-            params.batch_size,
+            params.sequence_length,
+            params.num_seqs,
         )
         mask_type = self._get_prims_mask_type(fwd)
         wrapper = self._get_or_plan_context_wrapper(
             q_processed,
             k_cache,
             v_cache,
-            batch_size=params.batch_size,
+            batch_size=params.num_seqs,
             max_seq_len_q=max_seq_len_q,
             max_kv_len=max_kv_len,
             page_size=params.tokens_per_block,
             mask_type=mask_type,
             window_left=window_left,
             sm_scale=self._get_bmm1_scale(attn),
-            output_dtype=params.context_buf.dtype,
+            output_dtype=params.output.dtype,
         )
         wrapper.run(
             q_processed,
@@ -952,14 +951,14 @@ class PrimsTSFmha(PhasedFmha):
             cu_q_seqlens,
             block_tables=fixed_block_tables,
             seq_lens_kv=seq_lens_kv,
-            out=params.context_buf,
+            out=params.output,
             validate=False,
         )
 
         thop.trtllm_gen_context_postprocess(
-            params.qkv_input,
+            params.qkv_or_q,
             params.workspace,
-            params.sequence_lengths,
+            params.sequence_length,
             params.context_lengths,
             meta.kv_cache_block_offsets,
             meta.host_kv_cache_pool_pointers,
@@ -979,7 +978,7 @@ class PrimsTSFmha(PhasedFmha):
             params.max_attention_window_size,
             params.cyclic_attention_window_size,
             params.num_tokens,
-            params.batch_size,
+            params.num_seqs,
             params.input_seq_length,
             params.max_past_kv_length,
             rope_params.dim,
@@ -1008,11 +1007,11 @@ class PrimsTSFmha(PhasedFmha):
         rope_params = attn.rope_params
         attention_chunk_size = attn.attention_chunk_size or 0
         return thop.trtllm_gen_generation_preprocess(
-            params.qkv_input,
+            params.qkv_or_q,
             params.workspace,
-            params.sequence_lengths,
+            params.sequence_length,
             params.spec_decoding_generation_lengths,
-            params.spec_decoding_position_offsets,
+            params.spec_decoding_position_offsets_for_cpp,
             meta.kv_cache_block_offsets,
             meta.host_kv_cache_pool_pointers,
             meta.host_kv_cache_pool_mapping,
@@ -1032,7 +1031,7 @@ class PrimsTSFmha(PhasedFmha):
             params.max_attention_window_size,
             params.cyclic_attention_window_size,
             params.num_tokens,
-            params.batch_size,
+            params.num_seqs,
             params.input_seq_length,
             params.max_past_kv_length,
             rope_params.dim,
@@ -1055,9 +1054,9 @@ class PrimsTSFmha(PhasedFmha):
         )
 
     def run_generation(self, params: FmhaParams) -> None:
-        if params.qkv_input is None or params.context_buf is None:
+        if params.qkv_or_q is None or params.output is None:
             raise RuntimeError("PrimTS decode requires QKV input and an output buffer.")
-        if params.sequence_lengths is None:
+        if params.sequence_length is None:
             raise RuntimeError("PrimTS decode requires sequence lengths.")
         if self._multi_processor_count is None:
             raise RuntimeError("PrimTS decode workspace was not prepared.")
@@ -1065,7 +1064,7 @@ class PrimsTSFmha(PhasedFmha):
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
-        batch_size = params.batch_size
+        batch_size = params.num_seqs
         (
             q_processed,
             kv_pool,
@@ -1098,14 +1097,14 @@ class PrimsTSFmha(PhasedFmha):
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
         fixed_block_tables = self._get_fixed_block_tables(block_tables, batch_size)
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
-        seq_lens = self._get_sequence_lengths(params.sequence_lengths, batch_size)
+        seq_lens = self._get_sequence_lengths(params.sequence_length, batch_size)
         query = q_processed.view(
             batch_size,
             params.input_seq_length,
             attn.num_heads,
             attn.head_dim,
         )
-        output = params.context_buf.view_as(query)
+        output = params.output.view_as(query)
         if params.input_seq_length == 1:
             query = query[:, 0]
             output = output[:, 0]
@@ -1165,14 +1164,14 @@ class PrimsTSFmha(PhasedFmha):
         return root_bytes[byte_offset:byte_end]
 
     def run_mla_generation(self, params: FmhaParams) -> None:
-        if params.qkv_input is None or params.context_buf is None:
+        if params.qkv_or_q is None or params.output is None:
             raise RuntimeError("PrimTS MLA decode requires query input and an output buffer.")
-        if params.sequence_lengths is None:
+        if params.sequence_length is None:
             raise RuntimeError("PrimTS MLA decode requires sequence lengths.")
 
         attn = params.attn
         meta = params.meta
-        batch_size = params.batch_size
+        batch_size = params.num_seqs
         kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
             meta.host_kv_cache_pool_pointers,
             meta.host_kv_cache_pool_mapping,
@@ -1186,20 +1185,20 @@ class PrimsTSFmha(PhasedFmha):
             attn.quant_mode,
             params.seq_offset,
             batch_size,
-            params.qkv_input.dtype,
+            params.qkv_or_q.dtype,
         )
         # The returned pool and block table share the THOP flat-page index ABI.
         if kv_cache is None or block_tables is None:
             raise RuntimeError("TRT-LLM did not return PrimTS MLA KV metadata.")
         fixed_block_tables = self._get_fixed_block_tables(block_tables, batch_size)
         seq_len_q = params.input_seq_length
-        query = params.qkv_input.view(
+        query = params.qkv_or_q.view(
             batch_size,
             seq_len_q,
             attn.num_heads,
             int(attn.kv_lora_rank) + int(attn.qk_rope_head_dim),
         )
-        output = params.context_buf.view(
+        output = params.output.view(
             batch_size,
             seq_len_q,
             attn.num_heads,
@@ -1211,7 +1210,7 @@ class PrimsTSFmha(PhasedFmha):
         )
         mask_type = self._get_prims_mask_type(params.fwd)
         seq_lens = self._get_sequence_lengths(
-            params.sequence_lengths,
+            params.sequence_length,
             batch_size,
         )
         caller_workspace = params.workspace.reshape(-1).view(torch.uint8)

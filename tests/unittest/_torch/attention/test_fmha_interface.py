@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention
+from fmha_test_utils import FakeAttention, make_fmha_forward_args
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
@@ -70,7 +70,7 @@ def test_support_forwards_request_and_phase(phase: FmhaPhase | None, supported: 
     fmha = _MinimalFmha(attn)
     q, k, v = (torch.empty((2, 4)) for _ in range(3))
     metadata = Mock(spec=TrtllmAttentionMetadata)
-    forward_args = AttentionForwardArgs()
+    forward_args = make_fmha_forward_args()
 
     with patch.object(fmha, "_is_supported", return_value=supported) as hook:
         assert fmha.is_supported(q, k, v, metadata, forward_args, phase=phase) is supported
@@ -83,7 +83,11 @@ def test_default_hooks_accept_requests() -> None:
 
     assert _MinimalFmha.is_available(attn)
     assert fmha.is_supported(
-        torch.empty((2, 4)), None, None, Mock(spec=TrtllmAttentionMetadata), AttentionForwardArgs()
+        torch.empty((2, 4)),
+        None,
+        None,
+        Mock(spec=TrtllmAttentionMetadata),
+        make_fmha_forward_args(),
     )
 
 
@@ -113,7 +117,7 @@ def test_support_checks_block_sparse_capability_before_implementation(
     attn = cast(TrtllmAttention, FakeAttention())
     q, k, v = (torch.empty((2, 4)) for _ in range(3))
     metadata = Mock(spec=TrtllmAttentionMetadata)
-    forward_args = AttentionForwardArgs()
+    forward_args = make_fmha_forward_args()
     if has_block_sparse_inputs:
         forward_args.sparse_runtime_params = SparseRuntimeParams(
             block_sparse_inputs=BlockSparseForwardInputs(

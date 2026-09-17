@@ -60,6 +60,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PositionEmbeddingType,
@@ -310,7 +311,7 @@ class _TrtllmMLAPlanner:
         self._cu_kv_decode_host = torch.zeros(
             max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
-        self.fmha_scheduler_counter_decode = torch.zeros(1, dtype=torch.uint32, device=device)
+        self.fmha_scheduler_counter_decode = torch.empty(1, dtype=torch.uint32, device=device)
 
         # Chunked-prefill metadata (cache-reused / chunked-prefill path).
         # Upper bound on iteration count: with chunk_size = max_seq_len (set in
@@ -551,6 +552,8 @@ class _TrtllmMLAPlanner:
         self._decode_buf_rope_dim = qk_rope_head_dim
         self._decode_buf_dtype = dtype
         gen_head_size = kv_lora_rank + qk_rope_head_dim
+
+        self.fmha_scheduler_counter_decode = torch.empty(1, dtype=torch.uint32, device=device)
 
         self.cu_q_decode = (
             torch.arange(max_tokens + 1, dtype=torch.int32, device=device) * num_heads
@@ -1005,7 +1008,7 @@ def _handle_prefill_thop(
     # at the top of this function so the FMHA never sees nonzero past_kv here.
     # All real past_kv values in this branch are zero, so ``host_past_kv_lengths``
     # is passed directly (no separate zero buffer needed).
-    thop.attention(
+    FallbackFmha.attention(
         q,  # q
         k,  # k
         v,  # v
@@ -1045,10 +1048,10 @@ def _handle_prefill_thop(
         max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
-        int(AttentionMaskType.causal),  # mask_type
+        AttentionMaskType.causal,  # mask_type
         quant_mode,  # quant_mode
         q_scaling,  # q_scaling
-        int(PositionEmbeddingType.yarn),  # position_embedding_type
+        PositionEmbeddingType.yarn,  # position_embedding_type
         qk_rope_head_dim,  # rope_dim
         10000.0,  # rope_base
         5,  # rope_scale_type (YaRN)
@@ -1058,7 +1061,7 @@ def _handle_prefill_thop(
         max_context_length,  # rope_max_positions
         max_context_length,  # rope_original_max_positions
         True,  # use_paged_context_fmha
-        int(AttentionInputType.context_only),  # attention_input_type
+        AttentionInputType.context_only,  # attention_input_type
         True,  # is_mla_enable
         1,  # chunked_prefill_buffer_batch_size
         0,  # q_lora_rank
@@ -1297,7 +1300,7 @@ def _handle_prefill_thop_cached_kv(
             chunk_total_kv, num_heads * qk_head_dim
         )
 
-        thop.attention(
+        FallbackFmha.attention(
             q_2d,  # q
             chunk_k,  # k
             chunk_v,  # v
@@ -1339,10 +1342,10 @@ def _handle_prefill_thop_cached_kv(
             max_seq_len,  # max_seq_len
             max_context_length,
             1,  # beam_width
-            int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
+            AttentionMaskType.padding,  # FULL mask: every Q attends to every K in this chunk
             quant_mode,
             q_scaling,
-            int(PositionEmbeddingType.yarn),
+            PositionEmbeddingType.yarn,
             qk_rope_head_dim,  # rope_dim
             10000.0,  # rope_base
             5,  # rope_scale_type (YaRN)
@@ -1352,7 +1355,7 @@ def _handle_prefill_thop_cached_kv(
             max_context_length,  # rope_max_positions
             max_context_length,  # rope_original_max_positions
             True,  # use_paged_context_fmha
-            int(AttentionInputType.context_only),
+            AttentionInputType.context_only,
             True,  # is_mla_enable
             _TRTLLM_MLA_CHUNK_BATCH_SIZE,  # chunked_prefill_buffer_batch_size
             0,  # q_lora_rank
@@ -1429,7 +1432,7 @@ def _handle_prefill_thop_cached_kv(
         num_tokens, num_heads * qk_head_dim
     )
 
-    thop.attention(
+    FallbackFmha.attention(
         q_2d,  # q
         new_k,  # k
         new_v,  # v
@@ -1469,10 +1472,10 @@ def _handle_prefill_thop_cached_kv(
         max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
-        int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
+        AttentionMaskType.causal,  # CAUSAL: new Q tokens with causal mask over new K/V
         quant_mode,
         q_scaling,
-        int(PositionEmbeddingType.yarn),
+        PositionEmbeddingType.yarn,
         qk_rope_head_dim,  # rope_dim
         10000.0,  # rope_base
         5,  # rope_scale_type (YaRN)
@@ -1482,7 +1485,7 @@ def _handle_prefill_thop_cached_kv(
         max_context_length,  # rope_max_positions
         max_context_length,  # rope_original_max_positions
         True,  # use_paged_context_fmha
-        int(AttentionInputType.context_only),
+        AttentionInputType.context_only,
         True,  # is_mla_enable
         _TRTLLM_MLA_CHUNK_BATCH_SIZE,
         0,
@@ -1698,7 +1701,7 @@ def _handle_decode_impl(
 
     output_latent = planner.output_latent[:num_tokens]
 
-    thop.attention(
+    FallbackFmha.attention(
         fused_q_flat,  # q (fused Q for decode)
         None,  # k
         None,  # v
@@ -1738,10 +1741,10 @@ def _handle_decode_impl(
         max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
-        int(AttentionMaskType.causal),  # mask_type
+        AttentionMaskType.causal,  # mask_type
         quant_mode,  # quant_mode
         q_scaling,  # q_scaling
-        int(PositionEmbeddingType.yarn),  # position_embedding_type
+        PositionEmbeddingType.yarn,  # position_embedding_type
         qk_rope_head_dim,  # rope_dim
         10000.0,  # rope_base
         5,  # rope_scale_type (YaRN)
@@ -1751,7 +1754,7 @@ def _handle_decode_impl(
         max_context_length,  # rope_max_positions
         max_context_length,  # rope_original_max_positions
         False,  # use_paged_context_fmha
-        int(AttentionInputType.generation_only),  # attention_input_type
+        AttentionInputType.generation_only,  # attention_input_type
         True,  # is_mla_enable
         1,  # chunked_prefill_buffer_batch_size
         0,  # q_lora_rank
