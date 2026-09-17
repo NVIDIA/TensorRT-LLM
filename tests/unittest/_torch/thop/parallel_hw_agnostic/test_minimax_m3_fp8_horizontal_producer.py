@@ -41,6 +41,43 @@ def _index_cache(num_pages, stride_scale=5):
     return backing[::stride_scale]
 
 
+def _assert_fp8_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Allow adjacent finite E4M3 values, including subnormals and signed zero."""
+    assert actual.dtype == expected.dtype == torch.float8_e4m3fn
+    assert torch.isfinite(actual.float()).all()
+    assert torch.isfinite(expected.float()).all()
+    # E4M3 encodes sign/magnitude. Map both signs to monotonically ordered
+    # integers, collapsing +0 and -0, so atol=1 means exactly one FP8 step.
+    actual_bits = actual.view(torch.uint8).to(torch.int16)
+    expected_bits = expected.view(torch.uint8).to(torch.int16)
+    actual_ordered = torch.where(actual_bits < 128, actual_bits, 128 - actual_bits)
+    expected_ordered = torch.where(expected_bits < 128, expected_bits, 128 - expected_bits)
+    torch.testing.assert_close(actual_ordered, expected_ordered, rtol=0, atol=1)
+
+
+def test_minimax_m3_fp8_one_ulp_comparison() -> None:
+    # Cover every adjacent finite pair, including exponent boundaries and
+    # subnormals, for both signs. Two-step errors and NaNs must still fail.
+    for sign in (0, 128):
+        values = (torch.arange(127, dtype=torch.uint8) + sign).view(torch.float8_e4m3fn)
+        _assert_fp8_within_one_ulp(values[:-1], values[1:])
+        with pytest.raises(AssertionError):
+            _assert_fp8_within_one_ulp(values[:-2], values[2:])
+    _assert_fp8_within_one_ulp(
+        torch.tensor([0, 128, 1, 129], dtype=torch.uint8).view(torch.float8_e4m3fn),
+        torch.tensor([128, 0, 128, 0], dtype=torch.uint8).view(torch.float8_e4m3fn),
+    )
+    with pytest.raises(AssertionError):
+        _assert_fp8_within_one_ulp(
+            torch.tensor([1], dtype=torch.uint8).view(torch.float8_e4m3fn),
+            torch.tensor([129], dtype=torch.uint8).view(torch.float8_e4m3fn),
+        )
+    for nan_bits in (127, 255):
+        nan = torch.tensor([nan_bits], dtype=torch.uint8).view(torch.float8_e4m3fn)
+        with pytest.raises(AssertionError):
+            _assert_fp8_within_one_ulp(nan, nan)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 16, 129])
 @pytest.mark.parametrize("num_kv_heads,num_index_heads", [(4, 4), (2, 2), (1, 1)])
 def test_minimax_m3_horizontal_producer_matches_separate_producers(
@@ -128,21 +165,29 @@ def test_minimax_m3_horizontal_producer_matches_separate_producers(
     valid = slots >= 0
     pages = slots[valid].long() // 128
     within = slots[valid].long() % 128
-    assert torch.equal(q.view(torch.uint8), q_reference.view(torch.uint8))
+    # The horizontal producer reads precomputed FP32 RoPE coefficients; the
+    # separate main producer computes powf/__sincosf per head. Near an FP8
+    # midpoint, their small FP32 differences can round to adjacent E4M3 bins.
+    # Bound Q/K differences to one actual FP8 step, not a broad atol/rtol.
+    _assert_fp8_within_one_ulp(q, q_reference)
     # The horizontal producer follows vLLM's CUDA contract and converts its
     # normalized/RoPE FP32 registers directly to E4M3. The existing separate
-    # TRT-LLM index producer first materializes BF16, so compare within one FP8
-    # ULP rather than requiring byte identity across the different rounding
-    # orders. Main Q/K/V retain byte-exact parity above and below.
+    # TRT-LLM index producer first materializes BF16, so retain its numerical
+    # tolerance across the different rounding orders. V is copy-cast only and
+    # retains byte-exact parity below.
     torch.testing.assert_close(
         index_q.float(),
         index_q_reference.float(),
         rtol=0.13,
         atol=0.05,
     )
+    _assert_fp8_within_one_ulp(
+        main_cache[pages, 0, :, within, :],
+        reference_main_cache[pages, 0, :, within, :],
+    )
     assert torch.equal(
-        main_cache[pages, :, :, within, :].view(torch.uint8),
-        reference_main_cache[pages, :, :, within, :].view(torch.uint8),
+        main_cache[pages, 1, :, within, :].view(torch.uint8),
+        reference_main_cache[pages, 1, :, within, :].view(torch.uint8),
     )
     torch.testing.assert_close(
         index_cache[pages, :, within, :].float(),
