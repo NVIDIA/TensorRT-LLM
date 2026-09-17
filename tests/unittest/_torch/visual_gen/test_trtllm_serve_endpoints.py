@@ -736,8 +736,6 @@ def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, m
                 server_role=ServerRole.VISUAL_GEN,
                 metadata_server_cfg=None,
             )
-        # Asking for the directory is what resolves it, and it has to land
-        # somewhere writable rather than raise.
         resolved = server.media_storage_path
     finally:
         read_only.chmod(0o755)
@@ -746,29 +744,6 @@ def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, m
     assert resolved.parent == Path(tempfile.gettempdir())
     assert resolved.name.startswith("trtllm_generated-")
     assert list(read_only.iterdir()) == []
-
-
-def test_a_server_that_is_never_asked_for_media_creates_no_directory(tmp_path, monkeypatch):
-    """A restart loop would otherwise leave a directory behind on every start,
-    and nothing removes them."""
-    from tensorrt_llm.llmapi.disagg_utils import ServerRole
-    from tensorrt_llm.serve.openai_server import OpenAIServer
-
-    monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
-    monkeypatch.chdir(tmp_path)
-    with patch(
-        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
-        return_value=True,
-    ):
-        OpenAIServer(
-            generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
-            model="test-model",
-            tool_parser=None,
-            server_role=ServerRole.VISUAL_GEN,
-            metadata_server_cfg=None,
-        )
-
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_servers_starting_in_the_same_second_get_separate_directories(tmp_path):

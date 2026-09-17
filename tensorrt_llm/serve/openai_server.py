@@ -967,22 +967,9 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self._media_storage_path: Optional[Path] = None
+        self.media_storage_path = _resolve_media_dir()
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
-
-    @property
-    def media_storage_path(self) -> Path:
-        """The directory generated media is stored in, created on first use.
-
-        Resolving it lazily keeps a server that is never asked for media from
-        leaving a directory behind on every restart, and lets such a server
-        start from a working directory it could not have written.
-        """
-        if self._media_storage_path is None:
-            self._media_storage_path = _resolve_media_dir()
-            logger.info(
-                f"VisualGen media storage path: {self._media_storage_path}")
-        return self._media_storage_path
 
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
