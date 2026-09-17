@@ -1119,6 +1119,93 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     assert request.py_request_id not in manager._allocated_draft_lens
 
 
+class _ScratchPreconditionKVCache:
+    """Fake KvCache that enforces the SWA-scratch precondition on resize.
+
+    Mirrors ``KvCache::resize`` in
+    ``cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.cpp``: while
+    scratch reuse is enabled, a capacity change requires the history length to
+    land in ``[old_capacity - max_rewind_len, old_capacity]``.
+    """
+
+    def __init__(self, max_rewind_len: int) -> None:
+        self.capacity = 0
+        self.history_length = 0
+        self.num_committed_tokens = 0
+        self.is_active = True
+        self.enable_swa_scratch_reuse = True
+        self.resize_calls = []  # (capacity, history_length) per resize()
+        self._max_rewind_len = max_rewind_len
+
+    def resume(self, stream) -> bool:
+        del stream
+        return True
+
+    def stop_committing(self) -> None:
+        pass
+
+    def resize(self, capacity=None, history_length=None) -> bool:
+        self.resize_calls.append((capacity, history_length))
+        new_capacity = self.capacity if capacity is None else capacity
+        new_history = self.history_length if history_length is None else history_length
+        if self.enable_swa_scratch_reuse and new_capacity != self.capacity:
+            lowest = max(0, self.capacity - self._max_rewind_len)
+            if not lowest <= new_history <= self.capacity:
+                raise RuntimeError(
+                    "SWA scratch requires old_capacity - max_rewind_len "
+                    "<= history_length <= old_capacity"
+                )
+        self.capacity = new_capacity
+        self.history_length = new_history
+        return True
+
+
+@pytest.mark.parametrize("materialize_history", [False, True])
+def test_generation_dummy_reserves_capacity_within_scratch_precondition(
+    materialize_history: bool,
+) -> None:
+    """A generation dummy must not trip the SWA-scratch resize precondition.
+
+    ``materialize_history`` holds the history marker at 0 -- the caller writes
+    the history itself -- and leaves scratch reuse enabled, so the capacity has
+    to be reserved in a single resize off zero capacity. Growing a second time
+    demanded ``history_length >= token_num`` and threw, which took the
+    layer-wise benchmark down on every sliding-window model.
+    """
+    token_num = 1150
+    num_extra_kv_tokens = 1
+    kv_cache = _ScratchPreconditionKVCache(max_rewind_len=num_extra_kv_tokens)
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._has_cp_helix = False
+    manager.num_extra_kv_tokens = num_extra_kv_tokens
+    manager._stream = SimpleNamespace(cuda_stream=None)
+    manager._create_kv_cache = Mock(return_value=kv_cache)
+    manager.free_resources = Mock()
+
+    requests = manager.add_dummy_requests(
+        [0],
+        token_nums=[token_num],
+        is_gen=True,
+        materialize_history=materialize_history,
+    )
+
+    assert requests is not None
+    # Same reserved capacity either way: the sequence, the extra KV tokens and
+    # the slot for the token that generation is about to produce.
+    assert kv_cache.capacity == token_num + num_extra_kv_tokens + 1
+    if materialize_history:
+        # One resize, so the precondition is only ever checked off zero
+        # capacity, and the history keeps its own blocks.
+        assert len(kv_cache.resize_calls) == 1
+        assert kv_cache.history_length == 0
+        assert kv_cache.enable_swa_scratch_reuse
+    else:
+        # The hinted-history path disables scratch reuse instead.
+        assert kv_cache.enable_swa_scratch_reuse is False
+        assert kv_cache.history_length == token_num - 1
+
+
 def _revert_context_request(request_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
