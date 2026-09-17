@@ -123,7 +123,8 @@ z
     <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(475.119513 143.302847)">→ exact refinement</text>
    </g>
    <g id="text_5">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #475569" x="19.4976" y="187.128" transform="rotate(-0 19.4976 187.128)">Two dependent reads; threshold quality follows temporal overlap.</text>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; fill: #475569" transform="translate(19.4976 176.490078)">Biased toward previous winners; overlap varies across layers and steps.</text>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; fill: #475569" transform="translate(19.4976 187.128)">Weak hints add verification and recovery work.</text>
    </g>
    <g id="text_6">
     <text style="font-weight: 700; font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #447a00" x="19.4976" y="219.5856" transform="rotate(-0 19.4976 219.5856)">GVR V2 streaming: self-sampling + multi-thresholding</text>
@@ -177,7 +178,7 @@ L 424.616412 275.1088
 " style="fill: none; stroke: #64748b; stroke-width: 1.5; stroke-linecap: round"/>
    </g>
    <g id="text_10">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #447a00" x="19.4976" y="327.15936" transform="rotate(-0 19.4976 327.15936)">Current-row information; no previous-step Top-K state.</text>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #447a00" x="19.4976" y="327.15936" transform="rotate(-0 19.4976 327.15936)">No temporal-overlap dependency; one calibration rule for both phases.</text>
    </g>
   </g>
   <g id="axes_2">
@@ -377,7 +378,7 @@ L 964.8 301.536
    <text style="font-weight: 700; font-size: 20px; font-family: 'DejaVu Sans'; text-anchor: start" x="17.28" y="22.396875" transform="rotate(-0 17.28 22.396875)">From temporal prediction to current-row calibration</text>
   </g>
   <g id="text_26">
-   <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #475569" x="22.32" y="378.144" transform="rotate(-0 22.32 378.144)">R0 already introduced a hint-derived threshold ladder. V2 combines that direction with current-row sampling and execution specialization.</text>
+   <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #475569" x="22.32" y="378.144" transform="rotate(-0 22.32 378.144)">Design goals: improve the practical performance floor and average latency; remove the temporal prior's framework lifecycle.</text>
   </g>
   <g id="text_27">
    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #475569" x="22.32" y="400.32" transform="rotate(-0 22.32 400.32)">Bars compare the temporal R0, temporal tiered, and self-sampling V2 implementations.</text>

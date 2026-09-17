@@ -270,8 +270,9 @@ def _evolution(rows: list[dict]) -> None:
     ax.text(
         0.2,
         3.25,
-        "Two dependent reads; threshold quality follows temporal overlap.",
-        fontsize=10,
+        "Biased toward previous winners; overlap varies across layers and steps.\n"
+        "Weak hints add verification and recovery work.",
+        fontsize=9.5,
         color="#475569",
     )
     ax.text(
@@ -299,8 +300,8 @@ def _evolution(rows: list[dict]) -> None:
     ax.text(
         0.2,
         0.23,
-        "Current-row information; no previous-step Top-K state.",
-        fontsize=10,
+        "No temporal-overlap dependency; one calibration rule for both phases.",
+        fontsize=9.5,
         color="#447a00",
     )
     bars = fig.add_axes((0.76, 0.25, 0.21, 0.5))
@@ -333,8 +334,8 @@ def _evolution(rows: list[dict]) -> None:
     fig.text(
         0.035,
         0.06,
-        "R0 already introduced a hint-derived threshold ladder. "
-        "V2 combines that direction with current-row sampling and execution specialization.",
+        "Design goals: improve the practical performance floor and average latency; "
+        "remove the temporal prior's framework lifecycle.",
         fontsize=10,
         color="#475569",
     )
@@ -562,7 +563,7 @@ def _integration() -> None:
         ax,
         (0.75, 0.72),
         (12.5, 0.66),
-        "Caller-owned INT32 output · no previous-step Top-K prior for V2",
+        "Caller-owned INT32 output · no temporal-prior seed, handoff, or write-back",
         "#edf5df",
         12,
     )

@@ -268,7 +268,7 @@ L 707.408449 408.86368
     <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616f" x="496.08" y="452.05728" transform="rotate(-0 496.08 452.05728)">Prefill specializes addressing, masks, and index origin; selection logic is shared.</text>
    </g>
    <g id="text_13">
-    <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #17202b" x="496.08" y="526.05285" transform="rotate(-0 496.08 526.05285)">Caller-owned INT32 output · no previous-step Top-K prior for V2</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #17202b" x="496.08" y="526.05285" transform="rotate(-0 496.08 526.05285)">Caller-owned INT32 output · no temporal-prior seed, handoff, or write-back</text>
    </g>
    <g id="patch_20">
     <path d="M 496.08 468.974834

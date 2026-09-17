@@ -13,7 +13,7 @@ By NVIDIA TensorRT-LLM Team
 
 Selecting 1,024 INT32 indices from 131,072 FP32 scores writes just **4 KiB of output**, yet one complete read of the scores moves **512 KiB**. Every additional full-row pass pays that input cost again. For a sparse-attention indexer, finding the Top-K boundary can therefore cost far more than emitting the winners.
 
-GVR V2 makes each full-row pass more useful. **Self-sampling estimates where the current row's Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.** Together, they concentrate exact refinement on the small group of scores still competing for the final slots.
+GVR V2 makes each full-row pass more useful without depending on the previous decode step to predict the current one. **Self-sampling estimates where the current row's Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.** Together, they concentrate exact refinement on the small group of scores still competing for the final slots.
 
 On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM radix CUDA and 1.66× over SGLang v2**, with **2.01× over FlashInfer, 2.37× over DeepSelect FP32, and 1.55× over HPC-ops FP32**. The workloads span DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers. The SGLang result includes planning; the transform-only comparison is **1.42×**.
 
@@ -21,11 +21,11 @@ On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM 
 
 *Figure 1. Kernel time relative to GVR V2, geometrically averaged over the same workloads within each model; shorter is faster. The temporal bars show the R0 and tiered implementations. SGLang includes planning; HPC-ops does not support Pro.*
 
-[The original GVR blog](blog21_Temporal_Correlation_Meets_Sparse_Attention.md) described a temporal shortcut: the previous decode step's selected indices predict the next step's winners. V2 makes the row itself the source of the guess. This removes a dependent gather and the need to carry Top-K state across decode steps, while preserving the **Guess–Verify–Refine** exactness contract. It also makes the design useful for prefill, where a previous decode selection does not exist.
+[The original GVR blog](blog21_Temporal_Correlation_Meets_Sparse_Attention.md) described a temporal shortcut: the previous decode step's selected indices predict the next step's winners. Experience with V1 exposed two limits: hint quality varies sharply, and maintaining the hint couples selection to the serving framework. V2 makes the current row the source of the guess, targeting **a stronger performance floor and better average latency**, while enabling **one selection core for prefill and decode**. The **Guess–Verify–Refine** exactness contract remains.
 
 ## Table of Contents
 
-- [From GVR V1 to V2: Two Costs to Remove](#from-gvr-v1-to-v2-two-costs-to-remove)
+- [From GVR V1 to V2: Why Move Beyond Temporal Hints?](#from-gvr-v1-to-v2-why-move-beyond-temporal-hints)
 - [Self-Sampling: Calibrate the Search to This Row](#self-sampling-calibrate-the-search-to-this-row)
 - [Multi-Thresholding: Make Each Full-Row Pass Count](#multi-thresholding-make-each-full-row-pass-count)
 - [Mapping Selection to Blackwell](#mapping-selection-to-blackwell)
@@ -35,7 +35,7 @@ On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM 
 - [Conclusion](#conclusion)
 - [Further Reading](#further-reading)
 
-## From GVR V1 to V2: Two Costs to Remove
+## From GVR V1 to V2: Why Move Beyond Temporal Hints?
 
 Original GVR V1 gathers the current scores at the previous step's Top-K indices, estimates a bracket from their minimum, maximum, and mean, then uses a secant-style search on the monotone count function
 
@@ -43,32 +43,46 @@ $$
 C(T)=\sum_{i=0}^{N-1}\mathbf{1}[x_i\ge T].
 $$
 
-It seeks an admission threshold with enough survivors to contain Top-K, but few enough to fit its candidate capacity. A good temporal prediction makes that search short. Two costs remain: loading the old indices before the score addresses are known, and scanning the row again when another threshold must be tested. The first is a memory dependency; the second multiplies traffic as $N$ grows.
+It seeks an admission threshold with enough survivors to contain Top-K, but few enough to fit its candidate capacity. A high-quality temporal hint can make this search very short. The difficulty is making that benefit reliable across inference workloads.
 
-V2 addresses both. Its streaming paths read regularly spaced, coalesced samples of the current row to choose a useful bracket. They then classify the full row into bins whose cumulative counts evaluate many thresholds together. The algorithm spends a small amount of work learning where to look, then obtains much more information from each expensive full-row pass.
+### A Biased Sample with Variable Value
+
+Temporal hints are a **biased sample**: they inspect current scores at positions selected as winners in the previous step. When temporal overlap is high and stable, that bias is valuable because the sample concentrates on the upper tail. In inference traces examined during V1 development, however, the hit rate—the fraction of previous-step selected indices retained in the current Top-K—varied from **nearly 0% to about 90%** across models, layers, and decode steps. A low-overlap sample can provide little useful information about the current tail.
+
+The kernel cannot know that exact hit rate before finding the current Top-K. Verification can reveal that a proposed threshold is poor, but by then the hint gather and some selection work have already been paid for. Hint quality therefore cannot serve as a cheap, advance decision about whether the temporal shortcut is worth taking.
+
+This variability affects the whole design. Robust selection must cover weak hints with conservative admission, additional count queries, candidate-capacity checks, and exact recovery. A wider range of hint quality puts more pressure on those mechanisms: retries add full-row reads, and managing the safe paths adds overhead. The cost reduces average speedup and contributes to latency variation, even when favorable steps are very fast. Exact fallback protects correctness; its cost still matters to serving performance.
+
+V2 instead calibrates from regularly spaced, coalesced samples of the **current row**, removing dependence on temporal overlap and the dependent read through old indices. Multi-thresholding then extracts many exact population counts from each full-row classification pass. The two ideas address complementary costs: unreliable initial calibration and repeated scalar threshold queries. The goal is a stronger practical performance floor and a better average, rather than relying on consistently favorable temporal overlap. This is a design objective, not a fixed worst-case latency guarantee.
 
 V1 also used a histogram during local refinement after candidate collection. The distinction is where that information becomes available: V2 makes multi-threshold population information central to verification, so it can pass an already identified crossing to refinement.
+
+### A Hint That Crosses Framework Boundaries
+
+V1's prior also has a lifecycle outside the kernel. Prefill lacks the same previous-decode-step hint, so its seeding policy differs. That phase-dependent history complicates a common selection architecture. V2's current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The [integration section](#decode-and-prefill-in-tensorrt-llm) traces the consequences for CUDA Graph preparation and disaggregated serving.
 
 | Algorithm question | Original GVR V1 | Streaming GVR V2 |
 | :--- | :--- | :--- |
 | Where does the guess come from? | Current scores gathered through previous-step indices | A coalesced sample of the current row |
+| What makes the guess useful? | High, stable overlap with previous winners | Coverage of the current row's score distribution |
 | What guides admission? | Hint statistics and scalar secant-style count queries | Sample-derived primary threshold, lower safety floor, and upper anchor |
 | What does verification learn? | A count for the trial threshold | Exact bin populations and counts at many boundaries |
 | Where is the remaining uncertainty? | The admitted candidate set | The crossing bin containing rank $K$ |
 | What state crosses decode steps? | Per-layer prior indices | No Top-K prior |
+| How do prefill and decode relate? | Different hint availability and seeding policies | Shared streaming selection with phase-specific row adapters |
 | How does a bad guess affect the result? | More verification/refinement work | Lower admission or exact recovery; membership remains exact |
 
-![GVR V1 and V2 data-flow comparison beside measured progression from temporal R0 to tiered temporal GVR and self-sampling GVR V2.](../media/gvr_v2/evolution.svg)
+![V1's temporal bias makes threshold quality depend on changing overlap; V2 calibrates from the current row with no temporal prior. Beside these flows, measured bars compare temporal R0, tiered temporal GVR, and V2.](../media/gvr_v2/evolution.svg)
 
-*Figure 2. Original V1 uses temporal hints and scalar threshold search. The later temporal R0 and tiered implementations introduce broader verification and execution specialization; V2 combines these advances with current-row self-sampling. Bars show speedup over radix CUDA.*
+*Figure 2. The design shift removes dependence on temporal overlap and prior state while making each verification pass more informative. Original V1 uses scalar threshold search; later temporal R0 and tiered implementations add broader verification and execution specialization. The bars compare those later temporal implementations with V2 over radix CUDA.*
 
 Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA; V2 reaches **4.93×**. V2 is **1.91× faster than temporal R0** and **1.42× faster than tiered temporal GVR**, combining current-row sampling, multi-threshold verification, and specialized execution paths.
 
 ## Self-Sampling: Calibrate the Search to This Row
 
-V2 takes a small, deterministic sample across the valid row and uses its ranks to estimate the upper tail of the full population. The sample chooses a starting region; full-row verification determines whether it contains enough candidates.
+V2 takes a small, deterministic sample across the valid row and uses its ranks to estimate the upper tail of the full population. The same rule works without knowing the model, layer, decode step, or previous winners. The sample chooses a starting region; full-row verification determines whether it contains enough candidates.
 
-In the `main` family, a sample unit is two adjacent `float4` vectors: eight scores loaded together. The clustered streaming family uses four vectors, or sixteen scores. Sample units are regularly spaced across the valid interval. Their addresses follow from the row layout, so sampling does not wait for previous-step indices. Sampling can still miss an unusual tail; its role is to reduce work, not to decide output membership.
+In the `main` family, a sample unit is two adjacent `float4` vectors: eight scores loaded together. The clustered streaming family uses four vectors, or sixteen scores. Sample units are regularly spaced across the valid interval. Their addresses follow from the row layout, so sampling does not wait for previous-step indices. Regular spacing is not a guarantee of statistical unbiasedness: it can still miss an unusual tail. Its role is to reduce work, not to decide output membership.
 
 Let $S$ be the sample size and $A\ge K$ the desired full-row candidate population. A **256-bin sample histogram** approximates the score distribution. Descending sample ranks
 
@@ -269,19 +283,23 @@ The full ideal bound is $T_{\mathrm{roof}}=\max(Q_{\min}/\mathrm{BW},W/R_{\mathr
 
 ## Decode and Prefill in TensorRT-LLM
 
+Self-sampling changes the integration boundary as well as the threshold estimate. A temporal prior makes selection depend on state produced by an earlier call. Its buffers, initialization, request alignment, and write-back must remain valid through CUDA Graph warmup and replay; disaggregated prefill/decode also needs a policy for making the prior available at the handoff. Prefill and decode do not naturally obtain that hint in the same way. These extra lifecycle rules create maintenance work and opportunities for inconsistent state.
+
+V2 derives its bracket from the current scores in both phases. Selection therefore needs the current row and its metadata, with no previous-step Top-K buffer, prefill-to-decode prior seeding, or prior write-back. This removes a Top-K-specific state dependency from graph preparation and phase handoffs. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) limits prior ownership to the temporal engine.
+
 ### One Selection Core, Two Row Interfaces
 
 TensorRT-LLM separates phase-specific row metadata from shared selection logic. The `TopK` module applies the same self-sampling configuration to supported decode and prefill paths, then passes each phase's valid score interval to the selected engine.
 
 ![Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes.](../media/gvr_v2/integration.svg)
 
-*Figure 8. Shared selection logic with phase-specific row interfaces. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
+*Figure 8. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
 
 The adapters preserve each phase's indexing semantics. Decode derives valid prefixes from device KV lengths, multi-token prediction offsets, and compression. Prefill receives `[start, end)` in compressed columns and returns indices relative to `start`. Both write INT32 indices into caller-owned output, with identity indices and `-1` padding for short rows.
 
 Prefill's compile-time mode changes addressing, masking, and index origin in the same **`GvrMainKernel` streaming implementation** used by decode. Self-sampling, multi-threshold counting, collection, and exact refinement stay shared. One block per prefill row and specialized decode scheduling let the common algorithm serve different parallelism requirements. [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) implements this reuse.
 
-The bracket comes from the current scores in both phases. Consequently, V2 needs no previous-step Top-K buffer, prefill-to-decode prior seeding, or prior write-back. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) limits that state to the temporal engine.
+This separation keeps phase-specific decisions in the wrapper, dispatch, and compile-time row adapters. Improvements to threshold calibration, counting, and exact recovery can serve both phases through the shared streaming body, reducing duplicated selection logic and the number of state transitions the framework must maintain.
 
 ### Stable Launches, Dynamic Row Lengths
 
@@ -319,9 +337,9 @@ V2 requires CUTLASS DSL, datacenter Blackwell SM100/SM103, $K\in\lbrace 512,1024
 
 ## Conclusion
 
-GVR V2 makes exact Top-K cheaper by learning more before repeating expensive work. **Self-sampling focuses the search; multi-threshold counts locate the crossing; exact refinement resolves the remaining membership.** Register, streaming, and cluster execution paths adapt that design to the available parallelism.
+GVR V2 follows from a practical limit of temporal prediction: a biased hint can be excellent when overlap is high, yet expensive to rely on when quality fluctuates. **Self-sampling calibrates from the current row; multi-threshold counts locate the crossing; exact refinement resolves the remaining membership.** Together, they target both difficult-input performance and average latency while preserving exactness.
 
-The performance maps show where the gains occur, and the Pareto curves express them as progress toward the bandwidth roof. A shared streaming implementation carries the same selection logic into decode and prefill, with phase-specific row interfaces and no temporal Top-K prior.
+The performance maps show the gains across shapes, and the Pareto curves relate them to the bandwidth roof. Removing the temporal prior also removes its framework lifecycle: a shared streaming implementation serves prefill and decode through phase-specific row interfaces. The result is one algorithmic core whose calibration depends on the input it is selecting now.
 
 ## Further Reading
 
