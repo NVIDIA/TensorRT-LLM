@@ -1119,7 +1119,11 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     )
 
 
-def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
+@pytest.mark.parametrize("chunked_workspace_profiled", [False, True])
+def test_estimation_temporarily_uses_inferred_pool_sizing(
+    chunked_workspace_profiled: bool,
+) -> None:
+    """Restore user sizing and reserve workspace only when chunks were not profiled."""
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
     max_seq_len = 4096
@@ -1138,7 +1142,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     # A bare Mock would auto-create the attribute; real engines set it to
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
-    llm_args = Mock(cache_transceiver_config=None)
+    llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=True)
 
     with patch.object(
         KvCacheCreator,
@@ -1164,6 +1168,16 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
             is_disagg=False,
         )
 
+    creator._mla_chunked_profile_length = 1408 if chunked_workspace_profiled else None
+    py_executor = Mock()
+    py_executor.dist.mapping.rank = 0
+    py_executor.dist.broadcast.side_effect = lambda value, root: value
+    py_executor.enqueue_requests.return_value = [1]
+    py_executor.await_responses.return_value = []
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
+    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+
     with (
         patch.object(
             creator,
@@ -1172,15 +1186,24 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
         ),
         patch.object(creator, "_cal_max_memory", return_value=512),
         patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
-        patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
+        patch.object(
+            torch.cuda,
+            "memory_stats",
+            return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 256},
+        ),
+        patch.object(creator, "_encode_dummy_inputs", return_value=None),
+        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=3)),
         patch.object(torch.cuda, "empty_cache"),
         patch.object(torch.cuda, "reset_peak_memory_stats"),
-        # This test exercises inferred pool sizing, not the backend workspace reserve; the mock
-        # model_config would otherwise walk into backend resolution and the MLA byte-cost path.
-        # Neutralize it so no reserve applies.
+        # Use a nonzero backend cost: the 512-byte budget splits into 384 bytes
+        # of KV and 128 bytes of workspace unless chunk profiling covered it.
         patch(
             "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
-            return_value=0,
+            return_value=1,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
+            return_value=True,
         ),
     ):
         assert creator.try_prepare_estimation()
@@ -1188,8 +1211,12 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
         assert kv_cache_config.pool_ratio is None
         assert kv_cache_config.avg_seq_len == max_seq_len
 
-        creator.configure_kv_cache_capacity()
+        creator.configure_kv_cache_capacity(py_executor)
 
+    assert kv_cache_config.max_gpu_total_bytes == (512 if chunked_workspace_profiled else 384)
+    assert creator._fp8_ctx_mla_kv_len_cap == (None if chunked_workspace_profiled else 128)
+    py_executor.start_worker.assert_called_once()
+    py_executor.shutdown.assert_called_once()
     assert kv_cache_config.max_tokens == user_max_tokens
     assert kv_cache_config.pool_ratio == pool_ratio
     assert kv_cache_config.avg_seq_len == avg_seq_len
