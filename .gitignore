@@ -88,6 +88,7 @@ ad-test-workspace/
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 !3rdparty/vendor_patches/*.patch
+!docker/patches/*.patch
 examples/disaggregated/slurm/benchmark/logs/
 scripts/attribution/data/checksum_to_paths.yml
 
