@@ -181,14 +181,7 @@ def _append_paged_kv_cache(
 # tensor-core kernel exists.
 FI_DECODE_TENSOR_CORES_ENV = "TRTLLM_FI_DECODE_TENSOR_CORES"
 
-_TENSOR_CORE_OVERRIDES = {
-    "0": False,
-    "false": False,
-    "off": False,
-    "1": True,
-    "true": True,
-    "on": True,
-}
+_TENSOR_CORE_OVERRIDES = {"0": False, "1": True}
 
 
 def decode_tensor_cores_override() -> Optional[bool]:

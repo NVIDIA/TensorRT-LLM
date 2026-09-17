@@ -84,21 +84,26 @@ def test_default_is_unchanged(num_heads, num_kv_heads, expected, unset_as):
     assert use_tensor_cores(plan(num_heads, num_kv_heads)) is expected
 
 
-@pytest.mark.parametrize("off", ["0", "false", "off", "OFF", " 0 "])
-def test_off_selects_the_decode_kernel(off):
-    os.environ[FI_DECODE_TENSOR_CORES_ENV] = off
-    assert use_tensor_cores(plan(128, 16)) is False
+@pytest.mark.parametrize(
+    "value,num_heads,num_kv_heads,expected",
+    [
+        # "0" forces the split-K decode kernel, even on a high-GQA decode shape
+        # the heuristic would have given tensor cores.
+        ("0", 128, 16, False),
+        (" 0 ", 128, 16, False),  # surrounding whitespace is tolerated
+        # "1" is symmetric: it forces tensor cores below the ratio and keeps
+        # them above it.
+        ("1", 24, 8, True),
+        ("1", 128, 16, True),
+    ],
+)
+def test_an_explicit_override_selects_that_kernel(value, num_heads, num_kv_heads, expected):
+    os.environ[FI_DECODE_TENSOR_CORES_ENV] = value
+    assert use_tensor_cores(plan(num_heads, num_kv_heads)) is expected
 
 
-@pytest.mark.parametrize("on", ["1", "true", "on", "ON", " 1 "])
-def test_on_forces_tensor_cores_below_the_ratio(on):
-    """The A/B is symmetric: it can force the kernel the heuristic would skip."""
-    os.environ[FI_DECODE_TENSOR_CORES_ENV] = on
-    assert use_tensor_cores(plan(24, 8)) is True
-    assert use_tensor_cores(plan(128, 16)) is True
-
-
-@pytest.mark.parametrize("bad", ["yes", "2", "no", "disable", "None"])
+# Only 0/1/auto are accepted; the old boolean spellings now raise like any typo.
+@pytest.mark.parametrize("bad", ["yes", "2", "no", "disable", "None", "false", "off", "true", "on"])
 def test_an_unrecognised_value_raises(bad):
     """Loud, not ignored. A typo that silently kept the heuristic would make
     both legs of the A/B measure the same thing and report a 0% difference."""
