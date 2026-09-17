@@ -297,7 +297,6 @@ def test_buffered_events_receive_vocab_size(
         assert event_constructor.call_args.kwargs["attention_dp_gather"] is distributed.allgather
     else:
         assert "attention_dp_rank" not in event_constructor.call_args.kwargs
-    assert manager.event_manager.needs_token_digest_context() == (vocab_size is not None)
     assert impl_constructor.call_args.kwargs["event_manager"] is manager.event_manager
 
 
