@@ -502,7 +502,9 @@ class TestCheckBenchmarkDisaggGate:
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
     def test_gate_retries_without_sleep_after_transfer_progress(self, mock_time):
         completed_req = _make_active_request(transfer_complete=True)
-        completed_req.py_disaggregated_params = Mock(disagg_request_id=117)
+        # ctx_request_id must be an explicit None: a bare Mock auto-creates one,
+        # and resolve_transfer_rid prefers it over disagg_request_id.
+        completed_req.py_disaggregated_params = Mock(disagg_request_id=117, ctx_request_id=None)
         reqs = [completed_req, _make_active_request(in_init=True)]
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=4,
@@ -526,7 +528,9 @@ class TestCheckBenchmarkDisaggGate:
         the gate opens, so the gate observes completion from request state
         alone, however the runtime reported it."""
         completed_req = _make_active_request(transfer_complete=True)
-        completed_req.py_disaggregated_params = Mock(disagg_request_id=117)
+        # ctx_request_id must be an explicit None: a bare Mock auto-creates one,
+        # and resolve_transfer_rid prefers it over disagg_request_id.
+        completed_req.py_disaggregated_params = Mock(disagg_request_id=117, ctx_request_id=None)
         blocked_req = _make_active_request(in_init=True)
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=2,
@@ -571,7 +575,9 @@ class TestCheckBenchmarkDisaggGate:
         """A request that stays in TRANS_COMPLETE while the gate is closed
         resets the watchdog only on the check that first observes it."""
         completed_req = _make_active_request(transfer_complete=True)
-        completed_req.py_disaggregated_params = Mock(disagg_request_id=117)
+        # ctx_request_id must be an explicit None: a bare Mock auto-creates one,
+        # and resolve_transfer_rid prefers it over disagg_request_id.
+        completed_req.py_disaggregated_params = Mock(disagg_request_id=117, ctx_request_id=None)
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=2,
             kv_cache_transceiver=_make_transceiver(transfer_complete=False),
