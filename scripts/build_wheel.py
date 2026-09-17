@@ -172,13 +172,42 @@ def stored_configure_fingerprint(build_dir) -> Optional[str]:
     """Fingerprint recorded by the last cmake configure, or None.
 
     None also covers build dirs created before fingerprints were recorded;
-    those keep the previous skip behavior until the next configure runs and
-    records one.
+    ``configure_reason`` turns that into a one-time reconfigure so a marker
+    gets recorded.
     """
     fingerprint_file = Path(build_dir) / CONFIGURE_FINGERPRINT_FILENAME
     if not fingerprint_file.exists():
         return None
     return fingerprint_file.read_text().strip() or None
+
+
+def configure_reason(build_dir, configure_fingerprint: str, *,
+                     first_build: bool, configure_cmake: bool,
+                     configure_only: bool, clean: bool) -> Optional[str]:
+    """Why a fingerprint change requires a cmake reconfigure, or None.
+
+    Explicit modes (clean, first build, ``--configure_cmake``,
+    ``--configure_only``) configure on their own, so this returns None and
+    leaves them to the caller. Otherwise it compares the recorded fingerprint
+    against the current arguments:
+
+    - No recorded fingerprint on an already-configured build dir means the dir
+      predates fingerprinting; reconfigure once so a marker gets recorded.
+      Without this, the first flag change on such a dir would silently build
+      the old configuration.
+    - A recorded fingerprint that differs means the configure-affecting
+      arguments changed.
+    """
+    if clean or first_build or configure_cmake or configure_only:
+        return None
+    stored = stored_configure_fingerprint(build_dir)
+    if stored is None:
+        return ("no cmake configure fingerprint recorded; "
+                "reconfiguring once to record one")
+    if stored != configure_fingerprint:
+        return (f"cmake arguments changed since last configure "
+                f"({stored[:8]} -> {configure_fingerprint[:8]}); reconfiguring")
+    return None
 
 
 def clear_folder(folder_path):
@@ -1099,8 +1128,11 @@ def main(*,
     # Fingerprint the configure-affecting arguments so a flag change (e.g.
     # --cuda_architectures, --nvrtc_dynamic_linking, --extra-cmake-vars) on
     # an already-configured build dir forces a reconfigure instead of
-    # silently building the old configuration. The conan toolchain path is
-    # excluded: it is derived from build_dir and constant per build dir.
+    # silently building the old configuration. The source directory is
+    # included because an explicit build_dir can be reused across checkouts
+    # (shared build_root, --no_venv) with every other argument equal while
+    # -S changes. The conan toolchain path is excluded: it is derived from
+    # build_dir and constant per build dir.
     configure_fingerprint = configure_args_fingerprint(cmake_def_args + [
         cmake_cuda_architectures,
         cmake_generator,
@@ -1114,15 +1146,17 @@ def main(*,
         f'-DBUILD_WHEEL_TARGETS="{";".join(targets)}"',
         f'-DPython_EXECUTABLE={venv_python}',
         f'-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}',
+        f'-S "{source_dir}"',
     ])
-    if not (clean or first_build or configure_cmake or configure_only):
-        stored_fingerprint = stored_configure_fingerprint(build_dir)
-        if (stored_fingerprint is not None
-                and stored_fingerprint != configure_fingerprint):
-            print(f"cmake arguments changed since last configure "
-                  f"({stored_fingerprint[:8]} -> {configure_fingerprint[:8]});"
-                  f" reconfiguring")
-            configure_cmake = True
+    reason = configure_reason(build_dir,
+                              configure_fingerprint,
+                              first_build=first_build,
+                              configure_cmake=configure_cmake,
+                              configure_only=configure_only,
+                              clean=clean)
+    if reason is not None:
+        print(reason)
+        configure_cmake = True
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:

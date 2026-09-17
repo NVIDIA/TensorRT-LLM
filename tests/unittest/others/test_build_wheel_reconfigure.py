@@ -106,3 +106,65 @@ def test_stored_fingerprint_round_trip(build_wheel, tmp_path):
     fingerprint = build_wheel.configure_args_fingerprint(["-DFAST_BUILD=ON"])
     (tmp_path / build_wheel.CONFIGURE_FINGERPRINT_FILENAME).write_text(fingerprint + "\n")
     assert build_wheel.stored_configure_fingerprint(tmp_path) == fingerprint
+
+
+def test_fingerprint_tracks_the_source_directory(build_wheel):
+    # An explicit build_dir can be reused across checkouts with every other
+    # argument equal; only -S changes. If the source dir were left out, the
+    # reused tree would build the previous checkout's sources.
+    base = ["-DFAST_BUILD=ON"]
+    assert build_wheel.configure_args_fingerprint(
+        base + ['-S "/work/a/cpp"']
+    ) != build_wheel.configure_args_fingerprint(base + ['-S "/work/b/cpp"'])
+
+
+# The reconfigure decision (configure_reason) is the flow the guard drives:
+# whether a fingerprint change forces a cmake configure. main() itself needs a
+# full toolchain, so the behavior is pinned here on the decision instead.
+def _reason(
+    build_wheel,
+    tmp_path,
+    fingerprint="cur",
+    *,
+    first_build=False,
+    configure_cmake=False,
+    configure_only=False,
+    clean=False,
+):
+    return build_wheel.configure_reason(
+        tmp_path,
+        fingerprint,
+        first_build=first_build,
+        configure_cmake=configure_cmake,
+        configure_only=configure_only,
+        clean=clean,
+    )
+
+
+def _record(build_wheel, tmp_path, fingerprint):
+    (tmp_path / build_wheel.CONFIGURE_FINGERPRINT_FILENAME).write_text(fingerprint + "\n")
+
+
+def test_matching_fingerprint_skips_configure(build_wheel, tmp_path):
+    _record(build_wheel, tmp_path, "cur")
+    assert _reason(build_wheel, tmp_path, "cur") is None
+
+
+def test_changed_fingerprint_forces_configure(build_wheel, tmp_path):
+    _record(build_wheel, tmp_path, "old")
+    assert _reason(build_wheel, tmp_path, "cur") is not None
+
+
+def test_missing_marker_on_existing_dir_forces_one_configure(build_wheel, tmp_path):
+    # Pre-existing configured build dir from before fingerprinting: no marker
+    # yet, so reconfigure once to record one instead of silently skipping.
+    assert build_wheel.stored_configure_fingerprint(tmp_path) is None
+    assert _reason(build_wheel, tmp_path, "cur") is not None
+
+
+@pytest.mark.parametrize("mode", ["first_build", "configure_cmake", "configure_only", "clean"])
+def test_explicit_configure_modes_are_left_to_the_caller(build_wheel, tmp_path, mode):
+    # These already configure on their own; the fingerprint guard stays out of
+    # the way (and must not fire on a mismatch it did not need to handle).
+    _record(build_wheel, tmp_path, "old")
+    assert _reason(build_wheel, tmp_path, "cur", **{mode: True}) is None
