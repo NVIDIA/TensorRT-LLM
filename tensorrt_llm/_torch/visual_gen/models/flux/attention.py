@@ -64,7 +64,27 @@ class FluxJointAttention(Attention):
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
         module_name: Optional[str] = None,
+        supports_static_e4m3_attention: bool = True,
     ):
+        quant_attention_config = (
+            config.attention.quant_attention_config if config is not None else None
+        )
+        requests_static_e4m3_attention = bool(
+            config is not None
+            and config.attention.backend == "CUTEDSL"
+            and quant_attention_config is not None
+            and quant_attention_config.qk_dtype == "fp8"
+            and quant_attention_config.v_dtype == "fp8"
+            and quant_attention_config.q_block_size == 0
+            and quant_attention_config.k_block_size == 0
+            and quant_attention_config.v_block_size == 0
+        )
+        if requests_static_e4m3_attention and not supports_static_e4m3_attention:
+            raise ValueError(
+                "Static CUTEDSL E4M3 attention is not yet implemented for FLUX.2 because "
+                "its attention paths do not load or forward the required Q/K/V scales."
+            )
+
         # Opt in to the fused DiT QK-norm + RoPE kernel (per-head template), but
         # only when TP=1: the fused op asserts tp_size == 1
         # (apply_packed_qk_norm_rope), so under TP>1 we fall back to the unfused
@@ -86,17 +106,8 @@ class FluxJointAttention(Attention):
             module_name=module_name,
         )
 
-        quant_attention_config = (
-            config.attention.quant_attention_config if config is not None else None
-        )
         self.requires_static_e4m3_attention = bool(
-            self.attn_backend == "CUTEDSL"
-            and quant_attention_config is not None
-            and quant_attention_config.qk_dtype == "fp8"
-            and quant_attention_config.v_dtype == "fp8"
-            and quant_attention_config.q_block_size == 0
-            and quant_attention_config.k_block_size == 0
-            and quant_attention_config.v_block_size == 0
+            requests_static_e4m3_attention and self.attn_backend == "CUTEDSL"
         )
         self.register_buffer(
             "_static_q_dequant_scale", torch.empty(0, dtype=torch.float32), persistent=False
@@ -488,6 +499,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
+            supports_static_e4m3_attention=False,
         )
 
         # Output projection needs FULL dims (ROW parallel divides internally)
