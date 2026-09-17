@@ -1226,16 +1226,17 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     num_valid_permuted_tokens = total_num_padded_tokens.item()
 
     # Create input tensors (original size, not permuted)
-    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
-        torch.bfloat16
-    )
+    # Draw straight into bfloat16: the int32 staging buffer for `b` is twice
+    # the size of the tensor it produces, and at ep_size=1 the pair is ~100 GB
+    # live at once, which is what makes this grid OOM.
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size * weight_n_multiplier, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     # Quantize inputs to FP4
     a_global_sf = a.abs().max().float() / (448 * 6)
