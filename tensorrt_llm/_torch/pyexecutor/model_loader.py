@@ -887,7 +887,9 @@ class ModelLoader:
         load_format = self.llm_args.load_format
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
-        if load_format == LoadFormat.GMS and config.locality_domain_policy.enabled:
+        locality_domain_policy = getattr(config, "locality_domain_policy", None)
+        if (load_format == LoadFormat.GMS and locality_domain_policy is not None
+                and locality_domain_policy.enabled):
             raise ValueError(
                 "LoadFormat.GMS is incompatible with locality domain localized weights. "
                 "GMS shares registered parameters, while locality domain execution "
@@ -1553,7 +1555,10 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
-        if model.model_config.locality_domain_policy.enabled:
+        model_locality_domain_policy = getattr(model.model_config,
+                                               "locality_domain_policy", None)
+        if (model_locality_domain_policy is not None
+                and model_locality_domain_policy.enabled):
             enabled_features.add(
                 PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
