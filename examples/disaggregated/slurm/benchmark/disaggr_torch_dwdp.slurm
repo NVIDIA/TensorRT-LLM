@@ -69,7 +69,38 @@ replace_placeholder() {
     done
 }
 
-env > ${full_logdir}/environment.txt
+# Dump the environment for debugging, with credential-shaped variables redacted.
+#
+# `env` here inherits the whole submitting shell. When this benchmark is driven from
+# CI that shell holds every secret the job was granted, and ${full_logdir} is
+# archived and published afterwards -- which is how a live API token, a registry
+# password and a complete SSH private key ended up in a publicly readable log
+# tarball. The dump is genuinely useful (paths, SLURM layout, container settings),
+# so it is filtered rather than dropped.
+#
+# Redaction is by variable NAME and deliberately broad: over-redacting a variable
+# nobody reads costs nothing, while the one value we failed to recognise is the one
+# that leaks -- with one exception: the names are matched a whole segment at a time
+# and only in the singular, because a plural is a count rather than a credential
+# (max_num_tokens, max_tokens_in_buffer). Note the continuation-line handling -- `env` prints a multi-line value
+# verbatim, so a private key's body arrives on later lines with no NAME= in front of
+# it, and skipping only the first line would publish the whole key.
+env | awk '
+    /^[A-Za-z_][A-Za-z0-9_]*=/ {
+        name = substr($0, 1, index($0, "=") - 1)
+        up = toupper(name)
+        if (up ~ /(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|AUTH|JWT|COOKIE|APIKEY)($|_)/ ||
+            up ~ /(^|_)(API|ACCESS|PRIVATE|SECRET|SESSION|SIGNING|SSH|GPG|DEPLOY|MASTER|APP|AUTH|CLIENT)_KEYS?($|_)/) {
+            print name "=***REDACTED***"
+            skip = 1
+        } else {
+            print
+            skip = 0
+        }
+        next
+    }
+    { if (!skip) print }
+' > ${full_logdir}/environment.txt
 
 # Start container
 echo "Starting container..."
