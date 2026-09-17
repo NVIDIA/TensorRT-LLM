@@ -4,8 +4,10 @@
 
 These validate MiniMax-M3 backend selection, indexer/cache integration, decode
 scratch-buffer sizing, and the paged HND contract passed to the packaged MSA
-kernel. Generic block-sparse MQA/GQA numerical coverage lives in the parent
-``test_sparse_mqa_gqa.py`` module.
+kernel; the CUDA-gated fused cache-scatter test checks the single-launch
+K/V/index-K write against the legacy per-cache path. Generic block-sparse
+MQA/GQA numerical coverage lives in the parent ``test_sparse_mqa_gqa.py``
+module.
 """
 
 import sys
@@ -20,9 +22,15 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
+    fused_write_layer_caches,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     msa_paged_kv,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
+    write_kv_slots,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import MsaDecodeSpan
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
@@ -192,9 +200,12 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     # Flat backing store sized for 4 heads * 8 k-tiles * 2 batch = 64 elements,
-    # too small for the plan's required 4 * 16 * 2 = 128.
+    # too small for the plan's required 4 * 16 * 2 = 128. One query token per
+    # decode row, so the token bound equals the batch here.
     metadata.msa_max_score = torch.zeros(4 * 8 * 2)
     metadata.kv_cache_manager = None
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 2
 
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata._ensure_msa_decode_scratch_buffers(
@@ -400,10 +411,14 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
 
     pages, heads, page_size, head_dim = 5, 2, 128, 128
     outer_stride = heads * page_size * head_dim + 1
-    storage = torch.empty(
-        pages * outer_stride,
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
+    storage = (
+        torch.arange(
+            pages * outer_stride,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        .remainder(16)
+        .to(torch.float8_e4m3fn)
     )
     view = storage.as_strided(
         (pages, heads, page_size, head_dim),
@@ -414,7 +429,32 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
 
     assert prepared.is_contiguous()
     assert prepared.data_ptr() != view.data_ptr()
-    torch.testing.assert_close(prepared, view)
+    torch.testing.assert_close(prepared, view, rtol=0, atol=0)
+
+
+def test_per_token_valid_blocks_multi_token_decode():
+    """Spec-verify decode rows get one entry per query token, following the causal
+    ladder inside the verify window.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+        per_token_valid_blocks,
+    )
+
+    # One request verifying 4 tokens against kv_len 10 (offset 6): token t
+    # attends 7 + t positions; with 2-token blocks that is ceil((7+t)/2).
+    qo = torch.tensor([4], dtype=torch.int32)
+    kv = torch.tensor([10], dtype=torch.int32)
+    off = torch.tensor([6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=2)
+    assert n_valid.tolist() == [4, 4, 5, 5]
+
+    # Mixed batch: an ordinary decode row (qo=1) alongside a verify row.
+    qo = torch.tensor([1, 3], dtype=torch.int32)
+    kv = torch.tensor([9, 6], dtype=torch.int32)
+    off = kv - qo
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
+    # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
+    assert n_valid.tolist() == [3, 1, 2, 2]
 
 
 def test_msa_index_k_uses_hnd_cache_view_and_writer():
@@ -741,6 +781,10 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed(
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 (Blackwell) required")
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() == 107:
+        pytest.skip("fmha_sm100 (vendored MiniMax-M3 MSA kernel) JIT targets sm_100a only")
 
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         msa_package_available,
@@ -1380,3 +1424,304 @@ def test_mixed_batch_generation_span_matches_the_whole_batch_msa_path():
     torch.testing.assert_close(
         split[num_ctx_tokens:], reference[num_ctx_tokens:], rtol=6e-2, atol=6e-2
     )
+
+
+def test_msa_scratch_sizing_covers_spec_verify_tokens():
+    """With Eagle3 a decode step has 1 + draft_len query tokens per request, so the
+    proxy scratch must be sized by tokens, not by batch. The draft length comes
+    from the KV cache manager, which knows the speculative config at build time.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    # 2 sequences, 4 tokens each (draft_len=3): 8 decode tokens per step.
+    metadata.kv_cache_manager = SimpleNamespace(max_total_draft_tokens=3)
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 8
+    # Store sized for batch-only sizing (4 heads * 16 k-tiles * 2), which is
+    # too small once tokens are accounted for (4 * 16 * 8).
+    metadata.msa_max_score = torch.zeros(4 * 16 * 2)
+
+    with pytest.raises(ValueError, match=r"msa_max_score backing store"):
+        metadata._ensure_msa_decode_scratch_buffers(
+            num_index_heads=4,
+            max_batch=2,
+            capture_graph=False,
+            required_max_k_tiles=16,
+        )
+
+
+def _kv_lens_update_metadata(
+    monkeypatch, *, qo_lens, kv_staged, kv_corrected, page_size, prefill_counts=False
+):
+    """Metadata with just enough staged state for on_update_kv_lens: requests with
+    several query tokens each, optimistic kv_lens from prepare(), then the
+    corrected kv_lens. Everything lives on the host. `prefill_counts` stages the
+    per-step valid-block buffer a mixed step uses in place of the graph-stable
+    one.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    # The base hook only touches MLA caches this metadata never builds.
+    monkeypatch.setattr(msa_backend.TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    qo = torch.tensor(qo_lens, dtype=torch.int32)
+    batch = int(qo.shape[0])
+    total_q = int(qo.sum())
+    metadata._seq_lens = qo
+    metadata._seq_lens_cuda = qo.clone()
+    metadata._num_tokens = total_q
+    metadata.kv_lens_cuda = torch.tensor(kv_corrected, dtype=torch.int32)
+    metadata.msa_kv_lens_staged = torch.tensor(kv_staged, dtype=torch.int32)
+    # What prepare() handed the decode kernels, before the correction.
+    metadata.msa_seq_lens_cuda = torch.tensor(kv_staged, dtype=torch.int32)
+    metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=page_size)
+    # Page table: request b's page p is block 100 // page_size * b + p, so its
+    # position pos maps to slot 100 * b + pos (16 positions per request).
+    assert 100 % page_size == 0
+    metadata.msa_block_table = (100 // page_size) * torch.arange(
+        batch, dtype=torch.int32
+    ).unsqueeze(1) + torch.arange(16 // page_size, dtype=torch.int32).unsqueeze(0)
+    qo_long = qo.to(torch.long)
+    metadata.msa_q_batch_row = torch.repeat_interleave(
+        torch.arange(batch, dtype=torch.int32), qo_long
+    )
+    starts = torch.cumsum(qo_long, 0) - qo_long
+    metadata.msa_q_intra = (
+        torch.arange(total_q, dtype=torch.int64) - torch.repeat_interleave(starts, qo_long)
+    ).to(torch.int32)
+    metadata.msa_out_cache_loc = torch.full((total_q + 3,), -1, dtype=torch.int32)
+    metadata.msa_n_valid_blocks = torch.zeros(total_q + 3, dtype=torch.int32)
+    metadata._msa_prefill_n_valid_blocks = (
+        torch.zeros(total_q, dtype=torch.int32) if prefill_counts else None
+    )
+    metadata._msa_fields_ready = True
+    metadata._msa_kv_lens_dynamic = True
+    return metadata
+
+
+def test_on_update_kv_lens_rederives_lengths_slots_and_counts(monkeypatch):
+    """Request 0 loses one rejected draft token (staged 9 -> corrected 8), request 1
+    is unchanged. The per-request length the decode kernels read, the write
+    slots and the per-token valid-block counts must all follow.
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
+    )
+
+    metadata.on_update_kv_lens()
+
+    # One length per request, in the buffer every decode kernel reads.
+    assert metadata.msa_seq_lens_cuda.tolist() == [8, 12]
+    # Token positions: request 0 attends 8 tokens with 2 queries -> 6, 7;
+    # request 1 attends 12 with 3 queries -> 9, 10, 11.
+    assert metadata.msa_out_cache_loc[:5].tolist() == [6, 7, 109, 110, 111]
+    assert metadata.msa_out_cache_loc[5:].tolist() == [-1, -1, -1]
+    # ceil((pos + 1) / 4) per token, into the graph-stable buffer on a
+    # pure-decode step; the tail past the step's tokens is left alone.
+    assert metadata.msa_n_valid_blocks[:5].tolist() == [2, 2, 3, 3, 3]
+    assert metadata.msa_n_valid_blocks[5:].tolist() == [0, 0, 0]
+
+
+def test_on_update_kv_lens_clamps_to_the_staged_lens(monkeypatch):
+    """A correction can only shrink lengths; anything above the staged value is
+    clamped, so the staged page table stays valid.
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1, 1), kv_staged=(5, 7), kv_corrected=(9, 7), page_size=4
+    )
+
+    metadata.on_update_kv_lens()
+
+    assert metadata.msa_seq_lens_cuda.tolist() == [5, 7]
+    assert metadata.msa_out_cache_loc[:2].tolist() == [4, 106]
+    assert metadata.msa_n_valid_blocks[:2].tolist() == [2, 2]
+
+
+def test_on_update_kv_lens_patches_a_mixed_steps_per_step_counts(monkeypatch):
+    """A mixed step stages its valid-block counts in the per-step prefill buffer
+    rather than the graph-stable one, and the correction must land there. The
+    context row (row 0) is untouched by the correction; the generation row
+    (row 1) loses one token.
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch,
+        qo_lens=(5, 3),
+        kv_staged=(5, 12),
+        kv_corrected=(5, 11),
+        page_size=4,
+        prefill_counts=True,
+    )
+
+    metadata.on_update_kv_lens()
+
+    assert metadata.msa_seq_lens_cuda.tolist() == [5, 11]
+    # Context row: positions 0..4 -> slots 0..4. Generation row attends 11
+    # tokens with 3 queries: positions 8, 9, 10.
+    assert metadata.msa_out_cache_loc[:8].tolist() == [0, 1, 2, 3, 4, 108, 109, 110]
+    # ceil((pos + 1) / 4): context [1, 1, 1, 1, 2], generation [3, 3, 3].
+    assert metadata._msa_prefill_n_valid_blocks.tolist() == [1, 1, 1, 1, 2, 3, 3, 3]
+    assert metadata.msa_n_valid_blocks.tolist() == [0] * 11
+
+
+def test_on_update_kv_lens_is_a_noop_without_speculative_decoding(monkeypatch):
+    """Without speculative decoding the patch and its staging are skipped. The gate
+    also sees max_total_draft_tokens, set by update_spec_dec_param, which
+    covers draft_len=1 under trtllm-gen (no extra KV tokens, linear-tree spec
+    decoding reported disabled).
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1, 1), kv_staged=(4, 6), kv_corrected=(3, 5), page_size=4
+    )
+    metadata.max_total_draft_tokens = None
+    metadata.draft_kv_cache_manager = None
+    metadata.is_spec_decoding_enabled = False
+    metadata.kv_cache_params = SimpleNamespace(num_extra_kv_tokens=0)
+    metadata.runtime_features = None
+    assert metadata._msa_kv_lens_may_change() is False
+    metadata.max_total_draft_tokens = 1
+    assert metadata._msa_kv_lens_may_change() is True
+    metadata.max_total_draft_tokens = None
+    metadata.kv_cache_params = SimpleNamespace(num_extra_kv_tokens=2)
+    assert metadata._msa_kv_lens_may_change() is True
+
+    metadata._msa_kv_lens_dynamic = False
+
+    metadata.on_update_kv_lens()
+
+    assert metadata.msa_seq_lens_cuda.tolist() == [4, 6]
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 5
+    assert metadata.msa_n_valid_blocks.tolist() == [0] * 5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("src_dtype", "cache_dtype"),
+    [
+        # bf16 K/V into a bf16 cache: the plain path.
+        (torch.bfloat16, torch.bfloat16),
+        # bf16 K/V into an fp8 cache: the kernel folds in the E4M3 cast.
+        (torch.bfloat16, torch.float8_e4m3fn),
+        # fp8 K/V into an fp8 cache: production with an FP8 KV cache, where
+        # the fused QK-norm+RoPE kernel already emits E4M3 k/v
+        # (MiniMaxM3Attention._emit_fp8_main_qkv), so the kernel stores
+        # without a cast.
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+    ],
+)
+@pytest.mark.parametrize("with_idx", [True, False])
+def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
+    """The fused per-layer cache scatter must match the legacy write_kv_slots
+    path exactly on production-shaped inputs: non-contiguous HND cache views
+    carved from a pooled allocation and strided source rows sliced from a fused
+    projection, for every source/cache dtype pairing the model produces.
+    Asserting on the whole pool also catches stray writes outside the targeted
+    slots."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_pages, num_kv_heads, tokens_per_block, head_dim = 6, 4, 32, 128
+    num_tokens = 17
+    inner = num_kv_heads * head_dim
+
+    # Paged HND caches carved from a pool with a coalescing axis, so the
+    # views are non-contiguous like production get_buffers(...) output.
+    pool = torch.zeros(
+        num_pages, 2, num_kv_heads, tokens_per_block, head_dim, dtype=cache_dtype, device=device
+    )
+    k_cache, v_cache = pool[:, 0], pool[:, 1]
+    idx_pool = torch.zeros(
+        num_pages, 2, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
+    )
+    idx_cache = idx_pool[:, 0]
+
+    # Strided sources: rows sliced out of a wider fused-projection tensor.
+    # randn has no fp8 variant, so generate bf16 and cast the whole buffer, as
+    # the fused producer would, before slicing the column views.
+    qkv = torch.randn(num_tokens, 3 * inner + 64, dtype=torch.bfloat16, device=device)
+    # The index branch stays bf16 on the bf16 indexer path even when the main
+    # K/V are fp8, so carve index-K out before casting.
+    idx_k = qkv[:, 2 * inner : 2 * inner + head_dim] if with_idx else None
+    qkv = qkv.to(src_dtype)
+    k = qkv[:, :inner]
+    v = qkv[:, inner : 2 * inner]
+
+    slots = torch.randperm(num_pages * tokens_per_block, device=device)[:num_tokens].to(torch.int32)
+
+    ref_pool = pool.clone()
+    ref_idx_pool = idx_pool.clone()
+    write_kv_slots(
+        ref_pool[:, 0], slots, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+    write_kv_slots(
+        ref_pool[:, 1], slots, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+    if with_idx:
+        write_kv_slots(
+            ref_idx_pool[:, 0], slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND"
+        )
+
+    assert fused_write_layer_caches(
+        k_cache, v_cache, idx_cache if with_idx else None, slots, k, v, idx_k
+    )
+
+    torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
+    torch.testing.assert_close(idx_pool, ref_idx_pool)
+
+
+@pytest.mark.parametrize("sparse", [True, False])
+def test_msa_attention_core_owns_the_cache_write(sparse):
+    """The model layer's MSA core must write the caches exactly once and in
+    the right place: write_layer_caches runs before run_indexer (whose proxy
+    pass reads the index-K cache), run_indexer is told index-K is already
+    resident, and forward() receives k=v=None so no FMHA phase writes K/V
+    again."""
+    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
+
+    num_tokens, width = 3, 128
+    topk_indices = torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
+    events = []
+
+    class FakeBackend:
+        layer_idx = 7
+
+        def write_layer_caches(self, k, v, idx_k, metadata):
+            events.append(("write", k, v, idx_k, metadata))
+
+        def run_indexer(self, idx_q, idx_k, metadata, *, idx_k_prewritten=False):
+            events.append(("indexer", idx_q, idx_k, metadata, idx_k_prewritten))
+            return topk_indices
+
+        def forward(self, q, k, v, metadata, forward_args=None):
+            events.append(("forward", q, k, v, metadata, forward_args))
+
+    layer = SimpleNamespace(is_sparse_attention_layer=sparse, attn=FakeBackend())
+    q, k, v = (torch.zeros(num_tokens, width) for _ in range(3))
+    idx_q = torch.zeros(num_tokens, width) if sparse else None
+    idx_k = torch.zeros(num_tokens, width) if sparse else None
+    metadata = object()
+    output = torch.empty(num_tokens, width)
+
+    result = MiniMaxM3Attention._msa_attention_core(layer, q, k, v, idx_q, idx_k, metadata, output)
+
+    assert result is output
+    names = [event[0] for event in events]
+    if sparse:
+        assert names == ["write", "indexer", "forward"]
+        _, indexer_q, indexer_k, indexer_metadata, prewritten = events[1]
+        assert indexer_q is idx_q and indexer_k is idx_k and indexer_metadata is metadata
+        assert prewritten is True
+    else:
+        assert names == ["write", "forward"]
+
+    _, written_k, written_v, written_idx_k, write_metadata = events[0]
+    assert written_k is k and written_v is v and write_metadata is metadata
+    assert written_idx_k is idx_k
+
+    _, forward_q, forward_k, forward_v, forward_metadata, forward_args = events[-1]
+    assert forward_q is q and forward_metadata is metadata
+    assert forward_k is None and forward_v is None
+    assert forward_args.output is output
+    if sparse:
+        assert forward_args.sparse_backend_args.topk_indices is topk_indices
+    else:
+        assert forward_args.sparse_backend_args is None

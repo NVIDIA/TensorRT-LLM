@@ -833,12 +833,16 @@ class TestLogIterationStatsKvCacheIteration:
             },
             "kvCacheIterationStatsByPoolGroup": {
                 "0": {
-                    "secondaryMaxNumBlocks": 50,
-                    "secondaryUsedNumBlocks": 20,
                     "iterGenAllocBlocks": 2,
                     "iterOnboardBytes": 4096,
                     "iterOffloadBytes": 2048,
                     "iterIntraDeviceCopyBytes": 8192,
+                }
+            },
+            "kvCacheIterationStatsByColdPoolGroup": {
+                "0": {
+                    "secondaryMaxNumBlocks": 50,
+                    "secondaryUsedNumBlocks": 20,
                 }
             },
         }

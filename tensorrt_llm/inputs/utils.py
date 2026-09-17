@@ -428,6 +428,27 @@ class MultimodalDataTracker:
             _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
 
+    async def discard_all_async(
+        self
+    ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
+        """Return `(None, None)`, closing the pending loads instead of running them.
+
+        Use instead of `retrieve_all_async` when the caller will not use the
+        media: the per-item loads are coroutines `add_data` parked and never
+        started, and closing them is what keeps Python from reporting them as
+        never awaited. Exactly one of the two may be awaited per tracker.
+
+        Placeholder counts and `item_order` are unaffected; `add_data` builds
+        both synchronously.
+        """
+        for pending in (self._data, self._embeddings):
+            for items in pending.values():
+                for item in items:
+                    if asyncio.iscoroutine(item):
+                        item.close()
+            pending.clear()
+        return None, None
+
     def retrieve_all_sync(
         self
     ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:

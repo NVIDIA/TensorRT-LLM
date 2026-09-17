@@ -536,7 +536,7 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
 
 
 def test_pipelined_transfer_rejects_bounce_buffer():
-    """Bounce buffers stage whole requests rather than individual chunks."""
+    """The Python bounce buffer stages whole requests rather than individual chunks."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -550,9 +550,30 @@ def test_pipelined_transfer_rejects_bounce_buffer():
 
     with pytest.raises(
         ValueError,
-        match="not supported with kv_cache_bounce_size_mb=1",
+        match="not supported with the Python bounce buffer \\(kv_cache_bounce_size_mb=1",
     ):
         KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
+
+
+def test_pipelined_transfer_allows_agent_bounce_buffer():
+    """The C++ transfer-agent bounce is compatible with per-chunk pipelined transfer.
+
+    It stages each transfer request on its own below the Python layer, so a pipelined
+    chunk is just another request.
+    """
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._mapping = SimpleNamespace(pp_size=1)
+    transceiver._kv_cache_manager = MagicMock()
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        enable_pipelined_transfer=True,
+        kv_cache_bounce_size_mb=1,
+        agent_bounce_buffer_enable=True,
+    )
+
+    assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 
 
 def test_pipelined_transfer_rejects_mamba_cache_manager():
@@ -1420,8 +1441,6 @@ def test_send_disagg_ctx_kv_skips_retired_session_without_mutating_state(
 
 
 def test_context_send_failure_is_applied_at_next_loop_boundary():
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
     request = _make_send_kv_request(is_last_chunk=False)
     request.py_kv_transfer_timed_out = False
     coordinator, transceiver, transfer_manager = _make_send_kv_coordinator(
@@ -1439,17 +1458,13 @@ def test_context_send_failure_is_applied_at_next_loop_boundary():
     assert request.state == LlmRequestState.CONTEXT_INIT
     transfer_manager.end_transfer.assert_not_called()
 
-    executor = MagicMock()
-    executor.disagg = coordinator
-    executor.active_requests = [request]
-    executor.enable_attention_dp = False
-    executor.dist.world_size = 1
-
-    PyExecutor._handle_disagg_cache_errors_synced(executor)
+    coordinator.handle_errors_synced()
 
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert not coordinator.take_pending_context_failures()
-    executor._check_cache_transfer_errors.assert_called_with("context requests")
+    coordinator._effects.fail_requests.assert_called_once_with(
+        "Error in kv cache transfer for context requests", [request], charge_budget=False
+    )
 
 
 @pytest.mark.parametrize("is_last_chunk", [False, True])

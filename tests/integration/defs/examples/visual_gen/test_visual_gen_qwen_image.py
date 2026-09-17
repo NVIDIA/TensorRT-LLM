@@ -23,7 +23,6 @@ from typing import Any
 
 import pytest
 import torch
-from defs import conftest
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
@@ -38,14 +37,13 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _fixed_nvfp4_quantization_backend,
     _golden_media_path,
     _lpips_deterministic_algorithms,
-    _lpips_model_path,
     _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
     _run_single_device_feature_generator,
-    _skip_if_missing,
     _validate_single_feature_config,
 )
+from test_common.llm_data import get_checkpoint
 
 # QwenImage (text-to-image) — default-setting LPIPS golden.
 # Params mirror the QwenImage 20B reference defaults (pipeline_qwen_image.py).
@@ -121,7 +119,6 @@ def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_grap
     from tensorrt_llm.media.encoding import save_image
     from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
-    _skip_if_missing(model_path, "QwenImage checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args = VisualGenArgs(
         model=model_path,
@@ -210,7 +207,6 @@ def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path
     from tensorrt_llm.media.encoding import save_image
     from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-    _skip_if_missing(model_path, "Qwen-Image-Layered checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args = VisualGenArgs(
         model=model_path,
@@ -246,8 +242,7 @@ def _generate_qwenimage_feature_image(case, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
 
-    model_path = _lpips_model_path(QWEN_IMAGE_MODEL_SUBPATH)
-    _skip_if_missing(model_path, "QwenImage checkpoint", is_dir=True)
+    model_path = get_checkpoint(QWEN_IMAGE_MODEL_SUBPATH)
     _disable_inductor_compile_worker_quiesce()
     pipeline = None
     with _lpips_deterministic_algorithms(), _fixed_nvfp4_quantization_backend(case.features):
@@ -327,7 +322,7 @@ def test_qwenimage_lpips_against_golden(_visual_gen_deps, tmp_path):
     golden_path = _golden_media_path(
         tmp_path, "qwenimage_lpips_golden.png", "QwenImage LPIPS golden image"
     )
-    _generate_qwenimage_lpips_image(_lpips_model_path(QWEN_IMAGE_MODEL_SUBPATH), generated_path)
+    _generate_qwenimage_lpips_image(get_checkpoint(QWEN_IMAGE_MODEL_SUBPATH), generated_path)
     score = _run_lpips_eval(
         tmp_path,
         "qwenimage",
@@ -349,7 +344,7 @@ def test_qwen_image_layered_lpips_against_golden(tmp_path):
     _copy_qwen_image_layered_lpips_input(tmp_path, input_path)
     _write_qwen_image_layered_lpips_golden_grid(tmp_path, golden_path)
     _generate_qwen_image_layered_lpips_image(
-        _lpips_model_path(QWEN_IMAGE_LAYERED_MODEL_SUBPATH),
+        get_checkpoint(QWEN_IMAGE_LAYERED_MODEL_SUBPATH),
         input_path,
         generated_path,
     )
@@ -375,14 +370,11 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     ``configs/qwen-image-fp8-1gpu.yaml`` work together as documented. Uses the
     local Qwen-Image checkpoint and the shared FP8 blockwise dynamic-quant config.
     """
-    scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, QWEN_IMAGE_MODEL_SUBPATH)
-    _skip_if_missing(model_path, "Qwen-Image checkpoint", is_dir=True)
+    model_path = get_checkpoint(QWEN_IMAGE_MODEL_SUBPATH)
     model_index_path = os.path.join(model_path, "model_index.json")
-    if not os.path.isfile(model_index_path):
-        pytest.skip(
-            f"Qwen-Image checkpoint is incomplete: {model_path} (missing {model_index_path})"
-        )
+    assert os.path.isfile(model_index_path), (
+        f"Qwen-Image checkpoint is incomplete: {model_path} (missing {model_index_path})"
+    )
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "qwen_image_example"
@@ -414,15 +406,11 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
 
 def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_venv):
     """Run examples/visual_gen/models/qwen_image_layered.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, QWEN_IMAGE_LAYERED_MODEL_SUBPATH)
-    _skip_if_missing(model_path, "Qwen-Image-Layered checkpoint", is_dir=True)
+    model_path = get_checkpoint(QWEN_IMAGE_LAYERED_MODEL_SUBPATH)
     model_index_path = os.path.join(model_path, "model_index.json")
-    if not os.path.isfile(model_index_path):
-        pytest.skip(
-            f"Qwen-Image-Layered checkpoint is incomplete: {model_path} "
-            f"(missing {model_index_path})"
-        )
+    assert os.path.isfile(model_index_path), (
+        f"Qwen-Image-Layered checkpoint is incomplete: {model_path} (missing {model_index_path})"
+    )
 
     input_path = tmp_path / "qwen_image_layered_input.png"
     _copy_qwen_image_layered_lpips_input(tmp_path, input_path)
@@ -467,16 +455,11 @@ def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv:
     Validates that the Qwen-Image-Edit example script and
     ``configs/qwen-image-edit-2511-fp8-1gpu.yaml`` work together as documented.
     """
-    model_path = os.environ.get("QWEN_IMAGE_EDIT_MODEL_PATH") or os.path.join(
-        conftest.llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
-    )
-    _skip_if_missing(model_path, "Qwen-Image-Edit-2511 checkpoint", is_dir=True)
+    model_path = get_checkpoint(QWEN_IMAGE_EDIT_MODEL_SUBPATH)
     model_index_path = os.path.join(model_path, "model_index.json")
-    if not os.path.isfile(model_index_path):
-        pytest.skip(
-            f"Qwen-Image-Edit-2511 checkpoint is incomplete: {model_path} "
-            f"(missing {model_index_path})"
-        )
+    assert os.path.isfile(model_index_path), (
+        f"Qwen-Image-Edit-2511 checkpoint is incomplete: {model_path} (missing {model_index_path})"
+    )
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "qwen_image_edit_example"
