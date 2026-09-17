@@ -412,7 +412,9 @@ def test_prepare_keeps_cuda_graph_slots_across_replays():
     meta = _make_metadata(max_num_requests=4)
     worker._lazy_init(_fake_draft_model(), meta)
     meta._dspark_worker = worker
-    meta.request_ids = [0, 1, 2]
+    # Not 0: that is ATTENTION_DP_DUMMY_REQUEST_ID, which prepare() routes to
+    # the scratch row by design, so it would never take a persistent slot.
+    meta.request_ids = [11, 12, 13]
     meta.num_generations = 3
     meta.is_cuda_graph = True
     meta.prepare()
