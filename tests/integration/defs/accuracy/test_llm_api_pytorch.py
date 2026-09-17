@@ -5818,8 +5818,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    enable_attention_dp: bool = False,
                    cover_guided_decoding: bool = False,
                    enable_block_reuse: bool = False,
-                   prefill_cuda_graph_backend: PrefillCudaGraphBackend =
-                   PrefillCudaGraphBackend.DISABLED,
+                   prefill_cuda_graph_backend:
+                   PrefillCudaGraphBackend = PrefillCudaGraphBackend.DISABLED,
                    prefill_capture_num_tokens: Optional[list[int]] = None,
                    disable_mm_encoder: bool = False) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
@@ -5875,8 +5875,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    enable_attention_dp: bool = False,
                    cover_guided_decoding: bool = False,
                    enable_block_reuse: bool = False,
-                   prefill_cuda_graph_backend: PrefillCudaGraphBackend =
-                   PrefillCudaGraphBackend.DISABLED,
+                   prefill_cuda_graph_backend:
+                   PrefillCudaGraphBackend = PrefillCudaGraphBackend.DISABLED,
                    prefill_capture_num_tokens: Optional[list[int]] = None,
                    disable_mm_encoder: bool = False) -> None:
         if not os.path.exists(model_path):
@@ -5884,9 +5884,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
 
         monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
 
-        mtp_adp_case = (tensor_parallel_size == 4
-                        and moe_backend == "TRTLLM" and max_draft_len == 3
-                        and moe_expert_parallel_size == 4
+        mtp_adp_case = (tensor_parallel_size == 4 and moe_backend == "TRTLLM"
+                        and max_draft_len == 3 and moe_expert_parallel_size == 4
                         and enable_attention_dp and not enable_block_reuse)
         check_acceptance_length = mtp_adp_case and (
             expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
@@ -5919,20 +5918,19 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                     enable_attention_dp=enable_attention_dp,
                     disable_mm_encoder=disable_mm_encoder) as eager_llm:
                 eager_parity = parity_outputs(eager_llm)
-        with self._build_llm(model_path,
-                             tensor_parallel_size,
-                             moe_backend,
-                             max_draft_len,
-                             check_acceptance_length,
-                             moe_expert_parallel_size=moe_expert_parallel_size,
-                             enable_attention_dp=enable_attention_dp,
-                             cover_guided_decoding=cover_guided_decoding,
-                             enable_block_reuse=enable_block_reuse,
-                             prefill_cuda_graph_backend=
-                             prefill_cuda_graph_backend,
-                             prefill_capture_num_tokens=
-                             prefill_capture_num_tokens,
-                             disable_mm_encoder=disable_mm_encoder) as llm:
+        with self._build_llm(
+                model_path,
+                tensor_parallel_size,
+                moe_backend,
+                max_draft_len,
+                check_acceptance_length,
+                moe_expert_parallel_size=moe_expert_parallel_size,
+                enable_attention_dp=enable_attention_dp,
+                cover_guided_decoding=cover_guided_decoding,
+                enable_block_reuse=enable_block_reuse,
+                prefill_cuda_graph_backend=prefill_cuda_graph_backend,
+                prefill_capture_num_tokens=prefill_capture_num_tokens,
+                disable_mm_encoder=disable_mm_encoder) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if eager_parity is not None:
                 assert parity_outputs(llm) == eager_parity
@@ -5944,11 +5942,10 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
             if check_acceptance_length:
-                test_name = (
-                    "test_fp8_adp4_mtp3_trtllm_ple_offload"
-                    if expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES else
-                    "test_nvfp4_adp4_mtp3_trtllm_ple_offload_"
-                    "breakable_prefill_cuda_graph")
+                test_name = ("test_fp8_adp4_mtp3_trtllm_ple_offload" if
+                             expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                             else "test_nvfp4_adp4_mtp3_trtllm_ple_offload_"
+                             "breakable_prefill_cuda_graph")
                 assert_acceptance_length_for_llm(
                     f"TestQwen3_8_Flash_Next::{test_name}",
                     llm,
@@ -6023,19 +6020,19 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     def test_nvfp4_adp4_mtp3_trtllm_ple_offload_breakable_prefill_cuda_graph(
             self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
         """NVFP4, MTP3 and PLE offload with breakable prefill CUDA graphs."""
-        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
-                        tensor_parallel_size=4,
-                        moe_backend="TRTLLM",
-                        max_draft_len=3,
-                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
-                        monkeypatch=monkeypatch,
-                        mocker=mocker,
-                        moe_expert_parallel_size=4,
-                        enable_attention_dp=True,
-                        prefill_cuda_graph_backend=
-                        PrefillCudaGraphBackend.BREAKABLE,
-                        prefill_capture_num_tokens=[2048, 8192],
-                        disable_mm_encoder=True)
+        self._run_evals(
+            f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+            tensor_parallel_size=4,
+            moe_backend="TRTLLM",
+            max_draft_len=3,
+            expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+            monkeypatch=monkeypatch,
+            mocker=mocker,
+            moe_expert_parallel_size=4,
+            enable_attention_dp=True,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_capture_num_tokens=[2048, 8192],
+            disable_mm_encoder=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
