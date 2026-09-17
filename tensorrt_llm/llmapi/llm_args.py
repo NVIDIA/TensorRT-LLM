@@ -1093,7 +1093,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     use_cute_dsl_paged_mqa_logits: bool = Field(
         default=False,
         description=
-        "Whether to use CuTE DSL paged MQA logits kernel on SM100 instead of C++ DeepGEMM."
+        "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM."
     )
     q_split_threshold: int = Field(
         default=8192,
