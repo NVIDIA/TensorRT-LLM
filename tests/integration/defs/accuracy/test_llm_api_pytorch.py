@@ -7478,10 +7478,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 },
                 assert_worker_log_contains="bounce path engaged",
                 server_waiting_timeout=1800) as llm:
-            # The launcher stamps quant_algo=NVFP4 from the model name; the
-            # checkpoint's hf_quant_config is MIXED_PRECISION (which is what
-            # the in-process arm asserts and the accuracy references key on).
+            # The launcher builds bare client LlmArgs, without the worker's
+            # FP8 KV or Eagle3 settings, and infers NVFP4 from the model name.
+            # Match the workers and checkpoint for accuracy reference lookup.
             llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            llm.args.speculative_config = Eagle3DecodingConfig(
+                **speculative_config)
             task = GSM8KInferenceX(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs={
