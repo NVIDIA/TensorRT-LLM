@@ -1652,18 +1652,18 @@ def test_create_cold_page_codec_resolves_against_the_passed_pretrained_config() 
 
 
 def test_policy_row_geometry_rejects_two_quantized_runs_and_bad_tiling() -> None:
-    policy = ColdPagePolicy(position="lossless")
+    policy = ColdPagePolicy(rope_precision="lossless")
     two_runs = BufferSchema(
         role="key",
         row_stride_elements=96,
-        spans=(RowSpan("content", 0, 32), RowSpan("position", 32, 32), RowSpan("content", 64, 32)),
+        spans=(RowSpan("nope", 0, 32), RowSpan("rope", 32, 32), RowSpan("nope", 64, 32)),
     )
     with pytest.raises(ValueError, match="2 separate quantized runs"):
         policy.row_geometry(two_runs, "gqa", where="test")
     gap = BufferSchema(
         role="key",
         row_stride_elements=64,
-        spans=(RowSpan("content", 0, 32), RowSpan("position", 48, 16)),
+        spans=(RowSpan("nope", 0, 32), RowSpan("rope", 48, 16)),
     )
     with pytest.raises(ValueError, match="must tile"):
         policy.row_geometry(gap, "gqa", where="test")
@@ -1671,7 +1671,7 @@ def test_policy_row_geometry_rejects_two_quantized_runs_and_bad_tiling() -> None
         BufferSchema(
             role="key",
             row_stride_elements=576,
-            spans=(RowSpan("content", 0, 512), RowSpan("position", 512, 64)),
+            spans=(RowSpan("nope", 0, 512), RowSpan("rope", 512, 64)),
         ),
         "mla",
         where="test",

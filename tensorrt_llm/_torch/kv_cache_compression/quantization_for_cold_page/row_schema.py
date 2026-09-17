@@ -3,14 +3,15 @@
 """Row schemas for cold-page quantization: what each hot KV row means.
 
 A :class:`LayerSchema` names the element spans of every hot buffer in one KVCM
-layer. A span is ``content`` (NoPE-like values) or ``position`` (RoPE-like
-values); a buffer without spans is opaque and is always copied byte-for-byte.
-A :class:`ColdPagePolicy` maps span kinds to precisions and turns the resolved
-spans into the single kernel row shape ``[lossless prefix][quantized run]
-[lossless suffix]``.
+layer. A span is ``nope`` (values without position encoding) or ``rope``
+(position-encoded values); a buffer without spans is opaque and is always
+copied byte-for-byte. A :class:`ColdPagePolicy` maps span kinds to precisions
+and turns the resolved spans into the kernel's row contract: one quantized run
+per row, described as (start, length, stride), with everything before and
+after the run preserved.
 
 Schemas come from an ordered table of resolvers. Each resolver sees the whole
-layer list of one KVCM, claims the layers it understands, and never sees a
+layer list of one KVCM, claims the layers it understands, and never reads a
 ``model_type``: DeepSeek-V4 is recognized by its buffer roles, MLA by its
 key-only layout and latent geometry, and everything else is treated as GQA.
 """
@@ -21,15 +22,33 @@ from typing import TYPE_CHECKING, Callable, Literal, Mapping, Sequence
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
-SpanKind = Literal["content", "position"]
+__all__ = [
+    "EXCLUDE",
+    "SPAN_ALIGNMENT_ELEMENTS",
+    "BufferSchema",
+    "ColdPagePolicy",
+    "Family",
+    "LayerSchema",
+    "Precision",
+    "ResolverContext",
+    "RopePrecision",
+    "RowGeometry",
+    "RowSpan",
+    "SpanKind",
+    "resolve_layer_schemas",
+    "rotary_dim",
+    "text_config",
+]
+
+SpanKind = Literal["nope", "rope"]
 Precision = Literal["quantized", "lossless"]
-PositionPolicy = Literal["auto", "quantized", "lossless"]
+RopePrecision = Literal["auto", "quantized", "lossless"]
 Family = Literal["deepseek_v4", "mla", "gqa"]
 
 SPAN_ALIGNMENT_ELEMENTS = 16
 """Every span length is a multiple of this, so a quantized run always starts on an NVFP4 scale group."""
 
-_DEFAULT_POSITION_PRECISION: Mapping[str, Precision] = {
+_DEFAULT_ROPE_PRECISION: Mapping[str, Precision] = {
     "deepseek_v4": "lossless",
     "mla": "quantized",
     "gqa": "quantized",
@@ -37,7 +56,7 @@ _DEFAULT_POSITION_PRECISION: Mapping[str, Precision] = {
 """Shipped behavior before the switch existed; ``rope_precision='auto'`` keeps it."""
 
 # HF per-layer-type ``rope_parameters`` keys (Gemma3/Gemma4 style). Their rows
-# differ per layer type, which the single-run row shape does not describe.
+# differ per layer type, which one row contract per buffer does not describe.
 _PER_LAYER_TYPE_ROPE_KEYS = frozenset({"full_attention", "sliding_attention", "chunked_attention"})
 
 _DEEPSEEK_V4_PREFIX = "deepseek_v4_"
@@ -116,7 +135,9 @@ EXCLUDE = _Exclude()
 
 @dataclass(frozen=True)
 class RowGeometry:
-    """Kernel row shape: one quantized run with optional lossless prefix and suffix."""
+    """The kernel row contract: one quantized run at ``quantized_run_start_elements``
+    of ``quantized_run_elements`` elements inside a ``raw_row_stride_elements``
+    row. Elements before and after the run are preserved byte-for-byte."""
 
     quantized_run_start_elements: int
     quantized_run_elements: int
@@ -137,23 +158,24 @@ class RowGeometry:
 
 @dataclass(frozen=True)
 class ColdPagePolicy:
-    """Which precision each span kind gets."""
+    """Which precision each span kind gets: NoPE is always quantized, RoPE
+    follows ``rope_precision``, opaque buffers are always lossless."""
 
-    position: PositionPolicy = "auto"
-    default_position_precision: Mapping[str, Precision] = field(
-        default_factory=lambda: dict(_DEFAULT_POSITION_PRECISION)
+    rope_precision: RopePrecision = "auto"
+    default_rope_precision: Mapping[str, Precision] = field(
+        default_factory=lambda: dict(_DEFAULT_ROPE_PRECISION)
     )
 
-    def position_precision(self, family: str) -> Precision:
-        if self.position == "auto":
-            return self.default_position_precision[family]
-        return self.position
+    def rope_precision_for(self, family: str) -> Precision:
+        if self.rope_precision == "auto":
+            return self.default_rope_precision[family]
+        return self.rope_precision
 
     def span_precision(self, kind: SpanKind, family: str) -> Precision:
-        return "quantized" if kind == "content" else self.position_precision(family)
+        return "quantized" if kind == "nope" else self.rope_precision_for(family)
 
     def row_geometry(self, buffer: BufferSchema, family: str, *, where: str) -> RowGeometry:
-        """Resolve, merge, and validate the spans of one buffer into the kernel row shape."""
+        """Resolve, merge, and validate the spans of one buffer into the row contract."""
 
         stride = buffer.row_stride_elements
         if stride is None or stride <= 0 or not buffer.spans:
@@ -184,13 +206,13 @@ class ColdPagePolicy:
         if not quantized:
             raise ValueError(
                 f"{where}: no quantized span is left after applying rope_precision="
-                f"{self.position_precision(family)!r}; the whole row is position-encoded, "
+                f"{self.rope_precision_for(family)!r}; the whole row is position-encoded, "
                 "so 'lossless' would leave this buffer uncompressed. Use 'quantized' or 'auto'."
             )
         if len(quantized) > 1:
             raise ValueError(
                 f"{where}: {len(quantized)} separate quantized runs {quantized}; the cold-page "
-                "kernel supports one lossless prefix, one quantized run, and one lossless suffix"
+                "kernel quantizes one run per row and preserves the elements around it"
             )
         _, start, length = quantized[0]
         return RowGeometry(
@@ -253,7 +275,7 @@ def text_config(pretrained_config: object) -> object:
 
 def rotary_dim(text: object, head_dim: int) -> int | None:
     """Number of leading K elements that carry RoPE, or None when the model
-    declares per-layer-type RoPE that a single row shape cannot describe."""
+    declares per-layer-type RoPE that one row contract cannot describe."""
 
     rope_parameters = getattr(text, "rope_parameters", None)
     if hasattr(rope_parameters, "to_dict"):
@@ -292,11 +314,11 @@ def resolve_deepseek_v4(
 ) -> Resolution | None:
     """Claim every layer that carries a ``deepseek_v4_`` role.
 
-    CSA layers quantize the 448-element NoPE prefix of each 512-element
-    compressed row and keep the 64-element RoPE suffix as a ``position`` span.
-    An HCA layer colocated with a CSA cache is an opaque layer. SWA, compressor
-    state, and HCA without a CSA cache are excluded, so KVCM's lossless codec
-    handles them as before.
+    CSA layers quantize the 448-element NoPE run of each 512-element compressed
+    row and describe the 64-element RoPE tail as a ``rope`` span. An HCA layer
+    colocated with a CSA cache is an opaque layer. SWA, compressor state, and
+    HCA without a CSA cache are excluded, so KVCM's lossless codec handles them
+    as before.
     """
 
     roles_by_layer: dict[int, set[str]] = {}
@@ -392,9 +414,9 @@ def resolve_deepseek_v4(
                         role=role,
                         row_stride_elements=_DEEPSEEK_V4_ROW_STRIDE,
                         spans=(
-                            RowSpan("content", 0, _DEEPSEEK_V4_NOPE_DIM),
+                            RowSpan("nope", 0, _DEEPSEEK_V4_NOPE_DIM),
                             RowSpan(
-                                "position",
+                                "rope",
                                 _DEEPSEEK_V4_NOPE_DIM,
                                 _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM,
                             ),
@@ -418,8 +440,8 @@ def resolve_deepseek_v4(
 def resolve_mla(
     layers: Sequence["AttentionLayerConfig"], ctx: ResolverContext
 ) -> Resolution | None:
-    """Claim every key-only layer as an MLA latent row: ``kv_lora_rank`` content
-    elements followed by ``qk_rope_head_dim`` position elements. Any other
+    """Claim every key-only layer as an MLA latent row: ``kv_lora_rank`` NoPE
+    elements followed by ``qk_rope_head_dim`` RoPE elements. Any other
     key-only geometry (for example the packed ``fp8_ds_mla`` layout) is rejected
     rather than passed on as GQA."""
 
@@ -444,9 +466,9 @@ def resolve_mla(
                 f"({kv_lora_rank} + {rope_dim}); packed layouts such as "
                 "kv_cache_config.dtype='fp8_ds_mla' are not supported"
             )
-        spans = [RowSpan("content", 0, kv_lora_rank)]
+        spans = [RowSpan("nope", 0, kv_lora_rank)]
         if rope_dim:
-            spans.append(RowSpan("position", kv_lora_rank, rope_dim))
+            spans.append(RowSpan("rope", kv_lora_rank, rope_dim))
         buffers = [BufferSchema(role="key", row_stride_elements=head_dim, spans=tuple(spans))]
         buffers.extend(BufferSchema(role=role) for role in roles if role != "key")
         schemas[layer_id] = LayerSchema(
@@ -463,7 +485,7 @@ def resolve_mla(
 def resolve_gqa(layers: Sequence["AttentionLayerConfig"], ctx: ResolverContext) -> Resolution:
     """Claim every remaining layer. K rows carry RoPE on their first
     ``rotary_dim`` elements (``partial_rotary_factor`` and friends; the whole
-    row when the model rotates every dimension); V rows are all content."""
+    row when the model rotates every dimension); V rows are all NoPE."""
 
     text = text_config(ctx.pretrained_config)
     schemas: Resolution = {}
@@ -479,19 +501,19 @@ def resolve_gqa(layers: Sequence["AttentionLayerConfig"], ctx: ResolverContext) 
             raise ValueError(f"NVFP4 cold pages require head_dim divisible by 16, got {head_dim}")
         rotary = rotary_dim(text, head_dim)
         if rotary is None:
-            if ctx.policy.position_precision("gqa") == "lossless":
+            if ctx.policy.rope_precision_for("gqa") == "lossless":
                 raise NotImplementedError(
                     f"NVFP4 cold-page compression: layer {layer_id} uses per-layer-type "
                     "rope_parameters, whose RoPE layout differs per layer; rope_precision="
                     "'lossless' is not supported for it. Use 'quantized' or 'auto'."
                 )
-            key_spans: tuple[RowSpan, ...] = (RowSpan("content", 0, head_dim),)
+            key_spans: tuple[RowSpan, ...] = (RowSpan("nope", 0, head_dim),)
         else:
             key_spans = tuple(
                 span
                 for span in (
-                    RowSpan("position", 0, rotary),
-                    RowSpan("content", rotary, head_dim - rotary),
+                    RowSpan("rope", 0, rotary),
+                    RowSpan("nope", rotary, head_dim - rotary),
                 )
                 if span.length
             )
@@ -503,7 +525,7 @@ def resolve_gqa(layers: Sequence["AttentionLayerConfig"], ctx: ResolverContext) 
                 BufferSchema(
                     role="value",
                     row_stride_elements=head_dim,
-                    spans=(RowSpan("content", 0, head_dim),),
+                    spans=(RowSpan("nope", 0, head_dim),),
                     scale_key="v",
                 )
             )
