@@ -786,10 +786,13 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
             {
                 float const pivot = sPivot;
 
-                // Inverse-CDF draw over the current support. Round 0 can consume the
-                // retained online-softmax partial; a narrowed retry recomputes its mass.
-                // Either way the scan aggregates the same per-thread partials that the
-                // sampling walk uses, so the target cannot fall outside that walk.
+                // Inverse-CDF draw over the current support. A narrowed retry
+                // recomputes the mass here, so its scan aggregates the same per-thread
+                // partials, in the same order, as the sampling walk and the target
+                // cannot fall outside it. Round 0's retained partial is an
+                // online-softmax merge rebased onto maxScaled, which can disagree with
+                // that ordered sum in the last ulps; a target landing in the gap leaves
+                // sCandIdx == -1 and the row takes the argmax fallback below.
                 float localMass = round == 0 && reuseThreadMass ? cachedLocalMass : 0.0f;
                 if (!(round == 0 && reuseThreadMass))
                 {

@@ -209,6 +209,10 @@ l0_b200:
   # cuda-availability skipif like the sibling KDA parity tests; relocated
   # from tests/torch/ which test-db cannot list).
   - unittest/_torch/speculative/test_suffix_automaton.py
+  # Fused sampling kernel; its numerics are architecture-dependent (the only
+  # accuracy deviation found so far is Blackwell-only), so it is not
+  # hw-agnostic and needs its own Blackwell run.
+  - unittest/_torch/speculative/test_fused_sampling_op.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
