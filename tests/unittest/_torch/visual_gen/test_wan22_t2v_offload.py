@@ -29,7 +29,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 from utils.llm_data import get_checkpoint
-from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import (
@@ -191,7 +190,6 @@ def _assert_offload_matches_baseline(
 
 @pytest.mark.integration
 @pytest.mark.wan_t2v
-@skip_pre_blackwell
 class TestWan22_A14B_Offload:
     """Wan2.2-T2V-A14B  480x832  two-stage with CPU offloading."""
 
