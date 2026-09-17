@@ -44,6 +44,8 @@ __all__ = [
     "Gemma4ForConditionalGeneration",
     "Gemma4UnifiedForConditionalGeneration",
     "Glm4MoeForCausalLM",
+    "Glm5NextForCausalLM",
+    "Glm5NextVLM",
     "GptOssForCausalLM",
     "HCXVisionForCausalLM",
     "HunYuanDenseV1ForCausalLM",

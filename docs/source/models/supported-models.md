@@ -25,6 +25,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^5]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5, GLM-5.2, GLM-5.3            | `zai-org/GLM-5`, `zai-org/GLM-5.2`, `zai-org/GLM-5.3` |
+| `Glm5NextForConditionalGeneration` [^19] | GLM-5.3-Flash                 | `zai-org/GLM-5.3-Flash`                     |
 | `GraniteForCausalLM` [^5]            | Granite 3, Granite Guardian 3      | `ibm-granite/granite-3.1-8b-instruct`, `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-guardian-3.2-5b` |
 | `GraniteMoeHybridForCausalLM` [^5]   | Granite 4.0 Hybrid MoE             | `ibm-granite/granite-4.0-h-small`            |
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
@@ -110,6 +111,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^16]: Guided decoding for `Glm4MoeForCausalLM` is currently supported only with the `xgrammar` backend; `llguidance` is not working.
 [^17]: Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain `DFlash`.
 [^18]: NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model's multi-token verification and cache-management paths and may be untested or explicitly restricted.
+[^19]: Supports text, image, and video inputs, MTP (including with attention data parallelism), and FP8 KV cache. Requires `transformers==5.17.0`. Beam search is not supported. See the [GLM-5.3-Flash deployment guide](../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.md) for setup and feature-specific requirements.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 

@@ -1713,7 +1713,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or request.max_beam_num_tokens >= self.max_seq_len
             ):
                 request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
-            elif request.py_stop_words_list and new_token in request.py_stop_words_list[0]:
+            elif request.py_stop_words_list and any(
+                new_token in word for word in request.py_stop_words_list
+            ):
                 request.finish_by(FinishReason.STOP_WORDS, DEFAULT_BEAM_IDX)
             request.py_num_accepted_draft_tokens = 0
             request.py_rewind_len = 0
