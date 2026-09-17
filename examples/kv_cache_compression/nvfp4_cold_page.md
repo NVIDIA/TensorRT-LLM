@@ -319,13 +319,14 @@ kv_cache_compression_config:
 
 DeepSeek-V4 specific requirements:
 
-* `tokens_per_block` must be divisible by 4, because the CSA cache holds one
-  entry per four tokens.
+* `tokens_per_block` must be 128 or 256, the values the DeepSeek-V4 cache
+  manager accepts. The CSA cache holds one entry per four tokens, so a page of
+  128 tokens holds 32 CSA entries.
 * The FP8 `fp8_ds_mla` footer-scale KV layout is not supported; use the
   ordinary FP8 or BF16 runtime KV layout.
-* If the checkpoint carries ModelOpt KV scales, the per-layer K scale is
-  applied to the CSA cache. Checkpoints without scale metadata use identity
-  scales and need no calibration.
+* If `scale_checkpoint_path` supplies ModelOpt KV scales, only the per-layer
+  K scale is applied to the CSA cache; the V scale is not used. Checkpoints
+  without scale metadata use identity scales and need no calibration.
 
 ## Verify Activation
 

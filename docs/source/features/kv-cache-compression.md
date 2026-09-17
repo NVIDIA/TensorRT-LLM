@@ -256,10 +256,12 @@ structures. Both share the same general platform requirements.[^general-requirem
 
 [^general-requirements]: Both methods currently require the PyTorch backend,
     KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.
-[^deepseek-v4]: DeepSeek-V4 support requires `tokens_per_block` divisible by 4
-    and does not cover the FP8 `fp8_ds_mla` footer-scale KV layout; use the
-    ordinary FP8 or BF16 runtime KV layout. If the checkpoint carries ModelOpt
-    KV scales, the per-layer K scale is applied to the CSA cache.
+[^deepseek-v4]: DeepSeek-V4 requires `tokens_per_block` of 128 or 256 (the
+    DeepSeek-V4 cache manager's constraint) and cold-page compression does not
+    cover the FP8 `fp8_ds_mla` footer-scale KV layout; use the ordinary FP8 or
+    BF16 runtime KV layout. If `scale_checkpoint_path` supplies ModelOpt KV
+    scales, only the per-layer K scale is applied to the CSA cache; the V scale
+    is not used.
 [^cold-page-requirements]: NVFP4 cold-page quantization additionally requires
     the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
     [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md)
