@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # GVR V2: Benchmark Methodology and Figure Reproduction
 
-This companion to [GVR V2: Faster Exact Top-K with Self-Sampling and Multi-Thresholding](../../tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.md) contains the observations and definitions needed to reproduce the article's figures. The article focuses on the algorithm and its performance; this document records the measurement boundaries.
+This companion to [GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K](../../tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.md) contains the observations and definitions needed to reproduce the article's figures. The article focuses on the algorithm and its performance; this document records the measurement boundaries.
 
 ## Regenerate the Figures
 

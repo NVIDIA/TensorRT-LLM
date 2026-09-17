@@ -3,7 +3,9 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# GVR V2: Faster Exact Top-K with Self-Sampling and Multi-Thresholding
+# GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K
+
+*A Unified Selection Core for Prefill and Decode in TensorRT-LLM*
 
 By NVIDIA TensorRT-LLM Team
 
