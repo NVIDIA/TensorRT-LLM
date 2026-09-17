@@ -122,12 +122,19 @@ def test_log_mel_frontend_does_not_mutate_input():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_whisper_for_conditional_generation_construction_and_forward():
+def test_whisper_for_conditional_generation_construction_and_forward() -> None:
+    """Verify Whisper registration, construction, and forward parity with Hugging Face."""
     from transformers import WhisperForConditionalGeneration as HFWhisper
 
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
     from tensorrt_llm._torch.models.modeling_whisper import WhisperForConditionalGeneration
+
+    assert (
+        get_registered_model_class("WhisperForConditionalGeneration")
+        is WhisperForConditionalGeneration
+    )
 
     config = WhisperConfig(
         vocab_size=32,
@@ -150,7 +157,8 @@ def test_whisper_for_conditional_generation_construction_and_forward():
     )
     config._attn_implementation = "eager"
 
-    def make_metadata(encoder_length=None):
+    def make_metadata(encoder_length: int | None = None) -> TrtllmAttentionMetadata:
+        """Build context attention metadata for decoder self-attention or cross-attention."""
         metadata = TrtllmAttentionMetadata(
             max_num_requests=1,
             max_num_tokens=3,
