@@ -2120,6 +2120,94 @@ class KvCacheCreator:
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
 
+    # A decode batch replays a CUDA graph only when it lands on a covered
+    # size (padding rounds up to the nearest captured size; without padding
+    # the batch must match exactly). Warn only when the admissible
+    # concurrency exceeds the covered range by this factor: a small
+    # overshoot spends a small fraction of iterations off-graph, while the
+    # failure mode this guards against is a ceiling several times the
+    # covered range (measured: admitted ~86 vs covered 32 collapsed
+    # throughput ~5x on a windowed-target posture).
+    _CUDA_GRAPH_CAPTURE_WARN_FACTOR = 1.5
+
+    def _warn_if_admitted_concurrency_outruns_graph_capture(
+        self,
+        target_budget: int,
+        draft_budget: int,
+        target_kv: CacheCost,
+        draft_kv: CacheCost,
+    ) -> None:
+        """Warn when the engine admits decode batches far above the range
+        covered by captured CUDA graphs.
+
+        The configured concurrency (scheduler ``max_batch_size``, and any
+        KV-capacity ceiling a manager reports via a worst-case per-request
+        cost) can sit well past ``cuda_graph_config``'s capture range.
+        Decode batches above the covered range run in eager mode, whose
+        per-iteration latency is far higher than a graph replay, so the
+        added concurrency can cost throughput instead of buying it. Eager
+        decode is a legitimate choice at low offered load, so this warns and
+        names the knobs rather than refusing.
+        """
+        capture_sizes = getattr(self._model_engine, "_cuda_graph_batch_sizes",
+                                None)
+        padding = getattr(self._model_engine, "_cuda_graph_padding_enabled",
+                          None)
+        if (not isinstance(capture_sizes, (list, tuple)) or not capture_sizes
+                or not all(isinstance(s, int) for s in capture_sizes)):
+            # CUDA graphs disabled (all-eager is a deliberate posture) or the
+            # engine does not expose its capture set.
+            return
+        if padding is True:
+            # Padding rounds a decode batch up to the nearest captured size,
+            # so everything up to the largest capture replays a graph.
+            covered = max(capture_sizes)
+        else:
+            # Without padding a decode batch replays a graph only at an
+            # exactly captured size, so the reliably covered range is the
+            # dense {1..n} prefix of the capture set: above it, ragged
+            # decode batches almost never match (the default no-padding set
+            # is range(1, 32) + [32, 64, 128, ...], so raising
+            # max_batch_size alone does not extend coverage past 32).
+            covered = 0
+            for size in sorted(set(capture_sizes)):
+                if size != covered + 1:
+                    break
+                covered = size
+        if covered <= 0:
+            return
+        ceilings = []
+        if isinstance(self._max_batch_size, int) and self._max_batch_size > 0:
+            ceilings.append(self._max_batch_size)
+        for budget, cost in ((target_budget, target_kv), (draft_budget,
+                                                          draft_kv)):
+            # ``bytes_per_request`` is an optional CacheCost extension (a
+            # manager-reported worst-case per-request pool spend); absent, the
+            # scheduler max_batch_size is the only admission ceiling.
+            per_request = getattr(cost, "bytes_per_request", None)
+            if isinstance(per_request, int) and per_request > 0:
+                ceilings.append(max(0, budget - cost.intercept) // per_request)
+        if not ceilings:
+            return
+        admissible = min(ceilings)
+        if admissible <= self._CUDA_GRAPH_CAPTURE_WARN_FACTOR * covered:
+            return
+        logger.warning(
+            f"The engine admits up to ~{admissible} concurrent decode "
+            f"requests (scheduler max_batch_size={self._max_batch_size}, and "
+            f"any KV-capacity ceiling from worst-case per-request spend), but "
+            f"captured CUDA graphs only cover decode "
+            f"batches up to {covered} (largest capture "
+            f"{max(capture_sizes)}, enable_padding="
+            f"{bool(padding)}). Decode batches above {covered} run in eager "
+            f"mode with a large per-iteration latency penalty, which can "
+            f"cost more throughput than the added concurrency buys. Raise "
+            f"cuda_graph_config.max_batch_size (or add larger "
+            f"cuda_graph_config.batch_sizes) and set "
+            f"cuda_graph_config.enable_padding=True so ragged batches round "
+            f"up to a captured size, or lower max_batch_size if decode above "
+            f"{covered} concurrent requests is not intended.")
+
     def _split_kv_cache_budget_for_draft(
         self,
         budget_attr: str,
@@ -2214,6 +2302,10 @@ class KvCacheCreator:
             f"Splitting KV cache {budget_attr}: total={total_budget / GB:.2f} GiB, "
             f"target={target_budget / GB:.2f} GiB ({target_kv}), "
             f"draft={draft_budget / GB:.2f} GiB ({draft_kv})")
+
+        if budget_attr == "max_gpu_total_bytes":
+            self._warn_if_admitted_concurrency_outruns_graph_capture(
+                target_budget, draft_budget, target_kv, draft_kv)
 
         split_target_kv_cache_config = target_kv_cache_config.model_copy()
         setattr(split_target_kv_cache_config, budget_attr, target_budget)
