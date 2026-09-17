@@ -101,7 +101,7 @@ Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,0
 
 Each workload/batch case repeats one captured layer/step score row into distinct batch rows. This controls the input distribution and valid width while measuring batch scaling; it is not a heterogeneous batch of independent serving requests. GVR uses `next_n=1` and sets `max_seq_len` to that case's valid row length times its compression ratio. A serving graph may use a larger stable envelope and choose a different execution plan. The bundled grid does not independently benchmark ragged mixed-length batches, MTP, or prefill.
 
-The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). All FP32 comparisons, including DeepSelect and HPC-ops, match existing baseline observations from separate runs by workload identity and batch size, with shape metadata checked where available. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled implementations and workloads; they are not a current-release, equal-interface benchmark of entire serving frameworks.
+The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). All FP32 comparisons match existing baseline observations from separate runs by workload identity and batch size, with shape metadata checked where available. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled implementations and workloads; they are not a current-release, equal-interface benchmark of entire serving frameworks.
 
 The device kernel and host dispatcher at the [main revision audited on September 17, 2026](https://github.com/NVIDIA/TensorRT-LLM/commit/73c70633b2547eedf0c91f85e760aec534f6af84) are byte-identical to those measured for the reference. This establishes source continuity for those files, not a new whole-framework performance measurement.
 
@@ -114,11 +114,10 @@ Figures 1, 3, and 7–10 and their numerical summaries all use this PR #19076 re
 | FlashInfer 0.6.14 | Native `top_k` returns FP32 values and INT64 indices and scans a padded row |
 | TensorRT-LLM radix CUDA | Production dispatcher, including short-row insertion and long-row split-work paths |
 | DeepSelect v1.0.0 | Unsorted INT32 indices only; FP32 K=2048 emphasizes correctness coverage |
-| HPC-ops FP32 | K=512 or 2048, with recommended workspace; K=1024 is unsupported |
 
-The public baseline revisions for DeepSelect and HPC-ops are [8e70df71d2](https://github.com/deepseek-ai/DeepSelect/tree/8e70df71d2) and [2a2e265624](https://github.com/Tencent/hpc-ops/tree/2a2e265624). Complete build revisions for the historical SGLang and radix observations are unavailable in the timing export.
+The public DeepSelect baseline revision is [8e70df71d2](https://github.com/deepseek-ai/DeepSelect/tree/8e70df71d2). Complete build revisions for the historical SGLang and radix observations are unavailable in the timing export.
 
-SGLang planning can be amortized across layers in a serving integration. FlashInfer's additional outputs and padded-row scan remain part of its timed native API. DeepSelect and HPC-ops receive preallocated output or workspace. The historical BF16 comparison remains separate from the PR #19076 FP32 reference. It uses its own paired `gvr_bf16_run_us` reference and preconverted BF16 input for DeepSelect; conversion time is excluded. Each dtype is checked against its own `torch.topk` result, so BF16 speed does not establish preservation of FP32 Top-K membership.
+SGLang planning can be amortized across layers in a serving integration. FlashInfer's additional outputs and padded-row scan remain part of its timed native API. DeepSelect receives preallocated output. The historical BF16 comparison remains separate from the PR #19076 FP32 reference. It uses its own paired `gvr_bf16_run_us` reference and preconverted BF16 input for DeepSelect; conversion time is excluded. Each dtype is checked against its own `torch.topk` result, so BF16 speed does not establish preservation of FP32 Top-K membership.
 
 ## Temporal GVR and Algorithm Evolution
 
@@ -141,9 +140,9 @@ These P5 values are percentiles across per-case `temporal_us / gvr_v2_us` mean-t
 
 Speedup is the geometric mean of per-case `baseline_us / gvr_v2_us` ratios. Every case has equal weight. A win is a ratio strictly above one; minima and percentiles also use individual ratios of case-level mean durations. `_stats` in `plot_results.py` calls `numpy.percentile` without a method override, using its default linear interpolation between adjacent sorted ratios at fractional index `(cases - 1)*p/100` for percentile `p`. No slower case is discarded.
 
-Figure 1 intersects all supported implementations within each model: 2,079 Flash, 2,970 Pro, and 4,466 V3.2 cases. V2 is fixed at 1.00; shorter bars mean less time. Pro omits unsupported HPC-ops. These values are recorded under `comparison_common_cases`. The article's overall and per-model tables use each baseline's full paired coverage.
+Figure 1 intersects all supported implementations within each model: 2,079 Flash, 2,970 Pro, and 4,466 V3.2 cases. V2 is fixed at 1.00; shorter bars mean less time. These values are recorded under `comparison_common_cases`. The article's overall and per-model tables use each baseline's full paired coverage.
 
-SGLang and FlashInfer lack V3.2 layers 0–2 and cover 9,515 cases in total. HPC-ops covers 6,776 Flash/V3.2 cases. GVR, radix, and DeepSelect cover all 9,746 cases. Missing coverage is never filled with estimated timings.
+SGLang and FlashInfer lack V3.2 layers 0–2 and cover 9,515 cases in total. GVR, radix, and DeepSelect cover all 9,746 cases. Missing coverage is never filled with estimated timings.
 
 The latency and roofline curves use arithmetic-mean durations over matching layers at each row-length/batch point: 21 layers for Flash, 30 for Pro, and 58 for V3.2. All layers at each plotted point have the same valid width. The SGLang and DeepSelect FP32 heatmaps (Figures 7 and 8) instead geometrically average per-layer speedups at each shape, using each baseline's full paired coverage. DeepSelect therefore includes all 61 V3.2 layers; SGLang includes 58. Both maps share a 0.8–8.0 scale with parity at 1.0, and cell labels round to one decimal place. A shape average can hide individual regressions.
 
@@ -159,17 +158,16 @@ The article uses Figure 1 for the model-level comparison. The following table re
 | FlashInfer 0.6.14 | 2.18× | 2.20× | 1.93× |
 | TensorRT-LLM radix CUDA | 4.88× | 4.87× | 5.25× |
 | DeepSelect FP32 | 2.03× | 2.13× | 2.85× |
-| HPC-ops FP32 | 2.37× | Unsupported | 1.33× |
 
 *Each model column uses the workloads supported by that baseline.*
 
 For a concrete large-batch slice, the following times are at $B=1024$ and $N\approx131{,}072$, averaged over the same layers as Figure 9:
 
-| Model | GVR V2 | SGLang | FlashInfer | Radix CUDA | DeepSelect FP32 | HPC-ops FP32 |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| V4 Flash | **113.1 µs** | 196.8 µs | 275.4 µs | 461.3 µs | 190.5 µs | 199.2 µs |
-| V4 Pro | **132.8 µs** | 199.1 µs | 298.3 µs | 477.7 µs | 209.1 µs | — |
-| V3.2 | **124.0 µs** | 211.0 µs | 388.7 µs | 496.6 µs | 419.6 µs | 159.7 µs |
+| Model | GVR V2 | SGLang | FlashInfer | Radix CUDA | DeepSelect FP32 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| V4 Flash | **113.1 µs** | 196.8 µs | 275.4 µs | 461.3 µs | 190.5 µs |
+| V4 Pro | **132.8 µs** | 199.1 µs | 298.3 µs | 477.7 µs | 209.1 µs |
+| V3.2 | **124.0 µs** | 211.0 µs | 388.7 µs | 496.6 µs | 419.6 µs |
 
 
 ## Roofline Definitions
@@ -180,7 +178,7 @@ The full model is `min(R, BW*I)`. The theoretical parameters are `R=37.224960 Tc
 
 Figure 10B uses linear axes at B=1024. In this article, a Pareto curve denotes each operator's measured intensity–throughput trace across row lengths at that fixed batch. The points connect in intensity order; the curve is not a computed nondominated frontier or a search over configurations. Figure 9 also shows B=1, and both heatmaps cover all 11 batches.
 
-Reachable rate is `100 * P / min(R, BW*I)` percent, using the calibrated roof. Compute each point from the arithmetic-mean duration across the same matched layers used in Figure 10B. The average reachable rate is the unweighted arithmetic mean of these point-level percentages, and the peak is their maximum. Flash and Pro each contribute nine intensity points; V3.2 contributes seven. The average is not weighted by row length or serving frequency. Unsupported HPC-ops Pro results remain absent. `summary.json` records the point counts and average/peak percentages under `roofline_reachable_rate`.
+Reachable rate is `100 * P / min(R, BW*I)` percent, using the calibrated roof. Compute each point from the arithmetic-mean duration across the same matched layers used in Figure 10B. The average reachable rate is the unweighted arithmetic mean of these point-level percentages, and the peak is their maximum. Flash and Pro each contribute nine intensity points; V3.2 contributes seven. The average is not weighted by row length or serving frequency. `summary.json` records the point counts and average/peak percentages under `roofline_reachable_rate`.
 
 Every plotted point lies on the bandwidth branch of the roof. With elapsed time `t` and consistent units, the fractional reachable rate simplifies to `(W/t)/(BW*W/Q_min) = Q_min/(BW*t)`; multiply by 100 for percent. This is the ideal minimum-traffic time `Q_min/BW` divided by measured time. The cancellation of `W` explains why the comparison convention does not change the reachable rate on this branch. Additional traffic and kernel work remain in `t`, so the rate does not measure actual DRAM bytes transferred or bandwidth utilization.
 

@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 COPYRIGHT = (
     "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. SPDX-License-Identifier: Apache-2.0"
 )
-ARMS = ["sglang", "flashinfer", "radix_cuda", "deepselect", "hpc_ops"]
+ARMS = ["sglang", "flashinfer", "radix_cuda", "deepselect"]
 MODELS = {
     "flash": "DeepSeek-V4 Flash · K=512",
     "pro": "DeepSeek-V4 Pro · K=1024",
@@ -37,7 +37,6 @@ LABELS = {
     "flashinfer": "FlashInfer 0.6.14",
     "radix_cuda": "TensorRT-LLM radix CUDA",
     "deepselect": "DeepSelect FP32",
-    "hpc_ops": "HPC-ops FP32",
 }
 COLORS = {
     "gvr_v2": "#579600",
@@ -47,7 +46,6 @@ COLORS = {
     "flashinfer": "#007e91",
     "radix_cuda": "#64748b",
     "deepselect": "#d97416",
-    "hpc_ops": "#bd426b",
 }
 CROSS_CAMPAIGN = set(ARMS)
 REACHABLE_BW = 6.912116
@@ -118,9 +116,7 @@ def _comparison(rows: list[dict]) -> dict:
             "cases": len(matched),
             "layers": len({r["layer"] for r in matched}),
             "latency_relative_to_v2": {
-                arm: _stats(matched, arm)["geomean"]
-                for arm in COMPARISON_ARMS
-                if not (model == "pro" and arm == "hpc_ops")
+                arm: _stats(matched, arm)["geomean"] for arm in COMPARISON_ARMS
             },
         }
     return result
@@ -138,18 +134,14 @@ def _overview(rows: list[dict]) -> None:
         "FlashInfer",
         "TRT-LLM radix CUDA",
         "DeepSelect FP32",
-        "HPC-ops FP32",
     ]
-    positions = [8.1, 6.8, 5.8, 4.5, 3.5, 2.5, 1.5, 0.5]
+    positions = [7.1, 5.8, 4.8, 3.5, 2.5, 1.5, 0.5]
     for ax, (model, title) in zip(axes, MODELS.items()):
         panel = data[model]
-        ax.axhspan(7.55, 8.65, color="#edf5df", zorder=0)
+        ax.axhspan(6.55, 7.65, color="#edf5df", zorder=0)
         ax.axvline(1, color="#579600", alpha=0.55, linewidth=1, linestyle=(0, (2, 3)))
         for y, arm in zip(positions, COMPARISON_ARMS):
-            value = panel["latency_relative_to_v2"].get(arm)
-            if value is None:
-                ax.text(0.15, y, "Not supported", fontsize=10, color="#88939f", va="center")
-                continue
+            value = panel["latency_relative_to_v2"][arm]
             ax.barh(y, value, height=0.63, color=COLORS[arm], zorder=3)
             ax.text(
                 value + 0.10,
@@ -170,7 +162,7 @@ def _overview(rows: list[dict]) -> None:
             fontsize=9.5,
             color="#52616f",
         )
-        ax.set(xlim=(0, 5.95), ylim=(-0.1, 8.7), xticks=[0, 1, 2, 3, 4, 5])
+        ax.set(xlim=(0, 5.95), ylim=(-0.1, 7.7), xticks=[0, 1, 2, 3, 4, 5])
         ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}×"))
         ax.set_yticks(positions, labels, fontsize=10.5)
         ax.tick_params(axis="both", length=0, pad=8)
@@ -211,7 +203,7 @@ def _overview(rows: list[dict]) -> None:
     fig.text(
         0.035,
         0.032,
-        "SGLang includes plan + transform. HPC-ops supports K=512 and K=2048.",
+        "SGLang includes plan + transform.",
         fontsize=9,
         color="#52616f",
     )
@@ -843,7 +835,7 @@ def _integration() -> None:
 
 
 def _matching(rows: list[dict], model: str) -> list[dict]:
-    required = ["gvr_v2", *ARMS] if model != "pro" else ["gvr_v2", *ARMS[:-1]]
+    required = ["gvr_v2", *ARMS]
     return [
         r for r in rows if r["model"] == model and all(r[a + "_us"] is not None for a in required)
     ]
@@ -874,7 +866,7 @@ def _legend(fig: plt.Figure) -> None:
     fig.legend(
         handles=handles,
         loc="lower center",
-        ncol=3,
+        ncol=5,
         frameon=False,
         bbox_to_anchor=(0.5, 0.01),
         fontsize=10,
@@ -888,8 +880,6 @@ def _latency(rows: list[dict]) -> None:
         for j, batch in enumerate((1, 1024)):
             ax = axes[i, j]
             for arm in ["gvr_v2", *ARMS]:
-                if model == "pro" and arm == "hpc_ops":
-                    continue
                 x, y = _line_data(matched, arm, batch)
                 ax.plot(
                     x,
@@ -925,8 +915,6 @@ def _roofline_reachable_rates(rows: list[dict]) -> dict:
         k = matched[0]["k"]
         by_model[model] = {}
         for arm in ["gvr_v2", *ARMS]:
-            if model == "pro" and arm == "hpc_ops":
-                continue
             widths, times = _line_data(matched, arm, 1024)
             rates = []
             for n, us in zip(widths, times):
@@ -1024,8 +1012,6 @@ def _roofline(rows: list[dict]) -> None:
         ax.fill_between(xroof, xroof * bw, 1.95, color="#f2f5f7", zorder=0)
         ax.plot(xroof, xroof * bw, color="#273746", linestyle=(0, (2, 2)), linewidth=1.5)
         for arm in [*ARMS, "gvr_v2"]:
-            if model == "pro" and arm == "hpc_ops":
-                continue
             widths, times = _line_data(matched, arm, 1024)
             x = [n / (4 * (n + k)) for n in widths]
             y = [1024 * n / (us * 1e6) for n, us in zip(widths, times)]
@@ -1096,7 +1082,7 @@ def _roofline(rows: list[dict]) -> None:
     fig.legend(
         handles=handles,
         loc="lower center",
-        ncol=3,
+        ncol=5,
         frameon=False,
         bbox_to_anchor=(0.53, 0.077),
         fontsize=10,

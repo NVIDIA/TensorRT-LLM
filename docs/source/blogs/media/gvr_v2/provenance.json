@@ -11,7 +11,6 @@
   "hardware": "NVIDIA B200 (SM100)",
   "baseline_versions": {
     "deepselect": "v1.0.0, 8e70df71d2",
-    "hpc_ops": "2a2e265624",
     "flashinfer": "0.6.14",
     "sglang": "Top-K v2",
     "radix_cuda": "Production insertion/radix/split-work dispatcher",
@@ -20,7 +19,6 @@
   },
   "pairing": {
     "deepselect": "cross-campaign; existing FP32 baseline matched by workload and batch to PR #19076",
-    "hpc_ops": "cross-campaign; existing FP32 baseline matched by workload and batch to PR #19076",
     "radix_cuda": "cross-campaign",
     "sglang": "cross-campaign; plan + transform",
     "sglang_transform": "cross-campaign; transform only",
@@ -30,9 +28,9 @@
     "temporal_tiered": "cross-campaign, same (cell, batch), not an isolated algorithm ablation"
   },
   "published_files": {
-    "flash_timings.csv.gz": "b4fd49550dfcc0d9edc61a7dd37af8f00ff1ea9df13ecdabc5fe81171238eb0e",
-    "pro_timings.csv.gz": "3473208ed857807a87a5f18cac4608f2052d72459a232b39e1bc3e919cea1d99",
-    "v32_timings.csv.gz": "052fbf1333c9ee839938d378366528ee59bfcd1e5608fd7c8eb030e510f370f8",
+    "flash_timings.csv.gz": "6ba9512ebdfbf93d5923fbd5248beaef36d0720f4a51b961a64b8dae3fc296c5",
+    "pro_timings.csv.gz": "bce5e0cb029df863e674993711b2bb9a8fb4d1ec8fad892c8856748de05656d6",
+    "v32_timings.csv.gz": "3eec2da81ead5fe425dc2f3ba163d886e5e56c81ee77bb543bd4908873c8073d",
     "temporal_comparison.csv.gz": "0a0973e218209d1f2e4db89e9539a3736753073ad72dc16a30288e79fa9309bb"
   },
   "scope": "Per-case cold kernel means with PR #19076 as the FP32 GVR V2 reference; all FP32 baseline comparisons are cross-campaign. Blank entries are missing/unsupported, never zero latency. Historical BF16 timings retain their separate paired reference.",

@@ -52,17 +52,6 @@
       "win_percent": 99.620357069567,
       "baseline_median_us": 26.854,
       "gvr_median_us": 9.6435
-    },
-    "hpc_ops": {
-      "cases": 6776,
-      "geomean": 1.5854641934414742,
-      "minimum": 0.7191312922503,
-      "p5": 1.0725354119733659,
-      "p95": 3.3893380735586316,
-      "wins": 6688,
-      "win_percent": 98.7012987012987,
-      "baseline_median_us": 15.2865,
-      "gvr_median_us": 10.0685
     }
   },
   "comparison_common_cases": {
@@ -76,8 +65,7 @@
         "sglang": 1.832846308120955,
         "flashinfer": 2.177976616444322,
         "radix_cuda": 4.875738163985888,
-        "deepselect": 2.0333546984325714,
-        "hpc_ops": 2.3687699378490183
+        "deepselect": 2.0333546984325714
       }
     },
     "pro": {
@@ -103,8 +91,7 @@
         "sglang": 1.5766773265824163,
         "flashinfer": 1.9260906164150302,
         "radix_cuda": 5.251958628200303,
-        "deepselect": 2.8495190179213177,
-        "hpc_ops": 1.3277233518189635
+        "deepselect": 2.8495190179213177
       }
     }
   },
@@ -153,17 +140,6 @@
         "win_percent": 99.03799903799904,
         "baseline_median_us": 16.634,
         "gvr_median_us": 6.608
-      },
-      "hpc_ops": {
-        "cases": 2079,
-        "geomean": 2.3687699378490183,
-        "minimum": 1.1533789329685362,
-        "p5": 1.5438957493794887,
-        "p95": 5.4378585199743545,
-        "wins": 2079,
-        "win_percent": 100,
-        "baseline_median_us": 16.144,
-        "gvr_median_us": 6.608
       }
     },
     "pro": {
@@ -210,9 +186,6 @@
         "win_percent": 99.42760942760943,
         "baseline_median_us": 18.569499999999998,
         "gvr_median_us": 6.979
-      },
-      "hpc_ops": {
-        "cases": 0
       }
     },
     "v32": {
@@ -258,17 +231,6 @@
         "wins": 4697,
         "win_percent": 100,
         "baseline_median_us": 45.325,
-        "gvr_median_us": 10.768
-      },
-      "hpc_ops": {
-        "cases": 4697,
-        "geomean": 1.3273267533814441,
-        "minimum": 0.7191312922503,
-        "p5": 1.0487701175120445,
-        "p95": 1.6321223815497354,
-        "wins": 4609,
-        "win_percent": 98.12646370023418,
-        "baseline_median_us": 14.95,
         "gvr_median_us": 10.768
       }
     }
@@ -349,11 +311,6 @@
           "points": 9,
           "average_percent": 21.163519529351618,
           "peak_percent": 64.37510759356354
-        },
-        "hpc_ops": {
-          "points": 9,
-          "average_percent": 23.01430056542999,
-          "peak_percent": 40.99358662670424
         }
       },
       "pro": {
@@ -408,11 +365,6 @@
           "points": 7,
           "average_percent": 14.419005752929042,
           "peak_percent": 34.77047716555635
-        },
-        "hpc_ops": {
-          "points": 7,
-          "average_percent": 31.59216128492162,
-          "peak_percent": 53.07637384676913
         }
       }
     }
