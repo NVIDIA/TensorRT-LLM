@@ -3,7 +3,7 @@ vendors:
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
     branch: prims-ts-mla-prefill--flashinfer
-    commit: bd081822e9faf0a78234c8fdf4c994dbc7635873
+    commit: fcee54d32296a34556b8d40d9cfce4f1c0801a5a
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
