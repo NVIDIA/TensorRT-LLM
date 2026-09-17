@@ -136,6 +136,81 @@ def check_openai_chat_completion(http_port,
         raise
 
 
+_SHORT_PROMPT = "What is the capital of France?"
+_LONG_PROMPT = ("Please summarize the following passage in one sentence.\n\n" +
+                ("The quick brown fox jumps over the lazy dog. " * 600))
+
+
+def check_mixed_prompt_batch(client,
+                             model_name,
+                             join_timeout=300,
+                             require_reasoning=True):
+    """Send 1 long + 3 short chat requests at once and check every reply.
+
+    Args:
+        require_reasoning: Require non-empty ``reasoning_content``; set False
+            where an empty thinking step is acceptable.
+    """
+    results = {}
+    errors = {}
+
+    def _complete(label, prompt):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }],
+                max_completion_tokens=1024,
+                stream=False,
+            )
+            assert len(resp.choices) == 1, \
+                f"[{label}] expected 1 choice, got {len(resp.choices)}"
+            results[label] = resp.choices[0].message
+        except Exception as exc:
+            errors[label] = str(exc)
+
+    threads = [
+        threading.Thread(name="long_0",
+                         target=_complete,
+                         args=("long_0", _LONG_PROMPT),
+                         daemon=True)
+    ]
+    for i in range(3):
+        threads.append(
+            threading.Thread(name=f"short_{i}",
+                             target=_complete,
+                             args=(f"short_{i}", _SHORT_PROMPT),
+                             daemon=True))
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=join_timeout)
+
+    hung = [t.name for t in threads if t.is_alive()]
+    assert not hung, f"Timed out waiting for request threads: {hung}"
+    assert not errors, f"Requests failed: {errors}"
+    assert "long_0" in results, "Long prompt (chunked prefill) got no response"
+    assert all(f"short_{i}" in results
+               for i in range(3)), "One or more short prompts got no response"
+
+    for label, msg in results.items():
+        reasoning = msg.reasoning_content or ""
+        content = msg.content or ""
+        if require_reasoning:
+            # content may be empty if the token budget was consumed by
+            # thinking, which is expected model behaviour, not a server error.
+            assert len(reasoning) > 0, \
+                f"[{label}] empty reasoning_content — request did not complete"
+        else:
+            assert len(reasoning) + len(content) > 0, \
+                f"[{label}] empty response — request did not complete"
+        print_info(f"[{label}] reasoning: {reasoning!r}")
+        print_info(f"[{label}] content:   {content!r}")
+
+
 @pytest.mark.parametrize("config_flag", ["--extra_llm_api_options", "--config"])
 @skip_no_hopper
 def test_config_file_loading(serve_test_root, config_flag):
@@ -298,77 +373,102 @@ def test_nemotron3_super_120b_nvfp4(serve_test_root):
         api_key="tensorrt_llm",
     )
 
-    # Short prompt: exercises MTP decode path.
-    short_prompt = "What is the capital of France?"
+    with popen(cmd, env=env) as proc:
+        _wait_for_server_ready(proc, http_port=port, timeout=7200)
+        print_info("Server ready — sending mixed short+long prompt batch...")
+        check_mixed_prompt_batch(client, model_name)
 
-    # Long prompt: 3000+ words to exceed max_num_tokens (8192 tokens) and
-    # force chunked prefill. The content is repeated to guarantee length.
-    long_prompt = (
-        "Please summarize the following passage in one sentence.\n\n" +
-        ("The quick brown fox jumps over the lazy dog. " * 600))
+    print_info("test_nemotron3_super_120b_nvfp4 PASSED")
+
+
+_NEMOTRON35_LIGHTNING_COMMON_CONFIG = "Nemotron35_Lightning_30B.yml"
+_NEMOTRON35_LIGHTNING_VARIANTS = {
+    "nvfp4": {
+        "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+        "config_overrides": {
+            "moe_config": {
+                "backend": "CUTEDSL"
+            },
+            "nvfp4_gemm_config": {
+                "allowed_backends":
+                ["marlin", "cutlass", "cublaslt", "cuda_core"]
+            },
+        },
+    },
+    "bf16": {
+        "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+        "config_overrides": {
+            "moe_config": {
+                "backend": "CUTLASS"
+            },
+        },
+    },
+}
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("precision", list(_NEMOTRON35_LIGHTNING_VARIANTS))
+def test_nemotron35_lightning_30b(serve_test_root, tmp_path, precision):
+    """Nemotron 3.5 Lightning 30B-A3B with chunked prefill + MTP=3."""
+    variant = _NEMOTRON35_LIGHTNING_VARIANTS[precision]
+    model_path = f"{llm_models_root()}/{variant['model_dir']}"
+    common_config = (f"{serve_test_root}/test_configs/"
+                     f"{_NEMOTRON35_LIGHTNING_COMMON_CONFIG}")
+
+    assert os.path.exists(model_path), f"Model not found: {model_path}"
+    assert os.path.exists(common_config), f"Config not found: {common_config}"
+
+    with open(common_config) as f:
+        config = yaml.safe_load(f)
+    overlapping = set(config) & set(variant["config_overrides"])
+    assert not overlapping, \
+        f"[{precision}] overrides would replace common settings: {overlapping}"
+    config.update(variant["config_overrides"])
+
+    config_file = str(tmp_path / f"nemotron35_lightning_{precision}.yml")
+    with open(config_file, "w") as f:
+        yaml.dump(config, f)
+    print_info(f"[{precision}] merged serve config:\n{yaml.dump(config)}")
+
+    port = get_free_port_in_ci()
+    env = os.environ.copy()
+    env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--max_batch_size",
+        "1",
+        "--max_num_tokens",
+        "8192",
+        "--trust_remote_code",
+        "--reasoning_parser",
+        "nemotron-v3",
+        "--tool_parser",
+        "qwen3_coder",
+        "--config",
+        config_file,
+    ]
+
+    model_name = os.path.basename(model_path)
+    client = OpenAI(
+        base_url=f"http://localhost:{port}/v1",
+        api_key="tensorrt_llm",
+    )
 
     with popen(cmd, env=env) as proc:
         _wait_for_server_ready(proc, http_port=port, timeout=7200)
         print_info("Server ready — sending mixed short+long prompt batch...")
+        check_mixed_prompt_batch(client,
+                                 model_name,
+                                 join_timeout=600,
+                                 require_reasoning=False)
 
-        # Send all requests in parallel threads so the server batches them.
-        results = {}
-        errors = {}
-
-        def _complete(label, prompt):
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{
-                        "role": "user",
-                        "content": prompt
-                    }],
-                    max_completion_tokens=1024,
-                    stream=False,
-                )
-                assert len(resp.choices) == 1, \
-                    f"[{label}] expected 1 choice, got {len(resp.choices)}"
-                results[label] = resp.choices[0].message
-            except Exception as exc:
-                errors[label] = str(exc)
-
-        threads = []
-        # 1 long-prompt request + 3 short-prompt requests sent simultaneously.
-        threads.append(
-            threading.Thread(name="long_0",
-                             target=_complete,
-                             args=("long_0", long_prompt),
-                             daemon=True))
-        for i in range(3):
-            threads.append(
-                threading.Thread(name=f"short_{i}",
-                                 target=_complete,
-                                 args=(f"short_{i}", short_prompt),
-                                 daemon=True))
-
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=300)
-
-        hung = [t.name for t in threads if t.is_alive()]
-        assert not hung, f"Timed out waiting for request threads: {hung}"
-        assert not errors, f"Requests failed: {errors}"
-        assert "long_0" in results, "Long prompt (chunked prefill) got no response"
-        assert all(
-            f"short_{i}" in results
-            for i in range(3)), "One or more short prompts got no response"
-
-        for label, msg in results.items():
-            # A valid reasoning-model response must have reasoning_content.
-            # content may be empty if the token budget was consumed by thinking,
-            # which is expected model behaviour, not a server error.
-            assert len(msg.reasoning_content) > 0, \
-                f"[{label}] empty reasoning_content — request did not complete"
-            print_info(f"[{label}] reasoning: {msg.reasoning_content!r}")
-            print_info(f"[{label}] content:   {msg.content!r}")
-
-    print_info("test_nemotron3_super_120b_nvfp4 PASSED")
+    print_info(f"test_nemotron35_lightning_30b[{precision}] PASSED")
 
 
 _NEMOTRON3_NANO_OMNI_MODEL_DIR = "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"
