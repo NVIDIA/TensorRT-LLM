@@ -272,6 +272,8 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             fp8_b_weight_dequant = weight_dequant(fp8_b_weight, fp8_b_scale).bfloat16()
             mla.o_b_proj.weight.data = fp8_b_weight
             mla.o_b_proj.weight_scale.data = fp8_b_scale
+            # SM107 re-lays weight_scale to UE8M0 K32 at load time; mirror the loader.
+            mla.o_b_proj.quant_method.post_load_weights(mla.o_b_proj)
 
     # Generate test inputs
     # Note: for deepseek_v4, kv_lora_rank equals qk_head_dim
