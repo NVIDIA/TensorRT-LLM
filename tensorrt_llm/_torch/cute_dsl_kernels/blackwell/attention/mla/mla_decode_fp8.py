@@ -1827,7 +1827,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            # NOTE: g1 skips p_cor_pipeline.producer_tail - g0 already does it.
+            # Neither compute group calls p_cor_pipeline.producer_tail().
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction warp
