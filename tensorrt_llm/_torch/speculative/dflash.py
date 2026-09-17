@@ -791,10 +791,25 @@ class DFlashWorker(SpecWorkerBase):
             )
         self._ctx_buf_inited = True
 
+        if not self._ctx_reuse_addressable and getattr(
+            draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False
+        ):
+            # Every fallback above (shape mismatch, stride mismatch, pool layer
+            # count) logs its own reason and then costs only memory -- except
+            # this one, where the scheduler goes on matching prefixes the
+            # drafter can no longer read. Silent, and it looks exactly like the
+            # unpaired build in every metric but acceptance length.
+            logger.warning(
+                "DFlash: the draft KV cache manager joins block reuse but the drafter "
+                "fell back to a private ctx arena, so a reused prefix's drafter K/V "
+                "stays unreachable and acceptance length drops as if unpaired."
+            )
+
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
-            f"dflash_attention_backend={self._dflash_attention_backend}"
+            f"dflash_attention_backend={self._dflash_attention_backend}, "
+            f"reuse_addressable={self._ctx_reuse_addressable}"
         )
 
     def _ctx_paged_index_args(self):
