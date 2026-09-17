@@ -655,14 +655,17 @@ class _FakeMoeQuantMode:
         any_quant: Optional[bool] = None,
         kv_cache_only: bool = False,
     ):
+        """Store the NVFP4, generic-quant, and KV-cache-only flags."""
         self._nvfp4 = nvfp4
         self._any_quant = nvfp4 if any_quant is None else any_quant
         self._kv_cache_only = kv_cache_only
 
     def has_nvfp4(self):
+        """Return whether this mode reports NVFP4 quantization."""
         return self._nvfp4
 
     def has_any_quant(self, exclude_kv_cache=False):
+        """Return whether any quantization is present, honoring exclude_kv_cache."""
         if self._kv_cache_only:
             return not exclude_kv_cache
         return self._any_quant
@@ -676,12 +679,16 @@ class _FakeMoeQuantConfig:
         nvfp4: bool = True,
         any_quant: Optional[bool] = None,
         kv_cache_only: bool = False,
+        layer_quant_mode: Optional[_FakeMoeQuantMode] = None,
     ):
-        # Real QuantConfig exposes both attributes; mirror that so the planner
-        # is exercised against whichever one it reads.
+        """Mirror the real QuantConfig: expose quant_mode and layer_quant_mode.
+
+        Both default to the same mode; pass layer_quant_mode to give the two
+        attributes distinct values and pin which one the planner reads.
+        """
         mode = _FakeMoeQuantMode(nvfp4, any_quant, kv_cache_only)
         self.quant_mode = mode
-        self.layer_quant_mode = mode
+        self.layer_quant_mode = mode if layer_quant_mode is None else layer_quant_mode
 
 
 class TestLocalityDomainMoePlanner:
@@ -766,6 +773,23 @@ class TestLocalityDomainMoePlanner:
         plan = planner.plan_moe(config, dtype_activation=torch.float16)
         assert not plan.enabled
         assert "bfloat16" in plan.reason_if_disabled
+
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
+    def test_moe_reads_layer_quant_mode_over_quant_mode(self, mock_locality_domain):
+        """plan_moe must key off layer_quant_mode: with quant_mode claiming weight
+        quantization but layer_quant_mode reporting none, the BF16 path is selected,
+        so a regression back to reading quant_mode fails this test."""
+        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        config = _FakeMoeQuantConfig(
+            nvfp4=False,
+            any_quant=True,
+            layer_quant_mode=_FakeMoeQuantMode(nvfp4=False, any_quant=False),
+        )
+        plan = planner.plan_moe(config, dtype_activation=torch.bfloat16)
+        assert plan.enabled
+        assert plan.merge_kind == "none"
 
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
