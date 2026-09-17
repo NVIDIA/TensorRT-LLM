@@ -54,6 +54,16 @@ MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+@pytest.fixture
+def nvmmh_config_guard():
+    tuner = AutoTuner.get()
+    previous = tuner.nvmmh_config
+    try:
+        yield tuner
+    finally:
+        tuner.configure_nvmmh(previous)
+
+
 def test_multi_dynamic_dims():
     tuner = autotuner.AutoTuner()
     x = torch.rand([5, 1024])
@@ -889,6 +899,45 @@ def test_kernel_testing_single_context():
         f"Expected 3 tactics to be tested, got {len(tested_tactics)}"
 
 
+def test_kernel_testing_uses_runner_valid_tactics():
+
+    class CaptureRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [1, 2]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    **kwargs) -> torch.Tensor:
+            assert tactic in [-1, 0, 1, 2]
+            return inputs[0]
+
+    x = torch.randn(4, 4)
+    runners = [CaptureRunner()]
+    tuning_config = TuningConfig()
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    with tuner.capture() as all_tactics:
+        tuner.choose_one("test_runner_valid_capture", runners, tuning_config,
+                         [x])
+
+    captured = list(all_tactics)
+    assert [tactic for ((_, tactic), ) in captured] == [1, 2]
+
+    for ((runner, tactic), ) in captured:
+        with tuner.replay(((runner, tactic), )):
+            replay_runner, replay_tactic = tuner.choose_one(
+                "test_runner_valid_capture", runners, tuning_config, [x])
+            assert replay_runner is runner
+            assert replay_tactic == tactic
+
+
 class MultiContextRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[FakeTensor],
@@ -1512,48 +1561,471 @@ def test_single_pair_shortcut_failure_is_logged_as_inf(monkeypatch):
     ), (f"a failed single-pair candidate must be logged as inf; got {lines}")
 
 
-def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
-    """End-to-end guard for the nvMatmulHeuristics tactic pruning.
+_CUPTI_PREFLIGHT_STATE = {}
+_CUTE_DSL_NVMMH_TEST_MNK = (16, 256, 7168)
 
-    For one representative problem size, the tactic the AutoTuner selects when
-    nvMatmulHeuristics prunes the tile/cluster candidates must be no slower (up
-    to a small tolerance) than the tactic it selects from the full CuteDSL
-    NVFP4 tactic sweep. This validates that pruning does not cost performance.
 
-    It additionally compares the heuristic-chosen CuteDSL kernel against the
-    cuBLASLt NVFP4 GEMM on the same fp4 inputs: the CuteDSL kernel-only device
-    time must be within a small tolerance of cuBLAS. Both kernel symbol names
-    are logged for manual inspection -- cuBLAS exposes no API for its selected
-    kernel's CTA tile / cluster shape, so that is not asserted.
+def _skip_if_cupti_unavailable(error, context):
+    """Skip CUPTI-only perf tests without hiding kernel/runtime failures."""
+    if not AutoTuner._is_torch_profiler_unavailable_error(error):
+        raise error
+    reason = f"{context} requires working torch.profiler/CUPTI: {error}"
+    _CUPTI_PREFLIGHT_STATE[torch.cuda.current_device()] = reason
+    pytest.skip(reason)
 
-    Note: the sweep and heuristic paths do NOT profile identical candidate sets
-    -- the heuristic path is a strict validated subset of the sweep -- so the
-    exact winning tactic can differ. Only the achieved runtime is a meaningful
-    invariant, hence the tolerance comparisons.
 
-    Blackwell only (SM100/SM103) and requires the nvMatmulHeuristics library;
-    skipped otherwise.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("requires a CUDA device")
+def _require_cupti_cuda_activity():
+    """Require torch.profiler to report positive CUDA activity on this GPU."""
+    device_index = torch.cuda.current_device()
+    if AutoTuner._torch_profiler_unavailable:
+        pytest.skip(
+            "CUPTI-only performance comparison cannot use the process-wide "
+            "CUDA-event fallback")
+
+    cached_state = _CUPTI_PREFLIGHT_STATE.get(device_index)
+    if cached_state is True:
+        return
+    if isinstance(cached_state, str):
+        pytest.skip(cached_state)
+
+    # Warm CUDA before starting the profiler so the probe tests CUPTI activity,
+    # not first-use CUDA initialization. A CUDA/kernel failure here is real and
+    # intentionally remains a test failure.
+    probe = torch.ones(1, device="cuda")
+    probe.add_(1)
+    torch.cuda.synchronize()
     try:
-        from tensorrt_llm._utils import get_sm_version
-        sm_version = get_sm_version()
-    except Exception:
-        sm_version = None
-    if sm_version not in (100, 103):
-        pytest.skip("CuteDSL NVFP4 requires SM100 (B200) / SM103 (B300)")
+        with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA],
+                acc_events=True,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+        ) as prof:
+            probe.add_(1)
+            torch.cuda.synchronize()
+        AutoTuner._torch_profiler_elapsed_time_ms(prof, repeat=1)
+    except Exception as error:
+        _skip_if_cupti_unavailable(error, "CuTe DSL performance test")
 
-    from tensorrt_llm._torch.custom_ops import \
-        cutedsl_matmul_heuristics as nvmmh
-    if not nvmmh.IS_NVMMH_AVAILABLE:
-        pytest.skip("nvMatmulHeuristics library not installed")
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellRunner
+    _CUPTI_PREFLIGHT_STATE[device_index] = True
 
-    # One representative square problem. fp4 packing / scale-factor layout
-    # follows shmoo_nvfp4_cutedsl_heuristics.py::_quantize_inputs.
-    m = n = k = 4096
+
+def _require_cupti_autotuner_entry(tuner, name, expected_candidates):
+    """Return a measured cache entry only when it was timed with CUPTI."""
+    assert len(expected_candidates) > 1, (
+        "CUPTI cache-time comparison requires multiple candidates; the "
+        "AutoTuner single-pair shortcut records an unmeasured 0.0 entry")
+    cache_entries = tuner.profiling_cache.get_specific_custom_op(name)
+    assert len(cache_entries) == 1
+    cache_key, cache_value = next(iter(cache_entries.items()))
+    _, cached_tactic, profile_ms = cache_value
+    timer_key = cache_key[-1]
+    if (AutoTuner._torch_profiler_unavailable
+            or timer_key == "cuda_event_fallback"):
+        pytest.skip(
+            f"CUPTI became unavailable while profiling {name}; refusing to "
+            "compare CUDA-event fallback timings")
+    assert timer_key == "torch_profiler", (
+        f"Expected CUPTI timing for {name}, got timer key {timer_key!r}")
+    assert math.isfinite(profile_ms) and profile_ms > 0.0, (
+        f"Expected a measured positive CUPTI time for {name}, got {profile_ms}")
+    return cached_tactic, profile_ms * 1000.0
+
+
+def _choose_cupti_autotuner_tactic(tuner, name, runner, tuning_config, inputs,
+                                   expected_candidates):
+    """Choose one tactic and return its total CUPTI time in microseconds."""
+    assert len(expected_candidates) > 1, (
+        "performance comparison requires a measured tactic sweep")
+    tuner.clear_cache()
+    with autotune(skip_dynamic_tuning_buckets=True):
+        _, tactic = tuner.choose_one(name, [runner], tuning_config, inputs)
+    cached_tactic, profile_us = _require_cupti_autotuner_entry(
+        tuner, name, expected_candidates)
+    assert cached_tactic == tactic
+    return tactic, profile_us
+
+
+def _profile_cupti_total_us(fn, context, warmup=20, iterations=200, trials=5):
+    """Return median per-call device time, including every CUDA activity."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    samples = []
+    for _ in range(trials):
+        try:
+            with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CUDA],
+                    acc_events=True,
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+            ) as prof:
+                for _ in range(iterations):
+                    fn()
+                torch.cuda.synchronize()
+            elapsed_ms = AutoTuner._torch_profiler_elapsed_time_ms(
+                prof, iterations)
+        except Exception as error:
+            _skip_if_cupti_unavailable(error, context)
+        samples.append(elapsed_ms * 1000.0)
+    return statistics.median(samples)
+
+
+def _nvmmh_tactic_family(tactic):
+    # Scheduler-only guidance annotates validated families with model-selected
+    # raster/swizzle values; the resulting tuples need not occur in the sweep.
+    if tactic[0] == "mixed_clusters":
+        return tactic[:7]
+    if tactic[0] == "base":
+        return tactic[:5] if isinstance(tactic[1], bool) else tactic[:6]
+    return tactic[:5]
+
+
+def _run_cute_dsl_bf16_heuristic_comparison(monkeypatch, tuner, nvmmh):
+    """Compare BF16 full sweep, scheduler-only NVMMH, and cuBLASLt."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+    m, n, k = _CUTE_DSL_NVMMH_TEST_MNK
+    torch.manual_seed(2028)
+    act = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    output = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    inputs = [act, weight, output]
+
+    runner = cute_dsl_custom_ops.CuteDSLBf16RubinGemmRunner(
+        use_tvm_ffi=True, output_dtype=torch.bfloat16)
+    runner.__class__.kernel_cache.clear()
+    runner.__class__.split_k_gemm_cache.clear()
+    tuning_config = runner.__class__.tuning_config
+    monkeypatch.setattr(tuning_config, "use_cuda_graph", False)
+
+    scheduler_fields = ("swizzle", "cta_order", "split_k")
+    tuner.configure_nvmmh(enabled=False, fields=scheduler_fields, max_tactics=5)
+    baseline_tactics = runner.get_valid_tactics(inputs, None)
+    assert baseline_tactics
+    sweep_tactic, sweep_us = _choose_cupti_autotuner_tactic(
+        tuner,
+        "test::cute_dsl_bf16_exact_full_sweep",
+        runner,
+        tuning_config,
+        inputs,
+        baseline_tactics,
+    )
+
+    tuner.configure_nvmmh(enabled=True, fields=scheduler_fields, max_tactics=5)
+    heuristic_candidates = runner.get_valid_tactics(inputs, None)
+    assert 0 < len(heuristic_candidates) <= len(baseline_tactics), (
+        "nvMMH did not prune SM107 BF16 tactics: "
+        f"{len(heuristic_candidates)} vs {len(baseline_tactics)}")
+    assert {_nvmmh_tactic_family(t)
+            for t in heuristic_candidates
+            }.issubset({_nvmmh_tactic_family(t)
+                        for t in baseline_tactics})
+
+    model_configs = nvmmh.rank_configs(
+        m,
+        n,
+        k,
+        nvmmh.BF16_PRECISION,
+        max(tuner.nvmmh_config.max_tactics * 16, 64),
+        layout_name=nvmmh.BF16_LAYOUT,
+    )
+    assert model_configs
+    native_rank1_split_k = int(model_configs[0].split_k)
+
+    def _split_k(tactic):
+        if (isinstance(tactic, tuple) and tactic and tactic[0] == "base"
+                and len(tactic) >= 6):
+            return int(tactic[5])
+        return 1
+
+    candidate_splits = {_split_k(tactic) for tactic in heuristic_candidates}
+    expected_local_splits = {
+        split_k
+        for split_k in (1, 2, 4, 8) if nvmmh.is_sm107_nvmmh_split_k_eligible(
+            k, runner.nvmmh_split_k_cta_k, split_k)
+    }
+    assert expected_local_splits.issubset(candidate_splits), (
+        "SM107 BF16 scheduler-only filtering removed locally admitted "
+        f"split-K candidates: expected={expected_local_splits}, "
+        f"actual={candidate_splits}")
+    assert all(
+        nvmmh.is_sm107_nvmmh_split_k_eligible(k, runner.nvmmh_split_k_cta_k,
+                                              split_k)
+        for split_k in candidate_splits), (
+            f"SM107 BF16 retained an ineligible split: {candidate_splits}")
+    baseline_base_families = {
+        tactic[:5]
+        for tactic in baseline_tactics
+        if isinstance(tactic, tuple) and tactic and tactic[0] == "base"
+    }
+    heuristic_base_families = {
+        tactic[:5]
+        for tactic in heuristic_candidates
+        if isinstance(tactic, tuple) and tactic and tactic[0] == "base"
+    }
+    assert heuristic_base_families == baseline_base_families, (
+        "scheduler-only BF16 NVMMH must keep every base tile/cluster family")
+    heuristic_tactic, heuristic_us = _choose_cupti_autotuner_tactic(
+        tuner,
+        "test::cute_dsl_bf16_scheduler_only_heuristic",
+        runner,
+        tuning_config,
+        inputs,
+        heuristic_candidates,
+    )
+
+    def _cublaslt_call():
+        return torch.ops.trtllm.cublas_mm(
+            act,
+            weight.t(),
+            bias=None,
+            out_dtype=None,
+        )
+
+    output.fill_(torch.nan)
+    runner(inputs, tactic=sweep_tactic)
+    sweep_output = output.clone()
+    output.fill_(torch.nan)
+    runner(inputs, tactic=heuristic_tactic)
+    heuristic_output = output.clone()
+    cublaslt_output = _cublaslt_call()
+    torch.cuda.synchronize()
+    reference = act.float() @ weight.t().float()
+    torch.testing.assert_close(sweep_output.float(),
+                               reference,
+                               rtol=1e-2,
+                               atol=1.0)
+    torch.testing.assert_close(heuristic_output.float(),
+                               reference,
+                               rtol=1e-2,
+                               atol=1.0)
+    torch.testing.assert_close(cublaslt_output.float(),
+                               reference,
+                               rtol=1e-2,
+                               atol=1.0)
+
+    # Use one CUPTI whole-call timer for the three selected implementations.
+    # This counts the reduction kernel when a CuTe DSL tactic uses split-K.
+    sweep_cupti_us = _profile_cupti_total_us(
+        lambda: runner(inputs, tactic=sweep_tactic),
+        "BF16 full-sweep tactic comparison",
+    )
+    heuristic_cupti_us = _profile_cupti_total_us(
+        lambda: runner(inputs, tactic=heuristic_tactic),
+        "BF16 scheduler-only nvMMH tactic comparison",
+    )
+    cublaslt_cupti_us = _profile_cupti_total_us(
+        _cublaslt_call,
+        "BF16 cuBLASLt comparison",
+    )
+
+    print(f"\nSM107 BF16 [{m},{k}] x [{k},{n}] -> [{m},{n}]")
+    print(f"full sweep: candidates={len(baseline_tactics)}, "
+          f"tactic={sweep_tactic}, autotuner_cupti_time={sweep_us:.3f} us, "
+          f"comparison_cupti_time={sweep_cupti_us:.3f} us")
+    print(f"scheduler-only heuristic: "
+          f"candidates={len(heuristic_candidates)}, "
+          f"native_rank1_split_k={native_rank1_split_k}, "
+          f"candidate_splits={sorted(candidate_splits)}, "
+          f"tactic={heuristic_tactic}, "
+          f"autotuner_cupti_time={heuristic_us:.3f} us, "
+          f"comparison_cupti_time={heuristic_cupti_us:.3f} us")
+    print(f"cuBLASLt: comparison_cupti_time={cublaslt_cupti_us:.3f} us")
+
+    tolerance = 1.1
+    cublas_tolerance = 1.1
+    assert heuristic_us <= sweep_us * tolerance, (
+        f"BF16 heuristic tactic {heuristic_tactic} ({heuristic_us:.3f} us) "
+        f"is >{tolerance:.2f}x slower than full-sweep tactic "
+        f"{sweep_tactic} ({sweep_us:.3f} us)")
+    assert heuristic_cupti_us <= sweep_cupti_us * tolerance, (
+        f"BF16 heuristic tactic {heuristic_tactic} "
+        f"({heuristic_cupti_us:.3f} us CUPTI) is >{tolerance:.2f}x slower "
+        f"than full-sweep tactic {sweep_tactic} "
+        f"({sweep_cupti_us:.3f} us CUPTI)")
+    assert heuristic_cupti_us <= cublaslt_cupti_us * cublas_tolerance, (
+        f"BF16 CuTe DSL heuristic tactic {heuristic_tactic} "
+        f"({heuristic_cupti_us:.3f} us CUPTI) is "
+        f">{cublas_tolerance:.2f}x slower "
+        f"than cuBLASLt ({cublaslt_cupti_us:.3f} us CUPTI)")
+
+
+def _run_cute_dsl_mxfp8_heuristic_comparison(monkeypatch, tuner, nvmmh):
+    """Compare MXFP8 full sweep with scheduler-only NVMMH on SM107."""
+    from _torch.helpers import calc_diff, per_block_cast_to_fp8_e8m0
+
+    import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+    m, n, k = _CUTE_DSL_NVMMH_TEST_MNK
+    torch.manual_seed(2029)
+    act = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") / math.sqrt(k)
+    weight = (torch.randn(n, k, dtype=torch.bfloat16, device="cuda") /
+              math.sqrt(k))
+    act_fp8, act_sf = \
+        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(act)
+    weight_fp8, weight_sf_k128 = per_block_cast_to_fp8_e8m0(weight)
+    weight_sf = fp8_utils.transform_k128_scales_to_cutedsl_mxfp8_layout(
+        weight_sf_k128, mn=n, k=k)
+    alpha = torch.ones((), dtype=torch.float32, device="cuda")
+    inputs = [act_fp8, weight_fp8, act_sf, weight_sf, alpha]
+
+    runner = cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear(
+        output_dtype=torch.bfloat16, use_tvm_ffi=True)
+    runner.__class__.kernel_cache.clear()
+    tuning_config = runner.__class__.tuning_config
+    monkeypatch.setattr(tuning_config, "use_cuda_graph", False)
+
+    scheduler_fields = ("swizzle", "cta_order", "split_k")
+    tuner.configure_nvmmh(enabled=False, fields=scheduler_fields, max_tactics=5)
+    baseline_tactics = runner.get_valid_tactics(inputs, None)
+    assert baseline_tactics
+    sweep_tactic, sweep_us = _choose_cupti_autotuner_tactic(
+        tuner,
+        "test::cute_dsl_mxfp8_exact_full_sweep",
+        runner,
+        tuning_config,
+        inputs,
+        baseline_tactics,
+    )
+
+    tuner.configure_nvmmh(enabled=True, fields=scheduler_fields, max_tactics=5)
+    heuristic_candidates = runner.get_valid_tactics(inputs, None)
+    assert 0 < len(heuristic_candidates) <= len(baseline_tactics), (
+        "nvMMH did not prune SM107 MXFP8 tactics: "
+        f"{len(heuristic_candidates)} vs {len(baseline_tactics)}")
+
+    assert {_nvmmh_tactic_family(t)
+            for t in heuristic_candidates
+            }.issubset({_nvmmh_tactic_family(t)
+                        for t in baseline_tactics})
+
+    def _split_k(tactic):
+        if (isinstance(tactic, tuple) and tactic and tactic[0] == "base"
+                and len(tactic) >= 9):
+            return int(tactic[8])
+        return 1
+
+    candidate_splits = {_split_k(tactic) for tactic in heuristic_candidates}
+    expected_local_splits = {
+        split_k
+        for split_k in runner.split_k_candidates
+        if nvmmh.is_sm107_nvmmh_split_k_eligible(k, runner.mma_tiler_k, split_k)
+    }
+    assert expected_local_splits.issubset(candidate_splits), (
+        "SM107 MXFP8 scheduler-only filtering removed locally admitted "
+        f"split-K candidates: expected={expected_local_splits}, "
+        f"actual={candidate_splits}")
+    assert all(
+        nvmmh.is_sm107_nvmmh_split_k_eligible(k, runner.mma_tiler_k, split_k)
+        for split_k in candidate_splits), (
+            f"SM107 MXFP8 retained an ineligible split: {candidate_splits}")
+    assert 8 in candidate_splits
+    baseline_base_families = {
+        tactic[:7]
+        for tactic in baseline_tactics
+        if isinstance(tactic, tuple) and tactic and tactic[0] == "base"
+    }
+    heuristic_base_families = {
+        tactic[:7]
+        for tactic in heuristic_candidates
+        if isinstance(tactic, tuple) and tactic and tactic[0] == "base"
+    }
+    assert heuristic_base_families == baseline_base_families, (
+        "scheduler-only MXFP8 NVMMH must keep every base tile/cluster family")
+
+    heuristic_tactic, heuristic_us = _choose_cupti_autotuner_tactic(
+        tuner,
+        "test::cute_dsl_mxfp8_scheduler_only_heuristic",
+        runner,
+        tuning_config,
+        inputs,
+        heuristic_candidates,
+    )
+
+    def _cublaslt_call():
+        # PyTorch's Rubin MXFP8 reference dispatches this block-scaled call to
+        # cuBLASLt. The CuTe DSL inputs already use its flat R128c4 SF layout.
+        return torch._scaled_mm(
+            act_fp8,
+            weight_fp8.t(),
+            scale_a=act_sf.view(torch.float8_e8m0fnu),
+            scale_b=weight_sf.view(torch.float8_e8m0fnu),
+            out_dtype=torch.bfloat16,
+        )
+
+    sweep_output = runner(inputs, tactic=sweep_tactic)
+    heuristic_output = runner(inputs, tactic=heuristic_tactic)
+    cublaslt_output = _cublaslt_call()
+    torch.cuda.synchronize()
+    reference = act @ weight.t()
+    assert calc_diff(sweep_output, reference) < 1e-3
+    assert calc_diff(heuristic_output, reference) < 1e-3
+    assert calc_diff(cublaslt_output, reference) < 1e-3
+
+    sweep_cupti_us = _profile_cupti_total_us(
+        lambda: runner(inputs, tactic=sweep_tactic),
+        "MXFP8 full-sweep tactic comparison",
+    )
+    heuristic_cupti_us = _profile_cupti_total_us(
+        lambda: runner(inputs, tactic=heuristic_tactic),
+        "MXFP8 scheduler-only nvMMH tactic comparison",
+    )
+    cublaslt_cupti_us = _profile_cupti_total_us(
+        _cublaslt_call,
+        "MXFP8 cuBLASLt comparison",
+    )
+
+    print(f"\nSM107 MXFP8 [{m},{k}] x [{k},{n}] -> [{m},{n}]")
+    print(f"full sweep: candidates={len(baseline_tactics)}, "
+          f"tactic={sweep_tactic}, autotuner_cupti_time={sweep_us:.3f} us, "
+          f"comparison_cupti_time={sweep_cupti_us:.3f} us")
+    print(f"scheduler-only heuristic: "
+          f"candidates={len(heuristic_candidates)}, "
+          f"candidate_splits={sorted(candidate_splits)}, "
+          f"tactic={heuristic_tactic}, "
+          f"autotuner_cupti_time={heuristic_us:.3f} us, "
+          f"comparison_cupti_time={heuristic_cupti_us:.3f} us")
+    print(f"cuBLASLt: comparison_cupti_time={cublaslt_cupti_us:.3f} us")
+
+    tolerance = 1.1
+    cublas_tolerance = 1.1
+    assert heuristic_us <= sweep_us * tolerance, (
+        f"MXFP8 heuristic tactic {heuristic_tactic} ({heuristic_us:.3f} us) "
+        f"is >{tolerance:.2f}x slower than full-sweep tactic "
+        f"{sweep_tactic} ({sweep_us:.3f} us)")
+    assert heuristic_cupti_us <= sweep_cupti_us * tolerance, (
+        f"MXFP8 heuristic tactic {heuristic_tactic} "
+        f"({heuristic_cupti_us:.3f} us CUPTI) is >{tolerance:.2f}x slower "
+        f"than full-sweep tactic {sweep_tactic} "
+        f"({sweep_cupti_us:.3f} us CUPTI)")
+    assert heuristic_cupti_us <= cublaslt_cupti_us * cublas_tolerance, (
+        f"MXFP8 CuTe DSL heuristic tactic {heuristic_tactic} "
+        f"({heuristic_cupti_us:.3f} us CUPTI) is "
+        f">{cublas_tolerance:.2f}x slower "
+        f"than cuBLASLt ({cublaslt_cupti_us:.3f} us CUPTI)")
+
+
+def _run_cute_dsl_nvfp4_heuristic_comparison(monkeypatch, tuner, nvmmh,
+                                             sm_version):
+    """Compare NVFP4 full sweep, NVMMH pruning, and cuBLASLt."""
+    from _torch.helpers import calc_diff
+
+    if sm_version == 107:
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+            CuteDSLNVFP4RubinLinear as NVFP4Runner
+    else:
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+            CuteDSLNVFP4BlackwellRunner as NVFP4Runner
+
+    # Keep the NVFP4 operands aligned with the BF16 and MXFP8 subcases. FP4
+    # packing / scale-factor layout follows
+    # shmoo_nvfp4_cutedsl_heuristics.py::_quantize_inputs.
+    m, n, k = _CUTE_DSL_NVMMH_TEST_MNK
     dtype = torch.bfloat16
     sf_vec_size = 16
     torch.manual_seed(0)
@@ -1565,52 +2037,77 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
                                                 False)
     w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w, w_sf_global, sf_vec_size,
                                                 False)
-    alpha = torch.tensor([1.0], device="cuda")
+    alpha = (1.0 / (x_sf_global * w_sf_global)).reshape(1)
     inputs = [x_fp4, w_fp4, x_sf, w_sf, alpha]
 
-    runner = CuteDSLNVFP4BlackwellRunner(output_dtype=dtype)
+    runner = NVFP4Runner(output_dtype=dtype)
     tuning_config = runner.__class__.tuning_config
+    monkeypatch.setattr(tuning_config, "use_cuda_graph", False)
+    nvfp4_fields = (("tile", "cluster", "split_k") if sm_version == 107 else
+                    ("tile", "cluster"))
+    tuner.configure_nvmmh(
+        enabled=False,
+        fields=nvfp4_fields,
+        max_tactics=5,
+    )
 
-    def _best_tactic():
-        tuner = AutoTuner.get()
+    def _best_tactic(name, expected_candidates):
+        assert len(expected_candidates) > 1, (
+            "NVFP4 performance comparison requires a measured tactic sweep")
         tuner.clear_cache()
-        with autotune():
+        with autotune(skip_dynamic_tuning_buckets=True):
             _, tactic = tuner.choose_one(
-                "test::cutedsl_nvfp4_heuristic_match",
+                name,
                 [runner],
                 tuning_config,
                 inputs,
             )
+        cached_tactic, _ = _require_cupti_autotuner_entry(
+            tuner, name, expected_candidates)
+        assert cached_tactic == tactic
         return tactic
 
-    def _dominant_kernel(fn, iters=20):
-        """(name, per-call device-us) of the longest-running CUDA kernel that
-        fn launches, isolating kernel time from host/op overhead."""
-        from torch.profiler import ProfilerActivity, profile
-        fn()
-        torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            for _ in range(iters):
-                fn()
-            torch.cuda.synchronize()
-        best_name, best_total, best_count = "<none>", -1.0, 1
-        for e in prof.key_averages():
-            t = (getattr(e, "self_device_time_total", 0)
-                 or getattr(e, "self_cuda_time_total", 0))
-            if t and t > best_total:
-                best_name, best_total, best_count = e.key, t, max(1, e.count)
-        return best_name, best_total / best_count
+    baseline_tactics = runner.get_valid_tactics(inputs, None)
+    assert baseline_tactics
 
     # Full sweep: heuristics disabled.
-    monkeypatch.delenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", raising=False)
-    sweep_tactic = _best_tactic()
+    sweep_tactic = _best_tactic("test::cute_dsl_nvfp4_exact_full_sweep",
+                                baseline_tactics)
 
     # Pruned: nvMatmulHeuristics drives the (coupled) tile+cluster candidates.
-    # Pin MAX_TACTICS so the tolerance below is not affected by an env override.
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", "1")
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_FIELDS", "tile,cluster")
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS", "5")
-    heuristic_tactic = _best_tactic()
+    tuner.configure_nvmmh(enabled=True)
+    heuristic_candidates = runner.get_valid_tactics(inputs, None)
+    assert 0 < len(heuristic_candidates) <= len(baseline_tactics), (
+        f"nvMMH did not prune SM{sm_version} NVFP4 tactics: "
+        f"{len(heuristic_candidates)} vs {len(baseline_tactics)}")
+    assert {_nvmmh_tactic_family(t)
+            for t in heuristic_candidates
+            }.issubset({_nvmmh_tactic_family(t)
+                        for t in baseline_tactics})
+    if sm_version == 107:
+
+        def _nvfp4_split_k(tactic):
+            if (isinstance(tactic, tuple) and tactic and tactic[0] == "base"
+                    and len(tactic) >= 9):
+                return int(tactic[8])
+            return 1
+
+        candidate_splits = {
+            _nvfp4_split_k(tactic)
+            for tactic in heuristic_candidates
+        }
+        expected_local_splits = {
+            split_k
+            for split_k in runner.split_k_candidates
+            if nvmmh.is_sm107_nvmmh_split_k_eligible(k, runner.mma_tiler_k,
+                                                     split_k)
+        }
+        assert expected_local_splits.issubset(candidate_splits)
+        assert all(
+            nvmmh.is_sm107_nvmmh_split_k_eligible(
+                k, runner.mma_tiler_k, split_k) for split_k in candidate_splits)
+    heuristic_tactic = _best_tactic("test::cute_dsl_nvfp4_exact_heuristic",
+                                    heuristic_candidates)
 
     # cuBLASLt runs its own heuristic auto-tuning; warm it under autotune().
     def _cublas_call():
@@ -1621,18 +2118,39 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         _cublas_call()
     torch.cuda.synchronize()
 
-    # All comparisons use kernel-only device time (isolates the GEMM kernel from
-    # host/op dispatch overhead), measured via the CUDA profiler.
-    _, sweep_us = _dominant_kernel(lambda: runner(inputs, tactic=sweep_tactic))
-    _, heuristic_us = _dominant_kernel(
-        lambda: runner(inputs, tactic=heuristic_tactic))
-    _, cublas_us = _dominant_kernel(_cublas_call)
+    sweep_output = runner(inputs, tactic=sweep_tactic)
+    heuristic_output = runner(inputs, tactic=heuristic_tactic)
+    cublas_output = _cublas_call()
+    torch.cuda.synchronize()
+    assert calc_diff(sweep_output, cublas_output) < 1e-3
+    assert calc_diff(heuristic_output, cublas_output) < 1e-3
+
+    # Use whole-call CUPTI time so in-place split-K's required output zeroing is
+    # included alongside the GEMM, matching the AutoTuner's timing semantics.
+    sweep_us = _profile_cupti_total_us(
+        lambda: runner(inputs, tactic=sweep_tactic),
+        "NVFP4 full-sweep tactic comparison",
+    )
+    heuristic_us = _profile_cupti_total_us(
+        lambda: runner(inputs, tactic=heuristic_tactic),
+        "NVFP4 heuristic tactic comparison",
+    )
+    cublas_us = _profile_cupti_total_us(
+        _cublas_call,
+        "NVFP4 cuBLASLt comparison",
+    )
+    print(f"\nSM{sm_version} NVFP4 [{m},{k}] x [{k},{n}] -> [{m},{n}]")
+    print(f"full sweep: candidates={len(baseline_tactics)}, "
+          f"tactic={sweep_tactic}, time={sweep_us:.3f} us")
+    print(f"heuristic: candidates={len(heuristic_candidates)}, "
+          f"tactic={heuristic_tactic}, time={heuristic_us:.3f} us")
+    print(f"cuBLASLt: time={cublas_us:.3f} us")
 
     # Pruning must not degrade the achieved kernel runtime beyond this tolerance.
     # With the default MAX_TACTICS=5 the heuristic set includes the empirical
-    # best tile (its cluster ranking can still be slightly off, ~2-3% on square
-    # 4096), so a tight bound catches gross regressions while allowing that.
-    tolerance = 1.05
+    # best tile, but its cluster ranking can be slightly off across Rubin nodes,
+    # so a 10% bound catches gross regressions while allowing that variance.
+    tolerance = 1.1
     assert heuristic_us <= sweep_us * tolerance, (
         f"heuristic-pruned tactic {heuristic_tactic} ({heuristic_us:.2f} us) is "
         f">{tolerance:.2f}x slower than full-sweep tactic {sweep_tactic} "
@@ -1646,8 +2164,64 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
     cublas_tolerance = 1.10
     assert heuristic_us <= cublas_us * cublas_tolerance, (
         f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
-        f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
+        f">{cublas_tolerance:.2f}x slower than cuBLASLt NVFP4 "
         f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
+
+
+@pytest.mark.parametrize(
+    "precision,supported_sms",
+    [
+        pytest.param("nvfp4", (100, 103, 107), id="nvfp4"),
+        pytest.param("bf16", (107, ), id="bf16"),
+        pytest.param("mxfp8", (107, ), id="mxfp8"),
+    ],
+)
+def test_cute_dsl_nvmmh_matches_full_sweep(precision, supported_sms,
+                                           monkeypatch, nvmmh_config_guard):
+    """Compare CuTe DSL full-sweep and NVMMH-selected performance.
+
+    Each precision uses the same representative M=16, N=256, K=7168 problem
+    and compares the NVMMH-selected tactic with both the full CuTe DSL sweep
+    and cuBLASLt using torch.profiler/CUPTI. NVFP4 runs on SM100/SM103/SM107;
+    BF16 and MXFP8 run on SM107.
+
+    The heuristic path is a strict validated subset of the sweep, so the exact
+    winning tactics may differ. The achieved runtime is the test invariant.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+
+    try:
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+    except Exception:
+        sm_version = None
+    if sm_version not in supported_sms:
+        supported_sm_names = ", ".join(f"SM{sm}" for sm in supported_sms)
+        pytest.skip(f"CuTe DSL {precision} comparison requires "
+                    f"{supported_sm_names}")
+
+    from tensorrt_llm._torch.custom_ops import \
+        cutedsl_matmul_heuristics as nvmmh
+    if not nvmmh.IS_NVMMH_AVAILABLE:
+        pytest.skip("nvMatmulHeuristics library not installed")
+    if sm_version == 107:
+        from tensorrt_llm._torch.cute_dsl_utils import \
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("CuTe DSL Rubin support is not available")
+
+    _require_cupti_cuda_activity()
+
+    comparison, args = {
+        "nvfp4": (_run_cute_dsl_nvfp4_heuristic_comparison,
+                  (monkeypatch, nvmmh_config_guard, nvmmh, sm_version)),
+        "bf16": (_run_cute_dsl_bf16_heuristic_comparison,
+                 (monkeypatch, nvmmh_config_guard, nvmmh)),
+        "mxfp8": (_run_cute_dsl_mxfp8_heuristic_comparison,
+                  (monkeypatch, nvmmh_config_guard, nvmmh)),
+    }[precision]
+    comparison(*args)
 
 
 @pytest.mark.parametrize("distribution", ["random", "balanced"])
