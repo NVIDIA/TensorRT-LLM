@@ -1922,8 +1922,8 @@ def test_nvfp4_experts_match_situ_reference(moe_backend, input_scale):
     # to the last failure; the two in fact differ a lot (see the xfail above),
     # and the claim was never measured. The structural guards do not rest on
     # this number at all: they are the BF16 comparison against the same golden
-    # reference and the SiTU-vs-SwiGLU discriminator, both tolerance-free. The
-    # accuracy gate for the real checkpoint is GSM8K.
+    # reference and the SiTU-vs-SwiGLU discriminator, which carries its own
+    # bound. The accuracy gate for the real checkpoint is GSM8K.
     assert cosine > 0.95, f"cosine={cosine.item()}, rel_l2={rel_l2.item()}"
 
 
@@ -1976,8 +1976,14 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     compiles a SwiGLU kernel and returns plausible numbers. An internal
     branch shipped exactly that defect on a sibling backend for weeks.
 
-    The comparison is tolerance-free, so it also catches the degenerate
-    all-zero FC1 output, which scores 0 against both references.
+    The degenerate all-zero FC1 output is caught as well: it scores 0 against
+    both references.
+
+    The weights here are deliberately 6-15x larger than production. Measured
+    from the checkpoint, real g and u have sigma 0.10..0.23 against beta=4, and
+    at that scale SiTU and plain SwiGLU differ by 0.4% -- under the
+    quantization floor, so nothing could be asserted. At the scale used here
+    they differ by 14%.
 
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
