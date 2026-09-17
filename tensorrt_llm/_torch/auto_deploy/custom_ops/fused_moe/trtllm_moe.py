@@ -78,7 +78,7 @@ def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
     """Whether the router GEMM may use tinygemm2 (else fall back to F.linear).
 
     Encodes tinygemm2's hard preconditions (thop CHECK_INPUT: CUDA + contiguous +
-    bf16; bias required; SM90/100/103/107) plus the small-M decode regime where it wins.
+    bf16; bias required; SM90/100/103) plus the small-M decode regime where it wins.
     Any unmet condition (prefill, non-bf16, non-contiguous, no bias, other arch)
     silently falls back to F.linear — no hard failure.
     """
@@ -87,7 +87,7 @@ def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
     # specialization no longer wins and its accumulation diverges); same threshold PT uses.
     _MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
     # tinygemm2 only supports these SM archs (see thop/tinygemm2.cpp).
-    _TINYGEMM_SM = (90, 100, 103, 107)
+    _TINYGEMM_SM = (90, 100, 103)
     return (
         bias is not None
         and get_sm_version() in _TINYGEMM_SM

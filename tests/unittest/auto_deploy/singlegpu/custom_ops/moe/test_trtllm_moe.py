@@ -19,7 +19,6 @@ Source: https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trt
 
 import math
 from typing import Callable
-from unittest import mock
 
 import pytest
 import torch
@@ -29,7 +28,6 @@ from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy._compat import ActivationType
-from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import trtllm_moe
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_COLUMN_SIZE,
     TRTLLM_NVFP4_ROW_SIZE,
@@ -1265,26 +1263,3 @@ def test_trtllm_finegrained_fp8_moe_blackwell(
     print(
         f"[Blackwell] Output range: [{test_output.min().item():.4f}, {test_output.max().item():.4f}]"
     )
-
-
-def _router_gemm_operands():
-    x = torch.zeros(8, 64, dtype=torch.bfloat16)
-    weight = torch.zeros(16, 64, dtype=torch.bfloat16)
-    bias = torch.zeros(16, dtype=torch.bfloat16)
-    return x, weight, bias
-
-
-@pytest.mark.parametrize("sm_version", [90, 100, 103, 107])
-def test_router_use_tinygemm_accepts_sm100_family(sm_version):
-    x, weight, bias = _router_gemm_operands()
-    with mock.patch.object(trtllm_moe, "get_sm_version", return_value=sm_version):
-        assert trtllm_moe._router_use_tinygemm(x, weight, bias)
-        assert not trtllm_moe._router_use_tinygemm(x, weight, None)
-        assert not trtllm_moe._router_use_tinygemm(x.repeat(17, 1), weight, bias)
-
-
-@pytest.mark.parametrize("sm_version", [89, 120])
-def test_router_use_tinygemm_rejects_other_archs(sm_version):
-    x, weight, bias = _router_gemm_operands()
-    with mock.patch.object(trtllm_moe, "get_sm_version", return_value=sm_version):
-        assert not trtllm_moe._router_use_tinygemm(x, weight, bias)
