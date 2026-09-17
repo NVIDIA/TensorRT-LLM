@@ -281,6 +281,7 @@ class _ReceiveOperationOwner:
         self._writer_cohort: Optional[frozenset[int]] = None
         self._writer_results: dict[int, bool] = {}
         self._in_doubt_writers: set[int] = set()
+        self._settled_writers: set[int] = set()
         self._publication_failed = False
         self._local_completion_pending = False
         self._invalid_evidence = False
@@ -323,7 +324,7 @@ class _ReceiveOperationOwner:
             if self._writer_cohort is not None and not published.issubset(self._writer_cohort):
                 self._invalid_evidence = True
                 raise RuntimeError("publication recorded a writer outside the sealed cohort")
-            if not self._writer_results.keys() <= published:
+            if not (self._writer_results.keys() | self._in_doubt_writers) <= published:
                 self._invalid_evidence = True
                 raise RuntimeError("terminal evidence came from an unpublished writer")
             self._expected_writers = len(published)
@@ -355,10 +356,34 @@ class _ReceiveOperationOwner:
             if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
                 self._invalid_evidence = True
                 raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
-            if peer_rank in self._in_doubt_writers:
+            if peer_rank in self._in_doubt_writers or peer_rank in self._settled_writers:
                 return False
             self._in_doubt_writers.add(peer_rank)
-            self._invalid_evidence = True
+            return True
+
+    def record_writer_settlement(self, peer_rank: int) -> bool:
+        """Accept physical DONE for a writer that previously reported IN_DOUBT.
+
+        Ordinary FAILED is not this proof: it may describe a later, unsubmitted
+        chunk while the earlier ambiguous write is still touching the destination.
+        """
+        with self._lock:
+            if self._expected_writers is None or (
+                self._writer_cohort is not None and peer_rank not in self._writer_cohort
+            ):
+                self._invalid_evidence = True
+                raise RuntimeError(f"writer {peer_rank} settled outside the published cohort")
+            if peer_rank in self._settled_writers:
+                return False
+            if peer_rank not in self._in_doubt_writers:
+                self._invalid_evidence = True
+                raise RuntimeError(f"writer {peer_rank} settled without prior ambiguous evidence")
+            if self._writer_results.get(peer_rank) is True:
+                self._invalid_evidence = True
+                raise RuntimeError(f"writer {peer_rank} settled after contradictory success")
+            self._writer_results[peer_rank] = False
+            self._in_doubt_writers.remove(peer_rank)
+            self._settled_writers.add(peer_rank)
             return True
 
     def record_writer_result(
@@ -378,6 +403,11 @@ class _ReceiveOperationOwner:
             if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
                 self._invalid_evidence = True
                 raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
+            if peer_rank in self._in_doubt_writers:
+                if succeeded:
+                    self._invalid_evidence = True
+                    raise RuntimeError(f"writer {peer_rank} reported success while in doubt")
+                return False, False
             previous = self._writer_results.get(peer_rank)
             if previous is not None:
                 if previous != succeeded:
@@ -408,6 +438,7 @@ class _ReceiveOperationOwner:
             return (
                 self._expected_writers is not None
                 and len(self._writer_results) == self._expected_writers
+                and not self._in_doubt_writers
             )
 
     @property
@@ -420,6 +451,7 @@ class _ReceiveOperationOwner:
                 writers_drained
                 and not self._publication_pending
                 and not self._local_completion_pending
+                and not self._in_doubt_writers
                 and not self._invalid_evidence
             )
 
@@ -428,6 +460,7 @@ class AgentResult(Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     IN_DOUBT = "IN_DOUBT"
+    FAILED_QUIESCED = "FAILED_QUIESCED"
 
 
 # KV_AGENT_RESULT prefix in one struct frame (was ascii frames serialized/parsed under the
@@ -438,11 +471,13 @@ _AGENT_RESULT_CODE = {
     AgentResult.SUCCESS: 0,
     AgentResult.FAILED: 1,
     AgentResult.IN_DOUBT: 2,
+    AgentResult.FAILED_QUIESCED: 3,
 }
 _AGENT_RESULT_BY_CODE = {
     0: AgentResult.SUCCESS,
     1: AgentResult.FAILED,
     2: AgentResult.IN_DOUBT,
+    3: AgentResult.FAILED_QUIESCED,
 }
 
 
@@ -485,11 +520,11 @@ class _PhysicalOperationState(Enum):
         ADMITTED -> NOT_SUBMITTED
         ADMITTED -> SUBMITTING -> SUBMITTED -> BACKEND_DONE
         SUBMITTING -> IN_DOUBT
-        SUBMITTED -> IN_DOUBT
+        SUBMITTED -> IN_DOUBT -> BACKEND_DONE (same retained status reports DONE)
 
     Only NOT_SUBMITTED and BACKEND_DONE prove that the operation can no longer
-    access the source. IN_DOUBT deliberately has no retirement transition in
-    this bridge. Repeating a terminal transition is idempotent, and repeating
+    access the source. An IN_DOUBT operation without a retained backend status
+    cannot retire. Repeating a terminal transition is idempotent, and repeating
     IN_DOUBT preserves the retained backend evidence.
     """
 
@@ -513,6 +548,15 @@ class _PhysicalOperation:
     state: _PhysicalOperationState
     request: Optional[TransferRequest] = None
     status: Optional[object] = None
+
+
+@dataclass
+class _PendingSettlement:
+    write_meta: WriteMeta
+    initial_report: Optional[list[bytes]]
+    send_slot_id: Optional[int] = None
+    backend_done: bool = False
+    report_error_logged: bool = False
 
 
 class SendTaskBase(_LogicalTask):
@@ -627,6 +671,39 @@ class SendTaskBase(_LogicalTask):
             operation.status = None
             operation.state = _PhysicalOperationState.BACKEND_DONE
 
+    def poll_in_doubt_physical_operation(self, peer_rank: int) -> bool:
+        """Retire once, only after a fresh DONE query on the retained status.
+
+        Polling does not change the task's logical outcome. Keep strong local
+        roots across the query, and reject a result if its operation changed.
+        """
+        with self._physical_lock:
+            operation = self._physical_operations.get(peer_rank)
+            if operation is None or operation.state is not _PhysicalOperationState.IN_DOUBT:
+                return False
+            request, status = operation.request, operation.status
+        if status is None:
+            return False
+        try:
+            completed = status.is_completed()
+        except Exception:
+            # A backend query failure is not evidence that its accessors stopped.
+            return False
+        if completed is not True:
+            return False
+        with self._physical_lock:
+            if (
+                self._physical_operations.get(peer_rank) is not operation
+                or operation.state is not _PhysicalOperationState.IN_DOUBT
+                or operation.request is not request
+                or operation.status is not status
+            ):
+                return False
+            operation.request = None
+            operation.status = None
+            operation.state = _PhysicalOperationState.BACKEND_DONE
+            return True
+
     def has_started_physical_operation(self, peer_rank: int) -> bool:
         with self._physical_lock:
             return peer_rank in self._physical_operations
@@ -726,6 +803,11 @@ class Sender(SenderBase):
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
+        ]
+        # Each dictionary belongs to its worker, preserving that peer stream's
+        # result ordering and ZMQ socket affinity even after the first failure.
+        self._pending_settlements: list[dict[tuple[SendTaskBase, int], _PendingSettlement]] = [
+            {} for _ in range(self._num_threads)
         ]
         self._worker_threads: List[threading.Thread] = [
             threading.Thread(target=self._process_task_queue, args=(i,), daemon=True)
@@ -965,7 +1047,22 @@ class Sender(SenderBase):
         task_queue = self._send_task_queues[thread_idx]
         try:
             while True:
-                write_meta = task_queue.get()
+                if self._pending_settlements[thread_idx]:
+                    self._poll_in_doubt_transfers(thread_idx)
+                    if any(
+                        pending.initial_report is not None
+                        for pending in self._pending_settlements[thread_idx].values()
+                    ):
+                        # A later queued FAILED may describe only an unsubmitted
+                        # chunk. It must never overtake the earlier IN_DOUBT.
+                        time.sleep(0.01)
+                        continue
+                    try:
+                        write_meta = task_queue.get(timeout=0.01)
+                    except queue.Empty:
+                        continue
+                else:
+                    write_meta = task_queue.get()
                 if write_meta is None:
                     break
                 if isinstance(write_meta, tuple):
@@ -1004,6 +1101,69 @@ class Sender(SenderBase):
                             f"for endpoint {endpoint}: {e}"
                         )
                 dealers.clear()
+
+    def _retain_in_doubt_transfer(
+        self,
+        write_meta: WriteMeta,
+        initial_report: list[bytes],
+        send_slot_id: Optional[int] = None,
+    ) -> None:
+        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        key = (write_meta.task, write_meta.peer_rank)
+        if key in self._pending_settlements[thread_idx]:
+            return
+        pending = _PendingSettlement(write_meta, initial_report, send_slot_id)
+        self._pending_settlements[thread_idx][key] = pending
+        try:
+            self._get_result_dealer(write_meta.peer_endpoint).send(initial_report)
+        except Exception as error:
+            logger.warning(f"Failed to report ambiguous transfer; retaining evidence: {error}")
+            pending.report_error_logged = True
+        else:
+            pending.initial_report = None
+
+    def _poll_in_doubt_transfers(self, thread_idx: int) -> None:
+        pending_transfers = self._pending_settlements[thread_idx]
+        for key, pending in list(pending_transfers.items()):
+            meta = pending.write_meta
+            try:
+                dealer = self._get_result_dealer(meta.peer_endpoint)
+                if pending.initial_report is not None:
+                    dealer.send(pending.initial_report)
+                    pending.initial_report = None
+                if not pending.backend_done:
+                    if not meta.task.poll_in_doubt_physical_operation(meta.peer_rank):
+                        continue
+                    pending.backend_done = True
+                if pending.send_slot_id is not None:
+                    self._bounce.release_send(pending.send_slot_id)
+                    pending.send_slot_id = None
+                if meta.meta_type == WriteMetaType.AUX:
+                    message = _make_aux_result_msg(
+                        self._instance_rank, meta.unique_rid, AgentResult.FAILED_QUIESCED
+                    )
+                else:
+                    message = _make_kv_result_msg(
+                        self._instance_rank,
+                        meta.unique_rid,
+                        meta.receiver_slice_id,
+                        True,
+                        AgentResult.FAILED_QUIESCED,
+                    )
+                dealer.send(message)
+            except Exception as error:
+                # Sending may have escaped before raising. A duplicate settlement
+                # is idempotent; losing the only remaining report is not safe.
+                if not pending.report_error_logged:
+                    logger.warning(f"Failed to report physical settlement; will retry: {error}")
+                    pending.report_error_logged = True
+                continue
+            with meta.task.lock:
+                if meta.meta_type == WriteMetaType.AUX:
+                    meta.task._transfer_count += 1
+                else:
+                    meta.task.transferred_count += 1
+            del pending_transfers[key]
 
     @staticmethod
     @nvtx_range("_make_agent_request")
@@ -1189,10 +1349,10 @@ class Sender(SenderBase):
             transfer_size=transfer_size,
             tail=tail,
         )
-        self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
-
         if agent_result == AgentResult.IN_DOUBT:
+            self._retain_in_doubt_transfer(write_meta, result_msg, send_slot_id)
             return
+        self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -1287,6 +1447,12 @@ class Sender(SenderBase):
         # claimant. Keep the claim at the send boundary so future cleanup-path
         # changes cannot publish contradictory evidence.
         if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
+            if agent_result == AgentResult.IN_DOUBT:
+                self._retain_in_doubt_transfer(
+                    write_meta,
+                    _make_aux_result_msg(self._instance_rank, write_meta.unique_rid, agent_result),
+                )
+                return
             self._get_result_dealer(write_meta.peer_endpoint).send(
                 _make_aux_result_msg(
                     self._instance_rank,
@@ -1780,7 +1946,9 @@ class Sender(SenderBase):
         *,
         defer_to_worker: bool,
     ) -> None:
-        if defer_to_worker:
+        if defer_to_worker or self._enforce_physical_ownership:
+            # Listener-side rejection must share the worker's ordered stream;
+            # it cannot overtake an ambiguous write's pending IN_DOUBT report.
             thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
             for message in messages:
                 self._send_task_queues[thread_idx].put((endpoint, message))
@@ -1847,6 +2015,8 @@ class Sender(SenderBase):
                 return
             if self._enforce_physical_ownership and self._sessions:
                 raise RuntimeError("Sender refuses shutdown while transfer ownership is active")
+            if any(self._pending_settlements):
+                raise RuntimeError("Sender refuses shutdown while settlement reports are pending")
             self._shutdown_requested = True
 
         self._messenger.stop()
@@ -2411,6 +2581,9 @@ class KVRecvTask(_LogicalTask):
 
     def record_writer_in_doubt(self, peer_rank: int) -> bool:
         return self._get_physical_owner().record_writer_in_doubt(peer_rank)
+
+    def record_writer_settlement(self, peer_rank: int) -> bool:
+        return self._get_physical_owner().record_writer_settlement(peer_rank)
 
     def record_writer_result(
         self,
@@ -3269,6 +3442,7 @@ class RxSession(RxSessionBase):
                 AgentResult.SUCCESS,
                 AgentResult.FAILED,
                 AgentResult.IN_DOUBT,
+                AgentResult.FAILED_QUIESCED,
             ):
                 raise ValueError(
                     f"Session {self.request_id} received unknown task status: {status.value}"
@@ -3292,6 +3466,19 @@ class RxSession(RxSessionBase):
                 )
                 task.fail(error)
                 self._record_ownership_evidence_error(error)
+                return
+            if status == AgentResult.FAILED_QUIESCED:
+                if not self._enforce_physical_ownership:
+                    raise RuntimeError("received physical settlement without ownership enabled")
+                try:
+                    accepted = task.record_writer_settlement(peer_rank)
+                except Exception as error:
+                    self._record_ownership_evidence_error(error)
+                    raise
+                if accepted:
+                    self._receiver._bounce.record_failure(
+                        (self.disagg_request_id, task.slice_id), peer_rank
+                    )
                 return
             if self._enforce_physical_ownership:
                 if status == AgentResult.FAILED or is_last_slice:
@@ -3433,6 +3620,15 @@ class RxSession(RxSessionBase):
                 )
                 self._aux_status = TaskStatus.ERROR
                 self._record_ownership_evidence_error(error)
+                return
+            if status == AgentResult.FAILED_QUIESCED:
+                if self._aux_physical_owner is None:
+                    raise RuntimeError("received auxiliary settlement without ownership enabled")
+                try:
+                    self._aux_physical_owner.record_writer_settlement(peer_rank)
+                except Exception as error:
+                    self._record_ownership_evidence_error(error)
+                    raise
                 return
             if self._aux_physical_owner is not None:
                 try:
