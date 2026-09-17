@@ -271,7 +271,7 @@ else:
     def is_sm_100f(sm_version=None) -> bool:
         if sm_version is None:
             sm_version = get_sm_version()
-        return sm_version == 100 or sm_version == 103
+        return 100 <= sm_version < 110
 
     # -- nvtx_range --
     @contextmanager

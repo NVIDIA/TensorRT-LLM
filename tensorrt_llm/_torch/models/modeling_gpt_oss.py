@@ -211,7 +211,7 @@ class MLPBlock(torch.nn.Module):
                             x: torch.Tensor,
                             lora_params: Optional[dict] = None) -> torch.Tensor:
         # Skip tinygemm2 optimization when LoRA is active (tinygemm2 doesn't support LoRA)
-        use_tinygemm = (get_sm_version() in [90, 100, 103]
+        use_tinygemm = (get_sm_version() in [90, 100, 103, 107]
                         and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS
                         and (lora_params is None or not bool(lora_params)))
 
