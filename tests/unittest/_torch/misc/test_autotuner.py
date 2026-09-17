@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import enum
 import itertools
 import json
@@ -41,6 +44,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 @pytest.fixture
 def nvmmh_config_guard():
+    """Restore the process-wide NVMMH policy after each test that changes it."""
     tuner = AutoTuner.get()
     previous = tuner.nvmmh_config
     try:
@@ -634,12 +638,14 @@ def test_kernel_testing_single_context():
 
 
 def test_kernel_testing_uses_runner_valid_tactics():
+    """Verify captured tactic combinations use the runner-provided candidate list."""
 
     class CaptureRunner(TunableRunner):
 
         def get_valid_tactics(self, inputs: List[FakeTensor],
                               profile: OptimizationProfile,
                               **kwargs) -> List[int]:
+            """Provide a fixed candidate list for capture and replay assertions."""
             return [1, 2]
 
         def forward(self,
@@ -648,6 +654,7 @@ def test_kernel_testing_uses_runner_valid_tactics():
                     *,
                     tactic: int = -1,
                     **kwargs) -> torch.Tensor:
+            """Return the input unchanged while the test observes tactic selection."""
             assert tactic in [-1, 0, 1, 2]
             return inputs[0]
 
@@ -1353,6 +1360,7 @@ def _profile_cupti_total_us(fn, context, warmup=20, iterations=200, trials=5):
 
 
 def _nvmmh_tactic_family(tactic):
+    """Strip model-selected scheduler fields before comparing structural families."""
     # Scheduler-only guidance annotates validated families with model-selected
     # raster/swizzle values; the resulting tuples need not occur in the sweep.
     if tactic[0] == "mixed_clusters":
@@ -1415,6 +1423,7 @@ def _run_cute_dsl_bf16_heuristic_comparison(monkeypatch, tuner, nvmmh):
     native_rank1_split_k = int(model_configs[0].split_k)
 
     def _split_k(tactic):
+        """Read the tactic split factor, defaulting unsplit variants to one."""
         if (isinstance(tactic, tuple) and tactic and tactic[0] == "base"
                 and len(tactic) >= 6):
             return int(tactic[5])
@@ -1457,6 +1466,7 @@ def _run_cute_dsl_bf16_heuristic_comparison(monkeypatch, tuner, nvmmh):
     )
 
     def _cublaslt_call():
+        """Execute the cuBLASLt reference used for BF16 timing comparisons."""
         return torch.ops.trtllm.cublas_mm(
             act,
             weight.t(),
@@ -1583,6 +1593,7 @@ def _run_cute_dsl_mxfp8_heuristic_comparison(monkeypatch, tuner, nvmmh):
                         for t in baseline_tactics})
 
     def _split_k(tactic):
+        """Read the tactic split factor, defaulting unsplit variants to one."""
         if (isinstance(tactic, tuple) and tactic and tactic[0] == "base"
                 and len(tactic) >= 9):
             return int(tactic[8])
@@ -1626,6 +1637,7 @@ def _run_cute_dsl_mxfp8_heuristic_comparison(monkeypatch, tuner, nvmmh):
     )
 
     def _cublaslt_call():
+        """Execute the cuBLASLt reference for the MXFP8 comparison inputs."""
         # PyTorch's Rubin MXFP8 reference dispatches this block-scaled call to
         # cuBLASLt. The CuTe DSL inputs already use its flat R128c4 SF layout.
         return torch._scaled_mm(
@@ -1730,6 +1742,7 @@ def _run_cute_dsl_nvfp4_heuristic_comparison(monkeypatch, tuner, nvmmh,
     )
 
     def _best_tactic(name, expected_candidates):
+        """Tune the supplied candidates and require a CUPTI-ranked cache entry."""
         assert len(expected_candidates) > 1, (
             "NVFP4 performance comparison requires a measured tactic sweep")
         tuner.clear_cache()
@@ -1765,6 +1778,7 @@ def _run_cute_dsl_nvfp4_heuristic_comparison(monkeypatch, tuner, nvmmh,
     if sm_version == 107:
 
         def _nvfp4_split_k(tactic):
+            """Read a base NVFP4 split factor, treating other families as unsplit."""
             if (isinstance(tactic, tuple) and tactic and tactic[0] == "base"
                     and len(tactic) >= 9):
                 return int(tactic[8])
@@ -2119,3 +2133,113 @@ def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
                               *zip(*[(world_size, )] * world_size)))
     for got in results:
         assert got == ["rank0", "rank1"]
+
+
+@pytest.mark.parametrize("conflicting_config",
+                         [None, {
+                             "fields": ("tile", ),
+                             "max_tactics": 2
+                         }])
+def test_nvmmh_engine_policy_lifetime(nvmmh_config_guard, monkeypatch,
+                                      conflicting_config):
+    """Engine wiring pins non-default policy until the last owner is cleaned up."""
+    from tensorrt_llm._torch.pyexecutor import model_engine
+    from tensorrt_llm.llmapi.llm_args import AutoTunerNvMMHConfig, TorchLlmArgs
+
+    class EngineOwner:
+        """Minimal engine resources for exercising the real cleanup path."""
+        _cleanup_done = False
+        model_loader = None
+
+        def _release_cuda_graphs(self):
+            """No graph resources are allocated by this wiring test."""
+
+    monkeypatch.setattr(model_engine, "release_gc", lambda: None)
+    args = TorchLlmArgs.model_construct(
+        autotuner_nvmmh_config=AutoTunerNvMMHConfig(
+            fields=("swizzle", "cta_order"), max_tactics=3))
+    first, second, rejected = EngineOwner(), EngineOwner(), EngineOwner()
+    tuner = nvmmh_config_guard
+    try:
+        model_engine._configure_autotuner_nvmmh(args, first)
+        expected = autotuner.NvMMHConfig(enabled=True,
+                                         fields=("swizzle", "cta_order"),
+                                         max_tactics=3)
+        assert tuner.nvmmh_config == expected
+        installed = tuner.nvmmh_config
+        model_engine._configure_autotuner_nvmmh(args, second)
+        assert tuner.nvmmh_config is installed
+        other_args = TorchLlmArgs.model_construct(autotuner_nvmmh_config=(
+            None if conflicting_config is None else AutoTunerNvMMHConfig(
+                **conflicting_config)))
+        with pytest.raises(ValueError, match="active model engines"):
+            model_engine._configure_autotuner_nvmmh(other_args, rejected)
+        assert tuner.nvmmh_config == expected
+        with pytest.raises(ValueError, match="active model engines"):
+            tuner.configure_nvmmh(enabled=False)
+        assert tuner.nvmmh_config == expected
+
+        model_engine.PyTorchModelEngine.cleanup(first)
+        model_engine.PyTorchModelEngine.cleanup(first)  # Idempotent release.
+        with pytest.raises(ValueError, match="active model engines"):
+            model_engine._configure_autotuner_nvmmh(other_args, rejected)
+        model_engine.PyTorchModelEngine.cleanup(second)
+        model_engine._configure_autotuner_nvmmh(other_args, rejected)
+        assert tuner.nvmmh_config != expected
+        model_engine.PyTorchModelEngine.cleanup(rejected)
+    finally:
+        tuner._release_nvmmh_policy(first)
+        tuner._release_nvmmh_policy(second)
+        tuner._release_nvmmh_policy(rejected)
+
+
+def test_nvmmh_policy_owner_collection(nvmmh_config_guard):
+    """An abandoned or partially initialized engine cannot pin policy forever."""
+    import gc
+    import weakref
+
+    class Owner:
+        """Weak-referenceable stand-in for an engine that failed to initialize."""
+
+    owner = Owner()
+    tuner = nvmmh_config_guard
+    tuner._acquire_nvmmh_policy(owner, autotuner.NvMMHConfig(enabled=True))
+    ref = weakref.ref(owner)
+    del owner
+    gc.collect()
+    assert ref() is None
+    tuner.configure_nvmmh(enabled=False)
+    assert not tuner.nvmmh_config.enabled
+
+
+def test_nvmmh_unmatched_swap_preserves_split_k_admission(
+        nvmmh_config_guard, monkeypatch):
+    """A model miss for one swap must not resurrect rejected split-K factors."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from tensorrt_llm._torch.custom_ops import \
+        cutedsl_matmul_heuristics as heuristics
+
+    if not hasattr(ops, "CuteDSLMXFP8RubinLinear"):
+        pytest.skip("Rubin CuTe DSL is unavailable")
+    monkeypatch.setattr(ops, "IS_NVMMH_AVAILABLE", True)
+    runner = ops.CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16)
+    nvmmh_config_guard.configure_nvmmh(enabled=True,
+                                       fields=("tile", "cluster", "split_k"))
+    tactics = [("base", (128, 128, 128), (128, 128, 64), (1, 1), swap, False,
+                "static", "m", split) for swap in (False, True)
+               for split in (1, 2, 4, 8)]
+
+    def rank_one_orientation(m, n, *args, **kwargs):
+        """Only the unswapped model problem has a representable result."""
+        return ([heuristics.HeuristicConfig((128, 128),
+                                            (1, 1), 1, 0)] if m == 128 else [])
+
+    monkeypatch.setattr(ops, "rank_configs", rank_one_orientation)
+    selected = runner._rank_prune_tactics(tactics, 128, 256, 1024)
+    admitted = [
+        t for t in tactics if heuristics.is_sm107_nvmmh_split_k_eligible(
+            1024, runner.mma_tiler_k, t[8])
+    ]
+    assert len(admitted) < len(tactics)
+    assert {t[4] for t in selected} == {False, True}
+    assert set(selected) == set(admitted)
