@@ -4030,13 +4030,12 @@ class KVCacheManagerV2(BaseResourceManager):
         worker receives prompt KV rather than prefilling it.
 
         Returns None when the IndexMapper is saturated, which neither branch
-        survives. copy_batch_block_offsets() runs later in the SAME iteration
-        and feeds every id in the batch -- context ids included, see
-        IndexMapper::getCopyIndex -- to getIndex(), which TLLM_CHECKs on an
-        unmapped id (kvCacheManagerV2Utils.cpp). So the caller's `continue` on
-        the context path does not defer the request to a later iteration;
-        there is no later iteration. That predates the mirror refactor and is
-        left as is here; only the claim about it is corrected.
+        survives. copy_batch_block_offsets() runs later in the SAME iteration and
+        feeds every id in the batch -- context ids included, IndexMapper::getCopyIndex
+        -- to getIndex(), which TLLM_CHECKs on an unmapped id
+        (kvCacheManagerV2Utils.cpp), so the caller's `continue` defers to nothing.
+
+        Pre-existing, and left as is here; only the claim about it is corrected.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None:
@@ -4058,12 +4057,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
         The draft manager mirrors the target's tokens but is sized from its own
         byte budget, and the capacity scheduler admits on the TARGET pool alone
-        (`scheduler_v2` touches `draft_kv_cache_manager` only to suspend/free).
-        A draft pool smaller in tokens than the target therefore cannot
-        backpressure -- it can only raise, and the raise kills every rank. When
-        that happens the first question is always "how big was the draft pool
-        and how full was it", so answer it in the message rather than leaving
-        it to post-hoc arithmetic over the budget-split log line.
+        (`scheduler_v2` touches `draft_kv_cache_manager` only to suspend/free). A
+        draft pool smaller in tokens than the target cannot backpressure -- it can
+        only raise, and the raise kills every rank.
+
+        The first question is always how big the draft pool was and how full, so the
+        message answers it rather than leaving post-hoc arithmetic over the split log.
 
         """
         live = sum(c.capacity for c in self.kv_cache_map.values())

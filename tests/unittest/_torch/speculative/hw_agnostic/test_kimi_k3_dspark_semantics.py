@@ -968,13 +968,11 @@ MLA_SHORT_CTX_LEN = 20  # one page, and the block stays inside it
 def _run_mla_block_decode(drafter, requests, paged=False):
     """Drive one block decode over a BATCH, optionally through the paged cache.
 
-    ``requests`` is a list of ``(captured, noise_embed)`` pairs; each one's
-    context length is its own ``captured.shape[0]``, and they are deliberately
-    unequal. B >= 2 with unequal lengths is what makes the paged path testable
-    at all: at B == 1 the page table's stride is 1 either way, so
-    ``.t()`` and ``.t().contiguous()`` are indistinguishable, and
-    ``kv_bounds`` built with ``repeat`` instead of ``repeat_interleave`` gives
-    the same vector. Both are silent at B == 1 and wrong at B == 2.
+    ``requests`` is a list of ``(captured, noise_embed)`` pairs with deliberately
+    unequal context lengths. B >= 2 with unequal lengths is what makes the paged
+    path testable: at B == 1 the page table's stride is 1 either way, so ``.t()``
+    and ``.t().contiguous()`` are indistinguishable, and ``kv_bounds`` built with
+    ``repeat`` instead of ``repeat_interleave`` gives the same vector.
 
     ``paged=False`` keeps the dense arena the eager reference path uses.
     ``paged=True`` hands ``dflash_forward`` a page table, which is what selects
@@ -1058,11 +1056,9 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
 
     The paged variants write the draft block into the pool and read it back
     through a kernel, so a bug in that write shows up here as a parity failure
-    rather than as lower acceptance length. Both kernels are compared against
-    the same reference: they differ in whether the block's strict upper triangle
-    comes from a separate fixup (TRTLLM) or from kv_bounds inside one pass
-    (CUTEDSL), and that is precisely the part a reference can catch and
-    acceptance cannot.
+    rather than as lower acceptance length. Both kernels meet the same reference;
+    they differ in whether the strict upper triangle comes from a separate fixup
+    (TRTLLM) or from kv_bounds in one pass (CUTEDSL).
 
     Two facts say the batch is wired right rather than the tolerance being
     generous: ctx 20 is IDENTICAL across the eager and paged paths (a wrong page
@@ -1179,10 +1175,9 @@ def test_mla_dspark_backend_selects_its_own_block_decode(backend, variant):
 
     Neither worker op set may be loaded -- otherwise a drafter that never calls
     them drags in an optional dependency, and the worker's per-backend shape
-    checks (which the absorbed 64:1 / head_dim 576 shape fails) would bind on a
-    path that does not use them. What the field DOES drive is
-    _mla_block_decode_variant, and getting that wrong is silent: every variant
-    returns the same shape and only acceptance would move.
+    checks (which the absorbed 64:1 / head_dim 576 shape fails) bind on a path
+    that does not use them. What the field DOES drive is _mla_block_decode_variant,
+    and getting that wrong is silent: every variant returns the same shape.
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_dspark import (
@@ -1212,11 +1207,10 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
     """One page and one request -- the page table the runtime used to reject.
 
     (max_blocks, B) == (1, 1) has stride (1, 1) and no dimension with size > 1,
-    so CuTe DSL's layout deduction refused to pick a leading dimension even
-    though, with both extents 1, the choice cannot change an address. It is
-    reachable whenever the draft pool is one page deep and a single request is
-    resident, which is a first-draft-step shape, not an exotic one -- and since
-    AUTO resolves to CUTEDSL it would be the default path that died.
+    so CuTe DSL's layout deduction refused to pick a leading dimension even though
+    with both extents 1 the choice cannot change an address. Reachable whenever
+    the draft pool is one page deep and a single request is resident -- a
+    first-draft-step shape, and since AUTO resolves to CUTEDSL, the default path.
 
     The parity bound is the same one the batched test uses; a wrongly deduced
     axis would show up as a magnitude error, not a last-bit one.
@@ -1366,13 +1360,11 @@ def test_mla_dspark_rope_conventions_agree_on_scores():
 def test_mla_block_fixup_stays_inside_the_allocation():
     """A context that fills its allocation must still leave the block room.
 
-    The bound comes from dflash.py, so it is called here rather than restated:
-    a test that computed `allocated - block_size` itself would still pass
-    against a production path truncating to `allocated`. The MLA writes the
-    block's own latents at ctx_len..ctx_len+block_size, so that regression puts
-    the first of them on the first unallocated page, whose block-table entry
-    _refresh_ctx_block_tables clamped from a negative placeholder to 0 --
-    another request's block. Silent cross-request corruption, not a fault.
+    The bound comes from dflash.py, so it is called here rather than restated: a
+    test computing `allocated - block_size` itself would still pass against a path
+    truncating to `allocated`. The MLA writes the block's latents at
+    ctx_len..ctx_len+block_size, so that regression puts the first on the first
+    unallocated page, clamped from a negative placeholder to 0 -- another request's.
     """
     from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
     from tensorrt_llm._torch.speculative.dflash import dflash_allocated_ctx_limit

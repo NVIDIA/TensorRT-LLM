@@ -3077,26 +3077,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
         default="AUTO",
         description=
-        "Attention backend for the block decode of a standalone DSpark drafter "
-        "(one shipped as its own checkpoint rather than inside the target's "
-        "mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft, which "
-        "uses its own captured-context attention. This is independent of the "
-        "backend used to construct the drafter's standard attention modules. "
-        "AUTO picks per drafter family: TRTLLM for both a GQA- and an "
-        "MLA-backboned drafter, though the two resolve that name to different "
-        "kernels. A GQA drafter degrades to VANILLA when its kernel is "
-        "unavailable; an MLA drafter raises instead, since a build that cannot "
-        "run its kernel cannot hold the target either. "
-        "TRTLLM requires FlashInfer and an NVIDIA Blackwell "
-        "GPU with SM100 or SM103; for a GQA backbone it uses generated FMHA "
-        "kernels with a private paged context cache, and for an MLA backbone "
-        "the absorbed-MLA paged decode plus a block-local fixup. VANILLA uses "
-        "FlashAttention with a contiguous cache on a GQA backbone and the eager "
-        "torch reference on an MLA one. CUTEDSL is MLA-only: one cute-dsl pass "
-        "over context and block that replaces the fixup. It is selectable but "
-        "not a default, because it needs a cute-dsl MLA decode taking per-token "
-        "kv_bounds that is not upstream yet; requesting it on a build without "
-        "that kernel raises with the reason.")
+        "Block-decode attention backend for a standalone DSpark drafter (one "
+        "shipped as its own checkpoint, not inside the target's mtp.* "
+        "namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent "
+        "of the backend that builds the drafter's own attention modules.\n\n"
+        "AUTO resolves per drafter family and is right unless you are pinning a "
+        "kernel: a GQA backbone degrades when its kernel is missing, an MLA one "
+        "raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only "
+        "and needs a cute-dsl MLA decode taking per-token kv_bounds that is not "
+        "upstream yet. Which kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

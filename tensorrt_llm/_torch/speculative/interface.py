@@ -2076,9 +2076,8 @@ class SpecWorkerBase(nn.Module, ABC):
         A padding request decodes from an uninitialized KV/hidden state, so its
         logits can be non-finite and its probs degenerate. flashinfer's
         ``chain_speculative_sampling`` then rejects at a position whose
-        ``relu(target - draft)`` residual has no mass, where it reads an
-        uninitialized shared-memory slot and emits an out-of-range token id.
-        Zeroed logits give a uniform -- and therefore legal -- distribution.
+        ``relu(target - draft)`` residual has no mass, reads an uninitialized
+        shared-memory slot and emits an out-of-range token id. Zeroed logits are legal.
 
         Padding requests are the ones ``populate_sampling_params_for_one_model``
         routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no

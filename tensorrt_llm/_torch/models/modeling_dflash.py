@@ -950,10 +950,9 @@ class DFlashForCausalLM(nn.Module):
 
         Module granularity. A PLAIN module is the hole `allow_partial_loading`
         cannot close -- the loader skips one whose subtree filters to nothing
-        (modeling_utils.py `if module_weights:`) whatever the flag says. A FUSED
-        module `allow_partial_loading=False` would catch (linear.py asserts all
-        three shards), but the flag must stay True for the target-shared
-        modules, so this requires every component rather than any.
+        (modeling_utils.py `if module_weights:`). A FUSED module would be caught by
+        `allow_partial_loading=False`, but the flag must stay True for the
+        target-shared modules, so this requires every component rather than any.
 
         Missing parameters INSIDE a present component stay tolerated: all three
         weights but only `q_proj.bias` leaves the rest at `torch.empty`.

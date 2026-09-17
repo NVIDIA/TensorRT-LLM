@@ -212,11 +212,10 @@ def test_fused_dspark_rmsnorm_rope_norm_dim(split_norm):
     latent, leave k_pe raw.
 
     Driven through ``_rmsnorm_rope_batched`` rather than the custom op, because
-    the plumbing under test is the dispatcher's -- it has to forward norm_dim to
-    the support predicate and to the kernel. The predicate is asserted first so
-    a fused path that silently stopped applying never reads as a pass; that is
-    what made the original home of this test (hw_agnostic, mapped to CPU and
-    H100 only) vacuous, since is_sm_100f() is false there.
+    the plumbing under test is the dispatcher's -- it forwards norm_dim to the
+    support predicate and to the kernel. The predicate is asserted first so a
+    fused path that silently stopped applying never reads as a pass; that is what
+    made this test's original home (hw_agnostic, CPU/H100 only) vacuous.
     """
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         is_fused_dspark_rmsnorm_rope_supported,
