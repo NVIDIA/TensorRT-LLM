@@ -184,6 +184,44 @@ class CodexBackend(Backend):
             tools=tools,
             cwd=session_cwd,
         )
+        mcp_overrides = config.get("mcp_servers", {})
+        if any("disabled_tools" in server for server in mcp_overrides.values()):
+            # Codex replaces arrays when merging thread overrides. Preserve
+            # exclusions inherited from the native config for this session's cwd.
+            # A failed read must prevent starting a thread with weakened bans.
+            native_config = await asyncio.wait_for(
+                self._transport.request(
+                    "config/read", {"cwd": str(session_cwd), "includeLayers": True}
+                ),
+                timeout=5,
+            )
+            inherited_configs = [native_config["config"]]
+            # Starting an unrestricted session can trust a project and activate
+            # its config. Conservatively retain those exclusions as well.
+            inherited_configs.extend(
+                layer["config"]
+                for layer in native_config.get("layers") or []
+                if layer["name"]["type"] == "project" and layer.get("disabledReason") is not None
+            )
+            for name, server in mcp_overrides.items():
+                if "disabled_tools" not in server:
+                    continue
+                inherited = []
+                for inherited_config in inherited_configs:
+                    native_servers = inherited_config.get("mcp_servers") or {}
+                    excluded = native_servers.get(name, {}).get("disabled_tools")
+                    if excluded is None:
+                        continue
+                    if not isinstance(excluded, list) or not all(
+                        isinstance(tool_name, str) for tool_name in excluded
+                    ):
+                        raise ValueError(
+                            f"Native MCP disabled_tools for {name!r} must be a list of strings"
+                        )
+                    inherited.extend(excluded)
+                server["disabled_tools"] = list(
+                    dict.fromkeys([*inherited, *server["disabled_tools"]])
+                )
         config.update(model_reasoning_effort=_REASONING_EFFORT, model_context_window=1000000)
         params = ThreadStartParams(
             model=model,
