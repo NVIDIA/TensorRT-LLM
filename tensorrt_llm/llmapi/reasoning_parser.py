@@ -197,12 +197,11 @@ class IdentityReasoningParser(BaseReasoningParser):
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
-@register_reasoning_parser("qwen3")
 # Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
 # pre-injects `<think>\n` into the assistant prompt prefix, so the model
 # output begins inside the reasoning block with no opening tag to search
-# for. That requires `reasoning_at_start=True`. The existing `qwen3` key
-# keeps `reasoning_at_start=False` for back-compat, and `parse()` is
+# for. That requires `reasoning_at_start=True`. The `qwen3` key resolves
+# the mode per request instead (see `Qwen3ReasoningParser`), and `parse()` is
 # binary on this flag (it either requires `<think>` to be present in the
 # output, or assumes the output begins at the start of reasoning) - so
 # the two behaviors must be registered under separate keys.
@@ -385,6 +384,61 @@ class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
             self._parser = DeepSeekR1Parser(
                 reasoning_at_start=False,
                 chat_template_kwargs=chat_template_kwargs)
+
+
+@register_reasoning_parser("qwen3")
+class Qwen3ReasoningParser(DeepSeekV4ReasoningParser):
+    """Qwen3 family, whose hybrid templates differ in prefilling `<think>`.
+
+    Qwen3.5 and later prefill `<think>` when thinking is on, so the output
+    carries only `</think>`. The original Qwen3 template prefills nothing and
+    the model emits `<think>` itself. The mode is resolved from the rendered
+    prompt, as for `PoolsideV1ReasoningParser`.
+    """
+
+    resolves_thinking_from_prompt = True
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        kwargs = chat_template_kwargs or {}
+        if kwargs.get("thinking") is None and kwargs.get(
+                "enable_thinking") is None:
+            # Mode unresolved (offline LLM API, disagg generation server,
+            # add_generation_prompt=false). Keep splitting on a `<think>` the
+            # model emits, as the original Qwen3 template expects.
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=False,
+                chat_template_kwargs=chat_template_kwargs)
+        # Caller kwargs can turn thinking on for a template that does not
+        # prefill `<think>`, so drop one that the model emits.
+        self._strip_start = (isinstance(self._parser, DeepSeekR1Parser)
+                             and self._parser.reasoning_at_start)
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        if self._strip_start:
+            # Leading whitespace can precede a redundant `<think>`; strip the
+            # tag after it without losing the whitespace itself.
+            prefix_len = len(text) - len(text.lstrip())
+            text = text[:prefix_len] + text[prefix_len:].removeprefix(
+                self.reasoning_start)
+        return self._parser.parse(text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        result = self._parser.parse_delta(delta_text)
+        if self._strip_start and (result.content.strip()
+                                  or result.reasoning_content.strip()):
+            # `DeepSeekR1Parser` withholds a partial tag, so the first
+            # delta with real content holds the whole leading `<think>`, if
+            # any. A whitespace-only delta must not disarm the strip early,
+            # or a redundant `<think>` arriving later leaks unstripped.
+            self._strip_start = False
+            result.reasoning_content = result.reasoning_content.removeprefix(
+                self.reasoning_start)
+        return result
 
 
 @register_reasoning_parser("minimax_m3")
