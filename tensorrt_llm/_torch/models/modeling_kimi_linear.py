@@ -1972,38 +1972,58 @@ class KimiLinearDecoderLayer(nn.Module):
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
-        if num_snapshots > 0:
-            hidden_states = _apply_attn_res(
+        if capture is not None:
+            # The mixture tap needs the PRE-norm value, which the fused
+            # attn-res + RMSNorm kernel does not expose. Keep the two steps
+            # split on captured layers only and fuse everywhere else.
+            if num_snapshots > 0:
+                hidden_states = _apply_attn_res(
+                    prefix_sum,
+                    valid_block_residual,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                )
+            capture[0].maybe_capture_hidden_states(capture[1], hidden_states, None)
+            hidden_states = self.input_layernorm(hidden_states)
+        elif num_snapshots > 0:
+            hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
                 valid_block_residual,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
+                self.input_layernorm,
             )
-        if capture is not None:
-            capture[0].maybe_capture_hidden_states(capture[1], hidden_states, None)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
 
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residual[num_snapshots].copy_(prefix_sum)
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
-
-        hidden_states = self.input_layernorm(hidden_states)
         if self.is_kda:
             hidden_states = self.linear_attn(hidden_states, attn_metadata)
         else:
             hidden_states = self.self_attn(hidden_states, attn_metadata)
 
-        if prefix_sum is not None:
-            prefix_sum = prefix_sum + hidden_states
-        else:
+        if prefix_sum is None:
             prefix_sum = hidden_states
-
-        hidden_states = _apply_attn_res(
-            prefix_sum, valid_block_residual, self.mlp_res_proj, self.mlp_res_norm
-        )
-
-        hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                prefix_sum,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        else:
+            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                prefix_sum,
+                hidden_states,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
                 hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
@@ -2140,13 +2160,13 @@ class KimiLinearModel(DecoderModel):
                 )
                 spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
-        hidden_states = _apply_attn_res(
+        return _apply_attn_res_and_rmsnorm(
             hidden_states,
             block_residual[:num_snapshots],
             self.output_attn_res_proj,
             self.output_attn_res_norm,
+            self.norm,
         )
-        return self.norm(hidden_states)
 
 
 # ---------------------------------------------------------------------------
