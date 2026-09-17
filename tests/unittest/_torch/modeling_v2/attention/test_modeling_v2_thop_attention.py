@@ -172,8 +172,10 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention,
+)
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig

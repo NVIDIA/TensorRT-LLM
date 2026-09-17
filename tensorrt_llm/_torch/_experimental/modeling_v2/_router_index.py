@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
 
-_PACKAGE = "tensorrt_llm._torch.modeling_v2"
+_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 
 #: The switch. An environment variable rather than an LLM-API field, so that
 #: nothing outside this package has to carry the concept: the only upstream

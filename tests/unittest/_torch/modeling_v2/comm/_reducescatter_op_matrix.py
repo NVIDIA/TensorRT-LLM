@@ -1430,7 +1430,7 @@ def _run_one_rank() -> int:
     global COMM, RANK, WORLD, GROUP, reducescatter
     from mpi4py import MPI
 
-    from tensorrt_llm._torch.modeling_v2.catalog.comm import reducescatter as entry
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
 
     reducescatter = entry.reducescatter
     COMM = MPI.COMM_WORLD
@@ -1497,7 +1497,7 @@ def _run_wedge_rank() -> int:
     global COMM, RANK, WORLD, GROUP, reducescatter
     from mpi4py import MPI
 
-    from tensorrt_llm._torch.modeling_v2.catalog.comm import reducescatter as entry
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
 
     reducescatter = entry.reducescatter
     COMM = MPI.COMM_WORLD

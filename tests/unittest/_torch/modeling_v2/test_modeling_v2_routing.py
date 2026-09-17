@@ -23,12 +23,12 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modeling_v2._router_index import (
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     MODELING_V2_ENV,
     ModelingV2Mode,
     modeling_v2_resolve,
 )
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import (
     _is_builtin_model_class,

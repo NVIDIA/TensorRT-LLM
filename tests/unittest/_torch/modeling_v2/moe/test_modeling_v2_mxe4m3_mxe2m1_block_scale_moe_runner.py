@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
     mxe4m3_mxe2m1_block_scale_moe_runner as moe,
 )
 

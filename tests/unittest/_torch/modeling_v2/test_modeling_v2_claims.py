@@ -22,8 +22,11 @@ from pathlib import Path
 
 import pytest
 
-import tensorrt_llm._torch.modeling_v2 as _modeling_v2
-from tensorrt_llm._torch.modeling_v2._router_index import MODELING_V2_ROUTERS, routing_module
+import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    MODELING_V2_ROUTERS,
+    routing_module,
+)
 
 # The package, not this file: these paths address the tree under test, and this
 # test lives in tests/ while that tree lives in tensorrt_llm/.

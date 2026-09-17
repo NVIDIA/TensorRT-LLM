@@ -4,7 +4,9 @@
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog.quantization.mxfp8_quantize import mxfp8_quantize
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
+    mxfp8_quantize,
+)
 
 assert torch.cuda.is_available(), "mxfp8_quantize requires a CUDA device"
 

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Say which target a configuration routes to, and why.
 
-    python -m tensorrt_llm._torch.modeling_v2.explain \
+    python -m tensorrt_llm._torch._experimental.modeling_v2.explain \
         --model /path/to/DeepSeek-R1-0528-NVFP4 --tp 4 --ep 4 --attention-dp
 
 Prints the routing module's decision tree as it was actually evaluated, one
@@ -41,7 +41,7 @@ def _sm(value: Optional[str]) -> Tuple[int, int]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m tensorrt_llm._torch.modeling_v2.explain",
+        prog="python -m tensorrt_llm._torch._experimental.modeling_v2.explain",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

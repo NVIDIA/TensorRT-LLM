@@ -4,7 +4,7 @@
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
     flashinfer_fused_add_rmsnorm,
 )
 

@@ -36,12 +36,12 @@ from typing import List, NamedTuple, Optional, Sequence, Union
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (
+    mla_rope_append_paged_kv_assign_q,
+)
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (
-    mla_rope_append_paged_kv_assign_q,
-)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
