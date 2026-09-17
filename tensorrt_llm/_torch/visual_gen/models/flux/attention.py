@@ -110,13 +110,13 @@ class FluxJointAttention(Attention):
             requests_static_e4m3_attention and self.attn_backend == "CUTEDSL"
         )
         self.register_buffer(
-            "_static_q_dequant_scale", torch.empty(0, dtype=torch.float32), persistent=False
+            "_static_q_dequant_scale", torch.empty((), dtype=torch.float32), persistent=False
         )
         self.register_buffer(
-            "_static_k_dequant_scale", torch.empty(0, dtype=torch.float32), persistent=False
+            "_static_k_dequant_scale", torch.empty((), dtype=torch.float32), persistent=False
         )
         self.register_buffer(
-            "_static_v_dequant_scale", torch.empty(0, dtype=torch.float32), persistent=False
+            "_static_v_dequant_scale", torch.empty((), dtype=torch.float32), persistent=False
         )
         self._static_q_dequant_scale_value: Optional[float] = None
         self._static_k_dequant_scale_value: Optional[float] = None
@@ -213,14 +213,12 @@ class FluxJointAttention(Attention):
             "k": self._validated_e4m3_dequant_scale(k_amax, "K"),
             "v": self._validated_e4m3_dequant_scale(v_amax, "V"),
         }
-        target_device = self.norm_q.weight.device
-        for operand_name, scale_value in scale_values.items():
-            setattr(
-                self,
-                f"_static_{operand_name}_dequant_scale",
-                torch.tensor(scale_value, dtype=torch.float32, device=target_device),
-            )
-            setattr(self, f"_static_{operand_name}_dequant_scale_value", scale_value)
+        self._static_q_dequant_scale.fill_(scale_values["q"])
+        self._static_k_dequant_scale.fill_(scale_values["k"])
+        self._static_v_dequant_scale.fill_(scale_values["v"])
+        self._static_q_dequant_scale_value = scale_values["q"]
+        self._static_k_dequant_scale_value = scale_values["k"]
+        self._static_v_dequant_scale_value = scale_values["v"]
 
     @property
     def static_e4m3_attention_scales_loaded(self) -> bool:

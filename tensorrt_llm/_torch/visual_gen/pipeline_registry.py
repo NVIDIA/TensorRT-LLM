@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
-from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -183,7 +183,9 @@ class AutoPipeline:
         # Bind the per-model attributes while modules are constructed. Linear
         # uses this context to resolve optional GEMM backends, matching the LLM
         # model-construction path.
-        with model_extra_attrs(config.extra_attrs):
+        extra_attrs = dict(config.extra_attrs)
+        extra_attrs.update(get_model_extra_attrs() or {})
+        with model_extra_attrs(extra_attrs):
             return pipeline_class(config)
 
     @staticmethod
