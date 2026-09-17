@@ -301,6 +301,104 @@ def test_multimodal_forward_uses_original_token_ids_for_ple(monkeypatch) -> None
     assert output is inputs_embeds
 
 
+def test_breakable_cuda_graph_defers_ple_state_to_layer_bridge(monkeypatch) -> None:
+    from tensorrt_llm._torch.models import modeling_qwen4_exp
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
+
+    captured = {}
+
+    class _PLELayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ple = nn.Identity()
+
+        def forward(self, **kwargs: object):
+            captured.update(kwargs)
+            return kwargs["hidden_states"], None
+
+    model = object.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.model_config = SimpleNamespace(mapping=SimpleNamespace(has_pp=lambda: False))
+    model.layers = nn.ModuleList((_PLELayer(),))
+    model.num_hidden_layers = 1
+    model.ple_layer_mask = [True]
+    model.ple_layer_index = 0
+    model.has_ple = True
+    model.defer_combine_mask = [False]
+    model._bcg_model_key = "target"
+
+    monkeypatch.setattr(modeling_qwen4_exp, "is_in_breakable_cuda_graph", lambda: True)
+    monkeypatch.setattr(
+        Qwen4ExpModel,
+        "_prepare_ple_state",
+        lambda *args, **kwargs: pytest.fail("PLE state must be prepared by the replay bridge"),
+    )
+    input_ids = torch.tensor([10, 11, 12])
+    inputs_embeds = torch.randn(3, 8)
+
+    output = model(
+        attn_metadata=SimpleNamespace(mamba_metadata=None, max_num_requests=1),
+        inputs_embeds=inputs_embeds,
+        orig_input_ids=input_ids,
+    )
+
+    assert output is inputs_embeds
+    assert captured["ple_state"] is None
+    assert captured["ple_input_ids"] is input_ids
+    assert captured["ple_model_key"] == "target"
+
+
+def test_breakable_cuda_graph_ple_bridge_uses_live_state_and_fixed_output(
+    monkeypatch,
+) -> None:
+    from tensorrt_llm._torch.models import modeling_qwen4_exp
+
+    metadata = SimpleNamespace(mamba_metadata=object())
+    spec_metadata = object()
+    ple_state = (object(), object(), object())
+    calls = {}
+
+    class _PLE:
+        def __call__(self, hidden_states, *state):
+            calls["ple_state"] = state
+            return hidden_states[:2].mul(3)
+
+    def prepare_state(attn_metadata, input_ids, mamba_metadata, spec):
+        calls["prepare"] = (attn_metadata, input_ids, mamba_metadata, spec)
+        return ple_state
+
+    model = SimpleNamespace(
+        ple_layer_index=0,
+        layers=[SimpleNamespace(ple=_PLE())],
+        _prepare_ple_state=prepare_state,
+    )
+    monkeypatch.setattr(
+        modeling_qwen4_exp,
+        "_extract_qwen4_exp_model",
+        lambda model_key: (model, metadata, spec_metadata),
+    )
+    hidden_states = torch.randn(4, 8)
+    input_ids = torch.tensor([10, 11, 12, 13])
+    output = torch.full_like(hidden_states, float("nan"))
+
+    modeling_qwen4_exp.qwen4_exp_ple_inplace(
+        hidden_states,
+        input_ids,
+        "target",
+        output,
+    )
+
+    assert calls["prepare"] == (
+        metadata,
+        input_ids,
+        metadata.mamba_metadata,
+        spec_metadata,
+    )
+    assert calls["ple_state"] == ple_state
+    torch.testing.assert_close(output[:2], hidden_states[:2] * 3)
+    torch.testing.assert_close(output[2:], torch.zeros_like(output[2:]))
+
+
 def test_multimodal_forward_requires_original_token_ids_on_a_ple_rank() -> None:
     from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
 
@@ -1420,6 +1518,7 @@ def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
         num_contexts=2,
         num_seqs=2,
         num_tokens=5,
+        padded_num_tokens=8,
         seq_lens=seq_lens,
         seq_lens_cuda=seq_lens_cuda,
         all_rank_num_tokens=None,
@@ -1445,6 +1544,7 @@ def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
     assert captured["state_indices"].data_ptr() == state_indices_long.data_ptr()
     assert captured["state_indices"].dtype == torch.long
     assert captured["kwargs"]["host_seq_lens"] == [2, 3]
+    assert captured["kwargs"]["physical_tokens"] == 8
     assert captured["input_ids"].shape == (5,)
     torch.testing.assert_close(conv_state.flatten(), torch.tensor([1.0, 0.0], device=device))
     torch.testing.assert_close(

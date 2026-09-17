@@ -765,3 +765,61 @@ def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> 
     )
 
     torch.testing.assert_close(output, full_weight[local_ids])
+
+
+def test_empty_attention_dp_rank_participates_in_embedding_collectives(monkeypatch) -> None:
+    config = SimpleNamespace(
+        hidden_size=4,
+        hc_count=2,
+        ngram_size=3,
+        heads_per_ngram=1,
+        ple_embed_dim=4,
+        ple_conv_kernel_size=2,
+        vocab_size=32,
+        eos_token_id=2,
+        seed=1234,
+        ngram_vocab_size_base=11,
+        make_ngram_vocab_size_divisible_by=8,
+        rms_norm_eps=1e-6,
+    )
+    mapping = SimpleNamespace(tp_size=2, tp_rank=0, cp_size=1, enable_attention_dp=True)
+    module = Qwen4ExpPLE(config, dtype=torch.float32, mapping=mapping)
+    physical_tokens = 8
+    metadata = PLEMetadata.build(
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        is_decode=False,
+        eos_token_id=config.eos_token_id,
+        physical_tokens=physical_tokens,
+        all_rank_num_tokens=[physical_tokens, physical_tokens],
+        is_cuda_graph=True,
+    )
+    embedding_calls = []
+
+    def fake_embed(ngram_ids, *, physical_tokens, all_rank_num_tokens):
+        embedding_calls.append((ngram_ids.shape, physical_tokens, all_rank_num_tokens))
+        return torch.empty(
+            (0, module.ple_embedding.ngram_heads, module.ple_embedding.head_dim_per_ngram)
+        )
+
+    monkeypatch.setattr(module.ple_embedding, "embed", fake_embed)
+    hidden_states = torch.empty((physical_tokens, config.hidden_size * config.hc_count))
+    conv_state = torch.zeros((1, *module.conv_state_shape))
+    ngram_context = torch.full(
+        (1, module.ngram_context_len),
+        config.eos_token_id,
+        dtype=torch.long,
+    )
+
+    output = module(hidden_states, metadata, conv_state, ngram_context)
+
+    assert embedding_calls == [
+        (
+            torch.Size([0, module.ple_embedding.ngram_heads]),
+            physical_tokens,
+            [physical_tokens, physical_tokens],
+        )
+    ]
+    assert output.shape == hidden_states.shape
+    assert torch.count_nonzero(output) == 0

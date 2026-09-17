@@ -165,6 +165,187 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
     assert output is None
 
 
+@pytest.mark.parametrize("in_graph", [False, True], ids=["padded-warmup", "capture"])
+def test_qsa_fixed_output_bridge_captures_index_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    in_graph: bool,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import custom_ops, module
+
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata._num_tokens = 2
+    hidden_states = torch.randn(4, 16)
+    position_ids = torch.arange(4, dtype=torch.int32)
+    q_index = torch.randn(4, 4, 8)
+    token_k = torch.randn(4, 1, 8)
+    position_coordinates = torch.arange(12, dtype=torch.int32).reshape(4, 3)
+    projection_calls = []
+
+    def project(hidden: torch.Tensor, positions: torch.Tensor):
+        projection_calls.append((hidden, positions))
+        return q_index, token_k, position_coordinates
+
+    attention = SimpleNamespace(
+        head_dim=8,
+        indexer=SimpleNamespace(project=project),
+        layer_idx_str="3",
+        num_heads=4,
+    )
+    bridge_calls = []
+
+    def bridge(*args: object) -> None:
+        bridge_calls.append(args)
+        output = args[-1]
+        assert isinstance(output, torch.Tensor)
+        output.fill_(7)
+
+    monkeypatch.setattr(module, "is_in_breakable_cuda_graph", lambda: in_graph)
+    monkeypatch.setattr(custom_ops, "maybe_bcg_qsa_attn_inplace", bridge)
+
+    output = QSASparseHooks().forward(
+        attention=attention,
+        q=torch.empty((4, 64)),
+        k=None,
+        v=None,
+        attn_metadata=metadata,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_window_size=None,
+        attention_mask_data=None,
+        mrope_config=None,
+        attention_sinks=None,
+        relative_attention_bias=None,
+        relative_attention_max_distance=0,
+        has_lora=False,
+        output_gate=None,
+        qsa_index_hidden_states=hidden_states,
+        qsa_position_ids=position_ids,
+    )
+
+    assert projection_calls == [(hidden_states, position_ids)]
+    assert bridge_calls[0][3] is q_index
+    assert bridge_calls[0][4] is token_k
+    assert bridge_calls[0][5] is position_coordinates
+    assert output.shape == (4, 32)
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+
+
+def test_qsa_breakable_cuda_graph_bridge_uses_live_dense_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import custom_ops
+
+    metadata = object()
+    q_index = torch.randn(4, 4, 8)
+    token_k = torch.randn(4, 1, 8)
+    position_coordinates = torch.arange(12, dtype=torch.int32).reshape(4, 3)
+    calls = {}
+
+    class _Hooks:
+        def forward(self, *args: object, **kwargs: object):
+            calls["metadata"] = args[4]
+            calls["sparse_gate"] = args[13]
+            calls["projection"] = kwargs["qsa_index_projection"]
+            return None
+
+    def dense_attention(*args: object, **kwargs: object):
+        calls["dense_metadata"] = args[3]
+        assert kwargs["output"].shape == (4, 32)
+        return torch.full((2, 32), 5.0), None
+
+    def apply_output_gate(output: torch.Tensor, gate: torch.Tensor):
+        calls["dense_gate"] = gate
+        return output + gate
+
+    attention = SimpleNamespace(
+        sparse_attn_hooks=_Hooks(),
+        _attn_impl=dense_attention,
+        apply_output_gate=apply_output_gate,
+    )
+    monkeypatch.setattr(
+        custom_ops,
+        "_extract_qsa_extra_attrs",
+        lambda layer_idx: (metadata, attention),
+    )
+    output = torch.full((4, 32), float("nan"))
+    output_gate = torch.full((4, 32), 2.0)
+
+    custom_ops.qsa_attn_inplace(
+        torch.empty((4, 64)),
+        None,
+        None,
+        q_index,
+        token_k,
+        position_coordinates,
+        None,
+        None,
+        output_gate,
+        "3",
+        output,
+    )
+
+    assert calls["metadata"] is metadata
+    assert calls["dense_metadata"] is metadata
+    assert calls["sparse_gate"] is output_gate
+    torch.testing.assert_close(calls["dense_gate"], output_gate[:2])
+    assert calls["projection"] == (q_index, token_k, position_coordinates)
+    torch.testing.assert_close(output[:2], torch.full((2, 32), 7.0))
+    torch.testing.assert_close(output[2:], torch.zeros((2, 32)))
+
+
+def test_qsa_breakable_cuda_graph_bridge_copies_live_sparse_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import custom_ops
+
+    metadata = object()
+    q_index = torch.randn(4, 4, 8)
+    token_k = torch.randn(4, 1, 8)
+    position_coordinates = torch.arange(12, dtype=torch.int32).reshape(4, 3)
+    output_gate = torch.full((4, 32), 2.0)
+    calls = {}
+
+    class _Hooks:
+        def forward(self, *args: object, **kwargs: object):
+            calls["metadata"] = args[4]
+            calls["gate"] = args[13]
+            calls["projection"] = kwargs["qsa_index_projection"]
+            return torch.full((2, 32), 6.0)
+
+    def unexpected_dense_attention(*args: object, **kwargs: object):
+        raise AssertionError("dense attention must not run after sparse dispatch")
+
+    attention = SimpleNamespace(
+        sparse_attn_hooks=_Hooks(),
+        _attn_impl=unexpected_dense_attention,
+    )
+    monkeypatch.setattr(
+        custom_ops,
+        "_extract_qsa_extra_attrs",
+        lambda layer_idx: (metadata, attention),
+    )
+    output = torch.full((4, 32), float("nan"))
+
+    custom_ops.qsa_attn_inplace(
+        torch.empty((4, 64)),
+        None,
+        None,
+        q_index,
+        token_k,
+        position_coordinates,
+        None,
+        None,
+        output_gate,
+        "3",
+        output,
+    )
+
+    assert calls["metadata"] is metadata
+    assert calls["gate"] is output_gate
+    assert calls["projection"] == (q_index, token_k, position_coordinates)
+    torch.testing.assert_close(output[:2], torch.full((2, 32), 6.0))
+    torch.testing.assert_close(output[2:], torch.zeros((2, 32)))
+
+
 def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers(monkeypatch) -> None:
     monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
     manager = object.__new__(QSAMambaHybridCacheManagerV2)
