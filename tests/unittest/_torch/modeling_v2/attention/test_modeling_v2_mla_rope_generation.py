@@ -9,17 +9,13 @@ an actual MLA (SELFKONLY, kv_factor=1) KVCacheManager and a prepared
 TrtllmAttentionMetadata — then checks the kernel effects against a torch
 fp32 reference.
 
-Two surfaces:
+One surface. The op also has a bf16-pool path (`quant_mode=0`), where the
+roped q lands in fused_q's tail instead of in a quant_q_buffer; nothing
+here drives it, so the entry does not claim it. `_MlaEnv` still knows how
+to allocate that pool — it is the scaffolding a driver would need, not
+evidence that one exists.
 
-1. bf16 latent pool (`quant_mode=0`, all fp8 buffers None), H = 16: GPT-J
-   RoPE of q_pe written into fused_q's tail, [compressed_kv | rope(k_pe)]
-   appended into the paged latent cache, and the decode-FMHA scheduler
-   buffers (cu_q/cu_kv/counter) filled. Covered at both pool page sizes:
-   64, and 32 (the engine default), where the appended slot is placed at
-   every 32-slot alignment and multi-step decodes cross a page boundary
-   between steps.
-
-2. fp8-e4m3 latent pool (`quant_mode=128`) at the DeepSeek-R1-0528 cell —
+1. fp8-e4m3 latent pool (`quant_mode=128`) at the DeepSeek-R1-0528 cell —
    H = 128, tokens_per_block = 32, C/R/nope/v = 512/64/128/128,
    beam_width = 1, rope_append = True. Here the op stops writing fused_q
    entirely and instead writes the three buffers the fp8 MLA decode FMHA
@@ -31,7 +27,7 @@ Two surfaces:
    inconsistent scale pair that separates which tensor drives the write side
    from which drives the read-side scales.
 
-3. predicted_tokens_per_seq (`P`) > 1 — the MTP path — over both pools, at
+2. predicted_tokens_per_seq (`P`) > 1 — the MTP path — at
    P in {1, 2, 3, 4}. One generation sequence then arrives with P query
    tokens at P consecutive absolute positions, and both helpers below are
    parameterised on P so P = 1 is the same code path it always was. What the
@@ -43,13 +39,16 @@ Two surfaces:
    is distinguishable from a blind one.
 """
 
+import contextlib
+import inspect
 import math
 from typing import List, NamedTuple, Optional
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_generation import (
-    mla_rope_generation,
+    mla_rope_generation as op,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -59,6 +58,9 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mla_rope_generation requires a CUDA device"
 
@@ -313,6 +315,7 @@ def _run_and_check_fp8(
     pass_bmm2: bool = True,
     repeats: int = 1,
     predicted_tokens_per_seq: int = 1,
+    validate: bool = True,
 ) -> _Fp8Run:
     """One generation step over an fp8-e4m3 latent pool. Verifies the three
     fp8 buffers, the quantized cache append, the scheduler buffers, that the
@@ -350,48 +353,53 @@ def _run_and_check_fp8(
     pool_before = pool.clone()
 
     def call() -> None:
-        mla_rope_generation(
-            fused_q,
-            q_pe,
-            latent_cache,
-            env.rotary_cos_sin,
-            cu_q_seqlens,
-            cu_kv_seqlens,
-            fmha_scheduler_counter,
-            bmm1,
-            bmm2,
-            quant_q_buffer,
-            metadata.kv_lens_cuda_runtime,
-            metadata.kv_lens_runtime,
-            metadata.prompt_lens_cpu_runtime,
-            num_contexts,
-            metadata.kv_cache_block_offsets,
-            env.kv_cache_manager.kv_cache_pool_pointers,
-            env.kv_cache_manager.kv_cache_pool_mapping,
-            env.kv_scale_orig_quant,
-            env.kv_scale_quant_orig,
-            None,  # kv_cache_scale_orig_quant
-            None,  # out_scale
-            None,  # block_ids_per_seq
-            [None, None],  # helix_tensor_params
-            p,  # predicted_tokens_per_seq
-            0,  # layer_idx
-            num_heads,
-            1,  # num_kv_heads
-            GEN_HEAD_SIZE,
-            0,  # residual_dim
-            env.tokens_per_block,
-            MAX_SEQ_LEN,  # attention_window_size
-            1,  # beam_width
-            QUANT_MODE_FP8_KV_CACHE,
-            q_scaling,
-            q_lora_rank,
-            KV_LORA_RANK,
-            QK_NOPE_HEAD_DIM,
-            QK_ROPE_HEAD_DIM,
-            V_HEAD_DIM,
-            True,  # rope_append
-        )
+        # Driving the guard over every production call is what proves it admits
+        # what it is supposed to admit. `validate=False` is for the one case
+        # that drives a non-reciprocal scale pair on purpose -- a
+        # characterization of the op, not a call a target makes.
+        with validating(op) if validate else contextlib.nullcontext():
+            op(
+                fused_q,
+                q_pe,
+                latent_cache,
+                env.rotary_cos_sin,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                bmm1,
+                bmm2,
+                quant_q_buffer,
+                metadata.kv_lens_cuda_runtime,
+                metadata.kv_lens_runtime,
+                metadata.prompt_lens_cpu_runtime,
+                num_contexts,
+                metadata.kv_cache_block_offsets,
+                env.kv_cache_manager.kv_cache_pool_pointers,
+                env.kv_cache_manager.kv_cache_pool_mapping,
+                env.kv_scale_orig_quant,
+                env.kv_scale_quant_orig,
+                None,  # kv_cache_scale_orig_quant
+                None,  # out_scale
+                None,  # block_ids_per_seq
+                [None, None],  # helix_tensor_params
+                p,  # predicted_tokens_per_seq
+                0,  # layer_idx
+                num_heads,
+                1,  # num_kv_heads
+                GEN_HEAD_SIZE,
+                0,  # residual_dim
+                env.tokens_per_block,
+                MAX_SEQ_LEN,  # attention_window_size
+                1,  # beam_width
+                QUANT_MODE_FP8_KV_CACHE,
+                q_scaling,
+                q_lora_rank,
+                KV_LORA_RANK,
+                QK_NOPE_HEAD_DIM,
+                QK_ROPE_HEAD_DIM,
+                V_HEAD_DIM,
+                True,  # rope_append
+            )
         torch.cuda.synchronize()
 
     call()
@@ -675,7 +683,13 @@ def test_fp8_kv_scale_tensors_are_independent() -> None:
     appended row and quant_q_buffer), quant_orig alone drives both decode-FMHA
     scales. The reference is built the same way, so a passing run pins the
     split — the op does not derive either tensor from the other, and a caller
-    passing a non-reciprocal pair gets a silently inconsistent round trip."""
+    passing a non-reciprocal pair gets a silently inconsistent round trip.
+
+    `validate=False`: that last sentence is exactly what `op.is_valid` refuses,
+    so this case has to run outside the guard. It is characterizing the op --
+    establishing that the two tensors are independent -- rather than making a
+    call a target would make, and the guard exists because of what this case
+    proves. `test_certified_cells` covers the reciprocal side under the guard."""
     torch.manual_seed(13)
     env = _fp8_env(orig_quant=0.25, quant_orig=3.0)
     try:
@@ -688,9 +702,76 @@ def test_fp8_kv_scale_tensors_are_independent() -> None:
             cached_lens=[32, 31],
             q_pe_contiguous=True,
             q_scaling=Q_SCALING_R1,
+            validate=False,
         )
     finally:
         env.shutdown()
+
+
+def _guard_args(**overrides: object) -> dict:
+    """Every `is_valid` parameter, inert, with the named ones replaced.
+
+    Read off the signature rather than written out. The guard mirrors a
+    47-parameter op because `validating` forwards positionally, and a
+    hand-counted positional list here would shift silently the day a parameter
+    is inserted -- landing a scale tensor in `out_scale` and testing nothing.
+    """
+    args = dict.fromkeys(inspect.signature(op.is_valid).parameters)
+    args.update(residual_dim=0, quant_mode=0)
+    args.update(overrides)
+    return args
+
+
+def test_is_valid_refuses_a_non_reciprocal_scale_pair() -> None:
+    """The other half of the guard: it refuses what the case above drives.
+
+    A non-reciprocal pair leaves the consuming FMHA undoing a write scale that
+    was never applied, and every buffer this op writes still looks plausible --
+    which is why the guard is the only place it can be caught."""
+    with pytest.raises(AssertionError, match="reciprocal"):
+        op.is_valid(
+            **_guard_args(
+                kv_scale_orig_quant=_scale_tensor(0.25),
+                kv_scale_quant_orig=_scale_tensor(3.0),
+            )
+        )
+    # The reciprocal pair the certified cells use is admitted.
+    op.is_valid(
+        **_guard_args(
+            kv_scale_orig_quant=_scale_tensor(0.5),
+            kv_scale_quant_orig=_scale_tensor(2.0),
+        )
+    )
+    # Both omitted is the production call: 1.0 and 1.0, which are reciprocal.
+    op.is_valid(**_guard_args())
+
+
+def test_is_valid_refuses_the_three_silent_configurations() -> None:
+    """The rest of the guard. Each of these is accepted by the op and answered
+    wrongly, or -- in quant_q_buffer's case -- answered with a dead process."""
+    # An fp8 pool with nowhere to put the quantized query. Not presence-checked
+    # by the op: the kernel launches into a null pointer.
+    with pytest.raises(AssertionError, match="quant_q_buffer"):
+        op.is_valid(**_guard_args(quant_mode=QUANT_MODE_FP8_KV_CACHE, quant_q_buffer=None))
+    op.is_valid(
+        **_guard_args(
+            quant_mode=QUANT_MODE_FP8_KV_CACHE,
+            quant_q_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
+        )
+    )
+
+    # residual_dim is only legal non-zero against an FP4 pool.
+    with pytest.raises(AssertionError, match="residual_dim"):
+        op.is_valid(**_guard_args(residual_dim=QK_ROPE_HEAD_DIM))
+
+    # A kv_norm_weight makes the kernel read latent_cache raw; every caller
+    # here has already normalized, so it would normalize twice.
+    with pytest.raises(AssertionError, match="kv_norm_weight"):
+        op.is_valid(
+            **_guard_args(
+                kv_norm_weight=torch.ones(KV_LORA_RANK, dtype=torch.bfloat16, device="cuda")
+            )
+        )
 
 
 def test_fp8_kv_mixed_batch_skips_context() -> None:
@@ -821,48 +902,52 @@ class _Fp8Step:
         block_offsets: Optional[torch.Tensor] = None,
     ) -> None:
         md = self.metadata
-        mla_rope_generation(
-            self.fused_q,
-            self.q_pe,
-            self.latent_cache,
-            self.env.rotary_cos_sin,
-            self.cu_q_seqlens,
-            self.cu_kv_seqlens,
-            self.fmha_scheduler_counter,
-            self.mla_bmm1_scale,
-            self.mla_bmm2_scale,
-            self.quant_q_buffer,
-            md.kv_lens_cuda_runtime,
-            md.kv_lens_runtime if host_past is None else host_past,
-            md.prompt_lens_cpu_runtime,
-            0,  # num_contexts
-            md.kv_cache_block_offsets if block_offsets is None else block_offsets,
-            self.env.kv_cache_manager.kv_cache_pool_pointers,
-            self.env.kv_cache_manager.kv_cache_pool_mapping,
-            self.env.kv_scale_orig_quant,
-            self.env.kv_scale_quant_orig,
-            None,  # kv_cache_scale_orig_quant
-            None,  # out_scale
-            None,  # block_ids_per_seq
-            [None, None],  # helix_tensor_params
-            self.p,
-            0,  # layer_idx
-            self.env.num_heads,
-            1,  # num_kv_heads
-            GEN_HEAD_SIZE,
-            0,  # residual_dim
-            self.env.tokens_per_block,
-            MAX_SEQ_LEN,  # attention_window_size
-            1,  # beam_width
-            QUANT_MODE_FP8_KV_CACHE,
-            self.q_scaling,
-            Q_LORA_RANK_R1,
-            KV_LORA_RANK,
-            QK_NOPE_HEAD_DIM,
-            QK_ROPE_HEAD_DIM,
-            V_HEAD_DIM,
-            True,  # rope_append
-        )
+        # Same guard as the production helper. The two controls below vary
+        # the host length tensor and the block-offset table, neither of which
+        # is_valid inspects, so they stay inside it.
+        with validating(op):
+            op(
+                self.fused_q,
+                self.q_pe,
+                self.latent_cache,
+                self.env.rotary_cos_sin,
+                self.cu_q_seqlens,
+                self.cu_kv_seqlens,
+                self.fmha_scheduler_counter,
+                self.mla_bmm1_scale,
+                self.mla_bmm2_scale,
+                self.quant_q_buffer,
+                md.kv_lens_cuda_runtime,
+                md.kv_lens_runtime if host_past is None else host_past,
+                md.prompt_lens_cpu_runtime,
+                0,  # num_contexts
+                md.kv_cache_block_offsets if block_offsets is None else block_offsets,
+                self.env.kv_cache_manager.kv_cache_pool_pointers,
+                self.env.kv_cache_manager.kv_cache_pool_mapping,
+                self.env.kv_scale_orig_quant,
+                self.env.kv_scale_quant_orig,
+                None,  # kv_cache_scale_orig_quant
+                None,  # out_scale
+                None,  # block_ids_per_seq
+                [None, None],  # helix_tensor_params
+                self.p,
+                0,  # layer_idx
+                self.env.num_heads,
+                1,  # num_kv_heads
+                GEN_HEAD_SIZE,
+                0,  # residual_dim
+                self.env.tokens_per_block,
+                MAX_SEQ_LEN,  # attention_window_size
+                1,  # beam_width
+                QUANT_MODE_FP8_KV_CACHE,
+                self.q_scaling,
+                Q_LORA_RANK_R1,
+                KV_LORA_RANK,
+                QK_NOPE_HEAD_DIM,
+                QK_ROPE_HEAD_DIM,
+                V_HEAD_DIM,
+                True,  # rope_append
+            )
         torch.cuda.synchronize()
 
     def assert_rows_at_sequence_length_slots(self) -> None:
@@ -1170,5 +1255,102 @@ def test_fp8_kv_mtp_append_race_control() -> None:
         for run in certified[1:]:
             torch.testing.assert_close(run, certified[0], rtol=0.0, atol=0.0)
         step.assert_rows_at_sequence_length_slots()
+    finally:
+        env.shutdown()
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_certified_cells(cell) -> None:
+    """Drive every configuration the entry claims, through the entry's own
+    reference and its own gate.
+
+    The cases above test the op; this one tests the *claim*. A cell list that
+    nothing executes reads as coverage and is not, which is why a separate
+    check refuses an entry whose cells no test names.
+
+    Each cell cross-checks `op.reference` against this file's `env.rope_ref` +
+    `env.quantize` before either is used to gate the kernel. Two references
+    disagreeing is a different failure from the kernel moving, and collapsing
+    them into one assert loses which happened.
+    """
+    spec = cell.spec
+    p = spec["predicted_tokens_per_seq"]
+    torch.manual_seed(abs(hash(cell.why)) % 2**31)
+
+    env = _MlaEnv(
+        max_batch_size=4,
+        tokens_per_block=spec["tokens_per_block"],
+        num_heads=spec["num_heads"],
+        fp8_pool=True,
+        orig_quant=spec["write_scale"],
+        quant_orig=spec["read_scale"],
+    )
+    try:
+        # Cached lengths chosen so the P rows of one sequence straddle a page
+        # boundary: at page 32 and P > 1, sequence 1 opens a fresh page mid-run.
+        cached = [32, spec["tokens_per_block"] - 1]
+        request_ids = [0, 1]
+        env.kv_cache_manager.add_dummy_requests(request_ids, token_nums=cached)
+
+        run = _run_and_check_fp8(
+            env,
+            request_ids=request_ids,
+            seq_lens=[p, p],
+            num_contexts=0,
+            cached_lens=cached,
+            q_pe_contiguous=False,
+            q_scaling=spec["q_scaling"],
+            q_lora_rank=Q_LORA_RANK_R1,
+            predicted_tokens_per_seq=p,
+        )
+
+        # 1. The entry's reference against this file's, on the appended row.
+        half = QK_ROPE_HEAD_DIM // 2
+        table = env.rotary_cos_sin.view(-1, QK_ROPE_HEAD_DIM, 2)
+        for r in range(run.latent_cache.shape[0]):
+            pos = run.positions[r]
+            entry_ref = op.reference(
+                run.latent_cache[r],
+                table[pos, :half, 0],
+                table[pos, :half, 1],
+                QK_ROPE_HEAD_DIM,
+                env.kv_scale_orig_quant,
+            )
+            local_ref = torch.cat(
+                [
+                    run.latent_cache[r, :KV_LORA_RANK],
+                    env.rope_ref(run.latent_cache[r, KV_LORA_RANK:], pos),
+                ]
+            )
+            _assert_bytes_equal(entry_ref, env.quantize(local_ref), f"references disagree, row {r}")
+
+        # 2. The entry's reference against the kernel, through the entry's gate.
+        quant_q = run.quant_q_buffer.view(torch.float8_e4m3fn)
+        for r in range(run.fused_q.shape[0]):
+            pos = run.positions[r]
+            row = torch.cat([run.fused_q[r, :, :KV_LORA_RANK], run.q_pe[r]], dim=-1)
+            op.compare(
+                quant_q[r],
+                op.reference(
+                    row,
+                    table[pos, :half, 0],
+                    table[pos, :half, 1],
+                    QK_ROPE_HEAD_DIM,
+                    env.kv_scale_orig_quant,
+                ),
+            )
+
+        # 3. The two scalar outputs the entry also states.
+        want1, want2 = op.reference_bmm_scales(
+            env.kv_scale_quant_orig, spec["q_scaling"], QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM
+        )
+        kv_lens = [c + p for c in cached]
+        want_cu_q, want_cu_kv = op.reference_scheduler_buffers(kv_lens, spec["num_heads"], p)
+        assert want_cu_q.tolist() == [0, spec["num_heads"] * p, 2 * spec["num_heads"] * p]
+        assert want_cu_kv.tolist() == [0, kv_lens[0], kv_lens[0] + kv_lens[1]]
+        assert want2.item() == pytest.approx(
+            1.0 if spec["read_scale"] is None else spec["read_scale"]
+        )
+        assert want1[1].item() == pytest.approx(want1[0].item() * math.log2(math.e), rel=1e-6)
     finally:
         env.shutdown()

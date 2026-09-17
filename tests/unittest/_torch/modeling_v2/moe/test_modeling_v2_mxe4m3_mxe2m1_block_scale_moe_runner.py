@@ -4,11 +4,15 @@
 
 import math
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
     mxe4m3_mxe2m1_block_scale_moe_runner as moe,
 )
+
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
 
@@ -255,34 +259,37 @@ def _call(data, sf, args, num_experts, top_k, **kw):
     kw.setdefault("valid_hidden_size", args["valid_hidden_size"])
     kw.setdefault("valid_intermediate_size", args["valid_intermediate_size"])
     kw.setdefault("intermediate_size", args["intermediate_size"])
-    return moe(
-        kw.pop("routing_logits"),
-        kw.pop("routing_bias"),
-        data,
-        sf,
-        args["gemm1_weights"],
-        args["gemm1_weights_scale"],
-        args["gemm1_bias"],
-        kw.pop("gemm1_alpha"),
-        kw.pop("gemm1_beta"),
-        kw.pop("gemm1_clamp_limit"),
-        args["gemm2_weights"],
-        args["gemm2_weights_scale"],
-        args["gemm2_bias"],
-        num_experts,
-        top_k,
-        kw.pop("n_group"),
-        kw.pop("topk_group"),
-        kw.pop("intermediate_size"),
-        kw.pop("valid_hidden_size"),
-        kw.pop("valid_intermediate_size"),
-        kw.pop("local_expert_offset"),
-        kw.pop("local_num_experts"),
-        kw.pop("routed_scaling_factor"),
-        kw.pop("routing_method_type"),
-        kw.pop("act_type"),
-        **kw,
-    )
+    # _call is the single call site: run the guard over every call it makes.
+    # The negative cases reach the raw op directly when they want it unguarded.
+    with validating(moe):
+        return moe(
+            kw.pop("routing_logits"),
+            kw.pop("routing_bias"),
+            data,
+            sf,
+            args["gemm1_weights"],
+            args["gemm1_weights_scale"],
+            args["gemm1_bias"],
+            kw.pop("gemm1_alpha"),
+            kw.pop("gemm1_beta"),
+            kw.pop("gemm1_clamp_limit"),
+            args["gemm2_weights"],
+            args["gemm2_weights_scale"],
+            args["gemm2_bias"],
+            num_experts,
+            top_k,
+            kw.pop("n_group"),
+            kw.pop("topk_group"),
+            kw.pop("intermediate_size"),
+            kw.pop("valid_hidden_size"),
+            kw.pop("valid_intermediate_size"),
+            kw.pop("local_expert_offset"),
+            kw.pop("local_num_experts"),
+            kw.pop("routed_scaling_factor"),
+            kw.pop("routing_method_type"),
+            kw.pop("act_type"),
+            **kw,
+        )
 
 
 # ── reference ─────────────────────────────────────────────────────────────
@@ -1554,3 +1561,101 @@ def test_determinism_and_purity():
     assert torch.equal(data, data_snap) and torch.equal(sf, sf_snap)
     assert torch.equal(ids, ids_snap) and torch.equal(wts, wts_snap)
     print("  test_determinism_and_purity OK")
+
+
+def _window(args, ref, offset: int, num_local: int):
+    """The `(args, ref)` pair narrowed to one expert-parallel window."""
+    sub = dict(args)
+    for key in (
+        "gemm1_weights",
+        "gemm1_weights_scale",
+        "gemm1_bias",
+        "gemm2_weights",
+        "gemm2_weights_scale",
+        "gemm2_bias",
+    ):
+        sub[key] = args[key][offset : offset + num_local].contiguous()
+    sub_ref = dict(ref)
+    for role in ("up", "gate", "down"):
+        c, s, b = ref[role]
+        sub_ref[role] = (
+            c[offset : offset + num_local],
+            s[offset : offset + num_local],
+            b[offset : offset + num_local],
+        )
+    return sub, sub_ref
+
+
+@pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
+def test_certified_cells(cell):
+    """Drive every configuration the entry claims, through the entry's own
+    reference and its own gate.
+
+    The cases above test the op; this one tests the *claim*. A cell list that
+    nothing executes reads as coverage and is not.
+
+    Each cell cross-checks `moe.reference` against this file's `_ref_moe`
+    before either is used to gate the kernel. Two references disagreeing is a
+    different failure from the kernel moving, and collapsing them into one
+    assert loses which happened. That cross-check earns its keep here: both
+    references model the FC1 epilogue's architecture-specific block-scale
+    recipe, and a disagreement there is bit-exact rather than a tolerance.
+
+    `routed_by_kernel` is honoured rather than approximated. The gpt-oss target
+    hands the call logits and lets it route, so those cells do too; the expected
+    routing is recomputed here the way Renormalize defines it (top-k, then
+    softmax over the kept logits), which is what makes the reference comparable
+    at all.
+    """
+    spec = cell.spec
+    args, ref = _gpt_oss()
+    off, n = spec["local_expert_offset"], spec["local_num_experts"]
+    num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
+    gen = torch.Generator(device=DEV).manual_seed(abs(hash(cell.why)) % 2**31)
+
+    data, sf, xv = _rand_mxfp8(spec["tokens"], hidden, ref["h1_pad"], gen)
+    alpha, beta, limit = _swiglu_params(n)
+    sub_args, sub_ref = (args, ref) if n == num_experts else _window(args, ref, off, n)
+
+    if spec["routed_by_kernel"]:
+        logits = _logits(spec["tokens"], num_experts, gen)
+        top_v, top_i = torch.topk(logits.float(), top_k, dim=-1)
+        ids, wts = top_i.to(torch.int32), torch.softmax(top_v, dim=-1)
+        entry = dict(routing_logits=logits, routing_method_type=1)  # Renormalize
+    else:
+        ids, wts = _routing(spec["tokens"], num_experts, top_k, gen)
+        entry = dict(topk_ids=ids, topk_weights=wts)
+
+    # 1. The entry's reference against this file's, on identical inputs.
+    entry_ref = moe.reference(
+        xv,
+        ids,
+        wts,
+        sub_ref["up"],
+        sub_ref["gate"],
+        sub_ref["down"],
+        alpha=alpha,
+        beta=beta,
+        clamp_limit=limit,
+        local_expert_offset=off,
+        local_num_experts=n,
+    )
+    local_ref = _ref_moe(xv, ids, wts, sub_ref, alpha, beta, limit, offset=off, num_local=n)
+    torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
+
+    # 2. The entry's reference against the kernel, through the entry's gate.
+    y = _call(
+        data,
+        sf,
+        sub_args,
+        num_experts,
+        top_k,
+        local_expert_offset=off,
+        local_num_experts=n,
+        gemm1_alpha=alpha,
+        gemm1_beta=beta,
+        gemm1_clamp_limit=limit,
+        **entry,
+    )
+    assert y.shape == (spec["tokens"], hidden), y.shape
+    moe.compare(y, entry_ref.to(torch.bfloat16))

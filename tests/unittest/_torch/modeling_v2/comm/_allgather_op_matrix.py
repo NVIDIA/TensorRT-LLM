@@ -125,9 +125,11 @@ def _gather_ref(
     rank order. Never from a second collective.
     """
     ranks = list(range(WORLD)) if ranks is None else list(ranks)
-    return torch.cat(
-        [_payload(r, sizes[i], seed, dtype, trailing) for i, r in enumerate(ranks)],
-        dim=0,
+    # Delegates to the entry: what the concatenation is supposed to be is the
+    # entry's claim, and building it here again would be a second place to fix
+    # if it were ever wrong.
+    return allgather.reference(
+        [_payload(r, sizes[i], seed, dtype, trailing) for i, r in enumerate(ranks)]
     )
 
 
@@ -137,11 +139,11 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
     Tightened from the default dtype-aware tolerances rather than loosened —
     a gather computes nothing, so any difference at all is a wrong gather.
     """
-    if out.dtype is torch.float8_e4m3fn:
-        # torch.testing cannot compare float8 tensors; for a pure data move the
-        # byte pattern is the honest gate anyway.
-        out, ref = out.view(torch.uint8), ref.view(torch.uint8)
-    torch.testing.assert_close(out, ref, rtol=0, atol=0, msg=lambda built: f"{where}: {built}")
+    # The gate itself is the entry's `compare`; `where` only labels the failure.
+    try:
+        allgather.compare(out, ref)
+    except AssertionError as exc:
+        raise AssertionError(f"{where}: {exc}") from exc
 
 
 def _sizes_vectors() -> List[List[int]]:
@@ -332,6 +334,27 @@ def check_cuda_graph_capture_of_a_first_call_raises() -> None:
     _assert_bitwise(captured, _gather_ref([rows] * WORLD, 700), "replay after warm-up")
     del graph
     COMM.Barrier()
+
+
+def check_certified_cells() -> None:
+    """Drive the entry's own cell list, inside `validating`.
+
+    The other checks in this file say things no cell can -- CUDA graph
+    behaviour, call-order disagreement, which stream the call lands on. This one
+    says the plain thing: for every configuration the entry claims to be
+    certified over, the gather is the concatenation, and the guard admits the
+    input a shipped target passes.
+    """
+    for i, cell in enumerate(allgather.CELLS):
+        spec = cell.spec
+        rows, trailing, dtype = spec["rows"], spec["trailing"], spec["dtype"]
+        seed = 9000 + 13 * i
+        x = _payload(RANK, rows, seed, dtype, trailing)
+        with validating(allgather):
+            out = allgather(x, spec["sizes"], GROUP)
+        assert out.shape == (rows * WORLD, *trailing), (cell.why, out.shape)
+        _assert_bitwise(out, _gather_ref([rows] * WORLD, seed, dtype, trailing), cell.why)
+        COMM.Barrier()
 
 
 def check_uniform_gather() -> None:
@@ -784,7 +807,8 @@ def check_wrapper_guards_a_non_contiguous_input() -> None:
     COMM.Barrier()
 
     try:
-        allgather(view, None, GROUP)
+        with validating(allgather):
+            allgather(view, None, GROUP)
     except AssertionError:
         pass
     else:
@@ -804,7 +828,8 @@ def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
 
     for sizes in (short, [rows] * (WORLD + 1)):
         try:
-            allgather(_payload(RANK, rows, seed), sizes, GROUP)
+            with validating(allgather):
+                allgather(_payload(RANK, rows, seed), sizes, GROUP)
         except AssertionError:
             pass
         else:
@@ -819,7 +844,8 @@ def check_wrapper_guards_a_zero_dim_input() -> None:
     `AllgatherOp::run_list` and kills every rank in the job.
     """
     try:
-        allgather(torch.tensor(1.0, device="cuda"), None, GROUP)
+        with validating(allgather):
+            allgather(torch.tensor(1.0, device="cuda"), None, GROUP)
     except AssertionError:
         pass
     else:
@@ -886,6 +912,7 @@ CHECKS = (
     # Stays first: it is the only test that can observe GROUP's first-ever
     # call, and every later test needs the communicator it builds.
     check_cuda_graph_capture_of_a_first_call_raises,
+    check_certified_cells,
     check_uniform_gather,
     check_ragged_gather,
     check_output_is_fresh_and_input_is_untouched,
@@ -913,7 +940,7 @@ CHECKS = (
 
 def _run_one_rank() -> int:
     """Body of one MPI rank: run every test, abort the job if any fails."""
-    global COMM, RANK, WORLD, GROUP, allgather, DIST, MPI
+    global COMM, RANK, WORLD, GROUP, allgather, DIST, MPI, validating
     from mpi4py import MPI as _MPI
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as entry
@@ -921,6 +948,16 @@ def _run_one_rank() -> int:
     from tensorrt_llm.mapping import Mapping
 
     allgather = entry.allgather
+
+    # This file is run as a script by its own mpirun, not collected by pytest,
+    # so the repo's `__extra_import_path__` mechanism is not in play and the
+    # sibling helper has to be reached the plain way. The mutation is confined
+    # to these rank processes; the pytest process that launched them never sees
+    # it, which is what its own sys.path check is there to protect.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as _validating_cm
+
+    validating = _validating_cm
     MPI = _MPI
     COMM = MPI.COMM_WORLD
     RANK = COMM.Get_rank()

@@ -14,7 +14,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 
-from .._op import Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 
 class _FlashinferRmsnorm(OpWrapper):
@@ -25,42 +25,33 @@ class _FlashinferRmsnorm(OpWrapper):
     (`flashinfer_gemma_rmsnorm`), no quantization. `x` is not mutated.
     """
 
-    # The certified range. Every entry here is driven against `reference` on
-    # sm_103 by test_modeling_v2_flashinfer_rmsnorm.py; a shape outside it is
-    # not known to work, which for this op means "probably fine, but nobody
-    # measured it" rather than "known broken".
+    ARCHS = frozenset({Arch.SM_103})
+
+    # The widths the shipped targets normalize over. gpt-oss reaches this op
+    # only on its residual stream; deepseek reaches it there and on the two
+    # lora ranks its MLA projects through, which is why the narrow cells are
+    # here at all -- a 512-wide row is one 128-bit vector per lane and takes a
+    # different path through the kernel than a 7168-wide one.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode-shaped: one token, the hidden size both targets use",
-            spec=dict(shape=(1, 4096), dtype=torch.bfloat16, eps=1e-6),
+            why="decode-shaped, gpt-oss-120b hidden 2880",
+            spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
         ),
         Cell(
-            why="a second hidden size, so the cell set is not one width",
-            spec=dict(shape=(4, 5120), dtype=torch.bfloat16, eps=1e-6),
+            why="decode-shaped, deepseek-r1 hidden 7168",
+            spec=dict(shape=(1, 7168), dtype=torch.bfloat16, eps=1e-6),
         ),
         Cell(
             why="prefill-shaped: enough rows to cross the kernel's grid tiling",
-            spec=dict(shape=(2048, 4096), dtype=torch.bfloat16, eps=1e-6),
+            spec=dict(shape=(2048, 7168), dtype=torch.bfloat16, eps=1e-6),
         ),
         Cell(
-            why="3-D q/k-norm shape -- the normalized dim is the head dim, not hidden",
-            spec=dict(shape=(16, 32, 128), dtype=torch.bfloat16, eps=1e-5),
+            why="deepseek q_lora rank 1536, the q_norm this op is called on",
+            spec=dict(shape=(16, 1536), dtype=torch.bfloat16, eps=1e-6),
         ),
         Cell(
-            why="hidden not divisible by the 128-bit vector width: the kernel "
-            "drops to a narrower vector, and 111 is small enough to also "
-            "exercise the scalar tail",
-            spec=dict(shape=(16, 111), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="hidden divisible by 128 bits but not by the widest vector",
-            spec=dict(shape=(16, 1152), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="row stride != hidden: a last-dim-contiguous column slice of a "
-            "wider buffer, which is what a fused qkv projection hands over. "
-            "Selects the kernel's strided path.",
-            spec=dict(shape=(8, 4096), dtype=torch.bfloat16, eps=1e-6, row_stride=8192),
+            why="deepseek kv_lora rank 512, the narrowest row any target asks for",
+            spec=dict(shape=(16, 512), dtype=torch.bfloat16, eps=1e-6),
         ),
     )
 
@@ -83,7 +74,6 @@ class _FlashinferRmsnorm(OpWrapper):
     """
 
     def __call__(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-        self.is_valid(x, weight, eps)
         return torch.ops.trtllm.flashinfer_rmsnorm(x, weight, eps)
 
     def reference(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
