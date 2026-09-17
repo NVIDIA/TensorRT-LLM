@@ -2006,14 +2006,10 @@ def test_selfsampling_topk_varlen_bf16_layout_guards() -> None:
         )
 
 
-def test_selfsampling_topk_varlen_bf16_cache_device_isolation(
+def test_selfsampling_topk_varlen_cache_dtype_device_isolation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BF16 launchers must not alias across CUDA devices or architecture profiles."""
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-        gvr_topk_decode_self_sampling_bf16_host as bf16_host,
-    )
-
+    """A shared launcher keeps dtypes, devices and architecture profiles isolated."""
     shape = (160, 8192, 512, 8192, 1, 1)
     profile_sm100 = ss_host._pack_device_profile(148, 100)
     profile_sm103 = ss_host._pack_device_profile(148, 103)
@@ -2022,9 +2018,78 @@ def test_selfsampling_topk_varlen_bf16_cache_device_isolation(
         (*shape, 1, profile_sm100): ("device1_sm100",),
         (*shape, 0, profile_sm103): ("device0_sm103",),
     }
-    monkeypatch.setattr(bf16_host, "_VARLEN_CACHE_BF16", launchers)
+    fp32 = ("fp32_sm100",)
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE", {(*shape, profile_sm100): fp32})
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", launchers)
+    assert ss_host._varlen_launcher(*shape, 148, 100) is fp32
     for key, launcher in launchers.items():
-        assert bf16_host._varlen_launcher_bf16(*key) is launcher
+        device_index, profile = key[-2:]
+        num_sms, sm_version = ss_host._unpack_device_profile(profile)
+        assert (
+            ss_host._varlen_launcher(
+                *shape,
+                num_sms,
+                sm_version,
+                dtype=torch.bfloat16,
+                device_index=device_index,
+            )
+            is launcher
+        )
+    assert ss_host._varlen_launcher(*shape, 148, 100, dtype=torch.float32) is fp32
+
+
+def test_selfsampling_topk_varlen_mixed_dtype_warmup_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated warmup of either dtype keeps both captured launchers usable."""
+    for name in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16"):
+        monkeypatch.setattr(ss_host, name, {})
+    for name in ("_VARLEN_WARMUP_DONE", "_VARLEN_WARMUP_DONE_BF16"):
+        monkeypatch.setattr(ss_host, name, set())
+
+    rows, ncols, top_k, compress_ratio = 4, 32768, 1024, 4
+    generator = torch.Generator(device=_DEV).manual_seed(8173)
+    original = torch.randn((rows, ncols), generator=generator, device=_DEV).round()
+    dtypes = (torch.float32, torch.bfloat16)
+    logits = {dtype: original.to(dtype=dtype, copy=True) for dtype in dtypes}
+    indices = {
+        dtype: torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV) for dtype in dtypes
+    }
+    kv_lens = torch.full((rows,), ncols * compress_ratio, dtype=torch.int32, device=_DEV)
+    for dtype in (*dtypes, *dtypes):
+        ss_host.warmup_varlen(
+            top_k,
+            ncols * compress_ratio,
+            compress_ratio=compress_ratio,
+            num_rows_list=(rows,),
+            row_stride=ncols,
+            dtype=dtype,
+        )
+
+    graphs = {}
+    for dtype in dtypes:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            ss_host.run_varlen(
+                logits[dtype],
+                kv_lens,
+                indices[dtype],
+                compress_ratio=compress_ratio,
+                max_seq_len=ncols * compress_ratio,
+            )
+        graphs[dtype] = graph
+
+    for lengths in ([ncols, ncols - 11, top_k - 1, 0], [top_k + 3, 0, ncols // 2, top_k]):
+        kv_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=_DEV) * compress_ratio)
+        for dtype in dtypes:
+            logits[dtype].copy_(original)
+            for row, valid in enumerate(lengths):
+                logits[dtype][row, valid:] = float("inf")
+        for dtype in (*dtypes, torch.float32):
+            indices[dtype].fill_(-7)
+            graphs[dtype].replay()
+            torch.cuda.synchronize()
+            _check_bf16_varlen_exact(logits[dtype], indices[dtype], lengths)
 
 
 def test_selfsampling_topk_regclus_mixed_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
