@@ -9,6 +9,10 @@ enable_attention_dp: true
 
 # Model init args
 moe_backend: CUTLASS
+enable_autotuner: true
+autotuner_nvmmh: true
+autotuner_nvmmh_fields: [swizzle, cta_order, split_k]
+autotuner_nvmmh_max_tactics: 5
 use_cuda_graph: true
 
 # Per iteration args
