@@ -326,7 +326,7 @@
 # kernel has two production consumers (Attention and KV-cache compression), so it
 # landed in the architecture-neutral tree at /tensorrt_llm/_torch/kernels/blackwell/
 # top_k (still topk-devs, below), and the test followed it out of thop/. Attention
-# keeps the test because Attention is its primary consumer. See PR #<PR>.
+# keeps the test because Attention is its primary consumer. See PR #19275.
 /tests/unittest/_torch/kernels/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
