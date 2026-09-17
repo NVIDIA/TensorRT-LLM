@@ -950,7 +950,8 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 
         self._dequantized_weights[name] = dequant_nvfp4_2d_triton(
             packed_uint8,
-            block_scale_fp8,
+            # The dequant kernel loads raw scale bytes and bitcasts them to FP8.
+            block_scale_fp8.view(torch.uint8),
             weight_scale_2,
             target_dtype=torch.bfloat16,
             sf_vec_size=self.NVFP4_BLOCK_SIZE,
