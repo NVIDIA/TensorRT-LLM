@@ -39,6 +39,8 @@ import pytest
 from pytest import param
 
 from tensorrt_llm._torch.pyexecutor.llm_request import MAX_SPEC_DECODE_POSITIONS
+from tensorrt_llm.serve.openai_server import (
+    OpenAIServer, resolve_spec_decode_num_spec_tokens)
 from tensorrt_llm.serve.postprocess_handlers import _build_spec_decode_stats
 
 
@@ -150,3 +152,70 @@ class TestOmission:
                             per_pos_drafted=None,
                             spec_dec_totals=None), _args(num_spec_tokens=3),
             "stop") is None
+
+
+class TestNumSpecTokensResolution:
+    """What the server reports as the fixed per-step draft bound.
+
+    This value is emitted as ``num_spec_tokens`` and sizes the acceptance
+    histogram, so getting it wrong makes every histogram the wrong width.
+    """
+
+    def test_no_speculative_config_is_none(self):
+        assert resolve_spec_decode_num_spec_tokens(SimpleNamespace()) is None
+
+    def test_no_args_is_none(self):
+        assert resolve_spec_decode_num_spec_tokens(None) is None
+
+    def test_fixed_bound_is_reported(self):
+        args = SimpleNamespace(speculative_config=SimpleNamespace(
+            max_draft_len=4, draft_len_schedule=None))
+        assert resolve_spec_decode_num_spec_tokens(args) == 4
+
+    def test_draft_len_schedule_reports_no_bound(self):
+        # The bound varies by batch size, so None is the honest answer rather
+        # than whichever max_draft_len happens to be configured alongside it.
+        args = SimpleNamespace(speculative_config=SimpleNamespace(
+            max_draft_len=4, draft_len_schedule={1: 4, 8: 2}))
+        assert resolve_spec_decode_num_spec_tokens(args) is None
+
+
+class TestServerOptIn:
+    """``_apply_spec_decode_stats_opt_in`` is what reaches the handlers.
+
+    The handlers read ``return_spec_decode_stats`` and
+    ``spec_decode_num_spec_tokens`` off the postproc args; this is the only
+    place they are set, so a server that resolved its config correctly but
+    failed to apply it would emit nothing.
+    """
+
+    @staticmethod
+    def _server(enabled, num_spec_tokens=4):
+        server = object.__new__(OpenAIServer)
+        server._per_request_spec_decode_stats = enabled
+        server._spec_decode_num_spec_tokens = num_spec_tokens
+        return server
+
+    @staticmethod
+    def _args():
+        return SimpleNamespace(return_spec_decode_stats=False,
+                               spec_decode_num_spec_tokens=None)
+
+    def test_disabled_server_leaves_args_untouched(self):
+        args = self._args()
+        OpenAIServer._apply_spec_decode_stats_opt_in(self._server(False), args)
+        assert args.return_spec_decode_stats is False
+        assert args.spec_decode_num_spec_tokens is None
+
+    def test_enabled_server_propagates_fixed_bound(self):
+        args = self._args()
+        OpenAIServer._apply_spec_decode_stats_opt_in(self._server(True), args)
+        assert args.return_spec_decode_stats is True
+        assert args.spec_decode_num_spec_tokens == 4
+
+    def test_enabled_server_propagates_adaptive_bound(self):
+        args = self._args()
+        OpenAIServer._apply_spec_decode_stats_opt_in(
+            self._server(True, num_spec_tokens=None), args)
+        assert args.return_spec_decode_stats is True
+        assert args.spec_decode_num_spec_tokens is None

@@ -647,6 +647,21 @@ def _image_output_size(image) -> Optional[str]:
     return f"{width}x{height}"
 
 
+def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
+    """Fixed per-step draft bound to report, or None when there is not one.
+
+    Emitted as ``num_spec_tokens`` and used to size the acceptance histogram, so
+    a wrong answer here makes every histogram the wrong width. Returns None both
+    when speculative decoding is off and when ``draft_len_schedule`` is set --
+    the bound genuinely varies by batch size there, and None is the honest
+    answer rather than reporting whichever value happened to be configured.
+    """
+    spec_config = getattr(args, "speculative_config", None) if args else None
+    if spec_config is None or getattr(spec_config, "draft_len_schedule", None):
+        return None
+    return getattr(spec_config, "max_draft_len", None)
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -747,16 +762,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # numbers silently mounts the Prometheus endpoint too.
         self._per_request_spec_decode_stats = bool(
             args and getattr(args, "per_request_spec_decode_stats", False))
-        spec_config = getattr(args, "speculative_config",
-                              None) if args else None
-        if spec_config is None or getattr(spec_config, "draft_len_schedule",
-                                          None):
-            # No spec decode, or draft_len_schedule makes the per-step bound
-            # vary by batch size; None is the honest answer for both.
-            self._spec_decode_num_spec_tokens = None
-        else:
-            self._spec_decode_num_spec_tokens = getattr(spec_config,
-                                                        "max_draft_len", None)
+        self._spec_decode_num_spec_tokens = resolve_spec_decode_num_spec_tokens(
+            args)
         # AsyncLLM uses this flag to request engine-level snapshots. Preserve the
         # original value separately because only it controls public headers.
         if self._collect_perf_metrics and args is not None:

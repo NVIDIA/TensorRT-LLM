@@ -131,9 +131,15 @@ class TestAccumulator:
 
     def test_capacity_not_grown_when_within_initial_size(self):
         # The common case (max_draft_len <= MAX_SPEC_DECODE_POSITIONS) must not
-        # reallocate: growth is a tail path, not per-step overhead.
+        # reallocate: growth is a tail path, not per-step overhead. Identity is
+        # what pins that -- a length check alone would still pass against an
+        # implementation that rebuilt a same-sized list on every step, which is
+        # exactly the per-step cost this is meant to rule out.
         request = _fake_request(verified=4, accepted=3, draft_buffer_len=4)
+        drafted, accepted = request.py_per_pos_drafted, request.py_per_pos_accepted
         _accumulate([request], max_draft_len=4)
+        assert request.py_per_pos_drafted is drafted
+        assert request.py_per_pos_accepted is accepted
         assert len(request.py_per_pos_drafted) == MAX_SPEC_DECODE_POSITIONS
         assert len(request.py_per_pos_accepted) == MAX_SPEC_DECODE_POSITIONS
 
