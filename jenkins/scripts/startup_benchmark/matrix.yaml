@@ -1,0 +1,254 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Checkpoints must already exist locally; no downloads belong in timed trials.
+# size_group describes host checkpoint pressure, not a demonstrated HBM fit.
+# All rows still require target-node startup qualification. Optional rows are
+# excluded from the runner's default selection, but have explicit OnDemand tests.
+# One-hour startup deadlines keep a two-policy, one-repeat pilot below four hours.
+version: 1
+variants:
+  - name: native
+    config:
+      checkpoint_io_policy: native
+  - name: rank_striped
+    config:
+      checkpoint_io_policy: rank_striped_read_ahead
+
+cases:
+  # Model identities: docs/source/deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.md.
+  # No checked-in cache path or TP1/TP4 recipe exists for the dense 27B model.
+  # Pin ONE local RadixArk/Qwen3.8-27B-NVFP4 or Inferact/Qwen3.8-27B-NVFP4
+  # snapshot and use it for both rows. These minimal envelopes need qualification.
+  - name: qwen38_27b_nvfp4_tp1
+    model: ${QWEN38_27B_MODEL}
+    size_group: small
+    tp: 1
+    pp: 1
+    ep: 1
+    timeout_seconds: 3600
+    optional: false
+    checkpoint_dirs: []
+    notes: Dense 27B NVFP4; checkpoint path and TP1 serving envelope require qualification.
+    config:
+      backend: pytorch
+      max_batch_size: 1
+      max_num_tokens: 2048
+      max_seq_len: 2048
+      cuda_graph_config:
+        max_batch_size: 1
+
+  - name: qwen38_27b_nvfp4_tp4
+    model: ${QWEN38_27B_MODEL}
+    size_group: small
+    tp: 4
+    pp: 1
+    ep: 1
+    timeout_seconds: 3600
+    optional: false
+    checkpoint_dirs: []
+    notes: Same dense snapshot as TP1; TP4 serving envelope requires qualification.
+    config:
+      backend: pytorch
+      max_batch_size: 1
+      max_num_tokens: 2048
+      max_seq_len: 2048
+      cuda_graph_config:
+        max_batch_size: 1
+
+  # _model_paths.py: deepseek_v4_pro_fp4 (mixed FP4/FP8, not NVFP4 DSpark).
+  # Recipe: examples/configs/curated/deepseek-v4-pro-throughput.yaml.
+  - name: deepseek_v4_pro_fp4_tp8
+    model: ${LLM_MODELS_ROOT}/DeepSeek-V4-Pro
+    size_group: large
+    tp: 8
+    pp: 1
+    ep: 8
+    timeout_seconds: 3600
+    optional: false
+    checkpoint_dirs: []
+    notes: DeepSeek V4 Pro mixed FP4/FP8, TP8/EP8/MTP1; not V4.1 or Pro-Base FP8.
+    config:
+      backend: pytorch
+      max_batch_size: 32
+      max_num_tokens: 8448
+      max_seq_len: 9256
+      enable_attention_dp: true
+      attention_dp_config:
+        enable_balance: true
+      enable_lm_head_tp_in_adp: true
+      disable_overlap_scheduler: false
+      cuda_graph_config:
+        batch_sizes: [1, 2, 4, 8, 16, 24, 32]
+        enable_padding: true
+      kv_cache_config:
+        dtype: fp8
+        enable_block_reuse: false
+        free_gpu_memory_fraction: 0.6
+        tokens_per_block: 128
+      moe_config:
+        backend: TRTLLM
+        use_low_precision_moe_combine: true
+      speculative_config:
+        decoding_type: MTP
+        max_draft_len: 1
+      num_postprocess_workers: 4
+      print_iter_log: true
+      stream_interval: 100
+
+  # _model_paths.py: qwen3.8_max_fp4_mtp. Serving recipe in
+  # tests/integration/defs/perf/pytorch_model_config.py and QA perf test list.
+  # The accuracy reference is GB300-only; B300 HBM/startup remain unqualified.
+  - name: qwen38_max_nvfp4_tp8_mtp3
+    model: ${LLM_MODELS_ROOT}/Inferact-Qwen3.8-2.4T-A95B-NVFP4
+    size_group: large
+    tp: 8
+    pp: 1
+    ep: 1
+    timeout_seconds: 3600
+    optional: false
+    checkpoint_dirs: []
+    notes: Existing MAX NVFP4 TP8/EP1/MTP3 recipe; B300 startup qualification required.
+    config:
+      backend: pytorch
+      trust_remote_code: true
+      max_batch_size: 32
+      max_num_tokens: 8192
+      max_seq_len: 8192
+      enable_attention_dp: false
+      cuda_graph_config:
+        max_batch_size: 32
+      kv_cache_config:
+        enable_block_reuse: false
+        free_gpu_memory_fraction: 0.8
+        mamba_ssm_cache_dtype: bfloat16
+      moe_config:
+        backend: TRTLLM
+      speculative_config:
+        decoding_type: MTP
+        max_draft_len: 3
+
+  # Model identity and recipe:
+  # docs/source/deployment-guide/deployment-guide-for-glm-5-on-trtllm.md.
+  # zai-org/GLM-5.3 already contains FP8 weights; do not substitute GLM-5-FP8.
+  - name: glm53_fp8_tp8_ep8
+    model: ${GLM53_MODEL}
+    size_group: large
+    tp: 8
+    pp: 1
+    ep: 8
+    timeout_seconds: 3600
+    optional: false
+    checkpoint_dirs: []
+    notes: Prestage a pinned zai-org/GLM-5.3 FP8 snapshot; cache path needs qualification.
+    config:
+      backend: pytorch
+      max_batch_size: 128
+      max_num_tokens: 8192
+      enable_attention_dp: false
+      enable_chunked_prefill: true
+      cuda_graph_config:
+        enable_padding: true
+        max_batch_size: 128
+      kv_cache_config:
+        dtype: fp8
+        enable_block_reuse: false
+        free_gpu_memory_fraction: 0.75
+      moe_config:
+        backend: DEEPGEMM
+      stream_interval: 10
+
+  # _model_paths.py: kimi_k2.5_fp4. Accuracy recipe:
+  # tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8].
+  - name: kimi_k25_nvfp4_tp8_ep1
+    model: ${LLM_MODELS_ROOT}/Kimi-K2.5-NVFP4
+    size_group: large
+    tp: 8
+    pp: 1
+    ep: 1
+    timeout_seconds: 3600
+    optional: false
+    checkpoint_dirs: []
+    notes: Kimi K2.5 NVFP4 accuracy recipe adapted to serving; no speculative decoding.
+    config:
+      backend: pytorch
+      trust_remote_code: true
+      max_batch_size: 16
+      enable_attention_dp: false
+      kv_cache_config:
+        free_gpu_memory_fraction: 0.8
+      speculative_config: null
+
+  # Serving recipe: tests/scripts/perf-sanity/aggregated/k25_thinking_fp4_blackwell.yaml,
+  # k25_thinking_fp4_tep8_8k1k (different serving envelope from the EP1 row).
+  - name: kimi_k25_nvfp4_tp8_ep8
+    model: ${LLM_MODELS_ROOT}/Kimi-K2.5-NVFP4
+    size_group: large
+    tp: 8
+    pp: 1
+    ep: 8
+    timeout_seconds: 3600
+    optional: true
+    checkpoint_dirs: []
+    notes: Optional EP8 serving-recipe coverage; not a controlled EP1/EP8 speedup comparison.
+    config:
+      backend: pytorch
+      trust_remote_code: true
+      max_batch_size: 4
+      max_num_tokens: 12288
+      attn_backend: TRTLLM
+      enable_attention_dp: false
+      moe_config:
+        backend: TRTLLM
+      cuda_graph_config:
+        enable_padding: true
+        max_batch_size: 4
+      kv_cache_config:
+        dtype: fp8
+        enable_block_reuse: false
+        free_gpu_memory_fraction: 0.6
+      speculative_config: null
+
+  # _model_paths.py: deepseek_r1_0528_fp8. Serving recipe:
+  # tests/scripts/perf-sanity/aggregated/deepseek_r1_fp8_blackwell.yaml,
+  # r1_fp8_tp8_mtp3_1k1k. Deliberately omit forced speculative-token acceptance.
+  - name: deepseek_r1_fp8_tp8_mtp3
+    model: ${LLM_MODELS_ROOT}/DeepSeek-R1/DeepSeek-R1-0528
+    size_group: large
+    tp: 8
+    pp: 1
+    ep: 1
+    timeout_seconds: 3600
+    optional: true
+    checkpoint_dirs: []
+    notes: Optional R1-0528 FP8 TP8/EP1/MTP3 regression anchor, without forced acceptance.
+    config:
+      backend: pytorch
+      max_batch_size: 8
+      max_num_tokens: 8192
+      attn_backend: TRTLLM
+      enable_attention_dp: false
+      moe_config:
+        backend: TRTLLM
+      cuda_graph_config:
+        enable_padding: true
+        max_batch_size: 8
+      kv_cache_config:
+        dtype: fp8
+        enable_block_reuse: false
+        free_gpu_memory_fraction: 0.8
+      speculative_config:
+        decoding_type: MTP
+        max_draft_len: 3
