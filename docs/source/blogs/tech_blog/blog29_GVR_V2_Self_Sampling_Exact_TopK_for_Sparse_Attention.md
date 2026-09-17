@@ -27,6 +27,7 @@ On B200, this design delivers **5.05× geometric-mean speedup over TensorRT-LLM 
   - [From Floyd–Rivest SELECT to GPU Top-K](#from-floydrivest-select-to-gpu-top-k)
   - [From GVR V1 to V2: Why Move Beyond Temporal Hints?](#from-gvr-v1-to-v2-why-move-beyond-temporal-hints)
 - **[Self-Sampling and Multi-Thresholding](#self-sampling-and-multi-thresholding)**
+  - [Why Threshold Quality Matters: Passes and Candidate Work](#why-threshold-quality-matters-passes-and-candidate-work)
   - [Self-Sampling: Calibrate the Search to This Row](#self-sampling-calibrate-the-search-to-this-row)
   - [Multi-Thresholding: Make Each Full-Row Pass Count](#multi-thresholding-make-each-full-row-pass-count)
   - [Mapping Selection to Blackwell](#mapping-selection-to-blackwell)
@@ -125,6 +126,25 @@ Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA
 
 ## Self-Sampling and Multi-Thresholding
 
+### Why Threshold Quality Matters: Passes and Candidate Work
+
+A useful threshold balances **full-row passes and candidate work**. A loose threshold may save a scan yet admit so many candidates that processing them consumes the saving. Another pass is worthwhile only when the work it removes exceeds its cost.
+
+For a finite-score row, let $\tau$ be the exact K-th-largest score and $q\le\tau$ an admission threshold. The candidate population decomposes as
+
+$$
+C_p=C(q)=K+E+D(q,\tau),\qquad
+\frac{C_p}{K}=1+\frac{E+D(q,\tau)}{K}.
+$$
+
+Here $E$ counts excess entries tied at the boundary, and $D$ counts scores in the shell $q\le x_i\lt\tau$. Dense scores near the boundary can turn a small threshold error into large **candidate amplification**. Temporal overlap alone therefore cannot predict refinement work.
+
+![Two panels connect thresholds to exact candidate counts and decompose the admitted population into K output entries, excess boundary ties, and a below-boundary shell. V2 distinguishes this population from its crossing-bin refinement size.](../media/gvr_v2/candidate_work.svg)
+
+*Figure 4. A: exact tail counts identify thresholds satisfying $K\le C(q)\le B_r$, where $B_r$ is candidate capacity; failed admission requires continued verification or exact recovery. B: extra ties and the boundary shell enlarge the candidate population. The curve and population sizes are schematic. Exact handling of ties preserves the Top-K value multiset.*
+
+Self-sampling aims to place admission near the current tail. Multi-thresholding then distinguishes certain winners, the crossing bin, and unnecessary lower bins. The admitted count $C(q)$ governs candidate handling; the crossing population $m$ sets the size of the remaining exact selection problem. V2 controls both, while balancing those costs against full-row reads. Figure 5 shows how these steps fit together.
+
 ### Self-Sampling: Calibrate the Search to This Row
 
 V2 takes a small, deterministic sample across the valid row and uses its ranks to estimate the upper tail of the full population. The same rule works without knowing the model, layer, decode step, or previous winners. The sample chooses a starting region; full-row verification determines whether it contains enough candidates.
@@ -147,7 +167,7 @@ The proportional ranks connect the small sample to the full-row selection target
 
 ![Self-sampling, exact multi-threshold counts, and crossing-bin refinement, with three verification outcomes: refine, lower admission, or exact recovery.](../media/gvr_v2/algorithm.svg)
 
-*Figure 4. The sample histogram estimates a bracket; the verification histogram counts the complete admitted population. The lower panel shows how verification controls refinement and recovery. Bin heights and the 980/73/44 example are illustrative; exact recovery depends on the kernel family.*
+*Figure 5. The sample histogram estimates a bracket; the verification histogram counts the complete admitted population. The lower panel shows how verification controls refinement and recovery. Bin heights and the 980/73/44 example are illustrative; exact recovery depends on the kernel family.*
 
 ### Multi-Thresholding: Make Each Full-Row Pass Count
 
@@ -184,7 +204,7 @@ The histogram discretizes the search region, not the selected scores. Exact comp
 
 #### How Verification Preserves Exactness
 
-**The sample focuses the bins; exact bin counts make the sample safe.** A useful bracket keeps the crossing small, while multi-threshold verification avoids a separate full-row query for every trial boundary. Figure 4 distinguishes the resulting paths: refine a complete admitted set, lower admission when too few scores survive, or recover exactly when staging or bracket checks fail.
+**The sample focuses the bins; exact bin counts make the sample safe.** A useful bracket keeps the crossing small, while multi-threshold verification avoids a separate full-row query for every trial boundary. Figure 5 distinguishes the resulting paths: refine a complete admitted set, lower admission when too few scores survive, or recover exactly when staging or bracket checks fail.
 
 Two mechanisms have different jobs. The **admission ladder**—the primary threshold, lower floor, and conservative sentinel—widens the candidate region. The **verification bin boundaries** locate rank $K$ within that region. Non-split streaming can rescan at a lower threshold; split-row streaming can stage down to the lower floor within its scan. Overflow requires complete-set or whole-row exact recovery.
 
@@ -243,11 +263,11 @@ The minimum column retains individual regressions. Figure 1 shows the model-leve
 
 The comparison changes with the model and shape. Figure 1 shows HPC-ops closest on V3.2 and a larger DeepSelect FP32 gap there. The heatmaps resolve those averages into the row-length and batch regions where each advantage appears.
 
-Figure 5 locates the SGLang gains across the full length–batch grid.
+Figure 6 locates the SGLang gains across the full length–batch grid.
 
 ![Three heatmaps of GVR V2 speedup over SGLang for every captured row-length bucket and all eleven batch sizes, averaged geometrically across layers.](../media/gvr_v2/sglang_map.svg)
 
-*Figure 5. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 5 and 6 share the same color scale; row lengths are rounded in the axis labels.*
+*Figure 6. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 6 and 7 share the same color scale; row lengths are rounded in the axis labels.*
 
 Long rows at intermediate batch sizes show particularly strong gains: **V4 Pro reaches 4.69× at $N=262{,}127$, $B=64$**. This is the strongest shape-average result in the grid; most regions are around 1.3–2.0×.
 
@@ -255,7 +275,7 @@ DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long
 
 ![Three heatmaps of GVR V2 speedup over DeepSelect FP32 across row lengths and all eleven batch sizes, using the same color scale as the SGLang comparison.](../media/gvr_v2/deepselect_map.svg)
 
-*Figure 6. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 5: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
+*Figure 7. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 6: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
 
 For **V3.2, the gain reaches 7.58× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.26×** and **4.40×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.993×).
 
@@ -277,7 +297,7 @@ These patterns identify useful operating regions. The native API contracts below
 
 ![Cold kernel latency for all six implementations versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
-*Figure 7. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
+*Figure 8. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
 
 At $B=1$, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At $B=1024$, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.
 
@@ -303,17 +323,17 @@ P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
 P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
 $$
 
-The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 8A.
+The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 9A.
 
 ![A clean two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2 and five baselines at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
-*Figure 8.* A: the full theoretical and calibrated roofs. B: Pareto curves in the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
+*Figure 9.* A: the full theoretical and calibrated roofs. B: Pareto curves in the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
 
 #### Compare Pareto Curves and Reachable Rates
 
-Each operator's **Pareto curve** in Figure 8B traces useful throughput across intensities at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 7 retains the contrasting single-row view, and Figures 5 and 6 cover all 11 batch sizes.
+Each operator's **Pareto curve** in Figure 9B traces useful throughput across intensities at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 8 retains the contrasting single-row view, and Figures 6 and 7 cover all 11 batch sizes.
 
-The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a percentage. The table compares **average / peak reachable rate** along each Pareto curve. The average weights the plotted intensity points equally; the peak is their maximum. Both use the same layer-averaged timings as Figure 8B.
+The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a percentage. The table compares **average / peak reachable rate** along each Pareto curve. The average weights the plotted intensity points equally; the peak is their maximum. Both use the same layer-averaged timings as Figure 9B.
 
 | Operator | V4 Flash | V4 Pro | V3.2 |
 | :--- | ---: | ---: | ---: |
@@ -330,7 +350,9 @@ GVR V2 leads both measures on all three models: its average reachable rate is **
 
 #### Interpret the Remaining Gap
 
-The full ideal bound is $T_{\mathrm{roof}}=\max(Q_{\min}/\mathrm{BW},W/R_{\mathrm{compare}})$. Within the Top-K band, traffic dominates. Sampling, histogram updates, candidate staging, exact refinement, and synchronization account for work beyond the ideal minimum. The read-dominated roof is optimistic, especially when $K/N$ is large; the plotted throughput describes useful selection work rather than measured DRAM traffic.
+The full ideal bound is $T_{\mathrm{roof}}=\max(Q_{\min}/\mathrm{BW},W/R_{\mathrm{compare}})$. Within the Top-K band, traffic dominates. Sampling, histogram updates, candidate staging, exact refinement, and synchronization account for work beyond the ideal minimum.
+
+The pass/candidate tradeoff in Figure 4 explains two sources of this gap: another full-row scan adds traffic, while a loose admission threshold adds candidate work even when the scan count stays fixed. V2 uses exact bin populations to restrict the remaining selection to the crossing bin. These costs increase measured time; under the shared minimum-traffic model, they move useful throughput downward at the same intensity. The read-dominated roof is optimistic, especially when $K/N$ is large; the plotted throughput describes useful selection work rather than measured DRAM traffic.
 
 ## TensorRT-LLM Integration and Takeaways
 
@@ -346,7 +368,7 @@ TensorRT-LLM separates phase-specific row metadata from shared selection logic. 
 
 ![Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes.](../media/gvr_v2/integration.svg)
 
-*Figure 9. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
+*Figure 10. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
 
 The adapters preserve each phase's indexing semantics. Decode derives valid prefixes from device KV lengths, multi-token prediction offsets, and compression. Prefill receives `[start, end)` in compressed columns and returns indices relative to `start`. Both write INT32 indices into caller-owned output, with identity indices and `-1` padding for short rows.
 

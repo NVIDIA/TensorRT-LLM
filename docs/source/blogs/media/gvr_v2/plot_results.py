@@ -349,6 +349,120 @@ def _evolution(rows: list[dict]) -> None:
     _save(fig, "evolution")
 
 
+def _candidate_work() -> None:
+    """Illustrate tail counts and candidate amplification without measured data."""
+    fig = plt.figure(figsize=(16.7, 6.4))
+    ink, muted = "#17202b", "#52616f"
+    green, blue, orange = "#447a00", "#386781", "#b56b0b"
+    fig.text(0.04, 0.94, "A   Thresholds control candidate count", fontsize=17, weight="bold")
+    fig.text(
+        0.04,
+        0.885,
+        "Sampled anchors guide exact counts at many boundaries",
+        fontsize=12,
+        color=muted,
+    )
+    ax = fig.add_axes((0.075, 0.26, 0.425, 0.56))
+    ax.set(xlim=(0, 9.5), ylim=(0.14, 17), yscale="log")
+    ax.axhspan(3.5, 17, color="#f6eeee", zorder=0)
+    ax.axhspan(1, 3.5, color="#edf5df", zorder=0)
+    ax.axhspan(0.14, 1, color="#fff7e9", zorder=0)
+    for level in (1, 3.5):
+        ax.axhline(level, color="#94a3b8", linewidth=1, linestyle=(0, (4, 4)))
+    thresholds = np.array([0, 1, 2, 2.9, 3.8, 4.8, 5.4, 6.2, 7.1, 7.8, 8.6, 9.5])
+    counts = np.array([14, 10, 7.5, 5.5, 3.1, 2.3, 1.8, 1.3, 0.72, 0.42, 0.24, 0.16])
+    ax.step(thresholds, counts, where="post", color=ink, linewidth=2.5, zorder=3)
+    boundaries = np.linspace(3.95, 7.65, 9)
+    populations = counts[np.searchsorted(thresholds, boundaries, side="left") - 1]
+    ax.scatter(
+        boundaries, populations, s=34, color=blue, edgecolor="white", linewidth=0.8, zorder=4
+    )
+    ax.text(9.15, 8.7, "Over capacity", color="#91515a", fontsize=12, ha="right")
+    ax.text(
+        9.15, 2.55, "Bounded Top-K\nsuperset", color=green, fontsize=12, ha="right", va="center"
+    )
+    ax.text(0.35, 0.31, "Too few candidates\nLower the threshold", color=orange, fontsize=12)
+    ax.vlines(5, 0.14, 2.3, color=green, linewidth=1.4, linestyles="dashed")
+    ax.scatter([5], [2.3], s=95, color=green, edgecolor="white", linewidth=1, zorder=5)
+    ax.annotate(
+        r"Accepted $q$",
+        (5, 2.3),
+        (4.25, 7.6),
+        color=green,
+        fontsize=12,
+        arrowprops={"arrowstyle": "->", "color": green, "connectionstyle": "arc3,rad=-0.2"},
+    )
+    ax.vlines(7.1, 0.14, 1.3, color="#bd426b", linewidth=1.2, linestyles="dashed")
+    ax.plot([7.1, 7.1], [0.72, 1.3], color="#bd426b", linewidth=3, zorder=5)
+    ax.scatter([7.1], [1.3], s=30, color="#bd426b", zorder=6)
+    ax.scatter([7.1], [0.72], s=30, facecolor="white", edgecolor="#bd426b", zorder=6)
+    ax.annotate(
+        r"$\tau$: boundary tie",
+        (7.1, 1.05),
+        (8.25, 1.38),
+        ha="center",
+        fontsize=10.5,
+        color="#9d3c5b",
+        arrowprops={"arrowstyle": "->", "color": "#9d3c5b"},
+    )
+    ax.set_yticks([1, 3.5], [r"$K$", r"$B_r$"])
+    ax.minorticks_off()
+    ax.set_xticks([])
+    ax.set_ylabel(r"Candidates $C(t)$ · log scale", fontsize=12, labelpad=12)
+    ax.set_xlabel(r"Threshold $t$  →", fontsize=12, labelpad=12)
+    ax.tick_params(axis="y", length=0, pad=9, labelsize=12)
+    ax.spines["left"].set_color("#cbd5e1")
+    ax.spines["bottom"].set_color("#cbd5e1")
+    fig.text(0.075, 0.155, "●  Exact counts from shared classification", fontsize=11, color=blue)
+
+    right = fig.add_axes((0.56, 0.19, 0.4, 0.66))
+    right.set(xlim=(0, 10), ylim=(0, 7))
+    right.axis("off")
+    fig.text(0.56, 0.94, "B   Where extra candidates come from", fontsize=17, weight="bold")
+    fig.text(
+        0.56, 0.885, r"All scores at or above $q$ · schematic population", fontsize=12, color=muted
+    )
+    segments = [
+        (0, 4, "#e3efcd", green, r"$K$", "Top-K output"),
+        (4, 1.2, "#f6dfe7", "#9d3c5b", r"$E$", "Extra ties"),
+        (5.2, 4, "#ffe9c9", orange, r"$D$", "Boundary shell"),
+    ]
+    for left, width, fill, color, symbol, label in segments:
+        right.add_patch(
+            Rectangle((left, 4.6), width, 1.25, facecolor=fill, edgecolor="white", linewidth=2)
+        )
+        right.text(
+            left + width / 2, 5.22, symbol, fontsize=22, ha="center", va="center", color=color
+        )
+        label_y = 3.8 if symbol == r"$E$" else 4.12
+        right.text(left + width / 2, label_y, label, fontsize=11, ha="center", color=color)
+    right.text(4.6, 3.0, r"$C_p=C(q)=K+E+D(q,\tau)$", fontsize=20, ha="center", color=ink)
+    right.text(
+        0, 2.04, r"$C(q)$  →  classify and handle admitted candidates", fontsize=12, color=blue
+    )
+    right.text(0, 1.20, r"$m$      →  refine only the crossing bin in V2", fontsize=12, color=green)
+    right.text(
+        0, 0.35, "A dense boundary can amplify a small threshold error.", fontsize=11, color=muted
+    )
+    fig.text(
+        0.04,
+        0.055,
+        "Optimize full-row passes AND candidate work",
+        fontsize=16,
+        weight="bold",
+        color=green,
+    )
+    fig.text(
+        0.96,
+        0.055,
+        "Fewer scans can still leave more work after admission.",
+        fontsize=12,
+        color=muted,
+        ha="right",
+    )
+    _save(fig, "candidate_work")
+
+
 def _algorithm() -> None:
     fig, ax = plt.subplots(figsize=(14, 9))
     ax.set(xlim=(0, 14), ylim=(0, 7))
@@ -921,7 +1035,7 @@ def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
 
 
 def main() -> None:
-    """Validate the frozen dataset, then regenerate statistics and eight figures."""
+    """Validate the frozen dataset, then regenerate statistics and nine figures."""
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
@@ -960,6 +1074,7 @@ def main() -> None:
         )
     _overview(rows)
     _evolution(rows)
+    _candidate_work()
     _algorithm()
     _speedup_map(rows, "sglang", "SGLang", "SGLang plan + transform")
     _speedup_map(rows, "deepselect", "DeepSelect FP32", "DeepSelect FP32 · unsorted indices")
