@@ -30,7 +30,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ..fla.index import prepare_chunk_indices
 from . import _kda_decode
 
 try:
@@ -430,19 +429,11 @@ class KDAKernelDispatch:
         cu_seqlens: Optional[torch.Tensor],
         num_sequences: int,
         num_tokens: int,
-        chunk_indices: Optional[torch.Tensor] = None,
-        chunk_size: int = 64,
     ) -> bool:
         """Return whether prefill can update this V-first pool directly."""
         if self.prefill_kernel_path != "optimized" or num_tokens == 0:
             return False
         if cu_seqlens is not None:
-            if chunk_indices is None:
-                from fla.ops.utils.index import prepare_chunk_indices
-
-                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-            if chunk_indices.shape[0] < 4:
-                return False
             if cu_seqlens.shape[0] - 1 != num_sequences:
                 return False
         if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
@@ -523,20 +514,6 @@ class KDAKernelDispatch:
                 "Indexed KDA prefill requires state_indices and does not accept initial_state."
             )
         use_optimized = self.prefill_kernel_path == "optimized" and use_indexed_state
-        if use_optimized and cu_seqlens is not None:
-            if chunk_indices is None:
-                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-            # The persistent K123 scheduler needs at least 4 total chunks
-            # (cgs_per_head = NT // 4 cooperative groups per head). The
-            # eqlen path guarantees this by padding to a 256-token multiple
-            # inside the op; varlen has no such pad, so small varlen
-            # batches (short-prompt contexts, NT < 4) launch with a
-            # zero-size grid -> DSLCudaRuntimeError. Route them to the FLA
-            # reference path (negligible perf impact at these sizes). The
-            # check must happen before dispatch: the FLA fallback applies
-            # Q/K normalization and beta sigmoid in its own kernels.
-            if chunk_indices.shape[0] < 4:
-                use_optimized = False
 
         if use_indexed_state and not use_optimized:
             raise RuntimeError(

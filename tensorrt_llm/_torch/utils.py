@@ -418,6 +418,38 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
+def deep_gemm_jit_warmup_buckets(max_m: int):
+    """M grid for the DeepGemm runners that exist only to drive JIT warmup.
+
+    DeepGemm picks its tile layout from a heuristic over M and compiles one
+    kernel per selected layout. A layout no bucket selects gets compiled
+    mid-inference instead, and DeepGemm forks nvcc while holding the GIL, so
+    that compile stalls every rank of the attention-DP group.
+
+    Step 16 is exactly the right spacing, and it is needed over the whole
+    range. In ``deepgemm/csrc/jit_kernels/heuristics/sm100.hpp`` the selection
+    depends on M only through ``ceil_div(m, block_m)``, and every candidate
+    ``block_m`` is a multiple of 16, so the choice is constant on each window
+    ``[16j + 1, 16j + 16]``: one sample per window misses nothing, and anything
+    coarser skips whole windows.
+
+    A coarse high-M band is *not* safe -- ``compare`` tie-breaks on
+    ``last_wave_util = num_blocks % num_sms``, which keeps oscillating. At
+    148 SMs and ``n=128, k=512``, ``M in [2305, 2368]`` selects a layout of its
+    own (``block_m=16``: one wave, best last-wave utilization) that a step-128
+    grid steps over, sampling 2304 and 2432.
+    """
+    # A worker whose M never leaves the low band -- a disagg GEN worker runs at
+    # batch x MTP tokens -- must not be pulled up to the 4096 floor. Measured
+    # cost of doing so: +283 s of GEN autotune, +1096 tuning-cache entries.
+    if max_m < 128:
+        return tuple(range(8, 128, 8))
+    max_m = max(min(max_m, 8192), 4096)
+    low = range(8, 128, 8)
+    dense = range(128, max_m, 16)
+    return tuple(low) + tuple(dense) + (max_m, )
+
+
 def fp4_scale_infer_shape(input_shapes: List[List[int]]) -> int:
     """Calculate the swizzled scale size for a packed FP4 input tensor."""
     unpacked_shape = list(input_shapes[0])
