@@ -735,6 +735,9 @@ class PyTorchModelEngine(ModelEngine):
             EagerWorkspaceReclaimer] = None
         self.spec_metadata = None
         self.iter_states = {}
+        # Log cached prefixes in model-input sequence order when enabled.
+        self._log_cached_kv_tokens_per_req = os.getenv(
+            'TLLM_LOG_CACHED_KV_TOKENS_PER_REQ', '0') == '1'
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
         # pre-created pool handle with the outer graph runner is unnecessary.
@@ -4383,6 +4386,9 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_tokens'] = num_context_tokens
         self.iter_states['num_generation_tokens'] = num_generation_requests
         self.iter_states['cached_kv_tokens'] = cached_kv_tokens
+        if self._log_cached_kv_tokens_per_req:
+            self.iter_states['cached_kv_tokens_per_req'] = buffers[
+                'cached_token_lengths'][:num_sequences].tolist()
         if not self.is_warmup:
             self.previous_request_ids = generation_request_ids
 
@@ -4525,6 +4531,9 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_tokens'] = 0
         self.iter_states['num_generation_tokens'] = num_requests
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
+        if self._log_cached_kv_tokens_per_req:
+            self.iter_states['cached_kv_tokens_per_req'] = list(
+                num_cached_tokens_per_seq)
 
         if use_mrope:
             final_position_ids = \
@@ -5818,6 +5827,9 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_generation_tokens'] = num_generation_tokens
         # Count the already-cached prefix for the sequences scheduled this iteration.
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
+        if self._log_cached_kv_tokens_per_req:
+            self.iter_states['cached_kv_tokens_per_req'] = list(
+                num_cached_tokens_per_seq)
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
