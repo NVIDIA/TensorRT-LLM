@@ -16,9 +16,8 @@
 
     GpuDemand.of(test) -> demand.assign_rung(ladder) -> Assignment.of(...)
 
-This sits beside `selector.py` rather than inside it: `Selector` answers whether
-a test can run on one machine, while a ladder is scheduling policy the pipeline
-owns, so a per-machine object must not hold one.
+Reads marks only, never a `MachineProfile`: a test's demand is the same on every
+machine and at every rung. Whether it can run there is `selector.py`'s question.
 """
 
 from dataclasses import dataclass
@@ -31,13 +30,11 @@ from .selector import CollectedTest, Decision
 class GpuDemand:
     """How many GPUs one test wants, and the marks that say so."""
 
-    # Assumed when a test states no lower bound at all: nothing in its source
-    # says one, so `required_gpus_from` stays empty to keep the guess visible.
+    # Used when a test states no lower bound; `required_gpus_from` is then empty.
     ASSUMED_GPUS = 1
 
-    # The markers stating a GPU lower bound, in the order
-    # `Selector.resource_blockers` applies them. `skip_less_mpi_world_size` is
-    # measured in GPUs because the cluster job gives each rank one.
+    # Markers stating a GPU lower bound, in `Selector.resource_blockers` order.
+    # `skip_less_mpi_world_size` is measured in GPUs: one rank per GPU.
     MARKERS = ("skip_less_device", "skip_less_mpi_world_size")
 
     required_gpus: int
@@ -45,10 +42,9 @@ class GpuDemand:
 
     @classmethod
     def of(cls, test: CollectedTest) -> "GpuDemand":
-        """Read `test`'s lower bounds; the largest is what it demands.
+        """The largest lower bound `test` states, with the marks that stated it.
 
-        The evidence names only the maximal bounds, since those are what
-        produced the number.
+        `required_gpus_from` names only the maximal bounds.
         """
         bounds = cls.bounds_of(test)
         if not bounds:
@@ -65,9 +61,8 @@ class GpuDemand:
     def bounds_of(cls, test: CollectedTest) -> Tuple[Tuple[str, int], ...]:
         """Every GPU lower bound `test` states, as (marker, value) pairs.
 
-        Read through `closest_requirement`, the accessor `Selector.shortfall`
-        uses: demand and feasibility must not disagree about which marker is
-        nearest, and they now sit in separate modules.
+        Takes the nearest marker of each kind, through the same accessor
+        `Selector.shortfall` uses.
         """
         bounds = []
         for marker in cls.MARKERS:
@@ -78,18 +73,14 @@ class GpuDemand:
 
     @property
     def assumed(self) -> bool:
-        """True when no marker stated a bound, so the demand is our assumption.
-
-        This is the population a wrong guess sends to a 1-GPU allocation, where
-        a multi-GPU test tends to hang rather than fail fast.
-        """
+        """True when no marker stated a bound, so `required_gpus` is `ASSUMED_GPUS`."""
         return not self.required_gpus_from
 
     def assign_rung(self, ladder: Sequence[int]) -> Optional[int]:
         """The smallest rung of `ladder` that fits, or None when none does.
 
-        None is never rounded up to the largest rung: an over-sized test belongs
-        in a report, not in an allocation that cannot run it.
+        Rung order is not assumed. A demand larger than every rung gives None,
+        never the largest rung.
         """
         fitting = [rung for rung in ladder if rung >= self.required_gpus]
         return min(fitting) if fitting else None
@@ -97,12 +88,7 @@ class GpuDemand:
 
 @dataclass(frozen=True)
 class Assignment:
-    """One test's feasibility decision, paired with its demand and allocation.
-
-    A pairing rather than a wider `Decision`: `Decision.selected` keeps meaning
-    feasibility alone, which is what lets a caller apply feasibility first and
-    assignment second.
-    """
+    """One test's feasibility decision, paired with its demand and allocation."""
 
     decision: Decision
     demand: GpuDemand
@@ -118,9 +104,7 @@ class Assignment:
     ) -> "Assignment":
         """Pair `decision` with the demand read from `test`, placed on `ladder`.
 
-        With no ladder there are no allocations to choose between, so `rung` is
-        None and `unassignable` is False -- the distinction a report needs
-        between "no ladder was given" and "no rung fits this test".
+        With no ladder, `rung` is None and `unassignable` is False.
         """
         demand = GpuDemand.of(test)
         rung = None if ladder is None else demand.assign_rung(ladder)
