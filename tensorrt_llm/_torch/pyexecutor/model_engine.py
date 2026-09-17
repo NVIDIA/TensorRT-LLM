@@ -4220,6 +4220,31 @@ class PyTorchModelEngine(ModelEngine):
         pool.append(buffers)
         return buffers
 
+    def _record_cached_kv_tokens_per_req(
+        self,
+        num_cached_tokens_per_seq: Sequence[int],
+        request_groups: Sequence[tuple[Sequence[LlmRequest], int]] = (),
+    ) -> None:
+        """Log sequence counts, separating CUDA graph padding from the total.
+
+        Groups follow input packing order and specify rows per request.
+        An empty group list denotes an unpadded steady-generation batch.
+        """
+        counts = []
+        if request_groups:
+            offset = 0
+            for requests, rows_per_request in request_groups:
+                for request in requests:
+                    end = offset + rows_per_request
+                    if not request.is_cuda_graph_dummy:
+                        counts.extend(num_cached_tokens_per_seq[offset:end])
+                    offset = end
+        else:
+            counts = list(num_cached_tokens_per_seq)
+        self.iter_states['cached_kv_tokens_per_req'] = counts
+        self.iter_states['cached_kv_tokens_cuda_graph_padding'] = (
+            sum(num_cached_tokens_per_seq) - sum(counts))
+
     @nvtx_range("_prepare_encoder_decoder_inputs_fast")
     def _prepare_encoder_decoder_inputs_fast(
             self, scheduled_requests: ScheduledRequests,
@@ -4387,8 +4412,10 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_generation_tokens'] = num_generation_requests
         self.iter_states['cached_kv_tokens'] = cached_kv_tokens
         if self._log_cached_kv_tokens_per_req:
-            self.iter_states['cached_kv_tokens_per_req'] = buffers[
-                'cached_token_lengths'][:num_sequences].tolist()
+            self._record_cached_kv_tokens_per_req(
+                buffers['cached_token_lengths'][:num_sequences].tolist(),
+                ((scheduled_requests.context_requests, 1),
+                 (scheduled_requests.generation_requests, 1)))
         if not self.is_warmup:
             self.previous_request_ids = generation_request_ids
 
@@ -4532,8 +4559,7 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_generation_tokens'] = num_requests
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
         if self._log_cached_kv_tokens_per_req:
-            self.iter_states['cached_kv_tokens_per_req'] = list(
-                num_cached_tokens_per_seq)
+            self._record_cached_kv_tokens_per_req(num_cached_tokens_per_seq)
 
         if use_mrope:
             final_position_ids = \
@@ -5828,8 +5854,12 @@ class PyTorchModelEngine(ModelEngine):
         # Count the already-cached prefix for the sequences scheduled this iteration.
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
         if self._log_cached_kv_tokens_per_req:
-            self.iter_states['cached_kv_tokens_per_req'] = list(
-                num_cached_tokens_per_seq)
+            self._record_cached_kv_tokens_per_req(
+                num_cached_tokens_per_seq,
+                ((scheduled_requests.context_requests, 1), (extend_requests, 1),
+                 (first_draft_requests, 1),
+                 (generation_requests,
+                  beam_width if generation_requests else 1)))
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
