@@ -7427,14 +7427,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "max_batch_size": 4,
             "max_num_tokens": 32768,
             "cuda_graph_config": None,
-            "torch_compile_config": {
-                "enable_fullgraph": True,
-                "enable_inductor": False,
-                "enable_piecewise_cuda_graph": True,
-                "capture_num_tokens": [1, 2048],
-                "enable_userbuffers": True,
-                "max_num_streams": 3,
-            },
+            # Validate bounce transfer with eager prefill until the MiniMax-M3
+            # PCG port is ready. Re-enable context PCG with that port.
+            "torch_compile_config": None,
         }
         gen_server_config = {
             **common_config,
