@@ -419,6 +419,14 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    supports_breakable_prefill_cuda_graph: ClassVar[bool] = False
+    """Whether the model may serve with the breakable prefill CUDA graph backend while its
+    multimodal encoder is enabled. Opt in only if the language model is a plain
+    `DecoderModelForCausalLM` whose no-multimodal `prepare_multimodal_inputs` path is a passthrough
+    of `input_ids`: the runner captures the decoder body with text-only warmup requests, and the
+    executor replays graphs only for batches with no multimodal inputs (multimodal prefills run
+    eagerly), so the captured graph must read the executor's persistent input buffers."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 

@@ -1058,11 +1058,27 @@ class PyTorchModelEngine(ModelEngine):
                 and isinstance(decoder_model, DecoderModelForCausalLM)
                 and getattr(self.model, "mm_encoder", None) is None):
             return
+        # Multimodal models may opt in: only the decoder body is captured
+        # (the encoder and embedding fusion stay outside the graph), and the
+        # per-batch gate in the runner replays graphs only for batches with no
+        # multimodal inputs, so multimodal prefills run eagerly while
+        # text-only prefills get the captured graph. Attention DP is excluded:
+        # skipping prefill padding for a multimodal batch is a per-rank
+        # decision there and would diverge from the all-rank padding
+        # consensus in get_padding_params.
+        if (getattr(self.model, "supports_breakable_prefill_cuda_graph", False)
+                and isinstance(decoder_model, DecoderModelForCausalLM)
+                and not self.llm_args.enable_attention_dp):
+            return
         if (isinstance(self.model, MultimodalModelMixin) or isinstance(
                 self.input_processor, BaseMultimodalInputProcessor)):
             raise ValueError(
-                "breakable prefill CUDA graph does not support multimodal models"
-            )
+                "breakable prefill CUDA graph does not support this multimodal "
+                "model; set disable_mm_encoder=True to serve it text-only, or "
+                "have the model class declare "
+                "supports_breakable_prefill_cuda_graph = True if its decoder "
+                "body is safe to capture (multimodal prefill batches always "
+                "run eagerly)")
 
     def forward_multimodal_encoder_items(
         self,

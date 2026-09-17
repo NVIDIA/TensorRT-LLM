@@ -4154,6 +4154,22 @@ class DecoderRunner(ScheduledModelRunner):
                 mapping=self.mapping,
                 dist=self.dist,
             )
+        # A breakable-graph batch that will not replay must not be padded
+        # either: the eager path runs attention on attn_metadata.num_tokens
+        # (real) tokens while the rest of the model body keeps the padded
+        # length, which breaks any op joining the two (e.g. an attention
+        # output gate). Replay is off the table during warmup (graphs are not
+        # captured yet, and capture/BCG-warmup batches are created at exactly
+        # the bucket sizes, so they lose nothing) and for multimodal batches
+        # (the forward gate routes them eagerly because their fused
+        # inputs_embeds cannot enter a captured graph). Multimodal batches
+        # cannot reach this under attention DP: the engine-init validation
+        # rejects BREAKABLE for multimodal models with attention DP enabled.
+        prefill_backend_for_padding = self._config.prefill_cuda_graph_backend
+        if prefill_backend_for_padding == PrefillCudaGraphBackend.BREAKABLE and (
+            is_dummy or multimodal_params_list
+        ):
+            prefill_backend_for_padding = PrefillCudaGraphBackend.DISABLED
         (padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens) = (
             get_padding_params(
                 total_num_tokens,
@@ -4161,7 +4177,7 @@ class DecoderRunner(ScheduledModelRunner):
                 attn_all_rank_num_tokens,
                 dist=self.dist,
                 enable_attention_dp=self._config.enable_attention_dp,
-                prefill_cuda_graph_backend=self._config.prefill_cuda_graph_backend,
+                prefill_cuda_graph_backend=prefill_backend_for_padding,
                 prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
             )
         )
@@ -4614,10 +4630,19 @@ class DecoderRunner(ScheduledModelRunner):
                         return breakable_runner.capture_model_body(forward_step)
 
                     num_tokens = inputs["input_ids"].shape[0]
+                    # Multimodal batches must not replay: the fused
+                    # inputs_embeds is a fresh tensor each step, and BCG
+                    # replay drops the body's arguments and re-reads only the
+                    # capture-time static buffers, so the image embeddings
+                    # would silently never enter the graph.
+                    has_multimodal_inputs = inputs.get("inputs_embeds") is not None or bool(
+                        inputs.get("multimodal_params")
+                    )
                     can_run_breakable_graph = (
                         breakable_runner is not None
                         and get_per_request_prefill_cuda_graph_flag()
                         and not gather_context_logits
+                        and not has_multimodal_inputs
                         and breakable_runner.has_graph(num_tokens)
                     )
                     if can_run_breakable_graph and not breakable_runner.is_warming_up:

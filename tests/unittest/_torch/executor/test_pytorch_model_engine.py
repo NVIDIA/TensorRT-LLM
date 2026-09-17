@@ -1436,7 +1436,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             disable_mm_encoder=False)
 
         self.assertTrue(engine.is_multimodal)
-        with self.assertRaisesRegex(ValueError, "multimodal models"):
+        with self.assertRaisesRegex(ValueError, "multimodal model"):
             engine._validate_breakable_cuda_graph_compatibility()
 
     def test_breakable_allows_text_decoder_with_multimodal_processor(
@@ -1464,6 +1464,77 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertTrue(engine.is_multimodal)
         engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_allows_opted_in_multimodal_model(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.supports_breakable_prefill_cuda_graph = True
+        engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+        engine.model.mm_encoder = Mock()
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False,
+            enable_attention_dp=False)
+
+        self.assertTrue(engine.is_multimodal)
+        engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_rejects_opted_in_multimodal_model_with_adp(self) -> None:
+        # Skipping prefill padding for a multimodal batch is a per-rank
+        # decision, which diverges from the all-rank padding consensus under
+        # attention DP, so the opt-in is refused there.
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.supports_breakable_prefill_cuda_graph = True
+        engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+        engine.model.mm_encoder = Mock()
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False,
+            enable_attention_dp=True)
+
+        self.assertTrue(engine.is_multimodal)
+        with self.assertRaisesRegex(ValueError, "multimodal model"):
+            engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_rejects_opted_in_model_without_decoder_body(
+            self) -> None:
+        # The opt-in is honored only when the decoder body the runner would
+        # capture actually is a DecoderModelForCausalLM.
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.supports_breakable_prefill_cuda_graph = True
+        engine.model.llm = torch.nn.Linear(2, 2)
+        engine.model.mm_encoder = Mock()
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False,
+            enable_attention_dp=False)
+
+        self.assertTrue(engine.is_multimodal)
+        with self.assertRaisesRegex(ValueError, "multimodal model"):
+            engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_rejects_multimodal_model_without_opt_in(self) -> None:
+        # Encoder enabled and no opt-in: same rejection as before the
+        # allowlist existed, so no model gains graph replay silently.
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+        engine.model.mm_encoder = Mock()
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False)
+
+        self.assertTrue(engine.is_multimodal)
+        self.assertFalse(DummyLegacyMultimodalIndexModel.
+                         supports_breakable_prefill_cuda_graph)
+        with self.assertRaisesRegex(ValueError, "multimodal model"):
+            engine._validate_breakable_cuda_graph_compatibility()
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:

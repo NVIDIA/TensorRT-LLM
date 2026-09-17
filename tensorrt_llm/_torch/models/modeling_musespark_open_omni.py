@@ -1226,6 +1226,15 @@ class MuseSparkOpenOmniForConditionalGeneration(MultimodalModelMixin, PreTrained
 
     config_class = type(None)  # resolved from model_config, not from a HF class
 
+    # Breakable prefill CUDA graphs are safe here: the wrapped decoder is a
+    # plain ``DecoderModelForCausalLM`` (``self.llm``), and the mixin's no-MM
+    # ``prepare_multimodal_inputs`` path passes the executor's persistent
+    # ``input_ids`` buffer through untouched, which is the buffer the captured
+    # graph reads on replay. Multimodal prefill batches never replay -- the
+    # executor gate (``model_engine.forward``) sends any batch carrying
+    # ``multimodal_params`` or ``inputs_embeds`` down the eager path.
+    supports_breakable_prefill_cuda_graph = True
+
     # -- class-level contracts the takeover must not drop ----------------
     #
     # The framework asks these three of the registered CLASS, before any
