@@ -7140,7 +7140,7 @@ class PyExecutor:
         self._pending_adp_dummy_request = dummy_request
 
     @nvtx_range("_prepare_disagg_gen_resources")
-    def _prepare_disagg_gen_resources(self, requests: List[LlmRequest]):
+    def _prepare_disagg_gen_resources(self, requests: List[LlmRequest]) -> None:
         """Prepare resource-manager state for gen-init requests about to
         receive their KV cache; the coordinator calls this right before it
         starts the receive."""
