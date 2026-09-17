@@ -188,6 +188,8 @@ Register families bypass sparse sampling but retain exact histogram crossing and
 
 This explains the two sources of performance improvement: a better starting threshold reduces selection work, and a suitable kernel family reduces the cost of executing that work. Neither eliminates the obligation to examine all valid scores.
 
+[PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076) extends this execution policy through host dispatch while keeping the device kernels unchanged. It adds register plans for roughly 4K–8K-score rows, sizes register waves using the device's SM count, and includes targeted B300 routing. A common 96-candidate gate also keeps large crossing bins out of the quadratic direct-ranking path, avoiding a long quadratic detour for a difficult row. This makes dispatch part of the same practical performance-floor objective as calibration and recovery.
+
 ## Performance Against Five Baselines
 
 ### Benchmark Setup
@@ -331,6 +333,8 @@ This separation keeps phase-specific decisions in the wrapper, dispatch, and com
 
 Host routing chooses a stable launch envelope; device metadata supplies each row's actual length. The physical memory bound remains separate from the bound used to select an execution plan. Warmup prepares exact-row decode launchers and a bounded set of prefill tiers and width buckets, with distinct compilation-cache keys for the two phase specializations. [PR #18683](https://github.com/NVIDIA/TensorRT-LLM/pull/18683) and [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) establish these rules.
 
+[PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076) also selects a sampled prefill plan for qualifying small row envelopes. Execution, readiness checks, and warmup share the envelope-dependent plan rule; decode launcher and warmup caches distinguish the device's SM count and architecture. These changes improve plan selection around the shared kernel while keeping graph preparation consistent with execution.
+
 Unsupported layouts use exact native selection. If a prefill specialization is missing during CUDA Graph capture, `TopK` selects radix without compiling inside capture. Both adapters preserve the exact output contract when the fast path is unavailable.
 
 ### Serving Gains from the Shared Engine
@@ -385,5 +389,6 @@ Implementation milestones:
 - [PR #18683: physical envelopes and exact-row warmup](https://github.com/NVIDIA/TensorRT-LLM/pull/18683).
 - [PR #18446: configuration-based dispatch and prior-state removal for V2](https://github.com/NVIDIA/TensorRT-LLM/pull/18446).
 - [PR #18702: self-sampling prefill](https://github.com/NVIDIA/TensorRT-LLM/pull/18702).
+- [PR #19076: register-plan tuning, a unified crossing-bin gate, sampled prefill plans, and SM-aware B200/B300 dispatch](https://github.com/NVIDIA/TensorRT-LLM/pull/19076).
 
 For the surrounding model pipeline, see [Sparse Attention in TensorRT-LLM](blog17_Sparse_Attention_in_TensorRT-LLM.md) and [DeepSeek-V4 on NVIDIA Blackwell](blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md).

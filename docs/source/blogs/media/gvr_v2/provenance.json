@@ -45,11 +45,12 @@
   },
   "illustrative_figures": {
     "temporal_overlap.svg": {
-      "sha256": "f44c09a246ad12fbf51c806999f29490ea2e8dae69b633f88dea0253e56e1a84",
+      "sha256": "4b9081122fb8f4fa208f4e3c66acc76bfd0ee131fab14cd9ef424db5b28be63c",
       "source": "Temporal Top-K overlap figure supplied by the article authors",
       "conversion": "Standalone figure converted from PDF to SVG; plotted values, labels, vector axes, and embedded point clouds preserved.",
       "scope": "SWE-bench-64K traces for DeepSeek-V3.2 and DeepSeek-V4 Pro; coordinate-aligned overlap, distinct from kernel timing comparisons.",
-      "reproduction": "Imported figure asset; not generated from the bundled kernel-timing CSVs."
+      "reproduction": "Imported figure asset; not generated from the bundled kernel-timing CSVs.",
+      "display": "Intrinsic width is 1200 CSS pixels for responsive full-column display; the original viewBox, aspect ratio, and plotted content are preserved."
     }
   }
 }

@@ -51,6 +51,8 @@ Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,0
 
 The primary reference is the hint-free GVR V2 `run_varlen` implementation. DeepSelect FP32 and HPC-ops were measured in the same process as that reference. Radix CUDA, SGLang, FlashInfer, and the temporal GVR implementations use matched observations from separate runs. These comparisons describe the bundled implementations and workloads; they are not a current-release, equal-interface benchmark of entire serving frameworks.
 
+The article also describes dispatch improvements in [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076). Its targeted B200/B300 measurements are separate from this frozen comparison grid; the existing figures and summaries have not been recomputed for that PR.
+
 | Implementation | Relevant comparison contract |
 | :--- | :--- |
 | GVR V2 | FP32 scores, valid row lengths, unordered INT32 indices |
