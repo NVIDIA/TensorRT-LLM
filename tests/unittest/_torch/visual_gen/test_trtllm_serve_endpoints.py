@@ -716,6 +716,10 @@ def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, m
         pytest.skip("cannot make a directory unwritable for root")
 
     monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    # The fallback creates a real directory, so point it inside tmp_path for
+    # pytest to remove. Setting TMPDIR would not reach it: tempfile caches the
+    # directory on first use, and this process has already used it.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     read_only = tmp_path / "read_only"
     read_only.mkdir()
     read_only.chmod(0o555)
