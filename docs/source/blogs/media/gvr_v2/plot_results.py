@@ -568,6 +568,103 @@ def _algorithm() -> None:
     _save(fig, "algorithm")
 
 
+def _gpu_sampling() -> None:
+    """Show sample-window ownership and the on-chip calibration pipeline."""
+    fig, ax = plt.subplots(figsize=(16.7, 7.0))
+    fig.subplots_adjust(left=0.025, right=0.985, bottom=0.03, top=0.97)
+    ax.set(xlim=(0, 16), ylim=(0, 7))
+    ax.axis("off")
+    ink, muted = "#17202b", "#52616f"
+    blue, purple = "#386781", "#7557a6"
+    ax.text(
+        0.1, 6.68, "Spread short sample windows across the current row", fontsize=21, weight="bold"
+    )
+    windows = (0.7, 5.5, 10.3)
+    for j, x in enumerate(windows):
+        ax.add_patch(Rectangle((x, 5.65), 2.4, 0.4, facecolor="#e3efcd", edgecolor="#a7c976"))
+        ax.text(
+            x + 1.2, 5.85, f"Window {j}", ha="center", va="center", fontsize=15, color="#447a00"
+        )
+        if j < 2:
+            ax.plot([x + 2.55, x + 4.65], [5.85, 5.85], color="#b6c0c9", linestyle=(0, (2, 3)))
+    ax.text(13.05, 5.83, "…", fontsize=22, color=muted)
+    ax.text(
+        0.7,
+        5.2,
+        "Window starts use a regular stride; no previous-index lookup or random-number generation.",
+        fontsize=15,
+        color=muted,
+    )
+
+    panels = [
+        (0.7, "MAIN · 8 scores / 32 bytes", 8, 0.56),
+        (8.3, "CLUS · 16 scores / 64 bytes", 16, 0.38),
+    ]
+    for x, heading, scores, width in panels:
+        ax.text(x, 4.57, heading, fontsize=19, weight="bold", color=ink)
+        for i in range(scores):
+            fill = "#dcebf3" if i < 8 else "#e9dff4"
+            ax.add_patch(
+                Rectangle(
+                    (x + i * width, 3.38),
+                    width,
+                    0.56,
+                    facecolor=fill,
+                    edgecolor="white",
+                    linewidth=1,
+                )
+            )
+        for vector in range(scores // 4):
+            left = x + vector * 4 * width
+            ax.add_patch(
+                Rectangle(
+                    (left, 3.38), 4 * width, 0.56, fill=False, edgecolor="#8e9ba7", linewidth=1
+                )
+            )
+            ax.text(left + 2 * width, 4.1, "float4 · 16 B", ha="center", fontsize=13, color=muted)
+        for worker in range(scores // 8):
+            start = x + worker * 8 * width
+            color = blue if worker == 0 else purple
+            ax.plot(
+                [start, start, start + 8 * width, start + 8 * width],
+                [3.21, 3.08, 3.08, 3.21],
+                color=color,
+                linewidth=1.2,
+            )
+            label = "Work item j" if worker == 0 else "Work item j + P"
+            ax.text(start + 4 * width, 2.78, label, fontsize=15, ha="center", color=color)
+        ax.text(
+            x,
+            2.3,
+            "Two vector loads per work item; eight retained sample scores.",
+            fontsize=14,
+            color=muted,
+        )
+
+    stages = [
+        (0.2, "1  REGISTER VALUES", "Warp min/max reductions"),
+        (5.6, "2  SHARED HISTOGRAM", "256 bins · atomic increments"),
+        (11.0, "3  WARP-0 SCAN", "Rank crossings → anchors"),
+    ]
+    for x, heading, description in stages:
+        _box(ax, (x, 0.63), (4.75, 1.05), heading + "\n" + description, "#f1f5f8", 15)
+        if x < 11:
+            ax.annotate(
+                "",
+                (x + 5.25, 1.15),
+                (x + 4.85, 1.15),
+                arrowprops={"arrowstyle": "->", "color": muted, "lw": 1.5},
+            )
+    ax.text(
+        0.2,
+        0.11,
+        "P = number of sample windows. CTA threads process work items in strides; a window is not a CUDA block.",
+        fontsize=13,
+        color=muted,
+    )
+    _save(fig, "gpu_sampling")
+
+
 def _integration() -> None:
     fig, ax = plt.subplots(figsize=(14, 8.4))
     ax.set(xlim=(0, 14), ylim=(0, 9))
@@ -1035,7 +1132,7 @@ def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
 
 
 def main() -> None:
-    """Validate the frozen dataset, then regenerate statistics and nine figures."""
+    """Validate the frozen dataset, then regenerate statistics and ten figures."""
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
@@ -1076,6 +1173,7 @@ def main() -> None:
     _evolution(rows)
     _candidate_work()
     _algorithm()
+    _gpu_sampling()
     _speedup_map(rows, "sglang", "SGLang", "SGLang plan + transform")
     _speedup_map(rows, "deepselect", "DeepSelect FP32", "DeepSelect FP32 · unsorted indices")
     _latency(rows)

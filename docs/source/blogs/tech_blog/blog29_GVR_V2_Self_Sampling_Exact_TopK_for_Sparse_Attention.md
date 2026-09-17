@@ -147,27 +147,54 @@ Self-sampling aims to place admission near the current tail. Multi-thresholding 
 
 ### Self-Sampling: Calibrate the Search to This Row
 
-V2 takes a small, deterministic sample across the valid row and uses its ranks to estimate the upper tail of the full population. The same rule works without knowing the model, layer, decode step, or previous winners. The sample chooses a starting region; full-row verification determines whether it contains enough candidates.
-
-In the `main` family, a sample unit is two adjacent `float4` vectors: eight scores loaded together. The clustered streaming family uses four vectors, or sixteen scores. Sample units are regularly spaced across the valid interval. Their addresses follow from the row layout, so sampling does not wait for previous-step indices. Regular spacing is not a guarantee of statistical unbiasedness: it can still miss an unusual tail. Its role is to reduce work, not to decide output membership.
-
-Let $S$ be the sample size and $A\ge K$ the desired full-row candidate population. A **256-bin sample histogram** approximates the score distribution. Descending sample ranks
-
-$$
-r_A\approx\frac{AS}{N},\qquad r_K\approx\frac{KS}{N},\qquad r_{2A}\approx\frac{2AS}{N}
-$$
-
-provide three anchors:
-
-- **Primary threshold $T$:** aim for roughly $A$ survivors, leaving room around the desired $K$ winners.
-- **Upper anchor $T_K$:** estimate the neighborhood of rank $K$; together with $T$, it defines the upper classification bound $H$ (`HIC` in the implementation).
-- **Lower floor $T_{\mathrm{floor}}$:** admit a larger population if the first estimate is too aggressive (`TSH` in the implementation).
-
-The proportional ranks connect the small sample to the full-row selection target. Unlike SELECT's recursively selected sample pivots, V2 estimates these anchors from histogram bins and budgets them around candidate capacity. Sample sizes, safety margins, and capacity clamps depend on the launch family. The estimate requires neither independent random samples nor a known analytical distribution; exact verification handles a poor estimate.
+V2 calibrates inside the selection kernel, using the current row's layout to generate sample addresses. It needs neither previous winners nor a separate sampling kernel. The sample estimates a useful starting region; full-row verification determines whether that region contains enough candidates.
 
 ![Self-sampling, exact multi-threshold counts, and crossing-bin refinement, with three verification outcomes: refine, lower admission, or exact recovery.](../media/gvr_v2/algorithm.svg)
 
 *Figure 5. The sample histogram estimates a bracket; the verification histogram counts the complete admitted population. The lower panel shows how verification controls refinement and recovery. Bin heights and the 980/73/44 example are illustrative; exact recovery depends on the kernel family.*
+
+#### Load Short Windows, Spread Them Across the Row
+
+A **sample window** is a contiguous group of scores. A CUDA thread block processes many such windows. The streaming families use these layouts:
+
+| Family | Scores per window | Loads and logical ownership |
+| :--- | :--- | :--- |
+| `main` | 8 FP32 scores = 32 bytes | Work item `j` loads two adjacent `float4` vectors |
+| `clus` | 16 FP32 scores = 64 bytes | Work items `j` and `j + P` each load two vectors, covering the lower and upper halves; `P` is the number of windows |
+
+For stride `d` in window units, window `j` begins at score offset `8*j*d` or `16*j*d` from the aligned sampling base. Threads process logical work items in CTA-sized strides when the sample exceeds the block's thread count. The stride and window count come from the valid row extent and sampling budget, with guards keeping every vector load inside the permitted interval. Prefill substitutes a valid score for leading alignment lanes before histogramming.
+
+**Why eight?** Eight FP32 scores fill a 32-byte memory sector when the window is sector-aligned. A scattered scalar sample can use only four bytes from each fetched sector. Two adjacent, 16-byte-aligned `float4` loads consume the whole window, giving more sample values per touched sector. The implementation issues explicit `ld.global.nc.v4.f32` loads. This is local packing within each window; widely spaced windows still produce strided accesses across the warp. The [CUDA memory-access model](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory) explains the sector granularity. Actual sector traffic also depends on the row's alignment and cache state.
+
+**Why sixteen in `clus`?** It groups two neighboring 32-byte pieces into one sampled location, divided between two work items. Each retains the same eight-score payload as `main`, avoiding a sixteen-score live payload in one worker. The engineering tradeoff is locality versus coverage: at a fixed sample budget, sixteen-score windows visit half as many locations as eight-score windows. Both aligned layouts can fully use their sectors; the clustered grouping favors wider local coverage at each visited location without doubling the per-worker sample payload. These are implementation tradeoffs, not a statistical guarantee or a universal optimum; a 64-byte window comprises four vector loads.
+
+![GPU sampling layout: regularly spaced windows, two float4 loads for a main work item, and four float4 loads split across two clustered work items, followed by register reduction, a shared histogram, and a warp-zero scan.](../media/gvr_v2/gpu_sampling.svg)
+
+*Figure 6. Each outlined memory box holds four FP32 scores. The 8/16-score grouping describes data layout, while CTA threads execute the work items. Register values feed a shared sample histogram; its rank crossings produce calibration anchors. The lower floor is computed where enabled.*
+
+#### Reduce, Histogram, and Extract the Anchors On Chip
+
+Each sampling worker keeps its first two vectors in registers. Local minima and maxima reduce within each warp; warp results are published through shared memory and combined after a CTA barrier. These extrema define **256 sample bins**. Workers then increment shared-memory counters for their sample values. Additional windows beyond the initially retained pair are reloaded for histogramming, limiting live register state.
+
+After another barrier, warp 0 scans the histogram: each lane handles eight counters, and shuffle operations combine their populations. The same scan finds the required rank crossings and clears the counters for the next phase. This avoids sorting the sample or running a separate search for every anchor.
+
+Let $S$ be the actual sample size and $A\ge K$ the desired full-row candidate population. The launch policy starts with a sample budget proportional to $N/A$, clamps its target between 256 scores and half the row, and rounds to legal windows. It computes target ranks from the resulting $S$, rather than the unrounded budget:
+
+$$
+r_A\approx\frac{AS}{N},\qquad r_K\approx\frac{KS}{N},\qquad r_{2A}\approx\frac{2AS}{N}.
+$$
+
+The budget therefore targets a usable number of observations in the relevant tail, rather than a fixed sampling percentage. Descending histogram crossings supply:
+
+- **Primary threshold $T$:** the lower edge of the sample bin at rank $r_A$, aiming for roughly $A$ full-row survivors.
+- **Upper anchor $T_K$:** the bin edge near rank $r_K$. In `main`, the classification bound `HIC` extends four times the nonnegative distance from $T$ to $T_K$, with at least eight sample-bin widths of headroom. The clustered route also caps this extrapolation using the lower quantile to limit heavy-tail expansion.
+- **Lower floor $T_{\mathrm{floor}}$:** the bin edge near rank $r_{2A}$, where enabled, admitting a larger population after an aggressive estimate (`TSH`).
+
+The sample histogram estimates these anchors without assuming a known score distribution. Regularly spaced windows can still miss an unusual tail or correlate with structured scores. Degenerate samples use conservative recovery paths; exact full-row accounting remains the authority.
+
+#### Overlap Calibration with the Upcoming Row Read
+
+In the variable-length `main` route, warp 0 computes sampling geometry and publishes it through shared memory while the other warps issue L2 prefetch hints for their upcoming row slice. Later prefetches are placed after the sample-reduction barrier to limit overlapping register lifetimes. Clustered streaming deliberately repeats the same full-row sample in each CTA, so all ranks derive the same classification bracket before merging their verification histograms. These choices balance calibration latency, register pressure, and communication with the cost of the full-row pass.
 
 ### Multi-Thresholding: Make Each Full-Row Pass Count
 
@@ -263,11 +290,11 @@ The minimum column retains individual regressions. Figure 1 shows the model-leve
 
 The comparison changes with the model and shape. Figure 1 shows HPC-ops closest on V3.2 and a larger DeepSelect FP32 gap there. The heatmaps resolve those averages into the row-length and batch regions where each advantage appears.
 
-Figure 6 locates the SGLang gains across the full length–batch grid.
+Figure 7 locates the SGLang gains across the full length–batch grid.
 
 ![Three heatmaps of GVR V2 speedup over SGLang for every captured row-length bucket and all eleven batch sizes, averaged geometrically across layers.](../media/gvr_v2/sglang_map.svg)
 
-*Figure 6. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 6 and 7 share the same color scale; row lengths are rounded in the axis labels.*
+*Figure 7. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 7 and 8 share the same color scale; row lengths are rounded in the axis labels.*
 
 Long rows at intermediate batch sizes show particularly strong gains: **V4 Pro reaches 4.69× at $N=262{,}127$, $B=64$**. This is the strongest shape-average result in the grid; most regions are around 1.3–2.0×.
 
@@ -275,7 +302,7 @@ DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long
 
 ![Three heatmaps of GVR V2 speedup over DeepSelect FP32 across row lengths and all eleven batch sizes, using the same color scale as the SGLang comparison.](../media/gvr_v2/deepselect_map.svg)
 
-*Figure 7. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 6: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
+*Figure 8. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 7: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
 
 For **V3.2, the gain reaches 7.58× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.26×** and **4.40×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.993×).
 
@@ -297,7 +324,7 @@ These patterns identify useful operating regions. The native API contracts below
 
 ![Cold kernel latency for all six implementations versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
-*Figure 8. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
+*Figure 9. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
 
 At $B=1$, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At $B=1024$, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.
 
@@ -323,17 +350,17 @@ P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
 P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
 $$
 
-The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 9A.
+The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 10A.
 
 ![A clean two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2 and five baselines at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
-*Figure 9.* A: the full theoretical and calibrated roofs. B: Pareto curves in the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
+*Figure 10.* A: the full theoretical and calibrated roofs. B: Pareto curves in the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
 
 #### Compare Pareto Curves and Reachable Rates
 
-Each operator's **Pareto curve** in Figure 9B traces useful throughput across intensities at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 8 retains the contrasting single-row view, and Figures 6 and 7 cover all 11 batch sizes.
+Each operator's **Pareto curve** in Figure 10B traces useful throughput across intensities at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 9 retains the contrasting single-row view, and Figures 7 and 8 cover all 11 batch sizes.
 
-The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a percentage. The table compares **average / peak reachable rate** along each Pareto curve. The average weights the plotted intensity points equally; the peak is their maximum. Both use the same layer-averaged timings as Figure 9B.
+The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a percentage. The table compares **average / peak reachable rate** along each Pareto curve. The average weights the plotted intensity points equally; the peak is their maximum. Both use the same layer-averaged timings as Figure 10B.
 
 | Operator | V4 Flash | V4 Pro | V3.2 |
 | :--- | ---: | ---: | ---: |
@@ -368,7 +395,7 @@ TensorRT-LLM separates phase-specific row metadata from shared selection logic. 
 
 ![Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes.](../media/gvr_v2/integration.svg)
 
-*Figure 10. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
+*Figure 11. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
 
 The adapters preserve each phase's indexing semantics. Decode derives valid prefixes from device KV lengths, multi-token prediction offsets, and compression. Prefill receives `[start, end)` in compressed columns and returns indices relative to `start`. Both write INT32 indices into caller-owned output, with identity indices and `-1` padding for short rows.
 
