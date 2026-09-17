@@ -1253,6 +1253,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
+        # Detect whether this request's KV cache was suspended (self- or
+        # victim-evicted by _suspend_request) *before* attempting
+        # allocation: a successful allocation resumes a suspended cache
+        # in-place, so this is the only point where the transition is
+        # still observable. Gated on peft_cache_manager so non-LoRA
+        # deployments (where it is None) pay no extra cost.
+        was_suspended = self.peft_cache_manager is not None and not (
+            self.kv_cache_manager.is_request_active(req.py_request_id)
+        )
+
         success = self._try_allocate_generation(req)
 
         if not success:
@@ -1285,6 +1295,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         if success:
+            if was_suspended:
+                # prepare_resources() only calls add_request_peft() for
+                # context_batch requests; a generation request resumed
+                # here never re-enters context admission, so PEFT
+                # ownership must be re-registered explicitly.
+                self.peft_cache_manager.add_request_peft(req)
             return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
 
         # Self-eviction: suspend this gen request to free its
@@ -1334,16 +1350,20 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache in both main and draft managers.
 
-        TODO: Also release PEFT resources (mark_request_done) for the
-        suspended request so the C++ PeftCacheManager can evict its
-        adapter pages.  Currently only KV cache is freed; the adapter
-        remains "active" on device, which could cause ensure_batch to
-        fail if it needs to load a different adapter into a full cache.
+        Also pauses PEFT ownership (mark_request_done(pause=True)) so the
+        C++ PeftCacheManager can evict the adapter's device pages while the
+        request is suspended; ownership is re-registered on resume in
+        _try_schedule_generation. Gated on _is_started_request: a request
+        that never began execution has never been through
+        PeftCacheManager.add_request_peft() and so holds no PEFT ownership
+        to release.
         """
         self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)
+        if self.peft_cache_manager is not None and self._is_started_request(req):
+            self.peft_cache_manager.mark_request_done(req, pause=True)
 
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
