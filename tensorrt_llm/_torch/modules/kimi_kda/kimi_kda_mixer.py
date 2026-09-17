@@ -26,11 +26,14 @@ import torch
 from fla.modules import ShortConvolution
 from torch import nn
 
+from ....models.modeling_utils import QuantConfig
+from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
+from ..linear import Linear
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
@@ -63,7 +66,12 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
             return torch.empty_like(tensor, dtype=dtype)
         return tensor.to(dtype=dtype)
 
-    module._apply(_cast)
+    for child in module.children():
+        if isinstance(child, Linear) and child.has_fp8_block_scales:
+            continue
+        child._apply(_cast)
+    for name, param in module.named_parameters(recurse=False):
+        param.data = _cast(param.data)
 
 
 def _kda_split_conv_sections(
@@ -155,12 +163,44 @@ class KimiKDALinearAttention(nn.Module):
         projection_size = self.num_heads * self.head_dim
         self.proj_size = projection_size
 
+        projection_quant_configs = (model_config.quant_config_dict or {}) if model_config else {}
+        default_quant_config = (
+            model_config.quant_config if model_config else None
+        ) or QuantConfig()
+        fp8_projections = ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
+        declared = [
+            projection_quant_configs.get(name, default_quant_config).quant_algo
+            for name in fp8_projections
+        ]
+        if any(algo is not None for algo in declared) and not all(
+            algo == QuantAlgo.FP8_BLOCK_SCALES for algo in declared
+        ):
+            raise ValueError("KDA requires all q/k/v/g/o projections to be declared FP8 together")
+
+        def projection(name: str, in_features: int, out_features: int) -> nn.Module:
+            quant_config = projection_quant_configs.get(name, default_quant_config)
+            if quant_config.quant_algo is None:
+                return nn.Linear(in_features, out_features, bias=False)
+            if in_features % 128 or out_features % 128:
+                raise ValueError("KDA FP8 projection shards must be aligned to 128x128 blocks")
+            return Linear(
+                in_features,
+                out_features,
+                bias=False,
+                dtype=torch.bfloat16,
+                quant_config=quant_config,
+                reduce_output=False,
+                use_cute_dsl_blockscaling_mm=(
+                    model_config.use_cute_dsl_blockscaling_mm if model_config else False
+                ),
+            )
+
         # Keep the logical projections separate for checkpoint-compatible
         # parameter names and portable fallbacks. After weight loading, the
         # Blackwell path aliases them into one fused QKVG weight buffer.
-        self.q_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        self.q_proj = projection("q_proj", self.hidden_size, projection_size)
+        self.k_proj = projection("k_proj", self.hidden_size, projection_size)
+        self.v_proj = projection("v_proj", self.hidden_size, projection_size)
         self.q_conv1d = ShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
@@ -193,14 +233,14 @@ class KimiKDALinearAttention(nn.Module):
         self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
 
         if self.use_full_rank_gate:
-            self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+            self.g_proj = projection("g_proj", self.hidden_size, projection_size)
         else:
             self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
             self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
         self.o_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
         if not self.o_norm.weight.is_meta:
             nn.init.ones_(self.o_norm.weight)
-        self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+        self.o_proj = projection("o_proj", projection_size, self.hidden_size)
         # Installed together by the FP8 weight loader as the fused
         # [q | k | v | g] projection and its output-section metadata.
         self.qkvg_proj: Optional[nn.Module] = None
@@ -217,8 +257,7 @@ class KimiKDALinearAttention(nn.Module):
 
         # Fused prefill/decode/verify projection weights, built after checkpoint
         # load. BF16 uses separate fused [q | k | v | g] and [f_a | b]
-        # GEMMs; FP8 supplies qkvg through the fused projection and reuses the
-        # BF16 [f_a | b] weight.
+        # GEMMs; FP8 fuses QKVG from checkpoint codes/scales and keeps BFA BF16.
         self._qkvg_proj_weight: Optional[torch.Tensor] = None
         self._bfa_proj_weight: Optional[torch.Tensor] = None
         self._w_q_t = self._w_k_t = self._w_v_t = None
@@ -262,20 +301,52 @@ class KimiKDALinearAttention(nn.Module):
         if self.q_proj.weight.device.type != "cuda":
             return
         with torch.no_grad():
-            qkvg_modules = (
-                self.q_proj,
-                self.k_proj,
-                self.v_proj,
-                self.g_proj,
+            qkvg_modules = (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
+            if all(isinstance(module, nn.Linear) for module in qkvg_modules):
+                self._qkvg_proj_weight = self._merge_projection_weights(qkvg_modules)
+            elif all(
+                isinstance(module, Linear) and module.has_fp8_block_scales
+                for module in qkvg_modules
+            ):
+                self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
+                self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
+            self._bfa_proj_weight = self._merge_projection_weights(
+                (self.f_a_proj, self.b_proj), pad_rows_to=8
             )
-            qkvg_weight = self._merge_projection_weights(qkvg_modules)
-            # Eight BF16 outputs occupy 16 bytes, so padding keeps each output row
-            # aligned for vectorized f_b consumption; it is not a kernel requirement.
-            bfa_weight = self._merge_projection_weights((self.f_a_proj, self.b_proj), pad_rows_to=8)
             self._build_decode_kernel_constants()
-            self._bfa_proj_weight = bfa_weight
-            # Publish last: both weights are required by the BF16 fast path.
-            self._qkvg_proj_weight = qkvg_weight
+
+    @staticmethod
+    def _fuse_checkpoint_projections(modules: tuple[Linear, ...]) -> Linear:
+        """Fuse block-aligned checkpoint pairs before backend scale preparation."""
+        if any(module.out_features % 128 for module in modules[:-1]):
+            raise ValueError("KDA FP8 fusion boundaries must be aligned to 128 rows")
+        first = modules[0]
+        with torch.device(first.weight.device):
+            fused = Linear(
+                first.in_features,
+                sum(module.out_features for module in modules),
+                bias=False,
+                dtype=torch.bfloat16,
+                quant_config=first.quant_config,
+                reduce_output=False,
+                use_cute_dsl_blockscaling_mm=first.use_cute_dsl_blockscaling_mm,
+            )
+        offset = 0
+        scale_offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            fused.weight.data[offset : offset + rows].copy_(module.weight.data)
+            offset += rows
+            scale_rows = module.weight_scale.shape[0]
+            fused.weight_scale.data[scale_offset : scale_offset + scale_rows].copy_(
+                module.weight_scale.data
+            )
+            scale_offset += scale_rows
+        fused.input_scale.data = first.input_scale.data
+        fused.inv_input_scale.data = first.inv_input_scale.data
+        # DeepGEMM resmooths codes in place. The model loader aliases the
+        # projection views only after each scale grid has been prepared.
+        return fused
 
     @staticmethod
     def _merge_projection_weights(
@@ -295,7 +366,7 @@ class KimiKDALinearAttention(nn.Module):
         return fused
 
     def _build_decode_kernel_constants(self) -> None:
-        """Kernel-layout constants shared by both finalize variants."""
+        """Kernel-layout constants shared by BF16 and FP8 projections."""
         self._w_q_t = (
             self.q_conv1d.weight.detach().squeeze(1).transpose(0, 1).to(torch.bfloat16).contiguous()
         )
@@ -311,31 +382,6 @@ class KimiKDALinearAttention(nn.Module):
         # Build the fused-verify conv constants eagerly too, so the first
         # verify call never allocates (a capture-unsafe lazy allocation).
         self._build_mtp_conv_weights()
-
-    def finalize_decode_weights_fp8(self) -> None:
-        """FP8 counterpart of ``finalize_decode_weights()``.
-
-        Runs AFTER ``_convert_kda_projections_to_fp8_weight_read``, so
-        q/k/v/g already live in the fused FP8 ``qkvg_proj`` GEMM. Only the
-        two small BF16 projections reading the same hidden — ``f_a_proj`` and
-        ``b_proj`` — are fused here into one ``[f_a | b]`` weight, with the
-        source parameters repointed to row views. Prefill, decode, and
-        verification then share both fused projections; the kernel-layout
-        constants are decode-only.
-        """
-        if self._dispatch.decode_kernel_path != "optimized" or not self.use_full_rank_gate:
-            return
-        fused_qkvg = self.qkvg_proj
-        split_sizes = self.qkvg_split_sizes
-        if fused_qkvg is None or split_sizes is None or len(split_sizes) != 4:
-            return
-        if self.f_a_proj.weight.device.type != "cuda":
-            return
-        with torch.no_grad():
-            bfa_weight = self._merge_projection_weights((self.f_a_proj, self.b_proj), pad_rows_to=8)
-            self._build_decode_kernel_constants()
-            # Publish last: enables fused [f_a | b] in prefill/decode/verify.
-            self._bfa_proj_weight = bfa_weight
 
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
@@ -1120,7 +1166,7 @@ class KimiKDALinearAttention(nn.Module):
             raise RuntimeError(
                 "Kimi K3 fused-verify conv weights were not prebuilt; call "
                 "_build_mtp_conv_weights() (done by load_weights() and by "
-                "finalize_decode_weights() / finalize_decode_weights_fp8()) "
+                "finalize_decode_weights()) "
                 "after weight load and before the first verify step."
             )
         return cached
