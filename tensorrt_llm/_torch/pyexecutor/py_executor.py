@@ -5972,6 +5972,12 @@ class PyExecutor:
         dummy_request.py_skip_gen_alloc_revert = True
         self.active_requests.append(dummy_request)
         scheduled_batch.generation_requests.append(dummy_request)
+        logger.warning(
+            f"[rank {self.dist.rank}] attention-DP empty-batch padding: an "
+            f"asynchronous connector restore emptied this rank's scheduled "
+            f"batch at iteration {self.iter_counter}; added the padding dummy "
+            f"so the fleet can still run a forward pass "
+            f"({len(self.active_requests)} active requests)")
         # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
         # cannot queue: no forward runs then, so the usual dummy teardown in
         # `_handle_responses` is not reached this iteration.

@@ -2337,7 +2337,21 @@ class SlotManager:
             # CUDA graph dummy request could be added for different batches,
             # but we only need to reserve slot for it once.
             from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-            assert request_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+            if request_id != CUDA_GRAPH_DUMMY_REQUEST_ID:
+                from .llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+                raise RuntimeError(
+                    f"Sequence slot {self.slot_mapping[request_id]} is already "
+                    f"held by request {request_id}, so a second request object "
+                    f"is presenting the same id. Only a reused id can reach "
+                    f"here: real ids are never reused and a request's slot is "
+                    f"never reset. Known reusable ids are "
+                    f"ATTENTION_DP_DUMMY_REQUEST_ID "
+                    f"({ATTENTION_DP_DUMMY_REQUEST_ID}) and the CUDA-graph "
+                    f"padding sentinels at or just below "
+                    f"{CUDA_GRAPH_DUMMY_REQUEST_ID}; for those, the previous "
+                    f"incarnation was dropped without freeing its slot. "
+                    f"{len(self.slot_mapping)} of {self.max_num_requests} "
+                    f"slots are mapped, {len(self.free_slots)} free.")
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
