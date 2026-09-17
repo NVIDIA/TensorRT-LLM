@@ -1463,6 +1463,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         do_finalize: bool,
         spec_metadata: Optional[SpecMetadata],
     ) -> bool:
+        # DeepSeek-R1/V3 uses hidden size 7168, the only width validated here.
+        validated_hidden_size = 7168
         return (self.enable_wideep_flashinfer_add_add_rmsnorm and do_finalize
                 and self.mapping.is_multi_node() and self.enable_attention_dp
                 and is_sm_100f() and IS_FLASHINFER_AVAILABLE
@@ -1474,7 +1476,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 and residual.is_cuda and hidden_states.device == residual.device
                 and hidden_states.dim() == 2 and residual.dim() == 2
                 and hidden_states.shape == residual.shape
-                and hidden_states.shape[-1] == 7168
+                and hidden_states.shape[-1] == validated_hidden_size
                 and hidden_states.dtype == torch.bfloat16
                 and residual.dtype == torch.bfloat16
                 and hidden_states.is_contiguous() and residual.is_contiguous()
@@ -1483,7 +1485,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 and self.next_layer_layernorm is not None and
                 self.next_layer_layernorm.weight.device == hidden_states.device
                 and self.next_layer_layernorm.weight.dtype == torch.bfloat16
-                and self.next_layer_layernorm.weight.shape == (7168, )
+                and self.next_layer_layernorm.weight.shape
+                == (validated_hidden_size, )
                 and self.next_layer_layernorm.weight.is_contiguous()
                 and self.next_layer_layernorm.nvfp4_scale is None
                 and not self.next_layer_layernorm.return_hp_output
