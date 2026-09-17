@@ -125,6 +125,8 @@ Model data type and quantization decide the precision in model computation, so a
 
 A direct implication is that multiple test cases with different features may share the same accuracy reference. This is by design. For example, we should expect a test case with tensor parallelism to have very similar accuracy to its single-GPU counterpart.
 
+A reference row may set `threshold` to an explicit pass/fail floor that replaces the computed hypothesis-test threshold; see [references/gsm8k_inferencex.yaml](./references/gsm8k_inferencex.yaml).
+
 #### Testing Logic
 
 As aforementioned, each test case evaluates the accuracy of a model with some specifications by running one or multiple tasks.
