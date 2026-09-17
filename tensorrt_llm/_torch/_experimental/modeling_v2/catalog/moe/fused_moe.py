@@ -16,7 +16,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 
-from .._op import Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: The one geometry this entry is certified at: the R1-0528 MTP layer's MoE,
 #: which is the only thing that calls this op. Repeated into every cell so a
@@ -41,6 +41,8 @@ class _FusedMoe(OpWrapper):
     #: What CI drives. The geometry is fixed -- one op, one caller, one shape
     #: family -- so the cells vary what the caller actually varies: how many
     #: tokens arrive in a chunk, and which expert window this rank owns.
+    ARCHS = frozenset({Arch.SM_103})
+
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: a single token, the shape that dominates serving",
@@ -138,7 +140,6 @@ class _FusedMoe(OpWrapper):
         Returns `[out]` with `out` a fresh `[num_tokens, hidden_size]` tensor in
         `output_dtype`, or `[]` when `out_tensor` is given (written in place).
         """
-        self.is_valid(input, fc1_expert_weights, output_dtype)
         return torch.ops.trtllm.fused_moe(
             input,
             token_selected_experts,
@@ -196,8 +197,15 @@ class _FusedMoe(OpWrapper):
     def is_valid(
         self,
         input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
         fc1_expert_weights: torch.Tensor,
+        fc1_expert_biases: Optional[torch.Tensor],
+        fc2_expert_weights: torch.Tensor,
+        fc2_expert_biases: Optional[torch.Tensor],
         output_dtype: torch.dtype,
+        *unused_args: object,
+        **unused_kwargs: object,
     ) -> None:
         """The one input the op takes and answers wrongly.
 
@@ -221,9 +229,15 @@ class _FusedMoe(OpWrapper):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         fc1_expert_weights: torch.Tensor,
-        fc2_expert_weights: torch.Tensor,
+        fc1_expert_biases: Optional[torch.Tensor] = None,
+        fc2_expert_weights: torch.Tensor = None,
+        fc2_expert_biases: Optional[torch.Tensor] = None,
+        output_dtype: torch.dtype = torch.bfloat16,
+        quant_scales: Optional[List[torch.Tensor]] = None,
+        *unused_args: object,
         ep_size: int = 1,
         ep_rank: int = 0,
+        **unused_kwargs: object,
     ) -> torch.Tensor:
         """What the op computes, in plain torch, fp32 through both GEMMs.
 

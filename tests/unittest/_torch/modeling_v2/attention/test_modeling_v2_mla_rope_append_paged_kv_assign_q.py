@@ -34,10 +34,11 @@ Two surfaces:
 
 from typing import List, NamedTuple, Optional, Sequence, Union
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (
-    mla_rope_append_paged_kv_assign_q,
+    mla_rope_append_paged_kv_assign_q as op,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -47,6 +48,9 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mla_rope_append_paged_kv_assign_q requires a CUDA device"
 
@@ -79,7 +83,7 @@ QUANT_MODE_INT8_KV_CACHE = 64  # QuantMode.INT8_KV_CACHE — rejected, see below
 # ever been approached. That both halves still discriminate is measured, not
 # assumed — test_fp8_kv_explicit_unit_scale runs four wrong mirrors of the same
 # bytes and asserts each blows the gate it is able to blow.
-E4M3_ULP_RTOL = 2**-3
+E4M3_ULP_RTOL = 2**-3  # the entry's own gate carries the derivation
 E4M3_MAX_INEXACT_FRACTION = 1e-3
 
 # The roped q must come back as an ordinary bf16 rotation, NOT quantized: this
@@ -277,14 +281,12 @@ def _inexact_bytes(got: torch.Tensor, want: torch.Tensor) -> int:
 
 
 def _assert_e4m3_roped(got: torch.Tensor, want: torch.Tensor, what: str) -> None:
-    """One-e4m3-ulp gate plus a bit-exact-fraction floor, for the part of the
-    fp8 output that passes through the in-kernel RoPE."""
-    torch.testing.assert_close(got.float(), want.float(), rtol=E4M3_ULP_RTOL, atol=0.0)
-    inexact = _inexact_bytes(got, want)
-    allowed = max(1, int(E4M3_MAX_INEXACT_FRACTION * got.numel()))
-    assert inexact <= allowed, (
-        f"{what} not bit-exact enough: {inexact}/{got.numel()} bytes differ (allowed {allowed})"
-    )
+    """Delegates to the entry: the gate and its derivation are the entry's
+    claim. `what` only labels the failure."""
+    try:
+        op.compare(got, want)
+    except AssertionError as exc:
+        raise AssertionError(f"{what}: {exc}") from exc
 
 
 def _fails_e4m3_tolerance(got: torch.Tensor, mirror: torch.Tensor) -> bool:
@@ -352,7 +354,7 @@ def _run_and_check(
     pool = env.pool_tensor(layer_idx)
     pool_before = pool.clone()
 
-    mla_rope_append_paged_kv_assign_q(
+    op(
         q,
         latent_cache,
         num_contexts,
@@ -511,6 +513,40 @@ def _fp8_env(max_batch_size: int = 8, orig_quant: Optional[float] = None) -> _Ml
         fp8_pool=True,
         orig_quant=orig_quant,
     )
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_certified_cells(cell) -> None:
+    """Every configuration the entry claims, through the same driver the
+    hand-written cases use.
+
+    Parametrized off the entry, so a cell added there is a case here. Without
+    this the cell list would be a claim nothing executes, which is worse than
+    no claim at all -- it reads as coverage.
+    """
+    spec = cell.spec
+    torch.manual_seed(abs(hash(cell.why)) % 2**31)
+    env = _MlaCtxEnv(
+        max_batch_size=8,
+        tokens_per_block=spec["tokens_per_block"],
+        num_heads=spec["head_num"],
+        fp8_pool=True,
+    )
+    try:
+        rids = list(range(len(spec["new"])))
+        env.kv_cache_manager.add_dummy_requests(
+            rids, token_nums=[c + n for c, n in zip(spec["cached"], spec["new"])]
+        )
+        with validating(op):
+            _run_and_check(
+                env,
+                request_ids=rids,
+                seq_lens=spec["new"],
+                num_contexts=len(rids),
+                cached_lens=spec["cached"],
+            )
+    finally:
+        env.shutdown()
 
 
 def test_fp8_kv_production_config() -> None:
@@ -751,7 +787,7 @@ def test_fp8_kv_rejects_int8_kv_cache_quant_mode() -> None:
         assert pool_pointers is not None and pool_mapping is not None
         raised = ""
         try:
-            mla_rope_append_paged_kv_assign_q(
+            op(
                 q,
                 latent_cache,
                 1,

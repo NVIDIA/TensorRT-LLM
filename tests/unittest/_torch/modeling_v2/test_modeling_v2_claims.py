@@ -215,3 +215,35 @@ def test_targets_do_not_share_files():
                         f"directory for {tail!r}; targets may import the "
                         f"catalog and nothing else"
                     )
+
+
+def test_every_entry_with_cells_has_a_test_that_drives_them():
+    """A cell list nothing executes is worse than no cell list.
+
+    It reads as coverage. `mla_rope_append_paged_kv_assign_q` shipped three
+    cells with no driver for exactly one commit, and nothing went red -- the
+    entry's own test had been wired to the entry's `compare` and not to its
+    `CELLS`, so the suite passed and the three configurations had never run.
+
+    Checked by reading rather than importing, like the rest of this file: an
+    entry declares `Cell(` in its source, and some test under this tree has to
+    name both the entry and `.CELLS`. That is weaker than proving the cells were
+    driven, and it is what a check that runs anywhere can say.
+    """
+    catalog = _ROOT / "catalog"
+    tests = list(Path(__file__).resolve().parent.rglob("*.py"))
+    sources = {t: t.read_text() for t in tests}
+
+    undriven = []
+    for entry in sorted(catalog.glob("*/*.py")):
+        if entry.name == "__init__.py":
+            continue
+        if "Cell(" not in entry.read_text():
+            continue
+        if not any(entry.stem in src and ".CELLS" in src for src in sources.values()):
+            undriven.append(f"{entry.parent.name}/{entry.stem}")
+
+    assert not undriven, (
+        f"{len(undriven)} entry(ies) declare cells that no test drives: "
+        f"{', '.join(undriven)}. Parametrize the entry's test off its CELLS."
+    )

@@ -164,11 +164,11 @@ def _ref(
     same seeds every rank uses. Never from a second collective.
     """
     ranks = list(range(WORLD)) if ranks is None else list(ranks)
-    acc_dtype = torch.float32 if dtype.is_floating_point else torch.int64
-    acc = torch.zeros((sizes[pos], *trailing), dtype=acc_dtype, device="cuda")
-    for r in ranks:
-        acc += _block(r, pos, sizes[pos], seed, dtype, trailing, amp).to(acc_dtype)
-    return acc.to(dtype)
+    # Delegates to the entry: what the sum is supposed to be is the entry's
+    # claim, and computing it here as well would be a second place to fix.
+    return reducescatter.reference(
+        [_block(r, pos, sizes[pos], seed, dtype, trailing, amp) for r in ranks]
+    )
 
 
 def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
@@ -179,7 +179,11 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
     intermediate representable, so any difference at all is a wrong reduction
     or a wrong slice, not rounding.
     """
-    torch.testing.assert_close(out, ref, rtol=0, atol=0, msg=lambda built: f"{where}: {built}")
+    # The gate itself is the entry's `compare`; `where` only labels the failure.
+    try:
+        reducescatter.compare(out, ref)
+    except AssertionError as exc:
+        raise AssertionError(f"{where}: {exc}") from exc
 
 
 def _sizes_vectors() -> List[List[int]]:
@@ -418,6 +422,27 @@ def check_cuda_graph_capture_of_a_first_call_raises() -> None:
     _assert_bitwise(captured, _ref(sizes, RANK, 700), "replay after warm-up")
     del graph
     COMM.Barrier()
+
+
+def check_certified_cells() -> None:
+    """Drive the entry's own cell list, inside `validating`.
+
+    The rest of this file says things no cell can -- CUDA graph behaviour, call
+    order, which stream the call lands on. This one says the plain thing: for
+    every configuration the entry claims, the slice is the sum, bitwise, and the
+    guard admits the input a shipped target passes.
+    """
+    for i, cell in enumerate(reducescatter.CELLS):
+        spec = cell.spec
+        rows, trailing, dtype = spec["rows_per_rank"], spec["trailing"], spec["dtype"]
+        seed = 9000 + 13 * i
+        sizes = [rows] * WORLD
+        x = _input(RANK, sizes, seed, dtype, trailing)
+        with validating(reducescatter):
+            out = reducescatter(x, spec["sizes"], GROUP)
+        assert out.shape == (rows, *trailing), (cell.why, out.shape)
+        _assert_bitwise(out, _ref(sizes, RANK, seed, dtype, trailing), cell.why)
+        COMM.Barrier()
 
 
 def check_uniform_reduce_scatter() -> None:
@@ -1221,7 +1246,8 @@ def check_float8_is_summed_as_raw_bytes() -> None:
     COMM.Barrier()
 
     try:
-        reducescatter(x, None, GROUP)
+        with validating(reducescatter):
+            reducescatter(x, None, GROUP)
     except AssertionError:
         pass
     else:
@@ -1294,7 +1320,8 @@ def check_wrapper_guards_a_non_contiguous_input() -> None:
     COMM.Barrier()
 
     try:
-        reducescatter(view, None, GROUP)
+        with validating(reducescatter):
+            reducescatter(view, None, GROUP)
     except AssertionError:
         pass
     else:
@@ -1309,7 +1336,8 @@ def check_wrapper_guards_a_zero_dim_input() -> None:
     `ReducescatterOp::run_list` and kills every rank in the job.
     """
     try:
-        reducescatter(torch.tensor(1.0, device="cuda"), None, GROUP)
+        with validating(reducescatter):
+            reducescatter(torch.tensor(1.0, device="cuda"), None, GROUP)
     except AssertionError:
         pass
     else:
@@ -1334,7 +1362,8 @@ def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     long_list = [rows] * (WORLD + 1)
     for bad in ([rows] * (WORLD - 1), long_list):
         try:
-            reducescatter(_input(RANK, sizes, seed), bad, GROUP)
+            with validating(reducescatter):
+                reducescatter(_input(RANK, sizes, seed), bad, GROUP)
         except AssertionError:
             pass
         else:
@@ -1369,7 +1398,8 @@ def check_wrapper_guards_a_split_that_does_not_cover_the_input() -> None:
 
     for x_, sizes_ in ((x, None), (y, short_split), (y, [6] * WORLD)):
         try:
-            reducescatter(x_, sizes_, GROUP)
+            with validating(reducescatter):
+                reducescatter(x_, sizes_, GROUP)
         except AssertionError:
             pass
         else:
@@ -1390,6 +1420,7 @@ CHECKS = (
     # Stays first: it is the only test that can observe GROUP's first-ever
     # call, and every later test needs the communicator it builds.
     check_cuda_graph_capture_of_a_first_call_raises,
+    check_certified_cells,
     check_uniform_reduce_scatter,
     check_ragged_reduce_scatter,
     check_output_is_fresh_and_input_is_untouched,
@@ -1427,12 +1458,20 @@ CHECKS = (
 
 def _run_one_rank() -> int:
     """Body of one MPI rank: run every test, abort the job if any fails."""
-    global COMM, RANK, WORLD, GROUP, reducescatter
+    global COMM, RANK, WORLD, GROUP, reducescatter, validating
     from mpi4py import MPI
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
 
     reducescatter = entry.reducescatter
+
+    # Run as a script by its own mpirun, not collected by pytest, so the repo's
+    # `__extra_import_path__` mechanism is not in play. The mutation is confined
+    # to these rank processes.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as _validating_cm
+
+    validating = _validating_cm
     COMM = MPI.COMM_WORLD
     RANK = COMM.Get_rank()
     WORLD = COMM.Get_size()
@@ -1494,12 +1533,20 @@ def _run_wedge_rank() -> int:
     tell a wedge from a crash: every rank reaching `ready` and none reaching
     `returned` is the wedge, and it means nothing without the first half.
     """
-    global COMM, RANK, WORLD, GROUP, reducescatter
+    global COMM, RANK, WORLD, GROUP, reducescatter, validating
     from mpi4py import MPI
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
 
     reducescatter = entry.reducescatter
+
+    # Run as a script by its own mpirun, not collected by pytest, so the repo's
+    # `__extra_import_path__` mechanism is not in play. The mutation is confined
+    # to these rank processes.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as _validating_cm
+
+    validating = _validating_cm
     COMM = MPI.COMM_WORLD
     RANK = COMM.Get_rank()
     WORLD = COMM.Get_size()
