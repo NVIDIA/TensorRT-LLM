@@ -4086,14 +4086,10 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
-                    # Pre-existing behaviour, kept deliberately: skipping here
-                    # does NOT buy a retry, because copy_batch_block_offsets()
-                    # asserts on this id later in the same iteration (see
-                    # _mirror_draft_kv_cache). Saturation needs a disagg worker
-                    # whose cancelled / retired-session requests pile up past
-                    # the 2x slack, since the normal path frees the slot before
-                    # start_transfer -- so this is a loud symptom of that, not a
-                    # recoverable state.
+                    # Pre-existing behaviour, kept deliberately: skipping does NOT buy a
+                    # retry, because copy_batch_block_offsets() asserts on this id later in
+                    # the same iteration. Saturation needs cancelled requests piling past
+                    # the 2x slack, so this is a loud symptom, not a recoverable state.
                     logger.warning(
                         f"Draft KV cache mirror has no free IndexMapper slot for "
                         f"context request {req.py_request_id}; this iteration "

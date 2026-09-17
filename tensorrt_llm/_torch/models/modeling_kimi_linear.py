@@ -1786,9 +1786,9 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.self_attention_res_proj,
                     self.self_attention_res_norm,
                 )
-            # Which residual the drafter was distilled against is a property
-            # of the DRAFTER checkpoint, not a knob: a mismatch only lowers
-            # acceptance, silently. prefix_only wants ``prefix_sum``.
+            # A property of the DRAFTER checkpoint, not a knob: a mismatch only lowers
+            # acceptance, silently. hidden_states is the pre-norm attn_res mixture;
+            # prefix_only wants the running prefix, already in hand as prefix_sum.
             tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
             capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
             hidden_states = self.input_layernorm(hidden_states)

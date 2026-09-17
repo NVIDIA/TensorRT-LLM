@@ -1100,14 +1100,9 @@ class TestExternalDrafterKvDtype:
         c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
         c._mapping.is_last_pp_rank.return_value = True
-        # The real config, not Mock() and not a SimpleNamespace: a bare Mock
-        # answers True to EVERY predicate, so use_one_engine() and
-        # is_mtp_vanilla() both fire and the code walks branches an external
-        # drafter never takes; a SimpleNamespace instead needs a new attribute
-        # stubbed every time the cost path reads one more field of the spec
-        # config (max_total_draft_tokens, tokens_per_gen_step, ...). DSparkDecodingConfig
-        # derives all of them and satisfies is_external_drafter() via
-        # is_parallel_draft() and nothing else.
+        # The real config, not Mock() or SimpleNamespace: a bare Mock answers True
+        # to every predicate, and a SimpleNamespace needs a new attribute stubbed
+        # each time the cost path reads one more spec-config field.
         c._speculative_config = DSparkDecodingConfig(max_draft_len=4)
         c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
         c._draft_model_engine = None
