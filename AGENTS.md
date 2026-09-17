@@ -205,23 +205,28 @@ Only requested revision pairs receive published results; unrelated manual
 fixture experiments do not change a PR's semantic Check. Missing results stay
 neutral, and stale results cannot mark a newer pair as passing.
 
-`CodeRabbit Semantic Review Tests` is a separate, read-only workflow for the
-automation's unit tests; passing it is not a semantic verdict. These tests
-are not part of the existing `Pre-commit Check`.
 The custom check requires CodeRabbit Custom Pre-Merge Checks access. This
 advisory pilot does not provide a merge-queue check or block merges.
 
-Changes to the semantic automation also run `Semantic conflict preview
-(advisory)` on `pull_request`, including fork drafts. It reads real CodeRabbit
-replies for the current head/main pair with read-only permissions and uses the
-same verification and verdict mapping as the publisher, without writing Checks.
-Before the configuration is merged, request `@coderabbitai evaluate custom
-pre-merge check` with `--name "Semantic conflict with target branch"`,
-`--mode warning`, and `--instructions` containing the check instructions from
-`.coderabbit.yaml` and the current head/main SHAs. After the reply arrives,
-rerun the preview job. A missing reply produces a warning and no AI verdict;
-a verified conflict makes the preview job red. Previewing does not validate
-the production event triggers or privileged Check writes.
+Changes to the semantic automation run the separate, read-only `CodeRabbit
+Semantic Review Preview` workflow on `pull_request`, including fork drafts.
+It shows two checks: `Automation tests and result lookup (not AI approval)`
+runs the unit tests and reads real CodeRabbit replies; the `AI` check is green
+only for a verified PASS and red for a verified FAIL. A missing, stale, or
+inconclusive verdict leaves `AI - no current verdict (advisory)` skipped (gray).
+The lookup job succeeding is not an AI pass. These tests are not part of
+`Pre-commit Check`. The production request/publish workflow does not run on
+`pull_request`, so its unrelated jobs do not appear in the preview.
+
+Both workflows use the same result verifier. The production publisher loads it
+from the trusted workflow commit; the fork preview has read-only permissions
+and writes no custom Checks. Before the configuration is merged, request
+`@coderabbitai evaluate custom pre-merge check` with `--name "Semantic conflict
+with target branch"`, `--mode warning`, and `--instructions` containing the check
+instructions from `.coderabbit.yaml` and the current head/main SHAs. After the
+reply arrives, rerun the **tests and result lookup** job to refresh its outputs
+and dependent AI check. Rerunning only the AI check reuses the previous outputs.
+Previewing does not validate production event triggers or privileged Check writes.
 
 ### Trouble Shooting
 

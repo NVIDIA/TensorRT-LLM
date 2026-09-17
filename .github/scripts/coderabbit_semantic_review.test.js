@@ -24,7 +24,7 @@ const scripts = [...workflow.matchAll(/^ {10}script: \|\n((?: {12}[^\n]*(?:\n|$)
 assert.equal(scripts.length, 2);
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const execute = new AsyncFunction('github', 'context', 'core', 'process', scripts[0]);
-const publish = new AsyncFunction('github', 'context', 'core', scripts[1]);
+const publish = require('./coderabbit_semantic_review_result.js');
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -204,6 +204,7 @@ function resultHarness(body = resultBody()) {
   const checks = [{id: 1, app: {slug: 'github-actions'},
     external_id: `semantic-conflict:12:${HEAD}:${BASE}`}];
   const updated = [];
+  const outputs = {};
   const warnings = [];
   const failures = [];
   const summaries = [];
@@ -225,15 +226,16 @@ function resultHarness(body = resultBody()) {
       return {data: {merge_base_commit: {sha: mergeBase}}};
     },
   };
-  const core = {info: () => {}, warning: text => warnings.push(text), setFailed: text => failures.push(text),
+  const core = {setOutput: (key, value) => {outputs[key] = value;}, info: () => {},
+    warning: text => warnings.push(text), setFailed: text => failures.push(text),
     summary: {addRaw(text) {summaries.push(text); return this;}, async write() {}}};
-  return {comment, comments, checks, updated, warnings, failures, summaries, pr: request.pr,
+  return {comment, comments, checks, updated, warnings, failures, summaries, outputs, pr: request.pr,
     setMergeBase: sha => {mergeBase = sha;},
     setTarget: sha => {target = sha;},
     afterCompare: callback => {afterCompare = callback;},
-    run: (eventName = 'issue_comment') => publish(github, {repo: {owner: 'example', repo: 'repo'},
+    run: (eventName = 'issue_comment') => publish({github, context: {repo: {owner: 'example', repo: 'repo'},
       eventName, payload: {issue: {number: 12}, comment: {id: 123},
-        pull_request: {number: 12, head: {sha: HEAD}}}}, core),
+        pull_request: {number: 12, head: {sha: HEAD}}}}, core}),
   };
 }
 
@@ -340,7 +342,10 @@ test('PR preview uses the same verdict mapping without writing a Check, even for
     h.checks.length = 0;
     await h.run('pull_request');
     assert.deepEqual(h.updated, []);
-    assert.equal(h.failures.length, verdict === 'FAIL' ? 1 : 0);
+    assert.equal(h.failures.length, 0); // The separate verdict job displays failures.
+    assert.equal(h.outputs.verdict, verdict);
+    assert.match(h.outputs.message, /false positives/);
+    assert.match(h.outputs.summary, /CodeRabbit analysis/);
     assert.equal(h.warnings.length, verdict === 'INCONCLUSIVE' ? 1 : 0);
     assert.match(h.summaries[0], /Read-only PR preview/);
     assert.match(h.summaries[0], /non-required/);
@@ -362,6 +367,7 @@ test('PR preview cannot reuse another SHA pair, an untrusted reply, or an older 
     assert.deepEqual(h.updated, []);
     assert.deepEqual(h.failures, []);
     assert.equal(h.warnings.length, 1);
+    assert.equal(h.outputs.verdict, 'INCONCLUSIVE');
   }
 });
 
@@ -378,5 +384,42 @@ test('PR preview chooses the latest matching reply and rechecks live refs', asyn
     assert.deepEqual(stale.updated, []);
     assert.deepEqual(stale.failures, []);
     assert.equal(stale.warnings.length, 1);
+    assert.equal(stale.outputs.verdict, 'INCONCLUSIVE');
+  }
+});
+
+test('preview never exports an AI approval for malformed or contradictory evidence', async () => {
+  for (const body of [
+    resultBody('PASS').replace('<!-- pre-merge-checks-results -->', ''),
+    resultBody('PASS').replace('✅ Passed', '❓ Inconclusive'),
+    resultBody('PASS').replace('</details>', resultBody('FAIL') + '</details>'),
+  ]) {
+    const h = resultHarness(body);
+    await h.run('pull_request');
+    assert.equal(h.outputs.verdict, 'INCONCLUSIVE');
+    assert.deepEqual(h.updated, []);
+  }
+});
+
+
+test('the separate AI job displays the verified verdict and fails only for conflicts', async () => {
+  const preview = fs.readFileSync(
+    path.join(__dirname, '../workflows/coderabbit-semantic-review-tests.yml'), 'utf8');
+  const displayScript = [...preview.matchAll(/^ {10}script: \|\n((?: {12}[^\n]*(?:\n|$)|\n)*)/gm)]
+    .at(-1)[1].replace(/^ {12}/gm, '');
+  const display = new AsyncFunction('core', 'process', displayScript);
+  for (const verdict of ['PASS', 'FAIL']) {
+    const h = resultHarness(resultBody(verdict));
+    await h.run('pull_request');
+    const failures = [];
+    const summaries = [];
+    await display({setFailed: message => failures.push(message), summary: {
+      addRaw(text) {summaries.push(text); return this;}, async write() {},
+    }}, {env: {SEMANTIC_VERDICT: h.outputs.verdict,
+      SEMANTIC_MESSAGE: h.outputs.message, SEMANTIC_SUMMARY: h.outputs.summary}});
+    assert.equal(failures.length, verdict === 'FAIL' ? 1 : 0);
+    assert.match(summaries[0], /Verified head/);
+    assert.match(summaries[0], /false positives/);
+    if (verdict === 'FAIL') assert.match(failures[0], /does not block merging/);
   }
 });
