@@ -1,6 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # The declarations must be aligned with thUtils.h
 SF_DTYPE = torch.uint8
@@ -10,10 +19,11 @@ FLOAT4_E2M1X2 = torch.uint8
 # (SF_VEC_SIZE in cpp/tensorrt_llm/kernels/quantization.h).
 NVFP4_SF_VEC_SIZE = 16
 
-# Scale block widths the weight-only (W4A16_NVFP4) dequantization path accepts.
+# Scale block widths the dense W4A16_NVFP4 Linear dequantization path accepts.
+# W4A16_NVFP4 MoE remains restricted to 16-element blocks.
 # The W4A4 NVFP4 GEMMs are hardware-bound to NVFP4_SF_VEC_SIZE; ModelOpt's
 # nvfp4_*_weight_only recipes may export 32-element blocks.
-W4A16_NVFP4_SF_VEC_SIZES = (16, 32)
+W4A16_NVFP4_LINEAR_SF_VEC_SIZES = (16, 32)
 
 # For GEMM autotuning.
 # Taken from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h#L38
@@ -25,7 +35,23 @@ float4_e2m1x2 = FLOAT4_E2M1X2
 float4_sf_dtype = SF_DTYPE
 fp4_buckets = FP4_BUCKETS
 
-__all__ = ['float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets']
+__all__ = [
+    'float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets',
+    'NVFP4_SF_VEC_SIZE', 'W4A16_NVFP4_LINEAR_SF_VEC_SIZES',
+    'nvfp4_scaling_vector_size'
+]
+
+
+def nvfp4_scaling_vector_size(quant_config: QuantConfig | None) -> int:
+    """Resolve a checkpoint's NVFP4 scale width without reinterpreting explicit values.
+
+    An omitted group_size retains the standard NVFP4 width even though
+    QuantConfig defaults to 128 for AWQ/GPTQ. Explicit values, including 128,
+    are passed through for algorithm-specific validation.
+    """
+    if quant_config is None or "group_size" not in quant_config.model_fields_set:
+        return NVFP4_SF_VEC_SIZE
+    return NVFP4_SF_VEC_SIZE if quant_config.group_size is None else quant_config.group_size
 
 
 def pad_up(x: int, y: int) -> int:

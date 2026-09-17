@@ -23,6 +23,7 @@ from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMap
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+    _lm_head_nvfp4_enabled,
     _normalize_qwen35_quant_config_dict,
     _normalize_qwen35_vl_config,
 )
@@ -33,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -239,15 +241,17 @@ def test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior(
 
 
 @pytest.mark.parametrize("sm_version", [100, 103])
+@pytest.mark.cpu_only
 def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int) -> None:
     """32-element weight-only scale blocks cannot feed the W4A4 NVFP4 GEMMs, so
-    the SM100/103 promotion must leave dense MLP and lm_head entries on the
-    W4A16 dequantization path. The dense Qwen3.5-27B checkpoint (recipe
+    the SM100/103 promotion must leave dense MLP entries on the W4A16 path
+    and send lm_head through load-time bf16 dequantization. The dense Qwen3.5-27B checkpoint (recipe
     nvfp4_mlp_weight_only) has no MoE experts, and the MoE methods reject
     group_size=32 outright, so only dense Linear paths are exercised here."""
     cfg = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32)
     model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        pretrained_config=SimpleNamespace(num_hidden_layers=64, vocab_size=248320),
+        mapping=Mapping(),
         quant_config_dict={
             "model.language_model.layers.0.mlp.gate_proj": cfg,
             "lm_head": cfg,
@@ -258,19 +262,59 @@ def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int
         "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
         return_value=sm_version,
     ):
-        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=True)
+        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        assert not keep_lm_head_quant
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
 
-    assert set(model_config.quant_config_dict) == {
-        "model.layers.0.mlp.mlp.gate_proj",
-        "lm_head",
-    }
+    assert set(model_config.quant_config_dict) == {"model.layers.0.mlp.mlp.gate_proj"}
     assert all(
         config.quant_algo == QuantAlgo.W4A16_NVFP4 and config.group_size == 32
         for config in model_config.quant_config_dict.values()
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [100, 103, 120])
 @pytest.mark.parametrize("group_size", [16, 32])
+def test_qwen35_lm_head_requires_native_nvfp4_blocks(sm_version: int, group_size: int) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64, vocab_size=248320),
+        mapping=Mapping(),
+        quant_config_dict={
+            "lm_head": QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=group_size),
+        },
+    )
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+    ):
+        keep = _lm_head_nvfp4_enabled(model_config)
+        assert keep is (group_size == 16)
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep)
+    assert ("lm_head" in model_config.quant_config_dict) is keep
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [90, 100, 103, 120])
+def test_qwen35_rejects_32_element_experts_before_promotion(sm_version: int) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            "model.language_model.layers.0.mlp.experts": QuantConfig(
+                quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32
+            ),
+        },
+    )
+    with (
+        patch(
+            "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+        ),
+        pytest.raises(ValueError, match="for layer 'model.layers.0.mlp.experts'"),
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+
+@pytest.mark.parametrize("group_size", [16, 32])
+@pytest.mark.cpu_only
 def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int) -> None:
     """The bf16 lm_head fallback infers the scale block width from ``weight_scale``,
     so 32-element weight-only exports dequantize correctly, and a scale shape that

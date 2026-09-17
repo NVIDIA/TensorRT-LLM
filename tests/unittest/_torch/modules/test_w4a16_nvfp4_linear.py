@@ -29,11 +29,11 @@ from tensorrt_llm._torch.modules.linear import (
     NVFP4LinearMethod,
     TensorParallelMode,
     W4A16NVFP4LinearMethod,
-    nvfp4_scaling_vector_size,
     quant_config_has_nvfp4_activation_quantization,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.utils.fp4_utils import nvfp4_scaling_vector_size
 
 
 def test_nvfp4_activation_quantization_excludes_w4a16():
@@ -256,6 +256,7 @@ def test_nvfp4_linear_hopper_marlin_applies_bias_as_post_op():
 
 
 @pytest.mark.parametrize("scaling_vector_size", [16, 32])
+@pytest.mark.cpu_only
 def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize(
     scaling_vector_size: int,
 ) -> None:
@@ -312,11 +313,11 @@ def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize(
         (None, 16),
         (16, 16),
         (32, 32),
-        # QuantConfig.group_size defaults to the AWQ/GPTQ 128, which NVFP4 never
-        # consumed: it must keep meaning the standard 16-element block.
-        (QuantConfig.model_fields["group_size"].default, 16),
+        # Explicit values are preserved for the quant method to validate.
+        (128, 128),
     ],
 )
+@pytest.mark.cpu_only
 def test_nvfp4_scaling_vector_size_honors_declared_block_width(
     group_size: int | None, expected: int
 ) -> None:
@@ -324,6 +325,7 @@ def test_nvfp4_scaling_vector_size_honors_declared_block_width(
 
     assert nvfp4_scaling_vector_size(quant_config) == expected
     assert nvfp4_scaling_vector_size(None) == 16
+    assert nvfp4_scaling_vector_size(QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)) == 16
 
 
 @pytest.mark.parametrize(
@@ -335,6 +337,7 @@ def test_nvfp4_scaling_vector_size_honors_declared_block_width(
         (None, 128 * 8),
     ],
 )
+@pytest.mark.cpu_only
 def test_w4a16_nvfp4_linear_allocates_scales_for_declared_block_width(
     group_size: int | None, expected_scale_numel: int
 ) -> None:
@@ -357,10 +360,13 @@ def test_w4a16_nvfp4_linear_allocates_scales_for_declared_block_width(
     ("quant_algo", "group_size"),
     [
         (QuantAlgo.W4A16_NVFP4, 64),
+        (QuantAlgo.W4A16_NVFP4, 128),
+        (QuantAlgo.NVFP4, 128),
         # W4A4 NVFP4 GEMMs are hardware-bound to 16-element blocks.
         (QuantAlgo.NVFP4, 32),
     ],
 )
+@pytest.mark.cpu_only
 def test_nvfp4_linear_rejects_unsupported_block_width(
     quant_algo: QuantAlgo, group_size: int
 ) -> None:
@@ -379,6 +385,7 @@ def test_nvfp4_linear_rejects_unsupported_block_width(
 
 
 @pytest.mark.parametrize(("group_size", "expect_marlin"), [(16, True), (32, False)])
+@pytest.mark.cpu_only
 def test_w4a16_nvfp4_marlin_requires_16_element_blocks(
     group_size: int, expect_marlin: bool
 ) -> None:
@@ -672,8 +679,15 @@ def test_w4a16_nvfp4_linear_marlin_applies_pre_quant_scale_once():
         (torch.bfloat16, True),
     ],
 )
-def test_w4a16_nvfp4_marlin_selection_requires_supported_module(dtype, use_fused_gemm_allreduce):
-    module = SimpleNamespace(dtype=dtype, use_fused_gemm_allreduce=use_fused_gemm_allreduce)
+@pytest.mark.cpu_only
+def test_w4a16_nvfp4_marlin_selection_requires_supported_module(
+    dtype: torch.dtype, use_fused_gemm_allreduce: bool
+) -> None:
+    module = SimpleNamespace(
+        dtype=dtype,
+        use_fused_gemm_allreduce=use_fused_gemm_allreduce,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
+    )
 
     with (
         patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=120),

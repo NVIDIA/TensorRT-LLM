@@ -147,3 +147,32 @@ def test_modelopt_mixed_precision_validates_per_layer_nvfp4_group_size() -> None
             _modelopt_hf_quant_config("MIXED_PRECISION", quantized_layers=quantized_layers),
             moe_backend="CUTLASS",
         )
+
+
+@pytest.mark.parametrize(
+    "layer_name",
+    [
+        "model.language_model.layers.0.mlp.experts",
+        "model.layers.0.mlp.experts.0.gate_proj",
+    ],
+)
+def test_modelopt_rejects_32_element_nvfp4_experts_before_backend_selection(
+    layer_name: str,
+) -> None:
+    with pytest.raises(ValueError, match="only supported by the dense W4A16_NVFP4 Linear path"):
+        ModelConfig.load_hf_quant_config(
+            _modelopt_hf_quant_config(
+                "MIXED_PRECISION",
+                quantized_layers={layer_name: {"quant_algo": "W4A16_NVFP4", "group_size": 32}},
+            ),
+            moe_backend="CUTLASS",
+        )
+
+
+@pytest.mark.parametrize("group_size", [None, 16, 32, 128])
+def test_modelopt_preserves_w4a8_nvfp4_fp8_group_size(group_size: int | None) -> None:
+    quant_config, _ = ModelConfig.load_hf_quant_config(
+        _modelopt_hf_quant_config("W4A8_NVFP4_FP8", group_size), moe_backend="TRTLLM"
+    )
+    assert quant_config.quant_algo == QuantAlgo.W4A8_NVFP4_FP8
+    assert quant_config.group_size == group_size

@@ -126,26 +126,6 @@ def _fp8_block_scales_uses_cute_dsl_sm107(module) -> bool:
             (module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm))
 
 
-# ``QuantConfig.group_size`` defaults to the AWQ/GPTQ convention, which the
-# NVFP4 methods never consumed; only an explicit checkpoint value changes the
-# scale block width.
-_AWQ_DEFAULT_GROUP_SIZE = QuantConfig.model_fields["group_size"].default
-
-
-def nvfp4_scaling_vector_size(quant_config: Optional[QuantConfig]) -> int:
-    """Weight elements per E4M3 block scale declared by an NVFP4 checkpoint.
-
-    ``None`` and the ``QuantConfig`` default both mean the standard 16-element
-    NVFP4 block. ModelOpt's ``nvfp4_*_weight_only`` recipes may export
-    ``group_size=32``, which only the W4A16 dequantization path can consume;
-    each quant method validates the returned width against what it supports.
-    """
-    group_size = quant_config.group_size if quant_config is not None else None
-    if group_size is None or group_size == _AWQ_DEFAULT_GROUP_SIZE:
-        return fp4_utils.NVFP4_SF_VEC_SIZE
-    return group_size
-
-
 def _uses_marlin_nvfp4_backend(module) -> bool:
     """Whether a regular NVFP4 linear explicitly selects Marlin."""
     allowed_backends = getattr(module, "nvfp4_allowed_backends", ())
@@ -1519,7 +1499,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def resolve_scaling_vector_size(self, module: Linear) -> int:
         """Scale block width for ``module``, validated against this method."""
-        size = nvfp4_scaling_vector_size(module.quant_config)
+        size = fp4_utils.nvfp4_scaling_vector_size(module.quant_config)
         if size not in self.supported_scaling_vector_sizes:
             raise ValueError(
                 f"{type(self).__name__} supports NVFP4 scale blocks of "
@@ -2167,7 +2147,7 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
 
     quantizes_nvfp4_activations: ClassVar[bool] = False
     supported_scaling_vector_sizes: ClassVar[tuple[int, ...]] = (
-        fp4_utils.W4A16_NVFP4_SF_VEC_SIZES)
+        fp4_utils.W4A16_NVFP4_LINEAR_SF_VEC_SIZES)
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -2301,7 +2281,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     @staticmethod
     def is_supported(module: Linear) -> bool:
         sm_version = get_sm_version()
-        block_width = nvfp4_scaling_vector_size(module.quant_config)
+        block_width = fp4_utils.nvfp4_scaling_vector_size(module.quant_config)
         return ((89 <= sm_version < 100 or sm_version in (120, 121))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
