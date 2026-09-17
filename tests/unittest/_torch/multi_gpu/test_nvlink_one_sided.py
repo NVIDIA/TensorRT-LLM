@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""NVLinkOneSided round trips with model-shaped payloads and independent references."""
+"""NVLinkOneSided path selection and model-shaped round trips with independent references."""
 
 from __future__ import annotations
 
@@ -684,3 +684,94 @@ CASES = [
 @pytest.mark.parametrize("case", CASES)
 def test_nvlink_one_sided(case: Case, mpi_pools: dict[tuple[int, bool], MPIPoolExecutor]) -> None:
     _run(case, mpi_pools)
+
+
+# ============================================================================
+# CFT path selection and capability checks
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("force_env", "driver_version", "num_tokens", "device_supported", "expected"),
+    [
+        pytest.param(None, "615.00", 128, True, True, id="auto-at-threshold"),
+        pytest.param(None, "615.00", 129, True, False, id="auto-above-threshold"),
+        pytest.param("0", "615.00", 128, True, False, id="force-fence"),
+        pytest.param("1", "615.00", 129, True, True, id="force-cft-above-threshold"),
+        pytest.param("1", b"614.99", 128, True, False, id="force-cft-old-driver"),
+        pytest.param("1", None, 128, True, False, id="force-cft-nvml-error"),
+        pytest.param("1", "615.00", 128, False, False, id="force-cft-unsupported-device"),
+        pytest.param("invalid", "615.00", 129, True, False, id="invalid-env-uses-auto"),
+    ],
+)
+def test_cft_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    force_env: str | None,
+    driver_version: str | bytes | None,
+    num_tokens: int,
+    device_supported: bool,
+    expected: bool,
+) -> None:
+    from tensorrt_llm._torch.modules.fused_moe.communication import nvlink_one_sided
+
+    if force_env is None:
+        monkeypatch.delenv(FORCE_CFT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(FORCE_CFT_ENV, force_env)
+
+    def query_driver_version() -> str | bytes:
+        if driver_version is None:
+            raise nvlink_one_sided.pynvml.NVMLError(nvlink_one_sided.pynvml.NVML_ERROR_UNKNOWN)
+        return driver_version
+
+    monkeypatch.setattr(nvlink_one_sided.pynvml, "nvmlDeviceGetCount", lambda: 1)
+    monkeypatch.setattr(nvlink_one_sided.pynvml, "nvmlSystemGetDriverVersion", query_driver_version)
+    force_cft = nvlink_one_sided.get_force_cft()
+    version = nvlink_one_sided._get_nvidia_driver_version()
+    assert version == (
+        driver_version.decode() if isinstance(driver_version, bytes) else driver_version
+    )
+    can_use_cft = (
+        nvlink_one_sided.resolve_cft_counted_writes(force_cft, version) and device_supported
+    )
+    assert nvlink_one_sided.should_use_cft(can_use_cft, force_cft, 128, num_tokens) is expected
+
+
+@pytest.mark.parametrize(
+    ("capability", "unsupported_index"),
+    [
+        pytest.param((9, 0), None, id="hopper"),
+        pytest.param((10, 3), None, id="supported"),
+        pytest.param((10, 3), 0, id="no-fabric-handle"),
+        pytest.param((10, 3), 1, id="no-unicast-endpoint"),
+        pytest.param((10, 3), 2, id="no-counted-ops"),
+    ],
+)
+def test_cft_device_support(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    unsupported_index: int | None,
+) -> None:
+    from tensorrt_llm._torch.modules.fused_moe.communication import nvlink_one_sided
+
+    cuda = nvlink_one_sided.cuda
+    attributes = (
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
+    )
+    unsupported = None if unsupported_index is None else attributes[unsupported_index]
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        cuda,
+        "cuDeviceGetAttribute",
+        lambda attribute, device: (cuda.CUresult.CUDA_SUCCESS, int(attribute != unsupported)),
+    )
+    reason = nvlink_one_sided._cft_device_support_reason()
+    if capability[0] < 10:
+        assert "SM90" in reason
+    elif unsupported is None:
+        assert reason is None
+    else:
+        assert unsupported.name in reason
