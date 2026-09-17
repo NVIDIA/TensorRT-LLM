@@ -88,11 +88,21 @@ class InfraDryRunPipelineTest(unittest.TestCase):
                 self.assertLess(body.index(infra_dry_run_check), body.index("def githubPrApiUrl"))
                 self.assertLess(body.index(empty_result), body.index("def githubPrApiUrl"))
 
-    def test_docs_skip_junit_after_a_successful_build(self) -> None:
+    def test_docs_skip_results_only_after_a_successful_build(self) -> None:
+        result_handler = _function_body(
+            L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"
+        )
         self.assertIn(
             'cacheErrorAndUploadResult(pipeline, "${key}", values[1], {}, true, attemptTag, '
             "isFinalAttempt, retryContext)",
             L0_TEST,
+        )
+        process_results = "boolean shouldProcessResults = !noResultIfSuccess || stageIsFailed"
+        process_results_branch = "if (shouldProcessResults) {"
+        self.assertIn(f"{process_results}\n            {process_results_branch}", result_handler)
+        self.assertLess(
+            result_handler.index(process_results_branch),
+            result_handler.index('junit(testResults: "${stageName}/results*.xml")'),
         )
 
 
