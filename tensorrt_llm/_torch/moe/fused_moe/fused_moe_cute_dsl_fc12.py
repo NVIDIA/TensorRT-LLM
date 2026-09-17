@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CuteDslFc12FusedMoE: ``trtllm.cutedsl.fused_fc12.nvfp4``.
+"""TrtllmCutedslFusedFc12Nvfp4Impl: ``trtllm.cutedsl.fused_fc12.nvfp4``.
 
 FC1+FC2-fused CuteDSL NVFP4 MoE backend for Rubin (SM107). One persistent kernel
 (``trtllm::cute_dsl_nvfp4_fc12_fused_rubin``) does gather + FC1 GEMM + SwiGLU +
@@ -80,11 +80,17 @@ class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
 
 
 @register_moe_impl
-class CuteDslFc12FusedMoE(MoEImplBase):
+class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     """``trtllm.cutedsl.fused_fc12.nvfp4``: FC1+FC2-fused CuteDSL NVFP4 MoE (Rubin/SM107).
 
     Args mirror ``CuteDslFusedMoE``; see the module docstring for what is
     shared with it and why it is restated rather than inherited.
+
+    The kernel segment stays in the name because the plain CuteDSL NVFP4
+    implementation shares provider, technique and quant with this one.
+
+    ``CuteDslFc12FusedMoE`` below is an alias onto this class, so the
+    pre-identity name still resolves for the call sites that use it.
     """
 
     # ConfigurableMoE reads this off the backend type: the fused kernel takes
@@ -454,3 +460,10 @@ class CuteDslFc12FusedMoE(MoEImplBase):
             scaling_vector_size=16,
         )
         return moe_output
+
+
+# The pre-identity name, kept as an alias rather than a base class: the
+# ``moe_backend="CUTEDSL_FC12"`` call sites, the ``issubclass`` dispatch in
+# ``create_moe.py``, and the comments across the MoE tree that still say
+# ``CuteDslFc12FusedMoE`` all mean the class above.
+CuteDslFc12FusedMoE = TrtllmCutedslFusedFc12Nvfp4Impl

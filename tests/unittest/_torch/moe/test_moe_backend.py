@@ -1823,6 +1823,7 @@ CI_MOE_MODEL_CONFIGS = [
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
+    MoeModelConfig(384, 6, 7168, 3072),  # DeepSeek-V4-Pro
     MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
     MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
@@ -1832,12 +1833,6 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
 ]
 
 MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS if IS_CI_MODE else LOCAL_MOE_MODEL_CONFIGS
-
-# DeepSeek-V4-Pro routed-MoE shape (n_routed_experts=384, top_k=6,
-# hidden_size=7168, moe_intermediate_size=3072), tested in both CI and local mode.
-MOE_MODEL_CONFIGS = MOE_MODEL_CONFIGS + [
-    MoeModelConfig(384, 6, 7168, 3072),  # DeepSeek-V4-Pro
-]
 
 # Sequence lengths to test
 SEQ_LENS_TO_TEST = [1, 8]
