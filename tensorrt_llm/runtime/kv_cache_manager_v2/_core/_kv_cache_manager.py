@@ -43,7 +43,7 @@ from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCyc
 from .._page import Page, _PageHolder
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
 from .._storage._config import BufferId, SlotDesc, create_storage_config
-from .._storage._core import GpuCacheLevelStorage, PoolGroupIndex, PoolIndex, SlotId
+from .._storage._core import GpuCacheLevelStorage, GpuPoolGroup, PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
 from .._utils import (
     HalfOpenRange,
@@ -70,6 +70,8 @@ class PoolDesc:
     pool_index: PoolIndex
     base_address: MemAddress
     slot_bytes: int
+    # Mapped byte ranges relative to base_address; None denotes contiguous storage.
+    mapped_ranges: tuple[tuple[int, int], ...] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -379,34 +381,18 @@ class KVCacheManager:
         lc_id = storage._layer_to_life_cycle_ids[layer_id]
         pg_idx = storage.get_pool_group_index(lc_id)
         pool_group = storage._levels[GPU_LEVEL].storage._pool_groups[pg_idx]
-        # num_slots is a @property on non-localized PoolGroupBase but a
-        # method(locality_domain_id) on localized GpuPoolGroup.  Handle both.
         num_slots = (
-            pool_group.num_slots() if callable(pool_group.num_slots) else pool_group.num_slots
+            pool_group.slot_index_upper_bound
+            if isinstance(pool_group, GpuPoolGroup)
+            else pool_group.num_slots
         )
         attr = storage.get_buffer_attr(layer_id, data_role)
-        pool_idx = attr.pool_index
-        slot_size = pool_group.slot_size[pool_idx]
-        upper_bound = (
-            exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size)
-        ) * attr.expansion
-        if (
-            isinstance(storage._levels[GPU_LEVEL].storage, GpuCacheLevelStorage)
-            and pool_group.num_locality_domains > 1
-        ):
-            # Shared-pool-pointer localized execution keeps locality domain 0 as the
-            # canonical base address and encodes the locality domain VA displacement in
-            # the same canonical slot-id / base-page-index space used by the
-            # localized allocators. Tensor views that wrap the underlying pool
-            # must therefore span the largest displaced page index as well.
-            scale = storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
-            upper_bound += (
-                (pool_group.num_locality_domains - 1)
-                * scale
-                * pool_group._slot_id_offset
-                * attr.expansion
-            )
-        return upper_bound
+        slot_size = pool_group.slot_size[attr.pool_index]
+        return max(
+            0,
+            (exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size))
+            * attr.expansion,
+        )
 
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int:
         """
@@ -896,27 +882,26 @@ class KVCacheManager:
     def pool_group_descs(self) -> TypedIndexList[PoolGroupIndex, PoolGroupDesc]:
         storage = self._storage
         gpu_storage = storage._levels[GPU_LEVEL].storage
-        # base_address below is the address of slot 0, which lives in locality
-        # domain 0, so the slot count has to describe that same domain.
-        use_primary_locality_domain = (
-            isinstance(gpu_storage, GpuCacheLevelStorage) and gpu_storage.num_locality_domains > 1
-        )
 
         def get_pool_group_desc(pg_idx: PoolGroupIndex) -> PoolGroupDesc:
             slot_size_list = storage.slot_size(pg_idx)
+            pool_group = gpu_storage._pool_groups[pg_idx]
             pools = make_typed(
                 lambda pool_idx: PoolDesc(
                     pool_index=pool_idx,
                     base_address=storage.get_mem_pool_base_address(pg_idx, pool_idx),
                     slot_bytes=slot_size_list[pool_idx],
+                    mapped_ranges=tuple(pool_group._pools[pool_idx]._vm.mapped_ranges())
+                    if isinstance(pool_group, GpuPoolGroup) and pool_group.num_locality_domains > 1
+                    else None,
                 ),
                 storage.num_pools(pg_idx),
             )
             return PoolGroupDesc(
                 pool_group_index=pg_idx,
-                num_slots=storage.num_slots(pg_idx, locality_domain_id=0)
-                if use_primary_locality_domain
-                else storage.num_slots(pg_idx),
+                num_slots=pool_group.slot_index_upper_bound
+                if isinstance(pool_group, GpuPoolGroup)
+                else pool_group.num_slots,
                 slot_desc=storage._slot_desc_list[pg_idx],
                 pools=pools,
             )

@@ -510,10 +510,11 @@ class StorageManager:
         level: CacheLevel,
         min_num_pages: TypedIndexList[PoolGroupIndex, int],
         drop_recorder: DropRecorder | None = None,
+        page_filter: Callable[[EvictablePage], bool] | None = None,
     ) -> None:
         # If we break inside this function with debugpy, pages in `evicted` won't be
         # released even after the function returns. This is a debugpy artifact.
-        evicted = self._levels[level].controller.evict(min_num_pages)
+        evicted = self._levels[level].controller.evict(min_num_pages, page_filter)
         if int(level) == self.num_cache_levels - 1:
             assert all(p.status == PageStatus.DROPPABLE for pages in evicted for p in pages), (
                 "Corrupted eviction controller"
@@ -728,14 +729,8 @@ class StorageManager:
             for src, dst in zip(src_pages, dst_slots):
                 assert defrag or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
-                if isinstance(dst_pool_group, GpuPoolGroup):
-                    dst_addresses = dst_pool_group.slot_address(dst.slot_id, dst_ldid)
-                else:
-                    dst_addresses = dst_pool_group.slot_address(dst.slot_id)
-                if isinstance(src_pool_group, GpuPoolGroup):
-                    src_addresses = src_pool_group.slot_address(src.slot_id, src.locality_domain_id)
-                else:
-                    src_addresses = src_pool_group.slot_address(src.slot_id)
+                dst_addresses = dst_pool_group.slot_address(dst.slot_id)
+                src_addresses = src_pool_group.slot_address(src.slot_id)
                 for pool_idx in typed_range(num_pools):
                     tasks_per_pool[pool_idx].append(
                         CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
@@ -870,9 +865,6 @@ class StorageManager:
         self, level: CacheLevel, pg_idx: PoolGroupIndex, slot_id: SlotId, pool_idx: PoolIndex
     ) -> Address:
         storage = self._levels[level].storage
-        if isinstance(storage, GpuCacheLevelStorage) and storage.num_locality_domains > 1:
-            locality_domain_id = storage._pool_groups[pg_idx].get_locality_domain_id(slot_id)
-            return storage.slot_address(pg_idx, pool_idx, slot_id, locality_domain_id)
         return storage.slot_address(pg_idx, pool_idx, slot_id)
 
     def get_page_indices_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
@@ -880,19 +872,7 @@ class StorageManager:
         return PageIndex(scale * int(self._base_page_index_for_slot(life_cycle, slot_id)))
 
     def _base_page_index_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
-        storage = self._levels[GPU_LEVEL].storage
-        if not (isinstance(storage, GpuCacheLevelStorage) and storage.num_locality_domains > 1):
-            return PageIndex(int(slot_id))
-
-        pg_idx = self.get_pool_group_index(life_cycle)
-        pool_group = storage._pool_groups[pg_idx]
-        locality_domain_id = pool_group.get_locality_domain_id(slot_id)
-        local_idx = pool_group.get_local_slot_index(slot_id, locality_domain_id)
-
-        # Shared-pool-pointer execution keeps the canonical locality domain 0 pool base and
-        # encodes the locality domain displacement in the same canonical slot-id space
-        # used by the localized allocators.
-        return PageIndex(local_idx + locality_domain_id * pool_group._slot_id_offset)
+        return PageIndex(int(slot_id))
 
     def get_statistics(
         self, level: CacheLevel = GPU_LEVEL
@@ -948,7 +928,7 @@ class StorageManager:
             allocator = pool_group._slot_allocators[ldid]
 
             def local_index(slot_id: SlotId) -> int:
-                return pool_group.get_local_slot_index(slot_id, ldid)
+                return allocator._local_idx(slot_id)
 
             def in_scope(page: Page) -> bool:
                 return pool_group.num_locality_domains == 1 or page.locality_domain_id == ldid
@@ -978,8 +958,11 @@ class StorageManager:
         ctrl = self._levels[level].controller
         # pages with overflow slots and their indices in the eviction queue.
         overflow_slots = deque[tuple[int, Page]]()
-        for i, p in enumerate(cast(Iterator[Page], ctrl.page_iterator(pg_idx))):
-            if in_scope(p) and local_index(p.slot_id) >= new_num_slots:
+        scoped_pages = (
+            page for page in cast(Iterator[Page], ctrl.page_iterator(pg_idx)) if in_scope(page)
+        )
+        for i, p in enumerate(scoped_pages):
+            if local_index(p.slot_id) >= new_num_slots:
                 overflow_slots.append((i, p))
         overflow_persistent_pages = [
             p for p in persistent_pages if in_scope(p) and local_index(p.slot_id) >= new_num_slots
@@ -1000,7 +983,11 @@ class StorageManager:
             min_num_evicted = overflow_slots.popleft()[0] + 1
             num_evicted_overflow_slots += 1
         self.force_evict(
-            level, make_typed(lambda i: min_num_evicted if i == pg_idx else 0, self.num_pool_groups)
+            level,
+            make_typed(lambda i: min_num_evicted if i == pg_idx else 0, self.num_pool_groups),
+            page_filter=lambda page: not isinstance(pool_group, GpuPoolGroup)
+            or pool_group.num_locality_domains == 1
+            or page.locality_domain_id == ldid,
         )
         # These are the pages that will remain in the cache level and require defragmentation.
         overflow_pages = [s[1] for s in overflow_slots] + overflow_persistent_pages

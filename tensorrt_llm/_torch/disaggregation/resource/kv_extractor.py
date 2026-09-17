@@ -659,6 +659,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         base_address=int(pool.base_address),
                         slot_bytes=int(pool.slot_bytes),
                         num_slots=int(pg_desc.num_slots),
+                        mapped_ranges=getattr(pool, "mapped_ranges", None),
                     )
                     for pool in pg_desc.pools
                 ]

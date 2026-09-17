@@ -4956,9 +4956,9 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype = torch.int8
 
         views: list[torch.Tensor] = []
-        for locality_domain_id in range(self.num_locality_domains):
+        for slot_start, slot_end in pool_group.slot_ranges():
             local_page_upper_bound = (
-                exact_div(slot_size, attr.size) * pool_group.num_slots(locality_domain_id)
+                exact_div(slot_size, attr.size) * (slot_end - slot_start)
                 - exact_div(attr.offset, attr.size)
             ) * attr.expansion
             if kv_layout == "NHD":
@@ -4978,8 +4978,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.head_dim_per_layer[layer_offset] // element_per_container,
                 ]
             addr_key = (
-                int(gpu_storage.slot_address(pg_idx, attr.pool_index, 0, locality_domain_id))
-                + attr.offset
+                int(gpu_storage.slot_address(pg_idx, attr.pool_index, slot_start)) + attr.offset
             )
             views.append(
                 convert_to_torch_tensor(TensorWrapper(addr_key, dtype, shape)).flatten(0, 1)
@@ -4998,10 +4997,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     continue
                 yield layer_id, buffer
             else:
-                # Guard pages are indexed against the whole layer buffer, which does
-                # not exist as one tensor once the pool is split, so yield no layer
-                # key: restoring the guard into a per-domain view would write the
-                # sentinel to the wrong page.
+                # These views omit unmapped gaps. Guard indices use global slot
+                # coordinates, so they cannot be applied to an individual range.
                 for buffer in self._get_buffer_views_for_invalid_value_check(layer_id):
                     if buffer is None:
                         continue

@@ -50,7 +50,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         GPU_LEVEL,
         CudaStream,
     )
-    from kv_cache_manager_v2._life_cycle_registry import LifeCycleId
     from kv_cache_manager_v2._storage._core import PoolGroupIndex, SlotId
     from kv_cache_manager_v2._utils import TemporaryCudaStream, init_cuda_once
 else:
@@ -70,7 +69,6 @@ else:
         GPU_LEVEL,
         CudaStream,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleId
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import PoolGroupIndex, SlotId
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import TemporaryCudaStream, init_cuda_once
 
@@ -165,17 +163,12 @@ def _get_valid_slot_ids(kv_cache: _KVCache, life_cycle_id: int = 0) -> list[int]
     return slot_ids
 
 
-def _get_localized_slot_id_offset(kv_cache: _KVCache, layer_group_id: int = 0) -> int:
-    storage = kv_cache.manager._storage._levels[GPU_LEVEL].storage
-    return storage._pool_groups[PoolGroupIndex(layer_group_id)]._slot_id_offset
-
-
-def _get_localized_base_page_index_offset(kv_cache: _KVCache, life_cycle_id: int = 0) -> int:
-    storage = kv_cache.manager._storage
-    slot_id_offset = _get_localized_slot_id_offset(kv_cache, life_cycle_id)
-    return int(
-        storage._base_page_index_for_slot(LifeCycleId(life_cycle_id), SlotId(slot_id_offset))
-    )
+def _get_slot_domains(kv_cache: _KVCache) -> set[int | None]:
+    return {
+        block.pages[DEFAULT_BEAM_INDEX][0].page.locality_domain_id
+        for block in kv_cache._blocks
+        if block.pages[DEFAULT_BEAM_INDEX][0] is not None
+    }
 
 
 class TestKVCacheLocalityDomainIdStorage(unittest.TestCase):
@@ -249,25 +242,23 @@ class TestKVCacheLocalizedResize(unittest.TestCase):
         return kv_cache
 
     def test_resize_slots_on_locality_domain0(self) -> None:
-        """Slots allocated for locality_domain_id=0 must have page indices below the localized offset."""
+        """Domain zero pages expose ordinary slot indices and domain metadata."""
         self.manager = _make_localized_manager()
         kv_cache = self._create_and_resize(locality_domain_id=0)
         indices = _get_valid_page_indices(kv_cache)
-        localized_offset = _get_localized_base_page_index_offset(kv_cache)
         self.assertGreater(len(indices), 0, "Must have at least one allocated page")
-        for idx in indices:
-            self.assertLess(idx, localized_offset)
+        self.assertEqual(indices, _get_valid_slot_ids(kv_cache))
+        self.assertEqual(_get_slot_domains(kv_cache), {0})
         kv_cache.close()
 
     def test_resize_slots_on_locality_domain1(self) -> None:
-        """Slots allocated for locality_domain_id=1 must have page indices at or above the localized offset."""
+        """Domain one pages expose ordinary slot indices and domain metadata."""
         self.manager = _make_localized_manager()
         kv_cache = self._create_and_resize(locality_domain_id=1)
         indices = _get_valid_page_indices(kv_cache)
-        localized_offset = _get_localized_base_page_index_offset(kv_cache)
         self.assertGreater(len(indices), 0, "Must have at least one allocated page")
-        for idx in indices:
-            self.assertGreaterEqual(idx, localized_offset)
+        self.assertEqual(indices, _get_valid_slot_ids(kv_cache))
+        self.assertEqual(_get_slot_domains(kv_cache), {1})
         kv_cache.close()
 
     def test_resize_does_not_cross_locality_domain(self) -> None:
@@ -280,12 +271,11 @@ class TestKVCacheLocalizedResize(unittest.TestCase):
         indices1 = set(_get_valid_page_indices(kv1))
         slot_ids0 = set(_get_valid_slot_ids(kv0))
         slot_ids1 = set(_get_valid_slot_ids(kv1))
-        localized_offset = _get_localized_base_page_index_offset(kv0)
 
         self.assertGreater(len(indices0), 0)
         self.assertGreater(len(indices1), 0)
-        self.assertTrue(all(i < localized_offset for i in indices0))
-        self.assertTrue(all(i >= localized_offset for i in indices1))
+        self.assertEqual(_get_slot_domains(kv0), {0})
+        self.assertEqual(_get_slot_domains(kv1), {1})
         self.assertEqual(
             indices0 & indices1, set(), "page index ranges must not overlap across locality domains"
         )
@@ -339,12 +329,11 @@ class TestKVCacheSuspendResumeLocalized(unittest.TestCase):
             success = kv_cache.resume(stream2)
             self.assertTrue(success, "resume() after suspend must succeed")
 
-            localized_offset = _get_localized_base_page_index_offset(kv_cache)
             # Page indices must still be on locality_domain1.
             indices_after = _get_valid_page_indices(kv_cache)
             self.assertGreater(len(indices_after), 0)
-            for idx in indices_after:
-                self.assertGreaterEqual(idx, localized_offset)
+            self.assertEqual(indices_after, _get_valid_slot_ids(kv_cache))
+            self.assertEqual(_get_slot_domains(kv_cache), {1})
 
         kv_cache.close()
 
@@ -560,7 +549,7 @@ class TestKVCacheManagerLocalizedQueries(unittest.TestCase):
         self.assertGreater(pool_group.num_locality_domains, 1)
 
         # Highest base page index a locality domain 1 slot can carry.
-        highest = pool_group._slot_id_offset + pool_group.num_slots(1) - 1
+        highest = pool_group.slot_index_upper_bound - 1
         converted = self.manager.get_page_index_converter(layer_id, ROLE_KEY)([highest])
         upper_bound = self.manager.get_page_index_upper_bound(layer_id, ROLE_KEY)
         self.assertGreater(
@@ -570,7 +559,7 @@ class TestKVCacheManagerLocalizedQueries(unittest.TestCase):
         )
 
     def test_page_index_upper_bound_ignores_page_stride_divisibility(self) -> None:
-        """Localized upper bounds must use canonical slot offsets, not LOCALIZATION_OFFSET/page_stride."""
+        """Upper bounds depend on slot extent and buffer layout."""
         from unittest.mock import patch
 
         self.manager = _make_localized_manager()
@@ -579,6 +568,62 @@ class TestKVCacheManagerLocalizedQueries(unittest.TestCase):
         with patch.object(type(self.manager), "get_page_stride", lambda _self, _layer_id, _role: 3):
             upper_bound = self.manager.get_page_index_upper_bound(LayerId(0), DataRole("key"))
             self.assertEqual(upper_bound, unpatched, "upper bound must not depend on page_stride")
+
+    def test_ld1_indices_address_all_buffer_pools(self) -> None:
+        roles = (ROLE_KEY, ROLE_VALUE, DataRole("key_block_quant"))
+        config = KVCacheManagerConfig(
+            tokens_per_block=_TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=_256MB, enable_locality_domains=True)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(i),
+                    buffers=[
+                        BufferConfig(role=role, size=size)
+                        for role, size in zip(roles, (8192, 8192, 192))
+                    ],
+                    sliding_window_size=None,
+                )
+                for i in range(2)
+            ],
+        )
+        with _override_localization_mode("1"):
+            self.manager = KVCacheManager(config)
+        kv = self.manager.create_kv_cache(locality_domain_id=1)
+        try:
+            with TemporaryCudaStream([]) as stream:
+                self.assertTrue(kv.resume(cast(CudaStream, stream.handle)))
+                self.assertTrue(kv.resize(64))
+            storage = self.manager._storage
+            base_indices = _get_valid_page_indices(kv)
+            self.assertTrue(base_indices)
+            for layer in (LayerId(0), LayerId(1)):
+                for role in roles:
+                    attr = storage.get_buffer_attr(layer, role)
+                    pg_idx = storage.get_pool_group_index(attr.life_cycle_id)
+                    base = self.manager.get_mem_pool_base_address(layer, role)
+                    stride = self.manager.get_page_stride(layer, role)
+                    converted = self.manager.get_page_index_converter(layer, role)(base_indices)
+                    for slot_id, index in zip(base_indices, converted):
+                        address = storage.slot_address(
+                            GPU_LEVEL, pg_idx, SlotId(slot_id), attr.pool_index
+                        )
+                        self.assertEqual(base + index * stride, address + attr.offset)
+                    self.assertGreater(
+                        self.manager.get_page_index_upper_bound(layer, role), max(converted)
+                    )
+            desc = self.manager.pool_group_descs[PoolGroupIndex(0)]
+            self.assertGreater(desc.num_slots, max(base_indices))
+            for pool in desc.pools:
+                for slot_id in base_indices:
+                    start = slot_id * pool.slot_bytes
+                    self.assertTrue(
+                        any(
+                            lo <= start and start + pool.slot_bytes <= hi
+                            for lo, hi in pool.mapped_ranges
+                        )
+                    )
+        finally:
+            kv.close()
 
 
 class TestKVCacheSaltedReuse(unittest.TestCase):
@@ -704,9 +749,43 @@ class TestKVCacheSaltedReuse(unittest.TestCase):
         )
         self._commit_and_close(kv_b, tokens, capacity)
 
+    def test_shrinking_ld1_preserves_ld0_cached_pages(self) -> None:
+        self.manager = _make_localized_manager()
+        tokens = list(range(64))
+        for uid in (0, 1):
+            kv = self.manager.create_kv_cache(input_tokens=tokens[:-1], locality_domain_id=uid)
+            self._commit_and_close(kv, tokens, len(tokens))
+        storage = self.manager._storage
+        pg = PoolGroupIndex(0)
+        controller = storage._levels[GPU_LEVEL].controller
+
+        def domain_zero_slots():
+            return {
+                page.slot_id
+                for page in controller.page_iterator(pg)
+                if page.locality_domain_id == 0
+            }
+
+        old_slots = domain_zero_slots()
+        self.assertEqual(len(old_slots), 2)
+        storage.shrink_pool_group(GPU_LEVEL, pg, 1, [], locality_domain_id=1)
+        self.assertEqual(domain_zero_slots(), old_slots)
+        self.assertEqual(storage.num_slots(pg, locality_domain_id=1), 1)
+        kv = self.manager.create_kv_cache(input_tokens=tokens[:-1], locality_domain_id=0)
+        try:
+            self.assertGreater(kv.num_committed_tokens, 0)
+        finally:
+            kv.close()
+
     def test_tree_task_id_computation(self) -> None:
         """Verify ReuseScope salting produces distinct roots for different locality_domain_ids."""
-        from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import ReuseScope, RootBlock
+        if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
+            from kv_cache_manager_v2._block_radix_tree import ReuseScope, RootBlock
+        else:
+            from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+                ReuseScope,
+                RootBlock,
+            )
 
         # Same lora, different locality_domain → different root key
         key_0 = RootBlock.make_key(ReuseScope(lora_id=42, locality_domain_id=0))

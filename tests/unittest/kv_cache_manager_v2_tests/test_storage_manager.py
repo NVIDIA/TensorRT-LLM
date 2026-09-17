@@ -17,6 +17,10 @@ import unittest
 from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+import cuda.bindings.driver as drv
+import numpy as np
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
@@ -29,18 +33,21 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         LayerId,
     )
     from kv_cache_manager_v2._common import GPU_LEVEL, PRIORITY_DEFAULT, CacheTier, PageStatus
-    from kv_cache_manager_v2._cuda_virt_mem import LOCALIZATION_OFFSET
+    from kv_cache_manager_v2._cuda_virt_mem import PooledPhysMemAllocator
     from kv_cache_manager_v2._eviction_controller import PerLevelEvictionController
+    from kv_cache_manager_v2._exceptions import LogicError
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleId, LifeCycleRegistry
     from kv_cache_manager_v2._storage._config import create_storage_config
     from kv_cache_manager_v2._storage._core import (
         GpuCacheLevelStorage,
+        GpuPoolGroup,
+        GpuSlotPool,
         PoolGroupIndex,
         SlotAllocator,
-        SlotId,
+        _SlotIdMap,
     )
     from kv_cache_manager_v2._storage_manager import StorageManager
-    from kv_cache_manager_v2._utils import exact_div, init_cuda_once, typed_range
+    from kv_cache_manager_v2._utils import _unwrap, exact_div, init_cuda_once, typed_range
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         AttentionLayerConfig,
@@ -57,10 +64,11 @@ else:
         CacheTier,
         PageStatus,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import LOCALIZATION_OFFSET
+    from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import PooledPhysMemAllocator
     from tensorrt_llm.runtime.kv_cache_manager_v2._eviction_controller import (
         PerLevelEvictionController,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import LogicError
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
         LifeCycleId,
         LifeCycleRegistry,
@@ -68,12 +76,15 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._config import create_storage_config
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
         GpuCacheLevelStorage,
+        GpuPoolGroup,
+        GpuSlotPool,
         PoolGroupIndex,
         SlotAllocator,
-        SlotId,
+        _SlotIdMap,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageManager
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+        _unwrap,
         exact_div,
         init_cuda_once,
         typed_range,
@@ -165,13 +176,6 @@ def _make_storage_manager(
             config.tokens_per_block,
             config.swa_scratch_reuse,
         )
-
-
-def _get_localized_slot_id_offset(
-    sm: StorageManager, pg: PoolGroupIndex = PoolGroupIndex(0)
-) -> int:
-    gpu_storage = sm._levels[GPU_LEVEL].storage
-    return gpu_storage._pool_groups[pg]._slot_id_offset
 
 
 class _FakeEvictablePage:
@@ -425,103 +429,207 @@ class TestStorageManagerInit(unittest.TestCase):
         sm.destroy()  # must not raise
 
 
-class TestSlotAllocatorOffset(unittest.TestCase):
-    """Tests for SlotAllocator with slot_id_offset.
+class TestSlotAllocatorMetadata(unittest.TestCase):
+    def _allocator(self, *args, **kwargs):
+        allocator = SlotAllocator(*args, **kwargs)
 
-    Motivation: SlotAllocator was redesigned to replace DynamicBitset with
-    set[SlotId] and to support a slot_id_offset parameter. These tests use
-    LOCALIZATION_OFFSET as a large arbitrary offset value to exercise the
-    generic offset bookkeeping in isolation:
-      default: slot_ids ∈ [0, capacity)
-      offset:  slot_ids ∈ [LOCALIZATION_OFFSET, LOCALIZATION_OFFSET + capacity)
+        def destroy():
+            allocator.prepare_for_shrink(0)
+            allocator.finish_shrink()
 
-    SlotAllocator is pure Python, so these tests do not assert how production
-    localized storage chooses its canonical slot-id stride.
-    """
+        self.addCleanup(destroy)
+        return allocator
 
+    def test_default_slot_ids_start_at_zero(self) -> None:
+        alloc = self._allocator(capacity=4)
+        slot = alloc.allocate()
+        self.assertEqual(slot.slot_id, 0)
+        self.assertIsNone(slot.locality_domain_id)
+        alloc.release(slot)
+
+    def test_domain_one_can_own_slot_zero(self) -> None:
+        mapping = _SlotIdMap(4)
+        mapping.append(0)
+        alloc = self._allocator(4, mapping, locality_domain_id=1)
+        slot = alloc.allocate()
+        self.assertEqual(slot.slot_id, 0)
+        self.assertEqual(slot.locality_domain_id, 1)
+        alloc.release(slot)
+        recycled = alloc.allocate()
+        self.assertEqual(recycled.slot_id, 0)
+        self.assertEqual(recycled.locality_domain_id, 1)
+        alloc.release(recycled)
+
+    def test_shrink_tracks_interleaved_ranges(self) -> None:
+        mapping = _SlotIdMap(4)
+        mapping.append(2)
+        mapping.append(0)
+        alloc = self._allocator(8, mapping, locality_domain_id=1)
+        slots = alloc.allocate_multiple(8)
+        self.assertEqual([s.slot_id for s in slots], [8, 9, 10, 11, 0, 1, 2, 3])
+        alloc.prepare_for_shrink(4)
+        self.assertEqual(set(alloc.get_slots_blocking_shrink()), {0, 1, 2, 3})
+        for slot in slots[4:]:
+            alloc.release(slot)
+        self.assertTrue(alloc.finish_shrink())
+        self.assertEqual(alloc.num_slots, 4)
+        for slot in slots[:4]:
+            alloc.release(slot)
+
+    def test_wrong_domain_release_preserves_slot(self) -> None:
+        mapping = _SlotIdMap(4)
+        mapping.append(0)
+        alloc = self._allocator(4, mapping, locality_domain_id=1)
+        slot = alloc.allocate()
+        with patch.object(slot, "locality_domain_id", 0):
+            with self.assertRaisesRegex(LogicError, "not occupied"):
+                alloc.release(slot)
+            self.assertTrue(slot.has_valid_slot)
+        alloc.release(slot)
+
+
+class TestGpuSlotMetadata(unittest.TestCase):
     def setUp(self) -> None:
         init_cuda_once()
 
-    # ------------------------------------------------------------------
-    # Test 1: without offset, slot_ids count up from 0
-    # ------------------------------------------------------------------
-    def test_default_slot_ids_start_at_zero(self) -> None:
-        """Without slot_id_offset the first allocated slot has slot_id == 0."""
-        alloc = SlotAllocator(capacity=4)
-        slot = alloc.allocate()
-        self.assertEqual(int(slot.slot_id), 0)
-        alloc.release(slot)
+    @contextmanager
+    def _group(self, counts, sizes=(256 << 10,)):
+        with _override_localization_mode("1"):
+            physical = PooledPhysMemAllocator.create_localized(2 << 20)
+            group = GpuPoolGroup(counts, list(sizes), physical)
+            try:
+                yield group
+            finally:
+                group.destroy()
+                physical.clear()
 
-    # ------------------------------------------------------------------
-    # Test 2: locality_domain1 offset — slot_ids count up from LOCALIZATION_OFFSET
-    # ------------------------------------------------------------------
-    def test_locality_domain1_slot_ids_start_at_localization_offset(self) -> None:
-        """With slot_id_offset=LOCALIZATION_OFFSET the first slot_id equals LOCALIZATION_OFFSET."""
-        alloc = SlotAllocator(capacity=4, slot_id_offset=LOCALIZATION_OFFSET)
-        slot = alloc.allocate()
-        self.assertEqual(int(slot.slot_id), LOCALIZATION_OFFSET)
-        alloc.release(slot)
+    def _assert_data(self, group, slots) -> None:
+        for slot, value in slots:
+            for pool in group._pools:
+                address = pool.slot_address(slot.slot_id)
+                self.assertEqual(address, pool._vm.address + slot.slot_id * pool.slot_size)
+                data = np.zeros(16, dtype=np.uint8)
+                _unwrap(drv.cuMemcpyDtoH(data.ctypes.data, address, data.nbytes))
+                self.assertTrue(np.all(data == value))
 
-    def test_consecutive_locality_domain1_slot_ids_increment_from_offset(self) -> None:
-        """Consecutive locality_domain1 slot_ids are LOCALIZATION_OFFSET, +1, +2, …."""
-        alloc = SlotAllocator(capacity=4, slot_id_offset=LOCALIZATION_OFFSET)
-        slots = [alloc.allocate() for _ in range(3)]
-        ids = [int(s.slot_id) for s in slots]
-        self.assertEqual(
-            ids,
-            [LOCALIZATION_OFFSET, LOCALIZATION_OFFSET + 1, LOCALIZATION_OFFSET + 2],
-        )
-        for s in slots:
-            alloc.release(s)
+    def _fill(self, group, slot, value) -> None:
+        for pool in group._pools:
+            _unwrap(drv.cuMemsetD8(pool.slot_address(slot.slot_id), value, pool.slot_size))
 
-    # ------------------------------------------------------------------
-    # Test 3: _local_idx strips the offset correctly
-    # ------------------------------------------------------------------
-    def test_local_idx_strips_offset(self) -> None:
-        """_local_idx(slot_id) returns the 0-based per-pool index for both locality_domain0 and locality_domain1."""
-        alloc0 = SlotAllocator(capacity=4)
-        alloc1 = SlotAllocator(capacity=4, slot_id_offset=LOCALIZATION_OFFSET)
+    def test_ld1_slot_zero_and_heterogeneous_pool_addressing(self) -> None:
+        # Non-power-of-two scale-buffer size exercises common alignment.
+        with self._group([0, 3], (4096, 192)) as group:
+            slots = [(group.allocate(1), 37)]
+            try:
+                self.assertEqual(slots[0][0].slot_id, 0)
+                self.assertEqual(slots[0][0].locality_domain_id, 1)
+                group.resize_pools(3, 0)
+                group._slot_allocators[0].expand(3)
+                slots.append((group.allocate(0), 81))
+                for slot, value in slots:
+                    self._fill(group, slot, value)
+                self._assert_data(group, slots)
+                for pool in group._pools:
+                    self.assertLess(pool._vm.virtual_bytes(), 1 << 40)
+            finally:
+                for slot, _ in slots:
+                    group.release(slot)
 
-        s0 = alloc0.allocate()  # slot_id == 0
-        s1 = alloc1.allocate()  # slot_id == LOCALIZATION_OFFSET
+    def test_grow_shrink_and_reuse_ranges_without_moving_other_domain(self) -> None:
+        with self._group([16, 8]) as group:
+            slots = [(group.allocate(0), 23), (group.allocate(1), 71)]
+            try:
+                addresses = [group.slot_address(slot.slot_id) for slot, _ in slots]
+                for slot, value in slots:
+                    self._fill(group, slot, value)
+                allocator = group._slot_allocators[0]
+                allocator.prepare_for_shrink(4)
+                allocator.finish_shrink()
+                group.resize_pools(4, 0)
+                group.resize_pools(16, 1)
+                group._slot_allocators[1].expand(16)
+                extra = group.allocate_multiple(15, 1)
+                slots.extend((slot, 97) for slot in extra)
+                for slot in extra:
+                    self._fill(group, slot, 97)
+                self.assertEqual(
+                    [group.slot_address(slot.slot_id) for slot, _ in slots[:2]], addresses
+                )
+                self.assertEqual(len({slot.slot_id for slot, _ in slots}), len(slots))
+                # The recycled range precedes this domain's original range.
+                self.assertLess(extra[-1].slot_id, slots[1][0].slot_id)
+                self._assert_data(group, slots)
+            finally:
+                for slot, _ in slots:
+                    group.release(slot)
 
-        self.assertEqual(alloc0._local_idx(s0.slot_id), 0)
-        self.assertEqual(alloc1._local_idx(s1.slot_id), 0)
+    def test_multi_pool_growth_failure_rolls_back(self) -> None:
+        with self._group([4, 4], (256 << 10, 128 << 10)) as group:
+            original_resize = GpuSlotPool.resize
+            old_ranges = [list(mapping.chunks) for mapping in group._slot_maps]
+            old_bytes = [pool.num_bytes(1) for pool in group._pools]
+            slot = group.allocate(1)
+            self._fill(group, slot, 52)
 
-        s0b = alloc0.allocate()  # slot_id == 1
-        s1b = alloc1.allocate()  # slot_id == LOCALIZATION_OFFSET + 1
-        self.assertEqual(alloc0._local_idx(s0b.slot_id), 1)
-        self.assertEqual(alloc1._local_idx(s1b.slot_id), 1)
+            def fail_second_pool(pool, new_num_slots, locality_domain_id=0):
+                if pool is group._pools[1] and new_num_slots > 4:
+                    raise RuntimeError("injected mapping failure")
+                original_resize(pool, new_num_slots, locality_domain_id)
 
-        alloc0.release(s0)
-        alloc0.release(s0b)
-        alloc1.release(s1)
-        alloc1.release(s1b)
+            try:
+                with patch.object(GpuSlotPool, "resize", fail_second_pool):
+                    with self.assertRaisesRegex(RuntimeError, "injected mapping failure"):
+                        group.resize_pools(40, 1)
+                self.assertEqual([list(mapping.chunks) for mapping in group._slot_maps], old_ranges)
+                self.assertEqual([pool.num_bytes(1) for pool in group._pools], old_bytes)
+                self._assert_data(group, [(slot, 52)])
+                # The failed reservation remains reusable by another domain.
+                group.resize_pools(40, 0)
+                group._slot_allocators[0].expand(40)
+                self._assert_data(group, [(slot, 52)])
+            finally:
+                group.release(slot)
 
-    # ------------------------------------------------------------------
-    # Test 4: _occupied_slot_ids tracks allocations and releases
-    # ------------------------------------------------------------------
-    def test_occupied_slot_ids_tracks_alloc_and_release(self) -> None:
-        """slot_id is in _occupied_slot_ids while held; removed on release."""
-        alloc = SlotAllocator(capacity=4, slot_id_offset=LOCALIZATION_OFFSET)
-        slot = alloc.allocate()
-        self.assertIn(slot.slot_id, alloc._occupied_slot_ids)
-        expected_id = SlotId(LOCALIZATION_OFFSET)
-        alloc.release(slot)
-        self.assertNotIn(expected_id, alloc._occupied_slot_ids)
+    def test_mapped_ranges_exclude_retired_storage(self) -> None:
+        with self._group([16, 8]) as group:
+            allocator = group._slot_allocators[0]
+            allocator.prepare_for_shrink(0)
+            allocator.finish_shrink()
+            group.resize_pools(0, 0)
+            self.assertEqual(group.slot_ranges(), [(16, 24)])
+            self.assertEqual(group.slot_index_upper_bound, 24)
+            pool = group._pools[0]
+            self.assertEqual(pool._vm.mapped_ranges(), [(16 * pool.slot_size, 24 * pool.slot_size)])
 
-    # ------------------------------------------------------------------
-    # Test 5: recycled slot preserves its original (offset) slot_id
-    # ------------------------------------------------------------------
-    def test_recycled_slot_preserves_offset_slot_id(self) -> None:
-        """Releasing and re-allocating returns the same offset-encoded slot_id."""
-        alloc = SlotAllocator(capacity=4, slot_id_offset=LOCALIZATION_OFFSET)
-        slot = alloc.allocate()
-        original_id = slot.slot_id
-        alloc.release(slot)
-        recycled = alloc.allocate()
-        self.assertEqual(recycled.slot_id, original_id)
-        alloc.release(recycled)
+    def test_cuda_mapping_failure_preserves_existing_pages(self) -> None:
+        for operation in ("cuMemMap", "cuMemSetAccess"):
+            with self.subTest(operation=operation), self._group([8, 8]) as group:
+                slot = group.allocate(1)
+                self._fill(group, slot, 61)
+                pool = group._pools[0]
+                original_ranges = pool._vm.mapped_ranges()
+                original_operation = getattr(drv, operation)
+                calls = 0
+
+                def fail_second_mapping(*args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise RuntimeError("injected CUDA mapping failure")
+                    return original_operation(*args)
+
+                try:
+                    with patch.object(drv, operation, fail_second_mapping):
+                        with self.assertRaisesRegex(RuntimeError, "injected CUDA mapping failure"):
+                            group.resize_pools(32, 1)
+                    self.assertEqual(pool._vm.mapped_ranges(), original_ranges)
+                    self.assertEqual(group.num_slots(1), 8)
+                    self._assert_data(group, [(slot, 61)])
+                    group.resize_pools(32, 1)
+                    group._slot_allocators[1].expand(32)
+                    self._assert_data(group, [(slot, 61)])
+                finally:
+                    group.release(slot)
 
 
 class TestStorageManagerLocalized(unittest.TestCase):
@@ -532,13 +640,13 @@ class TestStorageManagerLocalized(unittest.TestCase):
 
     CacheLevelManager._create_cache_level_storage
       → GpuCacheLevelStorage(localized=True)
-        → GpuPoolGroup (one SlotAllocator per locality domain, locality_domain1 offset by a canonical slot stride)
+        → GpuPoolGroup (one SlotAllocator per locality domain, shared slot IDs with per-domain metadata)
 
     Tests cover:
     - Correct storage type instantiation (num_locality_domains > 1) when locality domain is enabled and supported
     - Assertion guards: locality_domain_id must not be None for localized allocation operations
       (new_slots, new_slots_for_pool_group)
-    - Slot id encoding: locality_domain0 slots below the localized slot-id offset, locality_domain1 slots at or above it
+    - Global slot IDs use the same address calculation in every locality domain
     - Slot.locality_domain_id is stamped correctly by the allocator
     - num_slots returns the per-locality domain count and both locality domains receive equal quota
     - release_slot uses slot.locality_domain_id to dispatch to the correct locality domain allocator
@@ -749,50 +857,27 @@ class TestStorageManagerLocalized(unittest.TestCase):
         self.assertEqual(len(set(per_domain)), 1, per_domain)
 
     # ------------------------------------------------------------------
-    # Test 4: slot_id encoding — locality_domain0 below localized slot offset, locality_domain1 at or above it
+    # Test 4: shared slot-ID space and explicit locality metadata
     # ------------------------------------------------------------------
-    def test_locality_domain0_slot_ids_below_localization_offset(self) -> None:
-        """Slots allocated from locality_domain0 must have slot_id below the localized slot offset."""
+    def test_slot_ids_are_unique_across_domains(self) -> None:
         self.storage_manager = self._make_localized_sm(num_layers=2)
         sm = self.storage_manager
         pg = PoolGroupIndex(0)
-        storage = sm._levels[GPU_LEVEL].storage
-        localized_offset = _get_localized_slot_id_offset(sm, pg)
-        slots = sm.new_slots_for_pool_group(GPU_LEVEL, pg, 2, locality_domain_id=0)
+        slots = []
         try:
+            for uid in (1, 0):
+                allocated = sm.new_slots_for_pool_group(GPU_LEVEL, pg, 2, locality_domain_id=uid)
+                slots.extend(allocated)
+                self.assertTrue(all(slot.locality_domain_id == uid for slot in allocated))
+            self.assertEqual(len({slot.slot_id for slot in slots}), len(slots))
             for slot in slots:
-                self.assertLess(int(slot.slot_id), localized_offset)
-                self.assertEqual(slot.locality_domain_id, 0)
+                self.assertEqual(
+                    sm._base_page_index_for_slot(LifeCycleId(0), slot.slot_id), slot.slot_id
+                )
+                self.assertLess(sm.get_page_indices_for_slot(LifeCycleId(0), slot.slot_id), 2**31)
         finally:
             for slot in slots:
-                storage.release(pg, slot, slot.locality_domain_id)
-
-    def test_locality_domain1_slot_ids_at_or_above_localization_offset(self) -> None:
-        """Slots allocated from locality_domain1 must have slot_id at or above the localized slot offset."""
-        self.storage_manager = self._make_localized_sm(num_layers=2)
-        sm = self.storage_manager
-        pg = PoolGroupIndex(0)
-        storage = sm._levels[GPU_LEVEL].storage
-        localized_offset = _get_localized_slot_id_offset(sm, pg)
-        slots = sm.new_slots_for_pool_group(GPU_LEVEL, pg, 2, locality_domain_id=1)
-        try:
-            for slot in slots:
-                self.assertGreaterEqual(int(slot.slot_id), localized_offset)
-                self.assertEqual(slot.locality_domain_id, 1)
-        finally:
-            for slot in slots:
-                storage.release(pg, slot, slot.locality_domain_id)
-
-    def test_localized_page_index_offset_is_int32_safe(self) -> None:
-        """Localized page indices must stay within the int32 host buffer contract."""
-        self.storage_manager = self._make_localized_sm(num_layers=2)
-        sm = self.storage_manager
-        pg = PoolGroupIndex(0)
-        localized_slot_offset = _get_localized_slot_id_offset(sm, pg)
-        n1 = sm.num_slots(pg, GPU_LEVEL, locality_domain_id=1)
-        max_slot_id = SlotId(localized_slot_offset + n1 - 1)
-        max_page_index = int(sm.get_page_indices_for_slot(LifeCycleId(0), max_slot_id))
-        self.assertLess(max_page_index, 2**31)
+                sm.release_slot(LifeCycleId(0), GPU_LEVEL, slot)
 
     def test_localized_page_index_matches_slot_address(self) -> None:
         """Shared-pool-pointer execution must encode the full locality domain displacement in page indices."""
@@ -856,7 +941,7 @@ class TestStorageManagerLocalized(unittest.TestCase):
         src = _FakeEvictablePage(LifeCycleId(0), locality_domain_id=1)
         src.slot_id = src_slots[0].slot_id
         src.ready_event = src_slots[0].ready_event
-        self.assertEqual(pool_group.get_locality_domain_id(src.slot_id), 1)
+        self.assertEqual(src.locality_domain_id, 1)
 
         dst_slots = sm._batched_migrate(
             pg,
@@ -871,7 +956,7 @@ class TestStorageManagerLocalized(unittest.TestCase):
             self.assertIsNotNone(dst_slots)
             self.assertEqual(len(dst_slots), 1)
             self.assertEqual(
-                pool_group.get_locality_domain_id(dst_slots[0].slot_id),
+                dst_slots[0].locality_domain_id,
                 1,
                 "destination slot must come from the source's locality domain",
             )
@@ -879,6 +964,89 @@ class TestStorageManagerLocalized(unittest.TestCase):
             for slot in dst_slots or []:
                 pool_group.release(slot, 1)
             sm.release_slot(LifeCycleId(0), GPU_LEVEL, src_slots[0])
+
+    def test_failed_migration_returns_slots_to_their_owner(self) -> None:
+        self.storage_manager = self._make_localized_sm(num_layers=2)
+        sm = self.storage_manager
+        pg = PoolGroupIndex(0)
+        group = self._gpu_pool_group(sm, pg)
+        slot = group.allocate(1)
+        src = _FakeEvictablePage(LifeCycleId(0), locality_domain_id=1)
+        src.slot_id = slot.slot_id
+        src.ready_event = slot.ready_event
+        free_before = [group.num_free_slots(uid) for uid in (0, 1)]
+        try:
+            with patch(
+                f"{StorageManager.__module__}.batched_copy",
+                side_effect=RuntimeError("injected copy failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected copy failure"):
+                    sm._batched_migrate(
+                        pg,
+                        GPU_LEVEL,
+                        GPU_LEVEL,
+                        [src],
+                        update_src=False,
+                        defrag=True,
+                        dst_locality_domain_id=1,
+                    )
+            self.assertEqual([group.num_free_slots(uid) for uid in (0, 1)], free_before)
+            self.assertTrue(slot.has_valid_slot)
+            self.assertEqual(slot.locality_domain_id, 1)
+        finally:
+            group.release(slot)
+
+    def test_ld1_host_roundtrip_preserves_data_and_metadata(self) -> None:
+        self.storage_manager = self._make_localized_sm(
+            num_layers=2, host_quota=_256MB, block_quant_buf_size=192
+        )
+        sm = self.storage_manager
+        pg = PoolGroupIndex(0)
+        lc = LifeCycleId(0)
+        host_level = GPU_LEVEL + 1
+        group = self._gpu_pool_group(sm, pg)
+        slots = [(GPU_LEVEL, group.allocate(1))]
+
+        def page_for(slot):
+            page = _FakeEvictablePage(lc, slot.locality_domain_id)
+            page.slot_id = slot.slot_id
+            page.ready_event = slot.ready_event
+            return page
+
+        try:
+            for i, pool in enumerate(group._pools):
+                _unwrap(
+                    drv.cuMemsetD8(pool.slot_address(slots[0][1].slot_id), 51 + i, pool.slot_size)
+                )
+            host_slots = sm._batched_migrate(
+                pg, host_level, GPU_LEVEL, [page_for(slots[0][1])], update_src=False
+            )
+            self.assertIsNotNone(host_slots)
+            slots.append((host_level, host_slots[0]))
+            self.assertIsNone(host_slots[0].locality_domain_id)
+            gpu_slots = sm._batched_migrate(
+                pg,
+                GPU_LEVEL,
+                host_level,
+                [page_for(host_slots[0])],
+                update_src=False,
+                dst_locality_domain_id=1,
+            )
+            self.assertIsNotNone(gpu_slots)
+            slots.append((GPU_LEVEL, gpu_slots[0]))
+            self.assertEqual(gpu_slots[0].locality_domain_id, 1)
+            gpu_slots[0].ready_event.synchronize()
+            for i, pool in enumerate(group._pools):
+                data = np.zeros(pool.slot_size, dtype=np.uint8)
+                _unwrap(
+                    drv.cuMemcpyDtoH(
+                        data.ctypes.data, pool.slot_address(gpu_slots[0].slot_id), data.nbytes
+                    )
+                )
+                self.assertTrue(np.all(data == 51 + i))
+        finally:
+            for level, slot in slots:
+                sm.release_slot(lc, level, slot)
 
     def test_eviction_filter_selects_target_locality_domain(self) -> None:
         """Localized eviction must only free pages from the locality domain being allocated."""

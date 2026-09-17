@@ -25,6 +25,7 @@ from typing import Final, Optional, Protocol
 import cuda.bindings.driver as drv
 
 from ._common import MemAddress
+from ._exceptions import CuError, CuOOMError
 from ._utils import (
     ItemHolderWithSharedPool,
     PooledFactoryBase,
@@ -731,35 +732,15 @@ class PooledPhysMemAllocator:
             pool.clear()
 
 
-# Large fixed VA offset separating locality domain regions within a multi-locality domain VirtMem.
-# The first pool's mapped bytes can never realistically reach this value.
-LOCALIZATION_OFFSET: Final[int] = 1 << 40  # 1 TiB
-
-
 # Virtual memory
 class VirtMem:
-    """Virtual memory supporting 1 or N locality domains within a single VA reservation.
+    """One stable VA reservation with explicitly placed, domain-owned physical mappings.
 
-    Each locality domain owns an independent region of the VA space with its own physical
-    memory stack.  The number of locality domains is derived from the
-    ``PooledPhysMemAllocator`` passed at construction time
-    (``allocator.num_locality_domains``).
-
-    VA layout (N locality domains)::
-
-        locality_domain 0: [base,                              base + vm_sizes[0])
-        locality_domain 1: [base + 1 * LOCALIZATION_OFFSET,    base + 1 * LOCALIZATION_OFFSET + vm_sizes[1])
-        locality_domain k: [base + k * LOCALIZATION_OFFSET,    base + k * LOCALIZATION_OFFSET + vm_sizes[k])
-
-    For a single locality domain (the default, N == 1) this simplifies to a contiguous
-    region ``[base, base + vm_sizes[0])`` with no gap.
-
-    All public operations accept an optional ``locality_domain_id`` (default 0) so that
-    existing single-locality domain call sites remain unchanged.
+    A domain's stack records byte offsets, so growing another domain never moves
+    existing mappings. The caller coordinates offsets across pools sharing slot IDs.
     """
 
     __slots__ = (
-        "_vm_sizes",
         "_allocator",
         "_address",
         "_pm_stacks",
@@ -767,11 +748,12 @@ class VirtMem:
         "_context",
         "_device_id",
         "_reservation_size",
+        "_mapped_offsets",
     )
-    _vm_sizes: list[int]  # len == num_locality_domains
     _allocator: PooledPhysMemAllocator
     _address: drv.CUdeviceptr
-    _pm_stacks: list[list[PhysMem]]  # len == num_locality_domains
+    _pm_stacks: list[list[tuple[int, PhysMem]]]
+    _mapped_offsets: set[int]
     _access_desc: drv.CUmemAccessDesc
     _context: drv.CUcontext
     _device_id: int
@@ -779,59 +761,34 @@ class VirtMem:
 
     def __init__(
         self,
-        vm_sizes: int | list[int],
+        vm_size: int,
         phys_mem_allocator: PooledPhysMemAllocator,
-        init_num_phys_mem: int | list[int] = 0,
+        init_num_phys_mem: int = 0,
     ) -> None:
         num_locality_domains = phys_mem_allocator.num_locality_domains
-        # Normalise scalar args to per-locality domain lists.
-        if isinstance(vm_sizes, int):
-            vm_sizes = [vm_sizes]
-        if isinstance(init_num_phys_mem, int):
-            init_num_phys_mem = [init_num_phys_mem] * num_locality_domains
-        assert (
-            len(vm_sizes) == num_locality_domains and len(init_num_phys_mem) == num_locality_domains
-        ), (
-            f"Expected {num_locality_domains} elements (num_locality_domains={num_locality_domains}), "
-            f"got vm_sizes={len(vm_sizes)}, init_num_phys_mem={len(init_num_phys_mem)}"
-        )
-
         phys_mem_size = phys_mem_allocator.phys_mem_size
-        for vs in vm_sizes:
-            assert vs % phys_mem_size == 0
-        if num_locality_domains > 1:
-            assert LOCALIZATION_OFFSET % phys_mem_size == 0
-            for vs in vm_sizes:
-                assert vs <= LOCALIZATION_OFFSET
+        assert vm_size > 0 and vm_size % phys_mem_size == 0
 
         self._allocator = phys_mem_allocator
         self._context = phys_mem_allocator.context
         self._device_id = phys_mem_allocator.device_id
         self._address = drv.CUdeviceptr(0)
-        self._vm_sizes = list(vm_sizes)
         self._pm_stacks = [[] for _ in range(num_locality_domains)]
-        reservation_size = (
-            vm_sizes[0]
-            if num_locality_domains == 1
-            else (num_locality_domains - 1) * LOCALIZATION_OFFSET + vm_sizes[-1]
-        )
+        self._mapped_offsets = set()
         self._reservation_size = 0
 
-        # Reserve VA: single locality domain gets a tight reservation; multi-locality domain uses
-        # LOCALIZATION_OFFSET gaps to place each region at offset k * LOCALIZATION_OFFSET.
         with _activate_cuda_context(self._context, self._device_id):
-            self._address = _unwrap(drv.cuMemAddressReserve(reservation_size, 0, 0, 0))
-        self._reservation_size = reservation_size
+            self._address = _unwrap(drv.cuMemAddressReserve(vm_size, 0, 0, 0))
+        self._reservation_size = vm_size
         self._access_desc = drv.CUmemAccessDesc()
         self._access_desc.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         self._access_desc.location.id = self._device_id
         self._access_desc.flags = drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 
         try:
-            for uid, n in enumerate(init_num_phys_mem):
-                if n:
-                    self.extend(n, locality_domain_id=uid)
-        except Exception:
+            if init_num_phys_mem:
+                self.extend(init_num_phys_mem, offset=0)
+        except (CuError, CuOOMError, RuntimeError, ValueError):
             self._release_reservation(synchronize=False)
             raise
 
@@ -849,16 +806,22 @@ class VirtMem:
 
     @property
     def address(self) -> MemAddress:
-        """Base address of the entire reservation (== locality_domain_address(0))."""
+        """Base address shared by all locality domains."""
         return MemAddress(int(self._address))
 
-    def locality_domain_address(self, locality_domain_id: int = 0) -> MemAddress:
-        """Base virtual address for the given locality domain's region."""
-        return MemAddress(int(self._address) + locality_domain_id * LOCALIZATION_OFFSET)
+    def virtual_bytes(self) -> int:
+        return self._reservation_size
 
-    def virtual_bytes(self, locality_domain_id: int = 0) -> int:
-        """VA region size for the given locality domain."""
-        return self._vm_sizes[locality_domain_id]
+    def mapped_ranges(self) -> list[tuple[int, int]]:
+        """Return merged, mapped byte ranges relative to address, across all domains."""
+        ranges: list[tuple[int, int]] = []
+        for offset in sorted(self._mapped_offsets):
+            end = offset + self.phys_mem_size
+            if ranges and ranges[-1][1] == offset:
+                ranges[-1] = (ranges[-1][0], end)
+            else:
+                ranges.append((offset, end))
+        return ranges
 
     def num_phys_mem(self, locality_domain_id: int = 0) -> int:
         return len(self._pm_stacks[locality_domain_id])
@@ -884,7 +847,6 @@ class VirtMem:
                     self._pop(uid).close()
             _unwrap(drv.cuMemAddressFree(self._address, self._reservation_size))
         self._address = drv.CUdeviceptr(0)
-        self._vm_sizes = [0] * self.num_locality_domains
         self._reservation_size = 0
 
     def __del__(self) -> None:
@@ -894,54 +856,70 @@ class VirtMem:
     # Core operations (all take locality_domain_id, defaulting to 0)
     # ------------------------------------------------------------------
 
-    def _push(self, phy_mem: PhysMem, locality_domain_id: int = 0) -> None:
+    def _push(self, phy_mem: PhysMem, offset: int, locality_domain_id: int) -> None:
         phys_mem_size = self.phys_mem_size
         pm_stack = self._pm_stacks[locality_domain_id]
-        assert phys_mem_size * (len(pm_stack) + 1) <= self._vm_sizes[locality_domain_id]
-        vm_ptr = drv.CUdeviceptr(
-            self.locality_domain_address(locality_domain_id) + phys_mem_size * len(pm_stack)
-        )
+        vm_ptr = drv.CUdeviceptr(self.address + offset)
         with _activate_cuda_context(self._context, self._device_id):
             try:
                 _unwrap(drv.cuMemMap(vm_ptr, phys_mem_size, 0, phy_mem.handle, 0))
-            except Exception:
+            except (CuError, CuOOMError, RuntimeError):
                 phy_mem.close()
                 raise
             try:
                 _unwrap(drv.cuMemSetAccess(vm_ptr, phys_mem_size, (self._access_desc,), 1))
-            except Exception:
+            except (CuError, CuOOMError, RuntimeError):
                 try:
                     _unwrap(drv.cuMemUnmap(vm_ptr, phys_mem_size))
-                except Exception:
+                except (CuError, CuOOMError, RuntimeError):
                     # Keep ownership so the outer transaction can retry unmapping.
-                    pm_stack.append(phy_mem)
+                    pm_stack.append((offset, phy_mem))
+                    self._mapped_offsets.add(offset)
                 else:
                     phy_mem.close()
                 raise
-            pm_stack.append(phy_mem)
+            pm_stack.append((offset, phy_mem))
+            self._mapped_offsets.add(offset)
 
     def _pop(self, locality_domain_id: int = 0) -> PhysMem:
         pm_stack = self._pm_stacks[locality_domain_id]
         assert pm_stack
         phys_mem_size = self.phys_mem_size
-        vm_ptr = drv.CUdeviceptr(
-            self.locality_domain_address(locality_domain_id) + phys_mem_size * (len(pm_stack) - 1)
-        )
+        offset, phy_mem = pm_stack[-1]
+        vm_ptr = drv.CUdeviceptr(self.address + offset)
         with _activate_cuda_context(self._context, self._device_id):
             _unwrap(drv.cuMemUnmap(vm_ptr, phys_mem_size))
-        return pm_stack.pop()
+        pm_stack.pop()
+        self._mapped_offsets.remove(offset)
+        return phy_mem
 
-    def extend(self, num_phys_mem: int, locality_domain_id: int = 0) -> None:
+    def extend(
+        self, num_phys_mem: int, locality_domain_id: int = 0, *, offset: int | None = None
+    ) -> None:
         assert 0 <= locality_domain_id < self.num_locality_domains, (
             f"locality_domain_id {locality_domain_id} out of range [0, {self.num_locality_domains})"
         )
         pm_stack = self._pm_stacks[locality_domain_id]
         old_num = len(pm_stack)
+        if offset is None:
+            assert self.num_locality_domains == 1
+            offset = self.mapped_bytes()
+        end = offset + num_phys_mem * self.phys_mem_size
+        if (
+            num_phys_mem < 0
+            or offset < 0
+            or offset % self.phys_mem_size
+            or end > self._reservation_size
+        ):
+            raise ValueError("Physical mapping is outside or misaligned with the VA reservation")
+        offsets = range(offset, end, self.phys_mem_size)
+        if any(pos in self._mapped_offsets for pos in offsets):
+            raise ValueError("Physical mapping overlaps an existing mapping")
         try:
-            for _ in range(num_phys_mem):
-                self._push(self._allocator.create(locality_domain_id), locality_domain_id)
-        except Exception:
-            # Rollback to make realloc behave like normal realloc on OOM.
+            for pos in offsets:
+                self._push(self._allocator.create(locality_domain_id), pos, locality_domain_id)
+        except (CuError, CuOOMError, RuntimeError):
+            # Preserve existing mappings if extending fails.
             while len(self._pm_stacks[locality_domain_id]) > old_num:
                 self._pop(locality_domain_id).close()
             raise
