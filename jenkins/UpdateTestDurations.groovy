@@ -13,16 +13,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-method_to_list_all_aihub_clusters', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import com.nvidia.bloom.SlurmConfig
 
 LLM_ROOT = "llm"
 
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
-DURATION_FILE_PATH = "tests/integration/defs/.test_durations"
+TEST_DURATIONS_DIR = "tests/integration/defs/test_durations"
+DURATION_FILE_PATH = "${TEST_DURATIONS_DIR}/.general"
 // Target repository the updated duration file is committed straight back into.
-TARGET_REPO = "yuanjingx87/TensorRT-LLM"
+TARGET_REPO = "NVIDIA/TensorRT-LLM"
 
 def sanityCheckItemCount(String oldPath, String newPath, boolean requireOld = true) {
     if (!requireOld && !fileExists(oldPath)) {
@@ -283,7 +284,7 @@ pipeline {
                                     "${LLM_ROOT}/${DURATION_FILE_PATH}",
                                     "${LLM_ROOT}/new_test_durations.json")
 
-                                sh "cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
+                                sh "mkdir -p \$(dirname ${LLM_ROOT}/${DURATION_FILE_PATH}) && cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
 
                                 // Same reset-then-overlay treatment for each per-cluster file that
                                 // was generated (clusters with no OpenSearch records were skipped
@@ -292,7 +293,7 @@ pipeline {
                                 for (clusterName in SlurmConfig.activeClusterNames()) {
                                     def clusterKey = clusterName.replaceAll('[^a-zA-Z0-9]', '_')
                                     def newFile = "new_test_durations_${clusterKey}.json"
-                                    def clusterDurationPath = "${DURATION_FILE_PATH}_${clusterKey}"
+                                    def clusterDurationPath = "${TEST_DURATIONS_DIR}/.${clusterKey}"
                                     if (!fileExists("${LLM_ROOT}/${newFile}")) {
                                         continue
                                     }
@@ -300,7 +301,7 @@ pipeline {
                                         "${LLM_ROOT}/${clusterDurationPath}",
                                         "${LLM_ROOT}/${newFile}",
                                         false)
-                                    sh "cp ${LLM_ROOT}/${newFile} ${LLM_ROOT}/${clusterDurationPath}"
+                                    sh "mkdir -p \$(dirname ${LLM_ROOT}/${clusterDurationPath}) && cp ${LLM_ROOT}/${newFile} ${LLM_ROOT}/${clusterDurationPath}"
                                     trackedPaths << clusterDurationPath
                                 }
 
