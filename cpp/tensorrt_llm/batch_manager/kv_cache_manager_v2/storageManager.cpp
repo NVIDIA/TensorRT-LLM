@@ -103,13 +103,13 @@ PoolGroupIndex LifeCyclePoolGroupMapping::numPoolGroups() const noexcept
 CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
-    size_t commitUnit)
+    HostMemBackingOptions const& options)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
-    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, commitUnit);
+    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +321,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), tierCommitUnit(config.cacheTiers[kHotLevel]));
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), tierBackingOptions(config.cacheTiers[kHotLevel]));
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -422,7 +422,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
-            gpuPhysMemAllocator, tierCommitUnit(config.cacheTiers[level]));
+            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level]));
     }
 
     for (CacheLevel level{0}; level < mLevels.size(); ++level)
@@ -1928,6 +1928,17 @@ size_t StorageManager::tierCommitUnit(CacheTierConfig const& tierConfig) const
     return cacheTierOf(tierConfig) == CacheTier::GPU_MEM
         ? mGpuPhysMemAllocator->physMemSize()
         : tierAllocationGranularity(cacheTierOf(tierConfig), cacheTierQuota(tierConfig));
+}
+
+HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig) const
+{
+    HostMemBackingOptions options;
+    options.commitUnit = tierCommitUnit(tierConfig);
+    if (auto const* host = std::get_if<HostCacheTierConfig>(&tierConfig))
+    {
+        options.allowRemoteNumaFallback = host->allowRemoteNumaFallback;
+    }
+    return options;
 }
 
 // ---------------------------------------------------------------------------

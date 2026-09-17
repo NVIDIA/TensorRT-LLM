@@ -20,7 +20,6 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/hostMemBacking.h"
 
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -49,7 +48,7 @@ public:
     //! host allocation whose size is not a multiple of its granularity, which is
     //! 2 MiB. Sizes are not rounded up on the caller's behalf -- a request that
     //! is not a multiple of this is a bug and is rejected.
-    static constexpr size_t kAlignment = 2ULL << 20; // 2 MB
+    static constexpr size_t kAlignment = kHostMemAlignment;
 
     //! Bytes committed per watermark advance. Large enough that the commit cost
     //! dominates the notify, small enough that a waiter near the start of the
@@ -59,6 +58,17 @@ public:
     //! how often the fill publishes progress. See IHostMemBacking.
     static constexpr size_t kFillChunkSize = 512ULL << 20; // 512 MB
 
+    //! Reserves `vmSize` of address space and commits `initialSize` of it.
+    //!
+    //! The base address is fixed for the lifetime of the object: resize() only
+    //! moves the committed boundary within the reservation, and a resize past
+    //! `vmSize` is rejected rather than served by relocating. Reserving costs
+    //! address space, not memory.
+    //!
+    //! `options.commitUnit` is the granularity memory is allocated and released
+    //! in, and therefore the alignment every size must satisfy. It is
+    //! independent of kFillChunkSize, which only paces progress reporting.
+    //!
     //! The fill always runs on a worker thread. `waitForFill` selects whether
     //! the caller is exposed to that: when true, the constructor and resize()
     //! return only once the whole range is committed, which is what an owner
@@ -68,22 +78,13 @@ public:
     //! the offset it is about to touch. On the VMM backing, address space that
     //! has not been committed yet is unmapped, so reaching past the watermark
     //! faults rather than merely reading undefined bytes.
-    //! Reserves `maxSize` of address space and commits `initialSize` of it.
-    //!
-    //! The base address is fixed for the lifetime of the object: resize() only
-    //! moves the committed boundary within the reservation, and a resize past
-    //! `maxSize` is rejected rather than served by relocating. Reserving costs
-    //! address space, not memory.
-    //! `commitUnit` is the granularity memory is allocated and released in, and
-    //! therefore the alignment every size must satisfy. It is independent of
-    //! kFillChunkSize, which only paces progress reporting.
-    HostMem(size_t maxSize, size_t initialSize, size_t commitUnit = kAlignment, bool waitForFill = true);
+    HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options = {}, bool waitForFill = true);
 
     //! Reserves exactly as much as it commits, for an allocation that never
     //! resizes. Takes no waitForFill: a caller that cannot resize has no reason
     //! to observe a partially filled range.
     explicit HostMem(size_t size)
-        : HostMem(size, size, kAlignment, /*waitForFill=*/true)
+        : HostMem(size, size, HostMemBackingOptions{}, /*waitForFill=*/true)
     {
     }
 
@@ -107,9 +108,9 @@ public:
     void resize(size_t newSize);
 
     //! Bytes of address space reserved, i.e. the largest size resize() accepts.
-    [[nodiscard]] size_t maxSize() const noexcept
+    [[nodiscard]] size_t vmSize() const noexcept
     {
-        return mMaxSize;
+        return mVmSize;
     }
 
     //! Releases everything. Safe to call multiple times.
@@ -138,7 +139,7 @@ private:
     std::unique_ptr<IHostMemBacking> mBacking;
     MemAddress mAddr = 0;
     size_t mSize = 0;
-    size_t mMaxSize = 0;
+    size_t mVmSize = 0;
 
     //! Bytes committed between watermark advances. A multiple of the backing's
     //! commit granularity, so a fill step never lands inside an allocation.
@@ -154,6 +155,11 @@ private:
     //! sentinel has been observed, so no lock is needed.
     std::exception_ptr mFillFailure;
     std::thread mFillWorker;
+
+    //! Captured on the constructing thread. A new thread defaults to device 0
+    //! regardless of what the creator selected, so the fill worker has to be
+    //! told which GPU this allocation belongs to.
+    int mDevice = 0;
 };
 
 // ---------------------------------------------------------------------------

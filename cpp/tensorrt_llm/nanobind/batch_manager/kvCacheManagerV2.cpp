@@ -1528,9 +1528,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t, std::optional<size_t>>(), nb::arg("quota"), nb::arg("max_quota") = nb::none())
+        .def(nb::init<size_t, std::optional<size_t>, bool>(), nb::arg("quota"), nb::arg("max_quota") = nb::none(),
+            nb::arg("allow_remote_numa_fallback") = true)
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
         .def_rw("max_quota", &kv::HostCacheTierConfig::maxQuota)
+        .def_rw("allow_remote_numa_fallback", &kv::HostCacheTierConfig::allowRemoteNumaFallback)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
@@ -2049,6 +2051,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("kv_cache"), nb::arg("ordinal"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
+    nb::class_<kv::HostMemPlacement>(mIntrospection, "HostMemPlacement")
+        .def_ro("gpu_numa_node", &kv::HostMemPlacement::gpuNumaNode)
+        .def_ro("strict_binding", &kv::HostMemPlacement::strictBinding)
+        .def_ro("node_page_counts", &kv::HostMemPlacement::nodePageCounts);
+    mIntrospection.def("probe_host_mem_placement", &kv::KvCacheIntrospection::probeHostMemPlacement, nb::arg("size"),
+        nb::arg("allow_remote_numa_fallback"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "is_commit_allowed",
         [](kv::KvCache const& kvCache) { return kvCache.commitState() == kv::KvCache::CommitState::ALLOWED; },

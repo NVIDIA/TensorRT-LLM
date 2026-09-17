@@ -64,6 +64,21 @@ struct HostCacheTierConfig
     //! exceed anyway.
     std::optional<size_t> maxQuota;
 
+    //! Whether a page may come from a NUMA node other than the one the GPU
+    //! attaches to, when the local node cannot satisfy it.
+    //!
+    //! False keeps every page local, at the cost of capping the tier at one
+    //! node's memory: a quota sized from total system memory cannot then be
+    //! filled. True accepts a remote page, which the GPU reaches more slowly,
+    //! rather than failing the allocation.
+    //!
+    //! False additionally requires that a memory policy be settable. Where the
+    //! host tier is mmap-backed, a container without CAP_SYS_NICE cannot set
+    //! one, and the tier refuses to start rather than fall back to first touch
+    //! -- which prefers the local node but takes a remote page instead of
+    //! failing, and so would not be the strictness that was asked for.
+    bool allowRemoteNumaFallback = true;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;

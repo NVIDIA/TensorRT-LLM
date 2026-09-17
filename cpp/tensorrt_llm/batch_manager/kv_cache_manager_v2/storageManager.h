@@ -100,7 +100,7 @@ public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
-        size_t commitUnit = HostMem::kAlignment);
+        HostMemBackingOptions const& options = {});
 
     CacheLevel cacheLevel;
     CacheTier cacheTier;
@@ -356,6 +356,10 @@ private:
     //! quota. Fixed for the tier's lifetime, so every size derived from it stays
     //! consistent with what the pools were built for.
     [[nodiscard]] size_t tierCommitUnit(CacheTierConfig const& tierConfig) const;
+
+    //! Backing options for a tier: its fixed allocation unit together with the
+    //! page-placement policy the tier's config asks for.
+    [[nodiscard]] HostMemBackingOptions tierBackingOptions(CacheTierConfig const& tierConfig) const;
 
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,

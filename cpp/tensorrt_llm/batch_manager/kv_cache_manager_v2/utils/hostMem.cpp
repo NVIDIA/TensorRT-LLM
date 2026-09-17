@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.h"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -28,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <exception>
 #include <fcntl.h>
 #include <mutex>
@@ -182,10 +184,13 @@ void HostMem::startFill(size_t beginOffset)
         [this, beginOffset]
         {
             // A new thread starts on device 0 whatever the creator selected, and
-            // the VMM backing maps against the current device.
+            // the VMM backing maps against the current device. Selecting it here
+            // also gives bindThreadByCurrentGpu the right GPU to bind to, which
+            // keeps the prefault writes on the node that holds the pages.
             try
             {
                 TLLM_CUDA_CHECK(cudaSetDevice(mDevice));
+                runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
                 commitRange(beginOffset);
             }
             catch (...)
@@ -228,16 +233,17 @@ void HostMem::waitUsable(size_t endOffset) const
     }
 }
 
-HostMem::HostMem(size_t maxSize, size_t initialSize, size_t commitUnit, bool waitForFill)
+HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options, bool waitForFill)
     : mWaitForFill(waitForFill)
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
-    if (maxSize == 0)
+    if (vmSize == 0)
     {
         return;
     }
-    TLLM_CHECK_WITH_INFO(initialSize <= maxSize, "HostMem initial size %zu exceeds max size %zu", initialSize, maxSize);
-    mBacking = createHostMemBacking(commitUnit);
+    TLLM_CHECK_WITH_INFO(
+        initialSize <= vmSize, "HostMem initial size %zu exceeds reserved size %zu", initialSize, vmSize);
+    mBacking = createHostMemBacking(options);
     size_t const granularity = mBacking->commitGranularity();
     TLLM_CHECK_WITH_INFO(initialSize % granularity == 0,
         "HostMem size %zu is not a multiple of the commit granularity %zu", initialSize, granularity);
@@ -247,9 +253,9 @@ HostMem::HostMem(size_t maxSize, size_t initialSize, size_t commitUnit, bool wai
     {
         // The reservation is rounded up so that the largest accepted resize is
         // itself a valid, aligned size.
-        mMaxSize = roundUp(maxSize, granularity);
+        mVmSize = roundUp(vmSize, granularity);
         mSize = initialSize;
-        mAddr = mBacking->reserve(mMaxSize);
+        mAddr = mBacking->reserve(mVmSize);
         TLLM_CHECK_DEBUG(mAddr % granularity == 0);
         startFill(0);
         if (mWaitForFill)
@@ -263,7 +269,7 @@ HostMem::HostMem(size_t maxSize, size_t initialSize, size_t commitUnit, bool wai
         mBacking->destroy();
         mAddr = 0;
         mSize = 0;
-        mMaxSize = 0;
+        mVmSize = 0;
         throw;
     }
 }
@@ -283,7 +289,7 @@ void HostMem::destroy()
     }
     mAddr = 0;
     mSize = 0;
-    mMaxSize = 0;
+    mVmSize = 0;
     mChunkSize = 0;
     mFillFailure = nullptr;
     mFilledChunks.store(0, std::memory_order_release);
@@ -308,8 +314,8 @@ void HostMem::resize(size_t newSize)
 
     TLLM_CHECK_WITH_INFO(newSize % mBacking->commitGranularity() == 0,
         "HostMem size %zu is not a multiple of the commit granularity %zu", newSize, mBacking->commitGranularity());
-    TLLM_CHECK_WITH_INFO(newSize <= mMaxSize,
-        "HostMem resize to %zu exceeds the reserved maximum of %zu; raise the tier's maxQuota", newSize, mMaxSize);
+    TLLM_CHECK_WITH_INFO(newSize <= mVmSize,
+        "HostMem resize to %zu exceeds the reserved maximum of %zu; raise the tier's maxQuota", newSize, mVmSize);
 
     if (newSize < mSize)
     {

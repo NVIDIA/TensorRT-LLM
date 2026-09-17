@@ -104,6 +104,32 @@ enum class HostMemBackingKind : std::uint8_t
     kVmm,
 };
 
+//! Smallest unit any host backing allocates in: cuMemCreate rejects a host
+//! allocation whose size is not a multiple of this.
+inline constexpr size_t kHostMemAlignment = 2ULL << 20;
+
+struct HostMemBackingOptions
+{
+    //! Unit the backing allocates and releases in; see commitGranularity().
+    size_t commitUnit = kHostMemAlignment;
+
+    //! Whether a page may come from a NUMA node other than the one the GPU
+    //! attaches to, when the local node cannot satisfy it.
+    //!
+    //! Both backings honour this, by different means. The mmap backing sets
+    //! MPOL_PREFERRED or MPOL_BIND on the range; the VMM backing names the node
+    //! to the driver and, when a remote page is acceptable, retries an
+    //! exhausted allocation without naming one.
+    //!
+    //! False caps the tier at one node's memory, so a tier sized from total
+    //! system memory cannot be filled. It also requires that a memory policy be
+    //! settable: on the mmap backing, a container without CAP_SYS_NICE cannot
+    //! apply MPOL_BIND, and construction fails rather than silently running with
+    //! first-touch placement, which would take a remote page instead of
+    //! refusing.
+    bool allowRemoteNumaFallback = true;
+};
+
 //! Picks kMmap only when the GPU reaches pageable host memory through the CPU's
 //! page tables (ATS) *and* the link is coherent.
 //!
@@ -116,12 +142,13 @@ enum class HostMemBackingKind : std::uint8_t
 //! rather than going through this.
 [[nodiscard]] HostMemBackingKind selectHostMemBackingKind();
 
-//! `commitUnit` becomes the backing's commitGranularity(); it is rounded up to
-//! whatever the platform requires. Larger units make the fill cheaper and a
+//! `options.commitUnit` becomes the backing's commitGranularity(), rounded up
+//! to whatever the platform requires. Larger units make the fill cheaper and a
 //! resize coarser.
-[[nodiscard]] std::unique_ptr<IHostMemBacking> createHostMemBacking(HostMemBackingKind kind, size_t commitUnit);
+[[nodiscard]] std::unique_ptr<IHostMemBacking> createHostMemBacking(
+    HostMemBackingKind kind, HostMemBackingOptions const& options);
 
 //! Convenience overload using selectHostMemBackingKind().
-[[nodiscard]] std::unique_ptr<IHostMemBacking> createHostMemBacking(size_t commitUnit);
+[[nodiscard]] std::unique_ptr<IHostMemBacking> createHostMemBacking(HostMemBackingOptions const& options);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

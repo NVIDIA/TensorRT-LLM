@@ -204,6 +204,7 @@ class GpuCacheTierConfig:
 class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
+    allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
