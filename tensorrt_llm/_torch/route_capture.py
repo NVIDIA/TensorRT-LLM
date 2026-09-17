@@ -257,6 +257,14 @@ class RouteCapture:
     def finish_forward(self) -> None:
         self._finish_forward()
 
+    def abort_forward(self) -> None:
+        """Error-path counterpart of ``finish_forward`` (py_executor calls it when
+        the forward raises): nothing is staged, the armed layout is dropped so the
+        next forward starts clean. Per-request bookkeeping is deliberately left
+        as is -- this step's positions simply stay missing, and ``assemble`` fails
+        closed on them instead of shifting later rows onto the wrong positions."""
+        self._layout = None
+
     def attach_routes(self, request) -> None:
         """Called from py_executor._handle_responses when a request finishes:
         assemble its routes and append them so they surface on
@@ -270,6 +278,9 @@ class RouteCapture:
         (_handle_responses revisits it). Attach + free EXACTLY ONCE, and only
         once assemble succeeds: on an incomplete store (assemble None) do NOT
         free -- retry on a later call. Freeing eagerly corrupts the store.
+        After ``free`` the store is empty, so a repeated call is a no-op
+        (``assemble`` returns None); ``_attached`` only guards the window
+        between attaching and freeing.
 
         Errors are NOT swallowed here: an internal gap in the store (assemble
         raises ValueError) or a failed copy drain means the routes would be
@@ -542,6 +553,10 @@ class RouteCapture:
         self._pop_cursor.pop(req_id, None)
         self._prefix_populated.discard(req_id)
         self._readback_done.discard(req_id)
+        # Release the attach marker too: request ids can be reused by a later
+        # request, and once the store is gone a repeated attach_routes call for
+        # this request finds nothing to attach anyway.
+        self._attached.discard(req_id)
 
     # ---- PR2 prefix-cache: SharedRouteCache read-back / populate (position-granular) ----
     def _hashes_for(self, rid: int, toks: Optional[list], plen: int) -> Optional[list]:

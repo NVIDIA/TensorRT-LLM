@@ -7585,6 +7585,10 @@ class PyExecutor:
 
             return outputs
         except Exception as e:
+            if route_capture is not None:
+                # R3: the forward did not complete -- drop the armed capture so
+                # the next iteration does not inherit this step's layout.
+                route_capture.abort_forward()
             traceback.print_exc()
             error_msg = str(e)
             logger.error(

@@ -92,15 +92,30 @@ def test_attach_routes_propagates_errors_and_attaches_once():
     rc._store[6] = {0: _row(1), 2: _row(3)}
     with pytest.raises(ValueError):
         rc.attach_routes(_Req(6))
-    # Complete store: attached exactly once and freed; a repeat call is a no-op.
+    # Complete store: attached exactly once, then every per-request record
+    # (store and attach marker) is released; a repeat call is a no-op.
     rc._store[7] = {0: _row(1), 1: _row(2)}
     req = _Req(7)
     rc.attach_routes(req)
     assert [name for name, _ in req.py_result.appended] == ["routed_experts"]
     assert req.py_result.appended[0][1].shape == (2, _L, _K)
-    assert 7 in rc._attached and 7 not in rc._store
+    assert 7 not in rc._store and 7 not in rc._attached
     rc.attach_routes(req)
     assert len(req.py_result.appended) == 1
+    # A later request reusing the id is not suppressed by the stale marker.
+    rc._store[7] = {0: _row(5), 1: _row(6)}
+    req2 = _Req(7)
+    rc.attach_routes(req2)
+    assert len(req2.py_result.appended) == 1
+
+
+def test_abort_forward_disarms_without_staging():
+    rc = RouteCapture(rank=0)
+    rc._layout = [(1, 0), (2, 0)]  # armed by prepare() for a step that then failed
+    rc.abort_forward()
+    assert rc._layout is None
+    rc.finish_forward()  # nothing armed -> no-op, no error
+    assert rc._layout is None
 
 
 def test_prefix_hashes_deterministic_across_requests():
