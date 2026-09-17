@@ -233,11 +233,16 @@ def _make_gpu_cache_tier_config(
     quota: int, enable_locality_domains: bool = False
 ) -> GpuCacheTierConfig:
     """Construct GpuCacheTierConfig across Python and C++ backends."""
+    if not enable_locality_domains:
+        # Keep the default path identical to a plain quota construction: passing the
+        # keyword to a backend that lacks it would fall back to a positional call and
+        # yield a different tier-config type for every non-localized run.
+        return GpuCacheTierConfig(quota=int(quota))
     try:
-        return GpuCacheTierConfig(quota=int(quota), enable_locality_domains=enable_locality_domains)
+        return GpuCacheTierConfig(quota=int(quota), enable_locality_domains=True)
     except TypeError:
         # The C++ binding only accepts quota; locality domains are Python-only.
-        return GpuCacheTierConfig(int(quota))
+        return GpuCacheTierConfig(quota=int(quota))
 
 
 def _make_reuse_scope(
@@ -1654,9 +1659,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.impl = candidate
         # Cached at construction so the per-locality-domain metadata invariants
         # stay stable for the manager's lifetime.
-        self._fork_join_attn = (
-            getattr(self.impl, "num_locality_domains", 1) > 1 and enable_locality_domains
-        )
+        self._fork_join_attn = self.num_locality_domains > 1 and enable_locality_domains
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -3597,7 +3600,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 if kv_cache is None:
                     return None
-                assert getattr(kv_cache, "locality_domain_id", None) == locality_domain_id
+                if locality_domain_id is not None:
+                    # Only localized placement has a domain to honor; the non-localized
+                    # path leaves locality_domain_id None and has nothing to check.
+                    assert getattr(kv_cache, "locality_domain_id", None) == locality_domain_id
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
