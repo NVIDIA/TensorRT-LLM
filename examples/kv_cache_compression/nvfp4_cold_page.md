@@ -11,7 +11,7 @@ optimization: the active GPU cache and Attention kernels continue to use the
 model's normal runtime KV type.
 
 For an overview of all available compression methods, see
-[KV Cache Compression](https://nvidia.github.io/TensorRT-LLM/features/kv-cache-compression.html).
+[KV Cache Compression](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
 
 ## Motivation
 
@@ -76,7 +76,7 @@ required for Pages to cross a compression boundary.
 
 On Linux 6.11 through 6.13, mixed models that need both NVFP4 Attention
 lifecycles and lossless SSM/GDN fallback lifecycles are not supported. See the
-[KV Cache Compression Development Guide](https://nvidia.github.io/TensorRT-LLM/developer-guide/kv-cache-compression-development.html)
+[KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md)
 for the current storage-path limitation.
 
 ### Tested Models

@@ -301,7 +301,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "summary": {
                     "type": "string",
                     "description": "Short human-readable summary: which profilers you ran "
-                    "(nsys / torch / ncu), the trace files you produced, and the "
+                    "(nsys / ncu), the trace files you produced, and the "
                     "ranked bottleneck hypotheses with their key evidence.",
                 },
             },

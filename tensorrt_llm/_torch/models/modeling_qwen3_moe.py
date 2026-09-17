@@ -143,6 +143,7 @@ class Qwen3MoE(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
@@ -160,6 +161,7 @@ class Qwen3MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if not do_finalize:
@@ -234,6 +236,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[Dict[str, torch.Tensor]] = None,
         deepstack_embeds: Optional[List[torch.Tensor]] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -250,6 +253,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
             mrope_config=mrope_config,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -281,6 +285,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if deepstack_embeds is not None and self.layer_idx in range(

@@ -13,7 +13,7 @@ TensorRT LLM supports two precisions for MiniMax-M3:
 
 The block-sparse attention path does **not** currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.
 
-This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Choosing the Parallelism Strategy](#choosing-the-parallelism-strategy-tep-vs-dep).
+This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Recommended Performance Settings](#recommended-performance-settings).
 
 The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA's accelerated stack.
 

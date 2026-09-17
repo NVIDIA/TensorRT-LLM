@@ -211,69 +211,14 @@ def test_worktree_clean_ignores_a_built_worktrees_submodules(repo, tmp_path):
     assert gitops.worktree_clean(wt) is True
 
 
-# ── where the git command runs ───────────────────────────────────────────────
-def test_git_runs_locally_by_default(repo):
-    """The historical behaviour, and what every other test in this file assumes.
-
-    Asserted explicitly because it is now a *choice* rather than the only option: a
-    default that silently became remote would make every existing deployment reach
-    for a host it was never told about.
-    """
-    assert gitops.cluster_ssh() == ""
-    assert gitops.rev_parse_head(repo)  # a real local git call
-
-
-def test_use_cluster_routes_every_command_through_ssh(repo, monkeypatch):
-    """One switch has to cover all nine helpers, not just the one under test.
-
-    ``_git`` is the only place a git command is built in this package — there is no
-    other ``subprocess`` call here — which is what makes that true. So this asserts
-    the *rendering* for a representative sample rather than running ssh in a unit
-    test.
-    """
+def test_git_commands_are_always_local(repo, monkeypatch):
     seen: list[list[str]] = []
+    real_run = subprocess.run
 
-    class _Result:
-        returncode = 0
-        stdout = "deadbeef\n"
-        stderr = ""
+    def record(cmd, **kwargs):
+        seen.append(cmd)
+        return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(
-        gitops.subprocess, "run", lambda cmd, **kw: (seen.append(cmd), _Result())[1]
-    )
-    gitops.use_cluster("me@login-01")
-    try:
-        gitops.rev_parse_head(repo)
-        gitops.discard_uncommitted(repo)
-    finally:
-        # Restore, or the module-level host leaks into every later test in the
-        # session and they pass for the wrong reason.
-        gitops.use_cluster("")
-
-    assert len(seen) == 3, seen  # rev-parse + reset --hard + clean -fd
-    for cmd in seen:
-        assert cmd[0] == "ssh" and "me@login-01" in cmd, cmd
-        # The whole git command is ONE argument, so ssh's own shell cannot re-split
-        # a path or a commit message containing spaces.
-        assert cmd[-1].startswith("git -C "), cmd[-1]
-
-
-def test_a_remote_failure_names_the_host_it_ran_on(repo, monkeypatch):
-    """Reproducing a remote failure locally gives a different answer.
-
-    So the error carries the ssh line, not the bare git command — otherwise a reader
-    copies it, runs it here, and draws a conclusion about the wrong machine.
-    """
-
-    class _Fail:
-        returncode = 128
-        stdout = ""
-        stderr = "fatal: not a git repository"
-
-    monkeypatch.setattr(gitops.subprocess, "run", lambda cmd, **kw: _Fail())
-    gitops.use_cluster("me@login-01")
-    try:
-        with pytest.raises(gitops.GitOpsError, match="me@login-01"):
-            gitops.rev_parse_head(repo)
-    finally:
-        gitops.use_cluster("")
+    monkeypatch.setattr(gitops.subprocess, "run", record)
+    assert gitops.rev_parse_head(repo)
+    assert seen and seen[0][:2] == ["git", "-C"]

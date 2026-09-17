@@ -189,6 +189,8 @@ class _CacheKey(NamedTuple):
     mask_type: Any  # fmha_utils.MaskEnum
     with_lse: bool
     with_sink: bool
+    with_scale_softmax_tensor: bool
+    with_scale_output_tensor: bool
     with_scale_v_channels: bool
     has_window: bool
     has_skip_softmax: bool
@@ -257,15 +259,12 @@ def cute_dsl_fmha_fwd(
     o: torch.Tensor,
     *,
     is_causal: bool = False,
-    sm_scale: float | None = None,
+    sm_scale: float | torch.Tensor | None = None,
     window_left: int = -1,
     window_right: int = -1,
     lse: torch.Tensor | None = None,
-    scale_q: float | torch.Tensor = 1.0,
-    scale_k: float | torch.Tensor = 1.0,
-    scale_v: float | torch.Tensor = 1.0,
+    scale_output: float | torch.Tensor = 1.0,
     scale_v_channels: torch.Tensor | None = None,
-    scale_o: float | torch.Tensor = 1.0,
     is_persistent: bool = True,
     skip_softmax_threshold_scale_factor: float | None = None,
     sparse_params: SkipSoftmaxParams | None = None,
@@ -307,18 +306,6 @@ def cute_dsl_fmha_fwd(
         raise ValueError("Output tensor `o` must be contiguous (writes happen in place).")
     if lse is not None and not lse.is_contiguous():
         raise ValueError("LSE tensor must be contiguous (writes happen in place).")
-
-    # Delay scalar extraction to inside @torch.compiler.disable decoration
-    def _scalar_float(t):
-        if isinstance(t, torch.Tensor):
-            return t.item()
-        else:
-            return t
-
-    scale_q = _scalar_float(scale_q)
-    scale_k = _scalar_float(scale_k)
-    scale_v = _scalar_float(scale_v)
-    scale_o = _scalar_float(scale_o)
 
     # Reshape (B, S, H, D) → (B, S, h_kv, h_r, D) for Q/O and (B, S, h_kv, 1, D) for K/V; LSE
     # goes (B, S, H) → (B, S, h_kv, h_r). Layout matches fmha.py:run() (no head_dim split).
@@ -375,9 +362,17 @@ def cute_dsl_fmha_fwd(
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
-    scale_softmax = scale_q * scale_k * sm_scale
-    scale_softmax_log2 = scale_softmax * math.log2(math.exp(1.0))
-    scale_output = scale_v / scale_o
+
+    if isinstance(sm_scale, torch.Tensor):
+        scale_softmax_tensor = sm_scale
+        scale_softmax_log2_tensor = sm_scale * math.log2(math.exp(1.0))
+        scale_softmax_value = 1.0
+        scale_softmax_log2_value = 1.0
+    else:
+        scale_softmax_tensor = None
+        scale_softmax_log2_tensor = None
+        scale_softmax_value = sm_scale
+        scale_softmax_log2_value = sm_scale * math.log2(math.exp(1.0))
 
     use_skip_softmax = (
         skip_softmax_threshold_scale_factor is not None and skip_softmax_threshold_scale_factor > 0
@@ -388,12 +383,34 @@ def cute_dsl_fmha_fwd(
         else None
     )
 
+    if isinstance(scale_output, torch.Tensor):
+        scale_output_tensor = scale_output
+        scale_output_value = 1.0
+    else:
+        scale_output_tensor = None
+        scale_output_value = scale_output
+
     # For the block-scaled paths Q/K may be FP4 (stored as torch.uint8) or FP8 e4m3; pass
     # qk_cutlass_dtype to override the inferred element type for FP4 (FP8 e4m3 is auto-detected).
     q_cute = _to_cute_tensor(q_5d, leading_dim=4, cutlass_element_type=qk_cutlass_dtype)
     k_cute = _to_cute_tensor(k_5d, leading_dim=4, cutlass_element_type=qk_cutlass_dtype)
     v_cute = _to_cute_tensor(v_5d, leading_dim=4)
     o_cute = _to_cute_tensor(o_5d, leading_dim=4)
+    scale_output_tensor_cute = (
+        _to_cute_tensor(scale_output_tensor.view(-1), leading_dim=0)
+        if scale_output_tensor is not None
+        else None
+    )
+    scale_softmax_tensor_cute = (
+        _to_cute_tensor(scale_softmax_tensor.view(-1), leading_dim=0)
+        if scale_softmax_tensor is not None
+        else None
+    )
+    scale_softmax_log2_tensor_cute = (
+        _to_cute_tensor(scale_softmax_log2_tensor.view(-1), leading_dim=0)
+        if scale_softmax_log2_tensor is not None
+        else None
+    )
     if qk_sf_vec != 0:
         # MXFP8 SFs are Float8E8M0FNU (uint8 storage); NVFP4 SFs are Float8E4M3FN.
         sf_dtype = cutlass.Float8E8M0FNU if qk_sf_vec == 32 else cutlass.Float8E4M3FN
@@ -453,6 +470,8 @@ def cute_dsl_fmha_fwd(
         mask_type=mask_type,
         with_lse=lse is not None,
         with_sink=False,
+        with_scale_softmax_tensor=scale_softmax_tensor is not None,
+        with_scale_output_tensor=scale_output_tensor is not None,
         with_scale_v_channels=scale_v_channels is not None,
         has_window=has_window,
         has_skip_softmax=use_skip_softmax,
@@ -475,9 +494,12 @@ def cute_dsl_fmha_fwd(
             None,  # cum_seqlen_k
             lse_cute,
             None,  # sink
-            cute_typing.Float32(scale_softmax_log2),
-            cute_typing.Float32(scale_softmax),
-            cute_typing.Float32(scale_output),
+            cute_typing.Float32(scale_softmax_log2_value),
+            scale_softmax_log2_tensor_cute,
+            cute_typing.Float32(scale_softmax_value),
+            scale_softmax_tensor_cute,
+            cute_typing.Float32(scale_output_value),
+            scale_output_tensor_cute,
             scale_v_channels_cute,
             skip_threshold_log2,
             ws_left,
@@ -498,9 +520,12 @@ def cute_dsl_fmha_fwd(
             None,  # cum_seqlen_k
             lse_cute,
             None,  # sink
-            cute_typing.Float32(scale_softmax_log2),
-            cute_typing.Float32(scale_softmax),
-            cute_typing.Float32(scale_output),
+            cute_typing.Float32(scale_softmax_log2_value),
+            scale_softmax_log2_tensor_cute,
+            cute_typing.Float32(scale_softmax_value),
+            scale_softmax_tensor_cute,
+            cute_typing.Float32(scale_output_value),
+            scale_output_tensor_cute,
             skip_threshold_log2,
             ws_left,
             ws_right,
@@ -532,9 +557,8 @@ def _quantize_fp8_v(
         v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
         return v_quantized, 1.0, v_qscale.reciprocal().contiguous()
 
-    v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax().clamp(min=1e-3)
-    v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
-    return v_quantized, v_qscale.reciprocal(), None
+    v_quantized, v_dequant_scale = torch.ops.trtllm.quantize_e4m3_per_tensor(v_bshd.contiguous())
+    return v_quantized, v_dequant_scale.float(), None
 
 
 def _quantize_blockscaled_one(
@@ -586,16 +610,22 @@ def _quantize_blockscaled_one(
 
     if qk_sf_vec == 16:
         # NVFP4: per-16-element block, E4M3 SFs in swizzled layout; per-tensor global scale folded
-        # into the returned `scale` (caller multiplies it into scale_softmax via scale_q / scale_k).
-        amax = x_2d.float().abs().amax().clamp(min=1e-6)
-        global_sf = (_FP8_E4M3_MAX * _FP4_E2M1_MAX) / amax
+        # into the returned `scale` (caller multiplies it into scale_softmax via sm_scale).
+        #
+        # Use TRTLLM's fused kernel to reduce on the last dimension, then run a subsequent reduction
+        # to obtain the scalar SF for nvfp4_quantize. S_pad % 128 == 0 is leveraged to expand the
+        # last dimension for fused kernel reductions, while 8192 is the largest dimension compatible
+        # with the same routine.
+        x_reduction_shape = x_2d.reshape(-1, min(8 * num_heads * head_dim, 8192))
+        reduced_rows = torch.ops.trtllm.calculate_nvfp4_global_scale(x_reduction_shape, None)
+        global_sf = reduced_rows.amin().clamp(max=(_FP8_E4M3_MAX * _FP4_E2M1_MAX) / 1e-6)
         global_sf_t = global_sf.to(torch.float32).reshape(1)
         x_q_2d, x_sf = torch.ops.trtllm.fp4_quantize(x_2d, global_sf_t, 16, False)
         # x_q_2d shape: (M, D/2) uint8 — natural packed layout (2 FP4 / byte).
         head_dim_packed = head_dim // 2
         x_q = x_q_2d.view(batch_size, num_heads, s_pad, head_dim_packed)
         x_q = x_q[:, :, :seq_len, :].transpose(1, 2).contiguous()  # (B, S, H, D/2)
-        return x_q, x_sf, amax / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)
+        return x_q, x_sf, global_sf.reciprocal()
 
     raise ValueError(f"Unsupported qk_sf_vec={qk_sf_vec}; expected 0, 16, or 32.")
 
@@ -728,9 +758,8 @@ class CuTeDSLAttention(AttentionBackend):
         )
 
         # V is tensor-scaled by default. MXFP8/NVFP4 with v_block_size=1 use an (H, D) scale.
-        scale_v = kwargs.get("scale_v", 1.0)
-        scale_q = kwargs.get("scale_q", 1.0)
-        scale_k = kwargs.get("scale_k", 1.0)
+        v_dequant_scale = 1.0
+        sm_scale = self.scale
         qac = self.quant_attention_config
         q_sf = k_sf = qk_cutlass_dtype = None
         qk_sf_vec = 0
@@ -740,13 +769,11 @@ class CuTeDSLAttention(AttentionBackend):
                 qk_sf_vec = 32 if qac.qk_dtype == "mxfp8" else 16
                 q, q_sf, gs_q = _quantize_blockscaled_one(q, qk_sf_vec)
                 k, k_sf, gs_k = _quantize_blockscaled_one(k, qk_sf_vec)
-                scale_q = scale_q * gs_q
-                scale_k = scale_k * gs_k
+                sm_scale = sm_scale * gs_q * gs_k
                 qk_cutlass_dtype = cutlass.Float4E2M1FN if qk_sf_vec == 16 else cutlass.Float8E4M3FN
             v, v_dequant_scale, scale_v_channels = _quantize_fp8_v(
                 v, per_head_channel=qk_sf_vec != 0 and qac.v_block_size == 1
             )
-            scale_v = scale_v * v_dequant_scale
 
         # Skip softmax.
         skip_softmax_threshold_scale = self.skip_softmax_threshold_scale
@@ -766,13 +793,10 @@ class CuTeDSLAttention(AttentionBackend):
             v,
             out,
             is_causal=is_causal,
-            sm_scale=self.scale,
+            sm_scale=sm_scale,
             lse=lse,
-            scale_q=scale_q,
-            scale_k=scale_k,
-            scale_v=scale_v,
+            scale_output=v_dequant_scale,
             scale_v_channels=scale_v_channels,
-            scale_o=kwargs.get("scale_o", 1.0),
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale,
             sparse_params=self.sparse_params,
             timestep=kwargs.get("timestep"),

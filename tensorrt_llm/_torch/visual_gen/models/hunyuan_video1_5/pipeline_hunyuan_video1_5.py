@@ -35,7 +35,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 
 from .transformer_hunyuan_video1_5 import HunyuanVideo15Transformer3DModel
 
@@ -613,7 +613,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
                 f"(batch_size={batch_size}, num_videos_per_prompt={num_videos_per_prompt})."
             )
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         device = self.device
 

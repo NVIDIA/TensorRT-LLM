@@ -62,7 +62,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import PageIndexMode, Role
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
@@ -281,6 +281,55 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
         cute_dsl_radix.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "use_self_sampling,sm_version,msl_c,should_warmup",
+    [
+        (True, 100, 65536, True),
+        (True, 100, 30001, True),  # odd msl_c must not skip the prefill leg
+        (False, 100, 65536, False),  # temporal-hint layers: no prefill engine
+        (True, 90, 65536, False),  # Hopper
+        (True, 120, 65536, False),  # consumer Blackwell (SM120): engine is SM100/103-only
+    ],
+)
+def test_metadata_warmup_selfsampling_prefill_leg(
+    use_self_sampling, sm_version, msl_c, should_warmup
+):
+    """The self-sampling warmup drives BOTH the decode (varlen) and the prefill
+    engines; the prefill leg sits before the DeepGEMM decode-stride guard so an
+    odd msl_c cannot skip it."""
+    metadata = SimpleNamespace(
+        enable_gvr_topk=True,
+        use_self_sampling_topk=use_self_sampling,
+        sparse_mla_topk=512,
+        _indexer_compress_ratio=4,
+        kv_cache_manager=SimpleNamespace(),
+        get_indexer_max_seq_len=Mock(return_value=msl_c),
+        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
+        num_sms=148,
+    )
+    ss_host = (
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
+    )
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch(f"{ss_host}.warmup_prefill") as warmup_prefill,
+        patch(f"{ss_host}.warmup_varlen"),
+    ):
+        DSAtrtllmAttentionMetadata.warmup_selfsampling_topk(metadata, next_n=1, batch_sizes=[8])
+
+    if should_warmup:
+        warmup_prefill.assert_called_once_with(512, max(msl_c, 32768))
+    else:
+        warmup_prefill.assert_not_called()
+
+
 def test_kv_lens_row_reorder_threshold():
     """Prepare row order only when CuTe DSL GVR has enough decode rows."""
     num_sms = 16
@@ -410,6 +459,7 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.max_num_sequences = 2
     metadata.max_num_tokens = 4
     metadata.num_sparse_topk = 3
+    metadata._radix_rows_per_sequence = 1
     metadata.num_sms = 1
     metadata.cuda_graph_buffers = None
     metadata.kv_cache_manager = SimpleNamespace(max_blocks_per_seq=2)
@@ -601,6 +651,12 @@ def test_indexer_two_level_gvr_dispatch(
     assert indexer.top_k.decode_implementation == expected_decode
     assert indexer.top_k.gvr_self_sampling == use_self_sampling
     assert indexer.top_k.needs_gvr_prior == (not use_self_sampling)
+    # Prefill uses the self-sampling engine on exactly the self-sampling
+    # layers; the temporal-hint layers keep the exact radix prefill.
+    expected_prefill = (
+        TopKImplementation.CUTE_DSL_GVR if use_self_sampling else TopKImplementation.CUDA_RADIX
+    )
+    assert indexer.top_k.prefill_implementation == expected_prefill
 
 
 @skip_pre_hopper
@@ -640,6 +696,60 @@ def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, exp
     assert indexer.weights_proj.dtype == expected_dtype
 
 
+@pytest.mark.parametrize(
+    "is_tree,is_dynamic,max_draft_len,max_total_draft_tokens,spec_tree_manager,rows_per_sequence",
+    [
+        (False, False, 7, 7, None, 8),
+        (True, False, 3, 7, None, 8),
+        (
+            True,
+            True,
+            6,
+            31,
+            SimpleNamespace(_internal_buf_dim=60, dynamic_tree_max_topK=10),
+            60,
+        ),
+    ],
+)
+def test_metadata_spec_update_resizes_radix_workspace(
+    is_tree,
+    is_dynamic,
+    max_draft_len,
+    max_total_draft_tokens,
+    spec_tree_manager,
+    rows_per_sequence,
+):
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.max_num_sequences = 2
+    metadata.max_draft_tokens = 0
+    metadata._radix_rows_per_sequence = 1
+    metadata.num_sparse_topk = 2
+    metadata.is_cuda_graph = True
+    metadata.nvfp4_mla_fp8_scratch = None
+    metadata.kv_lens_cuda_2d = torch.empty(2, 1)
+    metadata.kv_lens_expanded_host = torch.empty(2)
+    metadata._create_kv_lens_2d_buffer = Mock()
+    metadata.create_expanded_buffers = Mock()
+    metadata._create_radix_aux_buffers = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata."
+        "TrtllmAttentionMetadata.update_spec_dec_param"
+    ):
+        metadata.update_spec_dec_param(
+            batch_size=2,
+            is_spec_decoding_enabled=True,
+            is_spec_dec_tree=is_tree,
+            is_spec_dec_dynamic_tree=is_dynamic,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            spec_tree_manager=spec_tree_manager,
+        )
+
+    assert metadata._radix_rows_per_sequence == rows_per_sequence
+    metadata._create_radix_aux_buffers.assert_called_once_with(True)
+
+
 def _ceil_to_ue8m0(x: torch.Tensor):
     """Round tensor values up to the nearest power of two (UE8M0 format)."""
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
@@ -651,7 +761,7 @@ def cdiv(a: int, b: int) -> int:
 
 
 def _load_cast_back_from_fp4():
-    from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
+    from .test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     return cast_back_from_fp4
 
@@ -1195,6 +1305,97 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         cache_manager.shutdown()
 
 
+def test_dsa_cache_manager_v2_remaps_indexer_after_empty_layers() -> None:
+    """Keep global buffer access aligned after masked and empty layers are removed."""
+    head_dim = 128
+    tokens_per_block = 16
+    layer_mask = [False, True, True, True, True, True, True]
+    pretrained_config = SimpleNamespace(
+        num_hidden_layers=len(layer_mask),
+        index_topk_pattern=["F", "S", "F", "S", "F", "S", "F"],
+    )
+    # Layer 0 is masked out before cache construction. Empty shared-indexer
+    # layers 1 and 3 must then be removed without shifting the surviving roles.
+    cache_manager = DSACacheManagerV2(
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=64,
+            host_cache_size=0,
+        ),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=sum(layer_mask),
+        num_kv_heads=[1, 0, 1, 0, 1, 1, 1],
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=64,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        layer_mask=layer_mask,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=head_dim),
+        pretrained_config=pretrained_config,
+    )
+
+    try:
+        retained_layers = [2, 4, 5, 6]
+        indexer_mask = [True, True, False, True]
+        assert cache_manager.num_layers == len(layer_mask)
+        assert cache_manager.pp_layers == retained_layers
+        assert cache_manager.num_local_layers == len(retained_layers)
+        assert cache_manager.layer_offsets == {2: 0, 4: 1, 5: 2, 6: 3}
+        assert cache_manager.indexer_k_cache_local_layer_mask == indexer_mask
+        assert cache_manager.indexer_k_cache_page_scale == sum(indexer_mask)
+
+        indexer_bytes_per_token = head_dim + 4
+        key_bytes_per_token = head_dim * 2
+        primary_pool = cache_manager.get_unique_primary_pool()
+        indexer_addresses = []
+        for local_layer_idx, global_layer_idx in enumerate(retained_layers):
+            has_indexer = indexer_mask[local_layer_idx]
+            layer_config = cache_manager.kv_cache_manager_py_config.layers[local_layer_idx]
+            assert int(layer_config.layer_id) == local_layer_idx
+            assert {buffer.role for buffer in layer_config.buffers} == (
+                {Role.KEY, Role.INDEX_KEY} if has_indexer else {Role.KEY}
+            )
+            assert cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.ALL) == (
+                key_bytes_per_token + (indexer_bytes_per_token if has_indexer else 0)
+            )
+
+            key = cache_manager.get_buffers(global_layer_idx)
+            assert key.data_ptr() == int(
+                cache_manager.impl.get_mem_pool_base_address(
+                    local_layer_idx, Role.KEY, PageIndexMode.SHARED
+                )
+            )
+            key[0, 0, 0, 0, 0] = global_layer_idx
+            assert primary_pool[0, local_layer_idx, 0, 0].item() == global_layer_idx
+            if has_indexer:
+                indexer = cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
+                assert indexer.shape[1:] == (tokens_per_block, 1, indexer_bytes_per_token)
+                assert indexer.data_ptr() == int(
+                    cache_manager.impl.get_mem_pool_base_address(
+                        local_layer_idx, Role.INDEX_KEY, PageIndexMode.SHARED
+                    )
+                )
+                indexer_addresses.append(indexer.data_ptr())
+                indexer[0, 0, 0, 0] = global_layer_idx
+            else:
+                with pytest.raises(AssertionError, match="shared-indexer layer"):
+                    cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
+
+        assert len(set(indexer_addresses)) == sum(indexer_mask)
+        for global_layer_idx in (2, 4, 6):
+            indexer = cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
+            assert indexer[0, 0, 0, 0].item() == global_layer_idx
+        for global_layer_idx in (0, 1, 3):
+            with pytest.raises(KeyError):
+                cache_manager.get_buffers(global_layer_idx)
+            with pytest.raises(KeyError):
+                cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
+    finally:
+        cache_manager.shutdown()
+
+
 def create_indexer(sparse_attn_config, layer_idx=0):
     """Helper to create an Indexer for testing."""
     # Create RopeParams
@@ -1477,6 +1678,31 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     check_accuracy(
         logits, ref_logits, atol=1e-2, rtol=2e-1, percent=0.9
     )  # double check for per-element similarity
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+@pytest.mark.parametrize("seq_len_kv", [1027, 4099])
+def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
+    """The self-sampling GVR prefill engine engages only while DeepGEMM keeps
+    a float4-aligned row stride on odd-width logits; an exact-width producer
+    would silently route every such tile back to radix."""
+    torch.manual_seed(0)
+    num_heads, head_dim, seq_len = 64, 128, 64
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+    ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
+    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+
+    logits = deep_gemm.fp8_mqa_logits(
+        q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
+    )
+
+    assert logits.shape == (seq_len, seq_len_kv)
+    top_k = TopK(512, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    assert top_k._selfsampling_prefill_ok(logits), (logits.dtype, tuple(logits.stride()))
 
 
 def _create_mock_metadata(

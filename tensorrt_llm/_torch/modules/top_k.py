@@ -11,8 +11,6 @@ import torch.nn as nn
 
 from tensorrt_llm.logger import logger
 
-from ..memory_buffer_utils import get_memory_buffers
-
 
 class TopKImplementation(str, Enum):
     """Top-K implementations grouped by backend and algorithm."""
@@ -36,9 +34,9 @@ class TopK(nn.Module):
 
     GVR decode state is owned by the caller so it can be shared with the
     request metadata and retain a stable address across CUDA Graph replays.
+    Native CUDA scratch is supplied by the caller so its lifetime follows the
+    caller's eager or CUDA-graph metadata.
     """
-
-    _memory_buffers = get_memory_buffers()
 
     def __init__(
         self,
@@ -89,6 +87,8 @@ class TopK(nn.Module):
         next_n: int = 1,
         max_seq_len: int | None = None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
+        radix_aux_indices: torch.Tensor | None = None,
+        radix_aux_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write prefill or decode Top-K indices into ``output_indices``.
 
@@ -110,6 +110,10 @@ class TopK(nn.Module):
                 self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
                 shape ``[num_requests]`` on the same device.
+            radix_aux_indices: Caller-owned int32 workspace for native CUDA
+                Radix split work.
+            radix_aux_logits: Caller-owned float32 workspace for native CUDA
+                Radix split work.
 
         Returns:
             ``output_indices`` after the selected implementation writes it.
@@ -127,6 +131,8 @@ class TopK(nn.Module):
             next_n,
             max_seq_len,
             gvr_ext_kwargs,
+            radix_aux_indices,
+            radix_aux_logits,
         )
 
     def _forward_prefill(
@@ -143,7 +149,59 @@ class TopK(nn.Module):
                 row_ends,
                 output_indices,
             )
-        if self.prefill_implementation == TopKImplementation.CUTE_DSL_RADIX:
+        if self.prefill_implementation == TopKImplementation.CUTE_DSL_GVR:
+            # hint-free k derives from the output width; pin it to the module's k
+            assert output_indices.shape[1] == self.top_k
+            if not self.gvr_self_sampling:
+                # the temporal (hint) GVR engine has no prefill form
+                logger.warning_once(
+                    "temporal GVR has no prefill engine; using the CUDA radix prefill Top-K.",
+                    key="gvr_temporal_prefill_radix",
+                )
+            elif scores.shape[1] <= self.top_k:
+                # every row is short (nv <= k): the exact radix path emits the
+                # identity/-1 answer without reading logits — cheaper than a
+                # zero-work self-sampling launch. Deliberate, no warning.
+                pass
+            elif self._selfsampling_prefill_ok(scores):
+                from ..cute_dsl_kernels.blackwell.top_k import (
+                    selfsampling_topk_prefill_ready,
+                    selfsampling_topk_run_prefill,
+                )
+
+                if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
+                    scores, output_indices
+                ):
+                    # the engine never JIT-compiles under capture; an engine
+                    # missed by warmup takes the exact radix path in the graph
+                    logger.warning_once(
+                        "self-sampling GVR prefill engine is not compiled for this "
+                        "shape and cannot JIT under CUDA graph capture; using the "
+                        "CUDA radix prefill Top-K.",
+                        key="selfsampling_topk_prefill_capture_radix",
+                    )
+                else:
+                    logger.info_once(
+                        "self-sampling GVR prefill top-K engaged "
+                        f"(K={self.top_k}, cr={self.compress_ratio}, hint-free).",
+                        key="selfsampling_topk_prefill_engaged",
+                    )
+                    # ks/ke are already in compressed column units; run_prefill
+                    # writes the local (column - ks) frame with -1 pad and no
+                    # host reads (envelope from scores.shape[1]).
+                    selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
+                    return output_indices
+            else:
+                # engine hardware-format gate missed (e.g. a non-fp4 layer with
+                # an odd DeepGEMM width, or a bf16 producer): exact radix.
+                logger.warning_once(
+                    "self-sampling GVR prefill is selected but the scores do "
+                    "not satisfy the engine's hardware-format gate "
+                    f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
+                    "falling back to the CUDA radix prefill Top-K.",
+                    key="selfsampling_topk_prefill_fallthrough",
+                )
+        elif self.prefill_implementation == TopKImplementation.CUTE_DSL_RADIX:
             # Keep the op's reread policy default; only its copy width is tuned.
             torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
                 scores,
@@ -154,7 +212,7 @@ class TopK(nn.Module):
                 _CUTE_DSL_PREFILL_COPY_BITS,
             )
             return output_indices
-        if self.prefill_implementation != TopKImplementation.CUDA_RADIX:
+        elif self.prefill_implementation != TopKImplementation.CUDA_RADIX:
             raise NotImplementedError(
                 f"{self.prefill_implementation.value} does not support prefill Top-K"
             )
@@ -167,6 +225,20 @@ class TopK(nn.Module):
         )
         return output_indices
 
+    def _selfsampling_prefill_ok(self, scores: torch.Tensor) -> bool:
+        """Engine format gate: fp32 row-major scores with a float4-aligned row
+        stride and a 16B base (the DeepGEMM prefill logits arena)."""
+        return (
+            scores.dtype == torch.float32
+            and scores.stride(1) == 1
+            and scores.stride(0) % 4 == 0
+            and scores.data_ptr() % 16 == 0
+        )
+
+    @staticmethod
+    def _prefill_capturing(scores: torch.Tensor) -> bool:
+        return scores.is_cuda and torch.cuda.is_current_stream_capturing()
+
     def _forward_decode(
         self,
         scores: torch.Tensor,
@@ -176,6 +248,8 @@ class TopK(nn.Module):
         next_n: int,
         max_seq_len: int | None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
@@ -187,6 +261,8 @@ class TopK(nn.Module):
                 output_indices,
                 next_n,
                 max_seq_len=max_seq_len,
+                radix_aux_indices=radix_aux_indices,
+                radix_aux_logits=radix_aux_logits,
                 **(gvr_ext_kwargs or {}),
             )
 
@@ -196,6 +272,8 @@ class TopK(nn.Module):
             scan_lengths,
             output_indices,
             next_n,
+            radix_aux_indices,
+            radix_aux_logits,
         )
 
     def _forward_decode_radix(
@@ -205,6 +283,8 @@ class TopK(nn.Module):
         scan_lengths: torch.Tensor,
         output_indices: torch.Tensor,
         next_n: int,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         use_cute_dsl = self.decode_implementation == TopKImplementation.CUTE_DSL_RADIX and not (
             self.compress_ratio > 1 and next_n > 1
@@ -219,7 +299,9 @@ class TopK(nn.Module):
             )
             return output_indices
 
-        radix_indices, radix_values = self._get_radix_workspace(scores)
+        radix_indices, radix_values = self._get_radix_workspace(
+            scores, radix_aux_indices, radix_aux_logits
+        )
         torch.ops.trtllm.indexer_topk_decode(
             scores,
             sequence_lengths,
@@ -232,52 +314,26 @@ class TopK(nn.Module):
         )
         return output_indices
 
-    def _get_workspace(
+    def _get_radix_workspace(
         self,
         scores: torch.Tensor,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        buffer_name: str,
-    ) -> torch.Tensor:
-        device_buffer_name = f"{buffer_name}_{scores.device}"
-        if scores.is_cuda:
-            with torch.cuda.device(scores.device):
-                capture_graph = torch.cuda.is_current_stream_capturing()
-                return self._memory_buffers.get_buffer(
-                    shape,
-                    dtype=dtype,
-                    buffer_name=device_buffer_name,
-                    reserve_buffer=capture_graph,
-                )
-        return self._memory_buffers.get_buffer(
-            shape,
-            dtype=dtype,
-            buffer_name=device_buffer_name,
-            reserve_buffer=False,
-        )
-
-    def _get_radix_workspace(
-        self, scores: torch.Tensor
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if scores.dtype != torch.float32:
             # The C++ bf16/fp16 entry has no split-work tier or aux-buffer
             # arguments and rejects widths that would require split work.
             return None, None
 
-        shape = (scores.shape[0], _MAX_RADIX_BLOCKS_PER_ROW, self.top_k)
-        radix_indices = self._get_workspace(
-            scores,
-            shape,
-            torch.int32,
-            "top_k_radix_indices_workspace",
+        if radix_aux_indices is None or radix_aux_logits is None:
+            raise ValueError(
+                "Native CUDA Radix TopK requires radix_aux_indices and radix_aux_logits"
+            )
+        num_rows = scores.shape[0]
+        return (
+            radix_aux_indices[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
+            radix_aux_logits[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
         )
-        radix_values = self._get_workspace(
-            scores,
-            shape,
-            torch.float32,
-            "top_k_radix_values_workspace",
-        )
-        return radix_indices, radix_values
 
     def _forward_decode_gvr(
         self,
@@ -286,6 +342,8 @@ class TopK(nn.Module):
         output_indices: torch.Tensor,
         next_n: int,
         max_seq_len: int | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -339,7 +397,9 @@ class TopK(nn.Module):
                 "falling back to the CUDA insertion/radix Top-K path.",
                 key="selfsampling_topk_fallthrough",
             )
-            radix_indices, radix_values = self._get_radix_workspace(scores)
+            radix_indices, radix_values = self._get_radix_workspace(
+                scores, radix_aux_indices, radix_aux_logits
+            )
             torch.ops.trtllm.indexer_topk_decode(
                 scores,
                 sequence_lengths,

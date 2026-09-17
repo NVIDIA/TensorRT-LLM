@@ -914,7 +914,7 @@ class TestPyMicroBatchSchedulerChunking:
     def test_sort_by_lora_task_id(self):
         """
         Requests are sorted by lora_task_id for performance.
-        C++ ref: sortRequests in inflightBatchingUtils.cpp
+        C++ ref: sortRequests in microBatchScheduler.cpp
         """
         scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
         r0 = _make_request(0, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=5)

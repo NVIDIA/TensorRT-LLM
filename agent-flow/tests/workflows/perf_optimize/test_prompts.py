@@ -103,8 +103,116 @@ def test_analyzer_carries_canonical_nsys_flags():
     assert "Verify the profiling knobs first" in ANALYZER_SYSTEM_PROMPT
 
 
+def test_run_a2_flags_reach_every_role_that_captures_nsys():
+    # The analyzer profiles each round and the evaluator captures the
+    # accept-evidence trace; both inherit PROFILING_RUNS_REFERENCE, so both
+    # must carry the utilization and call-stack passes or one of the two
+    # keeps producing traces with no bounding resource and no call sites.
+    for prompt, role in (
+        (ANALYZER_SYSTEM_PROMPT, "analyzer"),
+        (EVALUATOR_SYSTEM_PROMPT, "evaluator"),
+    ):
+        for flag in (
+            "--gpu-metrics-devices=all",
+            "--gpu-metrics-frequency=100000",
+            "--python-backtrace",
+            "--python-sampling=true",
+            "--cudabacktrace=kernel:5000,sync:10000",
+        ):
+            assert flag in prompt, (role, flag)
+        assert "## Run A2" in prompt, role
+
+
+def test_run_a2_is_a_separate_capture_and_degrades_gracefully():
+    # Metric sampling and backtraces perturb the timeline, so they take
+    # their own captures; and when the host withholds the profiling
+    # permission the run reports it rather than inventing utilization.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "server_nsys_metrics" in prompt
+    assert "server_nsys_stacks" in prompt
+    assert "additional** captures" in prompt
+    assert "ERR_NVGPUCTRPERM" in prompt
+    assert "additive, never blocking" in prompt
+
+
+def test_run_a2_call_stack_pass_states_the_cuda_graph_limit():
+    # perf-optimize profiles graph-captured servers almost exclusively, so
+    # the prompt has to say that a backtrace on cudaGraphLaunch names the
+    # launch site and not the operator inside the graph.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "cudaGraphLaunch" in prompt
+    assert "graphId IS NOT NULL" in prompt
+
+
+def test_findings_contract_carries_the_run_a2_evidence():
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "gpu metrics unavailable" in contract
+    assert "call stacks unavailable" in contract
+    assert "bounding resource" in contract
+
+
+def test_analyzer_carries_the_nsys_timeline_decomposition():
+    # Run A does not stop at ``nsys stats``: the analyzer exports a
+    # ``.sqlite`` and runs the internal-perf-nsight-system-analysis pipeline, whose
+    # per-iteration budget is what separates a host-exposure item from a
+    # slow-kernel item.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "internal-perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+    assert "nsys export --type sqlite" in prompt
+    # Proactive by construction — it re-reads a trace already captured.
+    assert "costs no extra server launch" in prompt
+    # The roadmap's expected-gain grounding reads the split, not just shares.
+    assert "compute-absent split" in prompt
+    assert "a launch-starved share is not recovered by a faster kernel" in prompt
+    # Degrades to a one-liner rather than blocking or fabricating.
+    assert "timeline analysis unavailable" in prompt
+
+
+def test_evaluator_decomposes_the_accept_evidence_capture():
+    # The accept-evidence trace gets the same treatment, so "the launch
+    # gaps shrunk" is measured on both sides rather than eyeballed.
+    prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
+    assert "internal-perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+    assert "nsys_analysis" in prompt
+    assert "the launch-starved share shrunk" in prompt
+    # Never blocks the verdict, never states an unmeasured split.
+    assert "never block the verdict on it" in prompt
+
+
+def test_evaluator_diffs_with_the_skills_comparative_mode():
+    # The skill differences two variants natively; running it twice
+    # single-variant and eyeballing the trees throws that away.
+    prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
+    assert "--variant before" in prompt
+    assert "--variant after" in prompt
+    assert "difference/rank-0/iteration.json" in prompt
+    # Per-call deltas survive a launch-count mismatch between the sides.
+    assert "difference/rank-0/module_slice.json" in prompt
+    # One taxonomy across both sides — a diff across two is not a diff.
+    assert "a diff across two taxonomies is not a diff" in prompt
+    # Degrades where the earlier capture kept no sqlite.
+    assert "kept no `.sqlite`" in prompt
+    # The mechanism claim names a row, not a vibe.
+    assert "is not a mechanism" in prompt
+
+
+def test_run_a2a_capture_feeds_the_timeline_pipeline():
+    # The two changes compose rather than sit side by side: A2a's
+    # metric-sampling capture is exactly what the skill's per-operator
+    # utilization step reads, and folding it in costs no GPU.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "--metrics-profile 0=<workspace>/server_nsys_metrics.sqlite" in prompt
+    assert "it reads the sampling capture, never the timing one" in prompt
+    # A2b is not an input to it — those flags name another tool's exports.
+    assert "Pass A2b's capture is **not** an input to that pipeline" in prompt
+    # And step 5 never waits on a pass that is allowed to be skipped.
+    assert "it must not wait on Run A2" in prompt
+
+
 def test_analyzer_carries_the_ncu_deep_dive():
-    # The shared Run C: a bounded per-kernel ncu capture of the top nsys
+    # The shared Run B: a bounded per-kernel ncu capture of the top nsys
     # kernels, interpreted with the perf-nsight-compute-analysis skill.
     for flag in (
         "--target-processes all",
@@ -457,15 +565,38 @@ def test_reporter_carries_the_trajectory_section():
 def test_reporter_carries_the_kernel_comparison():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
     assert "Kernel-Level Comparison" in prompt
-    # Grounded in the analyzer rounds' nsys artifacts...
+    # Grounded in the analyzer rounds' nsys artifacts. The kernel table
+    # still comes from `kern_sum` — it is the only per-kernel artifact
+    # carrying call counts — but it is a sum across overlapping streams
+    # over the whole capture, so it carries the relative before/after
+    # shift and the iteration budget carries the magnitude.
     assert "cuda_gpu_kern_sum" in prompt
     assert "nsys_stats.txt" in prompt
+    assert "the only artifact carrying per-kernel call" in prompt
+    assert "never as a per-iteration magnitude" in prompt
+    assert "the budget is the one describing" in prompt
     # ...with honest provenance: what each profile covers, and no
     # fabricated "after" data when only round 1 was profiled.
     assert "which accepted items were in effect" in prompt
     assert "closing analyzer round may have profiled the final accepted state" in prompt
     assert "capture directory your driving instructions name as freshest" in prompt
     assert "no post-optimization profile exists" in prompt
+
+
+def test_reporter_lists_both_sides_of_the_iteration_budget():
+    # The comparison opens on the iteration budget "where both sides
+    # carry a nsys_analysis/" — so both sides have to be reachable. The
+    # round-level products are the *before* side; the *after* side lives
+    # under the accepted attempt's profile/, and listing only the former
+    # leaves the reporter looking for a directory it was never given.
+    prompt = _norm(REPORTER_SYSTEM_PROMPT)
+    assert "rounds/round_<n>/analysis/nsys_analysis/" in prompt
+    assert "`profile/nsys_analysis/` beside it" in prompt
+    assert "This is the **after** side of" in prompt
+    # And the budget leads the section, ahead of the kernel table.
+    assert "open the section with the iteration budget before the kernel table" in prompt
+    # Degrades rather than fabricating a one-sided budget.
+    assert "where either side lacks it, say so and compare on kernels alone" in prompt
 
 
 def test_html_companion_charts_are_self_contained():
@@ -868,6 +999,60 @@ def test_slurm_bundle_preserves_canonical_templates():
         assert flag in slurm.analyzer, flag
 
 
+def test_remote_execution_prompt_is_short_and_task_specific():
+    task = {
+        "checkpoint_path": "/models/gemma",
+        "slurm-environment": {
+            "slurm_partition": "batch",
+            "docker_image": "/images/trtllm.sqsh",
+            "cluster_ssh": "user@login",
+            "remote_run_root": "/scratch/runs/gemma-serial",
+            "account": "acct",
+            "qos": "short",
+        },
+    }
+    bundle = build_perf_optimize_prompts(
+        include_slurm_environment=True,
+        remote_execution=task,
+        campaign_name="gemma-serial",
+    )
+    for role in (
+        "benchmarker",
+        "projector",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "qa",
+    ):
+        prompt = getattr(bundle, role)
+        compact = _norm(prompt)
+        assert "SSH target: user@login" in prompt
+        assert "Remote run root: /scratch/runs/gemma-serial" in prompt
+        assert "Container image: /images/trtllm.sqsh" in prompt
+        assert "Model checkpoint: /models/gemma" in prompt
+        assert "partition=batch, account=acct, qos=short" in prompt
+        assert "configured SSH target" in compact
+        assert "For each remote Slurm job" in compact
+        assert "isolated directory under the remote run root" in compact
+        assert "excluding `.git`, builds, and caches" in compact
+        assert "changed source" in compact
+        assert "wait for Slurm to finish" in compact
+        assert "role's required outputs and failure logs" in compact
+        assert "local inspection" in compact
+        assert "remove that remote job directory" in compact
+        assert "Prefer one allocation for related work" in compact
+        assert "retry only after a concrete correction" in compact
+        assert "or when another measurement is needed" in compact
+        for removed_detail in (
+            "Treat command output as noisy",
+            "probe, control, confirmation",
+            "harness failure",
+            "only Slurm submission",
+        ):
+            assert removed_detail not in compact
+    assert "SSH target:" not in bundle.reporter
+
+
 # --------------------------------------------------------- approach restriction
 
 
@@ -925,20 +1110,125 @@ def test_kernel_coverage_note_interpolates_the_task_bars():
     block = _norm(kernel_coverage_analyzer_note(0.75, 92.0))
     assert "0.75%" in block
     assert "92.0%" in block
-    # The contract supersedes Run C's bounded top-kernel targeting.
-    assert "supersedes Run C's target selection" in block
+    # The contract supersedes Run B's bounded top-kernel targeting.
+    assert "supersedes Run B's target selection" in block
 
 
-def test_kernel_coverage_note_poses_both_questions_per_kernel():
+def test_kernel_coverage_note_poses_all_four_questions_per_kernel():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "can it be eliminated?" in block
     assert "can it be made faster?" in block
     assert "can it be fused with its neighbors?" in block
+    assert "can it be overlapped with independent work on another stream?" in block
     # Each answer is an item or an evidence-backed dismissal — recorded
     # in the schema-validated ledger, with the abort consequence named.
     assert "kernel_ledger.yaml" in block
     assert "aborts the stage" in block
     assert "disposition: item" in block
     assert "disposition: dismissed" in block
+
+
+def test_kernel_coverage_note_orders_questions_by_what_they_presuppose():
+    """Each question assumes less than the last, elimination least of all."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "ordered by how much they presuppose, each asking less than the last" in block
+    # The order is load-bearing: elimination leads because a yes moots
+    # the rest, overlap trails because it drops the alone assumption.
+    for earlier, later in (
+        (
+            "### Question 1 per kernel — can it be eliminated?",
+            "### Question 2 per kernel — can it be made faster?",
+        ),
+        (
+            "### Question 2 per kernel — can it be made faster?",
+            "### Question 3 per kernel — can it be fused with its neighbors?",
+        ),
+        (
+            "### Question 3 per kernel — can it be fused with its neighbors?",
+            "### Question 4 per kernel — can it be overlapped with independent work?",
+        ),
+    ):
+        assert block.index(earlier) < block.index(later), later
+
+
+def test_kernel_coverage_note_grounds_elimination_in_why_the_kernel_runs():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "Ask this **first**" in block
+    # It recovers the WHOLE share, unlike every other question.
+    assert "recovers the row's **whole** wall-clock share" in block
+    assert "elimination.why_it_runs" in block or "why_it_runs" in block
+    # The four shapes it hunts for.
+    for shape in ("Redundant", "Wasted", "Hoistable", "Accidental slow path"):
+        assert shape in block, shape
+    # It is the per-kernel teeth on round 1's one-shot global sweep.
+    assert "dormant-capability sweep" in block
+    # Carved cleanly against question 2 so the two do not duplicate.
+    assert '"this work does not need to happen" is *elimination*' in block
+    for tag in (
+        "mandatory-math",
+        "padding-minimal",
+        "already-hoisted",
+        "fast-path-active",
+        "fast-path-blocked",
+    ):
+        assert tag in block, tag
+    # An elimination item outranks the row's other answers; gains are not
+    # summed across a kernel this item intends to delete.
+    assert "An elimination item outranks the row's other answers" in block
+
+
+def test_kernel_coverage_note_justifies_the_overlap_question():
+    """Q4 is not redundant with Q2/Q3 — both presuppose running alone."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "Questions 2 and 3 both presuppose the kernel must run **alone**" in block
+    # A latency-bound kernel is routed to Q3, not left at "use CUDA graphs":
+    # graphs collapse the gaps BETWEEN launches, not a kernel that fails to
+    # fill the device from inside a replayed graph.
+    assert "gaps *between* launches" in block
+    assert "answered by question 4" in block
+
+
+def test_kernel_coverage_note_grounds_overlap_in_an_independent_partner():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # The partner and the evidence of today's serialization are recorded,
+    # the same discipline `fusion.neighbors` imposes for adjacency.
+    assert "overlap.concurrent_with" in block
+    assert "data-independent" in block
+    assert "disjoint output slices, disjoint step state" in block
+    # Overlap only pays when the machine is idle — two saturated kernels
+    # serialize on the shared resource whatever stream issued them.
+    assert "do not overlap into anything" in block
+    assert "binding* resource" in block
+    # Realized through the shipped idiom, not a hand-rolled stream pair.
+    assert "maybe_execute_in_parallel" in block
+    assert "AuxStreamType" in block
+    # The CUDA-graph gate is a hard precondition, not a nicety.
+    assert "with_multi_stream(True)" in block
+    assert "graph-disabled" in block
+    for tag in (
+        "no-independent-partner",
+        "resource-saturated",
+        "already-concurrent",
+        "below-materiality",
+        "phase-boundary",
+    ):
+        assert tag in block, tag
+    # Fusion and overlap are alternative spends of one adjacency.
+    assert "Never book the same saving twice" in block
+
+
+def test_kernel_coverage_note_fixes_the_materiality_unit():
+    """`share_pct` is GPU time; every gate downstream is wall clock."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "The materiality unit — wall clock, not GPU time" in block
+    assert "coverage.gpu_busy_pct" in block
+    assert "wall_clock_share = share_pct x gpu_busy_pct / 100" in block
+    # The failure mode the conversion prevents is named with its factor.
+    assert "overstates every candidate by `1 / busy`" in block
+    # And dismissals must quote the converted number, not the raw share.
+    assert "dismissal quoting a raw `share_pct` is not evidence" in block
+    # A low busy share is itself a roadmap item, not per-kernel noise.
+    assert "*is* the host-overhead opportunity" in block
 
 
 def test_kernel_coverage_note_grounds_fusion_in_observed_adjacency():
@@ -985,6 +1275,39 @@ def test_kernel_coverage_note_bounds_the_capture():
     assert "below-materiality` dismissal wearing an item costume" in block
 
 
+def test_kernel_coverage_template_never_shows_a_note_the_schema_rejects():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # `has_note` requires a non-empty string, so an empty exemplar would
+    # teach a copy-paste that the schema then rejects.
+    assert 'note: ""' not in block
+    # The template demonstrates the partial-capture shape it is teaching.
+    assert "occupancy_pct: null" in block
+    assert 'note: "occupancy section empty' in block
+
+
+def test_kernel_coverage_degrade_string_takes_bound_on_the_row():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # A collective is excluded from every ncu pass, so `bound: comm` cannot
+    # live under `ncu`; the template and the rule must agree on where it goes.
+    assert "bound: comm" in block
+    assert "on the row, beside `ncu`" in block
+    assert "on the row when `ncu` is the degrade string" in block
+
+
+def test_kernel_coverage_note_requires_marking_unmeasured_rows():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "did *not* come from an ncu capture" in block
+
+
+def test_kernel_coverage_reporter_discloses_how_much_ncu_measured():
+    block = _norm(KERNEL_COVERAGE_REPORTER_GUIDANCE)
+    # A ledger of degrade strings / null metrics is valid, so the reporter
+    # must say so — otherwise an unmeasured coverage proof renders exactly
+    # like a measured one.
+    assert "Say how much of the table ncu actually measured" in block
+    assert "must never render" in block
+
+
 def test_kernel_coverage_bundle_extends_analyzer_and_reporter_only():
     base = build_perf_optimize_prompts()
     coverage = _coverage_bundle()
@@ -1007,6 +1330,14 @@ def test_kernel_coverage_reporter_section_slots_after_kernel_comparison():
     # itemized, never buried.
     assert "pending at campaign end" in block
     assert "untried tail" in block
+    # All four questions get a column, and the busy share that makes the
+    # shares readable as wall clock is stated.
+    assert "| eliminate → | faster → | fusion → | overlap → |" in block
+    assert "coverage.gpu_busy_pct" in block
+    assert "all four questions" in block
+    # One item can span two cells (alternative realizations) or two rows
+    # (a pair) — resolved consistently, counted once.
+    assert "never count its gain twice" in block
     # Honest degrade when the final ledger is missing.
     assert "Kernel coverage ledger unavailable" in block
 
@@ -1046,3 +1377,69 @@ def test_measuring_roles_inherit_the_server_identity_checks():
         assert "port 8000 already in use" in text, f"{name} lost the port precheck"
         assert "owns_port" in text, f"{name} lost the listener-ownership check"
         assert "not owned by PID" in text, f"{name} lost the identity failure path"
+
+
+# --------------------------------------------------------------------------- #
+# Consuming the nsys timeline analysis: headroom bounds what an item may
+# claim, and the skill's opportunity list must be accounted for rather than
+# read once and paraphrased into prose.
+# --------------------------------------------------------------------------- #
+
+
+def test_analyzer_bounds_expected_gain_by_measured_headroom():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Ranking hot kernels by cost alone is how rounds get spent on kernels
+    # that were already at their roofline.
+    assert "Headroom bounds the gain, cost only ranks it" in prompt
+    assert "utilization.json" in prompt
+    assert "headroom_verdict" in prompt
+    # An at-roofline operator can still be removed — it just cannot be
+    # made faster.
+    assert "elimination or fusion" in prompt
+    # Unsampled is not zero, and a contaminated row is directional only.
+    assert "cannot carry an item by itself" in prompt
+    # Two independent verdicts on one kernel; a disagreement is reported.
+    assert "disagree for the same kernel" in prompt
+
+
+def test_analyzer_must_account_for_every_nsys_opportunity():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "Cover the nsys opportunity list" in prompt
+    assert "nsys_analysis/items.json" in prompt
+    assert "nsys_items" in prompt
+    # Deterministic teeth, not a request.
+    assert "stops the round rather than quietly evaporating" in prompt
+    # Dismissal is a first-class answer — padding the roadmap is not.
+    assert "Dismissing is a legitimate answer" in prompt
+
+
+def test_roadmap_spec_documents_the_nsys_items_block():
+    spec = _norm(ROADMAP_SPEC)
+    assert "nsys_items:" in spec
+    assert "disposition: item" in spec
+    assert "disposition: dismissed" in spec
+    # Same vocabulary as the kernel ledger, and the same reason for it.
+    assert "must name a real roadmap item id, any status" in spec
+    # Absent when the pipeline could not run; required when it did.
+    assert "omitted entirely when it does not" in spec
+    # Ids are local to the analysis that wrote them, so the block is
+    # authored fresh each round rather than carried forward — a stale row
+    # names an id this round's file does not have.
+    assert "author the block fresh from *this* round's `items.json`" in spec
+    assert "never carried forward" in spec
+
+
+def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Jitter wait surfaces inside a collective but is caused elsewhere;
+    # filing it as `communication` aims the next round at bucketing and
+    # overlap levers that cannot recover another rank's lateness.
+    assert "categorized by the work, not by where it surfaces" in prompt
+    assert "not** `communication`" in prompt
+    assert "imbalance_operator" in prompt
+    # The two verdicts produce different items, and one of them often has
+    # no in-campaign lever at all.
+    assert "`pinned` is one machine" in prompt
+    assert "often not fixable in-campaign" in prompt
+    # Bounded by the measured share, not the raw spread.
+    assert "bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread" in prompt

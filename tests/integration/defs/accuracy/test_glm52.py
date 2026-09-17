@@ -33,7 +33,13 @@ from tensorrt_llm.llmapi import (
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_blackwell, skip_ray
-from .accuracy_core import GSM8K, ForceTokenLogitsProcessor, JsonModeEval, LlmapiAccuracyTestHarness
+from .accuracy_core import (
+    GSM8K,
+    ForceTokenLogitsProcessor,
+    JsonModeEval,
+    LlmapiAccuracyTestHarness,
+    assert_acceptance_length_for_llm,
+)
 
 
 class _JsonModeGrammarEval(JsonModeEvaluator):
@@ -161,7 +167,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_tep_nvfp4kv(self, tp_size, ep_size):
-        """Exercise the GLM-5.2 NVFP4 KV cache decode path."""
+        """Exercise GLM-5.2 NVFP4 KV cache prefill and decode paths."""
         model_name = "zai-org/GLM-5.2"
         model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
         kv_cache_config = KvCacheConfig(
@@ -174,7 +180,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
             moe_config=MoeConfig(backend="CUTEDSL"),
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=True,
         )
 
         with LLM(
@@ -184,6 +190,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             kv_cache_config=kv_cache_config,
             max_seq_len=8192,
+            max_num_tokens=512,
             **pytorch_config,
         ) as llm:
             assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
@@ -437,11 +444,17 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             kv_cache_config=kv_cache_config,
             max_seq_len=8192,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
             **pytorch_config,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                "TestGLM52NVFP4::test_mtp_index_share",
+                llm,
+            )
             self._assert_mtp_acceptance_rate(llm)
 
     @staticmethod

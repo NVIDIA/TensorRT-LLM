@@ -32,7 +32,7 @@
 /tensorrt_llm/commands/eval.py @NVIDIA/trt-llm-devs
 /tensorrt_llm/evaluate @NVIDIA/trt-llm-devs
 /tensorrt_llm/tools @NVIDIA/trt-llm-devs
-/tests/integration/test_lists/test-db @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
+/tests/integration/test_lists/test-db @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-infra-devs
 # Waiver updates follow the repository's normal review requirements.
 /tests/integration/test_lists/waives.txt
 /tests/test_common @NVIDIA/trt-llm-devs
@@ -96,7 +96,8 @@
 /examples @NVIDIA/trt-llm-doc-owners
 
 # ===== QA =====
-/tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa @NVIDIA/trt-llm-infra-devs
+/tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
+/tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf @NVIDIA/trt-llm-infra-devs
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
 /tests/integration/test_lists/qa/llm_perf_* @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa/llm_function_* @NVIDIA/trt-llm-qa-function
@@ -205,7 +206,6 @@
 /tests/scripts/perf-sanity @NVIDIA/trt-llm-perf-devs
 
 # ===== KV CACHE MANAGER =====
-/cpp/include/tensorrt_llm/batch_manager/allocateKvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -213,7 +213,6 @@
 /cpp/include/tensorrt_llm/batch_manager/reorderPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/stringSetTrie* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/templatedTrie* @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/allocateKvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -398,10 +397,9 @@
 /scripts/check_auto_deploy_imports.py @NVIDIA/trt-llm-torch-autodeploy-devs
 /scripts/check_model_registry.py @NVIDIA/trt-llm-torch-autodeploy-devs
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
 /tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /tests/unittest/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
@@ -427,7 +425,6 @@
 /cpp/include/tensorrt_llm/batch_manager/kvCacheEventManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCacheTransferManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/evictionPolicy.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/allocateKvCache.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheUtilsTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -449,6 +446,7 @@
 # Last-match cross-cutting: adds disagg-devs to shared files that can silently break disagg e2e.
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/_torch/pyexecutor/disagg_adapter.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/engine/ @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 
@@ -468,7 +466,7 @@
 /3rdparty/** @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_patches/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_patches/flashinfer-prims-ts.patch @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
-/3rdparty/vendor_sources.lock.yaml @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/3rdparty/vendor_sources.lock.yaml @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /ATTRIBUTIONS-*.md @NVIDIA/trt-llm-oss-compliance
 /LICENSE @NVIDIA/trt-llm-oss-compliance
 /constraints.txt @NVIDIA/trt-llm-oss-compliance

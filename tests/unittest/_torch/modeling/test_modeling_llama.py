@@ -623,7 +623,7 @@ class TestLlama(unittest.TestCase):
                 max_num_requests=1,
                 max_draft_len=max_draft_1,
                 max_total_draft_tokens=max_draft_1,
-                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
@@ -697,7 +697,7 @@ class TestLlama(unittest.TestCase):
                 max_num_requests=1,
                 max_draft_len=max_draft_ref,
                 max_total_draft_tokens=max_draft_ref,
-                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,

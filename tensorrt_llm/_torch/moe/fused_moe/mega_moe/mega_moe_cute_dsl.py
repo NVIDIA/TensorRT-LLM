@@ -359,7 +359,7 @@ class MegaMoECuteDsl(MoEImplBase):
     # The elementwise function and its constants are codegen-time literals, so
     # only a uniform per-layer value is representable.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.SiTu}),
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.SiTu}),
         alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
     )
@@ -380,6 +380,12 @@ class MegaMoECuteDsl(MoEImplBase):
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """Check static eligibility; runtime providers and tensor values are validated later."""
+        is_minimax_swiglu_bias = (
+            p.swiglu_gptoss_style
+            and p.activation_type == ActivationType.SwigluBias
+            and p.bias is False
+            and p.activation_constants == frozenset({"alpha", "beta", "clamp"})
+        )
         if not is_sm_100f(d.env.sm):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
@@ -391,10 +397,11 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl supports activations in "
                 f"{cls._SUPPORTED_ACTIVATION_DTYPES}, got {p.dtype_act}.",
             )
-        if p.swiglu_gptoss_style:
+        if p.swiglu_gptoss_style and not is_minimax_swiglu_bias:
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "MegaMoECuteDsl does not support swiglu_gptoss_style.",
+                "MegaMoECuteDsl supports MiniMax-style SwigluBias without "
+                "expert bias, but not the GPT-OSS expert-bias package.",
             )
         if p.quant_algo != QuantAlgo.NVFP4:
             return _reject(
@@ -453,9 +460,18 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
+        # The fused kernel returns a globally combined routed output. MiniMax-M3
+        # accounts for that when composing routed and shared experts; the other
+        # current model wrappers would apply a second AllReduce under TEP.
+        if d.parallel_size > 1 and not d.use_dp and not is_minimax_swiglu_bias:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style "
+                "SwigluBias; other model compositions would reduce its already-global "
+                "routed output twice.",
+            )
         # ADP wider than EP would need an outer allgather + reducescatter
-        # wrapper that this backend does not have. Unlike MegaMoEDeepGemm, TEP
-        # itself is fine here, so only the attention-DP case is constrained.
+        # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:
             return _reject(
                 MoERejectReason.TOPOLOGY_UNSUPPORTED,
@@ -1441,8 +1457,14 @@ class MegaMoECuteDsl(MoEImplBase):
                 # The kernel clamps the post-fc1_alpha gate/up, so the model
                 # value goes in as-is -- no trtllm-gen-style div_(fc31_alpha).
                 gate_up_clamp=self.act_clamp,
-                act_alpha=self.act_alpha,
-                act_beta=self.act_beta,
+                swiglu_alpha=(
+                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                swiglu_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                act_alpha=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
+                act_beta=(self.act_beta if self.activation_type is ActivationType.SiTu else None),
                 # Keep the deterministic standalone TopkReduce until form-B
                 # has dedicated GPU correctness and performance coverage.
                 in_kernel_fc2_reduce=False,

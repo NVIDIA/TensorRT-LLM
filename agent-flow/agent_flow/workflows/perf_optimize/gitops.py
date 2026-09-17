@@ -5,60 +5,17 @@ git state commands themselves — the orchestrator commits accepted roadmap
 items and reverts rejected ones through these wrappers, so the repo's
 history stays deterministic regardless of what an agent did in its turn.
 
-All helpers shell out to ``git -C <repo> ...`` and raise
+All helpers shell out locally to ``git -C <repo> ...`` and raise
 :class:`GitOpsError` (with the captured stderr) on failure, so a broken
 repo aborts the run loudly instead of silently optimizing against an
-inconsistent tree.
-
-WHERE THE COMMAND RUNS
-----------------------
-Locally by default, which is every deployment where the checkout is on the
-same machine as the workflow. :func:`use_cluster` switches every helper to
-run over ssh instead, for the deployment where the flow runs off-cluster
-(no shared filesystem, no slurm client) and the checkout only exists on the
-cluster — see ``slurm-environment.cluster_ssh``.
-
-One switch, because :func:`_git` is the single place any git command is
-built: there is no other ``subprocess`` call in this package, so nothing can
-bypass it and quietly run against the wrong machine.
+inconsistent tree. Remote execution is a runtime boundary only: agents
+copy source snapshots to the execution host, while Git remains local.
 """
 
 from __future__ import annotations
 
-import shlex
 import subprocess
 from pathlib import Path
-
-# The ssh alias every git command is routed through, or "" for local execution.
-#
-# Module state rather than a parameter threaded through nine helpers and their
-# ten call sites: the host is a property of the *deployment*, fixed for the
-# lifetime of a run, and a per-call argument invites exactly one caller to omit
-# it — which would run `reset --hard` against a local path that either does not
-# exist or, worse, is a different checkout than the one being optimized.
-_CLUSTER_SSH = ""
-
-# BatchMode so a missing key fails immediately with a readable error instead of
-# hanging on a password prompt no one is watching. Same reasoning, same flags as
-# the service's SshRunner — duplicated rather than imported because the core must
-# not depend on the service (a test pins that direction).
-_SSH_OPTS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=20")
-
-
-def use_cluster(ssh_alias: str) -> None:
-    """Route every git command through ``ssh <alias>``, or back to local.
-
-    Called once per run, from the workflow, before any git command is issued.
-    Passing ``""`` restores local execution — which is what the tests rely on, so
-    a test that sets a host cannot leak it into the next one.
-    """
-    global _CLUSTER_SSH
-    _CLUSTER_SSH = (ssh_alias or "").strip()
-
-
-def cluster_ssh() -> str:
-    """The ssh alias git commands are routed through, or ``""`` when local."""
-    return _CLUSTER_SSH
 
 
 class GitOpsError(RuntimeError):
@@ -66,28 +23,12 @@ class GitOpsError(RuntimeError):
 
 
 def _git(repo: str | Path, *args: str) -> str:
-    """Run ``git -C repo *args`` and return stripped stdout.
-
-    The only place a git command is constructed or run in this package, which is
-    what makes :func:`use_cluster` a complete switch rather than a partial one.
-    """
-    git_cmd = ["git", "-C", str(repo), *args]
-    if _CLUSTER_SSH:
-        # `shlex.join` on the remote side: the whole git command becomes ONE
-        # argument to ssh, so ssh's own shell does not re-split a commit message
-        # or a path containing spaces. Passing the argv through unquoted is the
-        # classic way this breaks, and it breaks on the commit message rather
-        # than on anything a test would notice.
-        cmd = ["ssh", *_SSH_OPTS, _CLUSTER_SSH, shlex.join(git_cmd)]
-    else:
-        cmd = git_cmd
+    """Run ``git -C repo *args`` locally and return stripped stdout."""
+    cmd = ["git", "-C", str(repo), *args]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        # The rendered command names the host when remote, so a reader who copies
-        # it lands where it actually ran. Reproducing a remote failure locally
-        # gives a different answer, which is worse than not reproducing it.
         raise GitOpsError(
-            f"`{shlex.join(cmd)}` failed with exit code {result.returncode}: "
+            f"`{' '.join(cmd)}` failed with exit code {result.returncode}: "
             f"{result.stderr.strip() or result.stdout.strip()}"
         )
     return result.stdout.strip()
