@@ -35,11 +35,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SOURCE_ROOT = REPO_ROOT / "tests" / "integration" / "defs"
-RULES_FILE = "tests/qa_selection/rules.json"
 
-sys.path.insert(0, str(REPO_ROOT / "tests"))
+class RepoPaths:
+    """Where this check's inputs live in the checkout.
+
+    `qa_selection` is imported from the working tree rather than an installed
+    wheel, so the check runs at commit time with nothing built.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    PACKAGE_ROOT = ROOT / "tests"
+    SKIP_DECORATORS = ROOT / "tests" / "integration" / "defs"
+
+    # Named in every message, so it stays repo-relative and pasteable.
+    RULES_FILE = "tests/qa_selection/rules.json"
+
+    @classmethod
+    def enable_package_import(cls) -> None:
+        """Put the checkout's `tests/` on the import path."""
+        path = str(cls.PACKAGE_ROOT)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+RepoPaths.enable_package_import()
+
 from qa_selection.rules import SkipRule, SkipRuleTable, default_rule_table  # noqa: E402
 
 
@@ -141,7 +161,7 @@ class RuleFaults:
         report: List[str] = []
         if self:
             report += [
-                f"{RULES_FILE} is out of date with the skip decorators.",
+                f"{RepoPaths.RULES_FILE} is out of date with the skip decorators.",
                 "This is drift, not a test regression: a rule that no longer mirrors a",
                 "live decorator matches nothing, so its tests ship to every machine and",
                 "skip on the node.",
@@ -258,7 +278,7 @@ class RuleTableDriftCheck:
             f"{len(uncurated)} decorator(s) with no rule (reported, not an error).",
             "The table is curated, not an inventory: these are kept for every machine",
             "and reported as an unknown reason at selection time. Add a rule to",
-            f"{RULES_FILE} if the target machine can decide one:",
+            f"{RepoPaths.RULES_FILE} if the target machine can decide one:",
         ]
         report += [
             f"  {self.scanner.named[name].location}\n    reason={self.scanner.named[name].reason!r}"
@@ -272,7 +292,7 @@ def main(argv: List[str] = None) -> int:
     parser.add_argument(
         "--source-root",
         type=Path,
-        default=DEFAULT_SOURCE_ROOT,
+        default=RepoPaths.SKIP_DECORATORS,
         help="directory scanned for skip decorators (default: %(default)s)",
     )
     args = parser.parse_args(argv)
