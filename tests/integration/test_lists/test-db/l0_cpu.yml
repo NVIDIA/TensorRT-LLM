@@ -45,6 +45,8 @@ l0_cpu:
   - unittest/_torch/memory
   - unittest/_torch/modeling
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -132,6 +134,7 @@ l0_cpu:
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_mx_args.py
+  - unittest/llmapi/test_custom_tokenizer_aliases.py
   - unittest/llmapi/test_llm_quant.py
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py

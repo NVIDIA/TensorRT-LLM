@@ -47,7 +47,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_load_balance_weight` | `float` | `value` |  |
 | `attention_dp_config.kv_cache_routing_match_rate_threshold` | `float` | `value` |  |
 | `attention_dp_config.kv_cache_routing_max_sessions` | `int` | `value` |  |
-| `attention_dp_config.kv_cache_routing_new_conv_placement` | `literal` | `categorical` | `round_robin`, `least_queued` |
+| `attention_dp_config.kv_cache_routing_new_conv_placement` | `literal` | `categorical` | `round_robin`, `least_queued`, `least_tokens` |
 | `attention_dp_config.timeout_iters` | `int` | `value` |  |
 | `attn_backend` | `allowlist` | `categorical` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
 | `backend` | `literal` | `categorical` | `pytorch` |

@@ -53,6 +53,8 @@ struct Nvfp4ColdPageKernelParams
     std::int32_t numKvHeads;
     std::int32_t tokensPerPage;
     std::int32_t headDim;
+    std::int32_t rawRowStrideElements;
+    std::int32_t losslessSuffixBytesPerRow;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -103,12 +105,12 @@ Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPag
             = {static_cast<std::int64_t>(buffer.rawBase), static_cast<std::int64_t>(buffer.rawSlotBytes),
                 static_cast<std::int64_t>(buffer.rawBytes), static_cast<std::int64_t>(buffer.coldDataOffset),
                 static_cast<std::int64_t>(buffer.coldScaleOffset), static_cast<std::int64_t>(buffer.coldPaddingOffset)};
-        metadata.integers[index]
-            = {static_cast<std::int32_t>(buffer.coldPaddingBytes), static_cast<std::int32_t>(buffer.transform),
-                buffer.params.numKvHeads, buffer.params.tokensPerPage, buffer.params.headDim};
+        metadata.integers[index] = {static_cast<std::int32_t>(buffer.coldPaddingBytes),
+            static_cast<std::int32_t>(buffer.transform), buffer.params.numKvHeads, buffer.params.tokensPerPage,
+            buffer.params.headDim, buffer.params.rawRowStrideElements, buffer.params.losslessSuffixBytesPerRow};
         metadata.scales[index] = {buffer.params.nvfp4ScaleOrigQuant, buffer.params.nvfp4ScaleQuantOrig,
             buffer.params.fp8ScaleOrigQuant, buffer.params.fp8ScaleQuantOrig};
-        if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4)
+        if (buffer.transform != Nvfp4ColdPageTransform::kLosslessCopy)
         {
             auto const halfGroups = static_cast<std::uint32_t>(buffer.params.numKvHeads)
                 * static_cast<std::uint32_t>(buffer.params.tokensPerPage)
@@ -156,7 +158,11 @@ constexpr PageGeometry kTiledLinearScaleTailGeometry{1, 4097, 16};
 constexpr PageGeometry kCrossRowTileGeometry{1, 343, 48};
 constexpr PageGeometry kLargeHeadDimTailGeometry{1, 1, 65552};
 constexpr PageGeometry kModelLikeGeometry{8, 64, 128};
+constexpr PageGeometry kDeepseekV4NopeGeometry{1, 32, 448};
+constexpr PageGeometry kDeepseekV4LargeNopeGeometry{1, 64, 448};
+constexpr std::int32_t kDeepseekV4RowElements = 512;
 constexpr std::array<std::int32_t, 5> kValidTokenCounts{1, 16, 17, 63, 64};
+constexpr std::array<std::int32_t, 4> kDeepseekV4ValidTokenCounts{1, 16, 17, 31};
 
 enum class RawKind
 {
@@ -206,7 +212,8 @@ private:
     cudaStream_t mStream{};
 };
 
-//! Device allocation guarded by canaries to catch descriptor or vector-tail out-of-bounds writes.
+//! Device allocation guarded by canaries to catch descriptor or vector-tail
+// out-of-bounds writes.
 class DeviceRegion
 {
 public:
@@ -365,6 +372,7 @@ Nvfp4ColdPageKernelParams makeParams(PageGeometry const& geometry = kDefaultGeom
     params.numKvHeads = geometry.numHeads;
     params.tokensPerPage = geometry.tokensPerPage;
     params.headDim = geometry.headDim;
+    params.rawRowStrideElements = geometry.headDim;
     params.nvfp4ScaleOrigQuant = role == 0U ? 1.0F : 2.0F;
     params.nvfp4ScaleQuantOrig = role == 0U ? 1.0F : 0.5F;
     params.fp8ScaleOrigQuant = role == 0U ? 2.0F : 4.0F;
@@ -434,7 +442,8 @@ float e2m1Value(std::uint8_t nibble)
     return (nibble & 0x8U) != 0 ? -value : value;
 }
 
-//! Independent nearest-level oracle; fixtures avoid ties instead of duplicating production tie rules.
+//! Independent nearest-level oracle; fixtures avoid ties instead of duplicating
+// production tie rules.
 std::uint8_t quantizeE2m1(float value)
 {
     bool const negative = std::signbit(value);
@@ -453,7 +462,8 @@ std::uint8_t quantizeE2m1(float value)
     return static_cast<std::uint8_t>(best | (negative ? 0x8U : 0U));
 }
 
-//! Exactly representable E2M1 values and E4M3 scales keep byte comparisons deterministic.
+//! Exactly representable E2M1 values and E4M3 scales keep byte comparisons
+// deterministic.
 std::vector<std::uint8_t> makeRawPage(RawKind kind, std::size_t page, std::uint32_t role,
     Nvfp4ColdPageKernelParams const& params, PageGeometry const& geometry, InputPattern inputPattern)
 {
@@ -563,6 +573,75 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
     return raw;
 }
 
+std::vector<std::uint8_t> extractRowSpan(std::vector<std::uint8_t> const& bytes, RawKind kind, std::size_t rows,
+    std::size_t rowElements, std::size_t firstElement, std::size_t spanElements)
+{
+    std::size_t const elementBytes = rawElementBytes(kind);
+    std::size_t const sourceRowBytes = rowElements * elementBytes;
+    std::size_t const spanBytes = spanElements * elementBytes;
+    std::vector<std::uint8_t> result(rows * spanBytes);
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        std::memcpy(result.data() + row * spanBytes, bytes.data() + row * sourceRowBytes + firstElement * elementBytes,
+            spanBytes);
+    }
+    return result;
+}
+
+void replaceRowSpan(std::vector<std::uint8_t>& destination, RawKind kind, std::size_t rows, std::size_t rowElements,
+    std::size_t firstElement, std::size_t spanElements, std::vector<std::uint8_t> const& source)
+{
+    std::size_t const elementBytes = rawElementBytes(kind);
+    std::size_t const destinationRowBytes = rowElements * elementBytes;
+    std::size_t const spanBytes = spanElements * elementBytes;
+    ASSERT_EQ(source.size(), rows * spanBytes);
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        std::memcpy(destination.data() + row * destinationRowBytes + firstElement * elementBytes,
+            source.data() + row * spanBytes, spanBytes);
+    }
+}
+
+std::vector<std::uint8_t> makeDeepseekV4RawPage(RawKind kind, std::size_t page, std::int32_t validTokens,
+    bool zeroInactiveRows, Nvfp4ColdPageKernelParams const& params,
+    PageGeometry const& geometry = kDeepseekV4NopeGeometry)
+{
+    std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
+    std::size_t const elementBytes = rawElementBytes(kind);
+    std::size_t const rowBytes = static_cast<std::size_t>(kDeepseekV4RowElements) * elementBytes;
+    std::size_t const nopeRowBytes = static_cast<std::size_t>(geometry.headDim) * elementBytes;
+    std::size_t const ropeRowBytes = rowBytes - nopeRowBytes;
+    auto const activeNope = makeRawPage(kind, page, 0U, params, geometry, InputPattern::kDense);
+    auto const inactiveNope = makeRawPage(kind, page + 32U, 0U, params, geometry, InputPattern::kDense);
+    std::vector<std::uint8_t> raw(rows * rowBytes);
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        bool const active = static_cast<std::int32_t>(row % geometry.tokensPerPage) < validTokens;
+        if (active || !zeroInactiveRows)
+        {
+            auto const& nope = active ? activeNope : inactiveNope;
+            std::memcpy(raw.data() + row * rowBytes, nope.data() + row * nopeRowBytes, nopeRowBytes);
+            for (std::size_t byte = 0; byte < ropeRowBytes; ++byte)
+            {
+                raw[row * rowBytes + nopeRowBytes + byte]
+                    = static_cast<std::uint8_t>((37U * row + 19U * byte + 11U * page + (active ? 5U : 131U)) & 0xFFU);
+            }
+        }
+    }
+    return raw;
+}
+
+std::vector<std::uint8_t> deepseekV4ExpectedRoundTrip(std::vector<std::uint8_t> const& raw, RawKind kind,
+    ReferenceNvfp4 const& reference, Nvfp4ColdPageKernelParams const& params,
+    PageGeometry const& geometry = kDeepseekV4NopeGeometry)
+{
+    std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
+    auto expected = raw;
+    replaceRowSpan(expected, kind, rows, kDeepseekV4RowElements, 0U, geometry.headDim,
+        decompressReference(reference, kind, params, geometry));
+    return expected;
+}
+
 void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultGeometry,
     std::size_t numPages = kDefaultNumPages, InputPattern inputPattern = InputPattern::kDense,
     bool synchronizeBetweenDirections = true, bool repeatRoundTrip = false, std::size_t coldBaseOffset = 0)
@@ -575,7 +654,8 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     std::array<Nvfp4ColdPageKernelParams, 2> const params{makeParams(geometry, 0U), makeParams(geometry, 1U)};
     CudaStream stream;
     std::size_t const rawSlotBytes = rawBytes(kind, geometry);
-    // Align compact Slot strides while independently testing an arbitrary staging-base offset.
+    // Align compact Slot strides while independently testing an arbitrary
+    // staging-base offset.
     std::size_t const compactSlotBytes = roundUp(2U * (packedBytes(geometry) + scaleBytes(geometry)), alignof(uint4));
     // Use alternate Slots to cover non-contiguous KVCM Page indices.
     std::size_t const slotCapacity = 2U * numPages;
@@ -659,7 +739,8 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         std::size_t const compactPayloadBytes = 2U * (packedBytes(geometry) + scaleBytes(geometry));
         if (compactPayloadBytes != compactSlotBytes)
         {
-            // Re-encode poisoned recycled Slots to verify deterministic payload and padding bytes.
+            // Re-encode poisoned recycled Slots to verify deterministic payload and
+            // padding bytes.
             auto const firstSerialization = compactPages.payload();
             for (std::size_t page = 0; page < numPages; ++page)
             {
@@ -697,7 +778,8 @@ void runColdPageRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
 
     if (repeatRoundTrip)
     {
-        // A second lossy round trip catches stale descriptors and validates Q(D(Q(D(Q(x))))).
+        // A second lossy round trip catches stale descriptors and validates
+        // Q(D(Q(D(Q(x))))).
         for (std::size_t page = 0; page < numPages; ++page)
         {
             for (std::uint32_t role = 0; role < 2; ++role)
@@ -744,13 +826,15 @@ std::vector<std::uint8_t> makePartialRawPage(RawKind kind, std::int32_t validTok
                 float value = 0.0F;
                 if (token < validTokens)
                 {
-                    // Zero-tail and stale-tail fixtures share valid rows with distinct K/V values and scales.
+                    // Zero-tail and stale-tail fixtures share valid rows with distinct
+                    // K/V values and scales.
                     value = static_cast<float>((dim % 13) - 6) * 0.125F + static_cast<float>(head) * 0.03125F
                         + static_cast<float>(token) * 0.0078125F + static_cast<float>(role) * 0.0625F;
                 }
                 else if (!zeroTail)
                 {
-                    // Poison inactive rows; 16-value groups stay within a token row and cannot affect the prefix.
+                    // Poison inactive rows; 16-value groups stay within a token row and
+                    // cannot affect the prefix.
                     if (dim % 31 == 0)
                     {
                         value = std::numeric_limits<float>::quiet_NaN();
@@ -881,6 +965,209 @@ void runPartialPageTailIsolation(RawKind kind)
     compactPages.expectCanaries();
 }
 
+void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = kDeepseekV4NopeGeometry,
+    float nvfp4ScaleOrigQuant = 1.0F, float nvfp4ScaleQuantOrig = 1.0F)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (!tensorrt_llm::common::isSM100Family())
+    {
+        GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
+    }
+
+    std::size_t constexpr numPages = 2U;
+    std::size_t constexpr slotCapacity = 8U;
+    std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
+    std::size_t const ropeElements = kDeepseekV4RowElements - geometry.headDim;
+    auto params = makeParams(geometry);
+    params.rawRowStrideElements = kDeepseekV4RowElements;
+    params.losslessSuffixBytesPerRow = static_cast<std::int32_t>(ropeElements * rawElementBytes(kind));
+    params.nvfp4ScaleOrigQuant = nvfp4ScaleOrigQuant;
+    params.nvfp4ScaleQuantOrig = nvfp4ScaleQuantOrig;
+    params.fp8ScaleOrigQuant = 1.0F;
+    params.fp8ScaleQuantOrig = 1.0F;
+    std::size_t const rawPageBytes = rows * kDeepseekV4RowElements * rawElementBytes(kind);
+    std::size_t const rawSlotBytes = rawPageBytes + 32U;
+    std::size_t const packed = packedBytes(geometry);
+    std::size_t const scales = scaleBytes(geometry);
+    std::size_t const suffix = rows * ropeElements * rawElementBytes(kind);
+    std::size_t const payloadBytes = packed + scales + suffix;
+    std::size_t const coldPageBytes = roundUp(payloadBytes, alignof(uint4));
+    std::uint32_t const paddingBytes = static_cast<std::uint32_t>(coldPageBytes - payloadBytes);
+
+    DeviceRegion rawInput(slotCapacity * rawSlotBytes);
+    DeviceRegion rawOutput(slotCapacity * rawSlotBytes);
+    MappedHostRegion coldStorage(slotCapacity * coldPageBytes);
+    std::array<std::int32_t, numPages> constexpr inputSlots{2, 7};
+    std::array<std::int32_t, numPages> constexpr coldSlots{5, 1};
+    std::array<std::int32_t, numPages> constexpr outputSlots{6, 0};
+    std::array<std::vector<std::uint8_t>, numPages> rawHost;
+    std::array<ReferenceNvfp4, numPages> references;
+    std::vector<PageIndexPair> offloadTasks;
+    std::vector<PageIndexPair> onboardTasks;
+    for (std::size_t page = 0; page < numPages; ++page)
+    {
+        rawHost[page] = makeDeepseekV4RawPage(kind, page, geometry.tokensPerPage, true, params, geometry);
+        auto const nope = extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements, 0U, geometry.headDim);
+        references[page] = compressReference(nope, kind, params, geometry);
+        rawInput.copyFrom(static_cast<std::size_t>(inputSlots[page]) * rawSlotBytes, rawHost[page]);
+        offloadTasks.push_back({coldSlots[page], inputSlots[page]});
+        onboardTasks.push_back({outputSlots[page], coldSlots[page]});
+    }
+
+    auto const makeMetadata = [&](DeviceRegion const& raw)
+    {
+        std::vector<Nvfp4ColdPageTestBuffer> const buffers{{reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes,
+            rawPageBytes, 0U, packed, payloadBytes, paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params}};
+        return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
+    };
+    auto const inputMetadata = makeMetadata(rawInput);
+    auto const outputMetadata = makeMetadata(rawOutput);
+    CudaStream stream;
+    invokeNvfp4ColdPageEncode(offloadTasks.data(), offloadTasks.size(), inputMetadata, coldStorage.data(), stream);
+    invokeNvfp4ColdPageDecode(onboardTasks.data(), onboardTasks.size(), outputMetadata, coldStorage.data(), stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    auto const cold = coldStorage.payload();
+    auto const coldRegion = [&](std::size_t slot, std::size_t offset, std::size_t bytes)
+    {
+        std::size_t const begin = slot * coldPageBytes + offset;
+        return std::vector<std::uint8_t>(cold.begin() + static_cast<std::ptrdiff_t>(begin),
+            cold.begin() + static_cast<std::ptrdiff_t>(begin + bytes));
+    };
+    for (std::size_t page = 0; page < numPages; ++page)
+    {
+        std::size_t const coldSlot = static_cast<std::size_t>(coldSlots[page]);
+        EXPECT_EQ(coldRegion(coldSlot, 0U, packed), references[page].packed);
+        EXPECT_EQ(coldRegion(coldSlot, packed, scales), references[page].scales);
+        EXPECT_EQ(coldRegion(coldSlot, packed + scales, suffix),
+            extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements, geometry.headDim, ropeElements));
+        auto const padding = coldRegion(coldSlot, payloadBytes, paddingBytes);
+        EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0U; }));
+
+        auto const restored
+            = rawOutput.copyToHost(static_cast<std::size_t>(outputSlots[page]) * rawSlotBytes, rawPageBytes);
+        EXPECT_EQ(restored, deepseekV4ExpectedRoundTrip(rawHost[page], kind, references[page], params, geometry));
+        for (auto const* raw : {&rawInput, &rawOutput})
+        {
+            auto const slot = raw == &rawInput ? inputSlots[page] : outputSlots[page];
+            auto const tail = raw->copyToHost(
+                static_cast<std::size_t>(slot) * rawSlotBytes + rawPageBytes, rawSlotBytes - rawPageBytes);
+            EXPECT_TRUE(std::all_of(tail.begin(), tail.end(), [](std::uint8_t value) { return value == kCanary; }));
+        }
+    }
+    for (std::size_t slot = 0; slot < slotCapacity; ++slot)
+    {
+        if (std::find(coldSlots.begin(), coldSlots.end(), static_cast<std::int32_t>(slot)) == coldSlots.end())
+        {
+            auto const unused = coldRegion(slot, 0U, coldPageBytes);
+            EXPECT_TRUE(std::all_of(unused.begin(), unused.end(), [](std::uint8_t value) { return value == kCanary; }));
+        }
+        if (std::find(outputSlots.begin(), outputSlots.end(), static_cast<std::int32_t>(slot)) == outputSlots.end())
+        {
+            auto const unused = rawOutput.copyToHost(slot * rawSlotBytes, rawSlotBytes);
+            EXPECT_TRUE(std::all_of(unused.begin(), unused.end(), [](std::uint8_t value) { return value == kCanary; }));
+        }
+    }
+    rawInput.expectCanaries();
+    rawOutput.expectCanaries();
+    coldStorage.expectCanaries();
+}
+
+void runDeepseekV4PartialPageTailIsolation(RawKind kind)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (!tensorrt_llm::common::isSM100Family())
+    {
+        GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
+    }
+
+    std::size_t constexpr variantsPerCount = 2U;
+    std::size_t constexpr rows
+        = static_cast<std::size_t>(kDeepseekV4NopeGeometry.numHeads * kDeepseekV4NopeGeometry.tokensPerPage);
+    std::size_t constexpr ropeElements = kDeepseekV4RowElements - kDeepseekV4NopeGeometry.headDim;
+    std::size_t constexpr numPages = variantsPerCount * kDeepseekV4ValidTokenCounts.size();
+    auto params = makeParams(kDeepseekV4NopeGeometry);
+    params.rawRowStrideElements = kDeepseekV4RowElements;
+    params.losslessSuffixBytesPerRow = static_cast<std::int32_t>(ropeElements * rawElementBytes(kind));
+    params.fp8ScaleOrigQuant = 1.0F;
+    params.fp8ScaleQuantOrig = 1.0F;
+    std::size_t const elementBytes = rawElementBytes(kind);
+    std::size_t const rawPageBytes = rows * kDeepseekV4RowElements * elementBytes;
+    std::size_t const rawSlotBytes = rawPageBytes + 32U;
+    std::size_t const packed = packedBytes(kDeepseekV4NopeGeometry);
+    std::size_t const scales = scaleBytes(kDeepseekV4NopeGeometry);
+    std::size_t const suffix = rows * ropeElements * elementBytes;
+    std::size_t const coldPageBytes = roundUp(packed + scales + suffix, alignof(uint4));
+
+    DeviceRegion rawInput(numPages * rawSlotBytes);
+    DeviceRegion rawOutput(numPages * rawSlotBytes);
+    MappedHostRegion coldStorage(numPages * coldPageBytes);
+    std::array<std::vector<std::uint8_t>, numPages> rawHost;
+    std::vector<PageIndexPair> pages;
+    pages.reserve(numPages);
+    for (std::size_t page = 0; page < numPages; ++page)
+    {
+        std::size_t const pair = page / variantsPerCount;
+        rawHost[page] = makeDeepseekV4RawPage(
+            kind, pair, kDeepseekV4ValidTokenCounts[pair], page % variantsPerCount == 0U, params);
+        rawInput.copyFrom(page * rawSlotBytes, rawHost[page]);
+        auto const pageIndex = static_cast<std::int32_t>(page);
+        pages.push_back({pageIndex, pageIndex});
+    }
+
+    auto const makeMetadata = [&](DeviceRegion const& raw)
+    {
+        std::size_t const payloadBytes = packed + scales + suffix;
+        std::vector<Nvfp4ColdPageTestBuffer> const buffers{
+            {reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes, rawPageBytes, 0U, packed, payloadBytes,
+                static_cast<std::uint32_t>(coldPageBytes - payloadBytes), Nvfp4ColdPageTransform::kNvfp4, params}};
+        return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
+    };
+    auto const inputMetadata = makeMetadata(rawInput);
+    auto const outputMetadata = makeMetadata(rawOutput);
+    CudaStream stream;
+    invokeNvfp4ColdPageEncode(pages.data(), pages.size(), inputMetadata, coldStorage.data(), stream);
+    invokeNvfp4ColdPageDecode(pages.data(), pages.size(), outputMetadata, coldStorage.data(), stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::size_t const rawRowBytes = static_cast<std::size_t>(kDeepseekV4RowElements) * elementBytes;
+    std::size_t const nopeRowBytes = static_cast<std::size_t>(kDeepseekV4NopeGeometry.headDim) * elementBytes;
+    for (std::size_t pair = 0; pair < kDeepseekV4ValidTokenCounts.size(); ++pair)
+    {
+        std::size_t const zeroPage = variantsPerCount * pair;
+        std::size_t const stalePage = zeroPage + 1U;
+        auto const zeroOutput = rawOutput.copyToHost(zeroPage * rawSlotBytes, rawPageBytes);
+        auto const staleOutput = rawOutput.copyToHost(stalePage * rawSlotBytes, rawPageBytes);
+        std::int32_t const validTokens = kDeepseekV4ValidTokenCounts[pair];
+        for (std::int32_t token = 0; token < validTokens; ++token)
+        {
+            std::size_t const offset = static_cast<std::size_t>(token) * rawRowBytes;
+            EXPECT_EQ(std::memcmp(zeroOutput.data() + offset, staleOutput.data() + offset, nopeRowBytes), 0)
+                << "valid NoPE row differs at token=" << token;
+        }
+        for (std::int32_t token = validTokens; token < kDeepseekV4NopeGeometry.tokensPerPage; ++token)
+        {
+            std::size_t const offset = static_cast<std::size_t>(token) * rawRowBytes;
+            EXPECT_TRUE(std::all_of(zeroOutput.begin() + static_cast<std::ptrdiff_t>(offset),
+                zeroOutput.begin() + static_cast<std::ptrdiff_t>(offset + nopeRowBytes),
+                [](std::uint8_t value) { return value == 0U; }));
+        }
+        for (auto const page : {zeroPage, stalePage})
+        {
+            auto const output = rawOutput.copyToHost(page * rawSlotBytes, rawPageBytes);
+            EXPECT_EQ(extractRowSpan(
+                          output, kind, rows, kDeepseekV4RowElements, kDeepseekV4NopeGeometry.headDim, ropeElements),
+                extractRowSpan(
+                    rawHost[page], kind, rows, kDeepseekV4RowElements, kDeepseekV4NopeGeometry.headDim, ropeElements));
+            auto const tail = rawOutput.copyToHost(page * rawSlotBytes + rawPageBytes, rawSlotBytes - rawPageBytes);
+            EXPECT_TRUE(std::all_of(tail.begin(), tail.end(), [](std::uint8_t value) { return value == kCanary; }));
+        }
+    }
+    rawInput.expectCanaries();
+    rawOutput.expectCanaries();
+    coldStorage.expectCanaries();
+}
+
 struct RoundTripCase
 {
     char const* name;
@@ -951,6 +1238,28 @@ std::string roundTripCaseName(testing::TestParamInfo<RoundTripCase> const& info)
 }
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, Nvfp4ColdPageRoundTripTest, testing::ValuesIn(kRoundTripCases), roundTripCaseName);
+
+class Nvfp4ColdPageDeepseekV4Test : public testing::TestWithParam<RawKind>
+{
+};
+
+TEST_P(Nvfp4ColdPageDeepseekV4Test, QuantizesNopeAndPreservesRopeAcrossNonContiguousPages)
+{
+    runDeepseekV4StridedRoundTrip(GetParam());
+}
+
+TEST_P(Nvfp4ColdPageDeepseekV4Test, ProductionPage256UsesNonUnitGlobalScale)
+{
+    runDeepseekV4StridedRoundTrip(GetParam(), kDeepseekV4LargeNopeGeometry, 2.0F, 0.5F);
+}
+
+TEST_P(Nvfp4ColdPageDeepseekV4Test, PartialPhysicalPageTailDoesNotAffectValidNopeRows)
+{
+    runDeepseekV4PartialPageTailIsolation(GetParam());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Bfloat16AndFp8, Nvfp4ColdPageDeepseekV4Test, testing::Values(RawKind::kBfloat16, RawKind::kFp8));
 
 void runUnaryMlaWithLosslessSideRoundTrip(RawKind kind)
 {
@@ -1094,7 +1403,8 @@ TEST(Nvfp4ColdPageWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
     std::array<std::array<Nvfp4ColdPageKernelParams, 2>, numLayers> params{
         std::array{makeParams(geometry, 0U), makeParams(geometry, 1U)},
         std::array{makeParams(geometry, 0U), makeParams(geometry, 1U)}};
-    // Distinct per-layer K/V scales verify blockIdx.y selects immutable launch metadata.
+    // Distinct per-layer K/V scales verify blockIdx.y selects immutable launch
+    // metadata.
     params[1][0].nvfp4ScaleOrigQuant = 0.5F;
     params[1][0].nvfp4ScaleQuantOrig = 2.0F;
     params[1][1].nvfp4ScaleOrigQuant = 4.0F;
