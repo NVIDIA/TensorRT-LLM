@@ -16,9 +16,9 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig)
+from ..autotuner import (AutoTuner, ConstraintSpec, CuteDSLTunableRunner,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig)
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
@@ -31,9 +31,13 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      infer_output_m_shape, is_gated_activation,
                      last_positive_power_of_2, mxfp8_scale_infer_shape,
                      next_positive_power_of_2)
-from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
-                                        nvmmh_enabled_for_nvfp4, nvmmh_fields,
-                                        nvmmh_max_tactics, rank_configs)
+from .cutedsl_matmul_heuristics import (
+    BF16_FP32_OUTPUT_PRECISION, BF16_LAYOUT, BF16_PRECISION,
+    FP8_BF16_OUTPUT_PRECISION, FP8_FP16_OUTPUT_PRECISION, FP8_LAYOUT,
+    IN_PLACE_SPLIT_K_KIND, IS_NVMMH_AVAILABLE, NVFP4_LAYOUT, NVFP4_PRECISION,
+    cute_raster_to_nvmmh_cta_order, expand_bf16_tactics_with_heuristic_splits,
+    filter_bf16_tactics, filter_fp8_tactics, is_sm107_nvmmh_split_k_eligible,
+    nvmmh_cta_order_to_cute_raster, rank_configs)
 
 try:
     from cuda.bindings import driver as cuda
@@ -107,6 +111,24 @@ def _kimi_k3_mxfp8_tuning_bucket(num_tokens: int) -> int:
     if num_tokens <= 192:
         return next(m for m in _KIMI_K3_MXFP8_TUNING_BUCKETS if num_tokens <= m)
     return next_positive_power_of_2(num_tokens)
+
+_CUTEDSL_NVMMH_TACTIC_SEARCH_CACHE_VERSION = "cutedsl-nvmmh-v1"
+
+
+def _cutedsl_nvmmh_tactic_search_cache_key():
+    """Return the cache discriminator for NVMMH-aware tactic generation."""
+    config = AutoTuner.get().nvmmh_config
+    if not config.enabled or not config.fields or not IS_NVMMH_AVAILABLE:
+        # These paths preserve the pre-NVMMH candidate list, so policy details
+        # cannot affect tactic search or fragment its cache identity.
+        return None
+    return (
+        _CUTEDSL_NVMMH_TACTIC_SEARCH_CACHE_VERSION,
+        bool(config.enabled),
+        bool(IS_NVMMH_AVAILABLE),
+        tuple(sorted(config.fields)),
+        int(config.max_tactics),
+    )
 
 
 def _with_input_cuda_device(function):
@@ -609,7 +631,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 1, max_active // 2)
         return max_active
 
-    class CuteDSLNVFP4BlackwellRunner(TunableRunner):
+    class CuteDSLNVFP4BlackwellRunner(CuteDSLTunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
@@ -644,6 +666,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tuple(self.group) if self.group is not None else None,
                 self.use_tvm_ffi,
             )
+
+        def tactic_search_cache_key(self):
+            return _cutedsl_nvmmh_tactic_search_cache_key()
 
         def __hash__(self):
             return hash(self.unique_id())
@@ -783,9 +808,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             logger.debug(
                 f"CuteDSL: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
             )
-            # Optionally rank/prune the sweep with nvMatmulHeuristics (opt-in via
-            # TRTLLM_CUTEDSL_NVMMH_ENABLE). Returns the full sweep unchanged when
-            # disabled, unconfigured, or on any failure.
+            # Optionally rank/prune the sweep with nvMatmulHeuristics. Returns
+            # the full sweep unchanged when disabled, unconfigured, unavailable,
+            # or on any failure.
             return self._rank_prune_tactics(valid_tactics, m, n, real_k)
 
         def _swap_ab_candidates(self, m, n):
@@ -905,28 +930,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             Called at the end of get_valid_tactics. A strict, re-validated subset
             of ``tactics`` -- it never introduces a (tile, cluster, swap) the
-            kernel validator rejected. Gated by TRTLLM_CUTEDSL_NVMMH_ENABLE;
-            TRTLLM_CUTEDSL_NVMMH_FIELDS selects the model-driven knobs. When
-            "tile"/"cluster" is selected we keep only the top
-            TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS ranked (mma_tiler, cluster, swap)
-            keys (all matching prefetch variants retained); when only scheduler
-            knobs (swizzle / cta_order) are selected we sweep every tile/cluster
-            and just annotate it with the model's swizzle / raster (a safe
-            6-tuple extension -- they do not affect can_implement). Deterministic
-            swap_ab selection (small M swaps) is applied here, in the opt-in path
-            only.
+            kernel validator rejected. The AutoTuner NVMMH policy selects the
+            model-driven knobs and maximum number of ranked signatures. When
+            "tile"/"cluster" is selected we retain the top ranked
+            (mma_tiler, cluster, swap) keys (all matching prefetch variants);
+            when only scheduler knobs (swizzle / cta_order) are selected we
+            sweep every tile/cluster and annotate it with the model's swizzle /
+            raster (a safe 6-tuple extension -- they do not affect
+            can_implement). Deterministic swap_ab selection (small M swaps) is
+            applied here, in the opt-in path only.
 
             Purely additive: on any failure, an empty match, or when heuristics
             are disabled / unconfigured, returns ``tactics`` unchanged so
             profiling never loses a valid candidate.
             """
-            if not nvmmh_enabled_for_nvfp4() or not tactics:
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if (not nvmmh_config.enabled or not IS_NVMMH_AVAILABLE
+                    or not tactics):
                 return tactics
-            fields = nvmmh_fields()
+            fields = set(nvmmh_config.fields)
             if not fields:
                 return tactics
             try:
-                max_tactics = nvmmh_max_tactics()
+                max_tactics = nvmmh_config.max_tactics
                 # Only prune the tile/cluster set when the model is asked to
                 # drive it; scheduler-only fields keep the full sweep.
                 prune_tile_cluster = bool(fields & {"tile", "cluster"})
@@ -962,10 +988,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             continue
                         pref_rank[key] = len(pref_rank)
                         swizzle_size = cfg.swizzle_factor if use_swizzle else 1
-                        # nvMatmulHeuristics cta_order==0 is row-major (N-major)
-                        # raster -> raster_along_m=False; !=0 -> M-major -> True.
-                        raster_along_m = ((cfg.cta_order != 0)
-                                          if use_cta_order else True)
+                        raster_along_m = (nvmmh_cta_order_to_cute_raster(
+                            cfg.cta_order) == "m" if use_cta_order else True)
                         pref_sched[key] = (max(1, int(swizzle_size)),
                                            bool(raster_along_m))
 
@@ -1355,7 +1379,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    class CuteDSLNVFP4SwigluBlackwellRunner(TunableRunner):
+    class CuteDSLNVFP4SwigluBlackwellRunner(CuteDSLTunableRunner):
         """Runner for dense GEMM + SwiGLU fusion on Blackwell GPUs using CuteDSL.
 
         Fuses the FC1 (gate_up projection) GEMM and SwiGLU activation into a
@@ -1905,7 +1929,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    class CuteDSLNVFP4SwigluFP4OutBlackwellRunner(TunableRunner):
+    class CuteDSLNVFP4SwigluFP4OutBlackwellRunner(CuteDSLTunableRunner):
         """Runner for dense GEMM + SwiGLU fusion with FP4 output on Blackwell.
 
         Same as CuteDSLNVFP4SwigluBlackwellRunner but produces Float4E2M1FN
@@ -2454,7 +2478,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 device=input_scale.device)
         return fp4_output, output_sf
 
-    class Sm100BlockScaledContiguousGroupedGemmRunner(TunableRunner):
+    class Sm100BlockScaledContiguousGroupedGemmRunner(CuteDSLTunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
@@ -2753,7 +2777,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return torch.empty(m, n, dtype=output_dtype, device=input.device)
 
     class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
-            TunableRunner):
+            CuteDSLTunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
@@ -3280,7 +3304,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            device=input.device)
 
     class Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner(
-            TunableRunner):
+            CuteDSLTunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
@@ -3604,7 +3628,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output, output_scale
 
     class Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
-            TunableRunner):
+            CuteDSLTunableRunner):
         kernel_class = BlockScaledContiguousGatherGroupedGemmKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
@@ -4180,7 +4204,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             position_ids)
         return inputs
 
-    class CuteDSLIndexerQBlackwellRunner(TunableRunner):
+    class CuteDSLIndexerQBlackwellRunner(CuteDSLTunableRunner):
         """Native MXF8 GEMM with fused DSv4 indexer-Q RoPE/MXFP4 output."""
 
         kernel_class = Sm100BlockScaledPersistentDenseGemmActFusionKernel
@@ -4469,7 +4493,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             input.new_empty((m, n // 128), dtype=torch.int32),
         )
 
-    class CuteDSLFp8BlackwellRunner(TunableRunner):
+    class CuteDSLFp8BlackwellRunner(CuteDSLTunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
@@ -4490,6 +4514,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.output_dtype = output_dtype
             self.use_tvm_ffi = use_tvm_ffi
+
+        def tactic_search_cache_key(self):
+            return _cutedsl_nvmmh_tactic_search_cache_key()
 
         def get_valid_tactics(
             self,
@@ -4528,7 +4555,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            return [
+            valid_tactics = [
                 (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
@@ -4549,6 +4576,64 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_major,
                 )
             ]
+            return self._rank_prune_tactics(valid_tactics, m, n, k)
+
+        @staticmethod
+        def _nvmmh_tactic_signature(tactic, fields):
+            """Return fields nvMMH can model for blockwise FP8 GEMM."""
+            if not isinstance(tactic, tuple) or len(tactic) != 3:
+                return None
+            use_2cta, mma_tiler_mn, cluster_shape_mn = tactic
+            signature = []
+            if fields & {"tile", "cluster"}:
+                cta_group = 2 if use_2cta else 1
+                cta = (int(mma_tiler_mn[0]) // cta_group, int(mma_tiler_mn[1]))
+                signature.extend((cta, tuple(cluster_shape_mn)))
+            return tuple(signature)
+
+        def _rank_prune_tactics(self, tactics, m, n, k):
+            """Rank/prune validated SM100/SM103 FP8 tactics with nvMMH.
+
+            Called at the end of get_valid_tactics. Any nvMMH failure or empty
+            match returns the validated full sweep unchanged.
+            """
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if (not nvmmh_config.enabled or not IS_NVMMH_AVAILABLE
+                    or not tactics):
+                return tactics
+            fields = set(nvmmh_config.fields) & {"tile", "cluster"}
+            if not fields:
+                return tactics
+
+            try:
+                m, n, k = int(m), int(n), int(k)
+                max_tactics = nvmmh_config.max_tactics
+                ranked_configs = rank_configs(
+                    m,
+                    n,
+                    k,
+                    FP8_BF16_OUTPUT_PRECISION,
+                    max(max_tactics * 16, 64),
+                    layout_name=FP8_LAYOUT,
+                )
+                selected = filter_fp8_tactics(
+                    tactics,
+                    ranked_configs,
+                    fields,
+                    max_tactics,
+                    self._nvmmh_tactic_signature,
+                )
+                logger.debug(
+                    f"CuteDSL FP8 nvMatmulHeuristics: {len(tactics)} valid "
+                    f"-> {len(selected)} tactics for M={m}, N={n}, K={k}")
+                return selected
+            except Exception as e:  # noqa: BLE001 - tuning must fall back
+                logger.warning_once(
+                    f"[nvMatmulHeuristics] FP8 tactic filtering failed: {e}. "
+                    f"Falling back to the full tactic list.",
+                    key="nvmmh_fp8_filter_failure",
+                )
+                return tactics
 
         def forward(
             self,
@@ -4780,7 +4865,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
+    class CuteDSLFp8BlackwellBmmRunner(CuteDSLTunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
@@ -5105,7 +5190,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
     # =============================================================================
 
-    class CuteDSLNVFP4DenseGemmSwigluRunner(TunableRunner):
+    class CuteDSLNVFP4DenseGemmSwigluRunner(CuteDSLTunableRunner):
         """Runner for Dense GEMM with SwiGLU fusion (MoE FC1 layer as dense GEMM).
 
         This kernel performs: C = SwiGLU(alpha * (SFA * A) @ (SFB * B))
@@ -5491,7 +5576,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc2 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmFC2Kernel
 
-    class CuteDSLNVFP4DenseGemmFC2Runner(TunableRunner):
+    class CuteDSLNVFP4DenseGemmFC2Runner(CuteDSLTunableRunner):
         """Runner for Dense GEMM FC2 layer (MoE second projection).
 
         This kernel performs: C = (A * SFA) @ (B * SFB) * alpha_scale
@@ -9083,7 +9168,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cta_tile_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
         return ceil_div(m, cta_tile_m) >= cluster_shape_mn[0]
 
-    class CuteDSLBf16BlackwellBmmRunner(TunableRunner):
+    class CuteDSLBf16BlackwellBmmRunner(CuteDSLTunableRunner):
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
 
@@ -9171,8 +9256,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tactic: Tiling and cluster strategy, typically a tuple
                     (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
             """
+            kernel_options = ("m", 1, True)
             if isinstance(tactic, tuple):
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic[:3]
+                if len(tactic) == 6:
+                    kernel_options = tactic[3:]
             else:
                 use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
                     False,
@@ -9227,6 +9315,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                *kernel_options,
                 self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
@@ -9253,6 +9342,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_2cta_instrs=use_2cta_instrs,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    raster_along=kernel_options[0],
+                    swizzle_size=kernel_options[1],
+                    use_tma_store=kernel_options[2],
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -9357,7 +9449,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # BF16 Dense Persistent GEMM (CuTe DSL) for Blackwell - Linear layers
     # ======================================================================
 
-    class CuteDSLBf16BlackwellGemmRunner(TunableRunner):
+    class CuteDSLBf16BlackwellGemmRunner(CuteDSLTunableRunner):
         """
         CuTe DSL BF16 GEMM runner for Linear layers.
 
@@ -9368,6 +9460,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
+        target_sm = "blackwell"
+
+        def tactic_search_cache_key(self):
+            return _cutedsl_nvmmh_tactic_search_cache_key()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -9417,7 +9513,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            return [
+            tactics = [
                 (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
@@ -9439,6 +9535,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             ]
 
+            canonical = [("base", *tactic, 0, 1) for tactic in tactics]
+            selected = self._rank_prune_tactics(canonical, m, n, k,
+                                                inputs[2].dtype)
+            return [
+                tuple(tactic[1:4]) + tuple(tactic[6:]) for tactic in selected
+            ]
+
         def forward(
             self,
             inputs: List[torch.Tensor],
@@ -9455,8 +9558,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tactic: Tiling and cluster strategy, typically a tuple
                     (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
             """
+            kernel_options = ("m", 1, True)
             if isinstance(tactic, tuple):
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic[:3]
+                if len(tactic) == 6:
+                    kernel_options = tactic[3:]
             else:
                 use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
                     False,
@@ -9513,6 +9619,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                *kernel_options,
                 self.use_tvm_ffi,
                 c_dtype_cutlass,
             )
@@ -9540,6 +9647,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_2cta_instrs=use_2cta_instrs,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    raster_along=kernel_options[0],
+                    swizzle_size=kernel_options[1],
+                    use_tma_store=kernel_options[2],
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -9589,6 +9699,145 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Copy result back if original output was non-contiguous
             if c_needs_copy:
                 c_tensor.copy_(c_buf)
+
+        def _rank_prune_tactics(self, tactics, m, n, k, output_dtype):
+            """Rank/prune BF16 GEMM tactics with nvMatmulHeuristics.
+
+            Called at the end of get_valid_tactics. The model controls only
+            fields selected by the AutoTuner NVMMH policy. Emitted tuples are
+            from the runner's validated tactic list. On SM107, split-K itself
+            remains a bounded local CUPTI sweep because the installed NVMMH
+            cannot expose its native K-tile lower bound.
+            Any query or matching failure keeps the validated tactic families.
+            """
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if (not nvmmh_config.enabled or not IS_NVMMH_AVAILABLE
+                    or not tactics):
+                return tactics
+
+            fields = set(nvmmh_config.fields)
+            if self.target_sm != "rubin":
+                # Main supports direct split-K only in the Rubin runner.
+                fields.discard("split_k")
+            if not fields:
+                return tactics
+            fallback_tactics = tactics
+            try:
+                m, n, k = int(m), int(n), int(k)
+                if output_dtype == torch.bfloat16:
+                    precision = BF16_PRECISION
+                elif output_dtype == torch.float32:
+                    precision = BF16_FP32_OUTPUT_PRECISION
+                else:
+                    return fallback_tactics
+
+                max_tactics = nvmmh_config.max_tactics
+                # The public API returns multiple warp/stage variants for the
+                # same runner-visible key. Over-query so those duplicates do not
+                # crowd out valid CTA/cluster/split matches.
+                query_count = max(max_tactics * 16, 64)
+                ranked_configs = rank_configs(
+                    m,
+                    n,
+                    k,
+                    precision,
+                    query_count,
+                    layout_name=BF16_LAYOUT,
+                )
+                if not ranked_configs:
+                    return fallback_tactics
+
+                candidate_tactics = tactics
+                model_fields = fields
+                if self.target_sm == "rubin" and "split_k" in fields:
+                    # NVMMH's native minTilesKLowerBound is not configurable in
+                    # this wheel. Admit Rubin splits with TRT-LLM's shared
+                    # lower bound, then let CUPTI select among the runner's
+                    # normal full-sweep candidates.
+
+                    def _split_k(tactic):
+                        if (isinstance(tactic, tuple) and len(tactic) >= 6
+                                and tactic[0] == "base"):
+                            return max(1, int(tactic[5]))
+                        return 1
+
+                    candidate_tactics = [
+                        tactic for tactic in candidate_tactics
+                        if is_sm107_nvmmh_split_k_eligible(
+                            k, self.nvmmh_split_k_cta_k, _split_k(tactic))
+                    ]
+                    model_fields = fields - {"split_k"}
+                    non_split_tactics = [
+                        tactic for tactic in candidate_tactics
+                        if _split_k(tactic) == 1
+                    ]
+                    split_tactics = [
+                        tactic for tactic in candidate_tactics
+                        if _split_k(tactic) > 1
+                    ]
+
+                    if model_fields:
+                        selected_non_split = filter_bf16_tactics(
+                            non_split_tactics,
+                            ranked_configs,
+                            model_fields,
+                            max_tactics,
+                            include_known_good=not bool(
+                                model_fields & {"swizzle", "cta_order"}),
+                            fallback_tactics=[],
+                        )
+                        if not selected_non_split:
+                            return fallback_tactics
+                    else:
+                        selected_non_split = non_split_tactics
+
+                    # Rubin's split-K reduction path has fixed scheduler
+                    # defaults, so swizzle/CTA order cannot participate in its
+                    # model match. Tile/cluster still can when requested.
+                    split_model_fields = model_fields - {"swizzle", "cta_order"}
+                    if split_tactics and split_model_fields:
+                        selected_split = filter_bf16_tactics(
+                            split_tactics,
+                            ranked_configs,
+                            split_model_fields,
+                            max_tactics,
+                            include_known_good=False,
+                            fallback_tactics=[],
+                        )
+                        if not selected_split:
+                            return fallback_tactics
+                    else:
+                        selected_split = split_tactics
+                    selected = list(
+                        dict.fromkeys(selected_non_split + selected_split))
+                else:
+                    if "split_k" in fields:
+                        candidate_tactics = (
+                            expand_bf16_tactics_with_heuristic_splits(
+                                tactics, ranked_configs))
+                    selected = filter_bf16_tactics(
+                        candidate_tactics,
+                        ranked_configs,
+                        fields,
+                        max_tactics,
+                        include_known_good=not bool(fields
+                                                    & {"swizzle", "cta_order"}),
+                        fallback_tactics=fallback_tactics,
+                    )
+                logger.debug(
+                    f"CuTe DSL BF16 nvMatmulHeuristics: {len(tactics)} baseline "
+                    f"/ {len(candidate_tactics)} candidates "
+                    f"-> {len(selected)} tactics for M={m}, N={n}, K={k}, "
+                    f"precision={precision}, fields={sorted(fields)}, "
+                    f"model_fields={sorted(model_fields)}")
+                return selected
+            except Exception as e:  # noqa: BLE001 - tuning must keep working
+                logger.warning_once(
+                    f"[nvMatmulHeuristics] BF16 tactic filtering failed: {e}. "
+                    f"Falling back to the validated tactic list.",
+                    key="nvmmh_bf16_filter_failure",
+                )
+                return fallback_tactics
 
     # input: [M, K], weight: [N, K], output: [M, N]
     @torch.library.custom_op("trtllm::cute_dsl_bf16_gemm_blackwell",
@@ -9776,6 +10025,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """Decode a tactic into (kernel_variant, use_2cta_instrs, mma_tiler_mn,
         preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
         split_k_slices)."""
+        if isinstance(tactic, tuple) and tactic and tactic[0] == "base":
+            if len(tactic) == 9:
+                tactic = tactic[:6]
+            elif len(tactic) == 8:
+                tactic = tactic[:5]
         if (isinstance(tactic, tuple) and len(tactic) > 0
                 and isinstance(tactic[0], str)):
             kernel_variant = tactic[0]
@@ -9806,7 +10060,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 preferred_cluster_shape_mn,
                                 cluster_shape_mn,
                                 max_num_ab_stage: int,
-                                split_k_slices: int = 1):
+                                split_k_slices: int = 1,
+                                raster_along: str = "m",
+                                swizzle_size: int = 1,
+                                use_tma_store: bool = True):
         kernel_class = _sm107_bf16_kernel_class(kernel_variant)
         if kernel_variant == "preferred_cluster":
             return kernel_class(
@@ -9824,6 +10081,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cluster_shape_mn=cluster_shape_mn,
             max_num_ab_stage=max_num_ab_stage,
             split_k_slices=split_k_slices,
+            raster_along=raster_along,
+            swizzle_size=swizzle_size,
+            use_tma_store=use_tma_store,
         )
 
     def _sm107_bf16_occupancy(cluster_shape_mn, preferred_cluster_shape_mn):
@@ -9877,6 +10137,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             (kernel_variant, use_2cta_instrs, mma_tiler_mn,
              preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
              _) = _parse_sm107_bf16_tactic(tactic)
+            kernel_options = ("m", 1, True)
+            if isinstance(tactic, tuple) and tactic and tactic[0] == "base":
+                if len(tactic) in (8, 9):
+                    kernel_options = tactic[-3:]
 
             a_tensor, b_tensor, c_tensor = inputs
             batch_size, m, k = a_tensor.shape
@@ -9933,6 +10197,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 preferred_cluster_shape_mn,
                 cluster_shape_mn,
                 max_num_ab_stage,
+                *kernel_options,
                 self.use_tvm_ffi,
                 c_layout_key,
                 max_active_clusters,
@@ -9953,11 +10218,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream = cute.runtime.make_fake_stream(
                         use_tvm_ffi_env_stream=True)
 
-                gemm = _sm107_bf16_gemm_kernel(kernel_variant, use_2cta_instrs,
+                gemm = _sm107_bf16_gemm_kernel(kernel_variant,
+                                               use_2cta_instrs,
                                                mma_tiler_mn,
                                                preferred_cluster_shape_mn,
                                                cluster_shape_mn,
-                                               max_num_ab_stage)
+                                               max_num_ab_stage,
+                                               raster_along=kernel_options[0],
+                                               swizzle_size=kernel_options[1],
+                                               use_tma_store=kernel_options[2])
                 compile_args = [
                     m, n, k, batch_size, a_ptr, b_ptr, c_cute_tensor,
                     a_stride_m, a_stride_batch, b_stride_n, b_stride_batch
@@ -10063,6 +10332,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Split-K artifacts are shape-independent (tactic plus occupancy) and
         # cached separately from the split=1 path.
         split_k_gemm_cache = dict()
+        target_sm = "rubin"
+        nvmmh_split_k_cta_k = 64
+
+        def tactic_search_cache_key(self):
+            return _cutedsl_nvmmh_tactic_search_cache_key()
 
         # See CuteDSLBf16RubinBmmRunner.tuning_config.
         tuning_config = TuningConfig(
@@ -10115,8 +10389,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if k >= 4096 and n <= 512 and inputs[2].shape[0] == m:
                 split_k_candi = [1, 2, 4, 8]
 
-            return _sm107_bf16_valid_tactics(m, n, k, 1, c_dtype_cutlass,
-                                             mma_tiler_mn_candi, split_k_candi)
+            tactics = _sm107_bf16_valid_tactics(m, n, k, 1, c_dtype_cutlass,
+                                                mma_tiler_mn_candi,
+                                                split_k_candi)
+            return self._rank_prune_tactics(tactics, m, n, k, inputs[2].dtype)
 
         def forward(
             self,
@@ -10126,6 +10402,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             (kernel_variant, use_2cta_instrs, mma_tiler_mn,
              preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
              split_k_slices) = _parse_sm107_bf16_tactic(tactic)
+            kernel_options = ("m", 1, True)
+            if isinstance(tactic, tuple) and tactic and tactic[0] == "base":
+                if len(tactic) in (8, 9):
+                    kernel_options = tactic[-3:]
 
             a_tensor, b_tensor, c_tensor = inputs
             m, k = a_tensor.shape
@@ -10188,6 +10468,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 preferred_cluster_shape_mn,
                 cluster_shape_mn,
                 max_num_ab_stage,
+                *kernel_options,
                 self.use_tvm_ffi,
                 c_dtype_cutlass,
                 c_layout_key,
@@ -10209,11 +10490,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream = cute.runtime.make_fake_stream(
                         use_tvm_ffi_env_stream=True)
 
-                gemm = _sm107_bf16_gemm_kernel(kernel_variant, use_2cta_instrs,
+                gemm = _sm107_bf16_gemm_kernel(kernel_variant,
+                                               use_2cta_instrs,
                                                mma_tiler_mn,
                                                preferred_cluster_shape_mn,
                                                cluster_shape_mn,
-                                               max_num_ab_stage)
+                                               max_num_ab_stage,
+                                               raster_along=kernel_options[0],
+                                               swizzle_size=kernel_options[1],
+                                               use_tma_store=kernel_options[2])
                 compile_args = [
                     m, n, k, batch_size, a_ptr, b_ptr, c_cute_tensor
                 ]
@@ -11937,7 +12222,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             (4, 4),
         ]
 
-        class CuteDSLFp8RubinGemmRunner(TunableRunner):
+        class CuteDSLFp8RubinGemmRunner(CuteDSLTunableRunner):
             """FP8 1x128/128x128 blockwise GEMM runner for SM107."""
 
             kernel_class = SM107BlockwiseGemmKernel
@@ -12617,7 +12902,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert packed_scale.shape == (expected_scale_numel, )
             assert packed_scale.is_contiguous()
 
-        class CuteDSLBlockScaledRubinLinear(TunableRunner):
+        class CuteDSLBlockScaledRubinLinear(CuteDSLTunableRunner):
             """Datatype-agnostic block-scaled Linear runner for SM107.
 
             Concrete datatypes provide their element types, scale-factor
@@ -12637,6 +12922,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_tiler_k: ClassVar[int]
             mma_inst_shape_k: ClassVar[int]
             allow_unswapped_small_m_fallback: ClassVar[bool]
+            # nvMatmulHeuristics models the GEMM element types and layout, but
+            # not the block-scale format. Concrete runners opt in with the
+            # closest matching compute precision. A None precision keeps the
+            # exact full-sweep behavior for unsupported datatypes.
+            nvmmh_precision: ClassVar[Optional[str]] = None
+            nvmmh_layout: ClassVar[Optional[str]] = None
+            nvmmh_supported_fields: ClassVar[frozenset] = frozenset()
+            nvmmh_sweep_cluster_shape: ClassVar[bool] = False
+            nvmmh_supplement_mixed_clusters: ClassVar[bool] = False
             raster_order_candidates: ClassVar[Tuple[str, ...]] = ("m", )
             scheduler_mode_candidates: ClassVar[Tuple[str,
                                                       ...]] = ("static",
@@ -12663,6 +12957,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             def unique_id(self):
                 return (self.output_dtype, self.to_userbuffers,
                         self.use_tvm_ffi)
+
+            def tactic_search_cache_key(self):
+                if (self.nvmmh_precision is None or self.nvmmh_layout is None):
+                    return None
+                return _cutedsl_nvmmh_tactic_search_cache_key()
 
             def __hash__(self):
                 return hash(
@@ -12764,7 +13063,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     (2, 2),
                     (4, 2),
                 ]
-                raster_order_candidates = self.raster_order_candidates
                 use_prefetch_candidates = [True, False]
 
                 valid_tactics = []
@@ -12772,8 +13070,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_tiler_m, mma_inst_m
                 ), mma_n, cluster_shape_mn, raster_order, swap_ab, use_prefetch in itertools.product(
                         mma_m_candidates, mma_n_candidates,
-                        cluster_shape_mn_candidates, raster_order_candidates,
-                        base_swap_ab_candidates, use_prefetch_candidates):
+                        cluster_shape_mn_candidates,
+                        self.raster_order_candidates, base_swap_ab_candidates,
+                        use_prefetch_candidates):
 
                     # Check 2CTA cluster constraint: cluster_m must be divisible by 2
                     if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
@@ -12819,7 +13118,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_tiler_m, mma_inst_m
                 ), mma_n, raster_order, swap_ab, use_prefetch in itertools.product(
                         mma_m_candidates, mma_n_candidates,
-                        raster_order_candidates, mixed_swap_ab_candidates,
+                        self.raster_order_candidates, mixed_swap_ab_candidates,
                         use_prefetch_candidates):
                     mma_tiler_mnk = (mma_tiler_m, mma_n, mma_tiler_k)
                     mma_inst_shape = (mma_inst_m, mma_n, mma_inst_shape_k)
@@ -12851,7 +13150,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         if self.mixed_scheduler_mode_candidates == ("static", ):
                             # Preserve the existing raster-only tactic schema
                             # for runners that do not profile mixed-cluster
-                            # schedulers (currently NVFP4).
+                            # scheduler fields.
                             valid_tactics.append(
                                 ("mixed_clusters", mma_tiler_mnk,
                                  mma_inst_shape, preferred_cluster_shape_mn,
@@ -12879,7 +13178,368 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 logger.debug(
                     f"CuteDSL SM107: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
                 )
-                return valid_tactics
+                return self._rank_prune_tactics(valid_tactics, m, n, real_k)
+
+            @staticmethod
+            def _nvmmh_tactic_signature(tactic, fields):
+                """Return the selected NVMMH fields plus the swap orientation.
+
+                Rubin encodes two-CTA MMA in ``mma_inst_shape[0] == 256``;
+                nvMatmulHeuristics reports the corresponding per-CTA M tile.
+                The model has one cluster field, so mixed-cluster tactics use
+                their fallback cluster. Instruction mode, B reuse, prefetch,
+                and persistent scheduler mode remain local sweep choices.
+                """
+                if not isinstance(tactic, tuple) or not tactic:
+                    return None
+                raster_order = "m"
+                split_k = 1
+                swizzle_size = 1
+                if tactic[0] == "base" and len(tactic) in (6, 7, 8, 9, 10):
+                    mma_tiler_mnk, mma_inst_shape = tactic[1], tactic[2]
+                    cluster_shape_mn, swap_ab = tactic[3], tactic[4]
+                    if len(tactic) >= 8:
+                        raster_order = tactic[7]
+                    if len(tactic) >= 9:
+                        split_k = tactic[8]
+                    if len(tactic) == 10:
+                        swizzle_size = tactic[9]
+                elif (tactic[0] == "mixed_clusters"
+                      and len(tactic) in (7, 8, 9, 10)):
+                    mma_tiler_mnk, mma_inst_shape = tactic[1], tactic[2]
+                    cluster_shape_mn, swap_ab = tactic[4], tactic[5]
+                    # Length eight is the legacy raster-only schema, but still
+                    # older cache entries used the same slot for a fixed
+                    # "static" scheduler. Length nine is either the new
+                    # raster/swizzle schema or the old scheduler/raster schema.
+                    if len(tactic) == 8 and tactic[7] in {"m", "n"}:
+                        raster_order = tactic[7]
+                    elif len(tactic) == 9:
+                        if tactic[7] in {"m", "n"}:
+                            raster_order = tactic[7]
+                            swizzle_size = tactic[8]
+                        elif tactic[7] in {"static", "clc_dynamic"}:
+                            raster_order = tactic[8]
+                        else:
+                            return None
+                    elif len(tactic) == 10:
+                        if tactic[7] not in {"static", "clc_dynamic"}:
+                            return None
+                        raster_order = tactic[8]
+                        swizzle_size = tactic[9]
+                else:
+                    return None
+
+                if raster_order not in {"m", "n"}:
+                    return None
+                if (isinstance(swizzle_size, bool)
+                        or not isinstance(swizzle_size, int)
+                        or swizzle_size < 1):
+                    return None
+                if (isinstance(split_k, bool) or not isinstance(split_k, int)
+                        or split_k < 1):
+                    return None
+
+                signature = []
+                if fields & {"tile", "cluster"}:
+                    cta_group = (2 if int(mma_inst_shape[0]) == 256 else 1)
+                    cta = (int(mma_tiler_mnk[0]) // cta_group,
+                           int(mma_tiler_mnk[1]))
+                    signature.extend((cta, tuple(cluster_shape_mn)))
+                if "split_k" in fields:
+                    signature.append(int(split_k))
+                if "swizzle" in fields:
+                    signature.append(int(swizzle_size))
+                if "cta_order" in fields:
+                    signature.append(
+                        cute_raster_to_nvmmh_cta_order(raster_order))
+                # swap_ab is not an NVMMH field. Keep it in the key because
+                # each orientation is ranked as a separate M/N problem below.
+                signature.append(bool(swap_ab))
+                return tuple(signature)
+
+            @staticmethod
+            def _nvmmh_config_signature(config, fields, swap_ab):
+                """Map one model result to the block-scaled runner key."""
+                signature = []
+                if fields & {"tile", "cluster"}:
+                    signature.extend((tuple(config.cta), tuple(config.cluster)))
+                if "split_k" in fields:
+                    signature.append(max(1, int(config.split_k)))
+                if "swizzle" in fields:
+                    signature.append(max(1, int(config.swizzle_factor)))
+                if "cta_order" in fields:
+                    signature.append(int(config.cta_order))
+                signature.append(bool(swap_ab))
+                return tuple(signature)
+
+            @staticmethod
+            def _nvmmh_cluster_family(signature, fields, sweep_shape):
+                """Drop runner-local cluster fields from a model-match key."""
+                if not (fields & {"tile", "cluster"}):
+                    return signature
+                cta, cluster, *remaining = signature
+                if sweep_shape:
+                    return (cta, *remaining)
+                return signature
+
+            def _apply_nvmmh_scheduler(self, tactic, config, fields):
+                """Copy selected scheduler fields directly from one config.
+
+                Raw validated tactics use the runner's native scheduler
+                settings. This helper materializes no local scheduler domain:
+                it only annotates values returned by NVMMH after structural
+                tactic matching.
+                """
+                scheduler_fields = fields & {"swizzle", "cta_order"}
+                if not scheduler_fields:
+                    return tactic
+                raster_order = (nvmmh_cta_order_to_cute_raster(config.cta_order)
+                                if "cta_order" in scheduler_fields else None)
+                swizzle_size = (max(1, int(config.swizzle_factor))
+                                if "swizzle" in scheduler_fields else 1)
+
+                if tactic[0] == "base":
+                    if len(tactic) not in {9, 10}:
+                        return None
+                    annotated = list(tactic[:9])
+                    if raster_order is not None:
+                        annotated[7] = raster_order
+                    if "swizzle" in scheduler_fields:
+                        if annotated[6] == "clc_dynamic" and swizzle_size != 1:
+                            return None
+                        annotated.append(swizzle_size)
+                    return tuple(annotated)
+
+                if tactic[0] != "mixed_clusters" or len(tactic) not in {
+                        8, 9, 10
+                }:
+                    return None
+                if len(tactic) == 8 and tactic[7] in {"m", "n"}:
+                    scheduler_mode = "static"
+                    current_raster = tactic[7]
+                    annotated = list(tactic[:7])
+                    annotated.append(raster_order or current_raster)
+                elif len(tactic) >= 9 and tactic[7] in {
+                        "static", "clc_dynamic"
+                }:
+                    scheduler_mode = tactic[7]
+                    current_raster = tactic[8]
+                    annotated = list(tactic[:8])
+                    annotated.append(raster_order or current_raster)
+                elif len(tactic) == 9 and tactic[7] in {"m", "n"}:
+                    # Accept the historical raster/swizzle schema, but replace
+                    # its scheduler value rather than carrying it forward.
+                    scheduler_mode = "static"
+                    current_raster = tactic[7]
+                    annotated = list(tactic[:7])
+                    annotated.append(raster_order or current_raster)
+                else:
+                    return None
+                effective_raster = annotated[-1]
+                if (scheduler_mode == "clc_dynamic"
+                        and (effective_raster != "m" or swizzle_size != 1)):
+                    return None
+                if "swizzle" in scheduler_fields:
+                    annotated.append(swizzle_size)
+                return tuple(annotated)
+
+            def _rank_prune_tactics(self, tactics, m, n, real_k):
+                """Rank/prune Rubin block-scaled tactics with NVMMH.
+
+                Split-K uses TRT-LLM's SM107 K-tile admission policy and remains
+                a local CUPTI sweep field. This is necessary because the native
+                scheduler's hard-coded lower bound can prevent useful factors
+                from being modeled at all. NVMMH still controls every other
+                selected field. Scheduler values are copied directly from the
+                matched model config instead of being locally swept.
+
+                MXFP8 uses the generic E4M3 FP8 compute model because NVMMH
+                does not encode scale-factor formats. Runner-native fields
+                absent from the model key remain swept.
+                """
+                if (self.nvmmh_precision is None or self.nvmmh_layout is None
+                        or not tactics):
+                    return tactics
+                nvmmh_config = AutoTuner.get().nvmmh_config
+                if not nvmmh_config.enabled or not IS_NVMMH_AVAILABLE:
+                    return tactics
+                fields = (set(nvmmh_config.fields)
+                          & set(self.nvmmh_supported_fields))
+                if not fields:
+                    return tactics
+                fallback_tactics = tactics
+                # The installed NVMMH has no public property for overriding
+                # minTilesKLowerBound. Treat split-K as an admitted local sweep
+                # dimension instead of matching its native rank-1 value.
+                model_fields = fields - {"split_k"}
+                scheduler_fields = model_fields & {"swizzle", "cta_order"}
+                match_fields = model_fields - scheduler_fields
+
+                try:
+                    m, n, real_k = int(m), int(n), int(real_k)
+                    max_tactics = nvmmh_config.max_tactics
+                    candidate_tactics = tactics
+                    if "split_k" in fields:
+
+                        def _split_k(tactic):
+                            if (isinstance(tactic, tuple) and tactic
+                                    and tactic[0] == "base"
+                                    and len(tactic) >= 9):
+                                return int(tactic[8])
+                            return 1
+
+                        candidate_tactics = [
+                            tactic for tactic in candidate_tactics
+                            if is_sm107_nvmmh_split_k_eligible(
+                                real_k, self.mma_tiler_k, _split_k(tactic))
+                        ]
+                    if not model_fields:
+                        return candidate_tactics or fallback_tactics
+
+                    baseline_signatures = {
+                        signature
+                        for tactic in candidate_tactics
+                        if (signature := self._nvmmh_tactic_signature(
+                            tactic, match_fields)) is not None
+                    }
+                    if not baseline_signatures:
+                        return fallback_tactics
+
+                    valid_swaps = sorted(
+                        {signature[-1]
+                         for signature in baseline_signatures})
+                    query_count = max(max_tactics * 16, 64)
+                    ranked_configs_by_swap = {}
+                    for swap_ab in valid_swaps:
+                        kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+                        query_kwargs = {"layout_name": self.nvmmh_layout}
+                        if "split_k" in fields:
+                            query_kwargs["split_k_kind"] = (
+                                IN_PLACE_SPLIT_K_KIND)
+                        ranked_configs = rank_configs(
+                            kernel_m,
+                            kernel_n,
+                            real_k,
+                            self.nvmmh_precision,
+                            query_count,
+                            **query_kwargs,
+                        )
+                        ranked_configs_by_swap[swap_ab] = ranked_configs
+                    valid_signatures = {
+                        signature
+                        for tactic in candidate_tactics
+                        if (signature := self._nvmmh_tactic_signature(
+                            tactic, match_fields)) is not None
+                    }
+                    if not valid_signatures:
+                        return fallback_tactics
+
+                    def model_key(signature):
+                        return self._nvmmh_cluster_family(
+                            signature,
+                            match_fields,
+                            self.nvmmh_sweep_cluster_shape,
+                        )
+
+                    valid_keys = {
+                        model_key(signature)
+                        for signature in valid_signatures
+                    }
+                    config_by_key = {}
+                    rank1_config_by_swap = {}
+                    matched_swaps = set()
+                    for swap_ab in valid_swaps:
+                        matches_for_swap = 0
+                        for config in ranked_configs_by_swap[swap_ab]:
+                            rank1_config_by_swap.setdefault(swap_ab, config)
+                            signature = self._nvmmh_config_signature(
+                                config, match_fields, swap_ab)
+                            key = model_key(signature)
+                            if key not in valid_keys or key in config_by_key:
+                                continue
+                            config_by_key[key] = config
+                            matches_for_swap += 1
+                            if matches_for_swap >= max_tactics:
+                                break
+                        if matches_for_swap:
+                            matched_swaps.add(swap_ab)
+
+                    if not matched_swaps:
+                        return fallback_tactics
+
+                    # Each swap orientation is a different model problem. If
+                    # only one orientation has a representable model result,
+                    # fail open for the unmatched orientation instead of
+                    # discarding its validated full-sweep candidates.
+                    unmatched_swaps = set(valid_swaps) - matched_swaps
+
+                    selected = []
+                    for tactic in candidate_tactics:
+                        signature = self._nvmmh_tactic_signature(
+                            tactic, match_fields)
+                        if signature is None:
+                            continue
+                        config = config_by_key.get(model_key(signature))
+                        if config is None:
+                            continue
+                        annotated = self._apply_nvmmh_scheduler(
+                            tactic, config, scheduler_fields)
+                        if annotated is not None:
+                            selected.append(annotated)
+                    selected.extend(
+                        tactic for tactic in fallback_tactics
+                        if ((signature := self._nvmmh_tactic_signature(
+                            tactic, match_fields)) is not None
+                            and signature[-1] in unmatched_swaps))
+
+                    # NVMMH cannot encode the preferred/fallback cluster pair.
+                    # Keep the canonical validated mixed-cluster family for
+                    # runners that have established it as a known-good tactic.
+                    if self.nvmmh_supplement_mixed_clusters:
+                        selected_mixed_swaps = {
+                            bool(tactic[5])
+                            for tactic in selected
+                            if tactic[0] == "mixed_clusters"
+                        }
+                        for tactic in tactics:
+                            if (tactic[0] != "mixed_clusters"
+                                    or bool(tactic[5]) in selected_mixed_swaps
+                                    or tuple(tactic[1]) != (256, 256,
+                                                            self.mma_tiler_k)
+                                    or tuple(tactic[2])
+                                    != (256, 256, self.mma_inst_shape_k)
+                                    or tuple(tactic[3]) != (4, 2)
+                                    or tuple(tactic[4]) != (2, 1)):
+                                continue
+                            swap_ab = bool(tactic[5])
+                            config = rank1_config_by_swap.get(swap_ab)
+                            if config is None:
+                                continue
+                            annotated = self._apply_nvmmh_scheduler(
+                                tactic, config, scheduler_fields)
+                            if annotated is not None:
+                                selected.append(annotated)
+
+                    selected = list(dict.fromkeys(selected))
+                    logger.debug(
+                        f"CuteDSL Rubin {self.gemm_name} "
+                        f"nvMatmulHeuristics: {len(tactics)} valid -> "
+                        f"{len(selected)} tactics ({len(config_by_key)} model keys) "
+                        f"for M={m}, N={n}, K={real_k}, "
+                        f"precision={self.nvmmh_precision}, "
+                        f"fields={sorted(fields)}, "
+                        f"model_fields={sorted(model_fields)}")
+                    return selected if selected else fallback_tactics
+                except Exception as e:  # noqa: BLE001 - tuning must fall back
+                    logger.warning_once(
+                        f"[nvMatmulHeuristics] Rubin {self.gemm_name} tactic "
+                        f"filtering failed: {e}. Falling back to the "
+                        f"validated tactic list.",
+                        key=("nvmmh_rubin_"
+                             f"{self.gemm_name.lower()}_filter_failure"),
+                    )
+                    return fallback_tactics
 
             def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                              assumed_align: int):
@@ -12910,11 +13570,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tactic: Tiling and cluster strategy:
                         base: ("base", mma_tiler_mnk, mma_inst_shape,
                         cluster_shape, swap_ab, use_prefetch, scheduler_mode,
-                        raster_order, split_k)
+                        raster_order, split_k[, swizzle_size])
                         mixed: ("mixed_clusters", mma_tiler_mnk,
                         mma_inst_shape, preferred_cluster_shape,
                         fallback_cluster_shape, swap_ab, use_prefetch,
-                        scheduler_mode, raster_order)
+                        scheduler_mode, raster_order[, swizzle_size])
                     bias: Optional per-N bias [N]. Added post-GEMM for the
                         non-inplace path.
 
@@ -12923,16 +13583,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 """
                 sf_vec_size = self.sf_vec_size
                 split_k = 1
+                swizzle_size = 1
 
                 if (isinstance(tactic, tuple) and len(tactic) > 0
                         and isinstance(tactic[0], str)):
                     kernel_variant = tactic[0]
                     if kernel_variant == "mixed_clusters":
-                        if len(tactic) not in {7, 8, 9}:
+                        if len(tactic) not in {7, 8, 9, 10}:
                             raise ValueError(
                                 "CuteDSL SM107 mixed-cluster tactics must use "
                                 "Boolean use_prefetch with optional scheduler "
-                                "mode and raster order")
+                                "mode, raster order, and swizzle")
                         (_, mma_tiler_mnk, mma_inst_shape,
                          preferred_cluster_shape_mn, cluster_shape_mn, swap_ab,
                          use_prefetch, *tuning_options) = tactic
@@ -12948,14 +13609,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 raster_order = "m"
                             else:
                                 raster_order = tuning_options[0]
+                        elif len(tuning_options) == 2:
+                            if tuning_options[
+                                    0] in self.mixed_scheduler_mode_candidates:
+                                scheduler_mode, raster_order = tuning_options
+                            else:
+                                # Accept the raster/swizzle schema emitted
+                                # before mixed-cluster scheduler profiling.
+                                raster_order, swizzle_size = tuning_options
                         else:
-                            scheduler_mode, raster_order = tuning_options
+                            scheduler_mode, raster_order, swizzle_size = tuning_options
                     else:
-                        if len(tactic) not in {6, 7, 8, 9}:
+                        if len(tactic) not in {6, 7, 8, 9, 10}:
                             raise ValueError(
                                 "CuteDSL SM107 base tactics must use Boolean "
                                 "use_prefetch with an optional scheduler mode "
-                                "and raster order, followed by split_k")
+                                "and raster order, followed by split_k and "
+                                "optional swizzle_size")
                         (_, mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
                          swap_ab, use_prefetch, *tuning_options) = tactic
                         preferred_cluster_shape_mn = None
@@ -12965,8 +13635,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             scheduler_mode = tuning_options[0]
                         if len(tuning_options) >= 2:
                             raster_order = tuning_options[1]
-                        if len(tuning_options) == 3:
+                        if len(tuning_options) >= 3:
                             split_k = tuning_options[2]
+                        if len(tuning_options) == 4:
+                            swizzle_size = tuning_options[3]
                 elif isinstance(tactic, tuple) and len(tactic) == 5:
                     kernel_variant = "base"
                     (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab,
@@ -12997,6 +13669,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if raster_order not in {"m", "n"}:
                     raise ValueError("CuteDSL SM107 raster_order must be 'm' "
                                      f"or 'n', got {raster_order!r}")
+                if (not isinstance(swizzle_size, int)
+                        or isinstance(swizzle_size, bool) or swizzle_size < 1):
+                    raise ValueError(
+                        "CuteDSL Rubin swizzle_size must be a positive integer, "
+                        f"got {swizzle_size!r}")
                 if (kernel_variant == "mixed_clusters" and scheduler_mode
                         not in self.mixed_scheduler_mode_candidates):
                     raise ValueError(
@@ -13011,6 +13688,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if scheduler_mode not in {"static", "clc_dynamic"}:
                     raise ValueError("Unsupported CuteDSL SM107 scheduler mode "
                                      f"{scheduler_mode!r}")
+                if scheduler_mode == "clc_dynamic" and swizzle_size != 1:
+                    raise ValueError(
+                        "CuteDSL Rubin clc_dynamic scheduler only supports "
+                        "swizzle_size=1 with the current CuTe DSL release")
 
                 assert len(inputs) == 5 or len(inputs) == 6
                 if len(inputs) == 5:
@@ -13159,9 +13840,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (kernel_variant, sf_vec_size, mma_tiler_mnk,
                              mma_inst_shape, preferred_cluster_shape_mn,
                              cluster_shape_mn, swap_ab, use_prefetch,
-                             raster_order, scheduler_mode, split_k,
-                             locality_domain_half_gemm, self.use_tvm_ffi,
-                             max_active_preferred_clusters, max_active_clusters)
+                             raster_order, swizzle_size, scheduler_mode,
+                             split_k, locality_domain_half_gemm,
+                             self.use_tvm_ffi, max_active_preferred_clusters,
+                             max_active_clusters)
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
                 # get stream
@@ -13214,6 +13896,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             preferred_cluster_shape_mn,
                             cluster_shape_mn,
                             None if use_prefetch else 0,
+                            swizzle_size=swizzle_size,
                             raster_order=raster_order,
                             scheduler_type=scheduler_type,
                         )
@@ -13224,6 +13907,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             mma_tiler_mnk,
                             cluster_shape_mn,
                             None if use_prefetch else 0,
+                            swizzle_size=swizzle_size,
                             raster_order=raster_order,
                             scheduler_type=scheduler_type,
                             split_k=split_k,
@@ -13326,6 +14010,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             kernel_cache = dict()
             gemm_name = "NVFP4"
+            nvmmh_precision = NVFP4_PRECISION
+            nvmmh_layout = NVFP4_LAYOUT
+            nvmmh_supported_fields = frozenset(
+                {"tile", "cluster", "swizzle", "cta_order", "split_k"})
+            nvmmh_supplement_mixed_clusters = True
             a_dtype = cutlass.Float4E2M1FN
             b_dtype = cutlass.Float4E2M1FN
             sf_dtype = cutlass.Float8E4M3FN
@@ -13353,6 +14042,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             kernel_cache = dict()
             gemm_name = "MXFP8"
+            # NVMMH has no block-scale descriptor. QQTST is the matching E4M3
+            # A/B, FP32-accumulate, BF16-output compute model; the CuTe DSL
+            # validity checks continue to enforce MXFP8's UE8M0 scale layout.
+            nvmmh_precision = FP8_BF16_OUTPUT_PRECISION
+            nvmmh_layout = FP8_LAYOUT
+            # NVMMH can prune tile/cluster choices or fix the rank-1 scheduler
+            # tuple. Split-K uses the shared SM107 admission rule and remains
+            # locally profiled.
+            nvmmh_supported_fields = frozenset(
+                {"tile", "cluster", "swizzle", "cta_order", "split_k"})
+            nvmmh_supplement_mixed_clusters = True
             a_dtype = cutlass.Float8E4M3FN
             b_dtype = cutlass.Float8E4M3FN
             sf_dtype = cutlass.Float8E8M0FNU
@@ -13855,13 +14555,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> None:
             return None
 
-        class CuteDSLFp8RubinPerTensorGemmRunner(TunableRunner):
+        class CuteDSLFp8RubinPerTensorGemmRunner(CuteDSLTunableRunner):
             kernel_class = SM107PersistentDenseGemmKernel
             kernel_cache = dict()
 
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
-                    0, 1, get_last_power_of_2_num_tokens_buckets,
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
                     last_positive_power_of_2), ),
                 use_cold_l2_cache=True,
             )
@@ -13876,6 +14576,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     )
                 self.output_dtype = output_dtype
                 self.use_tvm_ffi = use_tvm_ffi
+
+            def tactic_search_cache_key(self):
+                return _cutedsl_nvmmh_tactic_search_cache_key()
 
             def get_valid_tactics(
                 self,
@@ -13962,7 +14665,81 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         valid_tactics.append(
                             (use_2cta_instrs, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, use_tma_store, raster_along))
-                return valid_tactics
+                return self._rank_prune_tactics(valid_tactics, m, n, k)
+
+            @staticmethod
+            def _nvmmh_tactic_signature(tactic, fields):
+                """Return the nvMMH-visible FP8 tile, cluster, and CTA order."""
+                if not isinstance(tactic, tuple) or len(tactic) != 6:
+                    return None
+                use_2cta, mma_tiler_mnk, _, cluster_shape_mn, _, raster_along = tactic
+                signature = []
+                if fields & {"tile", "cluster"}:
+                    cta_group = 2 if use_2cta else 1
+                    cta = (
+                        int(mma_tiler_mnk[0]) // cta_group,
+                        int(mma_tiler_mnk[1]),
+                    )
+                    signature.extend((cta, tuple(cluster_shape_mn)))
+                if "cta_order" in fields:
+                    signature.append(
+                        cute_raster_to_nvmmh_cta_order(raster_along))
+                return tuple(signature)
+
+            def _rank_prune_tactics(self, tactics, m, n, k):
+                """Rank/prune validated Rubin per-tensor FP8 tactics with nvMMH.
+
+                Called at the end of get_valid_tactics. MMA instruction shape,
+                B-reuse, and TMA-store mode remain local choices. Raster order
+                remains swept unless ``cta_order`` is explicitly
+                model-controlled. Cluster-N is also swept within each
+                nvMMH-selected CTA/cluster-M family: current SM107 model rankings
+                consistently select cluster-N=1, while validated cluster-N
+                alternatives are required to avoid a performance regression.
+                """
+                nvmmh_config = AutoTuner.get().nvmmh_config
+                if (not nvmmh_config.enabled or not IS_NVMMH_AVAILABLE
+                        or not tactics):
+                    return tactics
+                fields = set(
+                    nvmmh_config.fields) & {"tile", "cluster", "cta_order"}
+                if not fields:
+                    return tactics
+
+                try:
+                    m, n, k = int(m), int(n), int(k)
+                    max_tactics = nvmmh_config.max_tactics
+                    precision = (FP8_BF16_OUTPUT_PRECISION
+                                 if self.output_dtype == torch.bfloat16 else
+                                 FP8_FP16_OUTPUT_PRECISION)
+                    ranked_configs = rank_configs(
+                        m,
+                        n,
+                        k,
+                        precision,
+                        max(max_tactics * 16, 64),
+                        layout_name=FP8_LAYOUT,
+                    )
+                    selected = filter_fp8_tactics(
+                        tactics,
+                        ranked_configs,
+                        fields,
+                        max_tactics,
+                        self._nvmmh_tactic_signature,
+                        sweep_cluster_n=True,
+                    )
+                    logger.debug(
+                        f"CuteDSL Rubin FP8 nvMatmulHeuristics: {len(tactics)} "
+                        f"valid -> {len(selected)} tactics for M={m}, N={n}, K={k}, "
+                        f"precision={precision}, fields={sorted(fields)}")
+                    return selected
+                except Exception as e:  # noqa: BLE001 - tuning must fall back
+                    logger.warning_once(
+                        f"[nvMatmulHeuristics] Rubin FP8 tactic filtering failed: "
+                        f"{e}. Falling back to the full tactic list.",
+                        key="nvmmh_rubin_fp8_filter_failure",
+                    )
+                    return tactics
 
             def forward(
                 self,
@@ -14212,7 +14989,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             validate_activation_type as validate_rubin_activation_type
 
         class Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
-                TunableRunner):
+                CuteDSLTunableRunner):
             """Rubin runner for gather + grouped GEMM + activation fusion.
 
             SM107 counterpart to Blackwell's
@@ -15853,7 +16630,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_gemm_swiglu_fusion import \
             Sm107ContiguousGatherGroupedGemmSwigluFusionKernel
 
-        class Sm107ContiguousGatherGroupedGemmSwigluFusionRunner(TunableRunner):
+        class Sm107ContiguousGatherGroupedGemmSwigluFusionRunner(
+                CuteDSLTunableRunner):
             """Rubin (SM107) runner for BF16/FP16 gather + grouped GEMM + SwiGLU fusion (FC1).
 
             Similar to the blockscaled runner but without scale factors.
@@ -16448,7 +17226,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
 
         class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
-                TunableRunner):
+                CuteDSLTunableRunner):
             """Rubin (SM107) runner for grouped GEMM + finalize fusion (FC2).
 
             This is the Rubin counterpart to
@@ -17149,7 +17927,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_gemm_finalize_fusion import \
             Sm107ContiguousGroupedGemmFinalizeFusionKernel
 
-        class Sm107ContiguousGroupedGemmFinalizeFusionRunner(TunableRunner):
+        class Sm107ContiguousGroupedGemmFinalizeFusionRunner(
+                CuteDSLTunableRunner):
             """Rubin (SM107) runner for BF16/FP16 grouped GEMM + finalize fusion (FC2).
 
             Similar to the blockscaled finalize runner but without scale factors.
