@@ -83,6 +83,7 @@ from .modeling_gemma4mm import (
     Gemma4MultimodalEmbedder,
     Gemma4MultimodalModelBase,
 )
+from .modeling_multimodal_mixin import make_multimodal_encoder_model_config
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 # Raw HF nn.LayerNorm default eps (the unified vision LayerNorms use this, NOT
@@ -265,6 +266,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
         # --- Text backbone (reused verbatim) ---
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
+        encoder_model_config = make_multimodal_encoder_model_config(model_config_cp)
         # Mirror the parent's quant exclude_modules remap so quantized unified
         # checkpoints exclude the right text modules.
         quant_config = model_config_cp.quant_config
@@ -294,7 +296,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
                     config.vision_config,
                     config.text_config,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)
@@ -309,7 +311,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
                     text_hidden_size=config.text_config.hidden_size,
                     eps=config.audio_config.rms_norm_eps,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)
