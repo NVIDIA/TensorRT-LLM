@@ -11,11 +11,11 @@ from typing import Any
 import click
 import grpc
 import uvloop
-from openengine.v1 import openengine_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
 
+from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .servicer import OpenEngineInferenceServicer
 

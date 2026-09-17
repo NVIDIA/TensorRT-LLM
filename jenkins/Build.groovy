@@ -495,6 +495,11 @@ def runLLMBuild(
     }
 
     sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
+    // build_wheel.py generates OpenEngine bindings after the source snapshot
+    // above. Restage them so source-based tests do not shadow the installed
+    // wheel with an incomplete tensorrt_llm package.
+    sh "rm -rf TensorRT-LLM/src/tensorrt_llm/grpc/openengine/_generated"
+    sh "cp -r ${LLM_ROOT}/tensorrt_llm/grpc/openengine/_generated TensorRT-LLM/src/tensorrt_llm/grpc/openengine/"
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 

@@ -757,7 +757,9 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
                   exclude=("__pycache__", "*.pyc"))
     top_level_files = [
         "setup.py", "pyproject.toml", "requirements.txt",
-        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+        "requirements-dev.txt", "requirements-grpc-smg.txt",
+        "requirements-openengine.txt", "requirements-build-openengine.txt",
+        "constraints.txt", "LICENSE", "README.md"
     ]
     top_level_files += [
         f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
@@ -777,6 +779,23 @@ def install_editable_package(venv_python: Path) -> None:
     already uses `venv_python` for the same reason.
     """
     build_run(f"\"{venv_python}\" -m pip install -e .[devel]")
+
+
+def generate_openengine_bindings(project_dir: Path, package_dir: Path,
+                                 tool_env_root: Path) -> None:
+    """Generate private OpenEngine bindings with an isolated compiler toolchain."""
+    output_dir = package_dir / "grpc" / "openengine" / "_generated"
+    command = [
+        sys.executable,
+        str(project_dir / "scripts/generate_openengine_protos.py"),
+        "--project-root",
+        str(project_dir),
+        "--output",
+        str(output_dir),
+        "--tool-env-root",
+        str(tool_env_root),
+    ]
+    run(command, check=True)
 
 
 def main(*,
@@ -943,6 +962,22 @@ def main(*,
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    # Validate and generate the Python protocol package before the expensive
+    # native build. Configure-only and C++-only builds do not package Python.
+    if not configure_only and not cpp_only:
+        if out_of_tree:
+            wheel_project_dir = build_root / "package"
+            stage_python_package(project_dir, wheel_project_dir)
+        else:
+            wheel_project_dir = project_dir
+
+        pkg_dir = wheel_project_dir / "tensorrt_llm"
+        assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
+        proto_tool_env_root = ((build_root / "openengine-proto-tools")
+                               if build_root is not None else
+                               (build_dir / "openengine-proto-tools"))
+        generate_openengine_bindings(project_dir, pkg_dir, proto_tool_env_root)
+
     if use_ccache:
         if build_root is not None and "CCACHE_DIR" not in os.environ:
             # Default the cache next to the rest of the out-of-tree build
@@ -1075,16 +1110,6 @@ def main(*,
         assert not install, "Installing is not supported for cpp_only builds"
         return
 
-    if out_of_tree:
-        # Assemble the wheel in an out-of-tree staging project; the checkout
-        # is only read from this point on.
-        wheel_project_dir = build_root / "package"
-        stage_python_package(project_dir, wheel_project_dir)
-    else:
-        wheel_project_dir = project_dir
-
-    pkg_dir = wheel_project_dir / "tensorrt_llm"
-    assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     include_dir = pkg_dir / "include"
     if lib_dir.exists():

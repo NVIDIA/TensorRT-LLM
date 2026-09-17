@@ -116,6 +116,63 @@ def verify_license_files():
     print(f"✓ License files verified: {', '.join(verified_files)}")
 
 
+def verify_openengine_distribution() -> None:
+    """Verify the installed wheel's OpenEngine metadata and static payload."""
+    from importlib.metadata import distribution
+
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    dist = distribution("tensorrt_llm")
+    provided_extras = set(dist.metadata.get_all("Provides-Extra") or ())
+    expected_requirements = {
+        "grpc-smg": Requirement("smg-grpc-proto>=0.4.2"),
+        "openengine": Requirement("grpcio>=1.67.1,<2"),
+    }
+    missing_extras = set(expected_requirements) - provided_extras
+    if missing_extras:
+        raise RuntimeError("Missing TensorRT-LLM wheel extras: " +
+                           ", ".join(sorted(missing_extras)))
+
+    requirements = [Requirement(raw) for raw in (dist.requires or ())]
+    for extra, expected in expected_requirements.items():
+        declared = any(
+            canonicalize_name(requirement.name) == canonicalize_name(
+                expected.name) and requirement.specifier == expected.specifier
+            and requirement.marker is not None
+            and requirement.marker.evaluate({"extra": extra})
+            for requirement in requirements)
+        if not declared:
+            raise RuntimeError(
+                f"Wheel extra {extra!r} does not declare {expected}")
+
+    proto_names = (
+        "error",
+        "generation",
+        "kv",
+        "lifecycle",
+        "lora",
+        "model",
+        "openengine",
+        "server",
+    )
+    expected_files = {
+        *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.pyi"
+          for name in proto_names),
+        "tensorrt_llm/grpc/openengine/proto/LICENSE",
+        "tensorrt_llm/grpc/openengine/proto/manifest.json",
+        *(f"tensorrt_llm/grpc/openengine/proto/openengine/v1/{name}.proto"
+          for name in proto_names),
+    }
+    installed_files = {str(path) for path in (dist.files or ())}
+    missing_files = expected_files - installed_files
+    if missing_files:
+        raise RuntimeError("Missing OpenEngine wheel files: " +
+                           ", ".join(sorted(missing_files)))
+
+    print("✓ OpenEngine wheel metadata and static payload verified")
+
+
 def get_cpython_version():
     python_version = sys.version_info[:]
     assert python_version[0] == 3
@@ -288,6 +345,7 @@ def test_pip_install(args):
     download_wheel(args)
     install_tensorrt_llm()
 
+    verify_openengine_distribution()
     run_sanity_check()
 
 

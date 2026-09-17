@@ -5,12 +5,10 @@
 
 `trtllm-serve` can expose an experimental OpenEngine gRPC server instead of its normal OpenAI HTTP server. SMG remains the default gRPC protocol.
 
-Install the optional Python bindings from the Buf Schema Registry:
+Install the optional gRPC runtime:
 
 ```bash
-python -m pip install \
-  --extra-index-url https://buf.build/gen/python \
-  "tensorrt_llm[openengine]"
+python -m pip install "tensorrt_llm[openengine]"
 ```
 
 Then select OpenEngine when starting the gRPC server:
@@ -62,19 +60,13 @@ Bind it to loopback alongside its caller, or front it with a proxy that
 terminates TLS and authenticates. The server logs a warning when it binds to a
 non-loopback address.
 
-## Dependency provenance
+## Schema and binding provenance
 
-The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0). That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR commit `768a93c7b44e40f28c692ad0b471a8f2`.
+The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
 
-The BSR generated the pinned wheels from that module commit:
+TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. The adjacent `manifest.json` records the source mapping, generator versions, runtime floors, and per-file checksums. During a wheel or supported editable build, `scripts/generate_openengine_protos.py` uses the fully pinned compiler environment in `requirements-build-openengine.txt` to generate private bindings under `tensorrt_llm.grpc.openengine._generated`.
 
-| Package | Generator | Version | SHA-256 |
-| --- | --- | --- | --- |
-| `openengine-openengine-grpc-python` | [`grpc/python`](https://buf.build/grpc/python) | `1.67.1.2.20260730172104+768a93c7b44e` | `1485aed9799c4eb9367d1a261ca5cc5319f1e9b8d950ac98a26f3cb3641b8cf6` |
-| `openengine-openengine-protocolbuffers-python` | [`protocolbuffers/python`](https://buf.build/protocolbuffers/python) | `31.1.0.2.20260730172104+768a93c7b44e` | `6eae12c3d8d06147fccf608da9772d6391139031fabdafdb7cf4c71a19c1f25e` |
-| `openengine-openengine-protocolbuffers-pyi` | [`protocolbuffers/pyi`](https://buf.build/protocolbuffers/pyi) | `31.1.0.2.20260730172104+768a93c7b44e` | `8b0a054dbdaaa67459b3fa4786f13d8f6f4d30cf30be325f5416dbd97aba46a6` |
-
-Buf documents the package naming and version format in its [Python-generated SDK guide](https://buf.build/docs/bsr/generated-sdks/python/). The final version segment is the BSR commit prefix. The exact requirements are pinned in `requirements-openengine.txt`.
+The generated modules are build outputs and are not checked in. They are shipped only in TensorRT-LLM's private namespace; the wheel does not provide or depend on a top-level `openengine` Python package. The runtime dependencies remain TensorRT-LLM's base protobuf constraint plus `grpcio>=1.67.1,<2` from the OpenEngine extra.
 
 ## Maintenance boundary
 
