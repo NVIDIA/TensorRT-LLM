@@ -312,7 +312,7 @@ class TestFirstNewBlockProbe(unittest.TestCase):
         def storage_snapshot() -> list[tuple[int, int, int]]:
             return [
                 (stat.total, stat.free, stat.evictable)
-                for stat in _introspection.storage_statistics(self.manager)
+                for stat in self.manager.get_storage_statistics()
             ]
 
         before = storage_snapshot()
