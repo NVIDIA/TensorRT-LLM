@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -378,6 +378,79 @@ INSTANTIATE_MOE_OUTPUT_MEMSET(half);
 INSTANTIATE_MOE_OUTPUT_MEMSET(__nv_bfloat16);
 #endif
 #undef INSTANTIATE_MOE_OUTPUT_MEMSET
+
+template <typename InputType, int32_t kThreadsPerBlock>
+__global__ void moeOutputMemsetFromExpertCountsKernel(InputType* input, int32_t const* expertCounts,
+    int32_t const numLocalExperts, int32_t const expertCapacity, int32_t const hiddenSize)
+{
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    int64_t const copiesPerToken = hiddenSize / kElemPerCopy;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    int32_t const numExpandedTokens = numLocalExperts * expertCapacity;
+    for (int32_t expandedIdx = blockIdx.x; expandedIdx < numExpandedTokens; expandedIdx += gridDim.x)
+    {
+        int32_t const expertIdx = expandedIdx / expertCapacity;
+        int32_t const rowInExpert = expandedIdx - expertIdx * expertCapacity;
+        int32_t const count = min(max(expertCounts[expertIdx], 0), expertCapacity);
+        if (rowInExpert >= count)
+        {
+            continue;
+        }
+
+        auto* dst = reinterpret_cast<ElemCopyType*>(input) + expandedIdx * copiesPerToken;
+        ElemCopyType const zero{};
+        for (int64_t copyIdx = threadIdx.x; copyIdx < copiesPerToken; copyIdx += kThreadsPerBlock)
+        {
+            dst[copyIdx] = zero;
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename InputType>
+void moeOutputMemsetFromExpertCounts(InputType* input, int32_t const* expertCounts, int32_t const numLocalExperts,
+    int32_t const expertCapacity, int32_t const hiddenSize, cudaStream_t stream)
+{
+    int32_t constexpr kThreadsPerBlock = 256;
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    TLLM_CHECK_WITH_INFO(hiddenSize % kElemPerCopy == 0, "hiddenSize must be divisible by %d.", kElemPerCopy);
+    TLLM_CHECK_WITH_INFO(numLocalExperts > 0, "numLocalExperts must be positive.");
+    TLLM_CHECK_WITH_INFO(expertCapacity > 0, "expertCapacity must be positive.");
+
+    auto kernel = &moeOutputMemsetFromExpertCountsKernel<InputType, kThreadsPerBlock>;
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(kernel, kThreadsPerBlock, 0);
+    int32_t const blocks = std::min(smCount * maxBlocksPerSM, numLocalExperts * expertCapacity);
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = kThreadsPerBlock;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel, input, expertCounts, numLocalExperts, expertCapacity, hiddenSize);
+}
+
+#define INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(InputType)                                                    \
+    template void moeOutputMemsetFromExpertCounts<InputType>(InputType * input, int32_t const* expertCounts,           \
+        int32_t numLocalExperts, int32_t expertCapacity, int32_t hiddenSize, cudaStream_t stream)
+
+INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(half);
+#ifdef ENABLE_BF16
+INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(__nv_bfloat16);
+#endif
+#undef INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS
 
 template <typename InputType, typename OutputType, typename SFType, int32_t kSFVecSize, typename ActFn,
     int32_t kThreadsPerBlock>
