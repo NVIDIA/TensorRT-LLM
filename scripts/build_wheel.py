@@ -1133,9 +1133,14 @@ def main(*,
     # (shared build_root, --no_venv) with every other argument equal while
     # -S changes. The conan toolchain path is excluded: it is derived from
     # build_dir and constant per build dir.
-    configure_fingerprint = configure_args_fingerprint(cmake_def_args + [
-        cmake_cuda_architectures,
-        cmake_generator,
+    #
+    # The arguments are listed in the same order the configure command below
+    # passes them (built-in definitions, then cmake_def_args, then the
+    # generator and source). cmake applies repeated -D definitions left to
+    # right, so a user override in cmake_def_args (e.g. --extra-cmake-vars
+    # BUILD_PYT=OFF) must come after the built-in default for the fingerprint's
+    # last-wins to match the configuration cmake actually caches.
+    configure_fingerprint = configure_args_fingerprint([
         f'-DCMAKE_BUILD_TYPE="{build_type}"',
         f'-DBUILD_PYT="{build_pyt}"',
         f'-DBUILD_DEEP_EP="{build_deep_ep}"',
@@ -1146,6 +1151,9 @@ def main(*,
         f'-DBUILD_WHEEL_TARGETS="{";".join(targets)}"',
         f'-DPython_EXECUTABLE={venv_python}',
         f'-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}',
+        cmake_cuda_architectures,
+    ] + cmake_def_args + [
+        cmake_generator,
         f'-S "{source_dir}"',
     ])
     reason = configure_reason(build_dir,
