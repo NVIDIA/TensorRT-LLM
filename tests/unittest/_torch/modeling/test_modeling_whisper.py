@@ -122,7 +122,7 @@ def test_log_mel_frontend_does_not_mutate_input():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_whisper_for_conditional_generation_construction_and_forward() -> None:
+def test_whisper_for_conditional_generation_construction_and_forward():
     """Verify Whisper registration, construction, and forward parity with Hugging Face."""
     from transformers import WhisperForConditionalGeneration as HFWhisper
 
@@ -157,7 +157,7 @@ def test_whisper_for_conditional_generation_construction_and_forward() -> None:
     )
     config._attn_implementation = "eager"
 
-    def make_metadata(encoder_length: int | None = None) -> TrtllmAttentionMetadata:
+    def make_metadata(encoder_length=None):
         """Build context attention metadata for decoder self-attention or cross-attention."""
         metadata = TrtllmAttentionMetadata(
             max_num_requests=1,
