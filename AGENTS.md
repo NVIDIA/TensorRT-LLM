@@ -213,7 +213,8 @@ Semantic Review Preview` workflow on `pull_request`, including fork drafts.
 It shows two checks: `Automation tests and result lookup (not AI approval)`
 runs the unit tests and reads real CodeRabbit replies; the `AI` check is green
 only for a verified PASS and red for a verified FAIL. A missing, stale, or
-inconclusive verdict leaves `AI - no current verdict (advisory)` skipped (gray).
+inconclusive verdict leaves `AI verdict (advisory; skipped = unavailable)`
+skipped (gray).
 The lookup job succeeding is not an AI pass. These tests are not part of
 `Pre-commit Check`. The production request/publish workflow does not run on
 `pull_request`, so its unrelated jobs do not appear in the preview.
