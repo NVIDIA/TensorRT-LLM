@@ -2100,7 +2100,7 @@ class PyTorchModelEngine(ModelEngine):
         """Reset all MoE all-to-all state machines reachable from ``self.model``.
 
         Each MoE backend keeps a small dispatch/combine phase state per layer
-        (``MoeAlltoAll`` or ``NVLinkOneSided``). A forward that calls
+        (``NVLinkOneSided``). A forward that calls
         ``dispatch`` but raises before reaching ``combine`` (e.g., a warmup
         OOM mid-MoE) leaves that state in ``dispatched``, which fails the
         invariant on the next ``dispatch`` call. This helper walks the model

@@ -15,12 +15,6 @@
 
 import pytest
 
-from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import (
-    get_force_cft as get_force_cft_standalone,
-)
-from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import (
-    should_use_cft as should_use_cft_standalone,
-)
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
     FORCE_CFT_ENV,
     cft_driver_is_supported,
@@ -53,7 +47,6 @@ def test_get_force_cft(monkeypatch: pytest.MonkeyPatch, value: str | None, expec
         monkeypatch.setenv(FORCE_CFT_ENV, value)
 
     assert get_force_cft() is expected
-    assert get_force_cft_standalone() is expected
 
 
 @pytest.mark.parametrize(
@@ -74,10 +67,6 @@ def test_should_use_cft(
     expected: bool,
 ):
     assert should_use_cft(can_use_cft, force_cft, 128, runtime_max_tokens_per_rank) is expected
-    assert (
-        should_use_cft_standalone(can_use_cft, force_cft, 128, runtime_max_tokens_per_rank)
-        is expected
-    )
 
 
 @pytest.mark.parametrize(

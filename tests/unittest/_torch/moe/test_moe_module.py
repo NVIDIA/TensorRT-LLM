@@ -801,7 +801,7 @@ def _test_moe_worker_impl(
 # thread is spawned lazily on first submit and persists by design, so the
 # multi-GPU tests disable pytest-threadleak via @pytest.mark.threadleak(
 # enabled=False) (same convention as the conftest mpi_pool_executor users
-# test_moe_a2a / test_autotuner), rather than excluding it in pytest.ini.
+# test_nvlink_one_sided / test_autotuner), rather than excluding it in pytest.ini.
 # ---------------------------------------------------------------------------
 
 
@@ -863,7 +863,7 @@ def moe_multi_gpu_executor():
     pool's manager thread is spawned lazily on first submit and persists by
     design, so the multi-GPU tests disable pytest-threadleak via
     @pytest.mark.threadleak(enabled=False) (same convention as the other
-    mpi_pool_executor users, test_moe_a2a / test_autotuner). world_size is 4.
+    mpi_pool_executor users, test_nvlink_one_sided / test_autotuner). world_size is 4.
     """
     world_size = 4
     with MPIPoolExecutor(
