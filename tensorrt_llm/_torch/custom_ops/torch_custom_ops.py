@@ -58,8 +58,8 @@ from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      next_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellRunner
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVFP4BlackwellRunner, _cutedsl_nvmmh_tactic_search_cache_key)
 
 if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -1507,6 +1507,18 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                         tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
+
+    def use_torch_profiler(self, tactic) -> bool:
+        # Keep one timing backend for every candidate in a mixed-backend sweep.
+        return "cutedsl" in self.allowed_backends
+
+    def profiling_timer_cache_key(self) -> Optional[str]:
+        return "torch_profiler" if "cutedsl" in self.allowed_backends else None
+
+    def tactic_search_cache_key(self):
+        if "cutedsl" not in self.allowed_backends or not IS_CUTLASS_DSL_AVAILABLE:
+            return None
+        return _cutedsl_nvmmh_tactic_search_cache_key()
 
 
 @fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
