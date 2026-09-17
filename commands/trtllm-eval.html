@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -2006,6 +2017,12 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </dd></dl>
 
 <dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k-stop_strings">
+<span class="sig-name descname"><span class="pre">--stop_strings</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;stop_strings&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k-stop_strings" title="Link to this definition">#</a></dt>
+<dd><p>Replace the task yaml’s stop strings, as a JSON list, e.g. ‘[“&lt;/s&gt;”, “&lt;<a href="#id1"><span class="problematic" id="id2">|im_end|</span></a>&gt;”]’. GSM8K’s yaml stops on “Question:”, a few-shot delimiter; in a chat-templated 0-shot run a model that restates the question before answering stops within the first few tokens and scores zero.</p>
+</dd></dl>
+
+<dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k-log_samples">
 <span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k-log_samples" title="Link to this definition">#</a></dt>
 <dd><p>Log sample outputs for debugging.</p>
@@ -2720,7 +2737,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-mmmu-post_process_fn">
 <span class="sig-name descname"><span class="pre">--post_process_fn</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;post_process_fn&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmmu-post_process_fn" title="Link to this definition">#</a></dt>
-<dd><p>Per-sample post-processor. ‘strip_thinking_mmmu’ strips &lt;think&gt;…&lt;/think&gt; and then runs the MMMU answer extractor — needed for thinking models (Kimi K2.5, Step3p7) whose CoT output the default lm-eval regex cannot parse. ‘kimi_k3_mmmu’ reads the answer from Kimi K3’s &lt;<a href="#id1"><span class="problematic" id="id2">|open|</span></a>&gt;response&lt;<a href="#id3"><span class="problematic" id="id4">|sep|</span></a>&gt;…&lt;<a href="#id5"><span class="problematic" id="id6">|close|</span></a>&gt;response channel (its reasoning ends with &lt;<a href="#id7"><span class="problematic" id="id8">|close|</span></a>&gt;think&lt;<a href="#id9"><span class="problematic" id="id10">|sep|</span></a>&gt;, not &lt;/think&gt;, so the strip_thinking path cannot see the answer) and falls back to the strip_thinking cascade when no channel is present.</p>
+<dd><p>Per-sample post-processor. ‘strip_thinking_mmmu’ strips &lt;think&gt;…&lt;/think&gt; and then runs the MMMU answer extractor — needed for thinking models (Kimi K2.5, Step3p7) whose CoT output the default lm-eval regex cannot parse. ‘kimi_k3_mmmu’ reads the answer from Kimi K3’s &lt;<a href="#id3"><span class="problematic" id="id4">|open|</span></a>&gt;response&lt;<a href="#id5"><span class="problematic" id="id6">|sep|</span></a>&gt;…&lt;<a href="#id7"><span class="problematic" id="id8">|close|</span></a>&gt;response channel (its reasoning ends with &lt;<a href="#id9"><span class="problematic" id="id10">|close|</span></a>&gt;think&lt;<a href="#id11"><span class="problematic" id="id12">|sep|</span></a>&gt;, not &lt;/think&gt;, so the strip_thinking path cannot see the answer) and falls back to the strip_thinking cascade when no channel is present.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
 <dd class="field-odd"><p>strip_thinking_mmmu | kimi_k3_mmmu</p>
@@ -3131,9 +3148,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

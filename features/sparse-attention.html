@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Architecture Overview" href="../developer-guide/overview.html" />
+    <link rel="next" title="Visual Generation (Beta)" href="visual-generation.html" />
     <link rel="prev" title="KV Cache Connector" href="kv-cache-connector.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -664,77 +675,492 @@
   <section class="tex2jax_ignore mathjax_ignore" id="sparse-attention">
 <h1>Sparse Attention<a class="headerlink" href="#sparse-attention" title="Link to this heading">#</a></h1>
 <ul class="simple">
-<li><p><a class="reference internal" href="#overview">Overview</a></p>
+<li><p><a class="reference internal" href="#overview">Overview</a></p></li>
+<li><p><a class="reference internal" href="#supported-sparse-attentions">Supported Sparse Attentions</a></p>
 <ul>
-<li><p><a class="reference internal" href="#algorithms">Algorithms</a></p></li>
+<li><p><a class="reference internal" href="#sparse-mla">Sparse MLA</a></p></li>
+<li><p><a class="reference internal" href="#sparse-mqa-gqa">Sparse MQA/GQA</a></p></li>
+<li><p><a class="reference internal" href="#sparse-mha">Sparse MHA</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#rocketkv">RocketKV</a></p></li>
-<li><p><a class="reference internal" href="#deepseek-sparse-attention-dsa">DeepSeek Sparse Attention (DSA)</a></p></li>
-<li><p><a class="reference internal" href="#skip-softmax-attention">Skip Softmax Attention</a></p></li>
-<li><p><a class="reference internal" href="#algorithm-comparison">Algorithm Comparison</a></p></li>
+<li><p><a class="reference internal" href="#supported-algorithms">Supported Algorithms</a></p>
+<ul>
+<li><p><a class="reference internal" href="#capability-comparison">Capability Comparison</a></p></li>
+<li><p><a class="reference internal" href="#algorithm-details">Algorithm Details</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#usage-with-trtllm-bench-and-trtllm-serve">Usage with trtllm-bench and trtllm-serve</a></p></li>
 <li><p><a class="reference internal" href="#further-reading">Further Reading</a></p></li>
 </ul>
 <section id="overview">
 <h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
-<p>Sparse attention reduces the cost of long-context inference by skipping work on KV entries that contribute little to the attention output. In TensorRT LLM, sparse attention is enabled by passing a <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> object to the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> API, or its YAML equivalent for <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>, or <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code>. The config object is a discriminated union: each algorithm has its own subclass of <code class="docutils literal notranslate"><span class="pre">BaseSparseAttentionConfig</span></code> selected via the <code class="docutils literal notranslate"><span class="pre">algorithm</span></code> field.</p>
-<p>This page focuses on the <strong>user-facing API</strong>: how to construct and pass the config for each supported algorithm, in both Python and YAML form. For framework design details, see <a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html"><span class="std std-doc">Blog 17: Sparse Attention in TensorRT-LLM</span></a>. For developers adding a new sparse attention algorithm, see the <a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html"><span class="std std-doc">Sparse Attention Development Guide</span></a>.</p>
-<section id="algorithms">
-<h3>Algorithms<a class="headerlink" href="#algorithms" title="Link to this heading">#</a></h3>
+<p>Sparse attention reduces long-context inference cost by avoiding attention work on
+KV entries that an algorithm considers unimportant. TensorRT LLM separates two
+parts of that process:</p>
+<ol class="arabic simple">
+<li><p>An algorithm selects tokens or blocks, or decides which kernel tiles can be
+skipped.</p></li>
+<li><p>An attention implementation consumes that sparse pattern and computes the
+output.</p></li>
+</ol>
+<p>This distinction matters for support. A kernel that can compute sparse MQA/GQA
+does not by itself define how a model selects tokens, and therefore is not a
+standalone user-facing algorithm.</p>
+<p>The user-facing <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> API is currently prototype and is
+supported by the PyTorch execution backend. Each public algorithm has a config
+class selected by its <code class="docutils literal notranslate"><span class="pre">algorithm</span></code> field. Model-native algorithms usually read
+their geometry from the checkpoint; avoid overriding those values unless the
+model-specific guide says they are tunable.</p>
+</section>
+<section id="supported-sparse-attentions">
+<h2>Supported Sparse Attentions<a class="headerlink" href="#supported-sparse-attentions" title="Link to this heading">#</a></h2>
+<p>TensorRT LLM supports sparse computation for MLA, MQA/GQA, and MHA. This
+section describes the attention and kernel contracts independently of the
+algorithm that produces the sparse pattern. The public algorithms that connect
+selectors, cache management, and these attention implementations are listed in
+<a class="reference internal" href="#supported-algorithms">Supported Algorithms</a>.</p>
+<section id="sparse-mla">
+<h3>Sparse MLA<a class="headerlink" href="#sparse-mla" title="Link to this heading">#</a></h3>
+<p>Sparse MLA consumes token-level selections against a model-specific shared KV
+representation. DeepSeek Sparse Attention selects entries from a low-rank
+latent KV cache, while DeepSeek-V4 combines compressed full-head non-RoPE K
+with its corresponding RoPE K. Both prefill and generation are supported,
+including mixed batches.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Support</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>GPU architecture</p></td>
+<td><p>SM90, SM100, SM103, SM120, and SM121</p></td>
+</tr>
+<tr class="row-odd"><td><p>Compute phase</p></td>
+<td><p>Packed prefill and generation, including mixed batches</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention type</p></td>
+<td><p>MLA</p></td>
+</tr>
+<tr class="row-odd"><td><p>Head counts</p></td>
+<td><p>Checkpoint-defined</p></td>
+</tr>
+<tr class="row-even"><td><p>Q heads per KV head</p></td>
+<td><p>Not applicable; the model uses a shared KV representation</p></td>
+</tr>
+<tr class="row-odd"><td><p>Head dimensions</p></td>
+<td><p>DeepSeek-V3.2: QK <code class="docutils literal notranslate"><span class="pre">192</span></code>, V <code class="docutils literal notranslate"><span class="pre">128</span></code>; DeepSeek-V4: QK/V <code class="docutils literal notranslate"><span class="pre">512</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Input dtype</p></td>
+<td><p>BF16</p></td>
+</tr>
+<tr class="row-odd"><td><p>Input layout</p></td>
+<td><p>Model-native MLA inputs</p></td>
+</tr>
+<tr class="row-even"><td><p>Output dtype</p></td>
+<td><p>BF16</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV-cache dtype</p></td>
+<td><p>BF16 or model- and architecture-specific FP8</p></td>
+</tr>
+<tr class="row-even"><td><p>KV-cache layout</p></td>
+<td><p>Paged, model-specific shared KV representation</p></td>
+</tr>
+<tr class="row-odd"><td><p>Sparse granularity</p></td>
+<td><p>Token</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention semantics</p></td>
+<td><p>Causal self-attention</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">Input</span> <span class="pre">dtype</span></code> refers to model-native MLA inputs, which remain BF16. The FP8
+KV-cache entry and any internal FP8 staging do not indicate raw FP8 model-input
+support.</p>
+<p>See
+<a class="reference download internal" download="" href="../_downloads/9eb2b90f1faec25a3a31dcd1821e62c9/test_sparse_mla_forward.py"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">test_sparse_mla_forward.py</span></code></span></a>
+for executable sparse MLA examples.</p>
+</section>
+<section id="sparse-mqa-gqa">
+<h3>Sparse MQA/GQA<a class="headerlink" href="#sparse-mqa-gqa" title="Link to this heading">#</a></h3>
+<p>The table below compares token-sparse and 128-token block-sparse MQA/GQA. The
+token-sparse path accepts a precomputed token list for each KV head and query
+token; query heads in the same KV group share that list. The block-sparse path
+accepts request-local KV-block selections from a paged HND cache. The shared
+page-sparse generation path described under <a class="reference internal" href="#sparse-mha">Sparse MHA</a> also
+supports MQA and GQA.</p>
+<p>These are attention capabilities, not standalone public
+<code class="docutils literal notranslate"><span class="pre">SparseAttentionConfig</span></code> algorithms. A user-facing algorithm must also provide
+the selector, metadata, cache management, and backend integration.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Token-sparse</p></th>
+<th class="head"><p>Block-sparse</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>GPU architecture</p></td>
+<td><p>SM100 and SM103</p></td>
+<td><p>SM100 and SM103</p></td>
+</tr>
+<tr class="row-odd"><td><p>Compute phase</p></td>
+<td><p>Packed prefill and generation, including linear draft tokens</p></td>
+<td><p>Packed prefill and generation, including linear multi-query and mixed batches</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention type</p></td>
+<td><p>MQA and GQA</p></td>
+<td><p>MQA and GQA</p></td>
+</tr>
+<tr class="row-odd"><td><p>Head counts</p></td>
+<td><p>Q heads must be divisible by KV heads; no other discrete limit</p></td>
+<td><p>Q heads must be divisible by KV heads; no other discrete limit</p></td>
+</tr>
+<tr class="row-even"><td><p>Q heads per KV head</p></td>
+<td><p>At most 32</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2</span></code>, <code class="docutils literal notranslate"><span class="pre">4</span></code>, <code class="docutils literal notranslate"><span class="pre">8</span></code>, or <code class="docutils literal notranslate"><span class="pre">16</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Head dimensions</p></td>
+<td><p>Q/K/V: <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">80</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, or <code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>Q/K/V: <code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Input dtype</p></td>
+<td><p>BF16 or FP16</p></td>
+<td><p>BF16 or E4M3 FP8</p></td>
+</tr>
+<tr class="row-odd"><td><p>Input layout</p></td>
+<td><p>Fused QKV</p></td>
+<td><p>Q <code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">q_heads,</span> <span class="pre">128]</span></code>; paged K/V <code class="docutils literal notranslate"><span class="pre">[pages,</span> <span class="pre">kv_heads,</span> <span class="pre">128,</span> <span class="pre">128]</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Output dtype</p></td>
+<td><p>BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, and <code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>BF16</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV-cache dtype</p></td>
+<td><p>BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, and <code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>BF16 or E4M3 FP8</p></td>
+</tr>
+<tr class="row-even"><td><p>KV-cache layout</p></td>
+<td><p>Paged cache; page size is a power of two and at least 8 tokens</p></td>
+<td><p>Paged HND cache with page size <code class="docutils literal notranslate"><span class="pre">128</span></code>; supports shuffled physical pages and strided outer-page storage</p></td>
+</tr>
+<tr class="row-odd"><td><p>Sparse granularity</p></td>
+<td><p>Token</p></td>
+<td><p>Block (<code class="docutils literal notranslate"><span class="pre">128</span></code> tokens)</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention semantics</p></td>
+<td><p>Causal self-attention</p></td>
+<td><p>Causal self-attention with bottom-right or explicit per-request query offsets</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The token-sparse path is JIT-compiled with NVRTC. During linear draft-token
+generation, each query has its own causal sparse list, including K/V written
+earlier in the same speculative forward.</p>
+<p>For an FP8 KV cache, token-sparse Q is quantized to E4M3 during QKV
+preprocessing while the model input remains BF16 or FP16. The path supports
+both BF16 output with an FP8 KV cache and E4M3 FP8 output.</p>
+<p>This is distinct from the block-sparse column: its E4M3 input row is a raw Q/K/V
+contract of that dedicated backend. Raw E4M3 fused QKV is not a token-sparse
+MQA/GQA input contract.</p>
+<p>Backend developers can use
+<a class="reference download internal" download="" href="../_downloads/4f8cb01524cfb883e291284daf83ebc9/test_sparse_mqa_gqa.py"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">test_sparse_mqa_gqa.py</span></code></span></a>
+as an executable integration example.</p>
+</section>
+<section id="sparse-mha">
+<h3>Sparse MHA<a class="headerlink" href="#sparse-mha" title="Link to this heading">#</a></h3>
+<p>The shared page-sparse MHA path consumes block indices and per-request offsets
+produced by a sparse selector. Sparse MHA computation starts during generation;
+prefill attention computation remains dense. An algorithm can still compact
+the retained KV cache after prefill to reduce cache size and later decode work.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Support</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>GPU architecture</p></td>
+<td><p>SM100 and SM103</p></td>
+</tr>
+<tr class="row-odd"><td><p>Compute phase</p></td>
+<td><p>Generation, including single-token and linear draft-token inputs</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention type</p></td>
+<td><p>MHA</p></td>
+</tr>
+<tr class="row-odd"><td><p>Head counts</p></td>
+<td><p>Positive and <code class="docutils literal notranslate"><span class="pre">num_q_heads</span> <span class="pre">==</span> <span class="pre">num_kv_heads</span></code>; no other discrete limit</p></td>
+</tr>
+<tr class="row-even"><td><p>Q heads per KV head</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Head dimensions</p></td>
+<td><p>Q/K/V: <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">80</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, or <code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Input dtype</p></td>
+<td><p>BF16 or FP16</p></td>
+</tr>
+<tr class="row-odd"><td><p>Input layout</p></td>
+<td><p>Fused QKV</p></td>
+</tr>
+<tr class="row-even"><td><p>Output dtype</p></td>
+<td><p>Model dtype for head dimensions <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">80</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, and <code class="docutils literal notranslate"><span class="pre">256</span></code>; E4M3 FP8 for head dimensions <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, and <code class="docutils literal notranslate"><span class="pre">256</span></code> with an FP8 KV cache</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV-cache dtype</p></td>
+<td><p>Model dtype for head dimensions <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">80</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, and <code class="docutils literal notranslate"><span class="pre">256</span></code>; E4M3 FP8 for head dimensions <code class="docutils literal notranslate"><span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">128</span></code>, and <code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>KV-cache layout</p></td>
+<td><p>Paged KV cache; page size is a power of two and at least 8 tokens</p></td>
+</tr>
+<tr class="row-odd"><td><p>Sparse granularity</p></td>
+<td><p>Positive-size blocks expanded to KV-cache pages</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention semantics</p></td>
+<td><p>Causal self-attention</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The E4M3 entries above describe FP8 KV-cache and output paths. The fused model
+QKV input remains BF16 or FP16; raw E4M3 fused QKV is not supported by the
+page-sparse MHA path.</p>
+<p>Backend developers can use
+<a class="reference download internal" download="" href="../_downloads/7525b8aed6c47a4c776c4122e5b37b42/test_sparse_mha.py"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">test_sparse_mha.py</span></code></span></a>
+as an executable integration example.</p>
+<p><a id="block-sparse-mha-mqa-gqa"></a></p>
+</section>
+<section id="block-sparse-mha-mqa-gqa">
+<h3>Block-sparse MHA/MQA/GQA<a class="headerlink" href="#block-sparse-mha-mqa-gqa" title="Link to this heading">#</a></h3>
+<p>The generic block-sparse path executes attention over KV blocks that a sparse
+algorithm selects for each KV head. The algorithm hands its routes to the core
+forward through the <code class="docutils literal notranslate"><span class="pre">block_sparse_attn_predict</span></code> hook as
+<code class="docutils literal notranslate"><span class="pre">BlockSparseForwardInputs</span></code>: canonical BSR (<code class="docutils literal notranslate"><span class="pre">block_indptr</span></code> plus <code class="docutils literal notranslate"><span class="pre">block_indices</span></code>)
+or a packed block bitmask, optionally with K/V block summaries so unselected
+blocks contribute a proxy instead of being dropped. Only the block-sparse FMHA
+library declares <code class="docutils literal notranslate"><span class="pre">supports_block_sparse_inputs</span></code>, so a request that carries
+routes is never served by a dense kernel. Both the contiguous prefill path,
+used by diffusion models that keep no KV cache, and the paged generation path
+are provided by the vendored PrimTS kernels.</p>
+<p>This is an attention capability, not a standalone public
+<code class="docutils literal notranslate"><span class="pre">SparseAttentionConfig</span></code> algorithm. A user-facing algorithm must also provide
+the selector, metadata, and backend integration.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Contiguous prefill</p></th>
+<th class="head"><p>Paged generation</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>GPU architecture</p></td>
+<td><p>SM100 and SM103</p></td>
+<td><p>SM100 and SM103</p></td>
+</tr>
+<tr class="row-odd"><td><p>Compute phase</p></td>
+<td><p>Prefill with separate Q/K/V and no KV cache</p></td>
+<td><p>Generation with a fixed per-request query length</p></td>
+</tr>
+<tr class="row-even"><td><p>Attention type</p></td>
+<td><p>MHA, MQA, and GQA</p></td>
+<td><p>MHA, MQA, and GQA</p></td>
+</tr>
+<tr class="row-odd"><td><p>Head counts</p></td>
+<td><p>Q heads must be divisible by KV heads; no other discrete limit</p></td>
+<td><p>Q heads must be divisible by KV heads; no other discrete limit</p></td>
+</tr>
+<tr class="row-even"><td><p>Q heads per KV head</p></td>
+<td><p>Any divisor of the Q head count</p></td>
+<td><p>Any divisor of the Q head count</p></td>
+</tr>
+<tr class="row-odd"><td><p>Head dimensions</p></td>
+<td><p>Q/K/V: <code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+<td><p>Q/K/V: <code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Input dtype</p></td>
+<td><p>BF16 or FP16</p></td>
+<td><p>BF16 or FP16</p></td>
+</tr>
+<tr class="row-odd"><td><p>Input layout</p></td>
+<td><p>Separate Q <code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">q_heads,</span> <span class="pre">128]</span></code> and K/V <code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">kv_heads,</span> <span class="pre">128]</span></code></p></td>
+<td><p>Fused QKV</p></td>
+</tr>
+<tr class="row-even"><td><p>Output dtype</p></td>
+<td><p>Model dtype</p></td>
+<td><p>Model dtype</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV-cache dtype</p></td>
+<td><p>No KV cache</p></td>
+<td><p>Model dtype</p></td>
+</tr>
+<tr class="row-even"><td><p>KV-cache layout</p></td>
+<td><p>No KV cache</p></td>
+<td><p>Paged HND cache; page size <code class="docutils literal notranslate"><span class="pre">64</span></code> or <code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Sparse granularity</p></td>
+<td><p>Q blocks of <code class="docutils literal notranslate"><span class="pre">q_block_size</span></code> tokens by KV blocks of <code class="docutils literal notranslate"><span class="pre">8</span></code>, <code class="docutils literal notranslate"><span class="pre">16</span></code>, <code class="docutils literal notranslate"><span class="pre">32</span></code>, or a positive multiple of <code class="docutils literal notranslate"><span class="pre">64</span></code> tokens, selected per KV head</p></td>
+<td><p>KV blocks of a positive multiple of <code class="docutils literal notranslate"><span class="pre">64</span></code> tokens, selected per KV head</p></td>
+</tr>
+<tr class="row-even"><td><p>Sparse routes</p></td>
+<td><p>BSR or packed bitmask; optional K/V block summaries (proxy routes); optional packed <code class="docutils literal notranslate"><span class="pre">kv_valid_bits</span></code> for ragged KV tails</p></td>
+<td><p>BSR; live per-request KV lengths and page tables</p></td>
+</tr>
+<tr class="row-odd"><td><p>Attention semantics</p></td>
+<td><p>Dense or causal self-attention; proxy routes require dense</p></td>
+<td><p>Causal self-attention</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Routes are validated against the kernel’s static profile on every call, and an
+unsupported request raises instead of degrading to dense attention. A paged
+request needs a page that holds at least one 64-token route fragment, which is
+why page sizes below <code class="docutils literal notranslate"><span class="pre">64</span></code> are rejected.</p>
+<p>Backend developers can use
+<a class="reference download internal" download="" href="../_downloads/e6153b33a76705e3ad7c12d38cf3de24/test_prims_ts_block_sparse.py"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">test_prims_ts_block_sparse.py</span></code></span></a>
+as an executable integration example; it covers MHA, GQA, and MQA head
+topologies, both model dtypes, KV block sizes <code class="docutils literal notranslate"><span class="pre">64</span></code> and <code class="docutils literal notranslate"><span class="pre">128</span></code>, page sizes <code class="docutils literal notranslate"><span class="pre">64</span></code>
+and <code class="docutils literal notranslate"><span class="pre">128</span></code>, proxy routes, token-validity masks, and CUDA Graph replay.</p>
+<p><a id="framework-level-sparse-attention"></a></p>
+</section>
+</section>
+<section id="supported-algorithms">
+<h2>Supported Algorithms<a class="headerlink" href="#supported-algorithms" title="Link to this heading">#</a></h2>
+<p>The public <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> API connects a sparse algorithm to its
+selector, runtime metadata, cache management, and attention implementation.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">algorithm</span></code></p></th>
 <th class="head"><p>Config class</p></th>
-<th class="head"><p>Reference</p></th>
+<th class="head"><p>Sparse mechanism</p></th>
+<th class="head"><p>Attention implementation</p></th>
+<th class="head"><p>Typical use</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rocket</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">RocketSparseAttentionConfig</span></code></p></td>
-<td><p><a class="reference external" href="https://arxiv.org/pdf/2502.14051">RocketKV paper</a></p></td>
+<td><p>Prompt KV eviction, then page-level Top-K selection during decode</p></td>
+<td><p>TRTLLM or Vanilla</p></td>
+<td><p>Training-free sparsity for MHA/MQA/GQA models</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dsa</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">DeepSeekSparseAttentionConfig</span></code></p></td>
-<td><p><a class="reference external" href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf">DeepSeek V3.2 paper</a></p></td>
+<td><p>Learned token-level indexer followed by sparse MLA</p></td>
+<td><p>TRTLLM</p></td>
+<td><p>DeepSeek-V3.2 and compatible model-native DSA architectures</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">deepseek_v4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DeepSeekV4SparseAttentionConfig</span></code></p></td>
+<td><p>Sliding-window attention plus compressed sparse or compressed dense history</p></td>
+<td><p>TRTLLM</p></td>
+<td><p>DeepSeek-V4 hybrid attention</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">minimax_m3</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseAttentionConfig</span></code></p></td>
+<td><p>Learned block selection followed by sparse GQA</p></td>
+<td><p>Dedicated Triton or packaged block-sparse implementation</p></td>
+<td><p>MiniMax-M3 sparse layers</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">skip_softmax</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">SkipSoftmaxAttentionConfig</span></code></p></td>
-<td><p><a class="reference external" href="https://arxiv.org/pdf/2512.12087">BLASST paper</a></p></td>
+<td><p>Dynamically skips eligible softmax work inside the FMHA kernel</p></td>
+<td><p>TRTLLM</p></td>
+<td><p>Existing full-attention models with calibrated or direct thresholds</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>For per-field semantics, refer to the docstring on each config class in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/llm_args.py</span></code>.</p>
-<p>YAML configs shown below are consumed via the standard <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> / <code class="docutils literal notranslate"><span class="pre">--config</span></code> flag:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>--model<span class="w"> </span>&lt;model_path&gt;<span class="w"> </span>--config<span class="w"> </span>extra_config.yaml<span class="w"> </span>...
-trtllm-bench<span class="w"> </span>--model<span class="w"> </span>&lt;model_path&gt;<span class="w"> </span>--config<span class="w"> </span>extra_config.yaml<span class="w"> </span>...
-trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model_path&gt;<span class="w"> </span>--config<span class="w"> </span>extra_config.yaml<span class="w"> </span>longbench_v2<span class="w"> </span>--max_output_length<span class="w"> </span><span class="m">1024</span>
-</pre></div>
+<p>All five configs are supported only by the PyTorch execution backend. The
+“attention implementation” column refers to the attention kernel/backend used
+inside that execution backend.</p>
+<section id="capability-comparison">
+<h3>Capability Comparison<a class="headerlink" href="#capability-comparison" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Capability</p></th>
+<th class="head text-right"><p>RocketKV</p></th>
+<th class="head text-right"><p>DSA</p></th>
+<th class="head text-right"><p>DeepSeek-V4</p></th>
+<th class="head text-right"><p>MiniMax-M3</p></th>
+<th class="head text-right"><p>Skip Softmax</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Sparse prefill computation</p></td>
+<td class="text-right"><p>No</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p>Sparse decode computation</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p>Reduces retained main KV history</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>No</p></td>
+<td class="text-right"><p>Yes, through model-native compression</p></td>
+<td class="text-right"><p>No</p></td>
+<td class="text-right"><p>No</p></td>
+</tr>
+<tr class="row-odd"><td><p>Requires a model-trained selector</p></td>
+<td class="text-right"><p>No</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>No</p></td>
+</tr>
+<tr class="row-even"><td><p>Selection granularity</p></td>
+<td class="text-right"><p>Token eviction and pages</p></td>
+<td class="text-right"><p>Tokens</p></td>
+<td class="text-right"><p>Compressed entries</p></td>
+<td class="text-right"><p>Blocks</p></td>
+<td class="text-right"><p>Kernel tiles</p></td>
+</tr>
+</tbody>
+</table>
 </div>
+<p>“No” for RocketKV prefill means that prompt attention is still computed
+densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
+size and later decode work.</p>
 </section>
-</section>
+<section id="algorithm-details">
+<h3>Algorithm Details<a class="headerlink" href="#algorithm-details" title="Link to this heading">#</a></h3>
 <section id="rocketkv">
-<h2>RocketKV<a class="headerlink" href="#rocketkv" title="Link to this heading">#</a></h2>
-<p>RocketKV is a training-free, two-stage algorithm. It applies permanent KV cache eviction in the context phase, followed by dynamic Top-K token selection in the generation phase. Some framework-level algorithms, including RocketKV, currently require disabling KV cache block reuse.</p>
-<p><strong>Python API</strong></p>
+<h4>RocketKV<a class="headerlink" href="#rocketkv" title="Link to this heading">#</a></h4>
+<p><a class="reference external" href="https://arxiv.org/pdf/2502.14051">RocketKV</a> is a training-free, two-stage
+algorithm for MHA, MQA, and GQA architectures. During prefill, it computes dense
+attention and permanently evicts prompt KV entries beyond a prompt budget.
+During decode, it scores retained pages and attends to the selected Top-K
+pages.</p>
+<p>RocketKV currently requires CUDA compute capability 10.0 or newer. KV-cache
+block reuse and chunked prefill must be disabled, and disaggregated serving is
+not supported.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">RocketSparseAttentionConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span>
-
-<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">RocketSparseAttentionConfig</span><span class="p">(</span>
-    <span class="n">prompt_budget</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
-    <span class="n">kt_cache_dtype</span><span class="o">=</span><span class="s2">"float8_e5m2"</span><span class="p">,</span>
-<span class="p">)</span>
-<span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">RocketSparseAttentionConfig</span>
 
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
     <span class="n">model</span><span class="o">=</span><span class="s2">"&lt;path_or_hf_id&gt;"</span><span class="p">,</span>
-    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">sparse_attention_config</span><span class="p">,</span>
-    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">kv_cache_config</span><span class="p">,</span>
+    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">RocketSparseAttentionConfig</span><span class="p">(</span>
+        <span class="n">prompt_budget</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+        <span class="n">kt_cache_dtype</span><span class="o">=</span><span class="s2">"float8_e5m2"</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+    <span class="n">enable_chunked_prefill</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span>
-<span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">"To be or not to be..."</span><span class="p">],</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">128</span><span class="p">))</span>
+<span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+    <span class="p">[</span><span class="s2">"To be or not to be..."</span><span class="p">],</span>
+    <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">128</span><span class="p">),</span>
+<span class="p">)</span>
 </pre></div>
 </div>
-<p><strong>YAML</strong></p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rocket</span>
 <span class="w">  </span><span class="nt">prompt_budget</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
@@ -744,51 +1170,137 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model_path
 <span class="nt">enable_chunked_prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
 </pre></div>
 </div>
+<p>The TRTLLM and Vanilla attention implementations support RocketKV. The
+Vanilla implementation requires a BF16 KT cache.</p>
 </section>
-<section id="deepseek-sparse-attention-dsa">
-<h2>DeepSeek Sparse Attention (DSA)<a class="headerlink" href="#deepseek-sparse-attention-dsa" title="Link to this heading">#</a></h2>
-<p>DSA is a model-native sparse attention mechanism introduced with DeepSeek V3.2. A lightweight learned indexer scores all KV entries, and only the top-<code class="docutils literal notranslate"><span class="pre">index_topk</span></code> entries are attended to.</p>
-<p><strong>Python API</strong></p>
+<section id="deepseek-sparse-attention">
+<h4>DeepSeek Sparse Attention<a class="headerlink" href="#deepseek-sparse-attention" title="Link to this heading">#</a></h4>
+<p>DeepSeek Sparse Attention (DSA) is a model-native mechanism introduced by
+DeepSeek V3.2. A learned MQA indexer scores the KV history, Top-K selects token
+indices, and sparse MLA consumes them. Checkpoint fields define the indexer
+head count, index head dimension, and Top-K; the safest configuration is to let
+TensorRT LLM load them from the model.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">DeepSeekSparseAttentionConfig</span>
 
-<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">DeepSeekSparseAttentionConfig</span><span class="p">(</span><span class="n">index_topk</span><span class="o">=</span><span class="mi">64</span><span class="p">)</span>
-
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-    <span class="n">model</span><span class="o">=</span><span class="s2">"&lt;path_or_hf_id&gt;"</span><span class="p">,</span>
-    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">sparse_attention_config</span><span class="p">,</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">"deepseek-ai/DeepSeek-V3.2"</span><span class="p">,</span>
+    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">DeepSeekSparseAttentionConfig</span><span class="p">(),</span>
 <span class="p">)</span>
 </pre></div>
 </div>
-<p><strong>YAML</strong></p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dsa</span>
-<span class="w">  </span><span class="nt">index_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span>
-</pre></div>
-</div>
-<p><strong>Optional: Guess-Verify-Refine Top-K.</strong> On Blackwell (SM 100+), set <code class="docutils literal notranslate"><span class="pre">enable_heuristic_topk=True</span></code> to use the Guess-Verify-Refine (GVR) Top-K. GVR is currently supported only for <code class="docutils literal notranslate"><span class="pre">index_topk=2048</span></code>; other values fall back to the production insertion/radix Top-K. <code class="docutils literal notranslate"><span class="pre">TRTLLM_HEURISTIC_NMIN</span></code> overrides the small-batch lower bound, and <code class="docutils literal notranslate"><span class="pre">TRTLLM_SCHEMEX_DEBUG=1</span></code> prints the dispatcher decision.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">DeepSeekSparseAttentionConfig</span><span class="p">(</span>
-    <span class="n">index_topk</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
-    <span class="n">enable_heuristic_topk</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="p">)</span>
-</pre></div>
-</div>
+<p>On supported Blackwell configurations, Guess-Verify-Refine (GVR) can replace
+the regular decode Top-K dispatcher. The current implementation accepts
+<code class="docutils literal notranslate"><span class="pre">index_topk</span></code> values <code class="docutils literal notranslate"><span class="pre">512</span></code>, <code class="docutils literal notranslate"><span class="pre">1024</span></code>, and <code class="docutils literal notranslate"><span class="pre">2048</span></code>, and indexer compression ratios
+<code class="docutils literal notranslate"><span class="pre">1</span></code> and <code class="docutils literal notranslate"><span class="pre">4</span></code>. Unsupported combinations fall back to the production
+insertion/radix Top-K path.</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dsa</span>
 <span class="w">  </span><span class="nt">index_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="w">  </span><span class="nt">enable_heuristic_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 </pre></div>
 </div>
+<p>See the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/models/core/deepseek_v3/README.md">DeepSeek V3/V3.2 example</a>
+for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
+and disaggregated-serving support.</p>
+</section>
+<section id="deepseek-v4-hybrid-sparse-attention">
+<h4>DeepSeek-V4 Hybrid Sparse Attention<a class="headerlink" href="#deepseek-v4-hybrid-sparse-attention" title="Link to this heading">#</a></h4>
+<p>DeepSeek-V4 interleaves three model-native attention modes:</p>
+<ul class="simple">
+<li><p>sliding-window attention over recent raw tokens;</p></li>
+<li><p>compressed sparse attention over 4x-compressed history selected by an
+indexer;</p></li>
+<li><p>compressed dense attention over 128x-compressed history.</p></li>
+</ul>
+<p>TensorRT LLM normally constructs <code class="docutils literal notranslate"><span class="pre">DeepSeekV4SparseAttentionConfig</span></code> from the
+checkpoint. An explicit config overrides matching fields; it must preserve the
+model’s attention layout. The current implementation requires
+<code class="docutils literal notranslate"><span class="pre">window_size=128</span></code>, compression ratios from <code class="docutils literal notranslate"><span class="pre">{1,</span> <span class="pre">4,</span> <span class="pre">128}</span></code>, Hopper (<code class="docutils literal notranslate"><span class="pre">SM90</span></code>) or
+Blackwell (<code class="docutils literal notranslate"><span class="pre">SM100+</span></code>) GPUs, KV-cache blocks of <code class="docutils literal notranslate"><span class="pre">128</span></code> or <code class="docutils literal notranslate"><span class="pre">256</span></code> tokens, and beam
+width <code class="docutils literal notranslate"><span class="pre">1</span></code>. Hopper requires <code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype=fp8_ds_mla</span></code>; on SM120 and
+SM121, that cache layout requires 256-token blocks.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">deepseek_v4</span>
+<span class="w">  </span><span class="nt">window_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
+<span class="w">  </span><span class="nt">index_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
+</pre></div>
+</div>
+<p>See the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example</a> for
+checkpoint-derived configuration and deployment constraints.</p>
+</section>
+<section id="minimax-m3-block-sparse-gqa">
+<h4>MiniMax-M3 Block-Sparse GQA<a class="headerlink" href="#minimax-m3-block-sparse-gqa" title="Link to this heading">#</a></h4>
+<p>MiniMax-M3 uses model-native block-sparse GQA in its sparse layers. An index
+branch scores main KV-cache blocks, forces configured initial/local blocks into
+the selection, and chooses the remaining Top-K blocks before sparse GQA.
+Defaults such as four index heads, index dimension <code class="docutils literal notranslate"><span class="pre">128</span></code>, block size <code class="docutils literal notranslate"><span class="pre">128</span></code>, and
+16 selected blocks come from the checkpoint-compatible config.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">minimax_m3</span>
+</pre></div>
+</div>
+<p>Two implementations are available:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">triton</span></code> is the default reference implementation.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">msa</span></code> uses <code class="docutils literal notranslate"><span class="pre">fmha_sm100</span></code> kernels and requires an SM100-family GPU (SM100 or
+SM103), the <code class="docutils literal notranslate"><span class="pre">fmha_sm100</span></code> package, and <code class="docutils literal notranslate"><span class="pre">sparse_block_size=128</span></code>.</p></li>
+</ul>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">minimax_m3</span>
+<span class="w">  </span><span class="nt">implementation</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">msa</span>
+</pre></div>
+</div>
+<p>The sparse path currently has no dense fallback and does not support KV-cache
+reuse or MTP. See the
+<a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html"><span class="std std-doc">MiniMax-M3 deployment guide</span></a>
+for supported checkpoints and parallel deployment settings.</p>
+<p><a id="kernel-level-sparse-attention"></a></p>
 </section>
 <section id="skip-softmax-attention">
-<h2>Skip Softmax Attention<a class="headerlink" href="#skip-softmax-attention" title="Link to this heading">#</a></h2>
-<p>Skip Softmax Attention is a kernel-level method, also known as BLASST, that dynamically skips computation in a FlashAttention-style kernel. It can accelerate existing full-attention models without changing the model architecture.</p>
-<p>The value actually consumed by the kernel is <strong><code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code></strong>. The kernel combines it with the <strong>sequence length</strong> to compute the <strong>threshold</strong> at runtime. Other configuration paths resolve to that scalar before the attention backend is constructed.</p>
-<section id="checkpoint-config">
-<h3>Checkpoint Config<a class="headerlink" href="#checkpoint-config" title="Link to this heading">#</a></h3>
-<p><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA Model Optimizer</a> (ModelOpt) can perform calibration and store metadata for Skip Softmax Attention in the model checkpoint’s <code class="docutils literal notranslate"><span class="pre">config.json</span></code>. The checkpoint config provides the formula that maps <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> to <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code>.</p>
-<p>This checkpoint config is <strong>optional</strong>. It is only required when using <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code>, which is a [0, 1] scalar that is more intuitive than directly choosing the kernel-facing <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code>. But please note that <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> only serves as a guidance, the actual <strong>achieved</strong> sparsity in the kernel would vary.</p>
-<p>Example checkpoint config:</p>
+<h4>Skip Softmax Attention<a class="headerlink" href="#skip-softmax-attention" title="Link to this heading">#</a></h4>
+<p>Skip Softmax Attention, also known as BLASST, dynamically skips eligible work
+inside a FlashAttention-style kernel. It does not select tokens, alter the
+model architecture, or reduce KV-cache storage.</p>
+<p>The kernel consumes <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> and combines it with sequence
+length at runtime. You can provide that value directly:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">SkipSoftmaxAttentionConfig</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">"&lt;path_or_hf_id&gt;"</span><span class="p">,</span>
+    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span>
+        <span class="n">threshold_scale_factor</span><span class="o">=</span><span class="p">{</span><span class="s2">"prefill"</span><span class="p">:</span> <span class="mf">1000.0</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">:</span> <span class="mf">500.0</span><span class="p">},</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">  </span><span class="nt">threshold_scale_factor</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1000.0</span>
+<span class="w">    </span><span class="nt">decode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">500.0</span>
+</pre></div>
+</div>
+<p>Alternatively, provide <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code>. This path requires the checkpoint to
+contain a calibration formula that maps the requested target to the kernel’s
+threshold scale factor. <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> is calibration guidance rather than a
+runtime guarantee; the achieved sparsity depends on the model inputs and
+workload.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">  </span><span class="nt">target_sparsity</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.5</span>
+<span class="w">    </span><span class="nt">decode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.3</span>
+</pre></div>
+</div>
+<p>Both fields accept a scalar for both phases or a dictionary with <code class="docutils literal notranslate"><span class="pre">prefill</span></code> and
+<code class="docutils literal notranslate"><span class="pre">decode</span></code> values. If both are present, <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> takes
+precedence. User-provided <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> overrides a checkpoint default.</p>
+<p>Model Optimizer can store calibration metadata in the checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">config.json</span></code>:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
 <span class="w">  </span><span class="nt">"sparse_attention_config"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="nt">"config_groups"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
@@ -797,127 +1309,80 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model_path
 <span class="w">        </span><span class="nt">"threshold_scale_factor"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
 <span class="w">          </span><span class="nt">"formula"</span><span class="p">:</span><span class="w"> </span><span class="s2">"a * exp(b * target_sparsity)"</span><span class="p">,</span>
 <span class="w">          </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"a"</span><span class="p">:</span><span class="w"> </span><span class="mf">100.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"b"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.0</span><span class="p">},</span>
-<span class="w">          </span><span class="nt">"decode"</span><span class="p">:</span><span class="w">  </span><span class="p">{</span><span class="nt">"a"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05</span><span class="p">,</span><span class="w">  </span><span class="nt">"b"</span><span class="p">:</span><span class="w"> </span><span class="mf">10.0</span><span class="p">}</span>
+<span class="w">          </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"a"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05</span><span class="p">,</span><span class="w"> </span><span class="nt">"b"</span><span class="p">:</span><span class="w"> </span><span class="mf">10.0</span><span class="p">}</span>
 <span class="w">        </span><span class="p">},</span>
-<span class="w">        </span><span class="nt">"target_sparsity"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">          </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span>
-<span class="w">          </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.3</span>
-<span class="w">        </span><span class="p">},</span>
-<span class="w">        </span><span class="nt">"ignore"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
-<span class="w">          </span><span class="s2">"model.layers.0.self_attn"</span><span class="p">,</span>
-<span class="w">          </span><span class="s2">"model.layers.1.self_attn"</span>
-<span class="w">        </span><span class="p">]</span>
+<span class="w">        </span><span class="nt">"target_sparsity"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.3</span><span class="p">},</span>
+<span class="w">        </span><span class="nt">"ignore"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"model.layers.0.self_attn"</span><span class="p">]</span>
 <span class="w">      </span><span class="p">}</span>
 <span class="w">    </span><span class="p">}</span>
 <span class="w">  </span><span class="p">}</span>
 <span class="p">}</span>
 </pre></div>
 </div>
-<p>The checkpoint config may contain multiple <code class="docutils literal notranslate"><span class="pre">config_groups</span></code> for different sparse attention algorithms. At most one group may configure Skip Softmax Attention. Multiple groups whose <code class="docutils literal notranslate"><span class="pre">algorithm</span></code> is <code class="docutils literal notranslate"><span class="pre">skip_softmax</span></code> are invalid.</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">formula</span></code> — an <strong>arbitrary</strong> <a class="reference external" href="https://numexpr.readthedocs.io/">numexpr</a> expression of <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> using <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> and one or more named coefficients. Standard math functions such as <code class="docutils literal notranslate"><span class="pre">exp</span></code>, <code class="docutils literal notranslate"><span class="pre">log</span></code>, <code class="docutils literal notranslate"><span class="pre">sqrt</span></code>, <code class="docutils literal notranslate"><span class="pre">pow</span></code>, and <code class="docutils literal notranslate"><span class="pre">**</span></code> are available. The runtime parses and evaluates it directly, so calibration is not locked to a fixed functional form. It can be configured separately for prefill and decode; otherwise both phases use the same config.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> — optional checkpoint-provided target values. It can be configured separately for prefill and decode; otherwise both phases use the same config.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">ignore</span></code> — optional fnmatch layer patterns where the calibrated Skip Softmax Attention config should not apply.</p></li>
-</ul>
+<p>The formula is a <a class="reference external" href="https://numexpr.readthedocs.io/">numexpr</a> expression over
+<code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> and named coefficients. The optional <code class="docutils literal notranslate"><span class="pre">ignore</span></code> list uses
+fnmatch layer patterns. At most one checkpoint config group may use the
+<code class="docutils literal notranslate"><span class="pre">skip_softmax</span></code> algorithm.</p>
+<p>Skip Softmax Attention requires the TRTLLM attention backend. Other attention
+backends do not apply it.</p>
 </section>
-<section id="user-configuration">
-<h3>User Configuration<a class="headerlink" href="#user-configuration" title="Link to this heading">#</a></h3>
-<p>User configuration is supplied through Python or YAML and controls how the checkpoint metadata is consumed:</p>
-<ul class="simple">
-<li><p>Set <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> directly to pass a concrete threshold to the kernel. This does not require checkpoint config.</p></li>
-<li><p>Set <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> to request a sparsity target. The runtime resolves it to <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> using the checkpoint calibration formula. If the checkpoint does not provide the required Skip Softmax Attention metadata, the runtime raises an error.</p></li>
-</ul>
-<p>Both <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> take either a scalar, applied to both prefill and decode, or a <code class="docutils literal notranslate"><span class="pre">{&quot;prefill&quot;:</span> <span class="pre">...,</span> <span class="pre">&quot;decode&quot;:</span> <span class="pre">...}</span></code> dict. <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> are alternatives: if both are present, <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> takes precedence and the calibration formula is not used. User-provided <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> overrides checkpoint-default <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code>. Checkpoint <code class="docutils literal notranslate"><span class="pre">ignore</span></code> patterns always disable Skip Softmax Attention for matching layers.</p>
-<section id="python-api">
-<h4>Python API<a class="headerlink" href="#python-api" title="Link to this heading">#</a></h4>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">SkipSoftmaxAttentionConfig</span>
-
-<span class="c1"># Direct threshold (single value applied to both phases):</span>
-<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">threshold_scale_factor</span><span class="o">=</span><span class="mf">1000.0</span><span class="p">)</span>
-
-<span class="c1"># Direct threshold, per-phase:</span>
-<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span>
-    <span class="n">threshold_scale_factor</span><span class="o">=</span><span class="p">{</span><span class="s2">"prefill"</span><span class="p">:</span> <span class="mf">1000.0</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">:</span> <span class="mf">500.0</span><span class="p">},</span>
-<span class="p">)</span>
-
-<span class="c1"># Target sparsity (requires the checkpoint to carry a calibration formula):</span>
-<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">target_sparsity</span><span class="o">=</span><span class="mf">0.5</span><span class="p">)</span>
-
-<span class="c1"># Target sparsity, per-phase:</span>
-<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span>
-    <span class="n">target_sparsity</span><span class="o">=</span><span class="p">{</span><span class="s2">"prefill"</span><span class="p">:</span> <span class="mf">0.5</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">:</span> <span class="mf">0.3</span><span class="p">},</span>
-<span class="p">)</span>
-
-<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"&lt;path_or_hf_id&gt;"</span><span class="p">,</span> <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">sparse_attention_config</span><span class="p">)</span>
-</pre></div>
-</div>
-<p>Skip Softmax Attention only works with the <strong>TRTLLM</strong> attention backend, which is the default attention backend. Other backends silently bypass Skip Softmax Attention.</p>
 </section>
-<section id="yaml">
-<h4>YAML<a class="headerlink" href="#yaml" title="Link to this heading">#</a></h4>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># Direct threshold:</span>
+</section>
+<section id="usage-with-trtllm-bench-and-trtllm-serve">
+<h2>Usage with trtllm-bench and trtllm-serve<a class="headerlink" href="#usage-with-trtllm-bench-and-trtllm-serve" title="Link to this heading">#</a></h2>
+<p>Sparse attention is configured through <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> on the
+PyTorch backend. DeepSeek-V3.2 provides a mature end-to-end example: its
+checkpoint defines the DSA indexer geometry and Top-K, so the minimal YAML only
+needs to select the <code class="docutils literal notranslate"><span class="pre">dsa</span></code> algorithm.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># config.yml</span>
 <span class="nt">sparse_attention_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
-<span class="w">  </span><span class="nt">threshold_scale_factor</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1000.0</span>
-<span class="w">    </span><span class="nt">decode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">500.0</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dsa</span>
 </pre></div>
 </div>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># Target sparsity (requires a calibrated checkpoint):</span>
-<span class="nt">sparse_attention_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
-<span class="w">  </span><span class="nt">target_sparsity</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.5</span>
-<span class="w">    </span><span class="nt">decode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.3</span>
+<p>Start an OpenAI-compatible server with the same config file used for other
+PyTorch backend options:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>deepseek-ai/DeepSeek-V3.2<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--custom_tokenizer<span class="w"> </span>deepseek_v32<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>./config.yml
 </pre></div>
 </div>
-</section>
-</section>
-</section>
-<section id="algorithm-comparison">
-<h2>Algorithm Comparison<a class="headerlink" href="#algorithm-comparison" title="Link to this heading">#</a></h2>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Aspect</p></th>
-<th class="head"><p>RocketKV</p></th>
-<th class="head"><p>DSA</p></th>
-<th class="head"><p>Skip Softmax Attention</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>Prefill acceleration</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-</tr>
-<tr class="row-odd"><td><p>Decode acceleration</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-</tr>
-<tr class="row-even"><td><p>KV cache reduction</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-</tr>
-<tr class="row-odd"><td><p>Framework-level support required</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-</tr>
-<tr class="row-even"><td><p>Model-native</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-</tr>
-</tbody>
-</table>
+<p>For a throughput benchmark, first prepare or supply a tokenized dataset, then
+pass the same config to <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-V3.2<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>prepare-dataset<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output<span class="w"> </span>./deepseek-v3.2-dataset.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>token-norm-dist<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input-mean<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-mean<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--num-requests<span class="w"> </span><span class="m">16</span>
+
+trtllm-bench<span class="w"> </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-V3.2<span class="w"> </span>throughput<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--ep<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset<span class="w"> </span>./deepseek-v3.2-dataset.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max_batch_size<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max_num_tokens<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>./config.yml
+</pre></div>
 </div>
+<p>Use a local checkpoint path in place of the Hugging Face model ID when needed.
+Other sparse algorithms use the same YAML entry point with their own
+<code class="docutils literal notranslate"><span class="pre">algorithm</span></code> discriminator and settings. See the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/models/core/deepseek_v3/README.md">DeepSeek V3/V3.2 example</a>
+for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
+and disaggregated-serving configurations.</p>
 </section>
 <section id="further-reading">
 <h2>Further Reading<a class="headerlink" href="#further-reading" title="Link to this heading">#</a></h2>
 <ul class="simple">
+<li><p><a class="reference internal" href="kv-cache-compression.html"><span class="std std-doc">KV Cache Compression</span></a> — methods that reduce the
+stored KV representation or retained KV set outside the Attention kernel.</p></li>
 <li><p><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html"><span class="std std-doc">Blog 17: Sparse Attention in TensorRT-LLM</span></a> — framework design, per-algorithm implementation details, evaluation results.</p></li>
 <li><p><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html"><span class="std std-doc">Blog 16: Accelerating Long Context Inference with Skip Softmax Attention</span></a> — algorithm details, kernel internals, end-to-end benchmarks.</p></li>
 <li><p><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html"><span class="std std-doc">Sparse Attention Development Guide</span></a> — how to add a new sparse attention algorithm, including config classes, prediction modules, auxiliary memory, and registration.</p></li>
@@ -945,11 +1410,11 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model_path
       </div>
     </a>
     <a class="right-next"
-       href="../developer-guide/overview.html"
+       href="visual-generation.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Architecture Overview</p>
+        <p class="prev-next-title">Visual Generation (Beta)</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -974,22 +1439,27 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model_path
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithms">Algorithms</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-sparse-attentions">Supported Sparse Attentions</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sparse-mla">Sparse MLA</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sparse-mqa-gqa">Sparse MQA/GQA</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sparse-mha">Sparse MHA</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#block-sparse-mha-mqa-gqa">Block-sparse MHA/MQA/GQA</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rocketkv">RocketKV</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-sparse-attention-dsa">DeepSeek Sparse Attention (DSA)</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#skip-softmax-attention">Skip Softmax Attention</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#checkpoint-config">Checkpoint Config</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#user-configuration">User Configuration</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#python-api">Python API</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#yaml">YAML</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-algorithms">Supported Algorithms</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#capability-comparison">Capability Comparison</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithm-details">Algorithm Details</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#rocketkv">RocketKV</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-sparse-attention">DeepSeek Sparse Attention</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-v4-hybrid-sparse-attention">DeepSeek-V4 Hybrid Sparse Attention</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#minimax-m3-block-sparse-gqa">MiniMax-M3 Block-Sparse GQA</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#skip-softmax-attention">Skip Softmax Attention</a></li>
 </ul>
 </li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithm-comparison">Algorithm Comparison</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage-with-trtllm-bench-and-trtllm-serve">Usage with trtllm-bench and trtllm-serve</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#further-reading">Further Reading</a></li>
 </ul>
   </nav></div>
@@ -1082,9 +1552,9 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model_path
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -515,8 +517,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -552,6 +556,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -563,8 +573,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -704,7 +715,7 @@
 <li><p><a class="reference internal" href="#serving-with-trtllm-serve">Serving with trtllm-serve</a></p></li>
 <li><p><a class="reference internal" href="#quality-evaluation">Quality Evaluation</a></p></li>
 <li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
-<li><p><a class="reference internal" href="#picking-the-right-configuration"><span class="xref myst">Picking the Right Configuration</span></a></p></li>
+<li><p><a class="reference internal" href="#picking-the-performant-configuration">Picking the Right Configuration</a></p></li>
 <li><p><a class="reference internal" href="#limitations-and-future-work">Limitations and Future Work</a></p></li>
 <li><p><a class="reference internal" href="#references">References</a></p></li>
 <li><p><a class="reference internal" href="#acknowledgement">Acknowledgement</a></p></li>
@@ -1068,7 +1079,7 @@ Attention2D:   cp = attn2d_row × attn2d_col   (+ row_group, col_group subgroups
 </section>
 <section id="nvl72-scaling-results">
 <h2>NVL72 Scaling Results<a class="headerlink" href="#nvl72-scaling-results" title="Link to this heading">#</a></h2>
-<p>All performance numbers in this section use the same measured workload and publish one distributed recipe: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml</span></code></a>.</p>
+<p>All performance numbers in this section use the same measured workload and publish one distributed recipe: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yaml"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yaml</span></code></a>.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Item</p></th>
@@ -1151,7 +1162,7 @@ Attention2D:   cp = attn2d_row × attn2d_col   (+ row_group, col_group subgroups
 </div>
 <section id="cosmos3-super">
 <h3>Cosmos3-Super<a class="headerlink" href="#cosmos3-super" title="Link to this heading">#</a></h3>
-<p>The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B Mixture-of-Transformers with 64 attention heads, generating a longer 189-frame clip — so each denoising step is an even larger dense prefill than Wan. Only the workload and the per-width recipe change; the CFG, Ulysses, Attention2D, and parallel-VAE knobs are identical (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml</span></code></a>)</p>
+<p>The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B Mixture-of-Transformers with 64 attention heads, generating a longer 189-frame clip — so each denoising step is an even larger dense prefill than Wan. Only the workload and the per-width recipe change; the CFG, Ulysses, Attention2D, and parallel-VAE knobs are identical (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yaml"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yaml</span></code></a>)</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Item</p></th>
@@ -1223,7 +1234,7 @@ Attention2D:   cp = attn2d_row × attn2d_col   (+ row_group, col_group subgroups
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">CONTAINER_IMAGE</span><span class="o">=</span>/path/to/tensorrt-llm.sqsh
 <span class="nb">export</span><span class="w"> </span><span class="nv">PROJECT_ROOT</span><span class="o">=</span>/path/to/TensorRT-LLM
 <span class="nb">export</span><span class="w"> </span><span class="nv">MODEL</span><span class="o">=</span>Wan-AI/Wan2.2-T2V-A14B-Diffusers
-<span class="nb">export</span><span class="w"> </span><span class="nv">SERVER_CONFIG</span><span class="o">=</span>examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml
+<span class="nb">export</span><span class="w"> </span><span class="nv">SERVER_CONFIG</span><span class="o">=</span>examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yaml
 
 <span class="c1"># Fill in &lt;ACCOUNT_NAME&gt; and &lt;PARTITION&gt; with your SLURM account and partition</span>
 sbatch<span class="w"> </span>-A<span class="w"> </span>&lt;ACCOUNT_NAME&gt;<span class="w"> </span>-p<span class="w"> </span>&lt;PARTITION&gt;<span class="w"> </span>-N<span class="w"> </span><span class="m">18</span><span class="w"> </span>--ntasks-per-node<span class="o">=</span><span class="m">4</span><span class="w"> </span>--ntasks<span class="o">=</span><span class="m">72</span><span class="w"> </span>examples/visual_gen/serve/benchmark_visual_gen_mgmn_distributed.sh
@@ -1238,9 +1249,8 @@ sbatch<span class="w"> </span>-A<span class="w"> </span>&lt;ACCOUNT_NAME&gt;<spa
 <h3>Distributed correctness<a class="headerlink" href="#distributed-correctness" title="Link to this heading">#</a></h3>
 <p>A single-node (4- and 8-GPU) parity harness (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py"><code class="docutils literal notranslate"><span class="pre">test_wan_transformer_parallel.py</span></code></a>) runs a BF16 <code class="docutils literal notranslate"><span class="pre">WanTransformer3DModel</span></code> forward (reduced layers, FA4) under each parallel configuration and compares it against an unsharded single-GPU reference on identical weights and seeded inputs.</p>
 <p>Every configuration — Ulysses, CFG+Ulysses, Ring×Ulysses, and Attention2D <code class="docutils literal notranslate"><span class="pre">row×col</span></code>×Ulysses — matches the single-GPU reference within <code class="docutils literal notranslate"><span class="pre">atol</span> <span class="pre">=</span> <span class="pre">1e-2,</span> <span class="pre">rtol</span> <span class="pre">=</span> <span class="pre">1e-3</span></code>. Because the harness uses randomly-initialized (stabilized) weights and a single forward on a reduced model, it isolates the <strong>parallelism itself</strong>: it proves the all-gather / all-to-all / online-softmax-merge collectives are numerically correct, independent of any specific checkpoint.</p>
-</section>
 <section id="end-to-end-video-quality">
-<h3>End-to-end video quality<a class="headerlink" href="#end-to-end-video-quality" title="Link to this heading">#</a></h3>
+<h4>End-to-end video quality<a class="headerlink" href="#end-to-end-video-quality" title="Link to this heading">#</a></h4>
 <p>We generate small videos using 6 prompts with Wan 2.2 T2V-A14B at 832x480, 9 frames, 8 steps, fixed seed 42 (BF16, FA4), and score each parallel configuration’s decoded video against a single-GPU reference, averaging LPIPS / PSNR / SSIM / cosine over all frames.</p>
 <p>Comparing decoded videos needs a reference point as the FA4 attention kernel and compiled layer (<code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>) use nondeterministic reductions (see below), so two single-GPU runs with the same prompt and seed differ slightly, and the iterative denoiser compounds those differences over its steps. We therefore establish a floor — a second single-GPU run scored against the first — and report each parallel configuration relative to it. All four metrics are computed per frame on the decoded MP4 and averaged, so they also include H.264 quantization.</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -1344,6 +1354,7 @@ sbatch<span class="w"> </span>-A<span class="w"> </span>&lt;ACCOUNT_NAME&gt;<spa
 </div>
 <p>A deterministic backend (PyTorch SDPA attention, <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> off) reproduces byte-for-byte, confirming the harness is exact. Turning on the fast kernels breaks that: an FA4 rerun alone already moves the output 0.121 LPIPS — the <em>floor</em> row in the results table above — and swapping the attention backend (0.21) or toggling <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> (0.24) moves it further. Routine single-GPU choices alone therefore span 0–0.24 LPIPS, all from pixel-level kernel ordering rather than any algorithmic change (LPIPS is a learned perceptual distance where 0 is bit-wise identical). Setting <code class="docutils literal notranslate"><span class="pre">torch.use_deterministic_algorithms(True)</span></code> forces deterministic kernel implementations and collapses this noise floor back to 0 LPIPS (bit-exact reruns), but impacts performance. We leave it off for the performance numbers above and instead measure parallel configurations against the realistic faster kernel floor.</p>
 <p>Against that band, parallelism is essentially free. Every parallel configuration lands at 0.187–0.220 LPIPS (cosine ≥ 0.967, PSNR ≥ 23 dB) — only 0.07–0.10 above the floor, well inside the spread that single-GPU kernel choices already produce. The offset is independent of parallel degree: 2-GPU Ulysses (0.187) is as close to the reference as the 4-GPU recipes (~0.196–0.198). Attention2D paths run marginally higher (up to 0.220) because their cross-rank online-softmax merge and gather collectives reorder non-associative BF16 additions — the same effect the correctness test isolates, bounded across steps rather than compounding. A parallel run is thus about as far from the single-GPU reference as two single-GPU runs are from each other.</p>
+</section>
 </section>
 </section>
 <section id="conclusion">
@@ -1476,8 +1487,10 @@ sbatch<span class="w"> </span>-A<span class="w"> </span>&lt;ACCOUNT_NAME&gt;<spa
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-with-trtllm-serve">Serving with trtllm-serve</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quality-evaluation">Quality Evaluation</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#distributed-correctness">Distributed correctness</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-video-quality">End-to-end video quality</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#distributed-correctness">Distributed correctness</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-video-quality">End-to-end video quality</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
@@ -1576,9 +1589,9 @@ sbatch<span class="w"> </span>-A<span class="w"> </span>&lt;ACCOUNT_NAME&gt;<spa
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

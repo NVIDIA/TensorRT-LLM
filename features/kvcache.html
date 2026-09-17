@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Long Sequences" href="long-sequence.html" />
+    <link rel="next" title="KV Cache Compression" href="kv-cache-compression.html" />
     <link rel="prev" title="Embeddings (Encoder-Only Models)" href="embeddings.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -756,14 +767,6 @@ one. Set it to <code class="docutils literal notranslate"><span class="pre">true
 <p>Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1’s
 unified pool, so <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2</span></code> does not apply to them.</p>
-<p>Two-model speculative decoding (for example Eagle3 with
-<code class="docutils literal notranslate"><span class="pre">eagle3_one_model=False</span></code>) is not supported by V2: the draft model runs in a
-separate engine with its own KV cache manager, and V2 sizes both managers from
-the full <code class="docutils literal notranslate"><span class="pre">max_gpu_total_bytes</span></code> budget instead of partitioning it between them.
-Under <code class="docutils literal notranslate"><span class="pre">auto</span></code>, a model default of V2 falls back to V1 for that combination;
-setting <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">true</span></code> explicitly raises an error. This
-applies to every model that selects its manager through
-<code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2</span></code>, not just GPT-OSS.</p>
 <p>For the native V2 cold-storage representation and codec extension contract, see
 <a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html"><span class="std std-doc">KVCacheManagerV2 Cold-Page Codec Design</span></a>.</p>
 </section>
@@ -854,6 +857,11 @@ snapshots only.</p>
 <p>Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property <code class="docutils literal notranslate"><span class="pre">host_cache_size</span></code> which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.</p>
 <p>When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with <code class="docutils literal notranslate"><span class="pre">secondary_offload_min_priority</span></code>. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.</p>
 <p>Here is an <a class="reference download internal" download="" href="../_downloads/289baa7eb9a76c4944f3e2800f51f4c4/llm_kv_cache_offloading.py"><span class="xref download myst">example</span></a> to show how to enable host offloading.</p>
+<p>KV cache compression can reduce the storage and transfer cost of offloaded
+Pages, or reduce the amount of KV retained by an algorithm. Compression is
+configured separately from <code class="docutils literal notranslate"><span class="pre">KvCacheConfig</span></code>; see
+<a class="reference internal" href="kv-cache-compression.html"><span class="std std-doc">KV Cache Compression</span></a> for the available methods and
+their activation points.</p>
 </section>
 <section id="partial-reuse">
 <h3>Partial Reuse<a class="headerlink" href="#partial-reuse" title="Link to this heading">#</a></h3>
@@ -863,6 +871,107 @@ snapshots only.</p>
 <section id="attention-window-size">
 <h3>Attention Window Size<a class="headerlink" href="#attention-window-size" title="Link to this heading">#</a></h3>
 <p>Property <code class="docutils literal notranslate"><span class="pre">max_attention_window</span></code> specifies the maximum attention window size for each layer in the model as a list of integer values. If the length of this list is less than number of layers, the list is repeated as many times as necessary. For instance, if the model has only full attention layers and maximum sequence length is 4096, you can specify this as <code class="docutils literal notranslate"><span class="pre">max_attention_window</span> <span class="pre">=</span> <span class="pre">[4096]</span></code>. If the first layer is full attention, the second layer is limited attention with window size 256 and then this repeats for the remaining layers, you specify this as <code class="docutils literal notranslate"><span class="pre">max_attention_window</span> <span class="pre">=</span> <span class="pre">[4096,256]</span></code>. This means first layer is full attention, second layer is limited attention, third layer is full attention, fourth layer is limited attention and so on.</p>
+</section>
+<section id="debugging-aids">
+<h3>Debugging Aids<a class="headerlink" href="#debugging-aids" title="Link to this heading">#</a></h3>
+<p>Two opt-in environment variables help when a result looks like it came from KV
+pages the request does not own – a stale page handed over by a previous owner,
+or a page-table slot the attention mask was supposed to cover. Both are off
+unless set, and when unset nothing about allocation, page contents or reported
+block counts changes. Both are diagnostic only: they cost extra work and are
+not meant for production serving. They apply to <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code>.</p>
+<p>Each accepts the same fill value: <code class="docutils literal notranslate"><span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">on</span></code>, <code class="docutils literal notranslate"><span class="pre">true</span></code> or <code class="docutils literal notranslate"><span class="pre">zero</span></code> for zeros, <code class="docutils literal notranslate"><span class="pre">nan</span></code>
+for NaN (any uncovered read then fails immediately and visibly rather than
+producing a plausible number), or any number for that constant.</p>
+<blockquote>
+<div><p><strong>Packed NVFP4 (e2m1) limitation.</strong> A packed sub-byte pool cannot store an
+arbitrary sentinel: every non-zero fill value collapses to the byte pattern
+<code class="docutils literal notranslate"><span class="pre">0x7f</span></code>. For most packed formats <code class="docutils literal notranslate"><span class="pre">0x7f</span></code> is non-finite, so a <code class="docutils literal notranslate"><span class="pre">nan</span></code>/<code class="docutils literal notranslate"><span class="pre">inf</span></code>
+sentinel still poisons the page. Packed NVFP4 (e2m1) has no NaN/Inf encoding,
+so <code class="docutils literal notranslate"><span class="pre">0x7f</span></code> decodes to <code class="docutils literal notranslate"><span class="pre">+6.0</span></code> (the largest finite magnitude) instead. On such a
+pool the sentinel lands as <code class="docutils literal notranslate"><span class="pre">6.0</span></code> – still a recognisable out-of-band pattern,
+but not one that an <code class="docutils literal notranslate"><span class="pre">isnan</span></code>/<code class="docutils literal notranslate"><span class="pre">isinf</span></code> check will flag. Only zero fills carry
+over exactly for packed e2m1.</p>
+</div></blockquote>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_KV_GUARD_PAGE</span></code> reserves one page that no request can be given, fills
+it with the chosen pattern, and publishes its per-layer index. Attention
+backends that have to keep masked-out page-table entries in range park them
+on this page instead of on page 0, which is a live page belonging to whatever
+request holds it. The mask still decides the result; what changes is that a
+masking bug reads a recognisable pattern instead of a stranger’s keys and
+values. Costs one page and one index-mapper slot.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_KV_FRESH_PAGE_FILL</span></code> writes the pattern into pages as a request is
+given them, so a read past what the request itself wrote returns the pattern
+rather than the previous owner’s data. Pages covering the reused/committed
+prefix are never overwritten. Costs one fill per layer per new allocation
+plus a device synchronization.</p></li>
+</ul>
+<p>Both announce themselves once at warning level when they take effect, so a log
+shows whether the switch actually did anything.</p>
+</section>
+<section id="kv-cache-events">
+<h3>KV Cache Events<a class="headerlink" href="#kv-cache-events" title="Link to this heading">#</a></h3>
+<p>KV cache events report block <strong>stored</strong>, <strong>removed</strong>, <strong>created</strong> and <strong>updated</strong> operations
+so an external KV-cache-aware router (for example NVIDIA Dynamo) can route a request to the
+engine that already holds its prefix. Two delivery paths are available.</p>
+<section id="buffered-path-default">
+<h4>Buffered path (default)<a class="headerlink" href="#buffered-path-default" title="Link to this heading">#</a></h4>
+<p>Set <code class="docutils literal notranslate"><span class="pre">event_buffer_max_size</span></code> to a positive integer and <code class="docutils literal notranslate"><span class="pre">enable_block_reuse</span></code> to True.
+Events are buffered per rank, gathered onto rank 0 under attention data parallelism, and
+pulled per iteration through <code class="docutils literal notranslate"><span class="pre">LLM.get_kv_cache_events()</span></code> / <code class="docutils literal notranslate"><span class="pre">LLM.get_kv_cache_events_async()</span></code>,
+or over the <code class="docutils literal notranslate"><span class="pre">/kv_cache_events</span></code> endpoint of <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>.</p>
+</section>
+<section id="streaming-path-prototype">
+<h4>Streaming path (prototype)<a class="headerlink" href="#streaming-path-prototype" title="Link to this heading">#</a></h4>
+<p>Configured with <code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_events_config</span></code>. Each rank encodes its own events and
+publishes them directly over a ZeroMQ <code class="docutils literal notranslate"><span class="pre">PUB</span></code> socket from a background thread, so there is no
+rank-0 gather and no per-iteration pull.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">KVEventsConfig</span>
+
+<span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span>
+    <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">kv_events_config</span><span class="o">=</span><span class="n">KVEventsConfig</span><span class="p">(</span>
+        <span class="n">enable_kv_cache_events</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">endpoint</span><span class="o">=</span><span class="s2">"tcp://*:5557"</span><span class="p">,</span>
+        <span class="n">replay_endpoint</span><span class="o">=</span><span class="s2">"tcp://*:5657"</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Constraints.</strong> The streaming path requires KV cache manager V2 running on its Python
+backend (<code class="docutils literal notranslate"><span class="pre">TLLM_KV_CACHE_MANAGER_V2_BACKEND=python</span></code>); the default <code class="docutils literal notranslate"><span class="pre">cpp</span></code> backend cannot
+consume the Python event sink and raises an error naming this variable. Pipeline
+parallelism and context parallelism are rejected. Events are not published for draft
+models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
+returns an empty list rather than raising.</p>
+<p><strong>Endpoint convention.</strong> Every attention-DP rank binds <code class="docutils literal notranslate"><span class="pre">base_port</span> <span class="pre">+</span> <span class="pre">rank</span></code> using its
+<strong>global</strong> rank, so <code class="docutils literal notranslate"><span class="pre">N</span></code> ranks occupy <code class="docutils literal notranslate"><span class="pre">[base_port,</span> <span class="pre">base_port</span> <span class="pre">+</span> <span class="pre">N</span> <span class="pre">-</span> <span class="pre">1]</span></code> cluster-wide and
+each rank’s port is distinct — on a multi-node deployment, rank 8 binds <code class="docutils literal notranslate"><span class="pre">base_port</span> <span class="pre">+</span> <span class="pre">8</span></code>
+whichever node it runs on. Co-located engines — for example disaggregated prefill and
+decode on one host — must use base ports at least <code class="docutils literal notranslate"><span class="pre">N</span></code> apart.</p>
+<p><code class="docutils literal notranslate"><span class="pre">replay_endpoint</span></code> follows the same convention. Because only ranks co-located on one
+host actually contend for a port, and a host holds a contiguous run of ranks, its base
+port must be at least <em>ranks-per-host</em> away from <code class="docutils literal notranslate"><span class="pre">endpoint</span></code>’s rather than <code class="docutils literal notranslate"><span class="pre">N</span></code> away.
+Overlapping ranges are rejected at startup. For <code class="docutils literal notranslate"><span class="pre">ipc://</span></code> and <code class="docutils literal notranslate"><span class="pre">inproc://</span></code> endpoints, which
+have no port, each rank appends a <code class="docutils literal notranslate"><span class="pre">_dp&lt;rank&gt;</span></code> suffix instead.</p>
+<p><strong>Wire format.</strong> Each batch is sent as three ZeroMQ frames: the subscription <code class="docutils literal notranslate"><span class="pre">topic</span></code>,
+an 8-byte big-endian sequence number, and a msgpack payload
+<code class="docutils literal notranslate"><span class="pre">[timestamp,</span> <span class="pre">[events],</span> <span class="pre">data_parallel_rank]</span></code>. Each event is a map tagged with a <code class="docutils literal notranslate"><span class="pre">type</span></code> key —
+<code class="docutils literal notranslate"><span class="pre">BlockStored</span></code>, <code class="docutils literal notranslate"><span class="pre">BlockRemoved</span></code> or <code class="docutils literal notranslate"><span class="pre">AllBlocksCleared</span></code> — carrying int64 block hashes derived
+from the V2 radix block keys. This is the format documented for custom router backends; it
+differs from vLLM’s positional-array encoding of the individual events, though the batch
+envelope is positional in both.</p>
+<p><strong>Delivery guarantees.</strong> Delivery is best effort, but loss is observable. Every accepted
+batch reserves a sequence number up front, so a batch dropped by a full publisher queue
+(<code class="docutils literal notranslate"><span class="pre">max_queue_size</span></code>) or by a failed send leaves a hole in the sequence. Subscribers must
+treat any gap as lost KV-cache state and resynchronize rather than assuming continuity.</p>
+<p><strong>Replay.</strong> If <code class="docutils literal notranslate"><span class="pre">replay_endpoint</span></code> is set, the publisher also binds a <code class="docutils literal notranslate"><span class="pre">ROUTER</span></code> socket. A
+subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and
+receives each retained batch as <code class="docutils literal notranslate"><span class="pre">[delimiter,</span> <span class="pre">topic,</span> <span class="pre">seq,</span> <span class="pre">payload]</span></code>, terminated by a sentinel
+with an empty payload. Only the last <code class="docutils literal notranslate"><span class="pre">buffer_steps</span></code> batches are retained, so a replay
+can legitimately start above the requested sequence — that too is a gap.</p>
+</section>
 </section>
 <section id="deprecated-properties">
 <h3>Deprecated Properties<a class="headerlink" href="#deprecated-properties" title="Link to this heading">#</a></h3>
@@ -894,11 +1003,11 @@ dropped before reaching the executor.</p>
       </div>
     </a>
     <a class="right-next"
-       href="long-sequence.html"
+       href="kv-cache-compression.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Long Sequences</p>
+        <p class="prev-next-title">KV Cache Compression</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -942,6 +1051,12 @@ dropped before reaching the executor.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-offloading-to-host-memory">Enable Offloading to Host Memory</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#partial-reuse">Partial Reuse</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-window-size">Attention Window Size</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#debugging-aids">Debugging Aids</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-events">KV Cache Events</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#buffered-path-default">Buffered path (default)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#streaming-path-prototype">Streaming path (prototype)</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deprecated-properties">Deprecated Properties</a></li>
 </ul>
 </li>
@@ -1036,9 +1151,9 @@ dropped before reaching the executor.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

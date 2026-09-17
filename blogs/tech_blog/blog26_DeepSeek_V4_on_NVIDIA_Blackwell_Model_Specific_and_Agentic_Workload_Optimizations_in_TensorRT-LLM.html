@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -515,8 +517,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -552,6 +556,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -563,8 +573,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -691,10 +702,10 @@ limitations under the License.
 <ul>
 <li><p><a class="reference internal" href="#model-support-and-parallelism">Model support and parallelism</a></p>
 <ul>
-<li><p><a class="reference internal" href="#hybrid-attention-swa-csa-and-hca"><span class="xref myst">Hybrid attention: SWA, CSA, and HCA</span></a></p></li>
-<li><p><a class="reference internal" href="#compressor-implementation"><span class="xref myst">Compressor implementation</span></a></p></li>
-<li><p><a class="reference internal" href="#beyond-attention-mhc-moe-and-speculative-decoding"><span class="xref myst">Beyond attention: mHC, MoE, and speculative decoding</span></a></p></li>
-<li><p><a class="reference internal" href="#parallelism-and-deployment-notation"><span class="xref myst">Parallelism and deployment notation</span></a></p></li>
+<li><p><a class="reference internal" href="#hybrid-attention-swa-csa-and-hca">Hybrid attention: SWA, CSA, and HCA</a></p></li>
+<li><p><a class="reference internal" href="#compressor-implementation">Compressor implementation</a></p></li>
+<li><p><a class="reference internal" href="#beyond-attention-mhc-moe-and-speculative-decoding">Beyond attention: mHC, MoE, and speculative decoding</a></p></li>
+<li><p><a class="reference internal" href="#parallelism-and-deployment-notation">Parallelism and deployment notation</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#cache-management-and-runtime-features">Cache management and runtime features</a></p></li>
@@ -706,8 +717,8 @@ limitations under the License.
 <li><p><a class="reference internal" href="#optimize-the-csa-hca-hot-path">Optimize the CSA/HCA hot path</a></p></li>
 <li><p><a class="reference internal" href="#compressor-and-mhc">Compressor and mHC</a></p>
 <ul>
-<li><p><a class="reference internal" href="#compressor-optimizations"><span class="xref myst">Compressor optimizations</span></a></p></li>
-<li><p><a class="reference internal" href="#mhc-optimizations"><span class="xref myst">mHC optimizations</span></a></p></li>
+<li><p><a class="reference internal" href="#compressor-optimizations">Compressor optimizations</a></p></li>
+<li><p><a class="reference internal" href="#mhc-optimizations">mHC optimizations</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#moe-optimizations">MoE optimizations</a></p></li>
@@ -730,16 +741,16 @@ limitations under the License.
 <ul>
 <li><p><a class="reference internal" href="#preserve-locality-with-two-level-routing">Preserve locality with two-level routing</a></p>
 <ul>
-<li><p><a class="reference internal" href="#instance-level-routing-across-context-servers"><span class="xref myst">Instance-level routing across context servers</span></a></p></li>
-<li><p><a class="reference internal" href="#rank-level-routing-within-a-context-server"><span class="xref myst">Rank-level routing within a context server</span></a></p></li>
-<li><p><a class="reference internal" href="#routing-policy-selection"><span class="xref myst">Routing policy selection</span></a></p></li>
+<li><p><a class="reference internal" href="#instance-level-routing-across-context-servers">Instance-level routing across context servers</a></p></li>
+<li><p><a class="reference internal" href="#rank-level-routing-within-a-context-server">Rank-level routing within a context server</a></p></li>
+<li><p><a class="reference internal" href="#routing-policy-selection">Routing policy selection</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#kv-cache-reuse-optimizations">KV cache reuse optimizations</a></p></li>
 <li><p><a class="reference internal" href="#optimize-scheduling-and-remove-end-to-end-overhead">Optimize scheduling and remove end-to-end overhead</a></p>
 <ul>
-<li><p><a class="reference internal" href="#optimize-host-overhead-for-ctx-and-gen"><span class="xref myst">Optimize host overhead for CTX and GEN</span></a></p></li>
-<li><p><a class="reference internal" href="#optimize-scheduling-orchestration-and-protocol-handling"><span class="xref myst">Optimize scheduling, orchestration, and protocol handling</span></a></p></li>
+<li><p><a class="reference internal" href="#optimize-host-overhead-for-ctx-and-gen">Optimize host overhead for CTX and GEN</a></p></li>
+<li><p><a class="reference internal" href="#optimize-scheduling-orchestration-and-protocol-handling">Optimize scheduling, orchestration, and protocol handling</a></p></li>
 </ul>
 </li>
 </ul>
@@ -1014,7 +1025,7 @@ limitations under the License.
 </section>
 <section id="moe-optimizations">
 <h4>MoE optimizations<a class="headerlink" href="#moe-optimizations" title="Link to this heading">#</a></h4>
-<p>Building on the routing design <a class="reference internal" href="#beyond-attention-mhc-moe-and-speculative-decoding"><span class="xref myst">described above</span></a>, TensorRT LLM optimizes DeepSeek-V4’s MoE path through a custom router GEMM, the MXFP8 × MXFP4 DeepGEMM MegaMoE backend, streamlined input preparation, and ongoing NVFP4 MegaMoE integration. These efforts preserve the model’s routing metadata, precision recipe, and checkpoint-defined <code class="docutils literal notranslate"><span class="pre">swiglu_limit</span></code> activation clamp.</p>
+<p>Building on the routing design <a class="reference internal" href="#beyond-attention-mhc-moe-and-speculative-decoding">described above</a>, TensorRT LLM optimizes DeepSeek-V4’s MoE path through a custom router GEMM, the MXFP8 × MXFP4 DeepGEMM MegaMoE backend, streamlined input preparation, and ongoing NVFP4 MegaMoE integration. These efforts preserve the model’s routing metadata, precision recipe, and checkpoint-defined <code class="docutils literal notranslate"><span class="pre">swiglu_limit</span></code> activation clamp.</p>
 <p><strong>MoE router GEMM optimization.</strong> For the 256-expert Flash shape, the score-based router uses a custom GEMM when it receives one to 16 token rows. The kernel consumes BF16 activations and weights and produces FP32 logits directly, avoiding the full FP32 input and weight casts required by the original linear path. Unsupported shapes, including the 384-expert Pro router, continue to use cuBLAS. In the reported small-shape measurements, router latency decreased from approximately 8 µs to 3 µs.</p>
 <p><strong>MXFP8 × MXFP4 DeepGEMM MegaMoE.</strong> For the W4A8 recipe with MXFP8 activations and MXFP4 weights, the DeepGEMM MegaMoE backend moves dispatch, the first expert GEMM, SwiGLU, the second expert GEMM, and combine into a fused-communication path that uses symmetric memory and in-kernel synchronization. In a 500-request DeepSeek-V4 Flash test on B200 with 1K-token inputs and outputs, TP4, EP4, and attention data parallelism, switching from the TensorRT LLM MoE backend to DeepGEMM MegaMoE increased throughput by 15.3% and reduced latency by 12.7%. TensorRT LLM also fuses the input preparation for this backend: instead of separately quantizing BF16 activations to MXFP8, converting selected expert indices, and copying activations, scales, indices, and routing weights into symmetric buffers, one CUDA kernel performs the quantization and writes all four outputs directly to their final buffers, reducing six GPU operations to one. No separate end-to-end gain is attributed to the preparation change.</p>
 <p><strong>NVFP4 MegaMoE (WIP).</strong> For native NVFP4 checkpoints, TensorRT LLM is integrating the ported <code class="docutils literal notranslate"><span class="pre">Sm100MegaMoEKernel</span></code> as a CuTe DSL execution backend on the SM100f path. The integration covers BF16-to-NVFP4 input quantization, dispatch, the two expert GEMMs, SwiGLU, per-route combine writes with native NVFP4 weights, and a separate reduction of the Top-K route contributions. It also includes symmetric-memory exchange for multi-rank expert parallelism and workload-specific tactic selection through the TensorRT LLM autotuner. The NVFP4 and DeepGEMM MegaMoE paths have separate hardware, quantization, and topology requirements. This precision-specific backend remains under integration and validation.</p>
@@ -1507,9 +1518,9 @@ limitations under the License.
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -688,9 +699,9 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
 <h2>Features<a class="headerlink" href="#features" title="Link to this heading">#</a></h2>
 <p>Currently available:</p>
 <ul class="simple">
-<li><p>Generate text asynchronously (refer to <a class="reference internal" href="#/examples/ray_orchestrator/llm_inference_async_ray.py"><span class="xref myst">llm_inference_async_ray.py</span></a>)</p></li>
-<li><p>Multi-node inference (refer to <a class="reference internal" href="#/examples/ray_orchestrator/multi_nodes/README.md"><span class="xref myst">multi-node README</span></a>)</p></li>
-<li><p>Disaggregated serving (refer to <a class="reference internal" href="#/examples/ray_orchestrator/disaggregated/README.md"><span class="xref myst">disagg README</span></a>)</p></li>
+<li><p>Generate text asynchronously (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/ray_orchestrator/llm_inference_async_ray.py">llm_inference_async_ray.py</a>)</p></li>
+<li><p>Multi-node inference (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/ray_orchestrator/multi_nodes/README.md">multi-node README</a>)</p></li>
+<li><p>Disaggregated serving (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/ray_orchestrator/disaggregated/README.md">disagg README</a>)</p></li>
 </ul>
 <p><em>Initial testing has been focused on LLaMA and DeepSeek variants. Please open an Issue if you encounter problems with other models so we can prioritize support.</em></p>
 </section>
@@ -703,7 +714,7 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
 </section>
 <section id="architecture">
 <h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h2>
-<p>This feature introduces new classes such as <a class="reference internal" href="#/tensorrt_llm/executor/ray/executor.py"><span class="xref myst">RayExecutor</span></a> and <a class="reference internal" href="#/tensorrt_llm/executor/ray/gpu_worker.py"><span class="xref myst">RayGPUWorker</span></a> for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on <a class="reference external" href="https://docs.pytorch.org/tutorials/beginner/dist_overview.html">torch.distributed</a> without MPI. We welcome contributions to improve and extend this support.</p>
+<p>This feature introduces new classes such as <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/tensorrt_llm/executor/ray/executor.py">RayExecutor</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/tensorrt_llm/executor/ray/gpu_worker.py">RayGPUWorker</a> for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on <a class="reference external" href="https://docs.pytorch.org/tutorials/beginner/dist_overview.html">torch.distributed</a> without MPI. We welcome contributions to improve and extend this support.</p>
 <p><img alt="Ray orchestrator architecture" src="docs/source/media/ray_orchestrator_architecture.jpg" /></p>
 </section>
 </section>
@@ -853,9 +864,9 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

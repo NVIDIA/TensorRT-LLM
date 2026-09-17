@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-296 captured fields.
+300 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -86,6 +86,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_early_first_token_response` | `<class 'bool'>` | `value` |  |  |
 | `enable_encoder_decoder_mixed_cuda_graph` | `<class 'bool'>` | `value` |  |  |
 | `enable_energy_metrics` | `<class 'bool'>` | `value` |  |  |
+| `enable_in_graph_sampling` | `<class 'bool'>` | `value` |  |  |
 | `enable_iter_perf_stats` | `<class 'bool'>` | `value` |  |  |
 | `enable_iter_req_stats` | `<class 'bool'>` | `value` |  |  |
 | `enable_layerwise_nvtx_marker` | `<class 'bool'>` | `value` |  |  |
@@ -140,6 +141,11 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.kv_cache_event_hash_algo` | `Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']` | `categorical` |  | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
+| `kv_cache_config.kv_events_config.buffer_steps` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.kv_events_config.enable_kv_cache_events` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.kv_events_config.hwm` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.kv_events_config.max_queue_size` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.kv_events_config.publisher` | `Optional[Literal['null', 'zmq']]` | `categorical` |  | `null`, `zmq` |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
@@ -267,25 +273,25 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.topr` | `Union[int, float, NoneType]` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_paged_mqa_logits` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_topk` | `<class 'bool'>` | `value` |  |  |
+| `sparse_attention_config.use_gvr_emission` | `<class 'bool'>` | `value` |  |  |
+| `sparse_attention_config.use_self_sampling_topk` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.window_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.acceptance_rate_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.acceptance_rate_window_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.advanced_sampling_mode` | `<enum 'AdvancedSamplingMode'>` | `categorical` |  | `full`, `no_topk`, `no_topp`, `no_topk_no_topp` |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
-| `speculative_config.attention_backend` | `Literal['VANILLA', 'TRTLLM']` | `categorical` |  | `VANILLA`, `TRTLLM` |
+| `speculative_config.attention_backend` | `Literal['VANILLA', 'TRTLLM', 'FA4']` | `categorical` |  | `VANILLA`, `TRTLLM`, `FA4` |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.block_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `Optional[int]` | `value` |  |  |
 | `speculative_config.eagle3_layers_to_capture` | `Optional[Set[int]]` | `value` |  |  |
 | `speculative_config.eagle3_model_arch` | `Literal['llama3', 'mistral_large3']` | `categorical` |  | `llama3`, `mistral_large3` |
-| `speculative_config.eagle3_one_model` | `Optional[bool]` | `value` |  |  |
 | `speculative_config.eagle_choices` | `Optional[List[List[int]]]` | `value` |  |  |
 | `speculative_config.enable_global_pool` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.enable_penalty` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.end_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.global_pool_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `speculative_config.greedy_sampling` | `Optional[bool]` | `value` |  |  |
 | `speculative_config.is_keep_all` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.is_public_pool` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.is_use_oldest` | `<class 'bool'>` | `value` |  |  |
@@ -297,10 +303,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_matching_ngram_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.max_non_leaves_per_layer` | `Optional[int]` | `value` |  |  |
 | `speculative_config.max_total_draft_tokens` | `Optional[int]` | `value` |  |  |
-| `speculative_config.mtp_eagle_one_model` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.num_eagle_layers` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_nextn_predict_layers` | `Optional[int]` | `value` |  |  |
-| `speculative_config.posterior_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.relaxed_delta` | `<class 'float'>` | `value` |  |  |
 | `speculative_config.relaxed_topk` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.sa_config.enable_global_pool` | `<class 'bool'>` | `value` |  |  |

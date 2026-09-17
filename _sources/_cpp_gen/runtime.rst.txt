@@ -4,12 +4,6 @@ Runtime
 .. Here are files in the cpp/include/runtime
 .. We manually add subsection to enable detailed description in the future
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
-gptJsonConfig.h
-_______________
-
-.. doxygenfile:: gptJsonConfig.h
-   :project: TensorRT-LLM
-
 worldConfig.h
 _____________
 

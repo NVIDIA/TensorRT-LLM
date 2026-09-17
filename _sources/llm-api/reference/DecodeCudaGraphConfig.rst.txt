@@ -8,3 +8,4 @@ DecodeCudaGraphConfig
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
+    :exclude-members: model_post_init,construct,validate,model_extra,model_fields,model_config,model_copy,parse_raw,schema,model_json_schema,model_construct,schema_json,model_computed_fields,model_validate,parse_obj,Config,model_fields_set,parse_file,update_forward_refs,model_rebuild,model_dump_json,model_dump,json,model_parametrized_name,copy,model_validate_strings,from_orm,dict,model_validate_json

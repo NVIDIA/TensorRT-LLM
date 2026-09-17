@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -674,10 +685,10 @@ actively evolving and may change in future releases.</p>
 <p>TensorRT-LLM <strong>VisualGen</strong> provides a unified inference stack for diffusion models, with a pipeline architecture separate from the LLM inference path. Key capabilities include:</p>
 <ul class="simple">
 <li><p>A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.</p></li>
-<li><p>Pluggable attention backends: PyTorch SDPA (<code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>), TRT-LLM kernels (<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>), TRT-LLM CuTe DSL kernels (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, Blackwell-class GPUs), and Flash Attention 4 (<code class="docutils literal notranslate"><span class="pre">FA4</span></code>).</p></li>
+<li><p>Pluggable attention backends: PyTorch SDPA (<code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>), TRT-LLM kernels (<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>), cuDNN fused SDPA (<code class="docutils literal notranslate"><span class="pre">CUDNN</span></code>), FlashInfer FP16/BF16 dense prefill (<code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code>), TRT-LLM CuTe DSL kernels (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, Blackwell-class GPUs), and Flash Attention 4 (<code class="docutils literal notranslate"><span class="pre">FA4</span></code>).</p></li>
 <li><p>Quantization support (dynamic and static) using the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">ModelOpt</a> configuration format.</p></li>
-<li><p>Quantized attention support: <code class="docutils literal notranslate"><span class="pre">QK16PV8</span></code> to quantize Bmm2 on <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">SAGE</span></code> to run SageAttention on <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> (requires Blackwell SM100).</p></li>
-<li><p>Sparse attention support: see <a class="reference internal" href="../visual-gen/features/sparse-attention.html"><span class="std std-doc">VisualGen Sparse Attention</span></a>.</p></li>
+<li><p>Quantized attention support: see <a class="reference internal" href="../features/visualgen-quantized-attention.html"><span class="std std-doc">VisualGen Quantized Attention</span></a>.</p></li>
+<li><p>Sparse attention support: see <a class="reference internal" href="../features/visualgen-sparse-attention.html"><span class="std std-doc">VisualGen Sparse Attention</span></a>.</p></li>
 <li><p>Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).</p></li>
 <li><p><strong>Step caching</strong> — two runtime caching backends (<strong>TeaCache</strong> and <strong>Cache-DiT</strong>) that skip transformer computation on steps where the step-to-step change is small.</p></li>
 <li><p>CPU offloading to reduce peak GPU memory usage.</p></li>
@@ -724,7 +735,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Text-to-Video, Image-to-Video</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers</span></code></p></td>
-<td><p>Text-to-Video</p></td>
+<td><p>Text-to-Video (3-step distilled)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2</span></code></p></td>
 <td><p>Text-to-Video (with Audio), Image-to-Video (with Audio)</p></td>
@@ -762,13 +773,16 @@ actively evolving and may change in future releases.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v</span></code></p></td>
 <td><p>Text-to-Video</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-Image</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-H3</span></code></p></td>
+<td><p>Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-Image</span></code></p></td>
 <td><p>Text-to-Image</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via <code class="docutils literal notranslate"><span class="pre">model_index.json</span></code>; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The <code class="docutils literal notranslate"><span class="pre">AutoPipeline</span></code> registry selects the appropriate pipeline class automatically.</p>
+<p>Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via <code class="docutils literal notranslate"><span class="pre">model_index.json</span></code> (or <code class="docutils literal notranslate"><span class="pre">modular_model_index.json</span></code> for modular pipelines); LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The <code class="docutils literal notranslate"><span class="pre">AutoPipeline</span></code> registry selects the appropriate pipeline class automatically.</p>
 <section id="feature-matrix">
 <h3>Feature Matrix<a class="headerlink" href="#feature-matrix" title="Link to this heading">#</a></h3>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -798,7 +812,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
-<td><p>No <a class="footnote-reference brackets" href="#id8" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
+<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -815,7 +829,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
-<td><p>No <a class="footnote-reference brackets" href="#id8" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
+<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -843,7 +857,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>Wan 2.1 VSA</strong> <a class="footnote-reference brackets" href="#id9" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><strong>Wan 2.1 VSA</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -863,7 +877,7 @@ actively evolving and may change in future releases.</p>
 <tr class="row-even"><td><p><strong>Wan 2.2</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id10" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -883,7 +897,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
-<td><p>No <a class="footnote-reference brackets" href="#id13" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>7<span class="fn-bracket">]</span></a></p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -897,13 +911,47 @@ actively evolving and may change in future releases.</p>
 <tr class="row-even"><td><p><strong>LTX-2</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id11" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>MiniMax-H3</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Qwen-Image</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -911,24 +959,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>Qwen-Image</strong></p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-</tr>
-<tr class="row-even"><td><p><strong>Qwen-Image-Layered</strong> <a class="footnote-reference brackets" href="#id12" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>6<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><strong>Qwen-Image-Layered</strong></p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -945,7 +976,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>Qwen-Image-Edit-2511</strong></p></td>
+<tr class="row-even"><td><p><strong>Qwen-Image-Edit-2511</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -962,7 +993,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-even"><td><p><strong>Cosmos3</strong></p></td>
+<tr class="row-odd"><td><p><strong>Cosmos3</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -979,7 +1010,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>HunyuanVideo 1.5</strong></p></td>
+<tr class="row-even"><td><p><strong>HunyuanVideo 1.5</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -996,7 +1027,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-even"><td><p><strong>GlmImage</strong></p></td>
+<tr class="row-odd"><td><p><strong>GlmImage</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -1085,6 +1116,11 @@ actively evolving and may change in future releases.</p>
 </section>
 <section id="reference-inputs">
 <h3>Reference Inputs<a class="headerlink" href="#reference-inputs" title="Link to this heading">#</a></h3>
+<p>Qwen-Image-Layered supports BF16 image-conditioned layer decomposition through
+<code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> image-edit routing. It returns one RGBA image per generated layer;
+set <code class="docutils literal notranslate"><span class="pre">extra_params.save_layers_to_grid</span></code> to <code class="docutils literal notranslate"><span class="pre">true</span></code> to pack layers into one saveable
+image grid. Quantization, cache acceleration, attention-parallel/Sage/VSA backends,
+and Tensor Parallelism are not enabled for this pipeline yet.</p>
 <p>Conditioning references are supplied through the typed fields <code class="docutils literal notranslate"><span class="pre">image_reference</span></code>, <code class="docutils literal notranslate"><span class="pre">video_reference</span></code>, and <code class="docutils literal notranslate"><span class="pre">audio_reference</span></code>. Each field takes a single reference or a list. A reference is <code class="docutils literal notranslate"><span class="pre">MediaRef(content=...,</span> <span class="pre">format=...)</span></code>, and <code class="docutils literal notranslate"><span class="pre">format</span></code> is required.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -1140,6 +1176,17 @@ actively evolving and may change in future releases.</p>
 <p>The same fields carry references over <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>; see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/serve/</span></code></a> for request examples.</p>
 </section>
 </section>
+<section id="minimax-h3-notes">
+<h2>MiniMax-H3 Notes<a class="headerlink" href="#minimax-h3-notes" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
+(Ref2VA) is not enabled yet.</p></li>
+<li><p>MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
+model-specific restriction, not a general VisualGen backend requirement.</p></li>
+<li><p>The published <a class="reference external" href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE">MiniMax-H3 checkpoint license</a>
+restricts use by territory. Obtain legal approval before downloading or running the weights.</p></li>
+</ul>
+</section>
 <section id="optimizations">
 <h2>Optimizations<a class="headerlink" href="#optimizations" title="Link to this heading">#</a></h2>
 <section id="quantization">
@@ -1156,6 +1203,61 @@ actively evolving and may change in future releases.</p>
 </pre></div>
 </div>
 <p>Omit <code class="docutils literal notranslate"><span class="pre">quant_config</span></code> for BF16/FP16 baseline.</p>
+<section id="wan-vae-nvfp4">
+<h4>Wan VAE NVFP4<a class="headerlink" href="#wan-vae-nvfp4" title="Link to this heading">#</a></h4>
+<p>The VAE can represent a substantial fraction of end-to-end latency in distilled
+video-generation pipelines with few denoising steps. Blackwell Tensor Cores offer
+up to four times the peak NVFP4 compute throughput of BF16, making VAE Conv3d
+operators an important optimization target. FP4 VAE replaces eligible native VAE
+Conv3d operators with NVFP4 weight-and-activation kernels while retaining BF16
+outputs.</p>
+<p>Linear-layer, attention, and VAE quantization are selected independently. Use
+<code class="docutils literal notranslate"><span class="pre">quant_config</span></code> for transformer linear layers,
+<code class="docutils literal notranslate"><span class="pre">attention_config.quant_attention_config</span></code> for attention, and
+<code class="docutils literal notranslate"><span class="pre">vae_config.quant_conv_config</span></code> for VAE convolutions.
+NVFP4 VAE execution currently supports native Wan-family VAEs on SM100 and
+SM103 GPUs. Unsupported pipelines and algorithms fail before
+pipeline construction. On an unsupported device, an explicit NVFP4 request
+fails; checkpoint-driven NVFP4 instead uses dequantized BF16 operators.</p>
+<p>By default, <code class="docutils literal notranslate"><span class="pre">vae_config.quant_conv_config</span></code> is unset (<code class="docutils literal notranslate"><span class="pre">None</span></code>) and VAE
+convolutions follow the checkpoint metadata. A high-precision checkpoint
+remains high precision. A packed NVFP4 checkpoint selects NVFP4 execution
+automatically and reuses any valid calibrated activation scales; layers without
+one derive it dynamically.</p>
+<p>To quantize eligible Wan Conv3d layers from a high-precision checkpoint and
+derive activation scales dynamically, use the shorthand configuration:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">vae_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">quant_conv_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">quant_algo</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NVFP4</span>
+<span class="w">    </span><span class="nt">dynamic</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">quant_conv_config.dynamic</span></code> shorthand sets both weight and activation
+modes. Configure them independently when their sources differ. For example,
+packed NVFP4 weights with rank-local dynamic activation scales use:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">vae_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">quant_conv_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">quant_algo</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NVFP4</span>
+<span class="w">    </span><span class="nt">config_groups</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">default</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">weights</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">dynamic</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">        </span><span class="nt">input_activations</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">dynamic</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">weights.dynamic:</span> <span class="pre">true</span></code> requires high-precision checkpoint weights, while
+<code class="docutils literal notranslate"><span class="pre">false</span></code> requires packed NVFP4 weights. <code class="docutils literal notranslate"><span class="pre">input_activations.dynamic:</span> <span class="pre">false</span></code>
+requires a valid calibrated checkpoint scale for every selected convolution;
+<code class="docutils literal notranslate"><span class="pre">true</span></code> derives rank-local activation scales at runtime. Do not specify both the
+top-level shorthand and <code class="docutils literal notranslate"><span class="pre">config_groups</span></code>.</p>
+<p>The optional <code class="docutils literal notranslate"><span class="pre">ignore</span></code> list excludes matching VAE modules. With a
+high-precision checkpoint, excluded convolutions remain in BF16. With a packed
+NVFP4 checkpoint, their weights can only be dequantized back to BF16; the
+original high-precision weights cannot be recovered.</p>
+<p>See the <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers#wan-22-vae-nvfp4-conv3d-implicit-gemm">Model Optimizer diffusion example</a>
+for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.</p>
+</section>
 </section>
 <section id="runtime-lora">
 <h3>Runtime LoRA<a class="headerlink" href="#runtime-lora" title="Link to this heading">#</a></h3>
@@ -1183,53 +1285,16 @@ actively evolving and may change in future releases.</p>
 </section>
 <section id="quantized-attention">
 <h3>Quantized Attention<a class="headerlink" href="#quantized-attention" title="Link to this heading">#</a></h3>
-<p>In addition to linear-layer quantization, VisualGen exposes two <strong>attention-level</strong> quantization presets that operate inside the attention kernel. They are configured through <code class="docutils literal notranslate"><span class="pre">AttentionConfig.quant_attention_config</span></code> and are mutually exclusive with each other.</p>
-<ul class="simple">
-<li><p><strong>QK16PV8</strong> (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> backend): Keeps Q &amp; K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (<code class="docutils literal notranslate"><span class="pre">sm_100a</span></code> / <code class="docutils literal notranslate"><span class="pre">sm_103a</span></code>) with <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">=</span> <span class="pre">128</span></code>.</p></li>
-<li><p><strong>SAGE</strong> (<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically <code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">k,</span> <span class="pre">v)</span> <span class="pre">=</span> <span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code> for Wan-1.3B and <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">16,</span> <span class="pre">1)</span></code> for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.</p></li>
-</ul>
-<p>Python API for SageAttention:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
-
-<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
-    <span class="n">model</span><span class="o">=</span><span class="s2">"Wan-AI/Wan2.1-T2V-1.3B-Diffusers"</span><span class="p">,</span>
-    <span class="n">attention_config</span><span class="o">=</span><span class="p">{</span>
-        <span class="s2">"backend"</span><span class="p">:</span> <span class="s2">"TRTLLM"</span><span class="p">,</span>
-        <span class="s2">"quant_attention_config"</span><span class="p">:</span> <span class="p">{</span>
-            <span class="s2">"qk_dtype"</span><span class="p">:</span> <span class="s2">"int8"</span><span class="p">,</span>
-            <span class="s2">"q_block_size"</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
-            <span class="s2">"k_block_size"</span><span class="p">:</span> <span class="mi">16</span><span class="p">,</span>
-            <span class="s2">"v_block_size"</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
-        <span class="p">},</span>
-    <span class="p">},</span>
-<span class="p">)</span>
-</pre></div>
-</div>
-<p>Python API for QK16PV8:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
-
-<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
-    <span class="n">model</span><span class="o">=</span><span class="s2">"Wan-AI/Wan2.1-T2V-1.3B-Diffusers"</span><span class="p">,</span>
-    <span class="n">attention_config</span><span class="o">=</span><span class="p">{</span>
-        <span class="s2">"backend"</span><span class="p">:</span> <span class="s2">"CUTEDSL"</span><span class="p">,</span>
-        <span class="s2">"quant_attention_config"</span><span class="p">:</span> <span class="p">{</span>
-            <span class="s2">"qk_dtype"</span><span class="p">:</span> <span class="s2">"bf16"</span><span class="p">,</span>
-            <span class="s2">"q_block_size"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="s2">"k_block_size"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="s2">"v_block_size"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
-        <span class="p">},</span>
-    <span class="p">},</span>
-<span class="p">)</span>
-</pre></div>
-</div>
+<p>In addition to linear-layer quantization, VisualGen exposes multiple backend-specific <strong>quantized-attention</strong> recipes that operate inside the attention kernel. They are configured through <code class="docutils literal notranslate"><span class="pre">AttentionConfig.quant_attention_config</span></code> and can be enabled independently with any linear layer configuration.  See <a class="reference internal" href="../features/visualgen-quantized-attention.html"><span class="std std-doc">VisualGen Quantized Attention</span></a> for the full recipe table, the V scale-granularity trade-off, and the block-scaled MXFP8 / NVFP4 recipes.</p>
 </section>
 <section id="cuda-graphs">
 <h3>CUDA Graphs<a class="headerlink" href="#cuda-graphs" title="Link to this heading">#</a></h3>
-<p>VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See <a class="reference internal" href="../visual-gen/features/cuda-graph.html"><span class="std std-doc">VisualGen CUDA Graphs</span></a> for capture scope, graph keys, and sparse-attention phase behavior.</p>
+<p>VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See <a class="reference internal" href="../features/visualgen-cuda-graph.html"><span class="std std-doc">VisualGen CUDA Graphs</span></a> for capture scope, graph keys, and sparse-attention phase behavior.</p>
 </section>
 <section id="step-caching">
 <h3>Step Caching<a class="headerlink" href="#step-caching" title="Link to this heading">#</a></h3>
 <p>Both caching backends are configured through <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.cache_config</span></code>. The backend is selected by the <code class="docutils literal notranslate"><span class="pre">cache_backend</span></code> discriminator field.</p>
+<p>FastWan 2.2 is a 3-step distilled model; TeaCache and Cache-DiT are not applicable.</p>
 <section id="teacache">
 <h4>TeaCache<a class="headerlink" href="#teacache" title="Link to this heading">#</a></h4>
 <p>TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.cache_config</span></code> (YAML or programmatic):</p>
@@ -1265,6 +1330,10 @@ actively evolving and may change in future releases.</p>
 </tbody>
 </table>
 </div>
+<p>Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables. Set
+<code class="docutils literal notranslate"><span class="pre">cache_config.coefficients</span></code> explicitly for LTX-2. Wan 2.2 requires both
+<code class="docutils literal notranslate"><span class="pre">cache_config.coefficients</span></code> for its high-noise transformer and
+<code class="docutils literal notranslate"><span class="pre">cache_config.coefficients_2</span></code> for its low-noise transformer.</p>
 </section>
 <section id="cache-dit">
 <h4>Cache-DiT<a class="headerlink" href="#cache-dit" title="Link to this heading">#</a></h4>
@@ -1403,7 +1472,7 @@ actively evolving and may change in future releases.</p>
 <h3>Multi-GPU Parallelism<a class="headerlink" href="#multi-gpu-parallelism" title="Link to this heading">#</a></h3>
 <p>Configured under <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.parallel_config</span></code>. Modes can be combined:</p>
 <ul class="simple">
-<li><p><strong>CFG Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>): Splits positive/negative guidance prompts across GPUs.</p></li>
+<li><p><strong>CFG Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.</p></li>
 <li><p><strong>Ulysses Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">ulysses_size:</span> <span class="pre">N</span></code>): Splits the sequence dimension across GPUs for longer sequences.</p>
 <ul>
 <li><p><strong>Async Ulysses A2A pipeline</strong> (<code class="docutils literal notranslate"><span class="pre">async_ulysses:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">parallel_config</span></code>): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires <code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and an NVLink-connected GPU domain (uses PyTorch <code class="docutils literal notranslate"><span class="pre">_SymmetricMemory</span></code> with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.</p></li>
@@ -1418,6 +1487,11 @@ actively evolving and may change in future releases.</p>
 </li>
 <li><p><strong>Tensor Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">tp_size:</span> <span class="pre">N</span></code>): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.</p></li>
 </ul>
+<p>For multi-node execution, VisualGen relies on the external launcher to terminate
+the remaining ranks when any rank exits. <code class="docutils literal notranslate"><span class="pre">torchrun</span></code> provides this behavior. With
+SLURM, launch the VisualGen rank group with <code class="docutils literal notranslate"><span class="pre">srun</span> <span class="pre">--kill-on-bad-exit=1</span></code>; without
+this option, surviving ranks can continue running and retain GPU memory after a
+peer or the coordinator exits.</p>
 </section>
 </section>
 <section id="developer-guide">
@@ -1505,34 +1579,6 @@ actively evolving and may change in future releases.</p>
 </section>
 </section>
 </section>
-<hr class="footnotes docutils" />
-<aside class="footnote-list brackets">
-<aside class="footnote brackets" id="id8" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></span>
-<span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id2">2</a>)</span>
-<p>FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.</p>
-</aside>
-<aside class="footnote brackets" id="id9" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">2</a><span class="fn-bracket">]</span></span>
-<p><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code> — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.</p>
-</aside>
-<aside class="footnote brackets" id="id10" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">3</a><span class="fn-bracket">]</span></span>
-<p>Wan 2.2 has two stage transformers; TeaCache requires explicit <code class="docutils literal notranslate"><span class="pre">teacache.coefficients</span></code> (high-noise) and <code class="docutils literal notranslate"><span class="pre">teacache.coefficients_2</span></code> (low-noise). There is no built-in coefficient table for Wan 2.2.</p>
-</aside>
-<aside class="footnote brackets" id="id11" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id6">4</a><span class="fn-bracket">]</span></span>
-<p>LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set <code class="docutils literal notranslate"><span class="pre">teacache.coefficients</span></code> explicitly when enabling TeaCache.</p>
-</aside>
-<aside class="footnote brackets" id="id12" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id7">6</a><span class="fn-bracket">]</span></span>
-<p>Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> image-edit routing and returns one RGBA image per generated layer by default. Set <code class="docutils literal notranslate"><span class="pre">extra_params.save_layers_to_grid</span></code> to <code class="docutils literal notranslate"><span class="pre">true</span></code> to pack layers into one saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, and Tensor Parallelism are not enabled for this pipeline yet.</p>
-</aside>
-<aside class="footnote brackets" id="id13" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id5">7</a><span class="fn-bracket">]</span></span>
-<p><code class="docutils literal notranslate"><span class="pre">FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers</span></code> — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.</p>
-</aside>
-</aside>
 
 
                 </article>
@@ -1594,8 +1640,12 @@ actively evolving and may change in future releases.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-inputs">Reference Inputs</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#minimax-h3-notes">MiniMax-H3 Notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optimizations">Optimizations</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization">Quantization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization">Quantization</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#wan-vae-nvfp4">Wan VAE NVFP4</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-lora">Runtime LoRA</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantized-attention">Quantized Attention</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graphs">CUDA Graphs</a></li>
@@ -1711,9 +1761,9 @@ actively evolving and may change in future releases.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

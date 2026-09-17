@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -369,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -452,6 +453,7 @@
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -511,8 +513,10 @@
 <li class="toctree-l1"><a class="reference internal" href="features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -548,6 +552,12 @@
 <li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -559,8 +569,9 @@
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -695,6 +706,8 @@
 <h3>API Changes<a class="headerlink" href="#api-changes" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><span style="color: red"><strong>[BREAKING CHANGE] TensorRT backend removed.</strong></span> PyTorch is now the sole execution backend. <code class="docutils literal notranslate"><span class="pre">LLM(backend=&quot;tensorrt&quot;)</span></code> now raises a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>; <code class="docutils literal notranslate"><span class="pre">TrtLlmArgs</span></code>, <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._tensorrt_engine.LLM</span></code>, the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> / <code class="docutils literal notranslate"><span class="pre">trtllm-refit</span></code> / <code class="docutils literal notranslate"><span class="pre">trtllm-prune</span></code> CLIs, the <code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">tensorrt</span></code> CLI choice, and the per-model <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code> scripts have all been removed. The <code class="docutils literal notranslate"><span class="pre">tensorrt</span></code> pip dependency is no longer installed. See the <a class="reference internal" href="legacy/tensorrt-backend-removal.html"><span class="std std-doc">TensorRT Backend Removed migration guide</span></a> for details.</p></li>
+<li><p><span style="color: red"><strong>[BREAKING CHANGE] Two-model speculative decoding removed.</strong></span> The separate draft-engine path behind Eagle3, MTP-Eagle and Draft-Target has been removed; the one-model implementations (draft/drafter as a submodule) are now the only supported paths. The <code class="docutils literal notranslate"><span class="pre">eagle3_one_model</span></code> and <code class="docutils literal notranslate"><span class="pre">mtp_eagle_one_model</span></code> fields are removed from <code class="docutils literal notranslate"><span class="pre">EagleDecodingConfig</span></code> and <code class="docutils literal notranslate"><span class="pre">MTPDecodingConfig</span></code>; both have carried a deprecation warning since #11043/#11761 and have been forced to the one-model path since #17366. Configurations that still set them (including <code class="docutils literal notranslate"><span class="pre">True</span></code>) now fail with a Pydantic <code class="docutils literal notranslate"><span class="pre">unexpected</span> <span class="pre">field</span></code> error and should simply drop the field. The <code class="docutils literal notranslate"><span class="pre">--use_one_model</span></code> flag is removed from <code class="docutils literal notranslate"><span class="pre">examples/llm-api/quickstart_advanced.py</span></code>. <code class="docutils literal notranslate"><span class="pre">EagleDecodingConfig.greedy_sampling</span></code> and <code class="docutils literal notranslate"><span class="pre">EagleDecodingConfig.posterior_threshold</span></code>, which had no effect, are also removed.</p></li>
+<li><p><span style="color: red"><strong>[BREAKING CHANGE] C++ executor API: <code class="docutils literal notranslate"><span class="pre">SpeculativeDecodingFastLogitsInfo::toTensor()</span></code> removed.</strong></span> This is a source and ABI break for downstream code linking against the C++ executor API: the exported symbol <code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::SpeculativeDecodingFastLogitsInfo::toTensor()</span> <span class="pre">const</span></code> no longer exists, so an unmodified binary fails at link/load time with <code class="docutils literal notranslate"><span class="pre">undefined</span> <span class="pre">symbol</span></code>. There is no replacement — it served the fast-logits path of the removed TensorRT-engine flow; call sites should be deleted. The struct’s data layout is unchanged (<code class="docutils literal notranslate"><span class="pre">sizeof</span></code> 16, <code class="docutils literal notranslate"><span class="pre">draftRequestId</span></code> at offset 0, <code class="docutils literal notranslate"><span class="pre">draftParticipantId</span></code> at offset 8), so no silent misreads are possible. Speculative-decoding accessors on <code class="docutils literal notranslate"><span class="pre">runtime::ModelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">runtime::SpeculativeDecodingMode</span></code> and <code class="docutils literal notranslate"><span class="pre">runtime::SpeculativeDecodingModule</span></code> are removed in the same change; these are <code class="docutils literal notranslate"><span class="pre">inline</span></code>/<code class="docutils literal notranslate"><span class="pre">constexpr</span></code> and therefore break at compile time rather than at load time.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code>, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>: explicit CLI flags now take precedence over values in <code class="docutils literal notranslate"><span class="pre">--config</span></code> / <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.</p></li>
 <li><p><span style="color: red"><strong>[BREAKING CHANGE] KV Cache Manager V2 <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> values are now specified in layer-group ID order, with exactly one normalized hot-tier byte ratio per layer group, instead of hot pool-group order. Cold-tier initialization preserves the implied layer-group slot-count proportions while accounting for cold page sizes.</strong></span></p></li>
 <li><p><span style="color: red"><strong>[BREAKING CHANGE] KV Cache Manager V2 reports cold-tier <code class="docutils literal notranslate"><span class="pre">secondary*</span></code> statistics in <code class="docutils literal notranslate"><span class="pre">kvCacheIterationStatsByColdPoolGroup</span></code>. These keys are no longer present in the hot pool-group or window-size views.</strong></span></p></li>
@@ -2426,7 +2439,7 @@
 <li><p>Skywork model support</p></li>
 <li><p>Add example for multimodal models (BLIP with OPT or T5, LlaVA)</p></li>
 </ul>
-<p>Refer to the <span class="xref std std-ref">support-matrix-software</span> section for a list of supported models.</p>
+<p>Refer to the <a class="reference internal" href="models/supported-models.html#support-matrix"><span class="std std-ref">Supported Models</span></a> section for a list of supported models.</p>
 <ul class="simple">
 <li><p>API</p>
 <ul>
@@ -2501,7 +2514,7 @@
 <li><p>Enable split-k for weight-only cutlass kernel when SM&gt;=75</p></li>
 </ul>
 </li>
-<li><p>Added <a class="reference internal" href="legacy/performance/perf-benchmarking.html#workflow"><span class="std std-ref">Workflow</span></a> documentation</p></li>
+<li><p>Added <a class="reference internal" href="legacy/architecture/workflow.html#workflow"><span class="std std-ref">TensorRT-LLM Build Workflow</span></a> documentation</p></li>
 </ul>
 </section>
 <section id="id85">
@@ -2813,9 +2826,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

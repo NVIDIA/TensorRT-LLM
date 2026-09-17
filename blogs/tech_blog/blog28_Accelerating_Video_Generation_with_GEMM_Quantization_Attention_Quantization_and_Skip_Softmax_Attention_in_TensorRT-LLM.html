@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,12 +76,12 @@
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
     <link rel="next" title="Evaluating Agentic Serving with Trace Replay and Job-Level Metrics" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html" />
-    <link rel="prev" title="Sparse Attention Development Guide" href="../../developer-guide/sparse-attention-development-guide.html" />
+    <link rel="prev" title="Telemetry" href="../../developer-guide/telemetry.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -515,8 +517,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -552,6 +556,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -563,8 +573,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -671,7 +682,7 @@
 <p>Video diffusion transformers (DiTs) repeatedly process long spatiotemporal token sequences across multiple denoising steps. Linear and attention layers therefore dominate much of the compute, making them the two most direct targets for reducing generation latency.</p>
 <p>Figure 1 breaks down pipeline-forward time for Wan 2.2 T2V-A14B on a single NVIDIA B200. For an 81-frame, 1280×720 video with 40 denoising steps, attention and linear-layer GEMMs account for 70.3% and 21.0% of BF16 pipeline-forward time, respectively.</p>
 <p align="center">
-  <img src="../media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that Wan 2.2 T2V-A14B in BF16 spends 70.3% of pipeline-forward time in attention, 21.0% in GEMMs, and 8.7% in other work" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that Wan 2.2 T2V-A14B in BF16 spends 70.3% of pipeline-forward time in attention, 21.0% in GEMMs, and 8.7% in other work" width="1080">
 </p>
 <p align="center"><sub><em>Figure 1. Diffusion pipeline-forward breakdown for Wan 2.2 T2V-A14B in BF16 on B200.</em></sub></p>
 <p>Our earlier post, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md">Scaling Video Generation Across NVL72 Rack with TensorRT-LLM</a>, showed how to accelerate video generation with multiple GPUs. This post focuses on three complementary techniques within one GPU: GEMM quantization, quantized attention, and sparse attention. The central question is how to reduce latency without giving up more visual quality than the application can tolerate.</p>
@@ -763,8 +774,8 @@
 <li><p><code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> expresses how aggressively to skip as an intuitive target.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> keeps the early denoising steps dense before enabling Skip Softmax.</p></li>
 </ul>
-<p>The mapping from <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to actual denoising steps depends on the scheduler and is not linear. In the 40-step UniPC schedule used here, <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep=0.86</span></code> keeps the 14/40 steps dense and enables Skip Softmax for the remaining 26. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#mapping-disabled_until_timestep-to-actual-denoising-steps">VisualGen Skip Softmax Attention documentation</a> for the scheduler-dependent mapping.</p>
-<p>The ModelOpt checkpoints used in this experiment already include this calibration metadata. Without calibration, Skip Softmax can still be enabled by setting the threshold directly. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#skip-softmax-attention">VisualGen Skip Softmax Attention documentation</a> for direct-threshold configuration.</p>
+<p>The mapping from <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to actual denoising steps depends on the scheduler and is not linear. In the 40-step UniPC schedule used here, <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep=0.86</span></code> keeps the 14/40 steps dense and enables Skip Softmax for the remaining 26. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/visualgen-sparse-attention.md#mapping-disabled_until_timestep-to-actual-denoising-steps">VisualGen Skip Softmax Attention documentation</a> for the scheduler-dependent mapping.</p>
+<p>The ModelOpt checkpoints used in this experiment already include this calibration metadata. Without calibration, Skip Softmax can still be enabled by setting the threshold directly. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/visualgen-sparse-attention.md#skip-softmax-attention">VisualGen Skip Softmax Attention documentation</a> for direct-threshold configuration.</p>
 </section>
 </section>
 <section id="results">
@@ -822,7 +833,7 @@
 </ul>
 <p>The aggressive point shows the upper-speed end of the sweep rather than a recommended setting. The remaining Skip Softmax configurations are circles, and the dashed line traces the global Pareto frontier across all six families.</p>
 <p align="center">
-  <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
 </p>
 <p align="center"><sub><em>Figure 2. Speedup–quality frontier across all 96 configurations. Both LPIPS and speedup are measured against compiled BF16 with standard attention and no Skip Softmax.</em></sub></p>
 </section>
@@ -880,7 +891,7 @@
 <h3>Latency step-down<a class="headerlink" href="#latency-step-down" title="Link to this heading">#</a></h3>
 <p>Figure 3 isolates the attention optimizations within each GEMM precision. Each group starts with standard attention, adds SAGE, and then adds the conservative Skip Softmax setting from the frontier. The bars report absolute pipeline-forward latency, while their labels retain the common speedup against the compiled BF16 baseline.</p>
 <p align="center">
-  <img src="../media/tech_blog28_latency_step_down.png" alt="Horizontal latency step-down bars for BF16, FP8 per-tensor, and NVFP4, each progressing from dense attention to SAGE and then SAGE with conservative Skip Softmax" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_latency_step_down.png" alt="Horizontal latency step-down bars for BF16, FP8 per-tensor, and NVFP4, each progressing from dense attention to SAGE and then SAGE with conservative Skip Softmax" width="1080">
 </p>
 <p align="center"><sub><em>Figure 3. Pipeline-forward latency after successively adding SAGE and conservative Skip Softmax within each GEMM precision. Lower is better.</em></sub></p>
 </section>
@@ -927,25 +938,25 @@
 <p align="center"><sub><em>Figure 4. P1 video comparison across the BF16 baseline and six conservative Skip Softmax configurations.</em></sub></p>
 <p>Figure 5 expands the first-frame comparison to all seven prompts. Each row compares the BF16 baseline with the same six conservative configurations as Figure 4. The previews are downsampled from the original videos.</p>
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 <p align="center"><sub><em>Figure 5. First-frame comparison across all seven prompts. Every Skip Softmax result uses `target_sparsity=0.75` and `disabled_until_timestep=0.86`, corresponding to the stars in Figure 2.</em></sub></p>
 </section>
@@ -1086,12 +1097,12 @@ trtllm-serve<span class="w"> </span><span class="s2">"</span><span class="nv">$M
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../../developer-guide/sparse-attention-development-guide.html"
+       href="../../developer-guide/telemetry.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Sparse Attention Development Guide</p>
+        <p class="prev-next-title">Telemetry</p>
       </div>
     </a>
     <a class="right-next"
@@ -1238,9 +1249,9 @@ trtllm-serve<span class="w"> </span><span class="s2">"</span><span class="nv">$M
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

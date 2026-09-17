@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -683,10 +694,10 @@
 <ul>
 <li><p><a class="reference internal" href="#attempts-at-online-eplb-implementation">Attempts at Online EPLB Implementation</a></p>
 <ul>
-<li><p><a class="reference internal" href="#1-initial-approach-for-weight-updating---cudamemcpyasync"><span class="xref myst">1. Initial Approach for Weight Updating - cudaMemcpyAsync</span></a></p></li>
-<li><p><a class="reference internal" href="#2-avoiding-deadlock---multithreaded-cpu-copy-with-managed-memory"><span class="xref myst">2. Avoiding Deadlock - Multithreaded CPU Copy with Managed Memory</span></a></p></li>
-<li><p><a class="reference internal" href="#3-numa-memory-to-prevent-page-migration"><span class="xref myst">3. NUMA Memory to Prevent Page Migration</span></a></p></li>
-<li><p><a class="reference internal" href="#4-addressing-the-tlb-thrashing-issue"><span class="xref myst">4. Addressing the TLB Thrashing Issue</span></a></p></li>
+<li><p><a class="reference internal" href="#initial-approach-for-weight-updating-cudamemcpyasync">1. Initial Approach for Weight Updating - cudaMemcpyAsync</a></p></li>
+<li><p><a class="reference internal" href="#avoiding-deadlock-multithreaded-cpu-copy-with-managed-memory">2. Avoiding Deadlock - Multithreaded CPU Copy with Managed Memory</a></p></li>
+<li><p><a class="reference internal" href="#numa-memory-to-prevent-page-migration">3. NUMA Memory to Prevent Page Migration</a></p></li>
+<li><p><a class="reference internal" href="#addressing-the-tlb-thrashing-issue">4. Addressing the TLB Thrashing Issue</a></p></li>
 </ul>
 </li>
 </ul>
@@ -896,7 +907,7 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
 <section id="reduce-binding-and-inter-process-communication-overhead">
 <h4>Reduce Binding and Inter-Process Communication Overhead<a class="headerlink" href="#reduce-binding-and-inter-process-communication-overhead" title="Link to this heading">#</a></h4>
 <p>TensorRT LLM is designed to be composed of both C++ and Python code, so that C++ can handle the most performance-sensitive parts while Python handles higher-level logic. As we try to put more logic into Python to make the program easier to read and debug, there are still frequent conversations through binding interfaces between C++ and Python. Besides, since most of the logic is implemented in Python, there are several layers of implementation that communicate with each other through inter-process communication overhead. Frequent binding calls and serialization/deserialization introduced by inter-process communication slow down the core library.</p>
-<p>To improve program efficiency, we used environment variables introduced in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-analysis.md">performance analysis guidance</a> to measure and profile CPU overhead, and improved performance by reducing and reusing different binding calls as much as possible, and delaying Python object deserialization to avoid duplicated serialization and reduce message size when doing inter-process communication. This optimization was added in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/5224">PR 5224</a>. We have also reduced Python garbage collection (GC) impacts in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/5141">PR 5141</a>.</p>
+<p>To improve program efficiency, we used environment variables introduced in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-analysis.md">performance analysis guidance</a> to measure and profile CPU overhead, and improved performance by reducing and reusing different binding calls as much as possible, and delaying Python object deserialization to avoid duplicated serialization and reduce message size when doing inter-process communication. This optimization was added in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/5224">PR 5224</a>. We have also reduced Python garbage collection (GC) impacts in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/5141">PR 5141</a>.</p>
 <p>To enable powerful NVTX markers for easier analysis of host overheads, TensorRT LLM provides several useful environment variables:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_NVTX_DEBUG</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="c1"># enables more NVTX markers</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_PROFILE_RECORD_GC</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="c1"># enables GC collection hint</span>
@@ -1131,9 +1142,9 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       
