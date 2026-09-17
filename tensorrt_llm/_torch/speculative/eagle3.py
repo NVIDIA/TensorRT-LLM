@@ -43,7 +43,8 @@ class Eagle3ResourceManager(BaseResourceManager):
                  max_num_requests: int,
                  max_seq_len: int,
                  max_num_tokens: int,
-                 sa_manager=None):
+                 sa_manager=None,
+                 num_seq_slots: Optional[int] = None):
         self.dtype = dtype
         self.max_draft_len = config.max_draft_len
         self.hidden_size = hidden_size
@@ -51,9 +52,10 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         # Optional SA manager for EAGLE3+SA mode
         self.sa_manager = sa_manager
+        self.num_seq_slots = max(num_seq_slots or 0, max_num_requests)
         # There could be dummy request for padding batch when using CUDA graph.
         # Reserve one more slot for the dummy request.
-        slot_size = self.max_seq_len + 1
+        slot_size = max(self.num_seq_slots, self.max_seq_len) + 1
         self.slot_manager = SlotManager(slot_size)
         # This class is reused by MTP_EAGLE
         from ...llmapi.llm_args import EagleDecodingConfig
@@ -94,16 +96,13 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.is_first_draft = True
         self.spec_tree_manager = None
 
-        if isinstance(config,
-                      EagleDecodingConfig) and (config.eagle_choices is not None
-                                                or config.use_dynamic_tree):
+        if isinstance(config, EagleDecodingConfig) and config.use_dynamic_tree:
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
-                use_dynamic_tree=config.use_dynamic_tree,
                 max_draft_len=self.max_draft_len,
                 max_total_draft_tokens=self.max_total_draft_tokens,
-                eagle_choices=config.eagle_choices,
                 dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+                num_seq_slots=self.num_seq_slots,
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -165,7 +164,10 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     hidden_states: Optional[torch.Tensor] = None
     batch_indices_cuda: Optional[torch.Tensor] = None
 
-    def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
+    def __init__(self,
+                 config: "EagleDecodingConfig",
+                 max_num_requests: int,
+                 num_seq_slots: Optional[int] = None):
         self.max_num_requests = max_num_requests
         self.batch_indices_cuda = torch.empty(
             [max_num_requests],
@@ -174,11 +176,10 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
         )
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
-            use_dynamic_tree=config.use_dynamic_tree,
             max_draft_len=config.max_draft_len,
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
-            eagle_choices=config.eagle_choices,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+            num_seq_slots=num_seq_slots,
         )
 
     def free_resources(self, request: LlmRequest):
@@ -224,7 +225,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     spec_resource_manager: Optional[Eagle3ResourceManager] = None
     # Dynamic tree flags
     use_dynamic_tree: bool = False
-    eagle_choices: Optional[List[List[int]]] = None
     # Slot IDs for each request; populated in prepare() when spec_resource_manager
     # is present (required for relaxed acceptance, mirrors MTPSpecMetadata.slot_ids).
     slot_ids: Optional[torch.Tensor] = None
@@ -312,15 +312,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         )
 
         # Set tree flags based on config
-        if self.use_dynamic_tree:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = True
-        elif self.eagle_choices is not None:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = False
-        else:
-            self.is_spec_dec_tree = False
-            self.is_spec_dec_dynamic_tree = False
+        self.is_spec_dec_tree = self.use_dynamic_tree
+        self.is_spec_dec_dynamic_tree = self.use_dynamic_tree
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture

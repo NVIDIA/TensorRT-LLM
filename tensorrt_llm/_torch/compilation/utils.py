@@ -103,6 +103,9 @@ def inplace_info():
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
+        torch.ops.trtllm.moe_output_memset_from_expert_counts_inplace.default: {
+            1: "input"
+        },
         torch.ops.trtllm.megamoe_prepare.default: {
             1: "x_out",
             2: "x_sf_out",
