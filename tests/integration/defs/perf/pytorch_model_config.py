@@ -423,8 +423,8 @@ def get_model_yaml_config(model_label: str,
         # fallback), it does not support KV-cache block reuse, and max_seq_len
         # must be capped just above ISL+OSL -- left at the checkpoint default
         # (1M) the CUDA-graph warmup decode allocates gigabyte-scale temporaries
-        # and capture fails with cudaErrorStreamCaptureUnsupported. Every NVFP4
-        # case keeps ISL+OSL <= 2048. See
+        # and capture fails with cudaErrorStreamCaptureUnsupported.
+        # Serve sequence-length overrides follow below. See
         # docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md
         {
             'patterns': ['minimax_m3_fp4'],
@@ -448,8 +448,34 @@ def get_model_yaml_config(model_label: str,
                     # The MSA path runs an FP8 KV cache.
                     'dtype': 'fp8',
                 },
+            }
+        },
+        {
+            'patterns': ['minimax_m3_fp4-bench-pytorch'],
+            'config': {
                 'stream_interval': 10,
                 'num_postprocess_workers': 4,
+            }
+        },
+        # Bound the serve warmup/capture batch and sequence length on TP4/EP4.
+        {
+            'patterns': ['minimax_m3_fp4-serve-pytorch'],
+            'config': {
+                'max_seq_len': 4096,
+                'cuda_graph_config': {
+                    'max_batch_size': 128,
+                },
+            }
+        },
+        # The 8K input exceeds the 2048-token budget, so serve needs chunking.
+        # Match the normalized PerfTestConfig label, including maxbs/maxnt.
+        {
+            'patterns': [
+                'minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000',
+            ],
+            'config': {
+                'max_seq_len': 9216,
+                'enable_chunked_prefill': True,
             }
         },
         # Gemma 4 NVFP4: VSWA (1024-token sliding window) plus per-layer

@@ -1476,6 +1476,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
+            elif self._config.model_name == "minimax_m3_fp4":
+                # Cold MSA JIT compilation can exceed the default 10 minutes.
+                server_timeout = 1800
             else:
                 server_timeout = 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
