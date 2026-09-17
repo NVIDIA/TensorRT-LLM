@@ -782,3 +782,4 @@ class CapturableGuidedDecoder(GuidedDecoder):
             # back, but a forked stream must be joined under CUDA graph capture.
             self.bitmask_event.record()
         torch.cuda.current_stream().wait_event(self.bitmask_event)
+        self._drain_host_functions()
