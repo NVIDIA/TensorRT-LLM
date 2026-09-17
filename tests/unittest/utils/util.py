@@ -95,7 +95,7 @@ def getCUDAVersion():
 
 def isSM100Family():
     sm = getSMVersion()
-    return sm == 100 or sm == 103
+    return sm >= 100 and sm < 110
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -111,7 +111,7 @@ skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 skip_blackwell = pytest.mark.skipif(
-    getSMVersion() == 100 or getSMVersion() == 103,
+    isSM100Family(),
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")

@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmResponse,
     SamplingConfig,
 )
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     EncoderStepResult,
@@ -180,11 +181,10 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
         ),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = types.SimpleNamespace(
-        encoder_cuda_graph_runner=types.SimpleNamespace(
-            feature_mode=False, enabled=True, supported_batch_sizes=batch_sizes
-        )
-    )
+    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine._cleanup_done = True
+    executor.model_engine._encoder_graph_batch_sizes = tuple(batch_sizes)
+    executor.model_engine._encoder_graph_pad_to_limit = True
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -197,7 +197,7 @@ def _make_feature_encoder_batch_wait_executor(
 
     A feature encoder leaves `num_tokens` / `seq_lens` unset and may have had
     its `batch_sizes` derived rather than configured, so the resolved sizes come
-    from the engine's encoder graph runner rather than the config.
+    from the encoder manager's resolved startup settings rather than the config.
     """
     executor = object.__new__(PyExecutor)
     executor.max_batch_size = 32
@@ -205,13 +205,12 @@ def _make_feature_encoder_batch_wait_executor(
         encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = types.SimpleNamespace(
-        encoder_cuda_graph_runner=types.SimpleNamespace(
-            supported_batch_sizes=runner_batch_sizes,
-            enabled=runner_enabled,
-            feature_mode=True,
-        )
+    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine._cleanup_done = True
+    executor.model_engine._encoder_graph_batch_sizes = (
+        tuple(runner_batch_sizes) if runner_enabled else ()
     )
+    executor.model_engine._encoder_graph_pad_to_limit = False
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -224,7 +223,9 @@ def _make_encoder_fallback_batch_wait_executor():
         encoder_cuda_graph_config=None,
         encoder_max_batch_size=None,
     )
-    executor.model_engine = types.SimpleNamespace(encoder_cuda_graph_runner=None)
+    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine._cleanup_done = True
+    executor.model_engine._runner = None
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
