@@ -640,3 +640,144 @@ def test_a_send_session_reads_a_parked_cancel_as_the_peers_too():
     outcome = TaskHandle(session, task, TOKENS).poll()
     assert isinstance(outcome, Cancelled)
     assert outcome.by_peer is True
+
+
+# ---------------------------------------------------------------------------
+# Logical decisions belong to the transition, not the first observer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("poll_before_completion", [False, True])
+@pytest.mark.parametrize("ending", ["failure", "local_cancel", "peer_cancel"])
+def test_receive_outcome_does_not_depend_on_polling_before_late_completion(
+    ending: str, poll_before_completion: bool
+) -> None:
+    session, handle = _receiving_from(1)
+    if ending == "failure":
+        session.fail_admission(RuntimeError("another publication failed"))
+    else:
+        session.cancel_local(by_peer=ending == "peer_cancel")
+    if poll_before_completion:
+        assert handle.poll() is not None
+
+    # The writer finishes after the logical decision. Its report still drains the transfer.
+    _report(session, 0, AgentResult.SUCCESS)
+
+    for observer in (handle, TaskHandle(session, session._kv_tasks[0], TOKENS)):
+        outcome = observer.poll()
+        if ending == "failure":
+            assert isinstance(outcome, Failed)
+            assert "another publication failed" in outcome.reason
+        else:
+            assert isinstance(outcome, Cancelled)
+            assert outcome.by_peer is (ending == "peer_cancel")
+        assert outcome.reports_pending is False
+
+
+@pytest.mark.parametrize("by_peer", [False, True])
+def test_receive_cancel_keeps_its_outcome_when_a_writer_later_fails(by_peer: bool) -> None:
+    session, _ = _receiving_from(1)
+    session.cancel_local(by_peer=by_peer)
+
+    _report(session, 0, AgentResult.FAILED)
+
+    outcome = TaskHandle(session, session._kv_tasks[0], TOKENS).poll()
+    assert isinstance(outcome, Cancelled)
+    assert outcome.by_peer is by_peer
+    assert outcome.reports_pending is False
+
+
+def test_receive_session_failure_precedes_later_cancel_without_an_observer() -> None:
+    session, handle = _receiving_from(1)
+    session.fail_admission(RuntimeError("first publication failure"))
+
+    assert session.cancel_local() is True
+
+    outcome = handle.poll()
+    assert isinstance(outcome, Failed)
+    assert "first publication failure" in outcome.reason
+    assert outcome.reports_pending is True
+
+
+def _sending_pieces(count: int = 1) -> tuple[Sender, TxSession]:
+    sender = _wired_sender()
+    sender.dispatch_task = MagicMock()
+    sender._get_result_dealer = MagicMock()
+    sender._instance_rank = 0
+    session = TxSession(
+        request_id=30, params=DisaggregatedParams(disagg_request_id=30), sender=sender
+    )
+    for _ in range(count):
+        session.send(_sole_piece())
+    return sender, session
+
+
+@pytest.mark.parametrize("by_peer", [False, True])
+def test_queued_sender_abort_preserves_the_committed_cancellation(by_peer: bool) -> None:
+    sender, session = _sending_pieces()
+    task = session.kv_tasks[0]
+    session.cancel_local(by_peer=by_peer)
+    # Execute the real worker's pre-submission abort branch after cancellation won.
+    empty = SimpleNamespace(size=0)
+    write_meta = SimpleNamespace(
+        src_ptrs=empty,
+        dst_ptrs=empty,
+        sizes=empty,
+        unique_rid=30,
+        slice_id=0,
+        receiver_slice_id=0,
+        peer_rank=0,
+        peer_endpoint="tcp://receiver:1234",
+        task=task,
+    )
+
+    sender._deliver_kv_to_agent(write_meta)
+
+    outcome = TaskHandle(session, task, TOKENS).poll()
+    assert isinstance(outcome, Cancelled)
+    assert outcome.by_peer is by_peer
+    sender._get_result_dealer.return_value.send.assert_called_once()
+
+
+@pytest.mark.parametrize("poll_before_completion", [False, True])
+def test_sender_sibling_failure_is_stable_across_late_completion(
+    poll_before_completion: bool,
+) -> None:
+    _, session = _sending_pieces(2)
+    failed, pending = session.kv_tasks
+    pending.status = TaskStatus.TRANSFERRING
+    handle = TaskHandle(session, pending, TOKENS)
+
+    failed.fail(RuntimeError("first sibling failed"))
+    if poll_before_completion:
+        assert isinstance(handle.poll(), Failed)
+    pending.complete()
+
+    for observer in (handle, TaskHandle(session, pending, TOKENS)):
+        outcome = observer.poll()
+        assert isinstance(outcome, Failed)
+        assert "first sibling failed" in outcome.reason
+
+
+def test_terminal_failure_cause_is_stable_without_polling() -> None:
+    session, handle = _receiving_from(1)
+    task = session._kv_tasks[0]
+    task.fail(RuntimeError("original failure"))
+    task.fail(RuntimeError("cleanup failure"))
+
+    outcome = handle.poll()
+    assert isinstance(outcome, Failed)
+    assert outcome.reason == "original failure"
+
+
+@pytest.mark.parametrize("ending", ["failure", "local_cancel", "peer_cancel"])
+def test_delivered_outcome_precedes_later_session_terminal_events(ending: str) -> None:
+    session, handle = _receiving_from(1)
+    _report(session, 0, AgentResult.SUCCESS)
+    if ending == "failure":
+        session.fail_admission(RuntimeError("later failure"))
+    else:
+        session.cancel_local(by_peer=ending == "peer_cancel")
+
+    assert isinstance(handle.poll(), Delivered)
+    assert handle.poll().token_end == TOKENS
