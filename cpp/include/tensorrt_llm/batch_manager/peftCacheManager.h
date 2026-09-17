@@ -27,6 +27,7 @@
 
 #include "tensorrt_llm/common/tllmDataType.h"
 
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,46 @@ class PeftTaskNotCachedException : public runtime::LoraExpectedException
 public:
     explicit PeftTaskNotCachedException(std::string const& msg);
     ~PeftTaskNotCachedException() noexcept override;
+};
+
+/**
+ * Per-iteration view of PEFT cache activity.
+ *
+ * The transition counters are cleared when read, so each drain reports only the
+ * activity since the previous one. The gauges are sampled at drain time and
+ * describe the cache as it stands.
+ */
+struct PeftCacheIterationStats
+{
+    //! Ownership transitions, counted per (adapter, request) pair. A request pausing
+    //! does not by itself free anything -- other requests may still hold the adapter.
+    std::uint64_t requestsPaused{0};
+    std::uint64_t requestsResumed{0};
+    std::uint64_t requestsTerminated{0};
+
+    //! Adapters whose last holder let go, making their pages evictable. This is the
+    //! transition that actually frees capacity: requestsPaused counts intent,
+    //! tasksReleasedDevice counts effect.
+    std::uint64_t tasksReleasedDevice{0};
+    //! Adapters dropped from the host cache too, i.e. released with no paused holder
+    //! left to come back for them.
+    std::uint64_t tasksReleasedHost{0};
+
+    std::uint64_t tasksEvictedDevice{0};
+    std::uint64_t pagesEvictedDevice{0};
+    std::uint64_t tasksEvictedHost{0};
+    std::uint64_t pagesEvictedHost{0};
+
+    SizeType32 devicePagesTotal{0};
+    SizeType32 devicePagesAvailable{0};
+    SizeType32 hostPagesTotal{0};
+    SizeType32 hostPagesAvailable{0};
+    //! Device-cache adapters still held by a request, and those marked done (evictable).
+    SizeType32 deviceTasksInProgress{0};
+    SizeType32 deviceTasksDone{0};
+    //! Distinct adapters with at least one active request, and with at least one paused request.
+    SizeType32 activeTasks{0};
+    SizeType32 pausedTasks{0};
 };
 
 /**
@@ -99,6 +140,10 @@ public:
     [[nodiscard]] virtual SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const = 0;
 
     [[nodiscard]] virtual bool enabled() const = 0;
+
+    //! \brief Read and clear this iteration's cache activity. Called once per iteration
+    //! from the executor loop; the transition counters reset on read.
+    [[nodiscard]] virtual PeftCacheIterationStats getAndResetIterationStats() = 0;
 };
 
 class PeftCacheManager : public BasePeftCacheManager
@@ -106,8 +151,11 @@ class PeftCacheManager : public BasePeftCacheManager
 public:
     using EnsureBatchTaskResult = BasePeftCacheManager::EnsureBatchTaskResult;
 
+    //! \param[in] enableStats: record the per-iteration counters reported by
+    //! getAndResetIterationStats(). Off by default; the executor turns it on when
+    //! iteration performance stats are enabled.
     PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
+        runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager, bool enableStats = false);
 
     ~PeftCacheManager() override = default;
 
@@ -147,6 +195,8 @@ public:
         return true;
     }
 
+    [[nodiscard]] PeftCacheIterationStats getAndResetIterationStats() override;
+
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> const& getActiveTasks() const;
 
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> const& getPausedTasks() const;
@@ -184,6 +234,18 @@ private:
 
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToReqIds;
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToPausedReqIds;
+
+    // Ownership-transition counters for the current iteration. Plain integers because
+    // they are written only from updateTaskState, which mutates mTaskIdToReqIds without
+    // a lock and is therefore already confined to the executor thread. The LoraCache
+    // eviction counters they are combined with are atomic, since eviction also runs on
+    // the put/ensure worker pools.
+    bool mEnableStats{false};
+    std::uint64_t mIterRequestsPaused{0};
+    std::uint64_t mIterRequestsResumed{0};
+    std::uint64_t mIterRequestsTerminated{0};
+    std::uint64_t mIterTasksReleasedDevice{0};
+    std::uint64_t mIterTasksReleasedHost{0};
 
     std::tuple<std::unordered_map<uint64_t, std::future<void>>, TaskIdToReqIds> getTaskMaps(
         RequestVector const& contextRequests, RequestVector const& generationRequests);
@@ -223,6 +285,11 @@ private:
     inline bool enabled() const override
     {
         return false;
+    }
+
+    [[nodiscard]] PeftCacheIterationStats getAndResetIterationStats() override
+    {
+        return {};
     }
 };
 } // namespace tensorrt_llm::batch_manager
