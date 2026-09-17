@@ -850,13 +850,12 @@ class KvCacheCreator:
             # sparse backend uses a subclass, so beams would read beam 0's
             # unmapped prompt rows. The sparse managers' own block tables
             # (indexer K-cache, pool block indices) are beam-0 only as well.
-            # Disaggregated serving: the context and generation instances own
-            # separate KvCaches and the handoff carries beam 0 only. Beam search
-            # over that handoff is not supported yet — with block reuse it trips
-            # "prepopulatedPromptLen >= promptLen" on the generation side.
+            # Disaggregated serving transfers the shared prompt in beam 0.
+            # The C++ V2 cache expands beams after receive completion, copying
+            # the prompt's partial tail before the first generation step.
             if (self._max_beam_width is not None and self._max_beam_width > 1
                     and (python_v2_backend or is_hybrid_linear(config)
-                         or self._is_disagg or sparse_attn_config is not None)):
+                         or sparse_attn_config is not None)):
                 incompat.append("max_beam_width > 1")
             if incompat:
                 incompat_str = ", ".join(incompat)

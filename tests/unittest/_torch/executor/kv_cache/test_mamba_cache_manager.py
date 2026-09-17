@@ -1036,15 +1036,27 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
 
 
 @pytest.mark.parametrize(
-    "backend, architecture, sparse, beam_width, expected_manager",
+    "backend, architecture, sparse, beam_width, is_disagg, expected_manager",
     [
-        ("cpp", "T5ForConditionalGeneration", False, 2, KVCacheManagerV2),
-        ("cpp", "LlamaForCausalLM", False, 2, KVCacheManagerV2),
-        ("python", "LlamaForCausalLM", False, 2, KVCacheManager),
-        ("cpp", "DeepseekV3ForCausalLM", True, 2, None),
-        ("cpp", "DeepseekV3ForCausalLM", True, 1, KVCacheManagerV2),
+        ("cpp", "T5ForConditionalGeneration", False, 2, False, KVCacheManagerV2),
+        ("cpp", "LlamaForCausalLM", False, 2, False, KVCacheManagerV2),
+        ("cpp", "LlamaForCausalLM", False, 2, True, KVCacheManagerV2),
+        ("python", "LlamaForCausalLM", False, 2, False, KVCacheManager),
+        ("python", "LlamaForCausalLM", False, 2, True, KVCacheManager),
+        ("cpp", "DeepseekV3ForCausalLM", True, 2, False, None),
+        ("cpp", "DeepseekV3ForCausalLM", True, 2, True, None),
+        ("cpp", "DeepseekV3ForCausalLM", True, 1, False, KVCacheManagerV2),
     ],
-    ids=["encoder_decoder", "cpp_beam", "python_fallback", "sparse_beam", "sparse_greedy"],
+    ids=[
+        "encoder_decoder",
+        "cpp_beam",
+        "cpp_disagg_beam",
+        "python_fallback",
+        "python_disagg_fallback",
+        "sparse_beam",
+        "sparse_disagg_beam",
+        "sparse_greedy",
+    ],
 )
 def test_v2_beam_compatibility(
     monkeypatch: pytest.MonkeyPatch,
@@ -1052,6 +1064,7 @@ def test_v2_beam_compatibility(
     architecture: str,
     sparse: bool,
     beam_width: int,
+    is_disagg: bool,
     expected_manager: type | None,
 ) -> None:
     monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", backend)
@@ -1063,7 +1076,7 @@ def test_v2_beam_compatibility(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = None
     creator._max_beam_width = beam_width
-    creator._is_disagg = False
+    creator._is_disagg = is_disagg
 
     if expected_manager is None:
         # Sparse attention metadata cannot pass cache_indirection to map beam rows.
