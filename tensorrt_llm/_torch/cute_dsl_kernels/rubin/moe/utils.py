@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -298,6 +298,10 @@ def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
             has_side_effects=True,
             loc=loc,
             ip=ip,
+        )
+    else:
+        raise TypeError(
+            f"atomic_add_func only supports Float32 and BFloat16, got {rOut_epi_packed.dtype}"
         )
 
 

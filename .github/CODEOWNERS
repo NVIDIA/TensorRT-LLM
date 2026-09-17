@@ -350,7 +350,7 @@
 /cpp/tensorrt_llm/nanobind/runtime/moe* @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/runtime/moeLoadBalancer @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4 @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/moe @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe @NVIDIA/trt-llm-moe-devs

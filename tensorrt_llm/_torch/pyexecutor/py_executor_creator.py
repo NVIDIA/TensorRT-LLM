@@ -38,7 +38,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    compute_max_num_sequences, create_py_executor_instance,
+                    instantiate_sampler, is_disagg_enabled, is_mla,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
@@ -634,8 +635,13 @@ def _create_py_executor_impl(
     resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
-    max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
-                                max_batch_size * getattr(mapping, "pp_size", 1))
+    max_num_seq_slots = getattr(
+        model_engine, "max_num_seq_slots", None) or compute_max_num_sequences(
+            mapping,
+            max_batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=getattr(model_engine,
+                                            "_enable_overlap_headroom", False))
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -730,15 +736,9 @@ def _create_py_executor_impl(
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
-                guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_disagg_adp_overlap_headroom", False)
-                                        else max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The disaggregated attention-DP overlap path follows the
-                    # expanded slot pool. Other configurations retain
-                    # max_batch_size.
-                    "max_num_sequences": guided_decoder_slots,
+                    "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
@@ -781,15 +781,44 @@ def _create_py_executor_impl(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+        # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
+        # not chosen until model loading, so the three manager-dependent
+        # rejections below fire here only when the config names the manager
+        # outright, sparing an explicit config a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats all three against the
+        # manager that was actually built.
+        v2_selection = kv_cache_config.use_kv_cache_manager_v2
+
+        # A policy that destroys and replays a live request leaves the
+        # connector's per-request block delta measured against pages that were
+        # freed with it. Only KVCacheManagerV2 drops that delta on replay.
+        if (scheduler_config.capacity_scheduler_policy
+                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                and v2_selection is False):
             raise NotImplementedError(
-                "KV connector is only supported with guaranteed no evict scheduler policy."
+                "KV connector in this configuration is only supported with the "
+                "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
             )
 
-        max_attention_window = kv_cache_config.max_attention_window
-        if uses_vswa_kv_cache_layout(max_attention_window):
+        # Rejected draft tokens shrink a request's page list, and the freed slot
+        # goes to whichever request allocates next. The connector is only told
+        # about pages appended since the last report, so it would keep
+        # addressing a slot another request now owns.
+        if (spec_config is not None and spec_config.max_draft_len > 0
+                and v2_selection is True):
             raise NotImplementedError(
-                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+                "KV connector is not supported with speculative decoding. "
+                "Disable speculative decoding to run a connector.")
+
+        # VSWA allocates one pool per window size, which only
+        # `register_kv_cache_layout` can describe.
+        max_attention_window = kv_cache_config.max_attention_window
+        if (uses_vswa_kv_cache_layout(max_attention_window)
+                and v2_selection is False):
+            raise NotImplementedError(
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
+                "in this configuration. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
         if mapping.enable_attention_dp:
@@ -849,8 +878,7 @@ def _create_py_executor_impl(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        is_disagg = (cache_transceiver_config is not None
-                     and cache_transceiver_config.backend is not None)
+        is_disagg = is_disagg_enabled(cache_transceiver_config)
         is_hybrid = is_hybrid_linear(
             model_engine.model.model_config.pretrained_config)
 
