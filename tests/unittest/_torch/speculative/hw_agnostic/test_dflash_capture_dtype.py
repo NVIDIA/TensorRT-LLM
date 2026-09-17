@@ -31,9 +31,9 @@ import torch
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
 requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="DFlashSpecMetadata allocates its capture buffer on cuda and "
-    "inplace_slice_copy is a CUDA-only custom op",
+    not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
+    reason="DFlashSpecMetadata allocates its bfloat16 capture buffer on cuda "
+    "and inplace_slice_copy is a CUDA-only custom op",
 )
 
 HIDDEN_SIZE = 16
