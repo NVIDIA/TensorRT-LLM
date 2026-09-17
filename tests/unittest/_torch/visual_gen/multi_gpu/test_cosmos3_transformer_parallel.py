@@ -23,28 +23,20 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
-        COSMOS3_EDGE_BACKBONE_TYPE,
-        QWEN3_RECIPE,
-        Cosmos3CrossAttention,
-        Cosmos3VFMTransformer,
-        _resolve_cosmos3_cross_attention_backend,
-    )
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-    # Module-level configs below reference this; every test skips in this
-    # branch, but the definitions still have to import cleanly.
-    COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    COSMOS3_EDGE_BACKBONE_TYPE,
+    QWEN3_RECIPE,
+    Cosmos3CrossAttention,
+    Cosmos3VFMTransformer,
+    _resolve_cosmos3_cross_attention_backend,
+)
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
@@ -170,7 +162,6 @@ RTOL = 1e-2
 ATOL = 1e-2
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 @pytest.mark.parametrize(
     ("backend", "mapping", "expected"),
     [
@@ -192,7 +183,6 @@ def test_cosmos3_cross_attention_backend_resolution(backend, mapping, expected):
     assert _resolve_cosmos3_cross_attention_backend(backend, mapping) == expected
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 @pytest.mark.parametrize("ulysses_size", [1, 2])
 def test_cosmos3_cross_attention_rejects_cute_dsl_with_attention2d(ulysses_size):
     mapping = SimpleNamespace(
@@ -204,7 +194,6 @@ def test_cosmos3_cross_attention_rejects_cute_dsl_with_attention2d(ulysses_size)
         _resolve_cosmos3_cross_attention_backend("CUTEDSL", mapping)
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 def test_cute_dsl_ulysses_backend_rejected():
     config = _make_model_config(
         _COSMOS3_TEST_CONFIG,
@@ -1012,7 +1001,6 @@ class TestCosmos3TransformerParallel:
 
     def test_ulysses2_unequal_text_lengths_vs_single_gpu(self):
         """CFG-in-one-batch text padding is excluded from sequence-parallel K/V."""
-        self._skip_if_unavailable()
         run_test_in_distributed(
             world_size=2,
             test_fn=_logic_cosmos3_ulysses_unequal_text_vs_single_gpu,
@@ -1052,9 +1040,9 @@ class TestCosmos3TransformerParallel:
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
 
     def test_attn2d_1x2_unequal_text_lengths_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(
             world_size=2,
             test_fn=_logic_cosmos3_attn2d_unequal_text_vs_single_gpu,
