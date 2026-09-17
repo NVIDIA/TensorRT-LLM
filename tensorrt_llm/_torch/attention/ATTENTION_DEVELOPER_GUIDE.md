@@ -280,11 +280,12 @@ estimator reserves it from the KV budget and the scheduler caps the driving sum.
 Keep the declared cost identical to the runtime allocation's when possible, or
 use a documented conservative upper bound. The current instances are the fp8
 context-MLA K/V dequant workspace and
-the NVFP4 DSA context gather workspace. Both are sized by summed attended KV
-length (`total_kv_len`), which cached prefixes can decouple from
-`max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`). NVFP4
-DSA reads the complete attended prefix even with chunked prefill, so it also
-returns `False` from `runtime_workspace_is_chunked_prefill_bounded`.
+the NVFP4 DSA and DeepSeek-V4 context gather workspaces. They are sized by
+summed attended KV length (`total_kv_len`), which cached prefixes can decouple
+from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
+so it also returns `False` from
+`runtime_workspace_is_chunked_prefill_bounded`.
 
 ### 2.4 Capability reference
 
@@ -436,8 +437,9 @@ The FMHA package is split by role:
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
   upstream-worthy changes in FlashInfer and update the vendor lock; keep only
   TRT-LLM-specific adaptations in the persistent patch.
-- `fmha/msa_sparse_gqa.py` integrates the packaged SM100/SM103 block-sparse
-  GQA implementation.
+- `fmha/msa_prefill.py` integrates the packaged SM100/SM103 block-sparse GQA
+  implementation for the context phase, and `fmha/msa_decode.py` runs the
+  MiniMax-M3 decode kernels for the generation phase.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
@@ -578,8 +580,6 @@ Key test files:
 
 - `tests/unittest/_torch/attention/test_attention.py`
 - `tests/unittest/_torch/attention/test_attention_mla.py`
-- `tests/unittest/_torch/attention/test_fmha_manager.py`
-- `tests/unittest/_torch/attention/test_combined_fmha.py`
 - `tests/unittest/_torch/attention/test_vanilla_attention.py`
 - `tests/unittest/_torch/attention/test_flashinfer_attention.py`
 - `tests/unittest/_torch/attention/kernels/`

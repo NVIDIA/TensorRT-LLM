@@ -28,7 +28,8 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
@@ -42,6 +43,17 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+
+
+def _sole_piece(block_ids_per_layer_groups=None, *, tokens=0, is_last=True) -> Chunk:
+    """A transfer's only piece; nothing in this file exercises chunking."""
+    groups = list(block_ids_per_layer_groups or [])
+    return Chunk(
+        block_ids_per_layer_groups=groups,
+        kind_per_layer_group=[CacheKind.PAGED] * len(groups),
+        token_range=TokenRange(start=0, end=tokens),
+        is_last=is_last,
+    )
 
 
 class _BounceProbe:
@@ -279,7 +291,7 @@ def _make_owned_receiver() -> Receiver:
     receiver._enforce_physical_ownership = True
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
-    receiver._pre_cancelled_rids = set()
+    receiver._pre_cancelled_rids = {}
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
@@ -294,7 +306,7 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
     thread_results: queue.Queue[Exception | None] = queue.Queue()
     receiver = _ReceiverProbe()
     session = _make_rx_session(receiver, rid=41)
-    session.receive(KVSlice(is_last_slice=True))
+    session.receive(_sole_piece())
     request = SimpleNamespace(
         request_id=41,
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=41),
@@ -371,7 +383,7 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
-    receiver._pre_cancelled_rids = {rid}
+    receiver._pre_cancelled_rids = {rid: True}
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
@@ -387,7 +399,7 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     session = _make_rx_session(receiver, rid)
     assert session.status == SessionStatus.CANCELLED
 
-    session.receive(KVSlice(is_last_slice=True))
+    session.receive(_sole_piece())
 
     assert (len(session._kv_tasks), receiver.dispatch_task.call_count) == (0, 0), (
         "a pre-cancelled receive session created and published a destination task"
@@ -400,7 +412,7 @@ def test_remote_cancel_resolves_strong_owned_session() -> None:
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
-    receiver._pre_cancelled_rids = set()
+    receiver._pre_cancelled_rids = {}
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
@@ -553,7 +565,7 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
 def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
     receiver = _ReceiverProbe()
     session = _make_rx_session(receiver, rid=80)
-    session.receive(KVSlice(is_last_slice=True))
+    session.receive(_sole_piece())
 
     session.process_kv_agent_result(
         peer_rank=0,
@@ -572,7 +584,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
-    receiver._pre_cancelled_rids = set()
+    receiver._pre_cancelled_rids = {}
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
@@ -614,7 +626,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
         ),
         receiver=receiver,
     )
-    task = session.prepare_receive(KVSlice(is_last_slice=True))
+    task = session.prepare_receive(_sole_piece())
     assert task is not None
 
     session.dispatch_prepared_receive(task)
@@ -661,7 +673,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
-    receiver._pre_cancelled_rids = set()
+    receiver._pre_cancelled_rids = {}
     receiver._bounce = bounce
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
@@ -729,7 +741,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     )
 
     with pytest.raises(RuntimeError, match="writer 1 publication failed"):
-        session.receive(KVSlice(is_last_slice=True))
+        session.receive(_sole_piece())
 
     assert queued_endpoints == ["tcp://sender-0"]
     if not writer_settles_before_failure:
@@ -797,7 +809,7 @@ def test_aborted_publication_cannot_complete_during_failure_unwind() -> None:
     session = _make_rx_session(receiver, rid=91)
 
     with pytest.raises(RuntimeError, match="publication failed"):
-        session.receive(KVSlice(is_last_slice=True))
+        session.receive(_sole_piece())
 
     assert session.status == SessionStatus.ERROR
     assert session.resources_drained()
@@ -808,7 +820,7 @@ def test_aborted_publication_cannot_complete_during_failure_unwind() -> None:
 def test_out_of_cohort_writer_cannot_authorize_reuse() -> None:
     receiver = _ReceiverProbe()
     session = _make_rx_session(receiver, rid=82)
-    session.receive(KVSlice(is_last_slice=True))
+    session.receive(_sole_piece())
 
     with pytest.raises(RuntimeError, match="outside the sealed cohort"):
         session.process_kv_agent_result(
@@ -841,7 +853,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
-    receiver._pre_cancelled_rids = set()
+    receiver._pre_cancelled_rids = {}
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
@@ -901,7 +913,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     session._publication_lock = publication_lock
 
     def receive() -> None:
-        session.receive(KVSlice(is_last_slice=True))
+        session.receive(_sole_piece())
 
     def cancel() -> None:
         publication_lock.tracked_thread_id = threading.get_ident()
@@ -957,7 +969,7 @@ def test_cancel_before_dispatch_releases_late_idle_reservation() -> None:
     bounce = _LateReservationBounce()
     receiver._bounce = bounce
     session = _make_rx_session(receiver, rid)
-    task = session.prepare_receive(KVSlice(is_last_slice=True))
+    task = session.prepare_receive(_sole_piece())
     assert task is not None
 
     assert session.cancel_local()
@@ -1044,7 +1056,7 @@ def test_failed_session_is_not_reported_retired_when_close_refuses() -> None:
     ("status", "is_completed", "has_failed", "wait_result", "mark_complete"),
     (
         (SessionStatus.CANCELLED, False, True, WaitResult.FAILED, False),
-        (SessionStatus.FULLY_TRANSFERRED, True, False, WaitResult.COMPLETED, True),
+        (SessionStatus.TRANSFERRED, True, False, WaitResult.COMPLETED, True),
     ),
 )
 def test_send_terminal_session_is_retained_when_close_refuses(
@@ -1115,7 +1127,7 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
         set_kv_cache_size=Mock(),
     )
     session = SimpleNamespace(
-        status=SessionStatus.KV_TRANSFERRED,
+        status=SessionStatus.TRANSFERRED,
         transfer_end_time=None,
         kv_cache_size_bytes=0,
         is_completed=Mock(return_value=True),
@@ -1126,7 +1138,11 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
-    transceiver._mapping = SimpleNamespace(pp_size=1, enable_attention_dp=False, world_size=1)
+    # `rank` is read only when the timing-output env var is set, so leaving it out is a failure
+    # that waits for whoever sets that variable process-wide.
+    transceiver._mapping = SimpleNamespace(
+        pp_size=1, enable_attention_dp=False, world_size=1, rank=0
+    )
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
     transceiver._gen_allgather = Mock()
@@ -1342,7 +1358,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
         slice_id=0,
     )
     sender._peer_requests = {rid: {info.instance_rank: info}}
-    sender._pre_cancelled_rids = {rid}
+    sender._pre_cancelled_rids = {rid: True}
     sender._instance_rank = 5
     sender._num_threads = 1
     sender._send_task_queues = [queue.Queue()]
@@ -1361,8 +1377,8 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     sender.setup_session(session)
 
     assert sender._sessions == {rid: session}
-    assert sender._pre_cancelled_rids == set()
-    session.cancel_local.assert_called_once_with()
+    assert sender._pre_cancelled_rids == {}
+    session.cancel_local.assert_called_once_with(by_peer=True)
     session._claim_unsubmitted_aux_failure.assert_called_once_with(info)
     make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
     assert sender._send_task_queues[0].get_nowait() == (
@@ -1423,7 +1439,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests = {}
     sender._peer_requests_timestamps = {}
-    sender._pre_cancelled_rids = {rid}
+    sender._pre_cancelled_rids = {rid: True}
     params = DisaggregatedParams(
         disagg_request_id=rid,
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
@@ -1452,7 +1468,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
         create_tx_session=lambda _request: transfer_mod.TxSession(rid, params, sender),
         sweep_stale_req_infos=sweep_stale_req_infos,
     )
-    transceiver._create_kv_slice = Mock()
+    transceiver._create_cache_extent = Mock()
     transceiver._finalize_send = Mock()
 
     transceiver.respond_and_send_async(request)
@@ -1463,7 +1479,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     assert session.aux_task is None
     assert transceiver._send_reqs == {rid: request}
     assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-    transceiver._create_kv_slice.assert_not_called()
+    transceiver._create_cache_extent.assert_not_called()
     transceiver._finalize_send.assert_not_called()
 
     transfers = {rid: request}
@@ -1475,7 +1491,8 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
         end_transfer=end_transfer,
     )
     executor.active_requests = [request]
-    executor._check_cache_transfer_errors = Mock()
+    # The reap's trailing rank-local error check is not under test here.
+    executor.disagg._check_transfer_errors = Mock()
 
     executor.disagg.reap_context_sends(0)
 
@@ -1712,7 +1729,7 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
     task = transfer_mod.KVSendTask(
-        KVSlice(is_last_slice=True),
+        _sole_piece(),
         DisaggregatedParams(disagg_request_id=rid),
         slice_id=0,
     )
@@ -1773,7 +1790,7 @@ def test_owned_kv_build_failure_settles_every_published_peer(monkeypatch) -> Non
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
     )
     task = transfer_mod.KVSendTask(
-        KVSlice(is_last_slice=True),
+        _sole_piece(),
         DisaggregatedParams(disagg_request_id=rid),
         slice_id=0,
     )
@@ -1885,7 +1902,7 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
     )
     if meta_type == transfer_mod.WriteMetaType.KV:
-        task = transfer_mod.KVSendTask(KVSlice(is_last_slice=True), params, slice_id=0)
+        task = transfer_mod.KVSendTask(_sole_piece(), params, slice_id=0)
         task._unique_rid = rid
         session = SimpleNamespace(
             kv_tasks=[task],
@@ -1953,7 +1970,7 @@ def test_receiver_in_doubt_retains_destination_and_closes_admission(
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
     )
     session = RxSession(request_id=rid, params=params, receiver=receiver)
-    task = session.prepare_receive(KVSlice(is_last_slice=True))
+    task = session.prepare_receive(_sole_piece())
     assert task is not None
     task.expected_transfers = 1
     assert session.try_begin_transfer(task.slice_id, set(), writer_cohort={0})
@@ -2275,7 +2292,7 @@ def test_rejected_sender_slice_addresses_receiver_task(monkeypatch) -> None:
     sender._num_threads = 1
     sender._send_task_queues = [queue.Queue()]
     task = transfer_mod.KVSendTask(
-        KVSlice(is_last_slice=False),
+        _sole_piece(is_last=False),
         DisaggregatedParams(disagg_request_id=rid),
         slice_id=3,
     )
@@ -2310,7 +2327,7 @@ def test_gen_first_aux_owner_uses_anonymous_no_retry_writer_count() -> None:
         ),
         receiver=receiver,
     )
-    task = session.prepare_receive(KVSlice(is_last_slice=True))
+    task = session.prepare_receive(_sole_piece())
     assert task is not None
     task.expected_transfers = 2
     published_writers: set[int] = set()
@@ -2418,7 +2435,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
         disagg_request_id=rid,
     )
-    kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[])
+    kv_slice = _sole_piece()
 
     send_req = SimpleNamespace(
         py_disaggregated_params=params,
@@ -2430,16 +2447,20 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     sender._enable_pipelined_transfer = False
     sender._send_reqs = {}
 
-    def send_after_rooting(_slice: KVSlice) -> None:
+    send_tasks = []
+
+    def send_after_rooting(_chunk: Chunk) -> None:
         assert sender._send_reqs[rid] is send_req
+        send_tasks.append(SimpleNamespace(status=None, _exception=None))
 
     send_session = SimpleNamespace(
         send=send_after_rooting,
+        kv_tasks=send_tasks,
         set_exception=Mock(),
         has_failed=Mock(return_value=False),
     )
     sender._get_or_create_send_session = Mock(return_value=send_session)
-    sender._create_kv_slice = Mock(return_value=kv_slice)
+    sender._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=kv_slice))
     sender._finalize_send = Mock()
 
     sender.respond_and_send_async(send_req)
@@ -2449,6 +2470,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
 
     recv_req = SimpleNamespace(
         py_disaggregated_params=params,
+        py_request_id=rid,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         set_kv_cache_transfer_start=lambda _timestamp: None,
     )
@@ -2458,13 +2480,18 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     receiver._recv_reqs = {}
     receiver._kv_size_rank_factor = 1
 
-    def receive_after_rooting(_slice: KVSlice) -> None:
-        assert receiver._recv_reqs[rid] is recv_req
+    recv_tasks = []
 
-    recv_session = SimpleNamespace(receive=receive_after_rooting, fail_admission=Mock())
+    def receive_after_rooting(_chunk: Chunk) -> None:
+        assert receiver._recv_reqs[rid] is recv_req
+        recv_tasks.append(SimpleNamespace(status=None, _exception=None))
+
+    recv_session = SimpleNamespace(
+        receive=receive_after_rooting, fail_admission=Mock(), _kv_tasks=recv_tasks
+    )
     receiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=recv_session))
-    receiver._create_kv_slice = Mock(return_value=kv_slice)
-    receiver._slice_num_bytes = Mock(return_value=0)
+    receiver._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=kv_slice))
+    receiver._chunk_num_bytes = Mock(return_value=0)
 
     receiver.request_and_receive_async(recv_req)
 

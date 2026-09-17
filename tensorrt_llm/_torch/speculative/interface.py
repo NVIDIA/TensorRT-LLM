@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from enum import IntEnum, auto
+from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional, Protocol, Type
 
 import torch
@@ -290,22 +290,25 @@ def get_force_num_accepted_tokens_float() -> float:
 
 
 class SpeculativeDecodingMode(IntEnum):
-    MTP = auto()
-    MTP_EAGLE = auto()
-    MTP_EAGLE_ONE_MODEL = auto()
-    EAGLE3 = auto()
-    EAGLE3_ONE_MODEL = auto()
-    NGRAM = auto()
-    SA = auto()
-    DRAFT_TARGET = auto()
-    DRAFT_TARGET_ONE_MODEL = auto()
-    USER_PROVIDED = auto()
-    SAVE_HIDDEN_STATES = auto()
-    PARD = auto()
-    DFLASH = auto()
-    DSPARK = auto()
-    NONE = auto()
-    AUTO = auto()
+    # Values are explicit and must stay stable: this enum is in the
+    # cross-process serialization allowlist (see llmapi/serialization.py), so a
+    # peer or a persisted config may carry an integer produced by a different
+    # build. Renumbering would let an old value decode as a different mode.
+    # 2, 4 and 8 are retired (the two-model MTP_EAGLE, EAGLE3 and DRAFT_TARGET
+    # modes) and must not be reused.
+    MTP = 1
+    MTP_EAGLE_ONE_MODEL = 3
+    EAGLE3_ONE_MODEL = 5
+    NGRAM = 6
+    SA = 7
+    DRAFT_TARGET_ONE_MODEL = 9
+    USER_PROVIDED = 10
+    SAVE_HIDDEN_STATES = 11
+    PARD = 12
+    DFLASH = 13
+    DSPARK = 14
+    NONE = 15
+    AUTO = 16
 
     def is_mtp_one_model(self):
         # Union: covers vanilla MTP and MTP_EAGLE_ONE_MODEL. Use is_mtp_vanilla()
@@ -318,12 +321,6 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
-
-    def is_mtp_eagle(self):
-        return self == SpeculativeDecodingMode.MTP_EAGLE
-
-    def is_eagle3(self):
-        return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
@@ -360,9 +357,6 @@ class SpeculativeDecodingMode(IntEnum):
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
 
-    def is_draft_target(self):
-        return self == SpeculativeDecodingMode.DRAFT_TARGET
-
     def is_draft_target_one_model(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
 
@@ -382,8 +376,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_sa() or self.has_draft_model() or self.is_external_drafter(
-        )
+        ) or self.is_sa() or self.is_external_drafter()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
@@ -397,17 +390,6 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
         ) or self.is_draft_target_one_model() or self.is_sa()
 
-    def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
-
-    def needs_kv_cache_recompute(self):
-        """
-        Whether the draft model needs to recompute the kv cache.
-        If true, the 1st draft model forward will recompute the kv cache for
-        the accepted draft tokens.
-        """
-        return self.is_eagle3() or self.is_mtp_eagle()
-
     def need_load_draft_weights(self):
         """
         Whether the draft model and target model are in the same model engine,
@@ -416,13 +398,11 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_eagle3_one_model() or self.is_external_drafter()
 
     def has_spec_decoder(self):
-        return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model() or self.is_external_drafter(
-        ) or self.is_sa()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_external_drafter() or self.is_sa()
 
     def has_spec_drafter(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided() or self.is_mtp_eagle()
+        return self.is_ngram() or self.is_user_provided()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -482,7 +462,7 @@ class SpecMetadata:
     max_num_requests: int
     # The number of draft layers. (Also the number of draft tokens for the linear tree.)
     max_draft_len: int
-    # The max number of draft tokens for the static tree and dynamic tree   .
+    # The max number of draft tokens for the dynamic tree.
     max_total_draft_tokens: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
@@ -503,6 +483,9 @@ class SpecMetadata:
     request_ids: Optional[List[int]] = None
     # Sequence length for each request.
     seq_lens: Optional[List[int]] = None
+    # Pinned copy of scalar position ids. These are sequential token indices regardless
+    # of rope flavor, so drafters can read a token's position without a D2H sync
+    host_position_ids: Optional[torch.Tensor] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
     # The number of accepted draft tokens for each request.
@@ -528,11 +511,9 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
-    # NOTE: For the linear tree, though it can be treated as a special case of static tree.
-    # NOTE: But we do not set `is_spec_dec_tree` to True for this cases.
-    # NOTE: i.e., for the linear tree, is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
-    # whether the spec-dec mode is a tree (can be static tree or dynamic tree).
+    # whether the spec-dec mode is a tree.
+    # NOTE: The linear tree is not treated as a tree here: for the linear tree,
+    # NOTE: is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
     is_spec_dec_tree: bool = False
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
@@ -799,7 +780,7 @@ class SpecMetadata:
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
-        # clamped to the executor's batch size (_filter_cuda_graph_batch_sizes),
+        # clamped to the executor's batch size (filter_cuda_graph_batch_sizes),
         # and graph padding refuses to cross it, so exceeding it here means the
         # invariant broke upstream and should surface.
         assert len(requests) <= self.max_num_requests, (

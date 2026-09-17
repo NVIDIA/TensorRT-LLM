@@ -45,6 +45,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         merge_attention_forward_args)
+from .utils import check_page_table, log_attention_failure_context
 
 # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
 # check would force a CUDA context at import time.
@@ -276,8 +277,19 @@ class FlashInferWrappers:
     decode_block_table_active_width: int = field(default=0, repr=False)
 
 
+# Environment variable arming the host-side page-table check, and how many
+# reports one run may emit before it goes quiet.
+_PAGE_TABLE_CHECK_ENV = "TRTLLM_FI_PAGE_TABLE_CHECK"
+_PAGE_TABLE_CHECK_REPORTS = 20
+
+
 @dataclass(kw_only=True)
 class FlashInferAttentionMetadata(AttentionMetadata):
+    # Report budget for the page-table check. A class attribute, because it
+    # bounds a run's log rather than a batch's, and deliberately unannotated so
+    # that @dataclass does not turn it into a field.
+    _page_table_check_budget = _PAGE_TABLE_CHECK_REPORTS
+
     workspace_buffer: Optional[torch.Tensor] = None
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
@@ -619,7 +631,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # FlashInfer may dereference page IDs before applying window_left, so
         # keep masked positions in range. The SWA mask excludes their values
         # from the attention result.
-        page_indices.masked_fill_(page_indices == BAD_PAGE_INDEX, 0)
+        #
+        # Page 0 is a live page owned by whichever request holds it, so parking
+        # there has the kernel dereference a stranger's keys and values, with
+        # the mask as the only thing keeping them out of the result. When the
+        # KV cache manager has reserved a guard page (TRTLLM_KV_GUARD_PAGE),
+        # park on that instead: a page no request can own, holding a known
+        # pattern. The default -- no guard page -- keeps page 0.
+        page_indices.masked_fill_(page_indices == BAD_PAGE_INDEX,
+                                  self._swa_park_page(layer_idx))
+
+    def _swa_park_page(self, layer_idx: int) -> int:
+        """Page index that masked-out entries are pointed at for this layer."""
+        guard = getattr(self.kv_cache_manager, 'guard_page_index', None)
+        if guard is None:
+            return 0
+        page = guard(layer_idx)
+        return 0 if page is None else int(page)
 
     def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
         """Copy pool-specific page indices into the shared buffer.
@@ -903,6 +931,64 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             out=kv_lens_buffer[:self.num_generations],
         )
 
+    def _debug_validate_page_table(self, kv_lens_host, logical_num_blocks,
+                                   num_blocks) -> None:
+        """Diagnostic: check the page table handed to FlashInfer is well formed.
+
+        Every structural claim the kernel relies on is already on the host by
+        the time this runs -- the index mirrors, the indptr host copies and the
+        length arrays are all numpy or CPU tensors -- so the check costs no GPU
+        work and no synchronization, which is what makes it usable on a path
+        where a synchronization can hide the fault being chased.
+
+        Off unless ``TRTLLM_FI_PAGE_TABLE_CHECK`` is set. Reports are bounded,
+        because a malformed row repeats on every step of the request that owns
+        it, and one line is printed when the check is armed and finds nothing,
+        so that a clean run is distinguishable from a run the environment
+        variable never reached.
+        """
+        if not os.environ.get(_PAGE_TABLE_CHECK_ENV, "").strip():
+            return
+        cls = FlashInferAttentionMetadata
+        if cls._page_table_check_budget <= 0:
+            return
+        pool_size = getattr(self.kv_cache_manager, 'blocks_in_primary_pool',
+                            None)
+        pools = getattr(self, '_host_pool_indices', None) or {
+            0: getattr(self, '_host_paged_kv_indices', None)
+        }
+        host_pools = {
+            pool_id:
+            (indices.cpu().numpy() if torch.is_tensor(indices) else indices)
+            for pool_id, indices in pools.items()
+        }
+        try:
+            problems = check_page_table(
+                host_pools,
+                num_blocks,
+                logical_num_blocks,
+                kv_lens_host,
+                self.page_size,
+                pool_size=pool_size,
+            )
+        except Exception as exc:  # pragma: no cover - a diagnostic must not break a run
+            cls._page_table_check_budget -= 1
+            logger.warning(
+                f"[flashinfer] page table check failed to run: {exc}")
+            return
+        if problems:
+            cls._page_table_check_budget -= 1
+            logger.warning(
+                f"[flashinfer] page table check, {self.num_contexts} context / "
+                f"{self.num_generations} generation rows: " +
+                "; ".join(problems))
+        elif cls._page_table_check_budget == _PAGE_TABLE_CHECK_REPORTS:
+            cls._page_table_check_budget -= 1
+            logger.info(
+                f"[flashinfer] page table check armed and clean on a batch of "
+                f"{self.num_contexts} context / {self.num_generations} "
+                f"generation rows, pool size {pool_size}")
+
     def _prepare_full_draft_page_table(self) -> None:
         """Expose every allocated draft page and use device KV lengths."""
         if self._uses_full_draft_page_table:
@@ -981,9 +1067,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # Note: even though flashinfer only recommends 128 MB, we have to push it
             # a bit higher to cover all possible CUDA graph cases. If it's too small,
             # warmup will crash.
+            # FlashInfer's split-KV decode plan sizes its temp buffers proportionally to
+            # SM count; 320 MB was tuned for a 148-SM baseline, so scale up (never down)
+            # on GPUs with more SMs.
+            baseline_sms = 148
+            baseline_bytes = 320 * 1024 * 1024
+            num_sms = torch.cuda.get_device_properties(
+                torch.cuda.current_device()).multi_processor_count
+            workspace_bytes = max(baseline_bytes,
+                                  baseline_bytes * num_sms // baseline_sms)
             self.workspace_buffer = self.get_empty(
                 buffers,
-                (320 * 1024 * 1024, ),
+                (workspace_bytes, ),
                 dtype=torch.uint8,
                 cache_name="workspace_buffer",
                 capture_graph=capture_graph,
@@ -1778,6 +1873,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
 
+        self._debug_validate_page_table(kv_lens_host, logical_num_blocks,
+                                        num_blocks)
+
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
         if (self.is_cuda_graph and self._vswa_layer_to_pool is not None
@@ -1861,6 +1959,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         kv_lens_buf[self.num_generations:batch_size].zero_()
 
         # Refresh captured FA2 schedules only after all page metadata updates.
+        # Under CUDA graphs every non-trtllm-gen decode wrapper carries
+        # fa2_plan_num_blocks, so this is what keeps replayed plans current;
+        # the deferral below only affects wrappers without a recorded tuple.
         # Defer ordinary multi-wrapper plans to forward_impl; single-wrapper
         # models still plan eagerly because forward_impl cannot plan during
         # graph capture.
@@ -2122,7 +2223,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 q_len_per_req=plan_params.q_len_per_req,
                 disable_split_kv=False,
             )
-            if use_graph_tensor_cores and decode_wrapper._backend == 'fa2':
+            # Graph replay reuses the split-KV schedule plan() computed, so
+            # record the page tuple this decode plan was built for; prepare()
+            # re-plans through _refresh_fa2_cuda_graph_plans() when the
+            # generation page counts change. trtllm-gen is excluded because it
+            # does its own per-step block-table/kv_lens refresh in prepare().
+            if self.is_cuda_graph and decode_wrapper._backend != 'trtllm-gen':
                 wrappers.fa2_plan_num_blocks = tuple(
                     self.num_blocks[self.num_contexts:])
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
@@ -2710,16 +2816,24 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 
-        self.forward_impl(
-            q=q,
-            k=k,
-            v=v,
-            metadata=metadata,
-            attention_mask_type=attention_mask_type,
-            attention_mask_data=attention_mask_data,
-            attention_window_size=attention_window_size,
-            output=output,
-            latent_cache=latent_cache,
-            attention_input_type=forward_args.attention_input_type,
-        )
+        try:
+            self.forward_impl(
+                q=q,
+                k=k,
+                v=v,
+                metadata=metadata,
+                attention_mask_type=attention_mask_type,
+                attention_mask_data=attention_mask_data,
+                attention_window_size=attention_window_size,
+                output=output,
+                latent_cache=latent_cache,
+                attention_input_type=forward_args.attention_input_type,
+            )
+        except RuntimeError as exc:
+            # Report the TRTLLM-convention (exclusive) window, not the
+            # decremented FlashInfer one, so both backends log the same number.
+            log_attention_failure_context(
+                type(self).__name__, self.layer_idx, metadata,
+                forward_args.attention_window_size, exc)
+            raise
         return output

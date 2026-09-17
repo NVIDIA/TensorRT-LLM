@@ -418,8 +418,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
-        "cancel_stress_test_large":
-        f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
         "llama31_8b":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b.yaml",
         "mamba_conc_greater_than_mbs":
@@ -1626,14 +1624,11 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
     asyncio.run(drive())
 
 
-# Plain parametrize (not the `llama_model_root` indirect fixture) so the
-# test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
-# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
-# trtllm-serve resolves the HuggingFace id directly.
-@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"],
+                         indirect=True)
 def test_disaggregated_python_transceiver_host_offload(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):  # noqa: ARG001 — used only for the parametrize label
+        llama_model_root):
     """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
 
     See `_verify_python_transceiver_under_host_offload` for what this
@@ -1641,10 +1636,6 @@ def test_disaggregated_python_transceiver_host_offload(
     ctx-side `host_cache_size` and a deliberately tight primary pool so
     that prefix reuse is forced through an offload+onboard cycle before
     each KV transfer.
-
-    Model resolution: trtllm-serve loads the HuggingFace id from the
-    config's `model:` field (TinyLlama/TinyLlama-1.1B-Chat-v1.0) via
-    huggingface_hub on first use. No LLM_MODELS_ROOT / NFS dependency.
     """
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
@@ -4279,29 +4270,6 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
-
-
-@pytest.mark.skip_less_device(8)
-@skip_pre_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
-def test_disaggregated_cancel_large_context_requests_long(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        model_path):
-    """Test that disaggregated server handles request cancellations gracefully.
-
-    This test sends bursts of requests with large contexts and cancels them
-    during prefill to stress test resource cleanup.
-    """
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test_large",
-                                  env=llm_venv._new_env,
-                                  num_bursts=1000,
-                                  requests_per_burst=32,
-                                  model_path=model_dir,
-                                  cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)

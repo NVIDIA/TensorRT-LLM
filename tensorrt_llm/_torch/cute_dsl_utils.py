@@ -26,3 +26,17 @@ if platform.system() != "Windows":
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
     except ImportError:
         pass
+
+
+def install_cutlass_dsl_compatibility() -> None:
+    """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return
+
+    import cutlass.cute as cute
+
+    for name in ("ThrCopy", "ThrMma"):
+        if not hasattr(cute.core, name) and hasattr(cute, name):
+            setattr(cute.core, name, getattr(cute, name))
+    if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
+        cute.make_fragment = cute.make_rmem_tensor

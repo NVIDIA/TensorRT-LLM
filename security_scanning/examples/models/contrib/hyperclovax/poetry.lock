@@ -201,14 +201,14 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "3.32.6"
+version = "3.32.7"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.32.6-py3-none-any.whl", hash = "sha256:3f16ecd0117feae0dfc147e8c62eb5daeccd8bd800378c3ddf416de9b4feb6b1"},
-    {file = "filelock-3.32.6.tar.gz", hash = "sha256:a3f55a18af3652a94d8f47d6055df434f254ca1d02ef2524850c6d249ca2512c"},
+    {file = "filelock-3.32.7-py3-none-any.whl", hash = "sha256:65ff0d0190ea42038b32bda4b77834fb05be2cad4c5b9b01aa4dfb3614536e52"},
+    {file = "filelock-3.32.7.tar.gz", hash = "sha256:37b8a3d9811b0f9aef7e5ec5c71bb320de52df51e6ca9bcd6f5ad81187660da7"},
 ]
 
 [[package]]
@@ -631,17 +631,17 @@ nvidia-cuda-nvrtc = "*"
 
 [[package]]
 name = "nvidia-cublas"
-version = "13.7.0.27"
+version = "13.8.0.4"
 description = "CUBLAS native runtime libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 markers = "(sys_platform != \"linux\" or platform_machine != \"aarch64\" and platform_machine != \"x86_64\") and platform_system == \"Linux\" and (sys_platform != \"linux\" and sys_platform != \"win32\" or platform_machine != \"x86_64\")"
 files = [
-    {file = "nvidia_cublas-13.7.0.27-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:39f240346a8bbc6c4f1e3100dcfa2c6d3fe353db513060329ef28cdd43c27f2f"},
-    {file = "nvidia_cublas-13.7.0.27-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:481adf76a6b7585a7a4cd5f53298589abe207415dd584887751b99baa85491d4"},
-    {file = "nvidia_cublas-13.7.0.27-py3-none-win_amd64.whl", hash = "sha256:15d3963ae9de7292348ced320c849ff27f76b0f433b81589e9eb87f5407841c9"},
-    {file = "nvidia_cublas-13.7.0.27-py3-none-win_arm64.whl", hash = "sha256:4cf58f2c8a4743a2717b0f5c51a90f0d93ada416d71eb3d96b17ca29b7af0106"},
+    {file = "nvidia_cublas-13.8.0.4-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:e22b25be18f8b7d267dbbe2a8ec78e2c69c05762536d299dd0afa2c847115740"},
+    {file = "nvidia_cublas-13.8.0.4-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:9f17797dfcc048694461f4e47de17d2e3c25adf172ef723d2db0a07cd8744b89"},
+    {file = "nvidia_cublas-13.8.0.4-py3-none-win_amd64.whl", hash = "sha256:8c5494423bb8a46822cb6b0cb95d7fa4be2d7b96a31155dff083839ec8297910"},
+    {file = "nvidia_cublas-13.8.0.4-py3-none-win_arm64.whl", hash = "sha256:a2ffda7a27d8315e6b75c1ced526d5a68c7a2a50adfe866235401c9592d3c9e4"},
 ]
 
 [package.dependencies]
@@ -677,17 +677,17 @@ files = [
 
 [[package]]
 name = "nvidia-cuda-nvrtc"
-version = "13.4.59"
+version = "13.4.92"
 description = "NVRTC native runtime libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 markers = "(sys_platform != \"linux\" or platform_machine != \"aarch64\" and platform_machine != \"x86_64\") and platform_system == \"Linux\" and (sys_platform != \"linux\" and sys_platform != \"win32\" or platform_machine != \"x86_64\")"
 files = [
-    {file = "nvidia_cuda_nvrtc-13.4.59-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:f6cb36996797989976bd021d89e263be379668be7a4249cc95a3d11590bda652"},
-    {file = "nvidia_cuda_nvrtc-13.4.59-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:da5e1ba65f402b2fdf1c4bfcb16e27df47e8ade27f7936b1524cb10cdd61a1c8"},
-    {file = "nvidia_cuda_nvrtc-13.4.59-py3-none-win_amd64.whl", hash = "sha256:93755e0f94e717c61168fb348ab5e2f5c67aa2f918416b1786f55ff813f6923d"},
-    {file = "nvidia_cuda_nvrtc-13.4.59-py3-none-win_arm64.whl", hash = "sha256:ec27241be8b65e88d37a25d5e4ec0f4fdb0499439a7d5122cfdc74457752ae81"},
+    {file = "nvidia_cuda_nvrtc-13.4.92-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:5ce8c97b00b232c4f50c8c4b5a3b68cafee08bdb82ea86f2052ff01d03194f4a"},
+    {file = "nvidia_cuda_nvrtc-13.4.92-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:24b9f5eccc6a5a19779038cf468aecb7cecfa8716269beaef5640bd989d21c28"},
+    {file = "nvidia_cuda_nvrtc-13.4.92-py3-none-win_amd64.whl", hash = "sha256:6af7ac5372920f6a7a560d0699348560fe44cb52c1d722d6afd3119f8af948c4"},
+    {file = "nvidia_cuda_nvrtc-13.4.92-py3-none-win_arm64.whl", hash = "sha256:1620066e967e93119d67338628935cbb1196b53a1474b07f14b7b77aba477284"},
 ]
 
 [[package]]
@@ -803,17 +803,17 @@ nvidia-nvjitlink = "*"
 
 [[package]]
 name = "nvidia-cusparse"
-version = "12.8.6.49"
+version = "12.8.6.72"
 description = "CUSPARSE native runtime libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 markers = "<empty>"
 files = [
-    {file = "nvidia_cusparse-12.8.6.49-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3bf4f2e34e8cfe0c691a4afd7bd479bee49f44dc5fa4940d9d54f720cbd6f2f3"},
-    {file = "nvidia_cusparse-12.8.6.49-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f740691172baae1d498f754cfbb565933c7dbcd7b16544d69fa666283d0715d7"},
-    {file = "nvidia_cusparse-12.8.6.49-py3-none-win_amd64.whl", hash = "sha256:7578698de43ca4f72371076adcba460182c4ae5b2263a094d6e70bc59db7fe10"},
-    {file = "nvidia_cusparse-12.8.6.49-py3-none-win_arm64.whl", hash = "sha256:aeee3f0f53e18345a75c9cb25d34070823d73ae193ab231ee7438fe30abbdfc5"},
+    {file = "nvidia_cusparse-12.8.6.72-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c3917c86fd419cbd42229b5cccb8bbe5200ed5b7dec3aa86d28e25c90a256e1b"},
+    {file = "nvidia_cusparse-12.8.6.72-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:a739f6ff51ea2a8a2990b267b9b4d3063a5d94890efb8ccf393bfcab9dd487aa"},
+    {file = "nvidia_cusparse-12.8.6.72-py3-none-win_amd64.whl", hash = "sha256:013d3f83316431dd3338cf15141dd5420b24dffc6663fc083c053c8409fa3cb7"},
+    {file = "nvidia_cusparse-12.8.6.72-py3-none-win_arm64.whl", hash = "sha256:7efe07b54c505f3eeec0469078c992a31b15ab716d40f07a8109f7cbcc4fd7fe"},
 ]
 
 [package.dependencies]
@@ -848,17 +848,17 @@ files = [
 
 [[package]]
 name = "nvidia-nvjitlink"
-version = "13.4.52"
+version = "13.4.92"
 description = "Nvidia JIT LTO Library"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 markers = "(sys_platform == \"linux\" or sys_platform == \"win32\") and (sys_platform == \"linux\" or platform_machine == \"x86_64\") and platform_system == \"Linux\" and (platform_machine == \"aarch64\" or platform_machine == \"x86_64\")"
 files = [
-    {file = "nvidia_nvjitlink-13.4.52-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:90401db7e5a580a5067a468b3086e0b65f3b96ab3c42524afd741efc8a0e150a"},
-    {file = "nvidia_nvjitlink-13.4.52-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3a589e3732140839349545efd0db67426523459b12e6952c3c73b6d55900f200"},
-    {file = "nvidia_nvjitlink-13.4.52-py3-none-win_amd64.whl", hash = "sha256:4bd7c27adc7832da5e6b8580fa64a42b9eebc94baae3ddcbedf4719f0bab2bb8"},
-    {file = "nvidia_nvjitlink-13.4.52-py3-none-win_arm64.whl", hash = "sha256:75f7e1a04b0a63c7d8af9921e1ed45d9ef880d3c6ef976989082482698e01205"},
+    {file = "nvidia_nvjitlink-13.4.92-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:e0391f24ed94ec879b84e3da4d4ec320c879aff681f2c7a638462f7199284323"},
+    {file = "nvidia_nvjitlink-13.4.92-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:25f74fad0d654271c921ac4dca614bd6258bc21791242fc7b2289dad7ae9c099"},
+    {file = "nvidia_nvjitlink-13.4.92-py3-none-win_amd64.whl", hash = "sha256:b286f3a4f227a9363efdec263c7b91788cef1478d2b8a5fa8bab7f3e82ff82fd"},
+    {file = "nvidia_nvjitlink-13.4.92-py3-none-win_arm64.whl", hash = "sha256:9e4a7ff4f0cafa8c624917055b863dc11f5c2912ead23c462889e166f3b0e57d"},
 ]
 
 [[package]]
@@ -1288,14 +1288,14 @@ scipy = ["scipy"]
 
 [[package]]
 name = "tqdm"
-version = "4.70.0"
+version = "4.70.1"
 description = "Fast, Extensible Progress Meter"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "tqdm-4.70.0-py3-none-any.whl", hash = "sha256:7f585706bfddbdebf89daac705b2dfcc16890130727d3197ca62c732b4310953"},
-    {file = "tqdm-4.70.0.tar.gz", hash = "sha256:55b0b0dbd97462d06ebee91e4dac24ed4d4702be82b24f07e6c1d27e08cea220"},
+    {file = "tqdm-4.70.1-py3-none-any.whl", hash = "sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73"},
+    {file = "tqdm-4.70.1.tar.gz", hash = "sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4"},
 ]
 
 [package.dependencies]

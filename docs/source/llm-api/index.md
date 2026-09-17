@@ -76,8 +76,7 @@ A typical result has the following structure:
 The `model_loader` object contains timings for the main LLM weights. If a draft
 model is used, the additional fields `draft_checkpoint_preparation_seconds`,
 `draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds`
-appear. A `draft_model_loader` object can also appear in the deprecated
-two-model MTP configuration.
+appear.
 
 | Metric | Description |
 |--------|-------------|
@@ -134,13 +133,13 @@ The following tips typically assist new LLM API users who are familiar with othe
 ### FlashInfer JIT workspaces for MPI workers
 
 `trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers
-isolate FlashInfer JIT source-generation workspaces by default. Each process
-normally claims a locked, persistent cache slot under
-`~/.cache/tensorrt_llm/flashinfer`, while downloaded cubins remain in
-FlashInfer's shared cache. This prevents concurrent MPI processes from writing
-the same generated source files without forcing a cold JIT compilation on
-every launch. Set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking
-the launcher or creating the LLM instance to disable this behavior.
+isolate FlashInfer JIT workspaces by default. Each process claims a locked,
+persistent cache slot under `~/.cache/tensorrt_llm/flashinfer` that holds its
+generated sources, compiled modules and downloaded FlashInfer artifacts, so
+concurrent MPI processes never write to each other's compiler inputs while JIT
+artifacts stay warm across launches. Set
+`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
+creating the LLM instance to disable this behavior.
 
 Persistent slots are not pruned automatically, so their count can grow with
 peak job concurrency. When no TensorRT-LLM processes are using the cache, the
@@ -148,11 +147,16 @@ slots may be deleted safely; subsequent launches rebuild the removed JIT
 artifacts.
 
 If persistent workspace setup is unavailable, each process falls back to a
-process-unique temporary workspace that is removed when the process exits.
-Persistent cache reuse is not available for this fallback.
+process-unique temporary workspace that is removed, artifacts included, when
+the process exits.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
-launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is also preserved.
+launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is propagated
+unchanged to every rank and is the way to share downloaded artifacts between
+ranks; populate it before the multi-rank launch, either by installing the
+`flashinfer-cubin` package matching `flashinfer-python` or with a single-rank
+warm-up run, and set `FLASHINFER_NO_DOWNLOAD=1` so a missing artifact fails
+instead of being downloaded concurrently into the shared directory.
 
 ### Cannot quit after generation
 

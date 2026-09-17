@@ -190,11 +190,12 @@ public:
     // ---- Migration ---------------------------------------------------------
 
     // Migrate a batch of pages to GPU (used by batchedLockToGpu).
-    void batchedMigrateToGpu(
-        std::vector<BatchedLockTarget> const& targets, KvCache& kvCache, MigrationRecorder const& migrationRecorder);
+    void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder);
 
-    // Best-effort migration of grouped pages to a destination cache level.
-    void prefetch(
+    // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
+    // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
+    // nothing, which in practice means slot preparation failed before anything moved.
+    int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
     // ---- Query helpers -----------------------------------------------------
@@ -403,7 +404,6 @@ private:
     // Codec-selected PageIndexPair memory location for each lifecycle.
     TypedVec<LifeCycleId, PageIndexLocation> mPageIndexLocations;
     std::unordered_map<LayerId, LifeCycleId> mLayerToLifeCycleIds;
-    StorageConfig mStorageConfig;
 
     // slot-to-page-index scale factors: [lcId][poolIdx]
     TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> mSlotToPageIndices;
