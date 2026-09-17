@@ -5272,13 +5272,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         if enable_block_reuse:
             kv_cache_config.avg_seq_len = 2048
             kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
-        # DeepGEMM MoE kernels only support datacenter Blackwell (SM100/SM103).
-        # Fall back to the CUTLASS MoE backend (which supports FP8 block scales)
-        # on other architectures such as Hopper (SM90) and consumer Blackwell
-        # (SM120/SM121); otherwise the unsupported kernel trips a scale-factor
-        # dtype assertion at warmup.
-        moe_backend = "DEEPGEMM" if get_sm_version() in (100,
-                                                         103) else "CUTLASS"
+        # DeepGEMM FP8 block scales support datacenter Blackwell (SM100/SM103)
+        # and Rubin (SM107). Keep CUTLASS for Hopper and consumer Blackwell.
+        moe_backend = "DEEPGEMM" if is_sm_100f() else "CUTLASS"
         moe_config = MoeConfig(backend=moe_backend)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)

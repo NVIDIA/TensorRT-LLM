@@ -928,14 +928,18 @@ class KvCacheCreator:
             effective_draft_config = self._get_effective_draft_config()
             draft_kv_cache_config = self._get_one_model_draft_kv_cache_config(
                 kv_cache_config, self._max_seq_len)
+            # Resolve draft manager class from draft config — may differ
+            # from target (e.g. hybrid target + plain transformer draft).
+            draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+                effective_draft_config,
+                draft_kv_cache_config,
+                is_disagg=self._is_disagg,
+                cache_transceiver_config=self._cache_transceiver_config)
+            draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
+                draft_kv_cache_manager_cls, effective_draft_config,
+                draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
-                # Resolve draft manager class from draft config — may differ
-                # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    is_disagg=self._is_disagg)
                 return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
                                                     effective_draft_config,
                                                     draft_kv_cache_config,
@@ -943,7 +947,7 @@ class KvCacheCreator:
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 return self._per_manager_cache_cost(
-                    self._kv_cache_manager_cls,
+                    draft_kv_cache_manager_cls,
                     effective_draft_config,
                     draft_kv_cache_config,
                     num_layers=self._get_num_draft_layers(),
@@ -1761,7 +1765,10 @@ class KvCacheCreator:
                 f"draft manager: {draft_kv_config.max_attention_window}")
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+            effective_draft_config,
+            draft_kv_config,
+            is_disagg=self._is_disagg,
+            cache_transceiver_config=self._cache_transceiver_config)
         draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 

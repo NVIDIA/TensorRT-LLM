@@ -17,9 +17,7 @@
 Two backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
 
 * :class:`DeepgemmCudaW4a8Mxfp4Mxfp8Impl` — DeepGEMM ``fp8_fp4_mega_moe``
-  fused kernel for W4A8_MXFP4_MXFP8 weights. One class carries the identity and
-  the whole contract; ``MegaMoEDeepGemm`` is an alias onto it, kept for the
-  call sites that predate the identity.
+  fused kernel for W4A8_MXFP4_MXFP8 weights, aliased as ``MegaMoEDeepGemm``.
   ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the DG-native weight tensors,
   scale conversion, and DeepGEMM weight transform.
 * :class:`MegaMoECuteDsl` — CuteDSL ``Sm100MegaMoEKernel`` fused dispatch +

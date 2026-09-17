@@ -421,6 +421,58 @@ class TestKVCacheManagerV2(unittest.TestCase):
         self.manager = KVCacheManager(self.cfg)
 
 
+class TestStorageStatistics(TestKVCacheManagerV2):
+    def test_statistics_are_detached_snapshots(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, 16, 0, tokens_per_block=4, kv_buf_size=4096)
+
+        def values(stats):
+            return [
+                (
+                    item.slot_sizes,
+                    item.total,
+                    item.free,
+                    item.evictable,
+                    item.available,
+                    item.unavailable,
+                )
+                for item in stats
+            ]
+
+        snapshots = [self.manager.get_storage_statistics(CacheLevel(level)) for level in range(2)]
+        saved = [values(stats) for stats in snapshots]
+        for level, stats in enumerate(snapshots):
+            self.assertTrue(stats)
+            mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(level))
+            # Both life cycles have the same slot sizes and share one pool group at each level.
+            self.assertEqual(mapping, [0, 0])
+            self.assertTrue(all(0 <= pool_group < len(stats) for pool_group in mapping))
+            mapping[0] = -1
+            self.assertNotEqual(
+                self.manager.get_life_cycle_pool_group_indices(CacheLevel(level))[0], -1
+            )
+            for item in stats:
+                self.assertEqual(item.total, item.available + item.unavailable)
+                self.assertEqual(item.available, item.free + item.evictable)
+                sizes = item.slot_sizes
+                sizes[0] = 0
+            self.assertEqual(
+                values(self.manager.get_storage_statistics(CacheLevel(level))), saved[level]
+            )
+
+        with TemporaryCudaStream([]) as stream:
+            cache = self.manager.create_kv_cache()
+            try:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.resize(self.manager.tokens_per_block)
+                current = self.manager.get_storage_statistics()
+                self.assertGreater(sum(item.unavailable for item in current), 0)
+                self.assertEqual([values(stats) for stats in snapshots], saved)
+            finally:
+                cache.close()
+        stream.take_finish_event().synchronize()
+        self.assertEqual(values(self.manager.get_storage_statistics()), saved[0])
+
+
 class TestNoBatching(TestKVCacheManagerV2):
     class Request(NamedTuple):
         id: int
@@ -591,20 +643,16 @@ class TestNoBatching(TestKVCacheManagerV2):
         full_lc, short_swa_lc, long_swa_lc = [
             self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(3)
         ]
-        hot_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 0)
-            for lc_id in (full_lc, short_swa_lc, long_swa_lc)
-        ]
-        cold_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 1)
-            for lc_id in (full_lc, short_swa_lc, long_swa_lc)
-        ]
+        hot_mapping = self.manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        cold_mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(1))
+        hot_groups = [hot_mapping[lc_id] for lc_id in (full_lc, short_swa_lc, long_swa_lc)]
+        cold_groups = [cold_mapping[lc_id] for lc_id in (full_lc, short_swa_lc, long_swa_lc)]
         self.assertNotEqual(hot_groups[0], hot_groups[1])
         self.assertEqual(hot_groups[1], hot_groups[2])
         self.assertEqual(cold_groups[0], cold_groups[1])
         self.assertNotEqual(cold_groups[1], cold_groups[2])
 
-        hot_stats = _introspection.storage_statistics(self.manager, 0)
+        hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
         self.assertEqual(hot_stats[hot_groups[0]].total, 3)
         self.assertEqual(hot_stats[hot_groups[1]].total, 6)
         self._run_cold_page_codec_round_trip(
@@ -649,16 +697,14 @@ class TestNoBatching(TestKVCacheManagerV2):
         full_lc, swa_lc = [
             self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(2)
         ]
-        hot_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 0) for lc_id in (full_lc, swa_lc)
-        ]
-        cold_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 1) for lc_id in (full_lc, swa_lc)
-        ]
+        hot_mapping = self.manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        cold_mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(1))
+        hot_groups = [hot_mapping[lc_id] for lc_id in (full_lc, swa_lc)]
+        cold_groups = [cold_mapping[lc_id] for lc_id in (full_lc, swa_lc)]
         self.assertEqual(hot_groups[0], hot_groups[1])
         self.assertNotEqual(cold_groups[0], cold_groups[1])
 
-        hot_stats = _introspection.storage_statistics(self.manager, 0)
+        hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
         self.assertEqual(hot_stats[hot_groups[0]].total, 6)
         self._run_cold_page_codec_round_trip(
             expected_num_pages=5,
@@ -798,7 +844,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         def overall_utilization() -> float:
             numerator = 0
             denominator = 0
-            for stat in _introspection.storage_statistics(self.manager):
+            for stat in self.manager.get_storage_statistics():
                 slot_size = sum(stat_slot_sizes(stat))
                 numerator += slot_size * stat.unavailable
                 denominator += slot_size * stat.total
@@ -2197,6 +2243,13 @@ class TestResizeQuota(TestKVCacheManagerV2):
             prefetch_counts_before[HOST_LEVEL] + prefetch_counts_before[DISK_LEVEL],
         )
         self.assertEqual(unscheduled_evictable_after[HOST_LEVEL], 0)
+        # The disk-prefetch counter measures what this call moved: every page that was on disk
+        # beforehand, counted the way iterOnboardBlocks/iterOffloadBlocks count.
+        moved_blocks = self.manager.get_and_reset_iteration_disk_prefetch_blocks()
+        self.assertEqual(moved_blocks, prefetch_counts_before[DISK_LEVEL])
+        # Nothing is left on disk now, so a second prefetch moves nothing and counts nothing.
+        self.assertTrue(prefetch_target.prefetch(HOST_LEVEL))
+        self.assertEqual(self.manager.get_and_reset_iteration_disk_prefetch_blocks(), 0)
         # Now both requests can resume
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
@@ -3536,7 +3589,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(self._make_hybrid_config())
         ssm_lc = _introspection.ssm_life_cycle_id(manager)
         assert ssm_lc is not None
-        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+        ssm_pg = manager.get_life_cycle_pool_group_indices()[ssm_lc]
         attn_pg = 1 - ssm_pg
 
         batch = BatchDesc(
@@ -3693,8 +3746,7 @@ class TestInitRatioConfig(unittest.TestCase):
             return stat.slot_size
 
         slots_by_size = {
-            tuple(stat_slot_sizes(stat)): stat.total
-            for stat in _introspection.storage_statistics(manager)
+            tuple(stat_slot_sizes(stat)): stat.total for stat in manager.get_storage_statistics()
         }
         self.assertEqual(slots_by_size[(grain - 1,)], 2)
         self.assertEqual(slots_by_size[(grain,)], 3)
@@ -3757,7 +3809,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = _introspection.storage_statistics(manager)
+        stats = manager.get_storage_statistics()
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,
@@ -4002,7 +4054,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = _introspection.storage_statistics(manager)
+        stats = manager.get_storage_statistics()
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,
@@ -4967,7 +5019,7 @@ class TestPoolRebalance(TestKVCacheManagerV2):
         return prompt
 
     def _slot_totals(self) -> list[int]:
-        return [s.total for s in _introspection.storage_statistics(self.manager, GPU_LEVEL)]
+        return [s.total for s in self.manager.get_storage_statistics(GPU_LEVEL)]
 
     def test_adjust_resizes_pool_groups(self) -> None:
         self.prepare_two_pool_groups()
@@ -5255,6 +5307,134 @@ class TestSlotAllocatorShrink(unittest.TestCase):
 
         for s in slots[:8]:
             allocator.release(s)
+
+
+class TestCachedTokensByTier(TestKVCacheManagerV2):
+    @contextmanager
+    def _tiered_prefix(self):
+        """Three committed blocks of 4 tokens spread over the configured cache levels.
+
+        Per-(block, life cycle) levels are (0,0), (1,0), (1,2), so a match of 11 tokens makes
+        blocks 0 and 1 full reuses and block 2 a partial one, with the two attention life cycles
+        disagreeing on where the pages sit. Yields (tokens, life_cycles).
+        """
+        self.prepare(16 << 20, 16 << 20, 16 << 20, 2, 16, 0, tokens_per_block=4)
+        tokens = [TokenId(i) for i in range(12)]
+        life_cycles = _introspection.attention_life_cycle_ids(self.manager)
+        coverage = [4 if i in life_cycles else 0 for i in range(max(life_cycles) + 1)]
+        blocks = []
+        try:
+            parent = None
+            for ordinal, levels in enumerate(((0, 0), (1, 0), (1, 2))):
+                block = _introspection.make_test_block(
+                    self.manager, tokens[ordinal * 4 : (ordinal + 1) * 4], coverage, parent
+                )
+                blocks.append(block)
+                for life_cycle, level in zip(life_cycles, levels):
+                    if level:
+                        _introspection.set_test_block_page_cache_level(
+                            block, life_cycle, CacheLevel(level)
+                        )
+                parent = block
+            yield tokens, life_cycles
+        finally:
+            # Put every page back on GPU before closing, so teardown does not trip over a block
+            # whose pages were parked on a cold level.
+            for block in blocks:
+                for life_cycle in life_cycles:
+                    _introspection.set_test_block_page_cache_level(block, life_cycle, CacheLevel(0))
+            for block in reversed(blocks):
+                _introspection.close_test_block(block)
+
+    def test_current_residency(self) -> None:
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                # Levels 0/1/2 are gpu/host/disk in this fixture's configured tier list.
+                self.assertEqual(list(cache.cached_tokens_by_level), [4, 4, 3])
+                self.assertEqual(cache._get_last_cached_token_level(), 2)
+            finally:
+                cache.close()
+
+    def test_reused_blocks_by_level(self) -> None:
+        """Reuse block counts are split by the cache level each reused page sat on."""
+        with self._tiered_prefix() as (tokens, life_cycles):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.commit_pending_stats()
+                by_level = self.manager.get_and_reset_iteration_reused_blocks_by_level()
+
+                # First life cycle: block 0 on level 0, block 1 on level 1 (both full), block 2
+                # on level 1 (partial). Second: blocks 0 and 1 on level 0, block 2 on level 2.
+                self.assertEqual(list(by_level[life_cycles[0]].full), [1, 1, 0])
+                self.assertEqual(list(by_level[life_cycles[0]].partial), [0, 1, 0])
+                self.assertEqual(list(by_level[life_cycles[1]].full), [2, 0, 0])
+                self.assertEqual(list(by_level[life_cycles[1]].partial), [0, 0, 1])
+                # Draining resets the accumulator.
+                self.assertEqual(self.manager.get_and_reset_iteration_reused_blocks_by_level(), {})
+            finally:
+                cache.close()
+
+    def test_iteration_accumulation(self) -> None:
+        """Attribution is staged with the reuse match and committed with the sequence's stats."""
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                # Nothing is reported until the sequence's pending stats are committed.
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 3]
+                )
+                # Draining resets the accumulator, and committing again does not re-report the
+                # same match.
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+            finally:
+                cache.close()
+
+    def test_drop_cached_token_attribution(self) -> None:
+        """Dropping suppresses the whole match, e.g. for a KV cache sizing dry run."""
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.drop_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+            finally:
+                cache.close()
+
+    def test_drop_partial_block_cached_token_attribution(self) -> None:
+        """Only the trailing partial block stops counting; complete blocks survive."""
+        with self._tiered_prefix() as (tokens, _):
+            # 11 tokens is two full blocks plus a 3-token tail resident on level 2.
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.drop_partial_block_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 0]
+                )
+            finally:
+                cache.close()
+
+    def test_drop_partial_block_keeps_block_aligned_attribution(self) -> None:
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:8])
+            try:
+                cache.drop_partial_block_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 0]
+                )
+            finally:
+                cache.close()
 
 
 @pytest.mark.cpu_only
