@@ -535,6 +535,62 @@ def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
 
     assert routed_model_config.moe_backend == backend
     assert model_config.moe_backend == backend
+    assert routed_model_config.moe_handles_global_routed_output
+    assert not model_config.moe_handles_global_routed_output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("global_routed_output", [False, True])
+def test_kimi_k3_tep_reduces_each_branch_once(monkeypatch, global_routed_output):
+    """Local and already-combined routed outputs must give the same model result."""
+    shared_local = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    shared_peer = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+    routed_local = torch.tensor([[2.0, 3.0]])
+    routed_peer = torch.tensor([[5.0, 7.0]])
+    collective_inputs = []
+
+    def all_reduce(value):
+        collective_inputs.append(value.clone())
+        peer = shared_peer if global_routed_output else torch.cat((shared_peer, routed_peer), -1)
+        return value + peer
+
+    class RoutedExperts(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return routed_local + routed_peer if global_routed_output else routed_local
+
+    runtime = KimiK3MoERuntime.__new__(KimiK3MoERuntime)
+    torch.nn.Module.__init__(runtime)
+    runtime.hidden_size = 4
+    runtime.moe_hidden_size = 2
+    runtime._use_combined_all_reduce = not global_routed_output
+    runtime._reduce_shared_output = global_routed_output
+    runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
+    runtime.routed_experts = RoutedExperts()
+    runtime.routed_experts.all_reduce = all_reduce
+    runtime.shared_experts = lambda value: shared_local
+    runtime.routed_expert_down_proj = torch.nn.Identity()
+    runtime.routed_expert_norm = torch.nn.RMSNorm(2, eps=0.1)
+    runtime.routed_expert_up_proj = torch.nn.Linear(2, 4, bias=False)
+    runtime.routed_expert_up_proj.weight.data.copy_(
+        torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, -1.0]])
+    )
+    runtime.moe_main_event = runtime.moe_shared_event = runtime.shared_expert_stream = None
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", True)
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "maybe_execute_in_parallel",
+        lambda first, second, *args, **kwargs: (first(), second()),
+    )
+
+    result = runtime(torch.zeros(1, 4))
+    expected = (
+        shared_local
+        + shared_peer
+        + runtime.routed_expert_up_proj(runtime.routed_expert_norm(routed_local + routed_peer))
+    )
+    torch.testing.assert_close(result, expected)
+    assert len(collective_inputs) == 1
+    assert collective_inputs[0].shape[-1] == (4 if global_routed_output else 6)
 
 
 @pytest.mark.parametrize(

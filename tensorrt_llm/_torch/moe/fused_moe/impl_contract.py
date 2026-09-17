@@ -236,6 +236,9 @@ class MoEDeployment:
     # ``model_config.locality_domain_policy.enabled``. Whether the machine can
     # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
     locality_domain_requested: bool = False
+    # The model wrapper can consume a globally combined routed output without
+    # reducing that branch again under tensor parallelism.
+    handles_global_routed_output: bool = False
 
     @property
     def smart_router(self) -> bool:

@@ -301,6 +301,7 @@ def build_moe_deployment(
         parallel_size=mapping.tp_size,
         cluster_size=mapping.moe_cluster_size,
         use_dp=mapping.enable_attention_dp,
+        handles_global_routed_output=model_config.moe_handles_global_routed_output,
         num_slots=num_slots,
         env=environment if environment is not None else collect_moe_environment(),
         # Registered balancer only; config alone does not enable EPLB.
