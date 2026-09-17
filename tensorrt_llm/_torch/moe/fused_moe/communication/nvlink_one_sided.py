@@ -32,12 +32,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pynvml
 import torch
 
-from tensorrt_llm._mnnvl_utils import (
-    CftMnnvlMemory,
-    MnnvlCheckpointCommunicator,
-    MnnvlMemory,
-    cuda,
-)
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -47,6 +41,12 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdogTimeout,
     EPGroupHealthLike,
     reject_rank_mask_cuda_graph_capture,
+)
+from tensorrt_llm._torch.distributed.mnnvl_memory import (
+    CftMnnvlMemory,
+    MnnvlCheckpointCommunicator,
+    MnnvlMemory,
+    cuda,
 )
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm.bindings import internal as _tllm_internal

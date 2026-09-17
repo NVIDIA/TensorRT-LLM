@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import tensorrt_llm._mnnvl_utils as mnnvl
+import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 from tensorrt_llm.mapping import Mapping

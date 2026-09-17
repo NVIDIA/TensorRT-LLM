@@ -64,9 +64,11 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
-import tensorrt_llm._mnnvl_utils as mnnvl
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import MnnvlMoe
 from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
+
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
@@ -1950,7 +1952,7 @@ def _build_combine_reference(
         # scaling: per-row global fp32 scale + per-group-of-16 fp8 scale,
         # with E2M1 quantization. After NVLink transfer,
         # dequantize_nvfp4_sharedmem reverses the process. The top_k
-        # reduction is then done in bf16 by torch.sum in _mnnvl_utils.py. The
+        # reduction is then done in bf16 by torch.sum in nvlink_two_sided.py. The
         # NVFP4 round-trip is precomputed on the worker GPU.
         for proc_result in all_results:
             nvfp4_out = proc_result["moe_output_for_ref"]

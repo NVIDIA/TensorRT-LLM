@@ -241,7 +241,7 @@ def test_device_index_uses_local_rank_under_mpi(mpi_mode):
 @pytest.fixture
 def mnnvl_capable_hardware(monkeypatch):
     """Make every hardware-level precondition of is_mnnvl() pass."""
-    import tensorrt_llm._mnnvl_utils as mnnvl_utils
+    import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl_utils
 
     monkeypatch.setattr(ops.platform, "machine", lambda: "aarch64")
     monkeypatch.setattr(mnnvl_utils.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))

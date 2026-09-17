@@ -52,7 +52,6 @@ if TYPE_CHECKING:
     import tensorrt_llm.runtime as runtime
     import tensorrt_llm.tools as tools
 
-    from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
     from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                          mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                          set_mpi_comm, str_dtype_to_torch)
@@ -74,9 +73,6 @@ _LAZY_ATTRS = {
     'quantization': ('tensorrt_llm.quantization', None),
     'runtime': ('tensorrt_llm.runtime', None),
     'tools': ('tensorrt_llm.tools', None),
-    'MnnvlMemory': ('tensorrt_llm._mnnvl_utils', 'MnnvlMemory'),
-    'MnnvlMoe': ('tensorrt_llm._mnnvl_utils', 'MnnvlMoe'),
-    'MoEAlltoallInfo': ('tensorrt_llm._mnnvl_utils', 'MoEAlltoallInfo'),
     'default_gpus_per_node': ('tensorrt_llm._utils', 'default_gpus_per_node'),
     'local_mpi_rank': ('tensorrt_llm._utils', 'local_mpi_rank'),
     'local_mpi_size': ('tensorrt_llm._utils', 'local_mpi_size'),
@@ -150,9 +146,6 @@ __all__ = [
     'mpi_world_size',
     'torch_models',
     'Mapping',
-    'MnnvlMemory',
-    'MnnvlMoe',
-    'MoEAlltoallInfo',
     'runtime',
     'models',
     'quantization',

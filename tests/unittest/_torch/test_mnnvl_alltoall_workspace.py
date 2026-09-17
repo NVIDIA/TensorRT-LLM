@@ -21,7 +21,7 @@ from weakref import WeakSet
 import pytest
 import torch
 
-import tensorrt_llm._mnnvl_utils as mnnvl
+import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 import tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll

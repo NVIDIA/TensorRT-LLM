@@ -18,7 +18,7 @@ import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
     FORCE_CFT_ENV,
     NVLinkOneSided,
