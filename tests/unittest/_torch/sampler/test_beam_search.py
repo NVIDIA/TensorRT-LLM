@@ -49,9 +49,8 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     LlmRequest as CppLlmRequest
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
-from tensorrt_llm.llmapi import (CacheTransceiverConfig,
-                                 CapacitySchedulerPolicy, CudaGraphConfig,
-                                 KvCacheConfig, SchedulerConfig)
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig)
 
 
 @pytest.fixture(scope="module")
@@ -473,12 +472,13 @@ def test_beam_search_disagg_first_token_is_end_id(
     prompts = [[1, 2, 3]]
 
     def _context_first_gen_tokens(llm, params: SamplingParams) -> list[int]:
+        # Let the executor assign a fresh ID: the previous context response
+        # can arrive while its KV transfer still owns the request's cache.
         outputs = llm.generate(
             deepcopy(prompts),
             sampling_params=deepcopy(params),
             disaggregated_params=[
-                DisaggregatedParams(request_type="context_only",
-                                    disagg_request_id=201)
+                DisaggregatedParams(request_type="context_only")
             ],
             use_tqdm=False,
         )
@@ -518,45 +518,47 @@ def test_beam_search_disagg_first_token_is_end_id(
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_beam_search_cache_indirection_kv_cache_manager_v2(
-    fixed_params,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gc.collect(2)
-    input_prompts = [[1, 2, 3], [4, 5], [6, 7, 8, 9]]
-    llm_kwargs: dict[str, Any] = dict(
-        model=_pl.Path("dummy_path"),
-        checkpoint_loader=HfCheckpointLoader(
-            weight_loader=DummyWeightLoader(),
-            config_loader=DummyConfigLoader(),
-        ),
-        sampler_type="TorchSampler",
-        disable_overlap_scheduler=False,
-        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
-                                          enable_padding=True),
-        kv_cache_config=KvCacheConfig(
-            max_tokens=10000,
-            use_kv_cache_manager_v2=True,
-        ),
-        scheduler_config=SchedulerConfig(
-            capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION),
-    )
-    with _build_llm(fixed_params, input_prompts, llm_kwargs=llm_kwargs) as llm:
-        sampling_params = SamplingParams(
-            max_tokens=fixed_params["max_tokens"],
-            n=fixed_params["max_beam_width"],
-            best_of=fixed_params["max_beam_width"],
-            use_beam_search=True,
-            end_id=-1,
-            additional_model_outputs=["cache_indirection"],
-        )
-        validate_outputs(
-            llm,
-            input_prompts,
-            sampling_params,
-            check_no_sync=False,
-            monkeypatch=monkeypatch,
-        )
+def test_beam_search_v2_preserves_outputs_with_reuse() -> None:
+    """Cold and reused V2 caches produce the same beams as V1 with mixed prompt lengths."""
+    model_root = llm_models_root()
+    if model_root is None:
+        pytest.skip("LLM_MODELS_ROOT is required for model-output parity")
+    prompts = [[1, 2, 3, 4] * 8, [5, 6, 7, 8] * 8 + [9, 10, 11]]
+    sampling = SamplingParams(max_tokens=8,
+                              n=2,
+                              best_of=2,
+                              use_beam_search=True,
+                              ignore_eos=True)
+    expected = None
+    for use_v2 in (False, True):
+        with LLM(
+                model=model_root / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+                max_seq_len=64,
+                max_batch_size=2,
+                max_beam_width=2,
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4],
+                                                  enable_padding=True),
+                kv_cache_config=KvCacheConfig(max_tokens=4096,
+                                              tokens_per_block=32,
+                                              enable_block_reuse=True,
+                                              use_kv_cache_manager_v2=use_v2),
+        ) as llm:
+            for repeat in range(2 if use_v2 else 1):
+                results = llm.generate(prompts, sampling, use_tqdm=False)
+                actual = [[list(beam.token_ids) for beam in result.outputs]
+                          for result in results]
+                assert len(actual) == len(prompts)
+                assert all(
+                    len(beams) == 2 and all(
+                        len(tokens) == 8 for tokens in beams)
+                    for beams in actual)
+                if expected is None:
+                    expected = actual
+                else:
+                    assert actual == expected
+                if repeat:
+                    assert all(result.cached_tokens > 0 for result in results)
 
 
 @pytest.mark.parametrize("beam_width", [10])
