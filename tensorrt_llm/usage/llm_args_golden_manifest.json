@@ -1766,9 +1766,7 @@
       "path": "torch_compile_config.compile_only_piecewise_graphs"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "torch_compile_config.enable_fullgraph"
     },
