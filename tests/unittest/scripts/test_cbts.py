@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import json
 import shutil
 import sqlite3
@@ -180,6 +181,90 @@ class CoverageArtifactTest(unittest.TestCase):
         assert selected is not None
         self.assertEqual(selected["drift"], 0)
         self.assertEqual(selected["drift_status"], "identical")
+
+    def test_select_build_resolves_explicit_pinned_build(self) -> None:
+        with (
+            mock.patch.object(artifact, "_exists", return_value=True),
+            mock.patch.object(artifact, "build_commit", return_value="coverage-commit"),
+            mock.patch.object(artifact, "drift", return_value=(3, "behind")),
+            mock.patch.object(artifact, "compare_distance", return_value=7),
+        ):
+            selected = artifact.select_build(42, "pr-base")
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected["build"], 42)
+        self.assertEqual(selected["commit"], "coverage-commit")
+        self.assertEqual(selected["base_commit"], "pr-base")
+        self.assertEqual(selected["drift"], 3)
+
+    def test_select_build_rejects_changed_pinned_commit(self) -> None:
+        with (
+            mock.patch.object(artifact, "_exists", return_value=True),
+            mock.patch.object(artifact, "build_commit", return_value="replacement-commit"),
+            mock.patch.object(artifact, "drift") as drift,
+        ):
+            selected = artifact.select_build(
+                42,
+                "pr-base",
+                expected_commit="pinned-commit",
+            )
+
+        self.assertIsNone(selected)
+        drift.assert_not_called()
+
+    def test_resolve_build_prints_metadata_without_residual_paths(self) -> None:
+        selection = {
+            "build": 42,
+            "commit": "coverage-commit",
+            "base_commit": "pr-base",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(artifact, "merge_base", return_value="pr-base"),
+            mock.patch.object(artifact, "select_tarball", return_value=selection),
+            mock.patch("sys.stdout", stdout),
+        ):
+            status = artifact.main(["--resolve-build", "--pr-head", "pr-head"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), selection)
+
+    def test_prepare_uses_explicit_pinned_build(self) -> None:
+        selection = {
+            "url": "x86-url",
+            "urls": ["x86-url", "sbsa-url"],
+            "build": 42,
+            "commit": "coverage-commit",
+            "base_commit": "pr-base",
+            "drift": 2,
+            "drift_status": "behind",
+            "lag": 5,
+        }
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(artifact, "merge_base", return_value="pr-base"),
+            mock.patch.object(artifact, "select_build", return_value=selection) as select_build,
+            mock.patch.object(artifact, "select_tarball") as select_latest,
+            mock.patch.object(artifact, "_patch_apply_status", return_value="conflict"),
+        ):
+            ready = artifact.prepare(
+                temp_dir,
+                "pr-head",
+                ["tensorrt_llm/source.py"],
+                build=42,
+                expected_commit="coverage-commit",
+            )
+
+        self.assertIsNotNone(ready)
+        assert ready is not None
+        self.assertIsNone(ready["path"])
+        select_build.assert_called_once_with(
+            42,
+            "pr-base",
+            expected_commit="coverage-commit",
+        )
+        select_latest.assert_not_called()
 
     def test_prepare_merges_x86_and_sbsa_databases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

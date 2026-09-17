@@ -160,23 +160,38 @@ stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
 ```
 run Tier 1                                      → Tier-2 residual paths
 GitHub compare main...<PR head>                 → PR base commit
-Jenkins REST lastBuild                          → newest build number N
-for b in N .. N-49:                              (_MAX_PROBE)
-   ranged GET both architecture tarballs        → skip b unless both exist
-   GET build_info.txt, parse `commit=`           → sha; skip when absent
-   first complete pair with a known sha          → latest coverage DB
-   compare <sha>...<PR base>                     → record topology and absolute distance
-fetch PR head locally; fetch base and latest DB from the normal CI Git mirror
+GET Artifactory pin at <PR number>/<PR head>:
+   200                                           → reuse its coverage build
+   404                                           → resolve the newest build below
+   other / malformed                             → decline Tier 2
+when no pin:
+   Jenkins REST lastBuild                        → newest build number N
+   for b in N .. N-49:                            (_MAX_PROBE)
+      ranged GET both architecture tarballs      → skip b unless both exist
+      GET build_info.txt, parse `commit=`         → sha; skip when absent
+      first complete pair with a known sha        → latest coverage DB
+   upload the build/commit pin                    → stable for this PR head
+compare <sha>...<PR base>                        → record topology and absolute distance
+fetch PR head locally; fetch base and selected DB from the normal CI Git mirror
 create a squashed PR commit with `commit-tree`, parented at the PR base
 cherry-pick it onto the DB revision
    no unmerged residual path                       → continue
    residual conflict / unavailable revision       → decline Tier 2
 ```
 
-Requiring the pair prevents the selector from narrowing only one CPU architecture. Builds are
-probed newest first, and the first complete pair with commit metadata is the only DB considered.
-The selector does not substitute an older DB merely because it is closer to the PR base or because
-the latest DB conflicts with the PR diff.
+The pin lives under
+`LLM/main/cbts/coverage-db-pins/v1/<PR number>/<PR head>/cbts_db_pin.json`. A new PR head has no
+pin and therefore receives the freshest complete pair available at its first CBTS run. Repeated
+`/bot run` commands for the same head reuse that build even after newer post-merge DBs appear.
+Pin lookup, validation, and first-write upload fail closed; CBTS never silently substitutes a
+newer build when a pin cannot be read or written. Preparation also verifies that the pinned
+build's `build_info.txt` still names the commit recorded in the pin, so an overwritten or
+corrupted build cannot silently change a repeated run.
+
+Requiring the architecture pair prevents the selector from narrowing only one CPU architecture.
+For an unpinned head, builds are probed newest first and the first complete pair with commit
+metadata is the only DB considered. The selector does not substitute an older DB merely because
+it is closer to the PR base or because the selected DB conflicts with the PR diff.
 
 ### 8.2 Measuring the lag (reporting)
 
@@ -209,13 +224,13 @@ This number reports overall freshness. It does not select the DB.
 
 ### 8.2b Measuring the drift (gating)
 
-The PR base is `merge_base_commit.sha` from `main...<PR head>`. The latest DB is compared as
+The PR base is `merge_base_commit.sha` from `main...<PR head>`. The selected DB is compared as
 `<db sha>...<PR base>`, and drift is `ahead_by + behind_by`: an absolute distance used only by the
 freshness gate and telemetry. `ahead`, `behind`, and `identical` describe valid positions on main;
 diverged and unknown relations decline Tier 2.
 
 `commit-tree` represents the complete base-to-head PR change as one commit, and `cherry-pick`
-tests that commit against the latest DB without serializing through patch format. When the
+tests that commit against the selected DB without serializing through patch format. When the
 cherry-pick reports conflicts, only unmerged paths in the Tier-2 residual count; conflicts in
 Tier-1-owned files are ignored. This check is independent of whether the DB is older than, equal
 to, or newer than the PR base. A residual conflict or an unmeasurable check declines before the
@@ -226,9 +241,10 @@ the PR runs in full.
 
 ### 8.3 What happens with the result
 
-After Tier 1 computes the residual, `--prepare DIR --paths-json PATH` resolves the PR base, selects
-the latest complete pair, validates residual compatibility, streams both tarballs down, unpacks
-their identically named SQLite files separately, and unions them with `compact_db.merge_databases`.
+After Tier 1 computes the residual, Groovy resolves and persists a build pin before any large
+download. `--prepare DIR --build BUILD --paths-json PATH` then resolves the PR base, validates the
+pinned pair's residual compatibility, streams both tarballs down, unpacks their identically named
+SQLite files separately, and unions them with `compact_db.merge_databases`.
 It writes the selection JSON
 beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
 credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.
