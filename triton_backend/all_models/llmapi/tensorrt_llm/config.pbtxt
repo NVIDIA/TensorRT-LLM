@@ -1,4 +1,4 @@
-# Copyright 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -50,6 +50,14 @@ input [
     name: "text_input"
     data_type: TYPE_STRING
     dims: [ -1 ]
+  },
+  ## Optional http(s) image URLs, one per image. Only read when
+  ## `triton_config.multimodal` is set in model.yaml.
+  {
+    name: "image_url"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+    optional: true
   },
   {
     name: "streaming"
@@ -146,6 +154,39 @@ input [
   {
     name: "stop"
     data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  ## LoRA Adapter Selection ##
+  # All three of lora_id, lora_name, and lora_path must be provided together
+  # (lora_ckpt_source is optional and defaults to "hf").
+  # Adapter weights are read from lora_path on first use and cached by the
+  # LLM executor keyed on lora_id; subsequent requests sharing the same
+  # lora_id reuse the cached adapter. If a cached lora_id is evicted, the
+  # adapter is transparently reloaded from lora_path on next use.
+  # Note: lora_path must be readable on the Triton server's filesystem
+  # (e.g. a shared mount), not uploaded inline with the request.
+  {
+    name: "lora_id"
+    data_type: TYPE_UINT64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "lora_name"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "lora_path"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "lora_ckpt_source"
+    data_type: TYPE_STRING
     dims: [ 1 ]
     optional: true
   }

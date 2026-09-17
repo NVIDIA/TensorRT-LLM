@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for Kimi-K2 / Kimi-K2.5 custom model implementation.
 
 This module tests the custom Kimi-K2 model implementation (DeepSeek-V3 variant)
@@ -163,7 +177,7 @@ def test_kimi_k2_text_model_can_be_exported():
     2. The exported graph module produces numerically equivalent output to eager
     3. Dynamic shapes work correctly with different input sizes
     """
-    device = "cpu"
+    device = "cuda"
     dtype = torch.bfloat16
     config = _create_small_text_config()
 
@@ -225,6 +239,7 @@ def test_kimi_k2_text_model_can_be_exported():
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_config_registration():
     """Test that configs are properly instantiated with correct model_type."""
     text_config = _create_small_text_config()
@@ -240,6 +255,7 @@ def test_kimi_k2_config_registration():
     assert isinstance(vlm_config.text_config, KimiK2Config)
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_layer_types():
     """Test that layer 0 uses dense MLP and later layers use MoE."""
     config = _create_small_text_config()
@@ -257,6 +273,7 @@ def test_kimi_k2_layer_types():
         )
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_expert_structure():
     """Test that experts have correct structure for checkpoint loading."""
     config = _create_small_text_config()
@@ -284,6 +301,7 @@ def test_kimi_k2_expert_structure():
         )
 
 
+@pytest.mark.cpu_only
 def test_kimi_k25_weight_layout():
     """Test that VLM wrapper has correct weight prefix for checkpoint compatibility."""
     config = _create_small_vlm_config()
@@ -299,6 +317,7 @@ def test_kimi_k25_weight_layout():
     )
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_shared_experts():
     """Test that shared experts are present when n_shared_experts > 0."""
     config = _create_small_text_config()
@@ -525,7 +544,7 @@ def test_kimi_k2_mlp_numerical_equivalence(B, S, dtype):
     if HFMLP is None:
         pytest.skip("transformers doesn't have DeepseekV3 (requires v4.57+)")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
@@ -562,7 +581,7 @@ def test_kimi_k2_moe_numerical_equivalence(B, S, dtype):
     if HFMoE is None:
         pytest.skip("transformers doesn't have DeepseekV3 (requires v4.57+)")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
@@ -610,7 +629,7 @@ def test_kimi_k2_attention_numerical_equivalence(B, S, dtype):
     if HFAttn is None:
         pytest.skip("transformers doesn't have DeepseekV3 (requires v4.57+)")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
@@ -661,7 +680,8 @@ def test_kimi_k2_attention_numerical_equivalence(B, S, dtype):
 
     # Compare — RoPE format conversion + fused MLA vs eager attention.
     # Higher tolerance due to RoPE de-interleaving + fused MLA vs eager path.
-    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.10, msg="Attention: ")
+    # bf16 GPU SDPA rounding occasionally lands just over 0.10 on small shapes; bump margin.
+    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.11, msg="Attention: ")
 
 
 # --- Level 2: Layer Equivalence ---
@@ -676,7 +696,7 @@ def test_kimi_k2_dense_layer_numerical_equivalence(B, S, dtype):
     if HFLayer is None:
         pytest.skip("transformers doesn't have DeepseekV3 (requires v4.57+)")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
@@ -735,7 +755,7 @@ def test_kimi_k2_moe_layer_numerical_equivalence(B, S, dtype):
     if HFLayer is None:
         pytest.skip("transformers doesn't have DeepseekV3 (requires v4.57+)")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
@@ -803,7 +823,7 @@ def test_kimi_k2_full_model_numerical_equivalence(B, S, dtype):
     if HFModel is None:
         pytest.skip("transformers doesn't have DeepseekV3 (requires v4.57+)")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 

@@ -6,9 +6,9 @@ import click
 from tensorrt_llm.bench.benchmark.low_latency import latency_command
 from tensorrt_llm.bench.benchmark.throughput import throughput_command
 from tensorrt_llm.bench.benchmark.visual_gen import visual_gen_command
-from tensorrt_llm.bench.build.build import build_command
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataset.prepare_dataset import prepare_dataset
+from tensorrt_llm.commands._telemetry import TelemetryGroup
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.usage import config as _telemetry_config
 
@@ -23,14 +23,21 @@ class NotRequiredForHelp(click.Option):
         return super().handle_parse_result(ctx, opts, args)
 
 
-@click.group(name="trtllm-bench", context_settings={'show_default': True})
+@click.group(
+    name="trtllm-bench",
+    cls=TelemetryGroup,
+    telemetry_usage_context=_telemetry_config.UsageContext.CLI_BENCH,
+    telemetry_component="llm",
+    context_settings={'show_default': True},
+)
 @click.option(
     "--model",
     "-m",
     required=True,
     type=str,
     cls=NotRequiredForHelp,
-    help="The Huggingface name of the model to benchmark.",
+    help=
+    "The Huggingface name of the model to benchmark. Also used as the tokenizer source for the prepare-dataset subcommand.",
 )
 @click.option(
     "--model_path",
@@ -88,7 +95,6 @@ def main(
     ctx.obj.workspace.mkdir(parents=True, exist_ok=True)
 
 
-main.add_command(build_command)
 main.add_command(throughput_command)
 main.add_command(latency_command)
 main.add_command(prepare_dataset)

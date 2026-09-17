@@ -13,7 +13,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 @dataclass
 class TokenRange:
-    """Range of tokens in the sequence dimension."""
+    """Half-open token range [start, end) within one request.
+
+    ``KVSlice`` ranges are block-aligned. Empty ranges are valid.
+    """
 
     start: int
     end: int  # exclusive
@@ -21,7 +24,7 @@ class TokenRange:
     def __post_init__(self):
         if self.start < 0 or self.end < 0:
             raise ValueError("Token indices must be non-negative")
-        if self.start >= self.end:
+        if self.start > self.end:
             raise ValueError(f"Invalid range: [{self.start}, {self.end})")
 
 
@@ -41,24 +44,20 @@ class LayerRange:
 
 @dataclass
 class KVSlice:
-    """
-    Specifies which portion of KV cache to transfer.
+    """KV-cache blocks for one request transfer slice.
 
-    token_range is the half-open token interval [start, end) representing
-    the logical portion of the prompt being transferred.  For non-windowed
-    layers every block in block_ids_per_layer_groups covers exactly this
-    range.  For sliding-window layers the actual blocks may cover only a
-    suffix of the interval; the sender derives the exact per-group token
-    offset from its own page-table metadata when building write metadata.
+    Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
+    Pipelined transfers use a block-aligned ``token_range`` and mark only the
+    final chunk with ``is_last_slice``. Block lists may omit cached or evicted
+    prefixes.
     """
 
-    token_range: Optional[TokenRange] = None
     layer_range: Optional[LayerRange] = None
     block_ids_per_layer_groups: List[np.ndarray] = field(
         default_factory=list
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
-    mamba_state_index: Optional[int] = None
+    token_range: Optional[TokenRange] = None
 
 
 class SessionStatus(Enum):
@@ -97,6 +96,9 @@ class SessionArgsBase:
     """Base arguments for transfer sessions."""
 
     params: DisaggregatedParams
+    # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
+    prompt_len: int
+    beam_width: int = 1
 
 
 def get_unique_rid(request: LlmRequest) -> Optional[int]:
@@ -133,7 +135,7 @@ class _SessionBase(ABC):
     def is_completed(self) -> bool: ...
 
     @abstractmethod
-    def wait_complete(self) -> Optional[WaitResult]: ...
+    def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]: ...
 
     @property
     @abstractmethod
@@ -149,7 +151,19 @@ class TxSessionBase(_SessionBase):
         self._sender = sender
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> None: ...
+    def send(self, slice: KVSlice) -> None:
+        """Send a KV slice.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+                For pipelined chunks, ``token_range`` is the shared sender-side
+                chunk cursor; each layer group projects it into its own
+                resident/windowed source and destination block ranges.
+        """
+        ...
+
+    @abstractmethod
+    def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]: ...
 
 
 class RxSessionBase(_SessionBase):

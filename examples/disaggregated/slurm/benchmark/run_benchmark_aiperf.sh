@@ -92,11 +92,5 @@ for concurrency in ${concurrency_list}; do
     echo "Benchmark with concurrency ${concurrency} done"
 done
 
-# Fetch perf metrics from disagg server
-echo "Fetching perf metrics from http://${hostname}:${port}/perf_metrics ..."
-curl -s "http://${hostname}:${port}/perf_metrics" > ${log_path}/perf_metrics.json 2>&1 || true
-if [ -s "${log_path}/perf_metrics.json" ]; then
-    echo "Perf metrics saved to ${log_path}/perf_metrics.json"
-else
-    echo "Warning: perf_metrics response was empty or endpoint not available"
-fi
+# Configure perf_metrics_output_dir on each server to persist per-request JSONL.
+echo "Per-request metrics are available in the configured server-side JSONL output."

@@ -40,6 +40,19 @@ The main entry point is `process_and_upload_test_results()`, which orchestrates 
 | 7 | `post_new_perf_data()` | Uploads to OpenSearch |
 | 8 | `check_perf_regression()` | Prints regression details. For pre-merge, raises `RuntimeError` if `fail_on_regression=True` (default for pre-merge, auto-detected) |
 
+`s_branch` comes from `globalVars["build_branch"]`, which the pipeline resolves
+once in `resolveBuildBranch()` (`jenkins/L0_MergeRequest.groovy`) and also writes
+into the build's `build_info.txt`, so the two always agree. It is
+`github-pr-<N>` for GitHub PR builds (the only builds that carry
+`github_pr_api_url`), and otherwise `env.gitlabBranch` — the pushed branch
+(`main`, `release/1.3.0rcXX`, ...) for post-merge builds, the source branch for
+GitLab MR builds — falling back to `main` when that is unset. A value the
+pipeline did not publish as a string becomes `""`, because an empty branch is
+recoverable and a wrong one is not. Do **not** try to recover it from
+`s_job_url`: the `/job/LLM/job/<folder>/` segment there names the Jenkins folder
+the job definition lives in, which is `main` even for release-branch post-merge
+builds.
+
 **Baseline calculation** (`calculate_baseline_metrics`):
 1. Group all data points by day, average within each day
 2. Apply trailing rolling mean (window=3) to smooth noise

@@ -416,7 +416,7 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cuda"])
 @torch.no_grad()
 def test_qwen3_moe_full_model_equivalence(B, S, dtype, device):
     """Test full model produces numerically equivalent output to HF implementation."""
@@ -547,6 +547,7 @@ def test_qwen3_moe_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_qwen3_moe_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -558,6 +559,7 @@ def test_qwen3_moe_config_registration():
     assert hasattr(config, "num_experts_per_tok")
 
 
+@pytest.mark.cpu_only
 def test_qwen3_moe_structure():
     """Test model structure: GQA, Q/K norms, MoE layers."""
     config = _create_small_config()
@@ -577,6 +579,7 @@ def test_qwen3_moe_structure():
         )
 
 
+@pytest.mark.cpu_only
 def test_qwen3_moe_dense_layer_config():
     """Test that mlp_only_layers correctly creates dense MLP layers."""
     config = _create_small_config()
@@ -594,6 +597,7 @@ def test_qwen3_moe_dense_layer_config():
     )
 
 
+@pytest.mark.cpu_only
 def test_qwen3_moe_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()

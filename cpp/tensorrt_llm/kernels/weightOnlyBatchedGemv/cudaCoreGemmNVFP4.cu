@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ template <typename InputType, typename OutputType, typename ScaleType, SizeType3
     SizeType32 BLOCK_SIZE>
 __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const alpha,
-    OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
+    OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     using VecType = int4;
 
@@ -40,8 +40,8 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
     static constexpr SizeType32 nvfp4_scale_granularity = 16;
     static constexpr SizeType32 step_k_scale = step_k / nvfp4_scale_granularity;
     static constexpr SizeType32 tile_k = step_k * BLOCK_SIZE;
-    auto tile_id_m = static_cast<SizeType32>(blockIdx.x * TILE_M);
-    auto tile_id_n = static_cast<SizeType32>(blockIdx.y * TILE_N);
+    auto tile_id_m = static_cast<SizeType32>(blockIdx.y * TILE_M);
+    auto tile_id_n = static_cast<SizeType32>(blockIdx.x * TILE_N);
     auto tid = static_cast<SizeType32>(threadIdx.x);
     float tile_a[step_k];
     float tile_w[TILE_N * step_k];
@@ -63,6 +63,7 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
     act += tile_id_m * k / 2;
     weight += tile_id_n * k / 2;
     output += tile_id_m * n + tile_id_n;
+    OutputType const* __restrict__ bias_tile = (bias != nullptr) ? bias + tile_id_n : nullptr;
 
     scale_a += tile_id_m * k / nvfp4_scale_granularity;
 
@@ -154,6 +155,10 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
         {
             val += shmem[jj * TILE_M * TILE_N + ii];
         }
+        if (bias_tile != nullptr)
+        {
+            val += static_cast<float>(bias_tile[nid]);
+        }
         output[mid * n + nid] = static_cast<OutputType>(val);
     }
 
@@ -166,13 +171,13 @@ template <typename InputType, typename OutputType, typename ScaleType, SizeType3
     SizeType32 BLOCK_SIZE>
 __global__ void cudaCoreGemmFp4(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const* alpha_ptr,
-    OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
+    OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     float alpha = alpha_ptr[0];
     cudaCoreGemmImpl<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>(
         reinterpret_cast<InputType const*>(act), reinterpret_cast<InputType const*>(weight),
         reinterpret_cast<ScaleType const*>(scale_a), reinterpret_cast<ScaleType const*>(scale_w), alpha,
-        reinterpret_cast<OutputType*>(output), m, n, k);
+        reinterpret_cast<OutputType*>(output), reinterpret_cast<OutputType const*>(bias), m, n, k);
 }
 
 template <typename InputType, typename OutputType, typename ScaleType, SizeType32 TILE_M, SizeType32 TILE_N,
@@ -180,7 +185,10 @@ template <typename InputType, typename OutputType, typename ScaleType, SizeType3
 void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
 {
     dim3 block(BLOCK_SIZE);
-    dim3 grid(params.m / TILE_M, params.n / TILE_N);
+    // N rides grid.x: its tile count is unbounded (a quantized LM head can be hundreds of
+    // thousands wide) and only grid.x allows more than 65535 blocks. M is safe on grid.y
+    // because it never exceeds cudaCoreGemmTemplateMaxM.
+    dim3 grid(params.n / TILE_N, params.m / TILE_M);
 
     if (tensorrt_llm::common::getEnvEnablePDL())
     {
@@ -203,7 +211,8 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
                 cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>,
                 reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
                 reinterpret_cast<ScaleType const*>(params.scale_a), reinterpret_cast<ScaleType const*>(params.scale_b),
-                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k));
+                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output),
+                reinterpret_cast<OutputType const*>(params.bias), params.m, params.n, params.k));
         }
     }
     else
@@ -213,7 +222,8 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
             cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
                 reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
                 reinterpret_cast<ScaleType const*>(params.scale_a), reinterpret_cast<ScaleType const*>(params.scale_b),
-                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output),
+                reinterpret_cast<OutputType const*>(params.bias), params.m, params.n, params.k);
         }
     }
 }

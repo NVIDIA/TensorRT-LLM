@@ -32,9 +32,6 @@ class TextPrompt(TypedDict):
     input processor for mm input processing.
     """
 
-    query: NotRequired[str]
-    """The query input text for star attention."""
-
 
 class TokensPrompt(TypedDict):
     """Schema for a tokenized prompt."""
@@ -63,8 +60,23 @@ class TokensPrompt(TypedDict):
     input processor for mm input processing.
     """
 
-    query_token_ids: NotRequired[List[int]]
-    """The query input token IDs for star attention."""
+    multi_item_part_lens: NotRequired[List[int]]
+    """Metadata for multi-item scoring.
+
+    Specifying this enables the multi-item scoring mode.
+    In this mode, `prompt_token_ids` is assumed to consist of a prefix (or query) and
+    multiple items (or candidates). Each part of the prompt is assumed to be followed
+    by a delimiter token. The attention computation (masking and positional encodings)
+    is altered such that the prefill logits correspond to those that would
+    have been obtained upon running separate prefills for prefix + item1, prefix + item2,
+    and so on. Currently, this feature is only supported in prefill-only execution
+    via `LLM.encode`.
+
+    The list elements should correspond, in order, to prefix length and the length of
+    each following item to score (all lengths in tokens).
+    See https://github.com/flashinfer-ai/flashinfer/pull/1015 for details and nomenclature.
+    The length should not include the delimiter tokens.
+    """
 
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]

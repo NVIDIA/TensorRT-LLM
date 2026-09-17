@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,9 +84,6 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mIsStreaming,                                              //
         mEndId,                                                    //
         mPadId,                                                    //
-        from_torch(mEmbeddingBias),                                //
-        from_torch(mBadWordsList),                                 //
-        from_torch(mStopWordsList),                                //
         mPositionIds,                                              //
         from_torch(mPromptEmbeddingTable),                         //
         mPromptVocabSize,                                          //
@@ -120,14 +117,17 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         getLlmRequestType(),                                       //
         std::nullopt,                                              // inputTokenExtraIds
         mNumReturnSequences,                                       //
-        mEagleConfig,                                              //
         from_torch(mSkipCrossAttnBlocks),                          //
         false,                                                     // returnPerfMetrics
         mGuidedDecodingParams,                                     //
         mLanguageAdapterUid,                                       //
         mAllottedTimeMs,                                           //
         mContextPhaseParams,                                       //
-        mCacheSaltID,                                              //
-        mPerfMetrics.timingMetrics.arrivalTime                     //
+        mPerfMetrics.timingMetrics.arrivalTime,                    //
+        mAgentHierarchy,                                           //
+        mMultimodalItemRunCuOffsets,                               //
+        mMultimodalRunPositions,                                   //
+        mMultimodalRunLengths,                                     //
+        mCacheSalt                                                 //
     );
 }

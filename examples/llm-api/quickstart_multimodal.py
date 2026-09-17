@@ -7,6 +7,7 @@ from quickstart_advanced import add_llm_args, setup_llm
 
 from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.llmapi import MultimodalConfig
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 example_medias_and_prompts = {
@@ -186,9 +187,14 @@ def main():
         lora_config.max_loras = 2
         lora_config.max_cpu_loras = 2
 
+    multimodal_config = None
+    if args.video_pruning_rate is not None:
+        multimodal_config = MultimodalConfig(
+            video_pruning_rate=args.video_pruning_rate)
+
     llm, sampling_params = setup_llm(args,
                                      lora_config=lora_config,
-                                     video_pruning_rate=args.video_pruning_rate)
+                                     multimodal_config=multimodal_config)
 
     image_format = args.image_format
     if args.model_type is not None:

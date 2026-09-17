@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any, Callable, Iterator, List, Tuple
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from torch import nn
 
@@ -413,8 +414,8 @@ class VideoDecoder(nn.Module):
         batch_size = sample.shape[0]
         if self.timestep_conditioning:
             noise = (
-                torch.randn(
-                    sample.size(), generator=generator, dtype=sample.dtype, device=sample.device
+                randn_tensor(
+                    sample.size(), generator=generator, device=sample.device, dtype=sample.dtype
                 )
                 * self.decode_noise_scale
             )
@@ -589,7 +590,7 @@ class VideoDecoder(nn.Module):
         weights = torch.zeros_like(buffer)
         for tile in group_tiles:
             decoded_tile = self.forward(latent[tile.in_coords], timestep, generator)
-            mask = tile.blend_mask.to(device=buffer.device, dtype=buffer.dtype)
+            mask = tile.blend_mask(buffer.device, buffer.dtype)
             temporal_offset = tile.out_coords[2].start - temporal_slice.start
             expected_temporal_len = tile.out_coords[2].stop - tile.out_coords[2].start
             decoded_temporal_len = decoded_tile.shape[2]

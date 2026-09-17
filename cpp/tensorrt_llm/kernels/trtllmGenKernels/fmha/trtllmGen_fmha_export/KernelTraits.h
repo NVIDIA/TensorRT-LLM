@@ -26,6 +26,7 @@
 #include <trtllm/gen/Expr.h>
 #include <trtllm/gen/Kernel.h>
 #endif // TLLM_FMHA_TRTLLM_COMPAT
+#include "Dsv4Constants.h"
 #include <nlohmann/json.hpp>
 #include <cassert>
 #include <numeric>
@@ -54,6 +55,55 @@ inline int32_t getPaddedHeadDimForSmem(int32_t headDim) {
   return paddedHeadDim;
 }
 
+// Whether the kernel uses the opt-in K-only BF16Q+FP8KV transform pipeline.
+template <typename FmhaOptions_>
+inline bool usesKOnlyTransformPipeline(FmhaOptions_ const& options) {
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
+  return options.mEnablesBf16QFp8KvKOnlyTransform && !isContextKernel(options.mFmhaKernelType) &&
+         !options.mIsMlaGen && options.mDtypeQ != options.mDtypeK && isSupportedHeadDim &&
+         options.mDtypeQ == tg::Dtype::Bfloat16 && options.mDtypeK == tg::Dtype::E4m3 &&
+         options.mDtypeV == tg::Dtype::E4m3 && tg::isArchBlackwell(options.mCudaArch);
+}
+
+// The dtype used by the softmax output P and V operands of BMM2.
+template <typename FmhaOptions_> inline tg::Dtype getDtypeBmm2(FmhaOptions_ const& options) {
+  return usesKOnlyTransformPipeline(options)
+           ? options.mDtypeV
+           : (options.mDtypeK != options.mDtypeQ ? options.mDtypeQ : options.mDtypeV);
+}
+
+// Whether the kernel is a Blackwell BF16Q+FP8KV generation kernel.
+template <typename FmhaOptions_> inline bool isBf16QFp8KvGeneration(FmhaOptions_ const& options) {
+  return !isContextKernel(options.mFmhaKernelType) && options.mDtypeQ == tg::Dtype::Bfloat16 &&
+         options.mDtypeK == tg::Dtype::E4m3 && options.mDtypeV == tg::Dtype::E4m3 &&
+         tg::isArchBlackwell(options.mCudaArch);
+}
+
+// Whether the kernel uses the full BF16Q+FP8KV transform pipeline.
+template <typename FmhaOptions_>
+inline bool isBf16QFp8KvFullTransformGeneration(FmhaOptions_ const& options) {
+  return isBf16QFp8KvGeneration(options) && !usesKOnlyTransformPipeline(options);
+}
+
+// Whether internal builds should use the E4M3->BF16 placeholder plus SASS patch.
+template <typename FmhaOptions_>
+inline bool usesE4m3ToBfloat16SassPatch(FmhaOptions_ const& options) {
+  return tg::isArchBlackwell(options.mCudaArch) && options.mDtypeQ == tg::Dtype::Bfloat16 &&
+         options.mDtypeK == tg::Dtype::E4m3;
+}
+
+// Whether separate transformed K/V resources are supported for this kernel.
+template <typename FmhaOptions_>
+inline bool supportsSeparateTransformedKv(FmhaOptions_ const& options) {
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
+  return isBf16QFp8KvFullTransformGeneration(options) && !options.mIsMlaGen &&
+         options.mNumInstsQ == 1 && options.mNumInstsKv == 1 && isSupportedHeadDim;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct KernelConfig : public KernelConfigBase {
@@ -71,16 +121,12 @@ struct KernelConfig : public KernelConfigBase {
   int32_t mNumStagesEpilogue;
   // The number of stages of the persistent work id pipeline.
   int32_t mNumStagesWorkId;
-  // The number of stages of the KV shared memory buffer.
-  int32_t mNumStagesKv;
   // The number of stages of the K shared memory buffer.
   int32_t mNumStagesK;
   // The number of stages of the V shared memory buffer.
   int32_t mNumStagesV;
   // The number of stages of the pageOffsetsKv shared memory buffer.
   int32_t mNumStagesPageOffsetsKv;
-  // The number of stages of the Q shared memory buffer.
-  int32_t mNumStagesQ;
   // The number of stages of the transformed KV shared memory buffer.
   int32_t mNumStagesTransformedKv;
   // The number of stages of the transposed V shared memory buffer.
@@ -118,6 +164,8 @@ struct KernelConfig : public KernelConfigBase {
   KernelConfig(FmhaOptions_ const& options)
     : KernelConfigBase(options) // Copy all base class members from options.
     , mSupportsPagedKv{options.mQkvLayout == QkvLayout::PagedKv} {
+    TLLM_CHECK_ERROR(options.mNumStagesKv >= 0, "numStagesKv must be >= 0");
+    TLLM_CHECK_ERROR(options.mNumStagesQ >= 0, "numStagesQ must be >= 0");
 
     // Derive mDtypeKv: equals mDtypeK when K and V share the same dtype, else Void.
     mDtypeKv = (mDtypeK == mDtypeV) ? mDtypeK : tg::Dtype::Void;
@@ -128,10 +176,12 @@ struct KernelConfig : public KernelConfigBase {
     }
 
     // The data type of softmax computation.
+#ifdef TLLM_RUBIN_FEATURES
     if (options.mEnablesFp16Softmax) {
       // E4m3 kernels will also use Fp16 for softmax computation.
       mDtypeSoftmax = (mDtypeQ == tg::Dtype::Bfloat16) ? tg::Dtype::Bfloat16 : tg::Dtype::Fp16;
     }
+#endif // TLLM_RUBIN_FEATURES
 
     // The maximum headDim for K and V.
     mMaxHeadDimKv = std::max(mHeadDimQk, mHeadDimV);
@@ -170,8 +220,14 @@ struct KernelConfig : public KernelConfigBase {
 
     // Set numStagesQ for headDim > 128 kernels.
     if (mNumInstsQ * mNumInstsKv == 1) {
-      TLLM_CHECK_INFO(mTileSizeQ == 64 || (mHeadDimQk > 128 && mHeadDimV > 128),
-                      "Consider using numInstsQ = 2 for better performance.");
+      // Whether the kernel is a generation kernel that skips softmax when possible.
+      bool isGenerationSkipsSoftmax =
+        options.mSkipsSoftmaxWhenPossible && !isContextKernel(options.mFmhaKernelType);
+      // Skip the check for skipsSoftmax generation kernels because this is intended.
+      if (!isGenerationSkipsSoftmax) {
+        TLLM_CHECK_INFO(mTileSizeQ == 64 || (mHeadDimQk > 128 && mHeadDimV > 128),
+                        "Consider using numInstsQ = 2 for better performance.");
+      }
       // There is no enough shared memory for 2 stages when the headDim is not split into multiple
       // stages.
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
@@ -181,11 +237,18 @@ struct KernelConfig : public KernelConfigBase {
         mNumStagesQ = int32_t{2 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
       }
     }
+    // A user-provided positive stage count overrides the heuristic; zero keeps the default.
+    if (options.mNumStagesQ > 0) {
+      mNumStagesQ = options.mNumStagesQ;
+    }
 
     // The number of stages of the KV shared memory buffer.
     if (tg::isArchHopper(options.mCudaArch)) {
       mNumStagesTransformedKv = 0;
       mNumStagesQ = mNumInstsQ;
+      if (options.mNumStagesQ > 0) {
+        mNumStagesQ = options.mNumStagesQ;
+      }
 
       // The minimal amount of stages for the kernel to run
       mNumStagesK = 1;
@@ -204,7 +267,7 @@ struct KernelConfig : public KernelConfigBase {
       // Take into account barriers in smem
       numFreeBytes -= 4 * 1024;
       // Take into account the minimal amount of stages
-      numFreeBytes -= mNumInstsQ * numBytesPerSmemStageQ;
+      numFreeBytes -= mNumStagesQ * numBytesPerSmemStageQ;
       numFreeBytes -= mNumStagesK * numBytesPerSmemStageK;
       numFreeBytes -= mNumStagesV * numBytesPerSmemStageV;
       numFreeBytes -= mNumStagesTransposedV * numBytesPerSmemStageV;
@@ -226,6 +289,12 @@ struct KernelConfig : public KernelConfigBase {
       }
 
       mNumStagesKv = mNumStagesK + mNumStagesV;
+      // Apply the KV override after computing the default K/V split.
+      if (options.mNumStagesKv > 0) {
+        mNumStagesKv = options.mNumStagesKv;
+        mNumStagesK = mNumStagesKv / 2;
+        mNumStagesV = mNumStagesKv - mNumStagesK;
+      }
     } else {
 
 
@@ -242,7 +311,21 @@ struct KernelConfig : public KernelConfigBase {
         mNumStagesKv = int32_t{4 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
 #ifdef TLLM_RUBIN_FEATURES
         if (tg::isArchRubin(options.mCudaArch)) {
-          mNumStagesKv = int32_t{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+          int32_t const numStagesKvDeep{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+          int32_t const estimatedNumBytesPerRowSmemQ{
+            ceilDiv(tg::dtypeGetNumBits(mDtypeQ) * mHeadDimQk / 8, 128) * 128};
+          int64_t const estimatedNumBytesSmemQ{int64_t{mNumStagesQ} * mTileSizeQ *
+                                               estimatedNumBytesPerRowSmemQ};
+          int64_t const estimatedNumBytesSmemKvDeep{
+            numStagesKvDeep * calculateSmemKvStageBytes(mDtypeQ, options.mClusterDimX)};
+          // Keep Q+KV within 200 KiB, reserving space below Rubin's 227-KiB normal dynamic-SMEM
+          // limit for page offsets, epilogue buffers, and barriers. Larger unsplit tiles retain the
+          // four-stage default instead of entering the 328-KiB oversized mode with only 8 KiB L1.
+          bool const fitsDeepKvPipelineSmemBudget{
+            estimatedNumBytesSmemQ + estimatedNumBytesSmemKvDeep <= int64_t{200} * 1024};
+          if (fitsDeepKvPipelineSmemBudget) {
+            mNumStagesKv = numStagesKvDeep;
+          }
         }
 #endif // TLLM_RUBIN_FEATURES
       } else if (keepsMmaAbForDsMlaGen) {
@@ -274,6 +357,33 @@ struct KernelConfig : public KernelConfigBase {
         mNumStagesKv = calculateNumStagesKv(maxBufferSizeKBForSmemKv, options.mClusterDimX);
       }
       mNumStagesTransformedKv = tg::dtypeGetNumBits(mDtypeKv) >= 8 ? 2 : 4;
+      // Apply the KV override after all architecture-specific defaults are selected.
+      if (options.mNumStagesKv > 0) {
+        mNumStagesKv = options.mNumStagesKv;
+      }
+      if (usesKOnlyTransformPipeline(options) && options.mNumStagesKv == 0) {
+        // K-only transform needs one BF16 transformed-K stage, while V stays in the raw FP8
+        // pipeline for BMM2. Reserve that transformed-K stage from the normal KV budget, then count
+        // how many raw FP8 K/V load stages fit in the remaining space.
+        int32_t numHeadDimBytes = ceilDiv(tg::dtypeGetNumBits(mDtypeQ) * mHeadDimQk / 8, 128) * 128;
+        int32_t totalNumKBSmemQ = numHeadDimBytes * mTileSizeQ / 1024;
+        int32_t maxBufferSizeKBForSmemKv = std::min(144, 218 - totalNumKBSmemQ * mNumStagesQ);
+        int64_t const transformedStageBytesK{
+          calculateSmemKvStageBytes(mDtypeQ, options.mClusterDimX)};
+        if (mSwapsMmaAb && isCgaSmemReduction(mMultiCtasKvMode) && mTileSizeQ == 32 &&
+            transformedStageBytesK >= 32 * 1024) {
+          maxBufferSizeKBForSmemKv = std::min(maxBufferSizeKBForSmemKv, 112);
+        }
+        mNumStagesKv = std::max(2,
+                                calculateNumStagesKv(maxBufferSizeKBForSmemKv,
+                                                     options.mClusterDimX,
+                                                     mDtypeK,
+                                                     transformedStageBytesK));
+        // Prefer an odd total so V gets one more raw stage after the K/V split below.
+        if ((mNumStagesKv % 2) == 0 && mNumStagesKv > 2) {
+          --mNumStagesKv;
+        }
+      }
       mNumStagesTransposedV = 0;
       // Set mNumStagesK and mNumStagesV to reasonable values.
       mNumStagesK = mNumStagesKv / 2;
@@ -287,6 +397,11 @@ struct KernelConfig : public KernelConfigBase {
 
     // Set the number of tmem cols we will allocate once.
     mNumTmemCols = 512;
+#ifdef TLLM_RUBIN_FEATURES
+    if (isArchRubin(options.mCudaArch)) {
+      mNumTmemCols = 576;
+    }
+#endif // TLLM_RUBIN_FEATURES
     // Set the softmax statistics tile size.
     mTileSizeStats = 32;
     // Set epilogue tile sizes for each instance in the M dimension.
@@ -384,17 +499,30 @@ struct KernelConfig : public KernelConfigBase {
   }
 
 private:
-  // Calculate the number of stages for K/V.
-  int32_t calculateNumStagesKv(int32_t bufferSizeKB, int32_t clusterDimX) {
-    // The total number of bits for K/V.
-    int64_t totalNumBitsKv = bufferSizeKB * 1024 * 8;
+  int64_t calculateSmemKvStageBytes(tg::Dtype dtype, int32_t clusterDimX) {
+    int32_t const clusterDim{std::max(clusterDimX, 1)};
     // The head dimension per stage for K/V.
     int32_t headDimPerStageKv = mHeadDimPerStageKv == 0 ? mPaddedHeadDimQk : getHeadDimPerStageK();
-    // The number of bits per tileKv.
-    int64_t numBitsPerTileKv =
-      std::max(tg::dtypeGetNumBits(mDtypeQ), 8) * mTileSizeKv * headDimPerStageKv / clusterDimX;
+    // The number of bytes per tileKv.
+    return int64_t{std::max(tg::dtypeGetNumBits(dtype), 8)} * mTileSizeKv * headDimPerStageKv /
+           clusterDim / 8;
+  }
+
+  // Calculate the number of stages for K/V.
+  int32_t calculateNumStagesKv(int32_t bufferSizeKB, int32_t clusterDimX) {
+    return calculateNumStagesKv(bufferSizeKB, clusterDimX, mDtypeQ, /*reservedBytes=*/0);
+  }
+
+  int32_t calculateNumStagesKv(int32_t bufferSizeKB,
+                               int32_t clusterDimX,
+                               tg::Dtype stageDtype,
+                               int64_t reservedBytes) {
+    // The total number of bytes for K/V after any non-raw-KV reservation.
+    int64_t totalNumBytesKv = std::max<int64_t>(0, bufferSizeKB * 1024 - reservedBytes);
+    // The number of bytes per tileKv.
+    int64_t numBytesPerTileKv = calculateSmemKvStageBytes(stageDtype, clusterDimX);
     // The number of stages.
-    return std::max(1, static_cast<int32_t>(totalNumBitsKv / numBitsPerTileKv));
+    return std::max(1, static_cast<int32_t>(totalNumBytesKv / numBytesPerTileKv));
   }
 };
 
@@ -442,7 +570,7 @@ struct MmaTraits {
   template <typename FmhaOptions_>
   MmaTraits(FmhaOptions_ const& options)
     : mDtypeBmm1{options.mDtypeQ}
-    , mDtypeBmm2(options.mDtypeK != options.mDtypeQ ? options.mDtypeQ : options.mDtypeV) {
+    , mDtypeBmm2{getDtypeBmm2(options)} {
 
     // Whether to use 2-CTA mode for UTCMMA.
     mUseUtcmma2CtaMode = options.mClusterDimX == 2;
@@ -475,6 +603,12 @@ struct MmaTraits {
     // The Atom Mma for Q * K^T.
     mAtomQkM = options.mSwapsMmaAb ? options.mTileSizeKv : options.mTileSizeQ;
     mAtomQkN = options.mSwapsMmaAb ? options.mTileSizeQ : options.mTileSizeKv;
+#ifdef TLLM_RUBIN_FEATURES
+    // For QMMAs with K=64, the M dimension must be 128 for 1cta mode and 256 for 2cta mode.
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkM == 128) {
+      mAtomQkK = isMma8BitBmm1 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       mAtomQkK = isMma8BitBmm1 ? 32 : 16;
     }
@@ -505,8 +639,11 @@ struct MmaTraits {
     mAtomPvM = options.mSwapsMmaAb ? std::min(128, paddedHeadDimV) : options.mTileSizeQ;
     // Keep BMM2's MMA width on the logical V width when keep-AB is used. SMEM can still be padded
     // independently through mPaddedHeadDimV for shared K/V storage alignment.
-    auto headDimPvN = options.mHeadDimPerStageKv != 0 ? headDimPerStageKv * options.mClusterDimX
-                                                      : options.mHeadDimV;
+    // headDimPerStageKv is the SMEM/TMEM staging width (e.g. 128 for Blackwell context MLA) and
+    // may exceed headDimV (e.g. Mistral 128/64). BMM2-N must stay on the logical V width.
+    auto headDimPvN = options.mHeadDimPerStageKv != 0
+                        ? std::min(headDimPerStageKv, options.mHeadDimV) * options.mClusterDimX
+                        : options.mHeadDimV;
     // AtomPvN is limited to 256 (UTCMMA-N).
     mAtomPvN = options.mSwapsMmaAb ? options.mTileSizeQ : std::min(headDimPvN, 256);
 
@@ -523,6 +660,11 @@ struct MmaTraits {
     }
 
     // The K dimension.
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomPvM == 128) {
+      mAtomPvK = isMma8BitBmm2 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       mAtomPvK = isMma8BitBmm2 ? 32 : 16;
     }
@@ -572,6 +714,8 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
   // dedicated columns (mSeparateTmemColsForSAndP false) to avoid data races. orderedSequence syncs
   // LDTM/STTM across instances.
   bool mInterleavesTmemSAndP;
+  // Whether 2-CTA causal spec decoding handles multiple Q tokens in one CTA cluster.
+  bool hasMultiTokensInTwoCta{false};
   // The reshape factor for K/V TMA box width to be a multiple of 128B.
   int32_t mReshapeFactorKv;
   // The reshape factor for K/V scaling factor TMA box width.
@@ -624,8 +768,13 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
   bool mStoreTransformedKvInTmem;
   // Whether to store the softmax local in shared memory (true: SMEM, false: TMEM).
   bool mStoresSoftmaxLocalInSmem;
-  // Whether swizzle is needed for K/V.
-  bool mSwizzleKv;
+  // Whether K is transformed before BMM1.
+  bool mTransformsK;
+  // Whether V is transformed before BMM2.
+  bool mTransformsV;
+  // Whether swizzle is needed for K and V.
+  bool mSwizzleK;
+  bool mSwizzleV;
 
   // The default constructor.
   KernelTraits()
@@ -638,8 +787,21 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     : KernelConfig(options)
     , MmaTraits(options) {
 
-    // The tile size for the correction step.
-    mCorrTileSize = std::min(mValidTilePvN, 64);
+    // Whether 2-CTA causal spec decoding handles multiple Q tokens in one CTA cluster.
+    hasMultiTokensInTwoCta =
+      mUseUtcmma2CtaMode && mTileSizeQ == 128 && mIsCausalSpecDecodingGen && mSingleTokenQPerCta;
+
+    mTransformsK = mDtypeBmm1 != mDtypeK;
+    mTransformsV = mDtypeBmm2 != mDtypeV;
+
+    if (mTransformsK && !mTransformsV) {
+      // K-only transform stores transformed K for BMM1 while BMM2 consumes raw V. Keep separate
+      // K/V SMEM views because the two operands no longer share the same element type/layout.
+      mSeparateSmemKv = true;
+    }
+
+    // Use the largest power-of-two tile up to 64 that exactly divides the correction width.
+    mCorrTileSize = std::gcd(mValidTilePvN, 64);
 
     // The number of keys per tile.
     mNumKeysPerTile = std::min(mNumTokensPerPage, mTileSizeKv);
@@ -672,6 +834,13 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     // Make sure the two MMAs consume the same K width in bits.
     int32_t bmm1KBits = mAtomQkK * tg::dtypeGetNumBits(mDtypeBmm1);
     int32_t bmm2KBits = mAtomPvK * tg::dtypeGetNumBits(mDtypeBmm2);
+#ifdef TLLM_RUBIN_FEATURES
+    // For Rubin, the K dimension of BMM1 and BMM2 can be different.
+    if (tg::isArchRubin(options.mCudaArch)) {
+      TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits || (mAtomQkK == 64 || mAtomPvK == 64),
+                       "BMM1-K and BMM2-K must have equal K width in bits or one of them is 64.");
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       // For other architectures, the K width in bits of BMM1 and BMM2 must be the same.
       TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits,
@@ -714,6 +883,11 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The HW is designed to have NumEltsIn128B elements consumed by 4 UTC?Mmas in the K
     // dimension.
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkK == 64) {
+      TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 2, "Internal error");
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 4, "Internal error");
     }
@@ -728,6 +902,15 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The number of transform stages for SmemTransformedKv.
     mNumSmemTransformStages = 2;
+    if (isBf16QFp8KvGeneration(options)) {
+      // BF16Q+FP8KV transform kernels use one conversion chunk so the SMEM budget goes to raw KV
+      // stages that overlap the E4M3->BF16 conversion.
+      mNumSmemTransformStages = 1;
+    }
+    if (options.mSeparateTransformedKv) {
+      // Separate transformed K/V is about producer/consumer ordering, not deeper buffering.
+      mNumStagesTransformedKv = 1;
+    }
 
     // Note: mInterleaveSfV and mUsesSharedPagedKvIdx are inherited from KernelConfigBase.
 
@@ -876,14 +1059,14 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
       mNumEltsPerSmemStageKv = ceilDiv(mNumEltsPerSmemStageKv, 1024) * 1024;
     }
 
-    // Do we have to transform K/V before MMA?
-    bool const transformsKv{mDtypeK != mDtypeQ};
     // Whether swizzle is needed for K/V.
-    mSwizzleKv = mStoreTransformedKvInTmem ? true : !transformsKv;
+    mSwizzleK = mStoreTransformedKvInTmem ? true : !mTransformsK;
+    mSwizzleV = mStoreTransformedKvInTmem ? true : !mTransformsV;
 
-    // Whether we can reshape the TMA box width.
-    bool canReshapeTmaKv = mSupportsPagedKv && mHeadDimQk == mHeadDimV && !mSwizzleKv;
-    // The reshape factor for K/V TMA box width:
+    // Whether this kernel may reshape the TMA box width. The actual runtime factor can be lowered
+    // to 1 by descriptor setup when the K/V strides do not make adjacent tokens contiguous.
+    bool canReshapeTmaKv = mSupportsPagedKv && mHeadDimQk == mHeadDimV && !mSwizzleK && !mSwizzleV;
+    // The maximum reshape factor for K/V TMA box width:
     //  - Aim for box width 128B.
     //  - But the box width must also be <= 128 elts for CU_TENSOR_MAP_SWIZZLE_128B.
     mReshapeFactorKv = canReshapeTmaKv

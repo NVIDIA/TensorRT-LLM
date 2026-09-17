@@ -26,7 +26,7 @@ using namespace tensorrt_llm::common;
 TEST(LoggerModuleTest, FormatModuleNoTrailingSpaces)
 {
     for (auto const* raw : {"batch_manager", "common", "cutlass_extensions", "deep_ep", "deep_gemm", "executor",
-             "executor_worker", "flash_mla", "kernels", "layers", "nanobind", "plugins", "runtime", "testing", "thop"})
+             "flash_mla", "kernels", "layers", "nanobind", "runtime", "testing", "thop"})
     {
         auto const fmt = formatModule(raw);
         EXPECT_FALSE(fmt.empty());
@@ -40,7 +40,7 @@ TEST(LoggerModuleTest, ExtractModuleMatchesEnvKey)
     EXPECT_EQ(Logger::extractModule("/code/tensorrt_llm/batch_manager/s.cpp"), "batchmgr");
     EXPECT_EQ(Logger::extractModule("/code/tensorrt_llm/common/logger.h"), "common");
     EXPECT_EQ(Logger::extractModule("/code/tensorrt_llm/thop/alloc.cpp"), "thop");
-    EXPECT_EQ(Logger::extractModule("/random/path/foo.cpp"), "  others");
+    EXPECT_EQ(Logger::extractModule("/random/path/foo.cpp"), "others");
 }
 
 TEST(LoggerModuleTest, PerModuleFilterGainControl)

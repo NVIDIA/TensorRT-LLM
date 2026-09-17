@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,13 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Rule contract and shared data types for CBTS."""
+"""Rule contracts and shared decision utilities for CBTS."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+def format_reason(reason: object) -> str:
+    """Render a structured decision reason as one human line."""
+    if not isinstance(reason, dict):
+        return str(reason)
+    if reason.get("source") == "fallback" and reason.get("reason") == "unhandled_files":
+        files = reason.get("files")
+        count = len(files) if isinstance(files, list) else "?"
+        parts = []
+        if coverage_declined := reason.get("coverage_declined"):
+            parts.append(f"[tier2] {coverage_declined}")
+        parts.append(
+            f"[tier1] residual_files={count} "
+            f"(not claimed by static rules; not necessarily coverage failures): {files}"
+        )
+        return " | ".join(parts)
+    source = reason.get("source", "?")
+    rest = ", ".join(f"{key}={value}" for key, value in reason.items() if key != "source")
+    return f"[{source}] {rest}" if rest else f"[{source}]"
 
 
 @dataclass

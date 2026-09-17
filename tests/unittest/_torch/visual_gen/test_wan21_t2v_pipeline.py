@@ -33,13 +33,13 @@ import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import (
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
+from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -94,10 +94,8 @@ def _load_trtllm_pipeline(checkpoint_path: str):
     if not os.path.exists(checkpoint_path):
         pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
-        checkpoint_path=checkpoint_path,
-        device="cuda",
-        dtype="bfloat16",
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     return PipelineLoader(args).load(skip_warmup=True)
 
@@ -292,10 +290,8 @@ class TestWanBatchGeneration:
             pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH_WAN21_1_3B.")
 
         args = VisualGenArgs(
-            checkpoint_path=WAN21_1_3B_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            model=WAN21_1_3B_PATH,
+            torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         yield pipeline
@@ -354,13 +350,11 @@ class TestWan21T2VCombinedOptimizations:
         if not os.path.exists(WAN21_1_3B_PATH):
             pytest.skip(f"Checkpoint not found: {WAN21_1_3B_PATH}")
         args = VisualGenArgs(
-            checkpoint_path=WAN21_1_3B_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            model=WAN21_1_3B_PATH,
+            torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            attention=AttentionConfig(backend="TRTLLM"),
-            cache=TeaCacheConfig(teacache_thresh=0.2),
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            cache_config=TeaCacheConfig(teacache_thresh=0.2),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
@@ -393,22 +387,25 @@ class TestWan21T2VCombinedOptimizations:
 # Quantization / dtype feature tests (transformer only, module-scoped fixtures)
 # =============================================================================
 
-_SKIP_AUX = ["text_encoder", "vae", "tokenizer", "scheduler"]
+
+_SKIP_AUX = [
+    PipelineComponent.TEXT_ENCODER,
+    PipelineComponent.VAE,
+    PipelineComponent.TOKENIZER,
+    PipelineComponent.SCHEDULER,
+]
 
 
 def _make_wan21_t2v(quant_config=None):
     if not os.path.exists(WAN21_1_3B_PATH):
         pytest.skip(f"Checkpoint not found: {WAN21_1_3B_PATH}")
     kwargs = dict(
-        checkpoint_path=WAN21_1_3B_PATH,
-        device="cuda",
-        dtype="bfloat16",
-        skip_components=_SKIP_AUX,
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        model=WAN21_1_3B_PATH,
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
-    return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True)
+    return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True, skip_components=_SKIP_AUX)
 
 
 @pytest.fixture(scope="module")
@@ -439,6 +436,15 @@ def wan21_t2v_fp8_block():
 
 
 @pytest.fixture(scope="module")
+def wan21_t2v_fp8_rowwise():
+    pipeline = _make_wan21_t2v({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True})
+    yield pipeline
+    del pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
 def wan21_t2v_nvfp4():
     pipeline = _make_wan21_t2v({"quant_algo": "NVFP4", "dynamic": True})
     yield pipeline
@@ -451,7 +457,9 @@ def _transformer_inputs(device: str = "cuda"):
     torch.manual_seed(42)
     return (
         torch.randn(1, 16, 1, 64, 64, dtype=torch.bfloat16, device=device),
-        torch.tensor([500], dtype=torch.long, device=device),
+        # Normalized timestep in [0, 1]; WanTransformer3DModel rescales to the
+        # scheduler's 1000-step range internally.
+        torch.tensor([0.5], dtype=torch.float32, device=device),
         torch.randn(1, 128, 4096, dtype=torch.bfloat16, device=device),
     )
 
@@ -590,13 +598,24 @@ class TestWan21T2VPipelineFeatures:
         [
             ("FP8", "wan21_t2v_fp8"),
             ("FP8_BLOCK_SCALES", "wan21_t2v_fp8_block"),
+            ("FP8_PER_CHANNEL_PER_TOKEN", "wan21_t2v_fp8_rowwise"),
         ],
     )
     def test_fp8_e2e_accuracy(
-        self, wan21_t2v_bf16, wan21_t2v_fp8, wan21_t2v_fp8_block, quant_name, pipe_fixture
+        self,
+        wan21_t2v_bf16,
+        wan21_t2v_fp8,
+        wan21_t2v_fp8_block,
+        wan21_t2v_fp8_rowwise,
+        quant_name,
+        pipe_fixture,
     ):
-        """FP8/FP8_BLOCK_SCALES full-transformer output close to BF16 (cos_sim > 0.99)."""
-        quant_pipeline = wan21_t2v_fp8 if pipe_fixture == "wan21_t2v_fp8" else wan21_t2v_fp8_block
+        """FP8/FP8_BLOCK_SCALES/FP8_PER_CHANNEL_PER_TOKEN full-transformer output close to BF16 (cos_sim > 0.99)."""
+        quant_pipeline = {
+            "wan21_t2v_fp8": wan21_t2v_fp8,
+            "wan21_t2v_fp8_block": wan21_t2v_fp8_block,
+            "wan21_t2v_fp8_rowwise": wan21_t2v_fp8_rowwise,
+        }[pipe_fixture]
         hs, ts, enc = _transformer_inputs()
 
         with torch.no_grad():

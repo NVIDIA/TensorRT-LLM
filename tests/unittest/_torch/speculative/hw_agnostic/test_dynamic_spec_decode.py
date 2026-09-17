@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from unittest.mock import Mock, patch
 
@@ -8,8 +6,6 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 @pytest.fixture(scope="function")
@@ -56,7 +52,6 @@ def test_dynamic_draft_len(enforce_single_worker):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=4,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=True,
         draft_len_schedule={
             1: 4
         },  # It doesn't matter which value is used here, as the draft length will be controlled by the mock function.

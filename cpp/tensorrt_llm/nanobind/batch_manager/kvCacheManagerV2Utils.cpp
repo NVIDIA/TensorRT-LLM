@@ -77,7 +77,11 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def("add_new_sequence", &IndexMapper::addNewSequence)
         .def("get_index", &IndexMapper::getIndex)
         .def("remove_sequence", &IndexMapper::removeSequence)
-        .def("get_copy_index", &IndexMapper::getCopyIndex);
+        .def("get_copy_index", &IndexMapper::getCopyIndex)
+        .def("gather_k_block_offsets", &IndexMapper::gatherKBlockOffsets, nb::arg("source"), nb::arg("destination"),
+            nb::arg("request_ids"), nb::arg("num_blocks"))
+        .def("size", &IndexMapper::size)
+        .def("num_free_slots", &IndexMapper::numFreeSlots);
 
     // Bind copy functions
     module.def(

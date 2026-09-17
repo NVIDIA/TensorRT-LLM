@@ -102,6 +102,8 @@ def run(
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
     use_cupti: bool = True,
+    split_k: int = 1,
+    swap_ab: bool = False,
     **kwargs,
 ):
     """Execute a persistent batched dense blockscaled GEMM operation on Blackwell architecture.
@@ -148,6 +150,10 @@ def run(
         raise ValueError(f"k ({k}) must be divisible by expert_count ({expert_count})")
     weight_per_expert = k // expert_count
 
+    # SwapAB: output must be M-major (col-major) to maintain functional equivalence
+    if swap_ab:
+        c_major = "m"
+
     print("Running Sm100 Persistent Dense BlockScaled GEMM test with:")
     print(f"mnkl: {mnkl}")
     print(f"AB dtype: {ab_dtype}, SF dtype: {sf_dtype}, SF Vec size: {sf_vec_size}")
@@ -164,6 +170,8 @@ def run(
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
     print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
+    print(f"Split-K: {split_k}")
+    print(f"Swap AB: {swap_ab}")
 
     # Skip unsupported testcase
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
@@ -310,22 +318,21 @@ def run(
     # Additional Alpha scale tensor
     def create_alpha_scale_tensor(l, m, n, expert_count, dtype):  # noqa: E741
         ### if not swapAB
-        # True means alpha_scale is expert_count major.
+        # True means alpha_scale is token (m) major for coalesced global memory access.
         alpha_scale_ref = cutlass_torch.matrix(
             l,
             m,
             expert_count,
-            False,  # expert_count is major
+            True,  # m (token) is major
             cutlass.Float32,
             # Debug alpha scale data
             # init_type=cutlass_torch.TensorInitType.SCALAR,
             # init_config=cutlass_torch.ScalarInitConfig(value=1),
         )
-        # currently we assume alpha_scale is n major, which means token major and 4B aligned, should be 4B aligned.
+        # alpha_scale is token major and 4B aligned.
         alpha_scale_tensor, alpha_scale_torch = cutlass_torch.cute_tensor_like(
             alpha_scale_ref, cutlass.Float32, is_dynamic_layout=True, assumed_align=4
         )
-        # print(f"alpha_scale_ref: {alpha_scale_ref.shape}")
         # reshape makes memory contiguous for reference check.
         alpha_scale_ref = (
             alpha_scale_ref.permute(2, 0, 1)
@@ -337,8 +344,11 @@ def run(
 
         return alpha_scale_ref, alpha_scale_tensor, alpha_scale_torch
 
+    # Alpha scale: (token_dim, expert_count, L).
+    # Standard: token_dim = M. SwapAB: token_dim = N (tokens are the N dimension).
+    alpha_token_dim = n if swap_ab else m
     alpha_scale_ref, alpha_scale_tensor, alpha_scale_torch = create_alpha_scale_tensor(
-        l, m, n, expert_count, cutlass.Float32
+        l, alpha_token_dim, n, expert_count, cutlass.Float32
     )
 
     # Configure gemm kernel
@@ -350,7 +360,13 @@ def run(
         weight_per_expert,
         use_prefetch,
         prefetch_dist,
+        split_k,
+        swap_ab,
     )
+
+    # For split-K > 1: zero-initialize C (kernel uses atomic add for reduction)
+    if split_k > 1:
+        c_torch.zero_()
 
     # Compute max active clusters on current device
     hardware_info = cutlass.utils.HardwareInfo()
@@ -389,8 +405,12 @@ def run(
         print("Verifying results...")
         res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
         res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
-        # Final reference result is the product of res_a, res_b and alpha_scale_ref.
-        ref = torch.einsum("mkl,nkl,mkl->mnl", res_a, res_b, alpha_scale_ref)
+        if swap_ab:
+            # SwapAB: alpha indexed by N (token dim), broadcast along M
+            ref = torch.einsum("mkl,nkl,nkl->mnl", res_a, res_b, alpha_scale_ref)
+        else:
+            # Standard: alpha indexed by M (token dim), broadcast along N
+            ref = torch.einsum("mkl,nkl,mkl->mnl", res_a, res_b, alpha_scale_ref)
 
         # Convert c back to f32 for comparison.
         c_ref_device = c_ref.cuda()
@@ -438,9 +458,12 @@ def run(
         b_tensor, _ = cutlass_torch.cute_tensor_like(
             b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
-        c_tensor, _ = cutlass_torch.cute_tensor_like(
+        c_tensor, c_torch_gen = cutlass_torch.cute_tensor_like(
             c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
         )
+        # Zero-init C for split-K (atomic adds accumulate onto initial values)
+        if split_k > 1:
+            c_torch_gen.zero_()
 
         # Mark tensor to be byte aligned
         a_tensor.mark_compact_shape_dynamic(
@@ -461,7 +484,9 @@ def run(
 
         _, sfa_tensor, _ = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
         _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
-        _, alpha_scale_tensor, _ = create_alpha_scale_tensor(l, m, n, expert_count, cutlass.Float32)
+        _, alpha_scale_tensor, _ = create_alpha_scale_tensor(
+            l, alpha_token_dim, n, expert_count, cutlass.Float32
+        )
         return cute.testing.JitArguments(
             a_tensor,
             b_tensor,
@@ -575,6 +600,18 @@ if __name__ == "__main__":
         default=True,
         help="Use CUPTI for profiling (default: True)",
     )
+    parser.add_argument(
+        "--split_k",
+        type=int,
+        default=1,
+        help="Split-K factor (default: 1)",
+    )
+    parser.add_argument(
+        "--swap_ab",
+        action="store_true",
+        default=False,
+        help="Swap A/B roles: A=weight, B=activation (default: False)",
+    )
     args = parser.parse_args()
 
     if len(args.mnkl) != 4:
@@ -606,6 +643,8 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
         args.use_cupti,
+        args.split_k,
+        args.swap_ab,
     )
     print(f"Execution time: {exec_time:.2f} us")
     print("PASS")

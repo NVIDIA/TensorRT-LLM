@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,12 +25,11 @@
 #else
 #include "allreduce_gemm_runner.h"
 #endif
-#include "common.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include <NvInferRuntime.h>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -53,8 +52,59 @@
 #include "cutlass/util/reference/host/gett.hpp"
 #include "cutlass/util/reference/host/tensor_fill.h"
 
+namespace tensorrt_llm::testing
+{
+
+/**
+ * GPU timer for recording the elapsed time across kernel(s) launched in GPU stream
+ */
+struct GpuTimer
+{
+    cudaStream_t _stream_id;
+    cudaEvent_t _start;
+    cudaEvent_t _stop;
+
+    /// Constructor
+    GpuTimer()
+        : _stream_id(0)
+    {
+        TLLM_CUDA_CHECK(cudaEventCreate(&_start));
+        TLLM_CUDA_CHECK(cudaEventCreate(&_stop));
+    }
+
+    /// Destructor
+    ~GpuTimer()
+    {
+        TLLM_CUDA_CHECK(cudaEventDestroy(_start));
+        TLLM_CUDA_CHECK(cudaEventDestroy(_stop));
+    }
+
+    /// Start the timer for a given stream (defaults to the default stream)
+    void start(cudaStream_t stream_id = 0)
+    {
+        _stream_id = stream_id;
+        TLLM_CUDA_CHECK(cudaEventRecord(_start, _stream_id));
+    }
+
+    /// Stop the timer
+    void stop()
+    {
+        TLLM_CUDA_CHECK(cudaEventRecord(_stop, _stream_id));
+    }
+
+    /// Return the elapsed time (in milliseconds)
+    float elapsed_millis()
+    {
+        float elapsed = 0.0;
+        TLLM_CUDA_CHECK(cudaEventSynchronize(_stop));
+        TLLM_CUDA_CHECK(cudaEventElapsedTime(&elapsed, _start, _stop));
+        return elapsed;
+    }
+};
+
+} // namespace tensorrt_llm::testing
+
 using namespace cutlass;
-using namespace nvinfer1;
 using namespace tensorrt_llm::mpi;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::common;
@@ -238,7 +288,7 @@ struct ToType
 template <>
 struct ToType<cutlass::bfloat16_t>
 {
-    nvinfer1::DataType trt_value = nvinfer1::DataType::kBF16;
+    tensorrt_llm::DataType trt_value = tensorrt_llm::DataType::kBF16;
     ncclDataType_t nccl_value = ncclBfloat16;
     char const* str_value = "bf16";
 };
@@ -246,7 +296,7 @@ struct ToType<cutlass::bfloat16_t>
 template <>
 struct ToType<cutlass::half_t>
 {
-    nvinfer1::DataType trt_value = nvinfer1::DataType::kHALF;
+    tensorrt_llm::DataType trt_value = tensorrt_llm::DataType::kHALF;
     ncclDataType_t nccl_value = ncclFloat16;
     char const* str_value = "fp16";
 };
@@ -254,7 +304,7 @@ struct ToType<cutlass::half_t>
 template <>
 struct ToType<cutlass::float_e4m3_t>
 {
-    nvinfer1::DataType trt_value = nvinfer1::DataType::kFP8;
+    tensorrt_llm::DataType trt_value = tensorrt_llm::DataType::kFP8;
     ncclDataType_t nccl_value = ncclFloat8e4m3;
     char const* str_value = "fp8_e4m3";
 };

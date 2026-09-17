@@ -59,15 +59,12 @@ using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using MillisecondsType = std::chrono::milliseconds;
-using CacheSaltIDType = std::uint64_t;
 using LogitsPostProcessor
     = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
 using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&, std::vector<Tensor>&,
     std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&,
     std::vector<std::optional<IdType>> const&)>;
-using MedusaChoices = std::vector<std::vector<SizeType32>>;
-using EagleChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
 using BufferView = std::basic_string_view<uint8_t>;
 

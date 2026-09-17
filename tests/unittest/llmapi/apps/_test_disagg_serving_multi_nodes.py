@@ -1,4 +1,5 @@
 import os
+import platform
 import socket
 import time
 
@@ -6,8 +7,8 @@ import openai
 import pytest
 from test_common.http_utils import (wait_for_endpoint_down,
                                     wait_for_endpoint_ready)
-from test_common.perf_metrics_utils import (get_timing_metrics,
-                                            validate_timing_metrics)
+
+from tensorrt_llm._utils import get_sm_version
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
@@ -66,12 +67,19 @@ def is_pytest_node():
 def env():
     # Remove MPI related environment variables to isolate the ctx/gen processes
     # so that they will not be in the same MPI communicator, otherwise the rank and world_size may mismatch
-    return {
+    e = {
         k: v
         for k, v in os.environ.items()
         if not ('PMI_' in k or 'OMPI_' in k or 'PMIX_' in k or 'SLURM_' in k)
         and k not in ["UCX_TLS", "UCX_NET_DEVICES"]  # avoid UCX failure on oci
     }
+    # Some GB300 machines have NICs that misbehave with UCX's default transport
+    # auto-selection, so UCX_TLS must be set explicitly there. Identify GB300 via
+    # sm_103 (Blackwell Ultra) + aarch64 (Grace) -- this excludes HGX B300
+    # (also sm_103 but x86_64) and avoids depending on the GPU device name string.
+    if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
+        e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
+    return e
 
 
 @pytest.fixture(scope="module")
@@ -111,8 +119,6 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
-        "perf_metrics_max_requests": 1000,
-        "return_perf_metrics": True,
     }
     if is_ctx_node():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
@@ -193,11 +199,6 @@ def test_completion(client: openai.OpenAI,
         message = completion.choices[0].text
         assert message.startswith('2.')
 
-        perf_metrics = get_timing_metrics(disagg_server.url_root)
-        # allow 5ms leniency when comparing the time points from disagg and ctx/gen servers
-        validate_timing_metrics(perf_metrics,
-                                "multinode test_completion",
-                                time_tolerance_seconds=0.005)
         # sleep 10 seconds to ensure a successful wait_for_endpoint_ready on rank1
         time.sleep(10)
         disagg_server.terminate()

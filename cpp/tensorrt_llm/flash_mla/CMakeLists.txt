@@ -44,6 +44,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID
   set(CMAKE_CUDA_HOST_COMPILER ${GCC_EXECUTABLE})
   message(
     STATUS "FlashMLA: Using GCC at ${GCC_EXECUTABLE} for CUDA compilation")
+  # PyTorch's cmake/public/cuda.cmake (loaded transitively by
+  # find_package(Torch)) appends -Xcompiler=-fclang-abi-compat=17 to
+  # CMAKE_CUDA_FLAGS whenever the parent build is configured with Clang>=18 (see
+  # pytorch PR #175233). Since CUDA host compilation here falls back to GCC,
+  # that Clang-only flag would be forwarded to g++ via `nvcc -ccbin=g++` and
+  # abort the build with: g++: error: unrecognized command-line option
+  # '-fclang-abi-compat=17'
+  string(REGEX REPLACE "-Xcompiler=-fclang-abi-compat=[0-9]+" ""
+                       CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 endif()
 
 # Check CUDA version and architecture support
@@ -137,22 +146,34 @@ endforeach()
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
 
-# Define source files matching FlashMLA's setup.py Note: pybind.cpp has runtime
-# checks (arch.is_sm90()), but still references all kernel symbols We compile
-# all sources to avoid undefined symbols at module load time
+# Define source files matching FlashMLA's setup.py api.cpp has runtime checks
+# (arch.is_sm90a()), but still references all kernel symbols. We compile all
+# sources to avoid undefined symbols at module load time.
 set(FLASH_MLA_SOURCES
-    ${FLASH_MLA_SOURCE_DIR}/csrc/pybind.cpp
-    ${FLASH_MLA_SOURCE_DIR}/csrc/smxx/get_mla_metadata.cu
-    ${FLASH_MLA_SOURCE_DIR}/csrc/smxx/mla_combine.cu)
+    ${FLASH_MLA_SOURCE_DIR}/csrc/api/api.cpp
+    ${FLASH_MLA_SOURCE_DIR}/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/smxx/decode/combine/combine.cu)
 
 # Add SM90 sources (always include if CUDA >= 12.3)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
   list(
     APPEND
     FLASH_MLA_SOURCES
-    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/dense/splitkv_mla.cu
-    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/splitkv_mla.cu
-    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu)
+    # SM90 dense decode
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/dense/instantiations/bf16.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/dense/instantiations/fp16.cu
+    # SM90 sparse FP8 decode (MODEL1 + V32 x h64/h128)
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
+    # SM90 sparse prefill
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu
+  )
 endif()
 
 # Add SM100 sources (always include if CUDA >= 12.9)
@@ -160,10 +181,20 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
   list(
     APPEND
     FLASH_MLA_SOURCES
-    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/decode/sparse_fp8/splitkv_mla.cu
+    # SM100 dense prefill
     ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
     ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
-    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu)
+    # SM100 sparse prefill (head64 + head128)
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu
+    # SM100 sparse decode (head64 + small_topk decode)
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
+  )
 endif()
 
 # Disable LTO before creating target (similar to DeepEP) Let CMake generate
@@ -175,9 +206,9 @@ pybind11_add_module(flash_mla_cpp_tllm ${FLASH_MLA_SOURCES})
 set_target_properties(
   flash_mla_cpp_tllm
   PROPERTIES CXX_STANDARD_REQUIRED ON
-             CXX_STANDARD 17
+             CXX_STANDARD 20
              CXX_SCAN_FOR_MODULES OFF
-             CUDA_STANDARD 17
+             CUDA_STANDARD 20
              CUDA_STANDARD_REQUIRED ON
              CUDA_SEPARABLE_COMPILATION ON
              CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -201,7 +232,7 @@ target_compile_options(
   flash_mla_cpp_tllm
   PRIVATE
     ${TORCH_CXX_FLAGS}
-    $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
+    $<$<COMPILE_LANGUAGE:CXX>:-std=c++20>
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:CXX>:-fPIC>
     $<$<COMPILE_LANGUAGE:CXX>:-DNDEBUG>
@@ -209,7 +240,7 @@ target_compile_options(
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-c++11-narrowing>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-lto>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-    $<$<COMPILE_LANGUAGE:CUDA>:-std=c++17>
+    $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>
     $<$<COMPILE_LANGUAGE:CUDA>:-DNDEBUG>
     $<$<COMPILE_LANGUAGE:CUDA>:-D_USE_MATH_DEFINES>
     $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__>
@@ -230,6 +261,7 @@ target_include_directories(
   flash_mla_cpp_tllm
   PRIVATE ${CUDA_INCLUDE_DIRS}
           ${FLASH_MLA_SOURCE_DIR}/csrc
+          ${FLASH_MLA_SOURCE_DIR}/csrc/kerutils/include
           ${FLASH_MLA_SOURCE_DIR}/csrc/sm90
           ${FLASH_MLA_SOURCE_DIR}/csrc/cutlass/include
           ${FLASH_MLA_SOURCE_DIR}/csrc/cutlass/tools/util/include)

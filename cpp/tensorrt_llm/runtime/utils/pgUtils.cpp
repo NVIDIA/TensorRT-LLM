@@ -41,4 +41,10 @@ void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
     pg_local = process_group_local;
 }
 
+void shutdown_pg()
+{
+    pg_world.reset();
+    pg_local.reset();
+}
+
 } // namespace tensorrt_llm::pg_utils

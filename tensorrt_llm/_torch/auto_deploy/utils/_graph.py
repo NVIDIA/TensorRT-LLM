@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Graph-related utilities for transformations."""
 
 import itertools
@@ -343,7 +357,27 @@ def lint(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
+def _restore_topological_order(gm: GraphModule) -> None:
+    """Move nodes after their direct inputs if graph rewrites left them out of order."""
+    while True:
+        node_order = {node: idx for idx, node in enumerate(gm.graph.nodes)}
+        for node in list(gm.graph.nodes):
+            input_nodes = [
+                input_node for input_node in node.all_input_nodes if input_node in node_order
+            ]
+            if not input_nodes:
+                continue
+            latest_input = max(input_nodes, key=node_order.__getitem__)
+            if node_order[node] < node_order[latest_input]:
+                latest_input.append(node)
+                break
+        else:
+            return
+
+
 def _canonicalize_single_gm(gm: GraphModule) -> None:
+    _restore_topological_order(gm)
+
     # clean up graph (needs to be done repeatedly until no more dead code)
     eliminate_dead_code(gm, is_impure_node=_is_impure_node)
 
@@ -553,16 +587,6 @@ def get_input_embeddings(model: nn.Module) -> torch.Tensor:
     return unique_embedding_weights[0]
 
 
-def get_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
-    """Find the unique output node across all graph modules."""
-    output_nodes = []
-    for _, gm in named_graphmodules(model):
-        output_nodes.extend([(gm, node) for node in gm.graph.find_nodes(op="output")])
-
-    assert len(output_nodes) == 1, f"Expected exactly 1 output node, but found {len(output_nodes)}."
-    return output_nodes[0]
-
-
 def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Node:
     if output_node is None:
         output_node = gm.graph.find_nodes(op="output")[0]
@@ -582,12 +606,6 @@ def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Nod
         lm_head_node = lm_head_node.all_input_nodes[0]
 
     return lm_head_node
-
-
-def get_lm_head_weights(model: nn.Module) -> torch.Tensor:
-    gm, output_node = get_output_node(model)
-    lm_head_node = get_lm_head_node(gm, output_node)
-    return get_weight_tensor(lm_head_node)
 
 
 def get_attr_by_name(obj, name):

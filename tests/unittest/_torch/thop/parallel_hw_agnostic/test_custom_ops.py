@@ -1,8 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 import torch._library.utils as library_utils
 
 import tensorrt_llm  # noqa: F401
+
+pytestmark = pytest.mark.cpu_only
 
 
 def discover_namespace_ops(namespace: str, prefix: str = ""):
@@ -64,7 +81,6 @@ def test_register_fake(custom_ops):
         "trtllm::mtp_relaxed_acceptance_op",
         "trtllm::mtp_update_hidden_states_op",
         "trtllm::mtp_prepare_drafter_inputs_op",
-        "trtllm::extract_real_draft_tokens_op",
         "trtllm::selective_scan",
         "trtllm::reducescatter_list",
         "trtllm::reducescatter_list_pg",
@@ -101,8 +117,7 @@ def test_register_fake(custom_ops):
         "trtllm::mxfp8_quantize",
         "trtllm::mamba2_mtp_ssm_cache_update",
         "trtllm::build_dynamic_tree_op",
-        "trtllm::verify_dynamic_tree_greedy_op",
-        "trtllm::verify_dynamic_tree_greedy_out_op",
+        "trtllm::verify_dynamic_tree_greedy_out_packed_op",
     }
 
     ops_missing_fake_impl = []

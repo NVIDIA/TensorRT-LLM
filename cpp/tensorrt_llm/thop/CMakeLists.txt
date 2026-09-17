@@ -31,8 +31,18 @@ endif()
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
-                                      ${CURAND_LIB})
+# Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
+# OptionalArrayRef in the reverse order, relying on C++20's automatic generation
+# of the reversed comparison operator. th_utils/th_common only contain host .cpp
+# sources, so scope the bump to these targets instead of the repo-wide C++17
+# standard.
+set_target_properties(th_utils PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                          ON)
+# Declare the dependency on the main shared library explicitly so consumers
+# (e.g. thUtilsTest) place it after th_utils on the link line; this was
+# previously satisfied transitively via the removed TensorRT plugin target.
+target_link_libraries(th_utils PUBLIC ${SHARED_TARGET} ${TORCH_LIBRARIES}
+                                      ${CUBLAS_LIB} ${CURAND_LIB})
 
 # TODO This does not compile with internal cutlass MOE gemm
 add_library(
@@ -41,16 +51,18 @@ add_library(
   allgatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
+  asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  convertSpecDecodingMaskToPackedMaskOp.cpp
   cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
+  marlinNvfp4MM.cpp
+  marlinNvfp4MoeMM.cpp
+  marlinRepack.cpp
   cudaScaledMM.cpp
-  dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp8PerTensorScalingTrtllmGenGemm.cpp
@@ -65,13 +77,24 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  deepseekV4QNormOp.cpp
+  deepseekV4BlockTableOp.cpp
+  inverseRopeFp8QuantOp.cpp
+  kdaDecodeOp.cpp
+  attnResOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
+  fusedDiTSplitNormOp.cpp
+  ulyssesPostUnscatterOp.cpp
+  ulyssesPermuteScatterOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
+  rmsNormFp4Quant.cpp
   fusedTopkSoftmax.cpp
-  gatherTreeOp.cpp
   groupRmsNormOp.cpp
   helixPostProcessOp.cpp
   llama4MinLatency.cpp
@@ -79,12 +102,15 @@ add_library(
   mambaConv1dOp.cpp
   moeOp.cpp
   moeUtilOp.cpp
+  moeGateOp.cpp
   moeCommOp.cpp
   moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
   moeAlignOp.cpp
+  megaMoePrepareOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
+  mxfp8Gemm.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
@@ -94,14 +120,18 @@ add_library(
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
+  sparseKvCacheCompactOp.cpp
+  minimaxM3Fp8IndexerOp.cpp
+  minimaxM3SelectBlocksOp.cpp
+  mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
-  redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
   customMoeRoutingOp.cpp
+  localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
@@ -117,11 +147,21 @@ add_library(
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  nvfp4MlaKvCacheGatherOp.cpp
+  trtllmGenQKVProcessOp.cpp
+  inplaceSliceCopyOp.cpp
+  mhcOp.cpp
+  compressorOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                           ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
+
+if(BUILD_DEEP_GEMM)
+  target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
+endif()
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common

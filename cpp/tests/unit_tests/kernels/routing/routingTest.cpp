@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "tests/unit_tests/kernels/routing/routingTest.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tensorrt_llm::tests::kernels::routing
 {
@@ -54,25 +55,25 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
     {
         countsSize = 2 * 256;
     }
-    mPtrExpertCountsHost = mBufferManager->pinned(ITensor::makeShape({countsSize}), nvinfer1::DataType::kINT32);
-    mPtrExpertCountsDevice = mBufferManager->gpu(ITensor::makeShape({countsSize}), nvinfer1::DataType::kINT32);
+    mPtrExpertCountsHost = mBufferManager->pinned(ITensor::makeShape({countsSize}), tensorrt_llm::DataType::kINT32);
+    mPtrExpertCountsDevice = mBufferManager->gpu(ITensor::makeShape({countsSize}), tensorrt_llm::DataType::kINT32);
 
     int64_t permIdxSize = 1;
-    mPtrPermutedIdxSizeHost = mBufferManager->pinned(ITensor::makeShape({permIdxSize}), nvinfer1::DataType::kINT32);
-    mPtrPermutedIdxSizeDevice = mBufferManager->gpu(ITensor::makeShape({permIdxSize}), nvinfer1::DataType::kINT32);
+    mPtrPermutedIdxSizeHost = mBufferManager->pinned(ITensor::makeShape({permIdxSize}), tensorrt_llm::DataType::kINT32);
+    mPtrPermutedIdxSizeDevice = mBufferManager->gpu(ITensor::makeShape({permIdxSize}), tensorrt_llm::DataType::kINT32);
 
     int64_t expIdxToPermIdxSize = numTokens * topK;
     mPtrExpandedIdxToPermutedIdxHost
-        = mBufferManager->pinned(ITensor::makeShape({expIdxToPermIdxSize}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({expIdxToPermIdxSize}), tensorrt_llm::DataType::kINT32);
     mPtrExpandedIdxToPermutedIdxDevice
-        = mBufferManager->gpu(ITensor::makeShape({expIdxToPermIdxSize}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({expIdxToPermIdxSize}), tensorrt_llm::DataType::kINT32);
 
     // int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts << paddingLog2) - numExperts);
     int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts * tileTokensDim) - numExperts);
     mPtrPermutedIdxToTokenIdxHost
-        = mBufferManager->pinned(ITensor::makeShape({permIdxToTokenIdxSize}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({permIdxToTokenIdxSize}), tensorrt_llm::DataType::kINT32);
     mPtrPermutedIdxToTokenIdxDevice
-        = mBufferManager->gpu(ITensor::makeShape({permIdxToTokenIdxSize}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({permIdxToTokenIdxSize}), tensorrt_llm::DataType::kINT32);
 
     int64_t expWeightsSize = numTokens * topK;
     mPtrTopKWeightsHost = mBufferManager->pinned(ITensor::makeShape({expWeightsSize}), TRTDataType<T>::value);
@@ -81,8 +82,8 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
     if (useTopKAsInput)
     {
         int64_t topKIdsSize = numTokens * topK;
-        mPtrTopKIdsHost = mBufferManager->pinned(ITensor::makeShape({topKIdsSize}), nvinfer1::DataType::kINT32);
-        mPtrTopKIdsDevice = mBufferManager->gpu(ITensor::makeShape({topKIdsSize}), nvinfer1::DataType::kINT32);
+        mPtrTopKIdsHost = mBufferManager->pinned(ITensor::makeShape({topKIdsSize}), tensorrt_llm::DataType::kINT32);
+        mPtrTopKIdsDevice = mBufferManager->gpu(ITensor::makeShape({topKIdsSize}), tensorrt_llm::DataType::kINT32);
     }
     else
     {
@@ -91,23 +92,26 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
     }
 
     int64_t ctaIdxSize = numTokens * topK;
-    mPtrCtaIdxXyToBatchIdxHost = mBufferManager->pinned(ITensor::makeShape({ctaIdxSize}), nvinfer1::DataType::kINT32);
-    mPtrCtaIdxXyToBatchIdxDevice = mBufferManager->gpu(ITensor::makeShape({ctaIdxSize}), nvinfer1::DataType::kINT32);
+    mPtrCtaIdxXyToBatchIdxHost
+        = mBufferManager->pinned(ITensor::makeShape({ctaIdxSize}), tensorrt_llm::DataType::kINT32);
+    mPtrCtaIdxXyToBatchIdxDevice
+        = mBufferManager->gpu(ITensor::makeShape({ctaIdxSize}), tensorrt_llm::DataType::kINT32);
 
-    mPtrCtaIdxXyToMnLimitHost = mBufferManager->pinned(ITensor::makeShape({ctaIdxSize}), nvinfer1::DataType::kINT32);
-    mPtrCtaIdxXyToMnLimitDevice = mBufferManager->gpu(ITensor::makeShape({ctaIdxSize}), nvinfer1::DataType::kINT32);
+    mPtrCtaIdxXyToMnLimitHost
+        = mBufferManager->pinned(ITensor::makeShape({ctaIdxSize}), tensorrt_llm::DataType::kINT32);
+    mPtrCtaIdxXyToMnLimitDevice = mBufferManager->gpu(ITensor::makeShape({ctaIdxSize}), tensorrt_llm::DataType::kINT32);
 
     int64_t numNonExitingCtasSize = 1;
     mPtrNumNonExitingCtasHost
-        = mBufferManager->pinned(ITensor::makeShape({numNonExitingCtasSize}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({numNonExitingCtasSize}), tensorrt_llm::DataType::kINT32);
     mPtrNumNonExitingCtasDevice
-        = mBufferManager->gpu(ITensor::makeShape({numNonExitingCtasSize}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({numNonExitingCtasSize}), tensorrt_llm::DataType::kINT32);
 
     int64_t idxSize = numTokens * topK * sizeof(PackedType);
-    mPtrTopKPackedHost = mBufferManager->pinned(ITensor::makeShape({idxSize}), nvinfer1::DataType::kINT8);
-    mPtrTopKPackedDevice = mBufferManager->gpu(ITensor::makeShape({idxSize}), nvinfer1::DataType::kINT8);
+    mPtrTopKPackedHost = mBufferManager->pinned(ITensor::makeShape({idxSize}), tensorrt_llm::DataType::kINT8);
+    mPtrTopKPackedDevice = mBufferManager->gpu(ITensor::makeShape({idxSize}), tensorrt_llm::DataType::kINT8);
     mCurandStatesDevice
-        = mBufferManager->gpu(ITensor::makeShape({numTokens, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
+        = mBufferManager->gpu(ITensor::makeShape({numTokens, sizeof(curandState_t)}), tensorrt_llm::DataType::kINT8);
 }
 
 template <typename T>
@@ -127,19 +131,19 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
     PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost));
 
     auto tokenToExpertHost
-        = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), tensorrt_llm::DataType::kINT32);
     auto tokenToExpertHostPtr = bufferCast<int32_t>(*tokenToExpertHost);
 
     auto tokenToIdxInExpertHost
-        = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), tensorrt_llm::DataType::kINT32);
     auto tokenToIdxInExpertHostPtr = bufferCast<int32_t>(*tokenToIdxInExpertHost);
 
     auto expertScanCountsHost
-        = mBufferManager->pinned(ITensor::makeShape({param.numExperts + 1}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({param.numExperts + 1}), tensorrt_llm::DataType::kINT32);
     auto expertScanCountsHostPtr = bufferCast<int32_t>(*expertScanCountsHost);
 
     auto ctaScanCountsHost
-        = mBufferManager->pinned(ITensor::makeShape({param.numExperts + 1}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({param.numExperts + 1}), tensorrt_llm::DataType::kINT32);
     auto ctaScanCountsHostPtr = bufferCast<int32_t>(*ctaScanCountsHost);
 
     for (int ie = 0; ie < param.numExperts + 1; ++ie)
@@ -348,7 +352,7 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
         assertEqual(bufferCast<int32_t>(*mPtrExpertCountsHost), expertCountsPtr, param.numExperts, "expert counts");
         // The second half of mPtrExpertCounts is only filled by the multi-kernel offsets pipeline
         // (routingIndicesOffsetsKernel). It is NOT filled by the coop kernel or cluster kernel.
-        // On SM90+, both the scores path (RoutingCustom.cu) and the post-topK path
+        // On SM90+, both the scores path (RoutingCustomKernels.cuh) and the post-topK path
         // (RoutingFromTopKIds.cu) may use the coop kernel instead of multi-kernel for medium
         // token counts. Skip this check whenever the coop path could have been taken.
         // The coop path requires SM90+ and numExperts <= 1024.
@@ -407,7 +411,7 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     // Retrieve the workspace size of the routing kernel.
     auto const workspaceSize = getDeviceWorkspaceSize(param);
     TensorPtr workspaceDevice
-        = mBufferManager->gpu(ITensor::makeShape({static_cast<int64_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
+        = mBufferManager->gpu(ITensor::makeShape({static_cast<int64_t>(workspaceSize)}), tensorrt_llm::DataType::kINT8);
     // Call tested function routing
     callTestedFunction(param, workspaceDevice);
     // Verify results

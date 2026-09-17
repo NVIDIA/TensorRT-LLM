@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Concise test suite for torch attention backend operations."""
 
 import math
@@ -10,6 +24,7 @@ import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
+@pytest.mark.cpu_only
 @torch.inference_mode()
 def test_gemma4_multimodal_mask_source_op():
     input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
@@ -41,6 +56,7 @@ def test_gemma4_multimodal_mask_source_op():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.cpu_only
 @torch.inference_mode()
 def test_gemma4_prepare_multimodal_mask_chunked_prefill():
     batch_info = BatchInfo()
@@ -76,6 +92,7 @@ def test_gemma4_prepare_multimodal_mask_chunked_prefill():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.cpu_only
 @torch.inference_mode()
 def test_torch_attention_explicit_mask_is_authoritative():
     torch.manual_seed(0)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import subprocess
 import sys
@@ -165,6 +166,17 @@ def get_visual_gen_test_cases() -> list[str]:
     return test_cases
 
 
+def _prompt_from_line(line: str) -> str:
+    """Read one prompt-file line, which is plain text or a JSONL record."""
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return line
+    if isinstance(record, dict):
+        return record.get("text", record.get("prompt", line))
+    return line
+
+
 class VisualGenPerfSanityTestConfig:
     """Configuration and execution state for one VisualGen perf sanity test case."""
 
@@ -177,6 +189,9 @@ class VisualGenPerfSanityTestConfig:
 
         self.config_file, self.select_pattern, self.upload_to_db = parse_test_case_name(
             test_case_name
+        )
+        self.upload_to_db = self.upload_to_db and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
         )
         self.raw_gpu_type, self.gpu_type = get_gpu_types()
         self.config_dir = get_config_dir()
@@ -196,9 +211,7 @@ class VisualGenPerfSanityTestConfig:
         hardware = config.get("hardware", {})
         self.environment = config.get("environment", {})
         self.default_model_name = str(metadata.get("model_name", ""))
-        shared_extra_visual_gen_options_path = str(
-            config.get("extra_visual_gen_options_path", "") or ""
-        )
+        shared_visual_gen_args_path = str(config.get("visual_gen_args_path", "") or "")
 
         if not self.default_model_name:
             raise ValueError(f"metadata.model_name is required in {config_path}")
@@ -232,21 +245,19 @@ class VisualGenPerfSanityTestConfig:
 
             model_name = str(server_config_data.get("model_name") or self.default_model_name)
             model_path = str(server_config_data.get("model_path") or model_name)
-            extra_visual_gen_options_path = str(
-                server_config_data.get("extra_visual_gen_options_path")
-                or shared_extra_visual_gen_options_path
-                or ""
+            visual_gen_args_path = str(
+                server_config_data.get("visual_gen_args_path") or shared_visual_gen_args_path or ""
             )
             inline_server_config = server_config_data.get("server_config") or {}
-            server_config, resolved_extra_visual_gen_options_path = self._load_server_config(
-                extra_visual_gen_options_path, inline_server_config
+            server_config, resolved_visual_gen_args_path = self._load_server_config(
+                visual_gen_args_path, inline_server_config
             )
             server_config = self._resolve_server_config_paths(server_config)
             client_configs = server_config_data.get("client_configs") or []
 
-            if not server_config and not extra_visual_gen_options_path:
+            if not server_config and not visual_gen_args_path:
                 raise ValueError(
-                    "server_config or extra_visual_gen_options_path is required in "
+                    "server_config or visual_gen_args_path is required in "
                     f"{config_path} for {server_name}"
                 )
             if not client_configs:
@@ -257,7 +268,7 @@ class VisualGenPerfSanityTestConfig:
             if gpus_per_node != expected_num_gpus:
                 raise ValueError(
                     "hardware.gpus_per_node must match the GPU count derived from "
-                    f"server_config.parallel: got {gpus_per_node} vs {expected_num_gpus} "
+                    f"server_config.parallel_config: got {gpus_per_node} vs {expected_num_gpus} "
                     f"for {server_name}"
                 )
 
@@ -269,8 +280,8 @@ class VisualGenPerfSanityTestConfig:
                     "server_config": server_config,
                     "client_configs": client_configs,
                     "expected_num_gpus": expected_num_gpus,
-                    "extra_visual_gen_options_path": extra_visual_gen_options_path,
-                    "resolved_extra_visual_gen_options_path": resolved_extra_visual_gen_options_path,
+                    "visual_gen_args_path": visual_gen_args_path,
+                    "resolved_visual_gen_args_path": resolved_visual_gen_args_path,
                 }
             )
 
@@ -281,7 +292,7 @@ class VisualGenPerfSanityTestConfig:
 
         self.server_cases = server_cases
 
-    def _resolve_extra_visual_gen_options_path(self, path_value: str) -> str:
+    def _resolve_visual_gen_args_path(self, path_value: str) -> str:
         """Resolve the optional external VisualGen config path."""
         config_path = Path(path_value)
         if not config_path.is_absolute():
@@ -330,35 +341,46 @@ class VisualGenPerfSanityTestConfig:
         )
 
     def _resolve_server_config_paths(self, server_config: dict[str, Any]) -> dict[str, Any]:
-        """Resolve model asset paths embedded in the serve config."""
+        """Resolve model asset paths embedded in the serve config.
+
+        Top-level ``model`` lives on ``VisualGenArgs``; the per-architecture
+        asset paths (``text_encoder_path``, ``spatial_upsampler_path``,
+        ``distilled_lora_path``) live under the nested ``pipeline_config``
+        dict.
+        """
         resolved_config = copy.deepcopy(server_config)
-        for key in (
-            "checkpoint_path",
+        top_level_keys = ("model",)
+        pipeline_keys = (
             "text_encoder_path",
             "spatial_upsampler_path",
             "distilled_lora_path",
-        ):
+        )
+        for key in top_level_keys:
             value = resolved_config.get(key)
             if value:
                 resolved_config[key] = self._resolve_asset_path(str(value))
+        pipeline_config = resolved_config.get("pipeline_config")
+        if isinstance(pipeline_config, dict):
+            for key in pipeline_keys:
+                value = pipeline_config.get(key)
+                if value:
+                    pipeline_config[key] = self._resolve_asset_path(str(value))
         return resolved_config
 
     def _load_server_config(
         self,
-        extra_visual_gen_options_path: str,
+        visual_gen_args_path: str,
         inline_server_config: dict[str, Any],
     ) -> tuple[dict[str, Any], str]:
         """Load and merge the optional external VisualGen config with inline overrides."""
-        if not extra_visual_gen_options_path:
+        if not visual_gen_args_path:
             return inline_server_config, ""
 
-        resolved_path = self._resolve_extra_visual_gen_options_path(extra_visual_gen_options_path)
+        resolved_path = self._resolve_visual_gen_args_path(visual_gen_args_path)
         with open(resolved_path, encoding="utf-8") as f:
             extra_config = yaml.safe_load(f) or {}
         if not isinstance(extra_config, dict):
-            raise ValueError(
-                f"extra_visual_gen_options_path must point to a YAML mapping: {resolved_path}"
-            )
+            raise ValueError(f"visual_gen_args_path must point to a YAML mapping: {resolved_path}")
         return _merge_nested_dicts(extra_config, inline_server_config), resolved_path
 
     def _resolve_model_path(self, model_path: str) -> str:
@@ -366,8 +388,8 @@ class VisualGenPerfSanityTestConfig:
         return self._resolve_asset_path(model_path)
 
     def _write_server_config(self, output_dir: str, server_config: dict[str, Any]) -> str:
-        """Materialize server_config into a temporary extra_visual_gen_options YAML."""
-        config_path = Path(output_dir) / "extra_visual_gen_options.yaml"
+        """Materialize server_config into a temporary visual_gen_args YAML."""
+        config_path = Path(output_dir) / "visual_gen_args.yaml"
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(server_config, f, default_flow_style=False, sort_keys=False)
         return str(config_path)
@@ -384,7 +406,7 @@ class VisualGenPerfSanityTestConfig:
         return [
             "trtllm-serve",
             model_path,
-            "--extra_visual_gen_options",
+            "--visual_gen_args",
             server_config_path,
             "--host",
             host,
@@ -415,6 +437,7 @@ class VisualGenPerfSanityTestConfig:
         server_config_path: str,
         result_dir: str,
         result_filename: str,
+        expected_num_gpus: int,
     ) -> list[str]:
         """Build the benchmark_visual_gen.py command for one client scenario."""
         command = [
@@ -425,12 +448,13 @@ class VisualGenPerfSanityTestConfig:
             model_path,
             "--backend",
             str(client_config["backend"]),
+            # Keeps the media off the wire, so a gated series is not part transfer.
+            "--response-format",
+            "path",
             "--host",
             host,
             "--port",
             str(port),
-            "--extra-visual-gen-options",
-            server_config_path,
             "--save-result",
             "--result-dir",
             result_dir,
@@ -439,45 +463,23 @@ class VisualGenPerfSanityTestConfig:
             "--disable-tqdm",
         ]
 
-        prompt_file = client_config.get("prompt_file")
-        if prompt_file is not None:
-            prompt_file_path = Path(prompt_file)
-            if not prompt_file_path.is_absolute():
-                prompt_file_path = Path(get_llm_root()) / prompt_file_path
-            command.extend(["--prompt-file", str(prompt_file_path)])
-        else:
-            prompt = client_config.get("prompt")
-            if not prompt:
-                raise ValueError(
-                    f"client_configs entry in {self.config_file} requires prompt or prompt_file"
-                )
-            command.extend(["--prompt", str(prompt)])
+        command.extend(["--num-gpus", str(expected_num_gpus)])
+        command.extend(["--workload", self._write_workload_document(client_config, result_dir)])
 
         optional_arg_map = {
-            "num_prompts": "--num-prompts",
-            "size": "--size",
-            "num_frames": "--num-frames",
-            "fps": "--fps",
-            "num_inference_steps": "--num-inference-steps",
-            "seed": "--seed",
+            "num_prompts": "--num-requests",
             "max_concurrency": "--max-concurrency",
             "request_rate": "--request-rate",
             "burstiness": "--burstiness",
             "request_timeout": "--request-timeout",
-            "guidance_scale": "--guidance-scale",
-            "negative_prompt": "--negative-prompt",
+            "poll_interval": "--poll-interval",
             "metric_percentiles": "--metric-percentiles",
         }
         for key, flag in optional_arg_map.items():
             self._append_optional_arg(command, client_config, key, flag)
 
-        extra_body = client_config.get("extra_body")
-        if extra_body is not None:
-            extra_body_json = extra_body if isinstance(extra_body, str) else json.dumps(extra_body)
-            command.extend(["--extra-body", extra_body_json])
-
-        if client_config.get("save_detailed", False):
-            command.append("--save-detailed")
+        # Keeps the server-phase breakdown and the per-request rows in the artifact.
+        command.append("--save-detailed")
         if client_config.get("no_test_input", False):
             command.append("--no-test-input")
 
@@ -487,6 +489,74 @@ class VisualGenPerfSanityTestConfig:
             command.extend(["--metadata", *metadata_items])
 
         return command
+
+    def _write_workload_document(self, client_config: dict[str, Any], result_dir: str) -> str:
+        """Render one client scenario as a --workload document.
+
+        `size` is WxH; the document carries width and height separately.
+        """
+        params: dict[str, Any] = {}
+        for key in (
+            "num_frames",
+            "fps",
+            "num_inference_steps",
+            "seed",
+            "guidance_scale",
+            "negative_prompt",
+        ):
+            if client_config.get(key) is not None:
+                params["frame_rate" if key == "fps" else key] = client_config[key]
+
+        size = client_config.get("size")
+        if size is not None:
+            width, sep, height = str(size).partition("x")
+            if not (sep and width.isdigit() and height.isdigit()):
+                raise ValueError(
+                    f"client_configs entry in {self.config_file} has size={size!r}; "
+                    "the document carries width and height, so it must be WxH."
+                )
+            params["width"], params["height"] = int(width), int(height)
+
+        extra_body = client_config.get("extra_body")
+        # A reference conditions one generation, so it rides on each request rather
+        # than on common_params, which the loader rejects it from.
+        per_request = {}
+        if extra_body is not None:
+            extra = json.loads(extra_body) if isinstance(extra_body, str) else dict(extra_body)
+            for key in ("image_reference", "video_reference", "audio_reference"):
+                if key in extra:
+                    per_request[key] = extra.pop(key)
+            if extra:
+                params["extra_params"] = {**params.get("extra_params", {}), **extra}
+
+        prompt_file = client_config.get("prompt_file")
+        if prompt_file is not None:
+            prompt_file_path = Path(prompt_file)
+            if not prompt_file_path.is_absolute():
+                prompt_file_path = Path(get_llm_root()) / prompt_file_path
+            prompts = [
+                _prompt_from_line(line)
+                for line in prompt_file_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        else:
+            prompt = client_config.get("prompt")
+            if not prompt:
+                raise ValueError(
+                    f"client_configs entry in {self.config_file} requires prompt or prompt_file"
+                )
+            prompts = [str(prompt)]
+
+        backend = str(client_config["backend"])
+        document = {
+            "backend": backend,
+            "common_params": params,
+            "requests": [{"prompt": p, **per_request} for p in prompts],
+        }
+        path = Path(result_dir) / f"requests_{client_config.get('name', 'default')}.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.safe_dump(document, sort_keys=False))
+        return str(path)
 
     def _validate_benchmark_result(
         self,
@@ -498,18 +568,18 @@ class VisualGenPerfSanityTestConfig:
         result_path: str,
     ) -> None:
         """Validate the saved benchmark JSON before it is used as the source of truth."""
+        is_video = str(result_data.get("backend")) == "openai-videos"
         required_keys = [
             "backend",
             "model",
             "total_requests",
             "completed",
-            "num_gpus",
             "request_throughput",
-            "per_gpu_throughput",
-            "mean_e2e_latency_ms",
-            "median_e2e_latency_ms",
-            "percentiles_e2e_latency_ms",
+            "e2e_latency",
+            "timings",
         ]
+        if is_video:
+            required_keys.append("gen_latency")
         missing_keys = [key for key in required_keys if key not in result_data]
         if missing_keys:
             raise ValueError(f"Missing keys in benchmark result {result_path}: {missing_keys}")
@@ -520,16 +590,17 @@ class VisualGenPerfSanityTestConfig:
                 f"result={result_data['backend']} config={client_config['backend']}"
             )
 
+        recorded_gpus = (result_data.get("config") or {}).get("num_gpus")
+        if recorded_gpus != expected_num_gpus:
+            raise ValueError(
+                f"Benchmark result num_gpus mismatch in {result_path}: "
+                f"result={recorded_gpus} server_config={expected_num_gpus}"
+            )
+
         if str(result_data["model"]) != model_path:
             raise ValueError(
                 f"Benchmark result model mismatch: result={result_data['model']} "
                 f"config={model_path}"
-            )
-
-        if int(result_data["num_gpus"]) != expected_num_gpus:
-            raise ValueError(
-                "Benchmark result GPU count mismatch: "
-                f"result={result_data['num_gpus']} expected={expected_num_gpus}"
             )
 
         total_requests = int(result_data["total_requests"])
@@ -540,12 +611,20 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
-        percentiles = result_data.get("percentiles_e2e_latency_ms", {})
-        for percentile in ("p90", "p99"):
-            if percentile not in percentiles:
-                raise ValueError(
-                    f"Missing {percentile} E2E latency in benchmark result {result_path}"
-                )
+        # The image route has no separate generation series: its whole request is one.
+        series = {"e2e_latency": result_data["e2e_latency"]}
+        if is_video:
+            series["gen_latency"] = result_data["gen_latency"]
+        for name, stats in series.items():
+            for percentile in ("p90", "p99"):
+                if percentile not in stats.get("percentiles", {}):
+                    raise ValueError(
+                        f"Missing {percentile} {name} in benchmark result {result_path}"
+                    )
+            for column in ("mean", "median"):
+                value = float(stats[column])
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"Invalid {column} {name} in benchmark result {result_path}")
 
     def _load_benchmark_result(
         self,
@@ -646,6 +725,7 @@ class VisualGenPerfSanityTestConfig:
                         server_config_path=server_config_path,
                         result_dir=result_dir,
                         result_filename=result_filename,
+                        expected_num_gpus=expected_num_gpus,
                     )
                     print_info(
                         f"Running VisualGen benchmark client for {server_name}: {client_command}"
@@ -657,6 +737,7 @@ class VisualGenPerfSanityTestConfig:
                         stderr=subprocess.STDOUT,
                         text=True,
                         check=False,
+                        timeout=DEFAULT_TIMEOUT,
                     )
                     with open(client_log_path, "w", encoding="utf-8") as client_log:
                         client_log.write(result.stdout)
@@ -722,7 +803,7 @@ class VisualGenPerfSanityTestConfig:
                     server_config=server_case["server_config"],
                     client_config=client_config,
                     result_data=result_data,
-                    extra_visual_gen_options_path=str(server_case["extra_visual_gen_options_path"]),
+                    visual_gen_args_path=str(server_case["visual_gen_args_path"]),
                 )
                 result_idx += 1
 

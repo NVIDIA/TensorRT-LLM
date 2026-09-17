@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,16 @@ namespace kernels
 template <typename InputT, typename OutputT, typename IdxT, bool DoSoftmaxBeforeTopK>
 void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream);
+
+// Gate forward function for custom MoE routing
+// All tensors are expected to be float32 for scores/weights, int32 for indices
+void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)
+    void* bias,                    // nullptr if hash mode
+    void* input_ids,               // nullptr if non-hash mode
+    void* tid2eid,                 // nullptr if non-hash mode
+    void* out_weights,             // [batch_size, topK] - pre-allocated
+    void* out_indices,             // [batch_size, topK] - pre-allocated
+    int batch_size, int n_experts, float route_scale, bool is_hash, cudaStream_t stream);
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

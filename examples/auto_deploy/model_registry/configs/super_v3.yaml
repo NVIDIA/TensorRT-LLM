@@ -53,5 +53,6 @@ transforms:
     backend: flashinfer_ssm
   fuse_nvfp4_moe:
     backend: trtllm_gen
+    enable_trtllm_gen_internal_routing: true
   fuse_fp8_moe:
     allow_different_input_scales: true

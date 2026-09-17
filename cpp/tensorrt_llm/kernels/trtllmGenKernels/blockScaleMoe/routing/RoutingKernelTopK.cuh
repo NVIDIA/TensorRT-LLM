@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -91,14 +91,25 @@ struct TopKRedType
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
         static constexpr bool hasFastRedux = tensorrt_llm::kernels::arch::is_major_v<10>;
-        if constexpr (!hasFastRedux || sizeof(TypeCmp) == 8)
+        if constexpr (!hasFastRedux)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
+        }
+        else if constexpr (sizeof(TypeCmp) == 8)
+        {
+            uint32_t hi = static_cast<uint32_t>(compVal >> 32);
+            uint32_t lo = static_cast<uint32_t>(compVal & 0xffffffffu);
+            uint32_t maxHi;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxHi) : "r"(hi));
+            uint32_t loContrib = (hi == maxHi) ? lo : 0u;
+            uint32_t maxLo;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxLo) : "r"(loContrib));
+            return (static_cast<TypeCmp>(maxHi) << 32) | static_cast<TypeCmp>(maxLo);
         }
         else
         {
             TypeCmp result;
-            asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compVal));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compVal));
             return result;
         }
     }
@@ -120,6 +131,92 @@ struct IsPowerOf2
 {
     static constexpr bool value = (N > 0) && ((N & (N - 1)) == 0);
 };
+
+// Helper to compute the next power of 2 (>= N).
+template <int N>
+struct NextPow2
+{
+private:
+    static constexpr unsigned u = static_cast<unsigned>(N - 1);
+    static constexpr unsigned s1 = u | (u >> 1);
+    static constexpr unsigned s2 = s1 | (s1 >> 2);
+    static constexpr unsigned s3 = s2 | (s2 >> 4);
+    static constexpr unsigned s4 = s3 | (s3 >> 8);
+    static constexpr unsigned s5 = s4 | (s4 >> 16);
+
+public:
+    static constexpr int value = (N <= 1) ? 1 : static_cast<int>(s5 + 1);
+};
+
+template <int A, int B, int Size, typename T>
+__device__ __forceinline__ void topkCompareSwap(T* a)
+{
+    if constexpr (A < Size && B < Size)
+    {
+        if (a[A] < a[B])
+        {
+            T tmp = a[A];
+            a[A] = a[B];
+            a[B] = tmp;
+        }
+    }
+    else
+    {
+        (void) a;
+    }
+}
+
+template <int I, int End, int Step, int PairStride, int Size, typename T>
+__device__ __forceinline__ void topkMergePairs(T* a)
+{
+    if constexpr (I + Step < End)
+    {
+        topkCompareSwap<I, I + Step, Size, T>(a);
+        topkMergePairs<I + PairStride, End, Step, PairStride, Size, T>(a);
+    }
+    else
+    {
+        (void) a;
+    }
+}
+
+template <int Lo, int N, int R, int Size, typename T>
+__device__ __forceinline__ void topkOddEvenMerge(T* a)
+{
+    constexpr int M = R * 2;
+    if constexpr (M < N)
+    {
+        topkOddEvenMerge<Lo, N, M, Size, T>(a);
+        topkOddEvenMerge<Lo + R, N - R, M, Size, T>(a);
+        topkMergePairs<Lo + R, Lo + N, R, M, Size, T>(a);
+    }
+    else if constexpr (R < N)
+    {
+        topkCompareSwap<Lo, Lo + R, Size, T>(a);
+    }
+    else
+    {
+        (void) a;
+    }
+}
+
+// Batcher odd-even mergesort over NextPow2<Size>. Comparators touching the padded
+// tail are dropped at compile time, so non-power-of-two sizes need no runtime padding.
+template <int Lo, int N, int Size, typename T>
+__device__ __forceinline__ void topkSortBatcher(T* a)
+{
+    if constexpr (N > 1)
+    {
+        constexpr int Half = N / 2;
+        topkSortBatcher<Lo, Half, Size, T>(a);
+        topkSortBatcher<Lo + Half, N - Half, Size, T>(a);
+        topkOddEvenMerge<Lo, N, 1, Size, T>(a);
+    }
+    else
+    {
+        (void) a;
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template <int N, typename RedType>
@@ -169,31 +266,8 @@ struct Sort
         }
         else
         {
-// Odd-even transposition sort for non-power-of-2 sizes
-#pragma unroll
-            for (int pass = 0; pass < N; ++pass)
-            {
-#pragma unroll
-                for (int i = 0; i < N - 1; i += 2)
-                {
-                    if (topK[i].compVal < topK[i + 1].compVal)
-                    {
-                        auto tmp = topK[i].compVal;
-                        topK[i].compVal = topK[i + 1].compVal;
-                        topK[i + 1].compVal = tmp;
-                    }
-                }
-#pragma unroll
-                for (int i = 1; i < N - 1; i += 2)
-                {
-                    if (topK[i].compVal < topK[i + 1].compVal)
-                    {
-                        auto tmp = topK[i].compVal;
-                        topK[i].compVal = topK[i + 1].compVal;
-                        topK[i + 1].compVal = tmp;
-                    }
-                }
-            }
+            constexpr int PaddedN = NextPow2<N>::value;
+            topkSortBatcher<0, PaddedN, N, RedType>(topK);
         }
     }
 };
@@ -234,6 +308,99 @@ struct Sort<4, RedType>
         TOPK_SWAP(0, 1);
         TOPK_SWAP(2, 3);
         TOPK_SWAP(1, 2);
+    }
+};
+
+template <typename RedType>
+struct Sort<5, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(2, 3);
+        TOPK_SWAP(1, 4);
+        TOPK_SWAP(0, 3);
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(1, 2);
+    }
+};
+
+template <typename RedType>
+struct Sort<6, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(4, 5);
+        TOPK_SWAP(3, 5);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(0, 3);
+        TOPK_SWAP(1, 4);
+        TOPK_SWAP(2, 5);
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(2, 3);
+    }
+};
+
+template <typename RedType>
+struct Sort<7, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(5, 6);
+        TOPK_SWAP(3, 5);
+        TOPK_SWAP(4, 6);
+        TOPK_SWAP(4, 5);
+        TOPK_SWAP(0, 4);
+        TOPK_SWAP(0, 3);
+        TOPK_SWAP(1, 5);
+        TOPK_SWAP(2, 6);
+        TOPK_SWAP(2, 5);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(2, 3);
+    }
+};
+
+template <typename RedType>
+struct Sort<8, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(2, 3);
+        TOPK_SWAP(4, 5);
+        TOPK_SWAP(6, 7);
+
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(4, 6);
+        TOPK_SWAP(5, 7);
+
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(5, 6);
+
+        TOPK_SWAP(0, 4);
+        TOPK_SWAP(1, 5);
+        TOPK_SWAP(2, 6);
+        TOPK_SWAP(3, 7);
+
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(3, 5);
+
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(5, 6);
     }
 };
 

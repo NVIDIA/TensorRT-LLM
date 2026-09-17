@@ -21,6 +21,9 @@ from .lm_eval import (AIME2025, AIME2026, GSM8K, MMMU, GPQADiamond,
                       GPQAExtended, GPQAMain, LongBenchV1, MMMUPro)
 from .longbench_v2 import LongBenchV2
 from .mmlu import MMLU
+from .nemo_skills_eval import (AALCR, HLE, ArenaHard, GPQANemoSkills, IFBench,
+                               SciCode)
+from .visual_gen.image_generation_eval import ImageGenerationEval
 
 __all__ = [
     "CnnDailymail",
@@ -30,6 +33,7 @@ __all__ = [
     "GPQAMain",
     "GPQAExtended",
     "JsonModeEval",
+    "ImageGenerationEval",
     "MMMU",
     "MMMUPro",
     "CoVoST2",
@@ -38,4 +42,10 @@ __all__ = [
     "AIME2025",
     "AIME2026",
     "AudioASREvaluator",
+    "GPQANemoSkills",
+    "IFBench",
+    "SciCode",
+    "HLE",
+    "AALCR",
+    "ArenaHard",
 ]

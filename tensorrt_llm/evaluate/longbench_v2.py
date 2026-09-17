@@ -24,13 +24,12 @@ import json
 import os
 import re
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional
 
 import click
 from datasets import load_dataset
 
 from .. import LLM as PyTorchLLM
-from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -779,7 +778,7 @@ class LongBenchV2(Evaluator):
                 max_len: int, max_input_length: int, max_output_length: int,
                 chat_template_kwargs: Optional[dict[str, Any]],
                 temperature: float, top_p: float) -> None:
-        llm: Union[LLM, PyTorchLLM] = ctx.obj
+        llm: PyTorchLLM = ctx.obj
 
         sampling_params = SamplingParams(max_tokens=max_output_length,
                                          temperature=temperature,

@@ -154,6 +154,8 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "SlidingOrChunkedCausal";
   case AttentionMaskType::Custom:
     return "Custom";
+  case AttentionMaskType::SlidingWindowCustom:
+    return "SlidingWindowCustom";
   default:
     return "";
   }

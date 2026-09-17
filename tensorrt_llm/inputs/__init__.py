@@ -12,7 +12,8 @@ from .multimodal_data import AudioData, BaseModalityData, VideoData
 # yapf: disable
 from .registry import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+                       InputProcessor, MultimodalEncoderItemMetadata,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, create_input_processor,
                        create_input_processor_with_hash,
                        maybe_compute_mm_embed_cumsum, register_input_processor,
@@ -21,11 +22,11 @@ from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     ALL_SUPPORTED_MULTIMODAL_MODELS, ALL_SUPPORTED_VIDEO_MODELS,
                     ConversationMessage, MultimodalData, MultimodalDataTracker,
                     add_multimodal_placeholders, apply_chat_template,
+                    apply_mm_placeholders, async_build_multimodal_prompt,
                     async_load_audio, async_load_image, async_load_video,
                     convert_image_mode, default_multimodal_input_loader,
                     encode_base64_content_from_url, encode_base64_image,
-                    get_cache_salt_id, load_base64_image_embeds, load_image,
-                    load_video)
+                    load_base64_image_embeds, load_image, load_video)
 
 # yapf: enable
 
@@ -52,6 +53,7 @@ __all__ = [
     "ExtraProcessedInputs",
     "BaseMultimodalDummyInputsBuilder",
     "BaseMultimodalInputProcessor",
+    "MultimodalEncoderItemMetadata",
     "MultimodalPlaceholderMetadata",
     "MultimodalPlaceholderPlacement",
     "ConversationMessage",
@@ -62,6 +64,8 @@ __all__ = [
     "async_load_image",
     "async_load_video",
     "add_multimodal_placeholders",
+    "apply_mm_placeholders",
+    "async_build_multimodal_prompt",
     "apply_chat_template",
     "convert_image_mode",
     "default_multimodal_input_loader",
@@ -69,7 +73,6 @@ __all__ = [
     "encode_base64_image",
     "load_image",
     "load_video",
-    "get_cache_salt_id",
     "compute_retained_tokens_count",
     "compute_retained_tokens_from_tubelet_budget",
     "compute_retention_mask",

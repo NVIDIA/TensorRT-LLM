@@ -1,7 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
-import re
+import math
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -32,17 +47,53 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
+                      NonNegativeInt, PositiveInt, field_validator,
                       model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.sampling_params import (check_logprobs_limit,
+                                          validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.visual_gen.params import MediaRole
+
+_LOGIT_BIAS_MIN = -100.0
+_LOGIT_BIAS_MAX = 100.0
+
+# Beam-search stopping mode as exposed over HTTP, mirroring the HuggingFace
+# Transformers interface. The engine encodes it as an integer, but that encoding
+# is an implementation detail and is kept out of the public schema.
+EarlyStopping: TypeAlias = Union[bool, Literal["never"]]
+
+
+def _early_stopping_to_int(value: Optional[EarlyStopping]) -> Optional[int]:
+    """Translate the HF-style tri-state into the engine's integer encoding.
+
+    Mirrors ``BeamSearchEarlyStop``: ``False`` -> 0, ``True`` -> 1,
+    ``"never"`` -> 2. ``None`` stays unset so the engine picks its default.
+    """
+    if value is None:
+        return None
+    if value == "never":
+        return 2
+    # NB: bool is a subclass of int, so this yields 1/0 for True/False.
+    return int(value)
+
+
+def ensure_request_chat_template_allowed(request: Any,
+                                         allow_request_chat_template: bool):
+    if (getattr(request, "chat_template", None) is not None
+            and not allow_request_chat_template):
+        raise ValueError(
+            "chat_template cannot be supplied per request unless request-level "
+            "chat templates are enabled at server startup.")
 
 
 def _logit_bias_to_embedding_bias(
@@ -57,6 +108,8 @@ def _logit_bias_to_embedding_bias(
             "without one (e.g. num_postprocess_workers > 0). "
             "Remove logit_bias from your request or set num_postprocess_workers=0."
         )
+    elif vocab_size <= 0:
+        raise ValueError("vocab_size must be positive when logit_bias is used")
 
     # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
     embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
@@ -65,18 +118,30 @@ def _logit_bias_to_embedding_bias(
     for token_str, bias in logit_bias.items():
         try:
             token_id = int(token_str)
-            if 0 <= token_id < vocab_size:
-                embedding_bias[token_id] = bias
-            else:
-                raise ValueError(
-                    f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
-                )
         except ValueError as e:
             if "invalid literal" in str(e):
                 raise ValueError(
                     f"Invalid logit_bias key '{token_str}': must be a valid integer token ID"
                 )
             raise
+        if not 0 <= token_id < vocab_size:
+            raise ValueError(
+                f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
+            )
+        try:
+            bias_value = float(bias)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"logit_bias value for token ID {token_id} must be a number"
+            ) from e
+        if not math.isfinite(bias_value):
+            raise ValueError(f"logit_bias value for token ID {token_id} "
+                             "must be finite")
+        if not _LOGIT_BIAS_MIN <= bias_value <= _LOGIT_BIAS_MAX:
+            raise ValueError(
+                f"logit_bias value for token ID {token_id} must be in "
+                f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}]")
+        embedding_bias[token_id] = bias_value
 
     return embedding_bias
 
@@ -114,6 +179,44 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class TokenizeRequest(OpenAIBaseModel):
+    """Request body for the ``POST /_internal/tokenize`` endpoint.
+
+    Asks the server to encode some text into the token-id sequence its
+    loaded tokenizer would produce, without running any generation.
+
+    Only plain-text ``prompt`` tokenization is supported. A ``messages``
+    path was intentionally left out: to be meaningful it must reuse the full
+    ``/v1/chat/completions`` preprocessing (server chat template, tools,
+    documents, template kwargs, model-type resolution, multimodal handling),
+    otherwise the returned token ids would silently diverge from the actual
+    inference prompt. It can be added once that path is shared.
+
+    Fields:
+        model: Target model name. Accepted for compatibility with
+            multi-model routers but ignored -- the server always tokenizes
+            against its own loaded model.
+        prompt: Plain text to tokenize directly via ``tokenizer.encode``.
+    """
+
+    model: Optional[str] = None
+    prompt: str
+
+
+class TokenizeResponse(OpenAIBaseModel):
+    """Response body for the ``POST /_internal/tokenize`` endpoint.
+
+    Fields:
+        count: Number of tokens in the encoded sequence. Always populated;
+            clients needing only the length can ignore ``tokens``.
+        tokens: The encoded token ids. Kept ``Optional`` so future
+            count-only variants can omit it without breaking the schema.
+    """
+
+    count: int
+    tokens: Optional[List[int]] = None
+
+
 class ResponseFormat(OpenAIBaseModel):
     type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
@@ -136,7 +239,45 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
-    conversation_id: Optional[str] = None
+    ctx_usage: Optional[UsageInfo] = None
+    # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
+    # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
+    # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
+    # before routing MM encoder -> context -> generation through OpenAI protocol.
+    # Orchestrator -> context-worker instruction: return prompt_token_ids as a
+    # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
+    return_prompt_token_ids_b64: bool = False
+    # Context worker -> generation worker: the reasoning mode the context
+    # worker read off the prompt it rendered. The generation worker only sees
+    # prompt_token_ids, so it cannot resolve this for itself.
+    resolved_thinking: Optional[bool] = None
+
+
+class ConversationParams(OpenAIBaseModel):
+    model_config = ConfigDict(extra="forbid",
+                              populate_by_name=True,
+                              validate_assignment=True)
+
+    conversation_id: str = Field(
+        description=("Stable multi-turn conversation id used for routing"), )
+
+    # Forwarded as a header; excluded from the request body for older workers.
+    subagent_affinity_id: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description=("Server-private parent-session id for sub-agent routing "
+                     "affinity; forwarded to workers as a header, never in the "
+                     "body."))
+
+    @field_validator("conversation_id", mode="before")
+    @classmethod
+    def validate_conversation_id(cls, value: Any) -> str:
+        if value is None:
+            raise ValueError("conversation_id must be non-empty")
+        conversation_id = str(value).strip()
+        if not conversation_id:
+            raise ValueError("conversation_id must be non-empty")
+        return conversation_id
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -210,9 +351,75 @@ class CompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+class EmbeddingRequest(OpenAIBaseModel):
+    # OpenAI-compatible embeddings request.
+    # https://platform.openai.com/docs/api-reference/embeddings/create
+    model: str = Field(description="The model to use for the embedding.")
+    input: Union[str, List[str], List[int], List[List[int]]] = Field(
+        description="Text(s) or pre-tokenized token-id list(s) to embed. Accepts "
+        "the four OpenAI forms: str, list[str], list[int], list[list[int]].")
+    encoding_format: Literal["float", "base64"] = Field(
+        default="float",
+        description="Format of the returned embedding: a JSON array of floats "
+        "(\"float\") or a base64-encoded string of packed little-endian float32 "
+        "values (\"base64\").")
+    dimensions: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of dimensions the resulting embedding should have. "
+        "Only supported by Matryoshka-trained text-embedding models; rejected "
+        "otherwise.")
+    user: Optional[str] = Field(
+        default=None,
+        description="A stable identifier for the end-user (OpenAI-compatible; "
+        "accepted but unused).")
+    add_special_tokens: bool = Field(
+        default=True,
+        description=
+        "TRT-LLM extension: whether to add the model's special tokens "
+        "(e.g. [CLS]/[SEP]) when tokenizing string inputs. Default matches "
+        "llm.encode(); encoder models such as BERT generally need them.")
+
+
+class EmbeddingResponseData(OpenAIBaseModel):
+    index: int = Field(
+        description="Index of this embedding in the request's input list.")
+    object: Literal["embedding"] = "embedding"
+    embedding: Union[List[float], str] = Field(
+        description=
+        "The embedding: a list of floats for encoding_format=\"float\", "
+        "or a base64 string of packed little-endian float32 values for "
+        "encoding_format=\"base64\".")
+
+
+class EmbeddingUsageInfo(OpenAIBaseModel):
+    """Token usage for embeddings.
+
+    OpenAI's embeddings `usage` object contains only `prompt_tokens` and
+    `total_tokens` (no `completion_tokens`), unlike chat/completions.
+    """
+    prompt_tokens: int = Field(default=0,
+                               description="Number of tokens in the input.")
+    total_tokens: int = Field(
+        default=0,
+        description="Total tokens consumed (equal to prompt_tokens for "
+        "embeddings).")
+
+
+class EmbeddingResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"embd-{str(uuid.uuid4().hex)}")
+    object: Literal["list"] = "list"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str = Field(description="The model used for the embedding.")
+    data: List[EmbeddingResponseData] = Field(
+        description="The list of embeddings, one per input item.")
+    usage: EmbeddingUsageInfo = Field(
+        description="Token usage for the request.")
+
+
 def _response_format_to_guided_decoding_params(
     response_format: Optional[ResponseFormat],
     reasoning_parser: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[GuidedDecodingParams]:
     if response_format is None:
         guided_decoding_params = None
@@ -294,6 +501,32 @@ def _response_format_to_guided_decoding_params(
             "stop_after_first":
             True,
         }
+    elif reasoning_parser == "kimi_k3":
+        # K3 XTML: the generation prompt already ends inside the channel the
+        # model starts in. In thinking mode (the default) the response channel
+        # opens mid-generation, so trigger the user constraint on it
+        # (mirrors the gpt_oss final-channel handling). In non-thinking mode
+        # the prompt ends inside <|open|>response<|sep|>, the trigger would
+        # never be generated, and the raw grammar applies from the first
+        # generated token instead.
+        thinking = (chat_template_kwargs or {}).get("thinking",
+                                                    True) is not False
+        if not thinking:
+            return guided_decoding_params
+        stag_format = {
+            "type":
+            "triggered_tags",
+            "triggers": ["<|open|>response<|sep|>"],
+            "tags": [
+                {
+                    "begin": "<|open|>response<|sep|>",
+                    "content": content,
+                    "end": "<|close|>response<|sep|>",
+                },
+            ],
+            "stop_after_first":
+            True,
+        }
     else:
         # Force thinking and then trigger user constraint
         parser = ReasoningParserFactory.create_reasoning_parser(
@@ -333,6 +566,14 @@ def _response_format_text_config_to_guided_decoding_params(
         resp_format, reasoning_parser=reasoning_parser)
 
 
+def _record_sampling_params_request_fields(
+        request: OpenAIBaseModel, sampling_params: SamplingParams) -> None:
+    """Preserve explicitly supplied fields across protocol defaulting."""
+    sampling_params._set_request_provided_fields(
+        field_name for field_name in request.model_fields_set
+        if getattr(request, field_name, None) is not None)
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -363,8 +604,12 @@ class CompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[EarlyStopping] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -374,6 +619,7 @@ class CompletionRequest(OpenAIBaseModel):
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     return_context_logits: bool = False
     detokenize: bool = True
+    thinking_token_budget: Optional[int] = None
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -395,6 +641,19 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Parameters for disaggregated serving"),
     )
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
 
     # doc: end-completion-extra-params
 
@@ -402,9 +661,22 @@ class CompletionRequest(OpenAIBaseModel):
                            vocab_size: Optional[int] = None,
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
+        sampling_logprobs = None
+        return_log_probs = False
+        if self.logprobs:
+            if backend == "pytorch" or gather_generation_logits:
+                sampling_logprobs = self.logprobs
+            elif self.logprobs > 1:
+                raise ValueError(
+                    "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
+                )
+            else:
+                return_log_probs = True
+
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
+            logprobs=sampling_logprobs,
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -422,7 +694,7 @@ class CompletionRequest(OpenAIBaseModel):
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            early_stopping=self.early_stopping,
+            early_stopping=_early_stopping_to_int(self.early_stopping),
             stop_token_ids=self.stop_token_ids,
             include_stop_str_in_output=self.include_stop_str_in_output,
             ignore_eos=self.ignore_eos,
@@ -434,6 +706,7 @@ class CompletionRequest(OpenAIBaseModel):
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
             detokenize=self.detokenize,
+            thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -442,26 +715,21 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if self.logprobs:
-            if backend == "pytorch":
-                sampling_params.logprobs = self.logprobs
-            else:
-                if gather_generation_logits:
-                    sampling_params.logprobs = self.logprobs
-                elif self.logprobs > 1:
-                    raise ValueError(
-                        "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
-                    )
-                else:
-                    sampling_params._return_log_probs = True
+        if return_log_probs:
+            sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if (logprobs := data.get("logprobs")) is not None and logprobs < 0:
-            raise ValueError("logprobs must be positive or zero")
+        check_logprobs_limit("logprobs", data.get("logprobs"))
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -543,7 +811,7 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     role: Required[str]
     """The role of the message's author."""
 
-    content: Union[str, List[ChatCompletionContentPartParam]]
+    content: Union[str, List[ChatCompletionContentPartParam], None]
     """The contents of the message."""
 
     name: str
@@ -562,7 +830,24 @@ class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     reasoning_content: Optional[str]
 
 
-ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
+class DynamicToolsSystemMessageParam(TypedDict, total=False):
+    """System message carrying message-level (dynamic) tool declarations.
+
+    Kimi-style templates render such messages as an in-conversation tool
+    declare block. Must come first in `ChatCompletionMessageParam`: the
+    stock OpenAI system-message TypedDict otherwise wins smart-union scoring
+    and silently drops the `tools` key.
+    """
+    __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
+
+    role: Required[Literal["system"]]
+    tools: Required[List[dict]]
+    content: Union[str, List[ChatCompletionContentPartParam], None]
+    name: str
+
+
+ChatCompletionMessageParam = Union[DynamicToolsSystemMessageParam,
+                                   OpenAIChatCompletionMessageParam,
                                    CustomChatCompletionMessageParam,
                                    ReasoningAssistantMessage]
 
@@ -595,6 +880,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer alternative to prompt_token_ids; set by the context
+    # worker so the orchestrator can relay a string instead of the int list.
+    prompt_token_ids_b64: Optional[str] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -645,6 +933,19 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class ChatCompletionThinkingParam(OpenAIBaseModel):
+    """Kimi/Moonshot `thinking` extension controlling reasoning output.
+
+    `keep` is fixed to `"all"` when thinking is enabled and ignored when
+    disabled; `effort` is only meaningful when enabled. An explicit
+    `effort` wins over a request-level `reasoning_effort`, which applies
+    only when `effort` is absent (and never for a disabled request).
+    """
+    type: Literal["enabled", "disabled"] = "enabled"
+    keep: Optional[Literal["all"]] = None
+    effort: Optional[Literal["low", "high", "max"]] = None
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -652,6 +953,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Add prompt_tokens_ids to the request to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer relayed by the orchestrator from the ctx response;
+    # decoded back to prompt_token_ids on the generation worker. Not for clients.
+    prompt_token_ids_b64: Optional[str] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
@@ -669,17 +973,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
-        "low", "medium", "high"]] = Field(
+        "low", "medium", "high", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
             description=(
                 "The level of reasoning effort to use. Controls how much "
                 "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high'."),
+                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'max' and "
+                "'none' for models with Kimi-style thinking control."),
         )
+    # Kimi/Moonshot extension: structured control of reasoning output. The
+    # serving layer maps it into the chat-template kwargs for models whose
+    # template understands it (e.g. kimi_k3); other models ignore it.
+    thinking: Optional[ChatCompletionThinkingParam] = None
+    thinking_token_budget: Optional[int] = None
     prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params
@@ -689,8 +999,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[EarlyStopping] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -764,6 +1078,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Parameters for disaggregated serving"),
     )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
 
     cache_salt: Optional[str] = Field(
         default=None,
@@ -771,9 +1089,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
+    )
 
     agent_hierarchy: Optional[AgentHierarchy] = Field(
         default=None, description="Agent hierarchy ")
+
+    mm_processor_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=
+        "Per-request kwargs forwarded to the multimodal HF processor (e.g. num_frames for video models).",
+    )
 
     # doc: end-chat-completion-extra-params
 
@@ -782,8 +1115,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
+        sampling_logprobs = None
+        return_log_probs = False
+        if self.logprobs:
+            logprobs = 1 if not self.top_logprobs else self.top_logprobs
+            if backend == "pytorch" or gather_generation_logits:
+                sampling_logprobs = logprobs
+            elif self.top_logprobs:
+                raise ValueError(
+                    "`gather_generation_logits` must be `True` to use `top_logprobs`"
+                )
+            else:
+                return_log_probs = True
+
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
+            logprobs=sampling_logprobs,
             max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -802,7 +1149,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            early_stopping=self.early_stopping,
+            early_stopping=_early_stopping_to_int(self.early_stopping),
             stop_token_ids=self.stop_token_ids,
             include_stop_str_in_output=self.include_stop_str_in_output,
             ignore_eos=self.ignore_eos,
@@ -811,7 +1158,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             guided_decoding=_response_format_to_guided_decoding_params(
-                self.response_format, reasoning_parser=reasoning_parser),
+                self.response_format,
+                reasoning_parser=reasoning_parser,
+                chat_template_kwargs=self.chat_template_kwargs),
+            thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -820,19 +1170,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if self.logprobs:
-            logprobs = 1 if not self.top_logprobs else self.top_logprobs
-            if backend == "pytorch":
-                sampling_params.logprobs = logprobs
-            else:
-                if gather_generation_logits:
-                    sampling_params.logprobs = logprobs
-                elif self.top_logprobs:
-                    raise ValueError(
-                        "`gather_generation_logits` must be `True` to use `top_logprobs`"
-                    )
-                else:
-                    sampling_params._return_log_probs = True
+        if return_log_probs:
+            sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode='before')
@@ -846,24 +1186,61 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_tool_choice(cls, data):
-        if "tool_choice" not in data and data.get("tools"):
+        if not isinstance(data, dict):
+            return data
+        has_dynamic_tools = any(
+            isinstance(msg, dict) and msg.get("role") == "system"
+            and msg.get("tools") for msg in data.get("messages") or [])
+        if "tool_choice" not in data and (data.get("tools")
+                                          or has_dynamic_tools):
             data["tool_choice"] = "auto"
-        if "tool_choice" in data and data["tool_choice"] != "none":
-            if "tools" not in data or data["tools"] is None:
+        # "none" and "auto" are meaningful without tools. "required" needs a
+        # non-empty tool set — request-level or message-level (dynamic)
+        # tools both count. A named function must be a request-level tool.
+        if "tool_choice" in data and data["tool_choice"] not in ("none",
+                                                                 "auto"):
+            satisfied = data.get("tools") or (data["tool_choice"] == "required"
+                                              and has_dynamic_tools)
+            if not satisfied:
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
         return data
 
     @model_validator(mode="before")
     @classmethod
+    def check_message_tools_role(cls, data):
+        """Message-level tool declarations ride on system messages only.
+
+        Union validation strips unknown keys from non-system messages, so
+        this raw-payload validator is the only layer that can reject the
+        misuse loudly instead of silently dropping the client's tools. The
+        rest of the dynamic-tools contract is model-specific and validated
+        in the serving layer (kimi_k3 only).
+        """
+        if not isinstance(data, dict):
+            return data
+        for message in data.get("messages") or []:
+            if (isinstance(message, dict) and message.get("tools") is not None
+                    and message.get("role") != "system"):
+                raise ValueError(
+                    "Message-level `tools` are only allowed on system "
+                    "messages.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
-            if top_logprobs < 0:
-                raise ValueError("top_logprobs must be positive or zero")
+            check_logprobs_limit("top_logprobs", top_logprobs)
             if not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -896,14 +1273,90 @@ class KVCacheTruncateRequest(OpenAIBaseModel):
     tool_choice: Optional[str] = None
 
 
+class KVCacheTruncateTokensRequest(OpenAIBaseModel):
+    """Token-level analog of :class:`KVCacheTruncateRequest`.
+
+    Posted to the ``/_control/kv_cache/truncate_tokens`` endpoint. Bypasses
+    the chat-template tokenization path entirely: callers (e.g.
+    trace replay) that already operate on raw token ids hand the server a
+    batch of full token-id sequences plus the prefix length to retain for
+    each, and the server trims the corresponding KV-cache blocks in the
+    radix tree. Each ``prefixes[i]`` becomes one
+    :class:`tensorrt_llm.executor.request.TruncateKVCacheRequest` on the
+    executor's KV-cache control queue, so one batched HTTP request fans out
+    into N atomic per-prefix radix-tree mutations while paying a single
+    network round-trip.
+
+    Fields:
+        model: Target model name. Accepted for router compatibility but
+            ignored -- the server uses its own loaded model.
+        prefixes: Batch of full token-id sequences. Each entry is one
+            cached prefix whose KV-cache blocks should be truncated.
+        num_tokens_to_keep: Per-prefix number of leading tokens to retain,
+            parallel to ``prefixes`` (``num_tokens_to_keep[i]`` applies to
+            ``prefixes[i]``). Blocks beyond this length are dropped from the
+            radix tree.
+    """
+
+    model: Optional[str] = None
+    prefixes: List[List[int]]
+    num_tokens_to_keep: List[int]
+
+
+# The trailing dict keeps a client's own item types from failing the request
+# outright. Codex multi-agent sessions carry "agent_message" items, which no
+# SDK model describes; without a permissive member the union rejects the whole
+# input and every request from a spawned agent comes back 422, so agent
+# collaboration cannot work at all. Known shapes still match their typed
+# member first; see _response_output_item_to_chat_completion_message for how
+# an unrecognised item is replayed.
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
                                            ResponseReasoningItem,
-                                           ResponseFunctionToolCall]
+                                           ResponseFunctionToolCall, dict[str,
+                                                                          Any]]
+
+# Roles whose message items map to EasyInputMessageParam / Message, both of
+# which forbid ``id``. An assistant message maps to ResponseOutputMessageParam
+# instead, which *requires* ``id`` and ``status`` - stripping ``id`` there
+# leaves the item matching no variant of the input union, so a conversation
+# breaks as soon as it carries one assistant turn.
+#
+# Module level on purpose: pydantic turns a leading-underscore class attribute
+# into a ModelPrivateAttr, so referring to it from a validator would raise
+# "argument of type 'ModelPrivateAttr' is not iterable" at request time.
+_ID_STRIPPED_ROLES = ("user", "system", "developer")
+
+
+def _materialize_validator_iterators(value, _depth=0):
+    """Recursively replace pydantic ValidatorIterator objects with lists.
+
+    Matched by type name rather than by import: the class lives in the
+    pydantic_core extension module and is not part of its public API.
+    """
+    if _depth > 12:
+        return value
+    if type(value).__name__ == "ValidatorIterator":
+        return [_materialize_validator_iterators(v, _depth + 1) for v in value]
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _materialize_validator_iterators(item, _depth + 1)
+        return value
+    if isinstance(value, list):
+        return [_materialize_validator_iterators(v, _depth + 1) for v in value]
+    return value
 
 
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
+    #
+    # Unlike the rest of the OpenAI models this one accepts unknown fields.
+    # Real Responses API clients attach evolving telemetry and routing keys -
+    # Codex CLI sends client_metadata and prompt_cache_key, for instance - and
+    # rejecting the whole request over a field the server would ignore anyway
+    # makes those clients unusable for no benefit.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     background: Optional[bool] = False
     include: Optional[list[
         Literal[
@@ -917,6 +1370,84 @@ class ResponsesRequest(OpenAIBaseModel):
     ]] = None
     input: Union[str, list[ResponseInputOutputItem]]
     instructions: Optional[str] = None
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def _drop_unsupported_input_item_keys(cls, value):
+        """Strip per-item keys the vendored Responses item types reject.
+
+        Clients echo back items exactly as the server emitted them, so input
+        message items arrive carrying the ``id`` the server assigned, which
+        ``EasyInputMessageParam`` / ``Message`` forbid. That fails the whole
+        request over a field with no prompt content.
+
+        Assistant messages and tool-call items keep their ids: the former
+        needs it to validate, the latter uses it to pair calls with results.
+        """
+        if not isinstance(value, list):
+            return value
+
+        def _with_annotations(part):
+            """output_text requires annotations; clients often omit it."""
+            if (isinstance(part, dict) and part.get("type") == "output_text"
+                    and "annotations" not in part):
+                return {**part, "annotations": []}
+            return part
+
+        cleaned = []
+        for item in value:
+            # A client may send a bare content part as a top-level item, not
+            # only nested inside a message.
+            item = _with_annotations(item)
+            if isinstance(item, dict) and item.get("type") in (None, "message"):
+                role = item.get("role")
+                if "id" in item and role in _ID_STRIPPED_ROLES:
+                    item = {k: v for k, v in item.items() if k != "id"}
+                elif role == "assistant":
+                    # ResponseOutputMessageParam requires status, and each
+                    # output_text part requires annotations. Clients rebuild an
+                    # assistant turn from the streamed deltas rather than from
+                    # the server's content-part objects, so both routinely
+                    # arrive absent and fail the whole request. Default them
+                    # rather than reject a conversation over fields that carry
+                    # no prompt content.
+                    item = dict(item)
+                    item.setdefault("status", "completed")
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        item["content"] = [
+                            {
+                                **part, "annotations": part.get(
+                                    "annotations", [])
+                            } if isinstance(part, dict)
+                            and part.get("type") == "output_text" else part
+                            for part in content
+                        ]
+            cleaned.append(item)
+        return cleaned
+
+    @field_validator("input", mode="after")
+    @classmethod
+    def _materialize_lazy_item_content(cls, value):
+        """Force lazily-validated sequences anywhere in ``input`` into lists.
+
+        Several vendored Responses item types declare sequence fields as
+        ``Iterable[...]`` - ``ResponseOutputMessageParam.content`` and
+        ``ResponseOutputTextParam.annotations`` among them - and pydantic
+        validates an Iterable lazily into a ``ValidatorIterator``. That object
+        cannot be pickled, so a request carrying structured input dies with
+
+            cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator'
+
+        the moment it is handed to a postprocess worker. It is also
+        single-consumption, so even with workers disabled anything that reads
+        the field twice sees an empty sequence the second time.
+
+        The walk has to be recursive: the lazy fields are nested inside items,
+        e.g. input[1].content[0].annotations.
+        """
+        return _materialize_validator_iterators(value)
+
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
@@ -925,6 +1456,7 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None
+    thinking_token_budget: Optional[int] = None
     service_tier: Literal["auto", "default", "flex", "scale",
                           "priority"] = "auto"
     store: Optional[bool] = True
@@ -975,14 +1507,17 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
                 self.text.format, reasoning_parser=reasoning_parser)
 
-        return SamplingParams(
+        sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
             logprobs=self.top_logprobs,
             stop_token_ids=stop_token_ids,
             guided_decoding=guided_decoding,
+            thinking_token_budget=self.thinking_token_budget,
         )
+        _record_sampling_params_request_fields(self, sampling_params)
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -1000,9 +1535,20 @@ class ResponsesRequest(OpenAIBaseModel):
             raise ValueError("prompt template is not supported")
         return data
 
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
+
 
 class InputTokensDetails(OpenAIBaseModel):
     cached_tokens: int
+    # Required by the openai SDK models that re-validate this payload when it
+    # is embedded in a streaming event. Omitting it fails validation while the
+    # response is being streamed, which truncates the stream with no
+    # terminating event and leaves the client waiting forever. Prompt cache
+    # writes are not tracked separately, so this is reported as zero.
+    cache_write_tokens: int = 0
 
 
 class OutputTokensDetails(OpenAIBaseModel):
@@ -1115,7 +1661,9 @@ class ResponsesStreamResponse(OpenAIBaseModel):
 
 
 class MemoryUpdateRequest(OpenAIBaseModel):
-    tags: List[str] = Field(default=["model", "kv_cache"])
+    tags: list[str] = Field(
+        min_length=1,
+        description="Memory tags to release/resume, e.g. ['model', 'kv_cache']")
 
 
 class UpdateWeightsRequest(OpenAIBaseModel):
@@ -1137,36 +1685,54 @@ def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
 
 
 def _serialize_first_gen_log_probs(
-    first_gen_log_probs: Optional[list], ) -> Optional[List]:
-    """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
+        first_gen_log_probs: Optional[list]) -> Optional[List]:
+    """Serialize ``list[dict[int, Logprob]] | list[float]`` to a JSON-safe form.
+
+    - Default (verbose) format: each position is a ``dict[int, Logprob]`` and is
+      serialized as a list of ``{token_id, logprob, rank}`` dicts.
+    - Simple format: each position is a ``float``; passed through verbatim.
+    """
     if first_gen_log_probs is None:
         return None
     if not isinstance(first_gen_log_probs, list):
         raise ValueError("first_gen_log_probs must be a list")
     result = []
     for i, pos in enumerate(first_gen_log_probs):
-        if not isinstance(pos, dict):
+        if isinstance(pos, dict):
+            result.append([{
+                "token_id": tid,
+                "logprob": lp.logprob,
+                "rank": lp.rank
+            } for tid, lp in pos.items()])
+        elif isinstance(pos, (float, int)):
+            # Simple format: per-token sampled logprob.
+            result.append(float(pos))
+        else:
             raise ValueError(
-                f"first_gen_log_probs[{i}] must be a dict, got {type(pos)}")
-        result.append([{
-            "token_id": tid,
-            "logprob": lp.logprob,
-            "rank": lp.rank
-        } for tid, lp in pos.items()])
+                f"first_gen_log_probs[{i}] must be a dict or float, got {type(pos)}"
+            )
     return result
 
 
 def _deserialize_first_gen_log_probs(
     serialized: Optional[List], ) -> Optional[list]:
-    """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
+    """Inverse of :func:`_serialize_first_gen_log_probs`.
+
+    Returns either ``list[dict[int, Logprob]]`` (default format) or
+    ``list[float]`` (simple format) depending on the serialized payload.
+    """
     if serialized is None:
         return None
     from tensorrt_llm.executor.result import Logprob
     result = []
     for i, pos in enumerate(serialized):
+        if isinstance(pos, (float, int)):
+            result.append(float(pos))
+            continue
         if not isinstance(pos, list):
             raise ValueError(
-                f"first_gen_log_probs[{i}] must be a list, got {type(pos)}")
+                f"first_gen_log_probs[{i}] must be a list or float, got {type(pos)}"
+            )
         token_map = {}
         for j, item in enumerate(pos):
             if not isinstance(item, dict):
@@ -1228,6 +1794,9 @@ def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
         return None
+    ctx_usage = tllm_disagg_params.ctx_usage
+    if ctx_usage is not None and not isinstance(ctx_usage, UsageInfo):
+        ctx_usage = UsageInfo.model_validate(ctx_usage)
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
@@ -1243,6 +1812,7 @@ def to_disaggregated_params(
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
+        ctx_usage=ctx_usage,
     )
 
 
@@ -1250,6 +1820,7 @@ def to_llm_disaggregated_params(
         disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
     if disaggregated_params is None:
         return None
+    ctx_usage = disaggregated_params.ctx_usage
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
@@ -1265,7 +1836,17 @@ def to_llm_disaggregated_params(
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
+        ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
     )
+
+
+def to_llm_conversation_params(
+    conversation_params: Optional[ConversationParams]
+) -> Optional[LlmConversationParams]:
+    if conversation_params is None:
+        return None
+    return LlmConversationParams(
+        conversation_id=conversation_params.conversation_id)
 
 
 # ============================================================================
@@ -1276,180 +1857,334 @@ def to_llm_disaggregated_params(
 class ImageGenerationRequest(OpenAIBaseModel):
     """OpenAI-compatible image generation request.
 
-    Follows the OpenAI Images API specification:
-    https://platform.openai.com/docs/api-reference/images/create
+    Universal per-request fields map 1:1 to :class:`VisualGenParams`.
+    Model-specific knobs (``stg_scale``, ``guidance_rescale``, …)
+    travel through ``extra_params``; the executor validates each
+    key against the loaded pipeline's
+    ``extra_param_specs``. Unknown top-level fields are rejected
+    with HTTP 422 via the inherited ``extra="forbid"`` policy.
     """
-    prompt: str
-    model: Optional[str] = None
-    n: int = Field(default=1, ge=1, le=10)
-    output_format: Literal["png", "webp", "jpeg"] = "png"
-    size: Optional[str] = Field(
-        default="auto",
-        description=(
-            "The size of the generated images. Must be in 'WxH' format like "
-            "1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), etc. "
-            "Use 'auto' for model default size."))
-    quality: Literal["standard", "hd"] = "standard"
-    response_format: Literal["url", "b64_json"] = "url"
-    style: Optional[Literal["vivid", "natural"]] = "vivid"
-    user: Optional[str] = None
 
-    # Extended parameters for diffusion control
-    num_inference_steps: Optional[int] = Field(
-        default=None,
-        description=
-        "Number of denoising steps. More steps = higher quality but slower.")
-    guidance_scale: Optional[float] = Field(
-        default=None,
-        description=
-        "Classifier-free guidance scale. Higher values follow prompt more closely."
+    # Prompt + transport (OpenAI-standard, always honored)
+    prompt: str
+    response_format: Literal["url", "b64_json", "path"] = "url"
+    format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = Field(
+        default="png",
+        description=(
+            "Generation content encoding format. Image encoders write "
+            "``png``/``webp``/``jpeg``; tensor encoders write "
+            "``safetensors``/``pt`` for programmatic post-processing."),
     )
-    guidance_rescale: Optional[float] = Field(
-        default=None, description="Classifier-free guidance rescale.")
-    negative_prompt: Optional[str] = Field(
-        default=None,
-        description="Text describing what to avoid in the generated image.")
     seed: Optional[int] = Field(default=None,
+                                ge=0,
                                 description="Random seed for reproducibility.")
 
-    @field_validator("size")
-    @classmethod
-    def validate_size(cls, v):
-        """Validate size format is 'WxH' or 'auto'."""
-        if v is None or v == "auto":
-            return v
-        if not isinstance(v, str):
-            raise ValueError("size must be a string in 'WxH' format or 'auto'")
-        # Check format: should be like "1024x1024"
-        import re
-        if not re.match(r'^\d+x\d+$', v):
+    # Resolution. ``size`` is OpenAI-shaped; ``width`` + ``height`` are an
+    # equivalent structured alternative. Exactly one of width/height is
+    # rejected by the paired validator below. Numeric fields use
+    # ``gt=0`` as a safety net so zero / negative inputs are rejected
+    # with HTTP 422 before reaching the pipeline.
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+    # TRT-LLM-supported per-request params (1:1 with VisualGenParams fields)
+    num_inference_steps: Optional[int] = Field(default=None, gt=0)
+    guidance_scale: Optional[float] = Field(default=None, gt=0)
+    max_sequence_length: Optional[int] = Field(default=None, gt=0)
+    negative_prompt: Optional[str] = None
+    n: Optional[int] = Field(
+        default=None,
+        gt=0,
+        le=10,
+        description=("Number of images to generate. Capped at 10 to match the "
+                     "OpenAI images API and to bound GPU memory / disk usage."),
+    )
+
+    # Model-specific overflow
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."),
+    )
+
+    # Accepted-but-ignored OpenAI-shaped fields. The conversion no-ops; the
+    # server logs WARNING when a client sets ``quality`` or ``style``, and
+    # WARNING-on-mismatch for ``model``. Kept in the schema so OpenAI-SDK
+    # clients don't trip ``extra="forbid"``.
+    model: Optional[str] = None
+    quality: Optional[Literal["standard", "hd"]] = None
+    style: Optional[Literal["vivid", "natural"]] = None
+    user: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_paired_dimensions(self):
+        """Reject sending exactly one of ``width`` / ``height``.
+
+        Either both are sent (structured resolution wins over ``size``)
+        or neither is sent (``size`` or pipeline default applies).
+        """
+        if (self.width is None) != (self.height is None):
             raise ValueError(
-                f"Invalid size format '{v}'. Must be in 'WxH' format "
-                "(e.g., '1024x1024', '1536x1024') or 'auto'.")
-        return v
+                "width and height must be sent together; got width="
+                f"{self.width!r}, height={self.height!r}")
+        return self
+
+
+class ImageEditRequest(OpenAIBaseModel):
+    """OpenAI-compatible image editing request.
+
+    The server accepts the OpenAI multipart shape and a JSON/base64
+    shape for tests and non-SDK clients. Model-specific knobs travel
+    through ``extra_params`` and are validated by the loaded visual
+    generation pipeline.
+    """
+
+    prompt: str
+    image: Union[str, UploadFile, List[Union[str, UploadFile]]] = Field(
+        description="Input image or images to edit.")
+    mask: Optional[Union[str, UploadFile]] = Field(
+        default=None,
+        description=
+        "Optional edit mask. Currently accepted for compatibility but unsupported.",
+    )
+    response_format: Literal["url", "b64_json", "path"] = "url"
+    output_format: Literal["png", "webp", "jpeg"] = Field(
+        default="png",
+        validation_alias=AliasChoices("output_format", "format"),
+        description="Edited image content encoding format.",
+    )
+    seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                description="Random seed for reproducibility.")
+
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+    num_inference_steps: Optional[int] = Field(default=None, gt=0)
+    guidance_scale: Optional[float] = Field(default=None, gt=0)
+    max_sequence_length: Optional[int] = Field(default=None, gt=0)
+    negative_prompt: Optional[str] = None
+    n: Optional[int] = Field(
+        default=None,
+        gt=0,
+        le=10,
+        description=("Number of edited images to generate. Capped at 10 to "
+                     "match the OpenAI images API."),
+    )
+
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."),
+    )
+
+    model: Optional[str] = None
+    quality: Optional[Literal["standard", "hd"]] = None
+    user: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_paired_dimensions(self):
+        if isinstance(self.image, list) and not self.image:
+            raise ValueError("image must contain at least one input image")
+        if (self.width is None) != (self.height is None):
+            raise ValueError(
+                "width and height must be sent together; got width="
+                f"{self.width!r}, height={self.height!r}")
+        return self
 
 
 class ImageObject(OpenAIBaseModel):
     """Generated image object in the response."""
     b64_json: Optional[str] = None
     url: Optional[str] = None
+    path: Optional[str] = None
     revised_prompt: Optional[str] = None
 
 
 class ImageGenerationResponse(OpenAIBaseModel):
-    """Response from image generation endpoint."""
+    """Response from image generation endpoint.
+
+    ``output_format`` reports the encoding actually applied to the
+    returned bytes / files so clients can decode or label the payload
+    correctly. Image encoders are ``"png"``/``"webp"``/``"jpeg"``;
+    tensor formats are ``"safetensors"``/``"pt"``.
+    """
+
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageObject]
-    output_format: Literal["png", "webp", "jpeg"] = "png"
+    output_format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = "png"
     quality: Literal["low", "medium", "high"] = "medium"
     size: Optional[str] = None
 
 
-class ImageEditRequest(OpenAIBaseModel):
-    """Request for image editing endpoint.
+class MediaReferenceItem(OpenAIBaseModel):
+    """One media reference (image / video / audio) for conditioning (mirrors ``MediaRef``).
 
-    Follows the OpenAI Images API specification:
-    https://platform.openai.com/docs/api-reference/images/createEdit
+    ``format`` declares how to read ``content``; it is required, so no wire form
+    is ever guessed. The request field it sits in (``image_reference`` /
+    ``video_reference`` / ``audio_reference``) fixes the modality. ``role`` is
+    required only when it is ambiguous — a model with more than one required role
+    for that modality; a single role, or a single required role (e.g. i2v
+    first_frame), is inferred.
     """
-    image: Union[List[str], str] = Field(
-        description="Base64-encoded source image(s) to edit")
-    prompt: str = Field(description="Text description of desired edits")
-    model: Optional[str] = None
-    mask: Optional[str] = Field(
-        default=None,
-        description=
-        "Base64-encoded mask image (optional, black areas will be edited)")
-    n: int = Field(default=1, ge=1, le=10)
-    size: Optional[str] = Field(
-        default="auto",
-        description=(
-            "The size of the edited images. Must be in 'WxH' format like "
-            "1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), etc. "
-            "Use 'auto' to match source image size."))
-    response_format: Literal["url", "b64_json"] = "url"
-    user: Optional[str] = None
 
-    # Extended parameters for diffusion control
-    num_inference_steps: Optional[int] = Field(
-        default=None, description="Number of denoising steps.")
-    guidance_scale: Optional[float] = Field(
-        default=None, description="Classifier-free guidance scale.")
-    guidance_rescale: Optional[float] = Field(
-        default=None, description="Classifier-free guidance rescale.")
-    negative_prompt: Optional[str] = Field(
+    content: str = Field(
+        description="The reference payload, in the form declared by ``format``."
+    )
+    format: Literal["path", "url", "base64"] = Field(description=(
+        "Wire form of ``content``: ``path`` (a file readable by the server; a "
+        "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
+        "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
+        "also accepted). Raw bytes reach the server as a multipart upload, "
+        "which carries no ``format`` of its own. Distinct from the top-level "
+        "``format``, which selects the *output* encoding."))
+    role: Optional[MediaRole] = Field(
         default=None,
-        description="Text describing what to avoid in the edited image.")
-    seed: Optional[int] = Field(default=None,
-                                description="Random seed for reproducibility.")
-
-    @field_validator("size")
-    @classmethod
-    def validate_size(cls, v):
-        """Validate size format is 'WxH' or 'auto'."""
-        if v != "auto" and not re.match(r"^\d+x\d+$", v):
-            raise ValueError(
-                "Size must be 'auto' or in 'WxH' format (e.g., '1024x1024')")
-        return v
+        description="Which conditioning slot this reference fills. Required only "
+        "when the target model accepts this modality in more than one slot; omit "
+        "it when the model leaves no ambiguity.",
+    )
 
 
 class VideoGenerationRequest(OpenAIBaseModel):
     """Video generation request (extended API).
 
-    This is an extension to the OpenAI API for video generation support.
+    Universal per-request fields map 1:1 to :class:`VisualGenParams`.
+    Model-specific knobs travel through ``extra_params``. Unknown
+    top-level fields are rejected with HTTP 422 via the inherited
+    ``extra="forbid"`` policy.
     """
-    prompt: str
-    input_reference: Optional[Union[str, UploadFile]] = Field(
-        default=None,
-        description="Optional image reference that guides generation.")
-    model: Optional[str] = None
-    size: Optional[str] = Field(
-        default="auto",
-        description=
-        ("The size of the generated video frames. Must be in 'WxH' format like "
-         "512x512, 1024x576 (landscape), 576x1024 (portrait), etc. "
-         "Use 'auto' for model default size."))
-    seconds: float = Field(default=2.0,
-                           ge=1.0,
-                           le=16.0,
-                           description="Video duration in seconds.")
 
-    # Extended parameters for diffusion control
-    n: int = Field(default=1, ge=1, le=4)
-    fps: int = Field(default=24, ge=8, le=60, description="Frames per second.")
-    num_inference_steps: Optional[int] = Field(
-        default=None, description="Number of denoising steps.")
-    guidance_scale: Optional[float] = Field(
-        default=None, description="Classifier-free guidance scale.")
-    guidance_rescale: Optional[float] = Field(
-        default=None, description="Classifier-free guidance rescale.")
-    negative_prompt: Optional[str] = Field(
-        default=None,
-        description="Text describing what to avoid in the generated video.")
-    seed: Optional[int] = Field(default=None,
-                                description="Random seed for reproducibility.")
-    output_format: Literal["mp4", "avi", "auto"] = Field(
+    # Prompt + transport
+    prompt: str
+    response_format: Literal["file", "path"] = "file"
+    format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = Field(
         default="auto",
         description=(
-            "Video encode format. "
-            "'mp4' for H.264 encoding (requires ffmpeg installed on server), "
-            "'avi' for MJPEG encoding (always available, no audio support), "
-            "'auto' to use best available (H.264 if ffmpeg installed, "
-            "otherwise MJPEG)."))
+            "Generation content encoding format. Video encoders write "
+            "``mp4``/``avi``/``auto``; tensor encoders write "
+            "``safetensors``/``pt`` and carry video, audio, and scalar "
+            "metadata (frame rate, audio sample rate) in one payload."),
+    )
+    seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                description="Random seed for reproducibility.")
+    image_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Image reference(s) conditioning generation (e.g. image-to-video "
+             "first frame). Send a ``{content, format, role}`` object or a list "
+             "of them, where ``format`` is ``path`` / ``url`` / ``base64``; or "
+             "upload a single image file via multipart, whose form is implied. "
+             "PNG or JPEG only — HEIF/AVIF are not supported."),
+        )
+    video_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Video reference(s) conditioning generation (video-to-video). Send "
+             "a ``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single video file "
+             "via multipart, whose form is implied. MP4 or AVI, with H.264 the "
+             "tested codec and others best-effort."),
+        )
+    audio_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Audio reference(s) conditioning generation. Send a "
+             "``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single audio "
+             "file via multipart, whose form is implied. Accepted only by "
+             "models that declare an audio reference slot."),
+        )
+    input_reference: Optional[Union[str, UploadFile]] = Field(
+        default=None,
+        description=
+        ("Deprecated. A single image or video reference, routed by content "
+         "signature to image-to-video or video-to-video. A JSON request carries "
+         "base64 bytes; a multipart request uploads the file. Kept for backward "
+         "compatibility; prefer the typed ``image_reference`` / "
+         "``video_reference`` fields, which take precedence — this field is "
+         "ignored whenever a typed ``image_reference`` or ``video_reference`` "
+         "is provided."),
+    )
 
-    @field_validator("size")
-    @classmethod
-    def validate_size(cls, v):
-        """Validate size format is 'WxH' or 'auto'."""
-        if v is None or v == "auto":
-            return v
-        if not isinstance(v, str):
-            raise ValueError("size must be a string in 'WxH' format or 'auto'")
-        import re
-        if not re.match(r'^\d+x\d+$', v):
+    # Resolution
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+    # Frame budget. ``num_frames`` is preferred; if absent the engine
+    # derives it from ``seconds * frame_rate``. ``frame_rate`` is the
+    # canonical name (matches the Python field); ``fps`` is an alias for
+    # OpenAI-shape clients via ``populate_by_name=True``.
+    # All three constrain to strictly positive values so a zero
+    # ``frame_rate`` (division-by-zero in the AVI fallback) or a
+    # negative ``num_frames`` are rejected with HTTP 422 before
+    # reaching the encoder.
+    # Upper bounds keep request-boundary protection against requests
+    # that can exhaust GPU memory or pin the server on unbounded work.
+    # The numbers are generous (a minute of video at 120 fps) so common
+    # workloads pass; clients that need larger budgets can lift the cap
+    # at deployment time.
+    num_frames: Optional[int] = Field(default=None, gt=0, le=7200)
+    seconds: Optional[float] = Field(default=None, gt=0, le=60.0)
+    frame_rate: Optional[float] = Field(default=None,
+                                        alias="fps",
+                                        gt=0,
+                                        le=120.0)
+
+    # TRT-LLM-supported per-request params (1:1 with VisualGenParams)
+    num_inference_steps: Optional[int] = Field(default=None, gt=0)
+    guidance_scale: Optional[float] = Field(default=None, gt=0)
+    max_sequence_length: Optional[int] = Field(default=None, gt=0)
+    negative_prompt: Optional[str] = None
+
+    # Model-specific overflow
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."),
+    )
+
+    # Accepted-but-ignored OpenAI-shaped field
+    model: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_paired_dimensions(self):
+        """Reject sending exactly one of ``width`` / ``height``."""
+        if (self.width is None) != (self.height is None):
             raise ValueError(
-                f"Invalid size format '{v}'. Must be in 'WxH' format "
-                "(e.g., '512x512', '1024x576') or 'auto'.")
-        return v
+                "width and height must be sent together; got width="
+                f"{self.width!r}, height={self.height!r}")
+        return self
+
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def _reject_removed_response_format(cls, value):
+        """Give migrating callers an actionable error for removed values.
+
+        ``url``/``b64_json`` were valid before the transport rewrite; run
+        before the ``Literal`` check so the error names the replacement
+        instead of the generic "Input should be 'file' or 'path'".
+        """
+        removed = {
+            "url":
+            ("'url' was removed for video; use 'file' (raw bytes -- the "
+             "old 'url' behavior, renamed) or 'path' (server-side path)."),
+            "b64_json": ("'b64_json' was removed for video; use 'file' (raw "
+                         "bytes) or 'path' (server-side path)."),
+        }
+        if isinstance(value, str) and value in removed:
+            raise ValueError(removed[value])
+        return value
 
 
 class VideoJob(OpenAIBaseModel):
@@ -1472,17 +2207,55 @@ class VideoJob(OpenAIBaseModel):
         default=None,
         description="Progress of the video generation job (0-100)")
     prompt: str = Field(description="The prompt used to generate the video")
-    status: Literal["queued", "in_progress", "completed", "failed"] = Field(
-        description="Current status of the video generation job")
+    status: Literal["queued", "generating", "postprocessing", "completed",
+                    "failed"] = Field(description=(
+                        "Current status of the video generation job. "
+                        "``generating`` (model inference) becomes "
+                        "``postprocessing`` (encode and/or write the output "
+                        "file) when inference finishes, then ``completed`` "
+                        "once downloadable via ``/content``."))
 
     # Video properties
     duration: Optional[float] = Field(default=None,
                                       description="Video duration in seconds")
-    fps: Optional[int] = Field(default=None, description="Frames per second")
+    fps: Optional[float] = Field(
+        default=None,
+        description=(
+            "Frames per second. Float to preserve cinematic rates such "
+            "as 23.976 / 29.97 that some encoders / pipelines use."),
+    )
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    # exclude=True: internal file-location for /content resolution + delete;
+    # never on the wire (the path payload is the hand-built {id, output_path}
+    # envelope in /content), so status/list model_dump() stays status-only.
     output_path: Optional[str] = Field(
-        default=None, description="Actual path where the video file was saved")
+        default=None,
+        exclude=True,
+        description="Server-side saved path (internal; excluded from the wire)."
+    )
+    output_paths: Optional[List[str]] = Field(
+        default=None,
+        exclude=True,
+        description=
+        "Server-side paths for n>1 (internal; excluded from the wire).")
+    # exclude=True internal timings, never on the wire (status/list
+    # model_dump() stays status-only). ``request_started`` carries the
+    # steady-clock ``server_arrival_time``; the background task computes
+    # ``total`` from it and stores the header timings
+    # (``generation``/``denoise``/``total``) in ``timing_metrics`` so
+    # ``/content`` emits the same Server-Timing header as the sync route.
+    request_started: Optional[float] = Field(default=None, exclude=True)
+    timing_metrics: Optional[Dict[str, float]] = Field(default=None,
+                                                       exclude=True)
+    response_format: Optional[Literal["file", "path"]] = Field(
+        default=None,
+        description=(
+            "Transport the client requested. ``GET /v1/videos/{id}/content`` "
+            "honors this: ``path`` returns the server-side output path(s) in a "
+            "JSON envelope; ``file`` (or unset) returns the file as a "
+            "``FileResponse`` download."),
+    )
 
 
 class VideoJobList(OpenAIBaseModel):
@@ -1493,3 +2266,31 @@ class VideoJobList(OpenAIBaseModel):
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
 UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
+
+ProfileActivity = Literal["CPU", "GPU", "CUDA_PROFILER"]
+
+
+class StartProfileRequest(OpenAIBaseModel):
+    """Request body for the POST /start_profile endpoint."""
+    output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory where chrome traces are written. Defaults "
+        "to the TLLM_TORCH_PROFILER_DIR environment variable, "
+        "then /tmp.")
+    num_steps: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of iterations to profile. Must be >= 1 if "
+        "provided; if omitted, profiling runs until /stop_profile is "
+        "called. ``num_steps == 0`` is rejected because the profile "
+        "window would never close — the stop iteration would equal the "
+        "start iteration, profile_step() would discard the stop marker "
+        "as stale, and the window would run forever.")
+    start_step: NonNegativeInt = Field(
+        default=0,
+        description="Skip this many iterations before profiling begins. "
+        "Must be >= 0.")
+    activities: List[ProfileActivity] = Field(
+        default_factory=lambda: ["CPU", "GPU"],
+        description="Which activities to trace. Supported values: "
+        "'CPU', 'GPU', 'CUDA_PROFILER'. Unknown values are rejected at "
+        "schema validation time.")

@@ -42,8 +42,6 @@ environment:
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
 worker_config:
   gen:
     print_iter_log: true
@@ -94,4 +92,4 @@ worker_config:
       backend: DEEPGEMM
     cache_transceiver_config:
       backend: DEFAULT
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false

@@ -1,0 +1,681 @@
+{
+  "trace_id": "ee41c788-de9a-451c-8d9d-696cdb4b9c2b",
+  "events": [
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "system",
+      "message_index": 0,
+      "system_prompt_id": "c124a9b6-7956-54c2-a145-f5bd02ef527b",
+      "tokens": 2827
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "user",
+      "message_index": 1,
+      "tokens": 1493
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 2,
+      "tool_calls": [
+        "read_file"
+      ],
+      "prompt_tokens": 4320,
+      "completion_tokens": 176,
+      "reasoning_tokens": 55,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_hc5nA1wxYKrOgLaiSo3B5A",
+      "tool_name": "read_file",
+      "duration_ms": 152.79793739318848
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 3,
+      "tokens": 306
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 4,
+      "tool_calls": [
+        "think"
+      ],
+      "prompt_tokens": 4731,
+      "completion_tokens": 104,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_mpScYcselDkAMVqbXNkcdg",
+      "tool_name": "think",
+      "duration_ms": 2.6912689208984375
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 5,
+      "tokens": 66
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 6,
+      "tool_calls": [
+        "read_file"
+      ],
+      "prompt_tokens": 4905,
+      "completion_tokens": 99,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_pAtmszVvyeTXTwMUBzCIYv",
+      "tool_name": "read_file",
+      "duration_ms": 19.20604705810547
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 7,
+      "tokens": 476
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 8,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 5485,
+      "completion_tokens": 106,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_bORnzoZ8s7WS39sCJmfMXz",
+      "tool_name": "shell",
+      "duration_ms": 35.65192222595215
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 9,
+      "tokens": 247
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 10,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 5843,
+      "completion_tokens": 91,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_hx9j1WR3oKRftUDvX2pxPJ",
+      "tool_name": "shell",
+      "duration_ms": 30.002355575561523
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 11,
+      "tokens": 19
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 12,
+      "tool_calls": [
+        "read_file"
+      ],
+      "prompt_tokens": 5957,
+      "completion_tokens": 99,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_TwX7gJ00JbEVlIn7ZSEYrv",
+      "tool_name": "read_file",
+      "duration_ms": 36.02933883666992
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 13,
+      "tokens": 303
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 14,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 6364,
+      "completion_tokens": 401,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_DrSWpulzqx2r9YnxPenWv4",
+      "tool_name": "shell",
+      "duration_ms": 133.87823104858398
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 15,
+      "tokens": 57
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 16,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 6826,
+      "completion_tokens": 89,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_P3ULvP14p6MiypN2xOcRIC",
+      "tool_name": "shell",
+      "duration_ms": 39132.69925117493
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 17,
+      "tokens": 299
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 18,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 7219,
+      "completion_tokens": 385,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_unGJXVtse7mcbqsOCGOykJ",
+      "tool_name": "shell",
+      "duration_ms": 2209.4762325286865
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 19,
+      "tokens": 103
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 20,
+      "tool_calls": [
+        "think"
+      ],
+      "prompt_tokens": 7712,
+      "completion_tokens": 76,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_8lXa8Cq63Bh82TkchnMYor",
+      "tool_name": "think",
+      "duration_ms": 3.214597702026367
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 21,
+      "tokens": 38
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 22,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 7830,
+      "completion_tokens": 391,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_3QlpkUPLUuXAqk0PlSu1wN",
+      "tool_name": "shell",
+      "duration_ms": 467.3750400543213
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 23,
+      "tokens": 708
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 24,
+      "tool_calls": [
+        "think"
+      ],
+      "prompt_tokens": 8934,
+      "completion_tokens": 106,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_lmSEbgT05vGtRU2PEdaLkA",
+      "tool_name": "think",
+      "duration_ms": 6.128787994384766
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 25,
+      "tokens": 68
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 26,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 9112,
+      "completion_tokens": 376,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_7wBkysPI7tbruZolMAztbJ",
+      "tool_name": "shell",
+      "duration_ms": 514.0607357025146
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 27,
+      "tokens": 67
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 28,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 9560,
+      "completion_tokens": 117,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_SmWVJn7jNN6UVTR2DEvbFN",
+      "tool_name": "shell",
+      "duration_ms": 35.076141357421875
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 29,
+      "tokens": 26
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 30,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 9707,
+      "completion_tokens": 87,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_SEtRKX30Pi6WI0NpvoXm3n",
+      "tool_name": "shell",
+      "duration_ms": 2129.9984455108643
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 31,
+      "tokens": 132
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 32,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 9931,
+      "completion_tokens": 103,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_ghses6qZQmTpCdE8o8MaBQ",
+      "tool_name": "shell",
+      "duration_ms": 613.4977340698242
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 33,
+      "tokens": 521
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 34,
+      "tool_calls": [
+        "think"
+      ],
+      "prompt_tokens": 10560,
+      "completion_tokens": 86,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_zAucvesKFSyp4eoBc8KJQG",
+      "tool_name": "think",
+      "duration_ms": 2.9976367950439453
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 35,
+      "tokens": 48
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 36,
+      "tool_calls": [
+        "grep_files"
+      ],
+      "prompt_tokens": 10698,
+      "completion_tokens": 88,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_cU6A17b6ItcH8YkDUeEYhN",
+      "tool_name": "grep_files",
+      "duration_ms": 82.65852928161621
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 37,
+      "tokens": 14
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 38,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 10804,
+      "completion_tokens": 113,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_cu4zWocZo2psKaJNiX8FCc",
+      "tool_name": "shell",
+      "duration_ms": 1683.6841106414795
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 39,
+      "tokens": 309
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 40,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 11231,
+      "completion_tokens": 112,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_zKJUWJf0wp6cHmkc6hiQwg",
+      "tool_name": "shell",
+      "duration_ms": 25.85768699645996
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 41,
+      "tokens": 246
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 42,
+      "tool_calls": [
+        "grep_files"
+      ],
+      "prompt_tokens": 11594,
+      "completion_tokens": 126,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_eMO0fFvBmepNZ4ER88nbHB",
+      "tool_name": "grep_files",
+      "duration_ms": 15.046119689941406
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 43,
+      "tokens": 14
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 44,
+      "tool_calls": [
+        "shell"
+      ],
+      "prompt_tokens": 11738,
+      "completion_tokens": 73,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_ecJvEvHv4JHSateYtBXYuj",
+      "tool_name": "shell",
+      "duration_ms": 18.251419067382812
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "tool",
+      "message_index": 45,
+      "tokens": 69
+    },
+    {
+      "event_type": "message",
+      "branch_path": [],
+      "conversation_id": 0,
+      "role": "assistant",
+      "message_index": 46,
+      "tool_calls": [
+        "complete_task"
+      ],
+      "prompt_tokens": 11884,
+      "completion_tokens": 412,
+      "reasoning_tokens": 0,
+      "finish_reason": "tool_calls"
+    },
+    {
+      "event_type": "tool_call",
+      "branch_path": [],
+      "tool_call_id": "tooluse_DaiJo1mPdg8iN2wZ8b3laM",
+      "tool_name": "complete_task",
+      "duration_ms": 3.222227096557617
+    }
+  ]
+}

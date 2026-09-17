@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cutlass/cutlass.h>
+#include <cutlass/arch/barrier.h>
 
 namespace trtllm {
 namespace dev {

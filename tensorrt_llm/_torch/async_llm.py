@@ -103,9 +103,14 @@ class AsyncLLM(LLM):
         return super().generate_async(*args, **kwargs)
 
     async def pause_generation(self) -> None:
-        """Abort all in-flight requests and block new ones until resume_generation() is called."""
+        """Abort all in-flight requests and block new ones until resume_generation() is called.
+
+        Sends abort signals then drains the executor. It only returns once the engine
+        has no active or queued requests.
+        """
         self._paused = True
         self._executor.abort_all_requests()
+        await self.collective_rpc("wait_for_engine_idle")
 
     async def resume_generation(self) -> None:
         """Allow new generation requests after a pause_generation() call."""

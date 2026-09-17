@@ -96,7 +96,7 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4
 template <typename T>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, int64_t batch_count,
-    tkc::CutlassGemmConfig const& gemmConfig, FP4GemmType fp4GemmType)
+    tkc::CutlassGemmConfig const& gemmConfig, FP4GemmType fp4GemmType, void const* bias_ptr = nullptr)
 {
     if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
@@ -107,7 +107,8 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 
         gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
             mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
-            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()),
+            bias_ptr);
     }
     else if (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
     {
@@ -118,7 +119,8 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 
         gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
             mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
-            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()),
+            bias_ptr);
     }
 }
 
@@ -133,7 +135,8 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, FP4GemmType fp4GemmType,
     std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind,
-    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt,
+    std::optional<at::Tensor> const& bias = std::nullopt)
 {
     if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
@@ -198,16 +201,31 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     std::vector<int64_t> out_shape = mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
     auto [out, _] = torch_ext::allocate_output(
         out_shape, out_dtype.value(), mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+
+    void const* bias_ptr = nullptr;
+    if (bias.has_value())
+    {
+        auto const& bias_tensor = *bias;
+        CHECK_TH_CUDA(bias_tensor);
+        TORCH_CHECK(bias_tensor.device() == out.device(), "bias must reside on the same CUDA device as the output");
+        TORCH_CHECK(bias_tensor.is_contiguous(), "bias must be contiguous");
+        TORCH_CHECK(bias_tensor.dim() == 1, "bias must be 1-D");
+        TORCH_CHECK(bias_tensor.sizes()[0] == n, "bias size must equal n=", n);
+        TORCH_CHECK(bias_tensor.scalar_type() == out.scalar_type(), "bias dtype must match output dtype");
+        bias_ptr = bias_tensor.const_data_ptr();
+    }
+
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
-        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType);
+        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType, bias_ptr);
         break;
     case at::ScalarType::BFloat16:
-        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType);
+        runGemm<__nv_bfloat16>(
+            out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType, bias_ptr);
         break;
     case at::ScalarType::Float:
-        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType);
+        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType, bias_ptr);
         break;
     default: C10_THROW_ERROR(NotImplementedError, "out_dtype must be one of fp16/bf16/fp32.");
     }
@@ -278,7 +296,8 @@ public:
 
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
         at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t output_buffer_kind, int64_t configIdx,
-        c10::optional<torch::List<int64_t>> group = c10::nullopt) const
+        c10::optional<torch::List<int64_t>> group = c10::nullopt,
+        std::optional<at::Tensor> const& bias = std::nullopt) const
     {
         tkc::CutlassGemmConfig const* config = nullptr;
         if (configIdx != -1)
@@ -287,7 +306,7 @@ public:
             config = &mConfigs.at(configIdx);
         }
         return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, mfp4GemmType, mOutputDtype,
-            output_buffer_kind, config, group);
+            output_buffer_kind, config, group, bias);
     }
 
     at::ScalarType getOutputDtype() const

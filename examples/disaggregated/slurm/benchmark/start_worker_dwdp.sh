@@ -18,6 +18,35 @@ unset UCX_TLS
 
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname)"
 
+# NOTE: do NOT export CUDA_VISIBLE_DEVICES from this script.
+#
+# Restricting CUDA visibility to a single GPU (via CUDA driver isolation)
+# breaks DWDP's intra-node peer GPU discovery:
+#   - VA composite cuMemMap imports of peer GPUs' MNNVL fabric handles
+#   - UCX cuda_ipc / cuda_copy intra-node transports for CTX->GEN KV
+#   - PyTorch torch.cuda.device_count() peer enumeration
+# All of these need the process to *see* peer GPUs on the same node,
+# even if it only computes on one of them.
+#
+# Empirically (R1/T2/T3/T4 vs T5 on dwdp3 dg=4): exporting
+# ``CUDA_VISIBLE_DEVICES=<single_gpu>`` blows TTFT std up 3x and drops
+# per-CTX-GPU throughput by 15%, with TPOT unchanged.  Letting
+# trtllm-serve auto-pick the device from SLURM_LOCALID restores Phase
+# D's full perf.
+#
+# For audit, log which GPU SLURM would have given this rank.  With our
+# compact-packing allocate_gpus, the natural mapping is:
+#   gpu_id = (gpu_map_mpi_worker.txt[rank][2])   if gpu_map exists
+#         == SLURM_LOCALID                       (always, by construction)
+# so we log it but don't export.
+gpu_map_file="${log_dir}/gpu_map_mpi_worker.txt"
+if [ -f "${gpu_map_file}" ]; then
+    expected_gpu=$(awk -v p="${SLURM_PROCID}" '$1==p {print $3; exit}' "${gpu_map_file}")
+    echo "rank-to-gpu (arbitrary-dist path): SLURM_PROCID=${SLURM_PROCID} LOCALID=${SLURM_LOCALID} expected_gpu=${expected_gpu}"
+else
+    echo "rank-to-gpu (block-dist path): SLURM_PROCID=${SLURM_PROCID} LOCALID=${SLURM_LOCALID}"
+fi
+
 if [ "${SLURM_PROCID}" -lt "${num_ctx_gpus}" ]; then
     worker_role="CTX"
     worker_env_var=${ctx_worker_env_var}

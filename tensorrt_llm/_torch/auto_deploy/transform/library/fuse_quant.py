@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import Optional, Tuple, Type
 
 import torch
@@ -88,8 +102,8 @@ def _fp4_ref_repl_1(
     alpha: torch.Tensor,
 ):
     return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
-        x,
-        w_fp4,
+        input=x,
+        weight_fp4=w_fp4,
         bias=None,
         input_scale=input_scale,
         weight_scale=weight_scale,
@@ -126,8 +140,8 @@ def _fp4_ref_repl_2(
     alpha: torch.Tensor,
 ):
     return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
-        x,
-        w_fp4,
+        input=x,
+        weight_fp4=w_fp4,
         bias=bias,
         input_scale=input_scale,
         weight_scale=weight_scale,
@@ -140,7 +154,10 @@ def _register_quant_fp8_linear_patterns(patterns: ADPatternMatcherPass, op) -> N
     Register FP8 linear patterns with robust dummy args and minimal ignores.
     """
 
-    # Define replacement functions that use the provided op
+    # Define replacement functions that use the provided op.
+    # Use keyword-only binding for input/weight/bias so the call stays robust
+    # against any FX-state perturbation that affects positional arg layout
+    # (e.g., sharding placeholder insertion in this PR).
     def _fp8_ref_repl_1(
         x: torch.Tensor,
         w_fp8: torch.Tensor,
@@ -148,9 +165,9 @@ def _register_quant_fp8_linear_patterns(patterns: ADPatternMatcherPass, op) -> N
         weight_scale: torch.Tensor,
     ):
         return op(
-            x,
-            w_fp8,
-            None,
+            input=x,
+            weight_fp8=w_fp8,
+            bias=None,
             input_scale=input_scale,
             weight_scale=weight_scale,
         )
@@ -163,9 +180,9 @@ def _register_quant_fp8_linear_patterns(patterns: ADPatternMatcherPass, op) -> N
         weight_scale: torch.Tensor,
     ):
         return op(
-            x,
-            w_fp8,
-            bias,
+            input=x,
+            weight_fp8=w_fp8,
+            bias=bias,
             input_scale=input_scale,
             weight_scale=weight_scale,
         )

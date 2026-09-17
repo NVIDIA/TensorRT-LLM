@@ -9,10 +9,12 @@ from tensorrt_llm import LLM
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.executor.result import IterationResult
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
-                                 GuidedDecodingParams, QuantConfig,
-                                 RequestOutput)
+                                 ConversationParams, GuidedDecodingParams,
+                                 QuantConfig, RequestOutput)
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestSamplingParams(ApiStabilityTestHarness):
@@ -73,6 +75,11 @@ class TestSamplingParams(ApiStabilityTestHarness):
 class TestGuidedDecodingParams(ApiStabilityTestHarness):
     TEST_CLASS = GuidedDecodingParams
     REFERENCE_FILE = "guided_decoding_params.yaml"
+
+
+class TestConversationParams(ApiStabilityTestHarness):
+    TEST_CLASS = ConversationParams
+    REFERENCE_FILE = "conversation_params.yaml"
 
 
 class TestLogitsProcessor(ApiStabilityTestHarness):

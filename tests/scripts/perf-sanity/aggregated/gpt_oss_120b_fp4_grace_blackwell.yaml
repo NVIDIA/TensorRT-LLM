@@ -127,6 +127,7 @@ server_configs:
         dataset_file: datasets/perf-ci/gpt_oss_120b-1k8k-20480-ratio-1_for_serve.json
 
   - name: "gpt_oss_fp4_tp4_eagle3_1k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
     model_name: "gpt_oss_120b_fp4"
     tensor_parallel_size: 4
     moe_expert_parallel_size: 1

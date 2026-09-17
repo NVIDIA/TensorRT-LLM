@@ -17,6 +17,7 @@
 
 import operator
 
+import pytest
 import torch
 import torch.fx as fx
 import torch.nn as nn
@@ -25,6 +26,8 @@ from torch.fx import GraphModule
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 — register custom ops
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import ShardableNode
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_any_split_op, is_any_view_op
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _call_function_nodes(gm: GraphModule):

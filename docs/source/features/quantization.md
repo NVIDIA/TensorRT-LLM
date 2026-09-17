@@ -61,6 +61,10 @@ llm = LLM(model='/path/to/model',
 llm.generate("Hello, my name is")
 ```
 
+This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
+cache in its normal runtime type and use NVFP4 only while Pages reside in Host
+or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
+
 
 ### Offline Quantization with ModelOpt
 
@@ -135,5 +139,6 @@ FP8 block wise scaling GEMM kernels for sm100/103 are using MXFP8 recipe (E4M3 a
 
 ## Quick Links
 
+- [KV Cache Compression](kv-cache-compression.md)
 - [Pre-quantized Models by ModelOpt](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4)
 - [ModelOpt Support Matrix](https://nvidia.github.io/Model-Optimizer/guides/0_support_matrix.html)

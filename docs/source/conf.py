@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 # Configuration file for the Sphinx documentation builder.
 #
 # For the full list of built-in configuration values, see the documentation:
@@ -8,6 +11,7 @@ import importlib.util
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 import os
+import re
 import subprocess
 import sys
 
@@ -42,7 +46,9 @@ version = version_module.__version__
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 templates_path = ['_templates']
-exclude_patterns = ['performance/performance-tuning-guide/introduction.md']
+exclude_patterns = [
+    'legacy/performance/performance-tuning-guide/introduction.md'
+]
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CPP_XML_INDEX = os.path.abspath(
@@ -67,11 +73,24 @@ extensions = [
     'sphinxcontrib.autodoc_pydantic',
     'sphinx_togglebutton',
     'sphinxcontrib.mermaid',
+    'trtllm_auto_deploy',
+    'llmapi_config_telemetry',
     'trtllm_config_selector',
 ]
 
 if HAS_CPP_XML:
     extensions.append("breathe")
+
+# Without this, autosectionlabel registers every section title as a global
+# label, so the many pages that share headings ("Overview", "Prerequisites",
+# "Known Issues", ...) collide and each collision is reported. Prefixing with
+# the document name makes the labels unique.
+autosectionlabel_prefix_document = True
+# Pages that repeat a heading internally still collide after prefixing -- the
+# release notes alone repeat "Fixed Issues" and friends once per release. Only
+# top-level sections are worth a generated label; deeper ones are reached
+# through explicit targets.
+autosectionlabel_maxdepth = 2
 
 autodoc_member_order = 'bysource'
 autodoc_pydantic_model_show_json = True
@@ -93,7 +112,9 @@ myst_url_schemes = {
     "https://github.com/NVIDIA/TensorRT-LLM/tree/" + commit_hash + "/{{path}}",
 }
 
-myst_heading_anchors = 4
+# Several pages (mostly tech blogs) carry hand-written tables of contents that
+# link down to level-5 headings, so anchors have to be generated that deep.
+myst_heading_anchors = 6
 
 myst_enable_extensions = [
     "deflist",
@@ -177,16 +198,46 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
     return [node], []
 
 
-def setup(app):
-    from helper import generate_examples, generate_llmapi, update_version
+def _expand_visualgen_navigation(_app, docname: str, source: list[str]) -> None:
+    """Keep Sphinx navigation hidden in GitHub's Markdown preview."""
+    if docname == 'features/visual-generation':
+        source[0] = re.sub(r'<!-- sphinx-only\n(.*?)\n-->',
+                           r'\1',
+                           source[0],
+                           flags=re.DOTALL)
 
+
+def setup(app):
+    from helper import (check_llmapi_reference_size,
+                        compact_llmapi_search_signature, generate_examples,
+                        generate_llmapi, strip_llmapi_search_docstrings,
+                        update_version)
+
+    # `import tensorrt_llm` pulls in the compiled bindings, which link against
+    # libcuda.so.1. On a driverless (CPU) doc-build node that resolves only if
+    # the CUDA driver stub is on LD_LIBRARY_PATH (see
+    # scripts/cuda_driver_stub.py, exported before `make html`). A failed import
+    # yields incomplete API docs, so in CI (TRTLLM_DOCS_REQUIRE_IMPORT=1) treat
+    # it as a hard failure instead of a silent warning; a local doc-only build
+    # without the wheel still degrades gracefully.
+    require_import = os.environ.get("TRTLLM_DOCS_REQUIRE_IMPORT") == "1"
     try:
         from tensorrt_llm.llmapi.utils import tag_llm_params
         tag_llm_params()
-    except ImportError:
-        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
+        print("tensorrt_llm imported successfully; applied tag_llm_params")
+    except ImportError as e:
+        msg = f"tensorrt_llm not importable, API docs would be incomplete: {e}"
+        if require_import:
+            raise RuntimeError(
+                "tensorrt_llm not importable, API docs would be incomplete"
+            ) from e
+        print(f"Warning: {msg}; skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
+    app.connect('source-read', _expand_visualgen_navigation)
+    app.connect('autodoc-process-docstring', strip_llmapi_search_docstrings)
+    app.connect('autodoc-process-signature', compact_llmapi_search_signature)
+    app.connect('build-finished', check_llmapi_reference_size)
 
     generate_examples()
     generate_llmapi()

@@ -42,8 +42,6 @@ environment:
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
 worker_config:
   gen:
     print_iter_log: true
@@ -66,6 +64,7 @@ worker_config:
       backend: TRTLLM
     cache_transceiver_config:
       backend: UCX
+      transceiver_runtime: CPP
     disable_overlap_scheduler: false
   ctx:
     print_iter_log: true
@@ -88,4 +87,5 @@ worker_config:
       backend: TRTLLM
     cache_transceiver_config:
       backend: UCX
-    disable_overlap_scheduler: true
+      transceiver_runtime: CPP
+    disable_overlap_scheduler: false

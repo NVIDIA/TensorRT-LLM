@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 from torch.fx import Graph, GraphModule, Node
-from xdsl.dialects.builtin import ModuleOp
+from xdsl.dialects.builtin import ModuleOp, TensorType
 from xdsl.ir import Operation, SSAValue
 
 from .dialect import (
@@ -512,14 +512,24 @@ class MLIRToFXConverter:
     def _restore_meta_from_op(
         node: Node, mlir_op: Operation, metadata: Dict[str, Dict[str, Any]]
     ) -> None:
-        """No-op: metadata for precisely-lowered ops is recomputed by shape propagation.
+        """Restore metadata for precisely-lowered ops from MLIR result types.
 
         Precisely-lowered ops (ad.add, ad.mul, etc.) don't carry a node_key back
         to the original FX metadata side-table, so there is no key to look up.
-        The transform framework runs shape_prop after MLIR→FX conversion, which
-        repopulates node.meta["val"] for all nodes.
+        Most runs recover metadata through shape propagation, but some AutoDeploy
+        graph partitions do not have fake input tensors available. In that case,
+        downstream transforms still require shape and dtype metadata from
+        node.meta["val"].
         """
-        pass
+        del metadata
+
+        output = getattr(mlir_op, "output", None)
+        if output is None:
+            return
+
+        fake_val = _fake_tensor_from_mlir_type(output.type)
+        if fake_val is not None:
+            node.meta["val"] = fake_val
 
     @staticmethod
     def _resolve_target(op_name: str) -> Optional[Callable]:
@@ -543,3 +553,16 @@ def _opaque_placeholder(*args, **kwargs):
         "Opaque op placeholder was called. This indicates an MLIR → FX "
         "conversion issue where the original op target could not be resolved."
     )
+
+
+def _fake_tensor_from_mlir_type(result_type: Any) -> torch.Tensor | None:
+    """Build minimal tensor metadata from an MLIR tensor result type."""
+    if not isinstance(result_type, TensorType):
+        return None
+
+    shape = [s if s >= 0 else 2 for s in result_type.get_shape()]
+    try:
+        dtype = mlir_to_torch_dtype(result_type.element_type)
+    except ValueError:
+        return None
+    return torch.empty(shape, dtype=dtype, device="meta")

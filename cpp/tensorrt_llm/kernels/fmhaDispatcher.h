@@ -61,6 +61,9 @@ private:
     UniqPtrWNullCopy<kernels::FusedMHARunnerV2> mFMHARunner;
     // Runner for trtllm-gen fmha kernels (for SM == 100)
     UniqPtrWNullCopy<kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
+    // Cached SM count to avoid repeated cudaDeviceGetAttribute calls in the per-iter
+    // FMHA dispatch hot path (isSupported / run).
+    int mMultiProcessorCount{0};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

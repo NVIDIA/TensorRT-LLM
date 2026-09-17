@@ -146,6 +146,7 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
         logger.debug(f"DeviceMeshTopology.tp_mesh: {cls.tp_mesh}")
 
     @require_device_mesh
+    @torch.compiler.disable
     def _get_mesh_dim_by_name(self, name: str) -> dist.DeviceMesh:
         cls = DeviceMeshTopologyImpl
 

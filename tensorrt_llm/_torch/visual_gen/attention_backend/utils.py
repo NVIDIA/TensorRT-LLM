@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,8 +25,8 @@ from typing import Optional, Type
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
-from ..config import AttentionConfig
 from .interface import AttentionBackend
 
 
@@ -37,7 +37,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
 
     Returns:
         Diffusion attention backend class
@@ -47,11 +47,20 @@ def get_visual_gen_attention_backend(
                      Uses torch SDPA backend
         - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths)
                     Better performance but requires fused QKV
+        - "FLASHINFER": Dense prefill attention without a KV cache. Supports FP16/BF16
+                        and architecture-specific NVFP4 attention recipes.
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
-                         Requires flash-attn package with cute interface
+                 Requires flash-attn package with cute interface
+        - "CUTEDSL": CuTe DSL kernels. create_attention selects dense/SkipSoftmax FMHA or VSA
+                      from AttentionConfig.sparse_attention_config.
+        - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
+                   selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).
     """
     # Lazy imports to avoid circular dependency
+    from .cudnn import CuDNNAttention
+    from .cute_dsl import CuTeDSLAttention
     from .flash_attn4 import FlashAttn4Attention
+    from .flashinfer import FlashInferAttention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
@@ -61,8 +70,14 @@ def get_visual_gen_attention_backend(
         return VanillaAttention
     elif backend_name == "TRTLLM":
         return TrtllmAttention
+    elif backend_name == "FLASHINFER":
+        return FlashInferAttention
     elif backend_name == "FA4":
         return FlashAttn4Attention
+    elif backend_name == "CUTEDSL":
+        return CuTeDSLAttention
+    elif backend_name == "CUDNN":
+        return CuDNNAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
@@ -89,7 +104,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -100,9 +115,10 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
-        attention_config: Optional AttentionConfig
+        attention_config: Optional AttentionConfig used to select the attention algorithm and
+            forward its quantization or sparsity configuration.
         attention_metadata_state: Optional model-scoped metadata state from
-            visual-gen config. Required for TRTLLM backend.
+            visual-gen config. Required for TRTLLM and shared by FlashInfer layers.
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -110,6 +126,10 @@ def create_attention(
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 
+    # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
+    # FMHA backend.
+    if attention_config is not None and attention_config.quant_attention_config is not None:
+        kwargs["quant_attention_config"] = attention_config.quant_attention_config
     if backend.upper() == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(
@@ -117,6 +137,22 @@ def create_attention(
                 "DiffusionModelConfig; creation path must not allocate metadata implicitly."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
+    elif backend.upper() == "FLASHINFER":
+        if attention_metadata_state is None:
+            raise ValueError(
+                "FLASHINFER backend requires `attention_metadata_state` from "
+                "DiffusionModelConfig for shared workspace allocation."
+            )
+        kwargs["attention_metadata_state"] = attention_metadata_state
+    if backend.upper() == "CUTEDSL" and attention_config is not None:
+        if (
+            attention_config.sparse_attention_config is not None
+            and getattr(attention_config.sparse_attention_config, "algorithm", None) == "vsa"
+        ):
+            from .cute_dsl.vsa import VSAAttention
+
+            attn_cls = VSAAttention
+            kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
 
     return attn_cls(
         layer_idx=layer_idx,

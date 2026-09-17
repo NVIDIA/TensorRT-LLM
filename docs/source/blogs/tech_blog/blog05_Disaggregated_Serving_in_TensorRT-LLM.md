@@ -124,11 +124,11 @@ In the Dynamo workflow, requests are initially processed by pre- and post-proces
 
 Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
 
-For more information on how to use Dynamo with TensorRT LLM, please refer to [this documentation](https://docs.dynamo.nvidia.com/dynamo/backends/tensor-rt-llm).
+For more information on how to use Dynamo with TensorRT LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/backends/tensor-rt-llm).
 
 ### Triton Inference Server
 
-The third approach to do disaggregated LLM inference with TensorRT LLM utilizes the Triton Inference Server. With this approach a Triton ensemble model is employed, comprising a preprocessor, an orchestrator implemented as [a Python business logic scripting (BLS) backend](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/bls.html), and a post-processor. The orchestrator is responsible for routing client requests to context and generation instances, managing the flow of prompt tokens, and handling the return of generated tokens. This approach is illustrated in Figure 5. The Triton Inference Server approach relies on the Triton TensorRT LLM backend and the Executor API, which is supported only for the TensorRT backend. For more information on how to use this approach, please refer to [this documentation](https://github.com/NVIDIA/TensorRT-LLM/tree/main/triton_backend/all_models/disaggregated_serving#running-disaggregated-serving-with-triton-tensorrt-llm-backend).
+The third approach to do disaggregated LLM inference with TensorRT LLM utilizes the Triton Inference Server. With this approach a Triton ensemble model is employed, comprising a preprocessor, an orchestrator implemented as [a Python business logic scripting (BLS) backend](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/bls.html), and a post-processor. The orchestrator is responsible for routing client requests to context and generation instances, managing the flow of prompt tokens, and handling the return of generated tokens. This approach is illustrated in Figure 5. The Triton Inference Server approach relies on the Triton TensorRT LLM backend and the Executor API, which is supported only for the TensorRT backend. For more information on how to use this approach, please refer to [this documentation](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.0/triton_backend/all_models/disaggregated_serving#running-disaggregated-serving-with-triton-tensorrt-llm-backend).
 
 <div align="center">
 <figure>

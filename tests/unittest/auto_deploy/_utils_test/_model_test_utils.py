@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 from typing import Any, Dict, Optional
 
@@ -423,16 +437,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 1,
         },
     },
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "intermediate_size": 256,
-            "hidden_size": 64,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "num_local_experts": 2,
-        },
-    },
     "Qwen/Qwen3-30B-A3B": {
         "model_kwargs": {
             "num_hidden_layers": 2,
@@ -441,33 +445,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "num_experts": 16,
-        },
-    },
-    "microsoft/Phi-3-mini-4k-instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 128,
-            "intermediate_size": 256,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-        },
-    },
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "model_factory": "AutoModelForImageTextToText",
-        "model_kwargs": {
-            "text_config": {
-                "num_hidden_layers": 1,
-                "head_dim": 64,
-                "hidden_size": 32,
-                "intermediate_size": 64,
-                "intermediate_size_mlp": 64,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "num_local_experts": 2,
-            },
-            "vision_config": {
-                "num_hidden_layers": 1,
-            },
         },
     },
     "deepseek-ai/DeepSeek-V3": {
@@ -487,15 +464,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
             "num_experts_per_tok": 2,
             "q_lora_rank": 128,
-        },
-    },
-    "Qwen/Qwen2.5-3B-Instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
         },
     },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
@@ -627,6 +595,7 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
         "free_gpu_memory_fraction": 0.0,  # No resizing of the cache to keep the mem footprint small
     }
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
+    llm_args["max_seq_len"] = 256
     llm_args["cuda_graph_config"] = {"max_batch_size": 2}  # Match max_batch_size
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)

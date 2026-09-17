@@ -1,3 +1,10 @@
-# Configuration for Apple OpenELM models
-# These models require Llama-2 tokenizer
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration for Apple OpenELM models (270M, 1.1B, 3B)
+# These models use the Llama-2 tokenizer (confirmed by Apple's CoreNet docs).
 tokenizer: meta-llama/Llama-2-7b-hf
+
+# Override dashboard_default's attn_backend=trtllm which produces degenerate
+# output for OpenELM. Use flashinfer which works with torch-cudagraph.
+attn_backend: flashinfer

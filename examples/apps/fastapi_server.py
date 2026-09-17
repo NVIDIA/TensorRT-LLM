@@ -18,9 +18,9 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm.executor import CppExecutorError, RequestError
-from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -120,8 +120,6 @@ def entrypoint(model_dir: str,
     port = port or 8000
     logging.info(f"Starting server at {host}:{port}")
 
-    build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width)
-
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
 
@@ -129,7 +127,8 @@ def entrypoint(model_dir: str,
               tokenizer,
               tensor_parallel_size=tp_size,
               pipeline_parallel_size=pp_size,
-              build_config=build_config,
+              max_batch_size=10,
+              max_beam_width=max_beam_width,
               kv_cache_config=kv_cache_config)
 
     server = LlmServer(llm=llm)

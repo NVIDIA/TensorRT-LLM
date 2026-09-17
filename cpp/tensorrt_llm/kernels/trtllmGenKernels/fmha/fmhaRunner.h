@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ public:
     // Constructor.
     explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
         int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
-        int numEltsPerSageAttnBlkV = 0);
+        int numEltsPerSageAttnBlkV = 0, bool fusesDsv4InvRopeFp8Quant = false);
 
     TllmGenFmhaRunner() = default;
 
@@ -64,6 +64,8 @@ private:
     int mNumEltsPerSageAttnBlkK;
     int mNumEltsPerSageAttnBlkP;
     int mNumEltsPerSageAttnBlkV;
+    // Whether DSv4 inverse-RoPE + FP8 quant epilogue fusion is enabled.
+    bool mFusesDsv4InvRopeFp8Quant;
 };
 
 } // namespace kernels

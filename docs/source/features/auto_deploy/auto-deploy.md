@@ -53,6 +53,10 @@ The exported graph then undergoes a series of automated transformations, includi
 
 - [Support Matrix](support_matrix.md)
 
+## API Reference
+
+- [AutoDeploy Transforms](transforms.rst)
+
 ## Advanced Usage
 
 - [Example Run Script](./advanced/example_run.md)

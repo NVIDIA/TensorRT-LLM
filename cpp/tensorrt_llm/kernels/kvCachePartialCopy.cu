@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/kvCachePartialCopy.h"
 #include <cstdint>
 #include <cuda_runtime_api.h>
@@ -89,42 +90,42 @@ void kvCacheBlockPartialCopy(IBuffer& dst, IBuffer const& src, unsigned int numL
     TLLM_CHECK_WITH_INFO(dataType == dst.getDataType(), "src and dst dataType does not match");
     switch (dataType)
     {
-    case nvinfer1::DataType::kINT64:
+    case tensorrt_llm::DataType::kINT64:
         hostKVCacheBlockPartialCopy<SizeType64>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
-    case nvinfer1::DataType::kINT32:
+    case tensorrt_llm::DataType::kINT32:
         hostKVCacheBlockPartialCopy<std::int32_t>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
-    case nvinfer1::DataType::kFLOAT:
+    case tensorrt_llm::DataType::kFLOAT:
         hostKVCacheBlockPartialCopy<float>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
         hostKVCacheBlockPartialCopy<__nv_bfloat16>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
 #endif
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
         hostKVCacheBlockPartialCopy<half>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
-    case nvinfer1::DataType::kBOOL:
+    case tensorrt_llm::DataType::kBOOL:
         hostKVCacheBlockPartialCopy<bool>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
-    case nvinfer1::DataType::kUINT8:
+    case tensorrt_llm::DataType::kUINT8:
         hostKVCacheBlockPartialCopy<std::uint8_t>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
-    case nvinfer1::DataType::kINT8:
+    case tensorrt_llm::DataType::kINT8:
         hostKVCacheBlockPartialCopy<std::int8_t>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;
 #ifdef ENABLE_FP8
-    case nvinfer1::DataType::kFP8:
+    case tensorrt_llm::DataType::kFP8:
         hostKVCacheBlockPartialCopy<__nv_fp8_e4m3>(
             dst, src, numLayers, numHeads, tokensPerBlock, numHidden, numTokensToCopy, kvFactor, stream);
         break;

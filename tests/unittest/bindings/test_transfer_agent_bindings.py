@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import numpy as np
 import pytest
 
 # Try to import the transfer agent binding module
@@ -85,6 +86,7 @@ pytestmark = pytest.mark.skipif(
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 def test_memory_type_enum():
     """Test MemoryType enum values."""
     assert tab.MemoryType.DRAM is not None
@@ -98,6 +100,7 @@ def test_memory_type_enum():
     assert tab.MemoryType.VRAM != tab.MemoryType.BLK
 
 
+@pytest.mark.cpu_only
 def test_transfer_op_enum():
     """Test TransferOp enum values."""
     assert tab.TransferOp.READ is not None
@@ -105,6 +108,7 @@ def test_transfer_op_enum():
     assert tab.TransferOp.READ != tab.TransferOp.WRITE
 
 
+@pytest.mark.cpu_only
 def test_transfer_state_enum():
     """Test TransferState enum values."""
     assert tab.TransferState.IN_PROGRESS is not None
@@ -117,6 +121,7 @@ def test_transfer_state_enum():
     assert tab.TransferState.IN_PROGRESS != tab.TransferState.FAILURE
 
 
+@pytest.mark.cpu_only
 def test_memory_desc():
     """Test MemoryDesc class."""
     addr = 0x1000
@@ -130,6 +135,7 @@ def test_memory_desc():
     assert desc.device_id == device_id
 
 
+@pytest.mark.cpu_only
 def test_memory_desc_different_values():
     """Test MemoryDesc with different values."""
     test_cases = [
@@ -145,6 +151,7 @@ def test_memory_desc_different_values():
         assert desc.device_id == device_id
 
 
+@pytest.mark.cpu_only
 def test_memory_descs():
     """Test MemoryDescs class."""
     desc1 = tab.MemoryDesc(0x1000, 4096, 0)
@@ -158,6 +165,41 @@ def test_memory_descs():
     assert descs.descs[1].addr == 0x2000
 
 
+@pytest.mark.cpu_only
+def test_memory_descs_from_readonly_arrays():
+    """Test MemoryDescs construction from read-only arrays."""
+    addrs = np.array([0x1000, 0x2000], dtype=np.int64)
+    sizes = np.array([4096, 8192], dtype=np.int64)
+    device_ids = np.array([0, 1], dtype=np.int32)
+    addrs.flags.writeable = False
+    sizes.flags.writeable = False
+    device_ids.flags.writeable = False
+
+    descs = tab.MemoryDescs.from_arrays(tab.MemoryType.VRAM, addrs, sizes, device_ids)
+
+    assert [(desc.addr, desc.len, desc.device_id) for desc in descs.descs] == [
+        (0x1000, 4096, 0),
+        (0x2000, 8192, 1),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_memory_descs_from_readonly_arrays_uniform_device():
+    """Test uniform-device MemoryDescs construction from read-only arrays."""
+    addrs = np.array([0x1000, 0x2000], dtype=np.int64)
+    sizes = np.array([4096, 8192], dtype=np.int64)
+    addrs.flags.writeable = False
+    sizes.flags.writeable = False
+
+    descs = tab.MemoryDescs.from_arrays_uniform_device(tab.MemoryType.VRAM, addrs, sizes, 2)
+
+    assert [(desc.addr, desc.len, desc.device_id) for desc in descs.descs] == [
+        (0x1000, 4096, 2),
+        (0x2000, 8192, 2),
+    ]
+
+
+@pytest.mark.cpu_only
 def test_memory_descs_empty():
     """Test MemoryDescs with empty list."""
     descs = tab.MemoryDescs(tab.MemoryType.DRAM, [])
@@ -165,6 +207,7 @@ def test_memory_descs_empty():
     assert len(descs.descs) == 0
 
 
+@pytest.mark.cpu_only
 def test_agent_desc_from_string():
     """Test AgentDesc from string."""
     test_data = "test_agent_descriptor"
@@ -172,6 +215,7 @@ def test_agent_desc_from_string():
     assert desc.backend_agent_desc == test_data.encode()
 
 
+@pytest.mark.cpu_only
 def test_agent_desc_from_bytes():
     """Test AgentDesc from bytes."""
     test_data = b"test_binary_data\x00\x01\x02"
@@ -179,13 +223,81 @@ def test_agent_desc_from_bytes():
     assert desc.backend_agent_desc == test_data
 
 
+@pytest.mark.cpu_only
+def test_agent_desc_serialize_returns_bytes():
+    """Test that AgentDesc.serialize() returns bytes."""
+    desc = tab.AgentDesc("some_blob")
+    serialized = desc.serialize()
+    assert isinstance(serialized, bytes)
+    assert len(serialized) > 0
+
+
+@pytest.mark.cpu_only
+def test_agent_desc_serialize_deserialize_no_regions():
+    """Test AgentDesc serialize/deserialize roundtrip without VMM regions."""
+    original_blob = b"nixl_metadata_blob_content"
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob
+
+
+@pytest.mark.cpu_only
+def test_agent_desc_serialize_deserialize_roundtrip_string():
+    """Test AgentDesc serialize/deserialize roundtrip with string input."""
+    original_blob = "string_blob_data"
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob.encode()
+
+
+@pytest.mark.cpu_only
+def test_agent_desc_serialize_deserialize_binary_blob():
+    """Test AgentDesc serialize/deserialize with binary data containing null bytes."""
+    # NIXL blobs can contain arbitrary binary data including null bytes
+    original_blob = bytes(range(256))
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob
+
+
+@pytest.mark.cpu_only
+def test_agent_desc_deserialize_accepts_bytes():
+    """Test that AgentDesc.deserialize() accepts bytes input."""
+    desc = tab.AgentDesc(b"test_data")
+    serialized = desc.serialize()
+
+    # deserialize should accept bytes
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == b"test_data"
+
+
+@pytest.mark.cpu_only
+def test_agent_desc_serialize_deserialize_empty_blob():
+    """Test AgentDesc serialize/deserialize with empty backend blob."""
+    desc = tab.AgentDesc(b"")
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == b""
+
+
+@pytest.mark.cpu_only
 def test_base_agent_config_default():
     """Test BaseAgentConfig with default values."""
     config = tab.BaseAgentConfig()
     # Default values should be set
     assert config is not None
+    assert config.rank is None
+    assert config.world_size is None
 
 
+@pytest.mark.cpu_only
 def test_base_agent_config_custom():
     """Test BaseAgentConfig with custom values."""
     name = "test_agent"
@@ -194,6 +306,8 @@ def test_base_agent_config_custom():
     use_listen_thread = True
     enable_telemetry = True
     backend_params = {"key1": "value1", "key2": "value2"}
+    rank = 2
+    world_size = 4
 
     config = tab.BaseAgentConfig(
         name=name,
@@ -202,6 +316,8 @@ def test_base_agent_config_custom():
         use_listen_thread=use_listen_thread,
         enable_telemetry=enable_telemetry,
         backend_params=backend_params,
+        rank=rank,
+        world_size=world_size,
     )
 
     assert config.name == name
@@ -210,8 +326,11 @@ def test_base_agent_config_custom():
     assert config.use_listen_thread == use_listen_thread
     assert config.enable_telemetry == enable_telemetry
     assert config.backend_params == backend_params
+    assert config.rank == rank
+    assert config.world_size == world_size
 
 
+@pytest.mark.cpu_only
 def test_base_agent_config_readwrite():
     """Test BaseAgentConfig read/write properties."""
     config = tab.BaseAgentConfig()
@@ -234,7 +353,14 @@ def test_base_agent_config_readwrite():
     config.backend_params = {"test_key": "test_value"}
     assert config.backend_params == {"test_key": "test_value"}
 
+    config.rank = 1
+    assert config.rank == 1
 
+    config.world_size = 2
+    assert config.world_size == 2
+
+
+@pytest.mark.cpu_only
 def test_transfer_request():
     """Test TransferRequest class."""
     src_desc = tab.MemoryDesc(0x1000, 4096, 0)
@@ -253,6 +379,7 @@ def test_transfer_request():
     assert request.dst_descs.type == tab.MemoryType.VRAM
 
 
+@pytest.mark.cpu_only
 def test_transfer_request_read_op():
     """Test TransferRequest with READ operation."""
     src_desc = tab.MemoryDesc(0x3000, 2048, 0)
@@ -267,6 +394,7 @@ def test_transfer_request_read_op():
     assert request.remote_name == "another_remote"
 
 
+@pytest.mark.cpu_only
 def test_backend_availability_flags():
     """Test that backend availability flags are exposed."""
     # These should always be defined (either True or False)
@@ -281,6 +409,7 @@ def test_backend_availability_flags():
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 @pytest.mark.skipif(not HAS_NIXL, reason="NIXL backend not available")
 class TestNixlTransferAgent:
     """Test cases for NixlTransferAgent."""
@@ -325,6 +454,7 @@ class TestNixlTransferAgent:
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 @pytest.mark.skipif(not HAS_MOONCAKE, reason="Mooncake backend not available")
 class TestMooncakeTransferAgent:
     """Test cases for Mooncake transfer agent via make_transfer_agent factory.
@@ -527,8 +657,11 @@ class TestNixlFunctionalTransfer:
         status = agent_a.submit_transfer_requests(request)
 
         # With timeout_ms=0, wait checks status once and returns immediately.
+        # Either IN_PROGRESS (transfer still running) or SUCCESS (transfer
+        # already completed by the progress thread on a fast loopback path)
+        # is a valid non-blocking observation; FAILURE would indicate a bug.
         result = status.wait(timeout_ms=0)
-        assert result == tab.TransferState.IN_PROGRESS
+        assert result in (tab.TransferState.IN_PROGRESS, tab.TransferState.SUCCESS)
 
         # Wait for the transfer to actually finish before cleanup
         final_result = status.wait(timeout_ms=5000)
@@ -741,8 +874,9 @@ class TestMooncakeFunctionalTransfer:
         )
         status = agent_a.submit_transfer_requests(request)
 
+        # Zero-timeout poll must not block; a fast device may already be done, so accept either.
         result = status.wait(timeout_ms=0)
-        assert result == tab.TransferState.IN_PROGRESS
+        assert result in (tab.TransferState.IN_PROGRESS, tab.TransferState.SUCCESS)
 
         final_result = status.wait(timeout_ms=5000)
         assert final_result == tab.TransferState.SUCCESS

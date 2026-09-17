@@ -1,0 +1,25 @@
+{
+  "image": "glm_image_nvfp4_lpips_golden.png",
+  "model": "GLM-Image",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "a tiny astronaut hatching from an egg on the moon",
+  "height": 1024,
+  "width": 1024,
+  "num_inference_steps": 30,
+  "guidance_scale": 1.5,
+  "seed": 42,
+  "feature_config": {
+    "quantization": "NVFP4",
+    "cuda_graph": false
+  },
+  "torch_compile": false,
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.39.0",
+  "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
+  "tensorrt_llm_version": "1.3.0rc25",
+  "tensorrt_llm_commit": "14ad9b524dd98dd514dd265601ac9c993b2d093b",
+  "container_image": "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-skip-tritondevel-202607311529-16970",
+  "sha256": "8489b4a994a3ae93c109d556e3ba3c932f19f150de3f53808d0c3e1b20688fcc"
+}

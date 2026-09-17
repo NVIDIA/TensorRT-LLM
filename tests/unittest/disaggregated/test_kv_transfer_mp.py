@@ -7,11 +7,20 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+# Force a deterministic UCX config regardless of what the cluster/CI injects;
+# see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+# Limit NIXL busy-polling progress threads; see test_kv_transfer.py for the
+# full rationale (intermittent 120s timeouts on shared CI nodes,
+# https://nvbugs/6426834).
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -114,6 +123,8 @@ def worker_fn(
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    # Use 4 worker threads for KV transfer to exercise multi-thread code paths
+    os.environ["TRTLLM_KV_TRANSFER_NUM_THREADS"] = "4"
 
     # Initialize distributed (use gloo for single GPU compatibility)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
@@ -334,7 +345,6 @@ def worker_fn(
             send_kv_slice = KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=[block_ids],
-                token_range=TokenRange(start=0, end=req_len),
             )
             sender_session.send(send_kv_slice)
 
@@ -380,7 +390,6 @@ def worker_fn(
             recv_kv_slice = KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=[block_ids],
-                token_range=TokenRange(start=0, end=req_len),
             )
             receiver_session.receive(recv_kv_slice)
 

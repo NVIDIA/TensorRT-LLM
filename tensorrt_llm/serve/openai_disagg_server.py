@@ -15,9 +15,11 @@
 
 # yapf: disable
 import asyncio
+import json
 import signal
 import socket
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
@@ -26,95 +28,239 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 
-# yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
-                                              MetadataServerConfig, ServerRole,
-                                              get_ctx_gen_server_addrs,
-                                              get_global_disagg_request_id)
+                                              MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                create_cluster_storage)
-from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve._telemetry import create_uvicorn_server
+from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
+                                                  AnthropicResponseError,
+                                                  anthropic_error_response,
+                                                  convert_anthropic_request,
+                                                  convert_chat_response,
+                                                  reframe_openai_stream)
+from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
+                                                   AnthropicMessagesRequest)
+from tensorrt_llm.serve.cluster_storage import (
+    HttpClusterStorageServer, create_cluster_storage,
+    validate_http_cluster_storage_scope)
+from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
+                                                resolve_request_conversation_id)
+from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
+                                                   DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
-                                                UCompletionRequest,
-                                                UCompletionResponse)
-from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
+    ConversationParams, UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
+from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
+                                             PerfMetricsJsonlWriter,
+                                             PerfMetricsMiddleware,
+                                             combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
-from tensorrt_llm.serve.router import Router, create_router
+from tensorrt_llm.serve.router import Router
+from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
-TIMEOUT_KEEP_ALIVE = 10  # seconds.
+_LOG_CONTROL_CHARACTERS = {
+    code: f"\\x{code:02x}"
+    for code in (*range(32), 127)
+}
+
+# Most round trips to spend estimating one ctx/gen server's steady-clock
+# offset. Only the least-delayed sample is kept; see `_sync_server_clock`.
+# Each probe costs ~0.2 s because the `/steady_clock_offset` handler sleeps
+# between its two timestamps, and servers are prepared sequentially, so the
+# loop stops early (below) instead of always spending the full budget.
+_CLOCK_SYNC_PROBES = 5
+
+# A round trip this fast is already conclusive -- its offset estimate is
+# accurate to +/- 2.5 ms -- so stop probing. This is the common case on a
+# healthy server, keeping the added startup cost to one extra round trip.
+_CLOCK_SYNC_GOOD_DELAY_SECONDS = 0.005
+
+# Per-request timeout for the handshake, and a wall-clock budget for the whole
+# probe loop. Servers are prepared one at a time, so an unresponsive worker must
+# not be able to stall startup for `_req_timeout_secs` once per probe. A healthy
+# handshake takes ~0.2 s per round trip.
+_CLOCK_SYNC_REQUEST_TIMEOUT_SECONDS = 10.0
+_CLOCK_SYNC_TOTAL_BUDGET_SECONDS = 15.0
+
+# Largest round-trip delay for which the estimated offset is still worth
+# applying. The NTP estimate is only accurate to +/- delay/2, so this caps the
+# error the handshake can inject into perf-metric timestamps at 5 ms. Co-located
+# servers share CLOCK_MONOTONIC (true offset exactly 0) and NTP-synced hosts are
+# aligned to well under a millisecond, so discarding a noisier estimate is
+# strictly better than applying it.
+_CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
 
 class RawRequestResponseHooks(ResponseHooks):
-    def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
+    def __init__(self, raw_req: Request, queue_latency_metric,
+                 collect_perf_metrics: bool):
         self.raw_req = raw_req
+        self.queue_latency_metric = queue_latency_metric
+        self.collect_perf_metrics = collect_perf_metrics
         self.ctx_server = ""
         self.gen_server = ""
+        self.request_id = ""
+        self.disagg_request_id = None
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
-        self.perf_metrics_collector = perf_metrics_collector
+        self.ctx_dispatch_time = 0
+        self.ctx_metrics = None
+        self.gen_metrics = None
 
     def on_req_begin(self, request: UCompletionRequest):
-        self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
+        params = request.disaggregated_params
+        if params is not None:
+            self.disagg_request_id = params.disagg_request_id
+            request_id = params.disagg_request_id or params.ctx_request_id
+            self.request_id = str(request_id or "")
+        self.queue_latency_metric.observe(
+            get_steady_clock_now_in_seconds() - self.request_arrival_time)
+
+    def on_disagg_request_id(self, disagg_request_id: int):
+        self.disagg_request_id = disagg_request_id
+        self.request_id = str(disagg_request_id)
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
+
+    def on_perf_metrics(self, server: str, role: str, metrics: dict):
+        if role == "ctx":
+            self.ctx_server = server
+            self.ctx_metrics = metrics
+        elif role == "gen":
+            self.gen_server = server
+            self.gen_metrics = metrics
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
 
-    def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
+    def on_first_token(
+            self, gen_server: str, request: UCompletionRequest,
+            response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
-    def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
-        if request.disaggregated_params:
-            ctx_req_id = request.disaggregated_params.ctx_request_id
-            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
+    def on_resp_done(
+            self, gen_server: str, request: UCompletionRequest,
+            response: UCompletionResponse = None):
+        self.gen_server = gen_server
+        if not self.collect_perf_metrics:
+            return
+        disagg_phase = {
+            "ctx_server": self.ctx_server,
+            "gen_server": self.gen_server,
+            "timing_metrics": {
+                "arrival_time": self.request_arrival_time,
+                "last_token_time": get_steady_clock_now_in_seconds(),
+                "server_arrival_time": self.request_arrival_time,
+                "ctx_dispatch_time": self.ctx_dispatch_time or None,
+                "server_first_token_time": self.server_first_token_time or None,
+            },
+        }
+        self.raw_req.state.perf_metrics_records.append(
+            combine_disagg_metrics(
+                self.request_id,
+                disagg_phase,
+                self.ctx_metrics,
+                self.gen_metrics,
+                disagg_request_id=self.disagg_request_id,
+            ))
+
+
+def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
+    """Recover the worker's own error text without leaking the worker.
+
+    str(ClientResponseError) embeds the full upstream URL, so returning it
+    verbatim tells every client the internal host and port of a context worker.
+    The worker is itself an Anthropic-shaped server, so its body is usually an
+    error envelope; lifting the inner message out also avoids handing the
+    client an envelope nested inside an envelope, which no SDK will unwrap.
+    """
+    raw = error.message or ""
+    start = raw.find("{")
+    if start != -1:
+        try:
+            payload = json.loads(raw[start:])
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            inner = payload.get("error")
+            if isinstance(inner, dict) and inner.get("message"):
+                return str(inner["message"])
+            if payload.get("message"):
+                return str(payload["message"])
+    # Not a body this server recognises. Report the status only: anything else
+    # in `raw` may still carry the upstream URL.
+    return f"context worker rejected the request with status {error.status}"
 
 
 class OpenAIDisaggServer:
-    _CONVERSATION_ID_HEADERS = (
-        "x-session-id",
-        "x-correlation-id",
-        "x-session-affinity",
-        "x-multi-turn-session-id",
-    )
-
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                 metrics_interval_secs: int = 0):
+                 metrics_interval_secs: int = 0,
+                 coordinator_url: Optional[str] = None):
         self._config = config
         self._req_timeout_secs = req_timeout_secs
         self._server_start_timeout_secs = server_start_timeout_secs
         self._metadata_server_cfg = metadata_server_cfg
         self._metrics_interval_secs = metrics_interval_secs
+        self._allow_request_chat_template = getattr(
+            config, "allow_request_chat_template", False)
+        # When set, this is a forked worker: routing/readiness are delegated to
+        # the coordinator at coordinator_url (CoordinatorClient). Otherwise this
+        # process owns the routers + cluster state (DisaggCoordinatorService).
+        self._coordinator_url = coordinator_url
 
-        self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
-        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
-        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
-        self._metadata_server = create_metadata_server(metadata_server_cfg)
-        self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
+        self._perf_metrics_collector = DisaggPerfMetricsCollector(
+            config.perf_metrics_max_requests)
+        self._expose_perf_metrics = config.return_perf_metrics
+        self._collect_perf_metrics = (
+            config.return_perf_metrics
+            or config.perf_metrics_output_dir is not None)
+        self._perf_metrics_writer = PerfMetricsJsonlWriter(
+            config.perf_metrics_output_dir, "disagg")
 
-        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
+        self._disagg_cluster_storage = None
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname)
+            self._disagg_cluster_storage = create_cluster_storage(
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name)
+        # The server doesn't build routers -- the coordinator object does:
+        # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
+        # server just reads .ctx_router / .gen_router off whichever it holds.
+        if self._coordinator_url:
+            self._coordinator = CoordinatorClient(
+                self._coordinator_url, self._config, metadata_server_cfg,
+                request_timeout_s=self._req_timeout_secs,
+                startup_timeout_s=self._server_start_timeout_secs)
+        else:
+            self._coordinator = DisaggCoordinatorService(
+                self._config, self._create_client,
+                metadata_config=self._metadata_server_cfg,
+                server_preparation_func=self._sync_server_clock,
+                server_start_timeout_secs=self._server_start_timeout_secs)
+        self._ctx_router = self._coordinator.ctx_router
+        self._gen_router = self._coordinator.gen_router
 
         self._service = OpenAIDisaggregatedService(
-            self._config, self._ctx_router, self._gen_router, self._create_client,
-            metadata_server=self._metadata_server,
-            metadata_config=self._metadata_server_cfg,
-            req_timeout_secs=self._req_timeout_secs,
-            server_start_timeout_secs=self._server_start_timeout_secs,
-            perf_metrics_collector=self._perf_metrics_collector,
-            disagg_cluster_storage=self._disagg_cluster_storage)
+            self._config, self._coordinator, self._create_client,
+            req_timeout_secs=self._req_timeout_secs)
 
         try:
             otlp_cfg = config.otlp_config
@@ -129,104 +275,262 @@ class OpenAIDisaggServer:
 
         @asynccontextmanager
         async def lifespan(app) -> None:
-            # Prepare servers (sync server clock) when static ctx/gen server list is used
-            await self._ctx_router.prepare_servers()
-            await self._gen_router.prepare_servers()
+            # The cluster manager (via setup) owns server preparation + monitoring.
+            await self._perf_metrics_writer.start()
             await self._service.setup()
             yield
             await self._service.teardown()
+            await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
 
+        if self._collect_perf_metrics:
+            self.app.add_middleware(
+                PerfMetricsMiddleware,
+                expose_headers=self._expose_perf_metrics,
+                writer=self._perf_metrics_writer)
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
+        # Log request-body validation failures so a client/server schema mismatch
+        # shows up server-side. Throttled (first, then every 1000th) to avoid
+        # flooding the event loop when every request fails identically.
+        self._val_err_n = 0
         @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(_, exc):
+        async def validation_exception_handler(request: Request, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
+            # Anthropic clients parse the error envelope, so every /v1/messages
+            # route must fail in that shape rather than the generic one below.
+            if request.url.path.startswith("/v1/messages"):
+                return anthropic_error_response(str(exc),
+                                                "invalid_request_error", 400)
+            self._val_err_n += 1
+            if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
+                try:
+                    errs = exc.errors()
+                    # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
+                    brief = [{"loc": e.get("loc"), "type": e.get("type"),
+                              "msg": e.get("msg")} for e in errs][:8]
+                except Exception:  # noqa: BLE001
+                    brief = str(exc)[:500]
+                method = request.method.translate(_LOG_CONTROL_CHARACTERS)
+                path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
+                logger.warning(
+                    f"[validation] {method} {path} 400 "
+                    f"(n={self._val_err_n}): {brief}")
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
-        node_id = self._config.node_id
+        async def disagg_id_generator():
+            return await self._coordinator.get_disagg_request_id()
         client = OpenAIHttpClient(
             router, role, self._req_timeout_secs, max_retries,
-            disagg_id_generator=lambda: get_global_disagg_request_id(node_id))
-        self._perf_metrics_collector.add_client(client)
+            disagg_id_generator=disagg_id_generator,
+            request_perf_metrics=self._collect_perf_metrics,
+            internal_disagg_auth_key=self._config.internal_request_auth_key)
         return client
 
     def register_routes(self):
-        self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion), methods=["POST"])
-        self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion), methods=["POST"])
+        # The disagg service owns only the request-serving endpoints (/v1/*) and
+        # perf metrics. Readiness / cluster topology are the coordinator's state,
+        # so /health and /cluster_info hook straight to self._coordinator.
+        self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
+        self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/perf_metrics", self._perf_metrics_collector.get_perf_metrics, methods=["GET"])
         # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
-        from prometheus_client import make_asgi_app
-        self.app.mount("/prometheus/metrics", make_asgi_app())
-        if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
-            self._disagg_cluster_storage.add_routes(self.app)
+        from prometheus_client import (CollectorRegistry, make_asgi_app,
+                                       multiprocess)
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        self.app.mount("/prometheus/metrics", make_asgi_app(registry=registry))
+        # Single-process (local coordinator): mount the in-process HTTP cluster
+        # storage routes on this app. In worker mode the coordinator is remote and
+        # owns those routes (CoordinatorClient has no cluster_storage).
+        cluster_storage = getattr(self._coordinator, "cluster_storage", None)
+        if isinstance(cluster_storage, HttpClusterStorageServer):
+            cluster_storage.add_routes(self.app)
+        elif (isinstance(self._coordinator, CoordinatorClient)
+              and isinstance(self._disagg_cluster_storage,
+                             HttpClusterStorageServer)):
+            # Keep the configured public cluster_uri valid in fleet mode while
+            # the coordinator remains the sole owner of the HTTP storage state.
+            for path, method in (("/set", "POST"), ("/get", "GET"),
+                                 ("/delete", "DELETE"), ("/expire", "GET"),
+                                 ("/get_prefix", "GET")):
+                self.app.add_api_route(path,
+                                       self._proxy_cluster_storage_request,
+                                       methods=[method])
+
+    async def _proxy_cluster_storage_request(self,
+                                             raw_req: Request) -> Response:
+        try:
+            body, status, content_type = (
+                await self._coordinator.proxy_cluster_storage_request(
+                    raw_req.method, raw_req.url.path,
+                    list(raw_req.query_params.multi_items()),
+                    await raw_req.body(), raw_req.headers.get("Content-Type")))
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.warning(f"Failed to proxy cluster storage request: {e}")
+            return JSONResponse(status_code=502,
+                                content={"error": "coordinator unavailable"})
+        headers = {"Content-Type": content_type} if content_type else None
+        return Response(content=body, status_code=status, headers=headers)
 
     @staticmethod
-    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_id from supported session headers.
+    def _extract_conversation_id(
+            req: UCompletionRequest,
+            raw_req: Request,
+            subagent_affinity_header: Optional[str] = None) -> None:
+        """Resolve conversation identity and the optional parent routing key."""
+        resolve_request_conversation_id(req, raw_req.headers)
 
-        When not already set in the request body, copies the header value
-        into ``disaggregated_params.conversation_id``.
+        # The configured header is the source of parent affinity.
+        if req.conversation_params is not None:
+            req.conversation_params.subagent_affinity_id = None
 
-        Supported headers are checked in priority order: ``X-Session-ID``,
-        ``X-Correlation-ID``, ``x-session-affinity``, and
-        ``x-multi-turn-session-id``.  We mirror these conventions so the
-        ConversationRouter can provide session affinity without requiring
-        clients to set the body field.
-
-        When ``disaggregated_params`` is ``None`` (standard OpenAI
-        requests without disagg fields), a minimal instance is created
-        to carry the conversation_id.  The service layer always rebuilds
-        ``disaggregated_params`` in ``_get_ctx_request`` /
-        ``_get_gen_request`` before forwarding to workers.
-        """
-        header_conv_id = None
-        for header_name in OpenAIDisaggServer._CONVERSATION_ID_HEADERS:
-            header_conv_id = raw_req.headers.get(header_name)
-            if header_conv_id is not None and header_conv_id.strip():
-                break
-        else:
+        parent = extract_subagent_parent_id(raw_req.headers,
+                                            subagent_affinity_header)
+        if not subagent_affinity_header or parent is None:
             return
 
-        if req.disaggregated_params is None:
-            req.disaggregated_params = DisaggregatedParams(
-                request_type="context_only",
-                conversation_id=header_conv_id,
-            )
-        elif req.disaggregated_params.conversation_id is None:
-            req.disaggregated_params.conversation_id = header_conv_id
+        # Give parent-only requests an independent conversation identity.
+        if req.conversation_params is None:
+            req.conversation_params = ConversationParams(
+                conversation_id=f"subagent:{uuid.uuid4()}")
+        req.conversation_params.subagent_affinity_id = parent
 
-    def _wrap_entry_point(self, entry_point: Callable) -> Callable:
-        async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
+    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
+        # Bind the concrete request model per route so FastAPI validates against it.
+        # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
+        # CompletionRequest first and 400 every chat body, so override the wrapper's
+        # annotation with request_type (as openai_server.py does).
+        @tracing.trace_span("disaggregated_request")
+        async def wrapper(req: request_type, raw_req: Request) -> Response:
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:
                     self._perf_metrics_collector.stream_requests.inc()
                 else:
                     self._perf_metrics_collector.nonstream_requests.inc()
-                self._extract_conversation_id(req, raw_req)
-                hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
+                try:
+                    ensure_request_chat_template_allowed(
+                        req, self._allow_request_chat_template)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+                self._extract_conversation_id(
+                    req, raw_req,
+                    self._config.conversation_affinity_header_for_subagents)
+                hooks = RawRequestResponseHooks(
+                    raw_req, self._perf_metrics_collector.queue_latency_seconds,
+                    self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
-                    return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
-                else:
-                    return JSONResponse(content=response_or_generator.model_dump())
+                    return StreamingResponse(
+                        content=response_or_generator,
+                        media_type="text/event-stream")
+                return JSONResponse(content=response_or_generator.model_dump())
             except Exception as e:
                 self._handle_exception(e)
         return wrapper
 
+    async def anthropic_messages(self, request: AnthropicMessagesRequest,
+                                 raw_request: Request) -> Response:
+        """Serve Anthropic Messages through the disaggregated chat pipeline."""
+        try:
+            chat_request = convert_anthropic_request(request)
+        except (AnthropicRequestError, ValidationError) as e:
+            return anthropic_error_response(str(e), "invalid_request_error",
+                                            400)
+
+        try:
+            openai_response = await self._wrap_entry_point(
+                self._service.openai_chat_completion)(chat_request, raw_request)
+        except HTTPException as e:
+            error_type = ("invalid_request_error"
+                          if 400 <= e.status_code < 500 else "api_error")
+            return anthropic_error_response(str(e.detail), error_type,
+                                            e.status_code)
+
+        if isinstance(openai_response, StreamingResponse):
+            return StreamingResponse(
+                content=reframe_openai_stream(openai_response.body_iterator,
+                                              model=request.model),
+                media_type="text/event-stream",
+            )
+
+        status = getattr(openai_response, "status_code", 500)
+        if status != 200:
+            try:
+                payload = json.loads(openai_response.body)
+                message = (payload.get("message") or payload.get("detail")
+                           or payload.get("error") or json.dumps(payload))
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                message = "Internal server error"
+            error_type = ("invalid_request_error"
+                          if 400 <= status < 500 else "api_error")
+            return anthropic_error_response(str(message), error_type, status)
+
+        try:
+            chat_response = ChatCompletionResponse(
+                **json.loads(openai_response.body))
+            anthropic_response = convert_chat_response(chat_response)
+        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
+            logger.error(
+                "Invalid response from OpenAI chat pipeline:\n"
+                f"{traceback.format_exc()}")
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
+        return JSONResponse(content=anthropic_response.model_dump(
+            exclude_none=True))
+
+    async def anthropic_count_tokens(
+            self, request: AnthropicCountTokensRequest) -> Response:
+        """Count Anthropic input tokens on a context worker."""
+        try:
+            response = await self._service.anthropic_count_tokens(request)
+        except aiohttp.ClientResponseError as error:
+            error_type = ("invalid_request_error"
+                          if 400 <= error.status < 500 else "api_error")
+            return anthropic_error_response(_upstream_error_message(error),
+                                            error_type, error.status or 500)
+        except (RuntimeError, ValueError) as error:
+            # Raised when the cluster is not ready or has no context worker;
+            # 503 tells the caller to retry rather than to fix the request.
+            return anthropic_error_response(str(error), "api_error", 503)
+        return JSONResponse(content=response.model_dump())
+
     def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
+            record_termination_observation(
+                TerminalOutcome(
+                    termination_kind="worker_failure",
+                    component="disagg_worker",
+                    reporting_source="supervisor",
+                    exit_code_known=False,
+                ))
             signal.raise_signal(signal.SIGINT)
+        elif isinstance(exception, aiohttp.ClientResponseError):
+            self._perf_metrics_collector.http_exceptions.inc()
+            status = exception.status or 502
+            logger.error(
+                f"Upstream HTTP error {status} {exception.message}: ",
+                traceback.format_exc())
+            # exception.message is the worker's raw response body (up to 2048
+            # chars, built in openai_client.post_json/_send_request). Forwarding
+            # it verbatim publishes the worker's URL and internals to every
+            # caller, so it goes through the same unwrapping the Anthropic
+            # route uses. This branch is shared with /v1/completions and
+            # /v1/chat/completions, so those get the same treatment.
+            raise HTTPException(
+                status_code=status,
+                detail=_upstream_error_message(exception)) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
@@ -238,26 +542,50 @@ class OpenAIDisaggServer:
 
 
     async def health(self) -> Response:
-        if not await self._service.is_ready():
-            return Response(status_code=500)
+        if not await self._coordinator.is_ready():
+            return Response(status_code=503)
         return Response(status_code=200)
 
     async def cluster_info(self) -> JSONResponse:
-        return JSONResponse(content=await self._service.cluster_info())
+        return JSONResponse(content=await self._coordinator.cluster_info())
 
     async def version(self) -> JSONResponse:
         return JSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
+        keep_alive_timeout = self._config.server_keep_alive_timeout
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level=logger.level,
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve(sockets=sockets)
+                                timeout_keep_alive=keep_alive_timeout)
+        await create_uvicorn_server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
-        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
+        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running).
+
+        The offset is estimated with the NTP algorithm from an HTTP round trip,
+        so its error is bounded by half the round-trip delay: a round trip whose
+        two legs are asymmetric is indistinguishable from a clock offset. The
+        handshake runs while the ctx/gen servers are still finishing startup, so
+        a single sample regularly lands on a stalled event loop and yields tens
+        of milliseconds of pure error, which is then baked into every perf-metric
+        timestamp those servers report.
+
+        Two mitigations, both standard NTP practice:
+
+        * Probe ``_CLOCK_SYNC_PROBES`` times and keep the sample with the
+          smallest delay (NTP's clock filter). The least-delayed round trip is
+          the most symmetric one, so it carries the least error. A throwaway
+          warm-up request first keeps DNS resolution and connection setup --
+          which are paid entirely on the outbound leg -- out of the samples.
+        * Skip the adjustment entirely when even the best sample is delayed by
+          more than ``_CLOCK_SYNC_MAX_DELAY_SECONDS``. Past that point the
+          estimate is worth less than the zero it would replace: co-located
+          servers share CLOCK_MONOTONIC and are already exactly aligned, and a
+          cross-host deployment running NTP is aligned to well under a
+          millisecond.
+        """
         async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
                 originate_ts = get_steady_clock_now_in_seconds()
@@ -283,11 +611,44 @@ class OpenAIDisaggServer:
                     logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
 
         async def align_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> None:
-            delay, offset = await query_steady_clock_offset(session, server_url)
-            if delay is None or offset is None:
+            # Warm-up probe: DNS resolution and connection setup are paid on the
+            # outbound leg only, so folding them into a measured sample biases
+            # the offset by half their cost. Its result is deliberately dropped.
+            await query_steady_clock_offset(session, server_url)
+
+            # NTP clock filter: keep the least-delayed round trip, since it is
+            # the most symmetric one and hence carries the least error. Stop as
+            # soon as a sample is conclusive so a healthy server costs one probe.
+            best = None
+            probes = 0
+            deadline = get_steady_clock_now_in_seconds() + _CLOCK_SYNC_TOTAL_BUDGET_SECONDS
+            for _ in range(_CLOCK_SYNC_PROBES):
+                probes += 1
+                sample = await query_steady_clock_offset(session, server_url)
+                if sample[0] is None or sample[1] is None:
+                    # The server is unreachable or erroring; retrying it four
+                    # more times only delays startup for every later server.
+                    break
+                if best is None or sample[0] < best[0]:
+                    best = sample
+                if best[0] <= _CLOCK_SYNC_GOOD_DELAY_SECONDS:
+                    break
+                if get_steady_clock_now_in_seconds() >= deadline:
+                    break
+            if best is None:
                 logger.warning(f"Unable to measure steady clock offset for {server_url}; skipping adjustment")
                 return
-            logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second')
+
+            delay, offset = best
+            logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second '
+                        f'(best of {probes} probes)')
+            if delay > _CLOCK_SYNC_MAX_DELAY_SECONDS:
+                logger.warning(
+                    f"Steady clock handshake with {server_url} was too slow to be conclusive "
+                    f"(best round-trip delay {delay * 1e3:.1f} ms > {_CLOCK_SYNC_MAX_DELAY_SECONDS * 1e3:.1f} ms); "
+                    f"the offset estimate is only accurate to +/-{delay / 2 * 1e3:.1f} ms, so it is discarded "
+                    "rather than applied. Perf-metric timestamps stay on each server's own steady clock.")
+                return
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
@@ -297,7 +658,9 @@ class OpenAIDisaggServer:
         try:
             async with aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
-                timeout=aiohttp.ClientTimeout(total=self._req_timeout_secs)) as session:
+                timeout=aiohttp.ClientTimeout(total=min(
+                    self._req_timeout_secs,
+                    _CLOCK_SYNC_REQUEST_TIMEOUT_SECONDS))) as session:
                 await align_steady_clock_offset(session, server_url)
         except (aiohttp.ClientError, OSError) as e:
             logger.warning(f"Unable to align steady clock offset for {server_url}: {e}; skipping adjustment")

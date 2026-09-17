@@ -1,6 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Weight loader for diffusion models."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -8,7 +24,8 @@ import torch
 import tqdm
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -18,7 +35,7 @@ class WeightLoader(BaseWeightLoader):
     Weight loader for diffusion models.
 
     Loads weights from safetensors/bin files, similar to HfWeightLoader
-    but simpler (no parallel loading optimization for now).
+    but tailored for diffusion checkpoint layouts.
 
     Supports loading multiple components (e.g., transformer and transformer_2):
         loader = WeightLoader(components=["transformer", "transformer_2"])
@@ -26,7 +43,10 @@ class WeightLoader(BaseWeightLoader):
         # Returns: {"transformer": {...}, "transformer_2": {...}}
     """
 
-    def __init__(self, components: Union[str, List[str]] = PipelineComponent.TRANSFORMER):
+    def __init__(
+        self,
+        components: Union[str, List[str]] = PipelineComponent.TRANSFORMER,
+    ) -> None:
         """
         Args:
             components: Component(s) to load weights for. Can be:
@@ -44,7 +64,7 @@ class WeightLoader(BaseWeightLoader):
         self,
         checkpoint_dir: str,
         mapping: Mapping,
-        **kwargs,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Load weights from checkpoint directory.
@@ -60,9 +80,11 @@ class WeightLoader(BaseWeightLoader):
         """
         checkpoint_path = Path(checkpoint_dir)
 
-        # Check if this is a pipeline (has model_index.json)
-        model_index = checkpoint_path / "model_index.json"
-        is_pipeline = model_index.exists()
+        # Standard and modular Diffusers manifests use the same component
+        # subdirectory layout for weight-bearing models.
+        is_pipeline = (checkpoint_path / "model_index.json").exists() or (
+            checkpoint_path / "modular_model_index.json"
+        ).exists()
 
         # Load weights for each component
         all_weights = {}
@@ -78,7 +100,7 @@ class WeightLoader(BaseWeightLoader):
                 if len(self.components) > 1:
                     raise ValueError(
                         f"Multiple components specified but {checkpoint_dir} is not a pipeline "
-                        "(no model_index.json found)"
+                        "(no model_index.json or modular_model_index.json found)"
                     )
                 weight_dir = checkpoint_path
 
@@ -87,12 +109,13 @@ class WeightLoader(BaseWeightLoader):
             if not weight_files:
                 raise ValueError(f"No weight files found in {weight_dir}")
 
-            # Load all weights with progress bar
-            component_weights = {}
-            desc = f"Loading {component}" if is_pipeline else "Loading checkpoint"
-            for wf in tqdm.tqdm(weight_files, desc=desc):
-                component_weights.update(self._load_file(wf))
+            if all(wf.endswith(".safetensors") for wf in weight_files):
+                prefetch_files_to_host_cache(
+                    weight_files,
+                    description="visual-gen checkpoint",
+                )
 
+            component_weights = self._load_weight_files(weight_files, component, is_pipeline)
             all_weights[component] = component_weights
 
         # Return flat dict for single component (backward compatibility)
@@ -102,7 +125,33 @@ class WeightLoader(BaseWeightLoader):
         # Return nested dict for multiple components
         return all_weights
 
-    def _find_weight_files(self, weight_dir) -> List[str]:
+    def _load_weight_files(
+        self, weight_files: List[str], component: str, is_pipeline: bool
+    ) -> Dict[str, Any]:
+        desc = f"Loading {component}" if is_pipeline else "Loading checkpoint"
+        if len(weight_files) <= 1:
+            component_weights = {}
+            for wf in tqdm.tqdm(weight_files, desc=desc):
+                component_weights.update(self._load_file(wf))
+            return component_weights
+
+        workers = min(4, len(weight_files))
+
+        logger.info(f"Loading {len(weight_files)} {component} shard files with {workers} workers")
+        component_weights = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self._load_file, wf): wf for wf in weight_files}
+            for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc=desc):
+                wf = futures[future]
+                try:
+                    loaded = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to load weight file {wf}") from exc
+                component_weights.update(loaded)
+
+        return component_weights
+
+    def _find_weight_files(self, weight_dir: Union[str, Path]) -> List[str]:
         """Find safetensors or bin weight files.
 
         Handles:

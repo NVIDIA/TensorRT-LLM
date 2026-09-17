@@ -26,9 +26,9 @@ server_configs:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con2_iter10_8k1k"
+      - name: "con2_iter5_8k1k"
         concurrency: 2
-        iterations: 10
+        iterations: 5
         isl: 8192
         osl: 1024
         backend: "openai"
@@ -61,9 +61,9 @@ server_configs:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con256_iter10_8k1k"
+      - name: "con256_iter5_8k1k"
         concurrency: 256
-        iterations: 10
+        iterations: 5
         isl: 8192
         osl: 1024
         backend: "openai"

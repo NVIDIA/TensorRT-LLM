@@ -149,6 +149,7 @@ def test_generated_rmsnorm_correctness():
     torch.testing.assert_close(result[0], ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.cpu_only
 def test_kernel_cache_reuse():
     """Same subgraph structure produces the same hash."""
     from tensorrt_llm._torch.auto_deploy.mlir.codegen.kernel_cache import KernelCache

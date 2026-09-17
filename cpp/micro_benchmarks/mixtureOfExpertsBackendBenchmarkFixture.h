@@ -31,6 +31,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -380,44 +381,44 @@ public:
     int64_t mNumExpertsPerNode{};
     int64_t mK{};
 
-    constexpr static nvinfer1::DataType toDTypeID()
+    constexpr static tensorrt_llm::DataType toDTypeID()
     {
         if (FP8 || WFP4AFP8)
-            return nvinfer1::DataType::kFP8;
+            return tensorrt_llm::DataType::kFP8;
         if (NVFP4)
-            return nvinfer1::DataType::kFP4;
+            return tensorrt_llm::DataType::kFP4;
         if (INT_QUANT && INT4)
-            return nvinfer1::DataType::kINT4;
+            return tensorrt_llm::DataType::kINT4;
         if (INT_QUANT)
-            return nvinfer1::DataType::kINT8;
+            return tensorrt_llm::DataType::kINT8;
         if (std::is_same_v<DataType, float>)
-            return nvinfer1::DataType::kFLOAT;
+            return tensorrt_llm::DataType::kFLOAT;
         if (std::is_same_v<DataType, half>)
-            return nvinfer1::DataType::kHALF;
+            return tensorrt_llm::DataType::kHALF;
 #ifdef ENABLE_BF16
         if (std::is_same_v<DataType, nv_bfloat16>)
-            return nvinfer1::DataType::kBF16;
+            return tensorrt_llm::DataType::kBF16;
 #endif
         TLLM_THROW("Unrecognised format");
     };
 
-    constexpr static nvinfer1::DataType toWTypeID()
+    constexpr static tensorrt_llm::DataType toWTypeID()
     {
         if (FP8)
-            return nvinfer1::DataType::kFP8;
+            return tensorrt_llm::DataType::kFP8;
         if (NVFP4 || WFP4AFP8)
-            return nvinfer1::DataType::kFP4;
+            return tensorrt_llm::DataType::kFP4;
         if (INT_QUANT && INT4)
-            return nvinfer1::DataType::kINT4;
+            return tensorrt_llm::DataType::kINT4;
         if (INT_QUANT)
-            return nvinfer1::DataType::kINT8;
+            return tensorrt_llm::DataType::kINT8;
         if (std::is_same_v<DataType, float>)
-            return nvinfer1::DataType::kFLOAT;
+            return tensorrt_llm::DataType::kFLOAT;
         if (std::is_same_v<DataType, half>)
-            return nvinfer1::DataType::kHALF;
+            return tensorrt_llm::DataType::kHALF;
 #ifdef ENABLE_BF16
         if (std::is_same_v<DataType, nv_bfloat16>)
-            return nvinfer1::DataType::kBF16;
+            return tensorrt_llm::DataType::kBF16;
 #endif
         TLLM_THROW("Unrecognised format");
     };
@@ -427,31 +428,31 @@ public:
     {
         if constexpr (std::is_same_v<T, SafeFP8>)
         {
-            return nvinfer1::DataType::kFP8;
+            return tensorrt_llm::DataType::kFP8;
         }
         else if constexpr (std::is_same_v<T, SafeFP4>)
         {
-            return nvinfer1::DataType::kFP4;
+            return tensorrt_llm::DataType::kFP4;
         }
         else if constexpr (std::is_same_v<T, uint8_t>)
         {
-            return nvinfer1::DataType::kINT8;
+            return tensorrt_llm::DataType::kINT8;
         }
         else if constexpr (std::is_same_v<T, cutlass::uint4b_t>)
         {
-            return nvinfer1::DataType::kINT4;
+            return tensorrt_llm::DataType::kINT4;
         }
         else if constexpr (std::is_same_v<T, nv_bfloat16>)
         {
-            return nvinfer1::DataType::kBF16;
+            return tensorrt_llm::DataType::kBF16;
         }
         else if constexpr (std::is_same_v<T, half>)
         {
-            return nvinfer1::DataType::kHALF;
+            return tensorrt_llm::DataType::kHALF;
         }
         else if constexpr (std::is_same_v<T, float>)
         {
-            return nvinfer1::DataType::kFLOAT;
+            return tensorrt_llm::DataType::kFLOAT;
         }
         else
         {

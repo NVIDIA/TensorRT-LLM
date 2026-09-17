@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
@@ -25,8 +27,10 @@ def scale_and_clamp(x, scale, dtype):
 
 @triton.jit
 def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
-                        BLOCK_SIZE: tl.constexpr,
-                        HAS_O_SCALE: tl.constexpr) -> None:
+                        swiglu_limit: tl.constexpr, swiglu_alpha: tl.constexpr,
+                        swiglu_beta: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                        HAS_O_SCALE: tl.constexpr,
+                        HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
     i = tl.program_id(axis=0).to(tl.int64)
     j = tl.program_id(axis=1)
 
@@ -39,7 +43,16 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
     a = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
     b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
 
-    result = tl.sigmoid(a) * a * b
+    if HAS_SWIGLU_LIMIT:
+        # Gate clamp is upper-side only, up clamp is symmetric, as both plain
+        # SwiGLU-with-limit and the SGLang swigluoai activation require.
+        a = tl.minimum(a, swiglu_limit)
+        b = tl.clamp(b, -swiglu_limit, swiglu_limit)
+
+    # swiglu_alpha=1.0, swiglu_beta=0.0 recovers plain silu_and_mul;
+    # swiglu_alpha=1.702, swiglu_beta=1.0 is the swigluoai shape (alpha gain
+    # inside the sigmoid, (up + 1) offset).
+    result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
 
     if HAS_O_SCALE:
         o_scale = tl.load(o_scale_ptr)
@@ -48,13 +61,24 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
     tl.store(o_row_ptr + offsets, result, mask=mask)
 
 
-def swiglu(x, quant_scale: torch.Tensor = None, quant_type=None):
+def swiglu(x,
+           quant_scale: Optional[torch.Tensor] = None,
+           quant_type=None,
+           swiglu_limit: Optional[float] = None,
+           swiglu_alpha: Optional[float] = None,
+           swiglu_beta: Optional[float] = None):
     if quant_scale is not None:
         assert quant_type is not None
         return torch.ops.trtllm.silu_and_mul(
             x,
             scale=quant_scale,
             dtype=quant_type,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
-    return torch.ops.trtllm.silu_and_mul(x)
+    return torch.ops.trtllm.silu_and_mul(x,
+                                         swiglu_limit=swiglu_limit,
+                                         swiglu_alpha=swiglu_alpha,
+                                         swiglu_beta=swiglu_beta)

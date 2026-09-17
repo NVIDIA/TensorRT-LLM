@@ -42,19 +42,19 @@ TEST(RequestWithIdTest, serializeDeserialize)
     biasData[3] = 48.f;
 
     auto request1 = Request({1, 2, 3, 4}, 1000, true, SamplingConfig(1, 4, 0.77), OutputConfig(false, true), 177, 234,
-        std::make_optional<std::vector<SizeType32>>({0, 1, 2, 3}), badWords, stopWords, embeddingBias,
-        ExternalDraftTokensConfig({11, 22}), std::nullopt, std::nullopt);
+        std::make_optional<std::vector<SizeType32>>({0, 1, 2, 3}), badWords, stopWords, embeddingBias, std::nullopt,
+        std::nullopt);
 
     auto request2 = Request({100, 200, 300, 400}, 77, false, SamplingConfig(1, 1, 0.33), OutputConfig(true, false), 66,
         99, std::make_optional<std::vector<SizeType32>>({0, 1, 1, 2}), badWords2, stopWords2, embeddingBias,
-        ExternalDraftTokensConfig({7, 8, 9, 10}), std::nullopt, std::nullopt);
+        std::nullopt, std::nullopt);
     request2.setEncoderInputFeatures(encoderInputFeatures);
 
     auto samplingConfig3 = SamplingConfig(1, 1, 0.9);
     samplingConfig3.setNumReturnSequences(3);
     auto request3 = Request({37, 19, 87, 29}, 4, false, samplingConfig3, OutputConfig(false, false), 66, 99,
-        std::make_optional<std::vector<SizeType32>>({0, 1, 1, 2}), badWords2, stopWords2, embeddingBias,
-        ExternalDraftTokensConfig({7, 8, 9, 10}), std::nullopt, std::nullopt);
+        std::make_optional<std::vector<SizeType32>>({0, 1, 1, 2}), badWords2, stopWords2, embeddingBias, std::nullopt,
+        std::nullopt);
 
     std::vector<RequestWithId> reqWithIds;
     reqWithIds.emplace_back(RequestWithId{request1, 1});
@@ -80,7 +80,5 @@ TEST(RequestWithIdTest, serializeDeserialize)
         EXPECT_EQ(reqOut.getMaxTokens(), req.getMaxTokens());
         EXPECT_EQ(reqOut.getSamplingConfig(), req.getSamplingConfig());
         EXPECT_EQ(reqOut.getStopWords(), req.getStopWords());
-        EXPECT_EQ(reqOut.getExternalDraftTokensConfig().value().getTokens(),
-            req.getExternalDraftTokensConfig().value().getTokens());
     }
 }

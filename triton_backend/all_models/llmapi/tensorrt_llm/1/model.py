@@ -35,12 +35,14 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from random import randint
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
 import triton_python_backend_utils as pb_utils
 import yaml
-from helpers import (get_input_tensor_by_name, get_output_config_from_request,
+from helpers import (get_input_tensor_by_name, get_lora_request_from_request,
+                     get_output_config_from_request,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
 
@@ -82,6 +84,19 @@ def get_model_config(filename, include_keys=None, exclude_keys=None):
             for k, v in engine_config.items() if k not in exclude_keys
         }
     return engine_config
+
+
+# `image_url` is client-controlled, so restrict it to web URLs for security.
+ALLOWED_MEDIA_SCHEMES = ("http", "https")
+
+
+def validate_media_urls(urls):
+    """Reject anything that is not a web URL."""
+    for url in urls:
+        if urlparse(url).scheme not in ALLOWED_MEDIA_SCHEMES:
+            raise pb_utils.TritonModelException(
+                f"Unsupported image_url {url!r}: only "
+                f"{', '.join(ALLOWED_MEDIA_SCHEMES)} URLs are accepted.")
 
 
 def get_input_scalar_by_name(request,
@@ -250,6 +265,11 @@ class TritonPythonModel:
             self._response_thread = threading.Thread(target=self._response_loop)
             self._response_thread.start()
 
+            self.multimodal_enabled = bool(
+                triton_config.get("multimodal", False))
+            if self.multimodal_enabled:
+                self._init_multimodal()
+
             self.req_id_to_request_data = {}
             self.triton_user_id_to_req_ids = {}
             self.lock = threading.Lock()
@@ -414,6 +434,18 @@ class TritonPythonModel:
                 req_ids = self.triton_user_id_to_req_ids[triton_user_id]
                 for req_id in req_ids:
                     request_data = self.req_id_to_request_data[req_id]
+                    # Send a COMPLETE_FINAL CANCELLED response on the main
+                    # request's response_sender so an in-flight streaming
+                    # client doesn't wait forever for a final chunk after
+                    # the iterator is aborted. Mirrors what
+                    # cancellation_loop does for Triton-level cancels.
+                    main_response_sender = (
+                        request_data.triton_request.get_response_sender())
+                    main_response_sender.send(
+                        pb_utils.InferenceResponse(error=pb_utils.TritonError(
+                            "Request cancelled by client",
+                            pb_utils.TritonError.CANCELLED)),
+                        flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
                     request_data.response_iterator.abort()
                     del self.req_id_to_request_data[req_id]
 
@@ -434,7 +466,6 @@ class TritonPythonModel:
         """
         # TODO: [JIRA-4040] Add health check here
         for request in requests:
-            # TODO : [JIRA-4040] Verify Lora
             if request is not None:
                 assert (
                     self._llm_engine_shutdown_event.is_set() is False
@@ -467,19 +498,23 @@ class TritonPythonModel:
 
         # Unique request id used to identify each triton request
         triton_req_id = str(randint(0, sys.maxsize))
+        request_registered = False
 
         try:
             from tensorrt_llm import SamplingParams
 
             # TODO: [JIRA-4496] Implement when request contains batched prompts
-            (prompt, sampling_params, streaming,
-             output_config) = self._convert_request(request)
+            (prompt, sampling_params, streaming, output_config,
+             lora_request) = await self._convert_request(request)
             if streaming and not self.decoupled:
                 raise pb_utils.TritonModelException(
                     "Streaming is only supported in decoupled mode.")
             # Generate the response.
             response_iterator = self._llm_engine.generate_async(
-                prompt, SamplingParams(**sampling_params), streaming)
+                prompt,
+                sampling_params=SamplingParams(**sampling_params),
+                lora_request=lora_request,
+                streaming=streaming)
 
             with self.lock:
                 self.req_id_to_request_data[triton_req_id] = RequestData(
@@ -493,6 +528,7 @@ class TritonPythonModel:
                     # TODO: [JIRA-4496] Add all batched request ids to the set
                     self.triton_user_id_to_req_ids[triton_user_id].add(
                         triton_req_id)
+                request_registered = True
 
             async for request_output in response_iterator:
                 # Send each response if streaming.
@@ -508,6 +544,20 @@ class TritonPythonModel:
                         decrement_ongoing_request_count = False
                     self._response_queue.put_nowait(
                         (response_state, response, flags))
+
+            # Ensure COMPLETE_FINAL is always sent for streaming, even if the
+            # iterator exited without yielding a chunk whose .finished was True
+            # (e.g. trtllm exits the async generator after the engine completes
+            # without setting finished on the last RequestOutput). Without this
+            # marker, clients keep the gRPC stream open forever waiting on the
+            # next chunk. Mirrors the pattern in tensorrt_llm_bls/1/model.py
+            # which sends an empty COMPLETE_FINAL after its streaming loop.
+            if streaming and not response_state["last_response_generated"]:
+                response_state["last_response_generated"] = True
+                decrement_ongoing_request_count = False
+                self._response_queue.put_nowait(
+                    (response_state, pb_utils.InferenceResponse(),
+                     pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL))
 
             # Send the last response which contains all the outputs if not streaming.
             if not streaming:
@@ -527,13 +577,21 @@ class TritonPythonModel:
 
         except Exception as e:
             self.logger.log_error(f"[trtllm] Error generating request: {e}")
-            error = pb_utils.TritonError(f"Error generating request: {e}")
-            text_output_tensor = pb_utils.Tensor(
-                "text_output", np.asarray(["N/A"], dtype=self.output_dtype))
-            response = pb_utils.InferenceResponse(
-                output_tensors=[text_output_tensor], error=error)
-            response_sender.send(
-                response, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+            # Skip sending if cancellation_loop or handle_stop_request
+            # already sent a COMPLETE_FINAL on this response_sender; they
+            # remove the entry from req_id_to_request_data as the signal.
+            with self.lock:
+                was_cancelled = (request_registered and triton_req_id
+                                 not in self.req_id_to_request_data)
+            if not was_cancelled:
+                error = pb_utils.TritonError(f"Error generating request: {e}")
+                text_output_tensor = pb_utils.Tensor(
+                    "text_output", np.asarray(["N/A"], dtype=self.output_dtype))
+                response = pb_utils.InferenceResponse(
+                    output_tensors=[text_output_tensor], error=error)
+                response_sender.send(
+                    response,
+                    flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
             raise e
 
         finally:
@@ -545,7 +603,45 @@ class TritonPythonModel:
                 if triton_user_id is not None and triton_user_id != "" and triton_user_id in self.triton_user_id_to_req_ids:
                     del self.triton_user_id_to_req_ids[triton_user_id]
 
-    def _convert_request(self, request):
+    def _init_multimodal(self):
+        """Resolve the tokenizer, HF processor and model type once."""
+        from transformers import AutoProcessor
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import \
+            load_pretrained_config
+
+        self._mm_tokenizer = self._llm_engine.tokenizer
+        hf_model_dir = self._llm_engine._hf_model_dir or getattr(
+            getattr(self._mm_tokenizer, "tokenizer", None), "name_or_path",
+            None)
+        if hf_model_dir is None:
+            raise pb_utils.TritonModelException(
+                "triton_config.multimodal is enabled but the checkpoint directory "
+                "could not be resolved from the engine.")
+        hf_model_dir = str(hf_model_dir)
+        trust_remote_code = self._llm_engine.args.trust_remote_code
+        try:
+            self._mm_processor = AutoProcessor.from_pretrained(
+                hf_model_dir, trust_remote_code=trust_remote_code)
+            model_config = load_pretrained_config(
+                hf_model_dir,
+                trust_remote_code=trust_remote_code,
+                checkpoint_format=getattr(self._llm_engine.args,
+                                          "checkpoint_format", None))
+        except Exception as e:
+            raise pb_utils.TritonModelException(
+                f"triton_config.multimodal is enabled but the HF processor/config "
+                f"for '{hf_model_dir}' could not be loaded: {e}")
+
+        # Composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
+        # attribute to `text_config`, so prefer the class attribute.
+        self._mm_model_type = getattr(type(model_config),
+                                      "model_type", None) or getattr(
+                                          model_config, "model_type", "")
+        self.logger.log_info("[trtllm] multimodal input enabled for model_type "
+                             f"'{self._mm_model_type}'")
+
+    async def _convert_request(self, request):
         """Helper function to convert the request into a prompt for LLM.generate_async
 
         Args:
@@ -556,6 +652,8 @@ class TritonPythonModel:
 
         Notes:
             - The current implementation only supports text_input being a 1D tensor(a single prompt).
+            - With `image_url`, prompt becomes a multimodal PromptInputs dict.
+              `image_url` is only read when `triton_config.multimodal` is set.
         """
         text_input = get_input_tensor_by_name(request, 'text_input')
         if text_input is None:
@@ -571,10 +669,32 @@ class TritonPythonModel:
         if isinstance(prompt, bytes):
             prompt = prompt.decode("utf-8")
 
+        # Only read `image_url` when the operator opts in, so a deployment
+        # already declaring that input keeps its behavior after an upgrade.
+        if self.multimodal_enabled:
+            image_url = get_input_tensor_by_name(request, 'image_url')
+            if image_url is not None and image_url.size > 0:
+                from tensorrt_llm.inputs import async_build_multimodal_prompt
+
+                media = [
+                    url.decode("utf-8") if isinstance(url, bytes) else str(url)
+                    for url in image_url.reshape(-1)
+                ]
+                validate_media_urls(media)
+                prompt = await async_build_multimodal_prompt(
+                    model_type=self._mm_model_type,
+                    tokenizer=self._mm_tokenizer,
+                    processor=self._mm_processor,
+                    prompt=prompt,
+                    media=media,
+                    modality="image",
+                )
+
         sampling_params = get_sampling_params_from_request(request)
         output_config = get_output_config_from_request(request)
         streaming = get_streaming_from_request(request)
-        return prompt, sampling_params, streaming, output_config
+        lora_request = get_lora_request_from_request(request)
+        return prompt, sampling_params, streaming, output_config, lora_request
 
     def _create_response(self, request_output, output_config):
         """Process the generated request_output and create the client response.

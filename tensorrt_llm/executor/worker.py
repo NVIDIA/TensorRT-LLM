@@ -1,19 +1,18 @@
 import gc
 import os
+import sys
 import threading
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import zmq
 
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
-from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -24,22 +23,33 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+                      StopProfileRequest)
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
+from .worker_process_monitor import capture_worker_process_identity
 
 __all__ = [
     "GenerationExecutorWorker",
 ]
+
+# Home of the architecture registries, imported on demand: a worker that never
+# touches the PyTorch model zoo should not pay for it.
+_MODELING_UTILS_MODULE = "tensorrt_llm._torch.models.modeling_utils"
+
+# Probed (not imported) in shutdown() so a non-MegaMoE run does not pull in
+# the MoE stack just to release an empty cache. Must stay in sync with the
+# real module path -- a mismatch silently degrades the release to a no-op.
+_MEGA_MOE_DEEPGEMM_MODULE = (
+    "tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm")
 
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
-        executor_config: Optional[tllm.ExecutorConfig] = None,
+        engine: Path,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -51,7 +61,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
     ) -> None:
         super().__init__(
             engine=engine,
-            executor_config=executor_config,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -80,8 +89,19 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             name="await_response_thread")
 
     def start_thread(self, thread: ManagedThread):
-        if self.engine.can_enqueue_requests() and not thread.is_alive():
-            thread.start()
+        if not self.engine.can_enqueue_requests():
+            return
+        if thread.is_alive():
+            return
+        if thread.ident is not None:
+            # Already exited: either stop() at shutdown (nothing to surface) or
+            # an engine event-loop crash, where restarting masks it into a peer
+            # MPI-collective hang. Wrap, since start() runs on every submit().
+            err = getattr(self.engine, "_event_loop_error", None)
+            if err is not None:
+                raise RequestError(str(err)) from err
+            return
+        thread.start()
 
     def await_response_task(self) -> bool:
         return self._await_response_helper()
@@ -109,19 +129,48 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.engine.shutdown()
             self.engine = None
 
-            if self.llm_args is not None:
-                assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
-                if (self.llm_args.backend == "pytorch"
-                        and hasattr(self, "checkpoint_loader")
-                        and self.checkpoint_loader is not None):
-                    self.checkpoint_loader.cleanup()
-                    self.checkpoint_loader = None
-            else:
-                if hasattr(
-                        self._executor_config, "checkpoint_loader"
-                ) and self._executor_config.checkpoint_loader is not None:
-                    self._executor_config.checkpoint_loader.cleanup()
-                    self._executor_config.checkpoint_loader = None
+            if (self.llm_args.backend == "pytorch"
+                    and hasattr(self, "checkpoint_loader")
+                    and self.checkpoint_loader is not None):
+                self.checkpoint_loader.cleanup()
+                self.checkpoint_loader = None
+
+        # MegaMoE's NVLink symmetric-memory activation workspaces are
+        # rendezvoused over the EP group, so they must go before the
+        # destroy_process_group() below. Never let a failure here escape:
+        # doing_shutdown is already set, so a retry would no-op, and skipping
+        # the teardown below would leave NCCL communicators alive -- turning a
+        # MegaMoE-only failure into a worker teardown hang.
+        mega_moe = sys.modules.get(_MEGA_MOE_DEEPGEMM_MODULE)
+        if mega_moe is not None:
+            try:
+                mega_moe.release_symm_buffer_cache()
+            except Exception as e:
+                logger.error(
+                    f"Failed to release MegaMoE symm buffers on shutdown: {e}")
+
+        # Destroy torch distributed process groups so that NCCL communicators
+        # are torn down cleanly before MPI session shutdown and process exit.
+        # This is done here (not in PyExecutor.shutdown()) because the MPI
+        # worker owns the process group.  In the Ray path the process group
+        # belongs to RayWorkerWrapper and must not be destroyed by the engine.
+        import torch.distributed
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+        # Return this rank's GPU memory to the driver. Under an external MPI
+        # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
+        # shared across successive LLM instances: a new GenerationExecutorWorker
+        # is built for each LLM, but the OS process -- and with it the CUDA
+        # context and PyTorch caching allocator -- persists. Setting
+        # `self.engine = None` above is not enough to free the GPU: reference
+        # cycles keep the model tensors alive until a later GC, and the allocator
+        # holds freed blocks as "reserved" instead of returning them. Without
+        # this, the previous model's ~weights-sized reservation carries into the
+        # next LLM built in this process and can OOM its load (e.g. back-to-back
+        # tests in one CI shard).
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
@@ -130,11 +179,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def block_subordinates(self):
         if self.rank != 0:
-            if isinstance(self.engine, tllm.Executor):
-                self.shutdown()
-                raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
-                )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
@@ -142,16 +186,16 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path | Engine,
+    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
-    executor_config: Optional[tllm.ExecutorConfig] = None,
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
-    _torch_model_class_mapping: Optional[dict] = None,
+    _torch_external_model_modules: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
+    worker_process_identities_signal: Optional[bytes] = None,
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     hf_model_dir: Optional[Path] = None,
@@ -198,15 +242,27 @@ def worker_main(
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
     is_leader: bool = mpi_rank() == 0
+    # Multi-frontend serving: the worker binds the request ingress (PULL)
+    # and pushes responses to per-frontend result lanes.
+    multi_frontend_addrs = worker_queues.frontend_result_queue_addrs
+    frontend_result_queues: Optional[List[FusedIpcQueue]] = None
     if tracer_init_kwargs is not None and is_leader:
         tracer = VizTracer(**tracer_init_kwargs)
         tracer.register_exit()
         tracer.start()
         set_global_tracer(tracer)
 
-    if _torch_model_class_mapping is not None:
-        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
-        MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
+    # Architectures the driver registered from outside the built-in zoo, as
+    # module names. Declaring them leaves this process's zoo lazy: the one
+    # module behind an architecture is imported when that architecture is
+    # looked up, not because the driver happened to have imported it. An empty
+    # declaration is still worth making once the registries exist, so a worker
+    # reused by a driver without custom modules releases the previous driver's
+    # providers; before that there is nothing registered to release.
+    if _torch_external_model_modules or _MODELING_UTILS_MODULE in sys.modules:
+        from tensorrt_llm._torch.models.modeling_utils import \
+            register_external_model_modules
+        register_external_model_modules(_torch_external_model_modules or {})
 
     set_mpi_session_cpp(mpi_comm())
 
@@ -215,7 +271,9 @@ def worker_main(
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
         request_queue = IpcQueue(worker_queues.request_queue_addr,
-                                 is_server=False,
+                                 is_server=multi_frontend_addrs is not None,
+                                 socket_type=zmq.PULL if multi_frontend_addrs
+                                 is not None else zmq.PAIR,
                                  name="worker_request_queue")
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
@@ -227,6 +285,23 @@ def worker_main(
             is_server=False,
             name="worker_resource_governor_queue"
         ) if worker_queues.resource_governor_queue_addr else None
+        # Synchronous ack channel back to the proxy for control requests
+        # (start_profile / stop_profile). Connected on first use rather
+        # than at startup: the proxy only binds its end when profiling is
+        # actually requested, and it passes the address on the request,
+        # so a deployment that never profiles never creates this socket.
+        profile_ack_queue = None
+
+        def send_profile_ack(kind: str, err, req) -> None:
+            nonlocal profile_ack_queue
+            addr = getattr(req, "ack_addr", None)
+            if addr is None:
+                return
+            if profile_ack_queue is None:
+                profile_ack_queue = IpcQueue(addr,
+                                             is_server=False,
+                                             name="worker_profile_ack_queue")
+            profile_ack_queue.put((kind, err))
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -237,6 +312,16 @@ def worker_main(
                               name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
+        elif multi_frontend_addrs is not None:
+            # One PUSH lane per frontend (see base_worker._send_rsp).
+            frontend_result_queues = [
+                FusedIpcQueue(addr,
+                              is_server=False,
+                              fuse_message=False,
+                              socket_type=zmq.PUSH,
+                              name=f"worker_result_queue_{i}")
+                for i, addr in enumerate(multi_frontend_addrs)
+            ]
         else:
             # IPC queue for sending results back to the proxy, and let the
             # Proxy process to handle the postprocess
@@ -246,9 +331,12 @@ def worker_main(
                                          name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
-        # Signal the dispatcher thread in the proxy to quit
+        # Signal the dispatcher thread in every frontend proxy to quit
         if result_queue is not None:
             result_queue.put(None)
+        elif frontend_result_queues is not None:
+            for q in frontend_result_queues:
+                q.put(None)
         else:
             assert result_queues is not None
             for q in result_queues:
@@ -258,20 +346,23 @@ def worker_main(
     if is_leader and postproc_worker_config.enabled:
         logger_debug(f"initiate postprocess workers...", "yellow")
 
-        proxy_result_queue: tuple[
-            str, Optional[bytes]] = worker_queues.result_queue_addr
+        # Each postproc worker pushes to every frontend result lane (a
+        # single lane in single-frontend mode).
+        proxy_result_addrs = (multi_frontend_addrs
+                              if multi_frontend_addrs is not None else
+                              [worker_queues.result_queue_addr])
 
         assert result_queues is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
-        assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
                 postproc_worker_main,
                 result_queues[i].address,
-                proxy_result_queue,
+                proxy_result_addrs,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                postproc_worker_config.post_processor_hook,
             )
             postprocess_worker_futures.append(fut)
 
@@ -287,12 +378,28 @@ def worker_main(
     #         error to the error_queue in the main thread.
 
     mpi_comm().barrier()
+    worker_process_identities = mpi_comm().allgather(
+        capture_worker_process_identity(mpi_rank()))
+
+    # Publish the process identities before backend construction begins. Model
+    # construction can load weights for several minutes, and an externally
+    # killed worker may not complete its MPI future. Registering the workers at
+    # this point lets the proxy observe such a death while it is still waiting
+    # for the READY signal.
+    if is_leader and worker_process_identities_signal is not None:
+        identities_msg = (worker_process_identities_signal, None,
+                          worker_process_identities)
+        if not worker_init_status_queue.notify_with_retry(identities_msg):
+            # The failed status queue cannot report its own failure. Let this
+            # escape through the MPI future so the proxy can observe it.
+            raise RuntimeError(
+                "Failed to deliver worker process identities to proxy")
+
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
         worker: GenerationExecutorWorker = worker_cls(
             engine,
-            executor_config,
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -323,11 +430,13 @@ def worker_main(
             if is_leader:
                 if postproc_worker_config.enabled:
                     worker.set_postproc_queues(result_queues)
+                elif frontend_result_queues is not None:
+                    worker.set_frontend_result_queues(frontend_result_queues)
                 else:
                     worker.set_result_queue(result_queue)
 
                 # Send ready signal with confirmation
-                ready_msg = (ready_signal, None)
+                ready_msg = (ready_signal, None, worker_process_identities)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
@@ -342,6 +451,37 @@ def worker_main(
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
+                    elif isinstance(req, StartProfileRequest):
+                        # ``PyExecutor.start_profile`` raises
+                        # ``RequestError`` on the double-start path.
+                        # Capture it and propagate back to the proxy via
+                        # ``profile_ack_queue`` so the HTTP /start_profile
+                        # handler can return 409 in the IPC-proxy
+                        # deployment too.
+                        ack_err: Optional[str] = None
+                        try:
+                            worker.start_profile(output_dir=req.output_dir,
+                                                 num_steps=req.num_steps,
+                                                 start_step=req.start_step,
+                                                 activities=req.activities)
+                        except RequestError as e:
+                            logger.warning(f"start_profile rejected: {e}")
+                            ack_err = str(e)
+                        send_profile_ack("start", ack_err, req)
+                    elif isinstance(req, StopProfileRequest):
+                        # ``worker.stop_profile`` blocks until
+                        # ``PyExecutor.stop_profile`` has actually fired
+                        # the in-loop stop and exported the chrome trace
+                        # (or its 30s timeout elapsed). Acking only after
+                        # that return is what gives the proxy its
+                        # synchronous "trace is on disk" guarantee.
+                        ack_err = None
+                        try:
+                            worker.stop_profile()
+                        except RequestError as e:
+                            logger.warning(f"stop_profile rejected: {e}")
+                            ack_err = str(e)
+                        send_profile_ack("stop", ack_err, req)
                     elif isinstance(req, GenerationRequest):
                         try:
                             worker.submit(req)

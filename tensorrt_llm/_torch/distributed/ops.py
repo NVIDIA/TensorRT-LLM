@@ -1,13 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 import os
 import platform
 import threading
-from typing import Dict, List, Optional, Tuple, Union
+import typing
+from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
@@ -19,17 +36,67 @@ from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 # Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
-# the window buffer so the allreduce needs no extra copy).  Off by default
-# (0); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 to enable.
+# the window buffer so the allreduce needs no extra copy).  On by default
+# (1); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=0 to disable.
 # Evaluated once at import — O(1) module-global lookup on every call,
 # equivalent to a C++ static-bool cached env var.
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
-    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "0") == "1")
+    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
+
+_MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
 _thread_local = threading.local()
+
+# Mirrored by the autotune context so Dynamo can guard this branch without
+# tracing the stateful AutoTuner singleton.
+_ALLREDUCE_AUTOTUNER_TUNING_MODE = False
+
+# Disabled only after the Python/C++ native-tactic contract cannot be honored.
+_ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = True
+
+
+def disable_native_allreduce_autotuner(reason: str) -> None:
+    """Use the Python AllReduce autotuner after a native compatibility failure."""
+    global _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED
+    if _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+        _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = False
+        logger.warning(
+            "Disabling native AllReduce autotuner (%s); falling back to the Python autotuner.",
+            reason)
+
+
+def set_allreduce_autotuner_tuning_mode(is_tuning_mode: bool) -> None:
+    """Set the Dynamo-safe AllReduce autotuner mode mirror."""
+    global _ALLREDUCE_AUTOTUNER_TUNING_MODE
+    _ALLREDUCE_AUTOTUNER_TUNING_MODE = is_tuning_mode
+
+
+class _MpiCommProtocol(Protocol):
+
+    def py2f(self) -> int:
+        ...
+
+    def allreduce(self, value: int) -> int:
+        ...
+
+    def Get_size(self) -> int:
+        ...
+
+    def Dup(self) -> "_MpiCommProtocol":
+        ...
+
+    def Free(self) -> None:
+        ...
+
+
+class _MnnvlWorkspace(TypedDict):
+    handle: McastGPUBuffer
+    uc_buffer: torch.Tensor
+    buffer_flags: torch.Tensor
+    buffer_size_bytes: int
+    mpi_comm: Optional[_MpiCommProtocol]
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -64,11 +131,45 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
+def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace,
+                                         *,
+                                         converge_errors: bool = True) -> None:
+    """Reset Lamport buffers and control flags after allocation or restore."""
+    buffer_size_bytes = workspace["buffer_size_bytes"]
+    num_bytes_to_clear = [0] * 4
+    local_error: Optional[Exception] = None
+    try:
+        # FlashInfer #3950: these tensors may have been created during CUDA
+        # graph warmup under inference mode, so reset them under inference
+        # mode as well.
+        with torch.inference_mode():
+            workspace["uc_buffer"].fill_(-0.0)
+            workspace["buffer_flags"].copy_(
+                torch.tensor(
+                    [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                    dtype=torch.uint32,
+                    device=workspace["buffer_flags"].device,
+                ))
+        torch.cuda.synchronize()
+    except Exception as error:
+        local_error = error
+
+    if converge_errors:
+        comm = workspace["mpi_comm"]
+        assert comm is not None
+        success_count = comm.allreduce(int(local_error is None))
+        if success_count != comm.Get_size():
+            raise RuntimeError(
+                "MNNVL all-reduce protocol reset failed on at least one rank"
+            ) from local_error
+    if local_error is not None:
+        raise local_error
+
+
 def get_or_scale_allreduce_mnnvl_workspace(
-    mapping: Mapping,
-    dtype: torch.dtype,
-    buffer_size_bytes: Optional[int] = None
-) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+        mapping: Mapping,
+        dtype: torch.dtype,
+        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
@@ -78,6 +179,11 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+
+    if mapping in allreduce_mnnvl_workspaces:
+        workspace = allreduce_mnnvl_workspaces[mapping]
+        if not workspace["handle"].is_mapped():
+            raise RuntimeError("MNNVL workspace handles are not attached")
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
@@ -104,6 +210,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
         else:
             comm = allreduce_mnnvl_workspaces[mapping]["mpi_comm"]
+            assert comm is not None
             # Safeguard against when buffer_size_bytes is None
             req_buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
@@ -112,46 +219,54 @@ def get_or_scale_allreduce_mnnvl_workspace(
             logger.debug(
                 f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
             )
-        # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
-        workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
-        mcast_buf_handle = McastGPUBuffer(
-            workspace_size_bytes,
-            mapping.tp_size,
-            mapping.tp_rank,
-            mapping.local_rank,
-            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
-            comm.py2f(),  # Fortran handle for the MPI communicator
-        )
+        candidate_workspace: Optional[_MnnvlWorkspace] = None
+        candidate_error: Optional[Exception] = None
+        try:
+            # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
+            workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
+            # Pass the pre-split MPI communicator's Fortran handle to avoid
+            # redundant splitting in C++.
+            mcast_buf_handle = McastGPUBuffer(
+                workspace_size_bytes,
+                mapping.tp_size,
+                mapping.tp_rank,
+                mapping.local_rank,
+                use_fabric_handle,
+                comm.py2f(),
+            )
+            buffer = mcast_buf_handle.get_uc_buffer(
+                mapping.tp_rank,
+                (workspace_size_bytes // torch.float32.itemsize, ),
+                torch.float32,
+                0,
+            )
+            # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages,
+            # numBytesToClear[4], access count ptr].
+            buffer_flags = torch.tensor(
+                [0] * 9,
+                dtype=torch.uint32,
+                device=torch.device("cuda", mapping.local_rank),
+            )
+            candidate_workspace = {
+                "handle": mcast_buf_handle,
+                "uc_buffer": buffer,
+                "buffer_flags": buffer_flags,
+                "buffer_size_bytes": buffer_size_bytes,
+                "mpi_comm": comm,
+            }
+        except Exception as error:
+            candidate_error = error
 
-        # We use per FP32 element in the buffer for lamport sync
-        buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
-                                                (workspace_size_bytes //
-                                                 (torch.float32.itemsize), ),
-                                                torch.float32, 0)
-        buffer.fill_(-0.0)
-        # Wait until the initialization is done
-        torch.cuda.synchronize()
-        comm.Barrier()
-
-        # This is a buffer to maintain the state of this allreduce Op
-        # Should have the same lifetime with self._buffer
-        # The flag should be binded to each buffer allocation
-        # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
-        num_bytes_to_clear = [0] * 4
-        buffer_flags = torch.tensor(
-            [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
-            dtype=torch.uint32,
-            device=torch.device("cuda", mapping.local_rank),
-        )
-
-        allreduce_mnnvl_workspaces[mapping] = {
-            "handle": mcast_buf_handle,
-            "uc_buffer": buffer,
-            "buffer_flags": buffer_flags,
-            "buffer_size_bytes": buffer_size_bytes,
-            "mpi_comm": comm,
-        }
+        candidate_success_count = comm.allreduce(int(candidate_error is None))
+        if candidate_success_count != comm.Get_size():
+            raise RuntimeError(
+                "MNNVL workspace construction failed on at least one rank"
+            ) from candidate_error
+        if candidate_error is not None:
+            raise candidate_error
+        assert candidate_workspace is not None
+        _initialize_allreduce_mnnvl_protocol(candidate_workspace)
+        allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
 
 
@@ -523,9 +638,26 @@ class MNNVLAllReduce(nn.Module):
     """A specialized AllReduce implementation for Multi-Node NVLink communication.
 
     This class handles the MNNVL-specific allreduce operations, which can be more efficient
-    for certain operations when using NVLink for multi-node communication.
+    for certain operations when using NVLink for multi-node communication. The oneshot kernel
+    is deterministic across ranks. For TP sizes up to 8, it uses a rank-specialized
+    fast path that keeps the local value in registers and volatile-loads only peers
+    from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
+
+    The checkpoint hooks are internal and experimental resource hooks. They do
+    not stop admission or drain execution; an engine-level coordinator must
+    establish global quiescence before invoking them. Multi-node MPI, NCCL, and
+    RDMA process-restore semantics are not yet supported by such a coordinator.
     """
-    allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
+    allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
+                                                     _MnnvlWorkspace]] = {}
+
+    SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
+        AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+    })
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
@@ -563,8 +695,9 @@ class MNNVLAllReduce(nn.Module):
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
         elem_size = torch.tensor([], dtype=dtype).element_size()
-        # This should match the heuristic in allreduceOp.cpp
-        is_one_shot = num_tokens * hidden_dim * group_size * elem_size <= 64 * 1024 * 8
+        # This should match the heuristic in allreduceOp.cpp.
+        is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
+                       <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
         if is_one_shot:
             # For one-shot, each rank needs to store num_tokens * group_size tokens
             workspace_size = num_tokens * hidden_dim * group_size * elem_size
@@ -575,6 +708,61 @@ class MNNVLAllReduce(nn.Module):
                 num_tokens / group_size) * group_size * hidden_dim * elem_size
         return workspace_size
 
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach handles after external global quiescence.
+
+        This internal, experimental hook assumes an engine-level coordinator
+        has atomically stopped admission and drained all in-flight work on every
+        participating rank. It releases this workspace's communicator while the
+        current MPI runtime is still valid. It is not sufficient for live-serving
+        checkpointing.
+        """
+        workspace = self.allreduce_mnnvl_workspaces[self.mapping]
+        workspace["handle"].checkpoint_prepare()
+        comm = workspace["mpi_comm"]
+        if comm is not None:
+            comm.Free()
+            workspace["mpi_comm"] = None
+
+    def checkpoint_restore(self, comm: _MpiCommProtocol) -> None:
+        """Collectively recreate handles under an external restore coordinator.
+
+        This follows FlashInfer #3745 and requires a communicator created
+        after process restore for the fresh handle exchange. This internal,
+        experimental hook assumes every rank is still quiescent; serving must
+        resume only after all resource hooks have completed successfully.
+
+        Args:
+            comm: Communicator newly created after process restore. The workspace
+                retains its own duplicate, so the caller may release this object
+                after the method returns.
+        """
+        workspace = self.allreduce_mnnvl_workspaces[self.mapping]
+        restore_pending = workspace["handle"].checkpoint_restore(comm.py2f())
+        if not restore_pending:
+            return
+        owned_comm: Optional[_MpiCommProtocol] = None
+        protocol_error: Optional[Exception] = None
+        try:
+            owned_comm = comm.Dup()
+            workspace["mpi_comm"] = owned_comm
+            _initialize_allreduce_mnnvl_protocol(workspace,
+                                                 converge_errors=False)
+        except Exception as error:
+            protocol_error = error
+        try:
+            workspace["handle"].checkpoint_restore_complete(
+                protocol_error is None)
+        except Exception as completion_error:
+            workspace["mpi_comm"] = None
+            if owned_comm is not None:
+                owned_comm.Free()
+            if protocol_error is not None:
+                raise protocol_error from completion_error
+            raise
+        if protocol_error is not None:
+            raise protocol_error
+
     def forward(
         self,
         input: torch.Tensor,
@@ -583,17 +771,18 @@ class MNNVLAllReduce(nn.Module):
         """Forward pass for MNNVL AllReduce.
 
         Args:
-            input (torch.Tensor): Input tensor to be reduced
-            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+            input (torch.Tensor): Input tensor to be reduced; last dim is the hidden dimension.
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations.
 
         Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s). Output tensors
+            preserve the input's N-D shape (NVFP4 quant output has its last dim halved; the
+            NVFP4 scale-factor output is 1-D).
         """
 
         fusion_op = all_reduce_params.fusion_op
-        shape = input.shape
-        input = input.view(-1, shape[-1])
-        (num_tokens, hidden_dim) = input.shape
+        hidden_dim = input.shape[-1]
+        num_tokens = input.numel() // hidden_dim
 
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
@@ -617,30 +806,22 @@ class MNNVLAllReduce(nn.Module):
         # The buffer flags is tied to the buffer and used to save the state of the buffer
         buffer_flags = workspace["buffer_flags"]
 
-        if fusion_op == AllReduceFusionOp.NONE:
-            output, _ = torch.ops.trtllm.mnnvl_fusion_allreduce(
-                input,
-                None,  # gamma
-                None,  # residual
-                1e-6,  # epsilon
-                buffer_base,  # comm_buffer
-                buffer_flags,  # buffer_flags
-                False,  # rmsnorm_fusion
-            )
-            return output.view(shape)
-        # Fallback to use other allreduce if hidden_size is not supported
-        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            output, residual_out = torch.ops.trtllm.mnnvl_fusion_allreduce(
-                input,
-                all_reduce_params.norm_weight,  # gamma
-                all_reduce_params.residual,  # residual
-                all_reduce_params.eps,  # epsilon
-                buffer_base,  # comm_buffer
-                buffer_flags,  # buffer_flags
-                True,  # rmsnorm_fusion
-            )
-            return output.view(shape), residual_out.view(shape)
-        return None
+        is_fusion = fusion_op != AllReduceFusionOp.NONE
+        if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
+            return None
+
+        outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
+            input,
+            all_reduce_params.norm_weight,  # gamma
+            all_reduce_params.residual,  # residual
+            all_reduce_params.eps,  # epsilon
+            buffer_base,  # comm_buffer
+            buffer_flags,  # buffer_flags
+            is_fusion,  # rmsnorm_fusion
+            all_reduce_params.scale,  # scale
+            int(fusion_op),
+        )
+        return tuple(outputs) if is_fusion else outputs[0]
 
 
 class AllReduce(nn.Module):
@@ -736,7 +917,7 @@ class AllReduce(nn.Module):
                         # Keep SYMM_MEM strategy but allocate workspace for fallback to regular allreduce
                     else:
                         logger.info(
-                            f"SymmetricMemoryAllReduce is disabled (not supported or unavailable), falling back to AUTO strategy"
+                            "SymmetricMemoryAllReduce is disabled (not supported or unavailable), falling back to AUTO strategy"
                         )
                         # Fall back to AUTO if SYMM_MEM can't be enabled
                         self.strategy = AllReduceStrategy.AUTO
@@ -774,7 +955,7 @@ class AllReduce(nn.Module):
                         self.mnnvl_allreduce = None
                 else:
                     logger.debug(
-                        f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
+                        "MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
 
@@ -890,20 +1071,38 @@ class AllReduce(nn.Module):
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
-            output = torch.ops.trtllm.tunable_allreduce(
-                input=input,
-                residual=all_reduce_params.residual,
-                norm_weight=all_reduce_params.norm_weight,
-                scale=all_reduce_params.scale,
-                bias=all_reduce_params.bias,
-                workspace=self.workspace,
-                group=self.mapping.tp_group,
-                strategy=allreduce_strategy,
-                op=all_reduce_params.fusion_op,
-                eps=all_reduce_params.eps,
-                trigger_completion_at_end=all_reduce_params.
-                trigger_completion_at_end,
-            )
+            # Use native lookup after tuning unless its Python/C++ contract
+            # failed; then retain the existing Python cache and selection path.
+            if _ALLREDUCE_AUTOTUNER_TUNING_MODE or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+                output = torch.ops.trtllm.tunable_allreduce(
+                    input=input,
+                    residual=all_reduce_params.residual,
+                    norm_weight=all_reduce_params.norm_weight,
+                    scale=all_reduce_params.scale,
+                    bias=all_reduce_params.bias,
+                    workspace=self.workspace,
+                    group=self.mapping.tp_group,
+                    strategy=allreduce_strategy,
+                    op=all_reduce_params.fusion_op,
+                    eps=all_reduce_params.eps,
+                    trigger_completion_at_end=all_reduce_params.
+                    trigger_completion_at_end,
+                )
+            else:
+                output = torch.ops.trtllm.autotuned_allreduce(
+                    input=input,
+                    residual=all_reduce_params.residual,
+                    norm_weight=all_reduce_params.norm_weight,
+                    scale=all_reduce_params.scale,
+                    bias=all_reduce_params.bias,
+                    workspace=self.workspace,
+                    group=self.mapping.tp_group,
+                    strategy=allreduce_strategy,
+                    op=all_reduce_params.fusion_op,
+                    eps=all_reduce_params.eps,
+                    trigger_completion_at_end=all_reduce_params.
+                    trigger_completion_at_end,
+                )
         else:
             output = self.all_reduce_op(
                 input=input,

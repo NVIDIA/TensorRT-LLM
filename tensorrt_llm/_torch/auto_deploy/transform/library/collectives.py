@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Transformations for fusing collective operations.
 
 This module registers TRT-LLM backend patterns only. Fusion is only applied
@@ -124,11 +138,10 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             # with allreduce_strategy populated from YAML.
             strategy = shared_config.dist_config.allreduce_strategy
         elif hasattr(gm, "_sharding_transform_container"):
-            # Legacy fallback: entered only by external invocations that construct
-            # InferenceOptimizer without a dist_config kwarg (e.g.
-            # tests/unittest/auto_deploy/multigpu/transformations/library/
-            # test_allreduce_residual_rmsnorm_fusion.py). Will be removed together
-            # with the legacy sharding pipeline (sharding.py).
+            # Heuristic-pipeline fallback: entered only by external invocations
+            # that construct InferenceOptimizer without a dist_config kwarg
+            # (e.g. tests/unittest/auto_deploy/multigpu/transformations/library/
+            # test_allreduce_residual_rmsnorm_fusion.py).
             strategy = gm._sharding_transform_container.config.allreduce_strategy.name
         else:
             ad_logger.warning("No dist config found, skipping allreduce-residual-rmsnorm fusion")

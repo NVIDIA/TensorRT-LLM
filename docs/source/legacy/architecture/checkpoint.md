@@ -1,4 +1,12 @@
+---
+orphan: true
+---
+
 # TensorRT LLM Checkpoint
+
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
 
 > [!WARNING]
 > This page describes the **legacy** TensorRT engine-build workflow.

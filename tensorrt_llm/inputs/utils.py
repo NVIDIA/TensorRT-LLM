@@ -3,32 +3,34 @@
 
 import asyncio
 import base64
-import ipaddress
-import math
-import os
-import socket
 import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import urlparse
 
-import aiohttp
 import numpy as np
-import requests
 import soundfile
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
-from transformers import AutoProcessor, ProcessorMixin
+from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
+from tensorrt_llm.inputs.data import prompt_inputs
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY,
+                                          _get_aiohttp_session,
+                                          _load_and_convert_image,
+                                          _load_video_by_cv2,
+                                          _normalize_file_uri,
+                                          _safe_aiohttp_get, _safe_request_get)
+from tensorrt_llm.inputs.media_io import \
+    convert_image_mode as convert_image_mode
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
-from tensorrt_llm.inputs.multimodal_data import AudioData as AudioData
 from tensorrt_llm.inputs.multimodal_data import \
     BaseModalityData as BaseModalityData
 from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
@@ -36,207 +38,10 @@ from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
-
-# Module-level aiohttp session shared across all media fetch calls.
-# Created lazily on first use inside the async event loop, then reused so that
-# TCP connections are kept alive and not re-established per request.
-_global_aiohttp_session: aiohttp.ClientSession | None = None
-
-
-async def _get_aiohttp_session() -> aiohttp.ClientSession:
-    """Return the shared aiohttp.ClientSession, creating it on first call."""
-    global _global_aiohttp_session
-    if _global_aiohttp_session is None or _global_aiohttp_session.closed:
-        _global_aiohttp_session = aiohttp.ClientSession()
-    return _global_aiohttp_session
-
-
-def rgba_to_rgb(
-    image: Image.Image,
-    background_color: Union[tuple[int, int, int], list[int]] = (255, 255, 255)
-) -> Image.Image:
-    """Convert an RGBA image to RGB with filled background color.
-
-    Uses white (255, 255, 255) as the default background color because:
-    1. It's the most neutral and commonly expected background for images
-    2. Maintains backward compatibility with existing code
-    """
-    if image.mode != "RGBA":
-        raise ValueError(
-            f"Expected image mode to be 'RGBA', but got '{image.mode}'")
-    converted = Image.new("RGB", image.size, background_color)
-    converted.paste(image, mask=image.split()[3])  # 3 is the alpha channel
-    return converted
-
-
-def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
-    """Convert image to specified mode with proper handling of RGBA to RGB conversion."""
-    if image.mode == to_mode:
-        return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
-        return rgba_to_rgb(image)
-    else:
-        return image.convert(to_mode)
-
-
-# Maximum allowed response size for remote fetches (200 MB).
-_MAX_RESPONSE_BYTES = 200 * 1024 * 1024
-
-# Chunk size used while enforcing the response size cap.
-_RESPONSE_CHUNK_BYTES = 1024 * 1024
-
-# Maximum number of redirects allowed for remote fetches.
-_MAX_REDIRECTS = 5
-
-_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
-
-
-def _validate_url(url: str) -> None:
-    """Validate that *url* points to a public, non-internal HTTP(S) resource.
-
-    Raises ``RuntimeError`` for URLs that target non-global addresses or that
-    use a scheme other than http / https.
-
-    Note: validation is performed at DNS-resolution time. A DNS-rebinding
-    attack (TTL=0, resolves to a public IP during validation then a private IP
-    during the actual TCP connect) could bypass this check. For strict
-    isolation, supplement with network-level egress filtering that blocks
-    non-global address ranges at the host firewall.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise RuntimeError(
-            f"Only http and https URLs are allowed, got: {parsed.scheme!r}")
-
-    hostname = parsed.hostname
-    if not hostname:
-        raise RuntimeError("URL has no hostname")
-
-    # Resolve to IP and check address range.
-    try:
-        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
-
-    for _family, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global or ip.is_multicast:
-            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
-
-
-def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
-    """Read a requests response with a hard size limit."""
-    content = BytesIO()
-    total = 0
-    try:
-        for chunk in resp.iter_content(chunk_size=_RESPONSE_CHUNK_BYTES):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > _MAX_RESPONSE_BYTES:
-                raise RuntimeError("Response exceeds maximum allowed size")
-            content.write(chunk)
-    except Exception:
-        resp.close()
-        raise
-
-    data = content.getvalue()
-    resp._content = data
-    resp.raw = BytesIO(data)
-    return resp
-
-
-def _safe_request_get(url: str,
-                      *,
-                      stream: bool = False,
-                      timeout: int = 30) -> "requests.Response":
-    """``requests.get`` wrapper that validates URLs and bounds response size."""
-    del stream  # Kept for API compatibility; responses are always bounded.
-
-    current_url = url
-    _validate_url(current_url)
-
-    for redirect_count in range(_MAX_REDIRECTS + 1):
-        resp = requests.get(
-            current_url,
-            stream=True,
-            timeout=timeout,
-            allow_redirects=False,
-        )
-        if resp.status_code not in _REDIRECT_STATUSES:
-            try:
-                resp.raise_for_status()
-            except Exception:
-                resp.close()
-                raise
-            return _buffer_requests_response(resp)
-
-        if redirect_count == _MAX_REDIRECTS:
-            resp.close()
-            raise RuntimeError("Too many redirects")
-
-        redirect_url = resp.headers.get("Location", "")
-        next_url = urljoin(current_url, redirect_url)
-        resp.close()
-        _validate_url(next_url)
-        current_url = next_url
-
-    raise RuntimeError("Too many redirects")
-
-
-async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
-    """Read an aiohttp response to EOF with a hard size limit."""
-    content = BytesIO()
-    total = 0
-    while True:
-        chunk = await response.content.read(_RESPONSE_CHUNK_BYTES)
-        if not chunk:
-            return content.getvalue()
-        total += len(chunk)
-        if total > _MAX_RESPONSE_BYTES:
-            raise RuntimeError("Response exceeds maximum allowed size")
-        content.write(chunk)
-
-
-async def _safe_aiohttp_get(
-        url: str,
-        timeout_sec: int = 30,
-        session: Optional[aiohttp.ClientSession] = None) -> bytes:
-    """Aiohttp GET wrapper that validates every redirect hop before following."""
-    await asyncio.to_thread(_validate_url, url)
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
-
-    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
-        current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
-            async with fetch_session.get(current_url,
-                                         timeout=timeout,
-                                         allow_redirects=False) as response:
-                if response.status in _REDIRECT_STATUSES:
-                    redirect_url = response.headers.get("Location", "")
-                    current_url = urljoin(current_url, redirect_url)
-                    await asyncio.to_thread(_validate_url, current_url)
-                    continue
-                maybe_coro = response.raise_for_status()
-                if asyncio.iscoroutine(maybe_coro):
-                    await maybe_coro
-                return await _read_aiohttp_content(response)
-        raise RuntimeError("Too many redirects")
-
-    if session is not None:
-        return await _fetch(session)
-
-    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
-        return await _fetch(owned_session)
-
-
-def _load_and_convert_image(image):
-    image = Image.open(image)
-    image.load()
-    return convert_image_mode(image, "RGB")
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:
@@ -316,188 +121,6 @@ async def async_load_image(
                                        (image).to(device=device))
     else:
         return image
-
-
-def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
-    """Convert a PyAV audio frame to a NumPy array, averaging channels if mono."""
-    chunk = frame.to_ndarray()
-    if mono and chunk.ndim > 1:
-        chunk = chunk.mean(axis=0)
-    return chunk
-
-
-# TODO(TRTLLM-12001): Add unit tests for this.
-def extract_audio_from_video(
-    source: Union[str, BytesIO],
-    *,
-    sr: Optional[float] = None,
-    mono: bool = True,
-) -> Tuple[np.ndarray, int]:
-    """Extract the audio track from a video file using PyAV.
-
-    Args:
-        source: File path, URL, or BytesIO containing the video.
-        sr: Target sample rate. If `None`, the native sample rate is kept.
-        mono: If `True` (default), average channels to produce a mono waveform.
-
-    Returns:
-        `(waveform, sample_rate)` where *waveform* is a 1-D float32
-        NumPy array and *sample_rate* is an integer in Hz.
-
-    Raises:
-        ValueError: If the video has no audio stream or the data is corrupt.
-    """
-    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
-        raise RuntimeError(
-            "PyAV is required for audio extraction from video. "
-            "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it.")
-    try:
-        import av
-    except ImportError:
-        raise ImportError(
-            "PyAV is required for audio extraction from video but is not installed."
-        )
-
-    try:
-        with av.open(source) as container:
-            if not container.streams.audio:
-                raise ValueError("No audio stream found in the video.")
-            stream = container.streams.audio[0]
-            stream.thread_type = "AUTO"
-            native_sr = stream.rate
-            target_sr = int(sr) if sr is not None else native_sr
-
-            chunks: List[np.ndarray] = []
-            target_layout = "mono" if mono else stream.layout.name
-            needs_resampling = (not math.isclose(
-                float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
-                                or stream.format.name != "fltp"
-                                or stream.layout.name != target_layout)
-            resampler = (av.AudioResampler(
-                format="fltp",
-                layout=target_layout,
-                rate=target_sr,
-            ) if needs_resampling else None)
-            for frame in container.decode(stream):
-                if needs_resampling:
-                    for out_frame in resampler.resample(frame):
-                        chunks.append(_audio_frame_to_array(out_frame, mono))
-                else:
-                    chunks.append(_audio_frame_to_array(frame, mono))
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            "Invalid or corrupted video data when extracting audio. "
-            "Ensure the input is a valid video file.") from e
-
-    if not chunks:
-        raise ValueError("No audio frames decoded from the video.")
-
-    audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
-
-    return audio, target_sr
-
-
-def _load_video_by_cv2(video: str,
-                       num_frames: int = 10,
-                       fps: int = 30,
-                       format: str = "pt",
-                       device: str = "cpu",
-                       extract_audio: bool = False) -> VideoData:
-    # Keep this import local to avoid importing cv2 if not needed
-    import cv2
-
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-
-    vidcap = cv2.VideoCapture(video)
-
-    try:
-        if not vidcap.isOpened():
-            raise ValueError(
-                f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
-            )
-
-        frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-        original_fps = vidcap.get(cv2.CAP_PROP_FPS)
-
-        if frame_count <= 0 or original_fps <= 0:
-            raise ValueError("Video has no frames or invalid FPS.")
-
-        duration = frame_count / original_fps
-        num_frames_to_sample = frame_count
-        if num_frames > 0:
-            num_frames_to_sample = min(num_frames, frame_count)
-        if fps > 0:
-            num_frames_to_sample = min(num_frames_to_sample,
-                                       math.floor(duration * fps))
-        num_frames_to_sample = max(1,
-                                   num_frames_to_sample)  # at least one sample
-
-        indices = np.linspace(0,
-                              frame_count - 1,
-                              num_frames_to_sample,
-                              dtype=int).tolist()
-
-        # Sequential forward scan — grab() without per-frame seek
-        target_set = set(indices)
-        max_idx = indices[-1]
-        raw_frames: dict[int, np.ndarray] = {}
-        frame_idx = 0
-        while frame_idx <= max_idx:
-            grab_succeeded = vidcap.grab()
-            if not grab_succeeded:
-                break
-            if frame_idx in target_set:
-                # cv2 decodes frames in BGR order; convert to RGB for downstream use
-                retrieve_succeeded, bgr_frame = vidcap.retrieve()
-                if retrieve_succeeded:
-                    raw_frames[frame_idx] = cv2.cvtColor(
-                        bgr_frame, cv2.COLOR_BGR2RGB)
-            frame_idx += 1
-        vidcap.release()
-
-        if not raw_frames:
-            raise ValueError("Video has no readable frames.")
-
-        valid_indices = [i for i in indices if i in raw_frames]
-        if format == "pt":
-            # Bypass PIL: direct numpy HWC uint8 -> torch CHW float32
-            loaded_frames = [
-                torch.from_numpy(raw_frames[i]).permute(
-                    2, 0, 1).float().div_(255.0).to(device=device)
-                for i in valid_indices
-            ]
-        else:
-            loaded_frames = [
-                Image.fromarray(raw_frames[i]) for i in valid_indices
-            ]
-
-        metadata = {
-            "total_num_frames": frame_count,
-            "fps": original_fps,
-            "duration": duration,
-            "frames_indices": valid_indices,
-        }
-    finally:
-        # Release the OpenCV handle before any downstream re-open (e.g. PyAV
-        # audio extraction on Windows) and to avoid leaking descriptors.
-        vidcap.release()
-
-    audio = None
-    if extract_audio:
-        try:
-            audio_samples, audio_sample_rate = extract_audio_from_video(video)
-            audio = AudioData(samples=audio_samples,
-                              sample_rate=audio_sample_rate)
-        except ValueError as e:
-            if "No audio stream found" in str(e):
-                logger.warning(
-                    "Video has no audio track, skipping audio extraction.")
-            else:
-                raise
-
-    return VideoData(frames=loaded_frames, metadata=metadata, audio=audio)
 
 
 def load_base64_video(video: str) -> BytesIO:
@@ -593,14 +216,6 @@ async def async_load_video(video: str,
                                        extract_audio=extract_audio)
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
-
-
-def _normalize_file_uri(uri: str) -> str:
-    """Strip the file:// scheme and unquote percent-encoded characters."""
-    parsed = urlparse(uri)
-    if parsed.scheme == "file":
-        return unquote(parsed.path)
-    return uri
 
 
 def load_audio(
@@ -738,11 +353,15 @@ class ConversationMessage(TypedDict, total=False):
             This is used by `interleave_mm_placeholders` to insert multimodal placeholders at the
             correct positions, and to reconstruct the OpenAI-style content list for templates that
             handle media natively.
+        tools: Message-level (dynamic) tool declarations carried on system messages. Only
+            populated for models whose python-renderer chat template consumes them (kimi_k3);
+            absent for other models.
     """
     role: str
     content: str
     media: List[MultimodalData]
     content_parts: List[Union[str, dict]]
+    tools: List[Dict[str, Any]]
 
 
 class MultimodalDataTracker:
@@ -759,10 +378,18 @@ class MultimodalDataTracker:
         self._embeddings = defaultdict[str, list](list)
         self._placeholder_counts = defaultdict[str, int](int)
         self._placeholder_to_modality: dict[str, str] = {}
+        # Prompt-order manifest of data-backed items. Each entry is
+        # `{"modality": <str>, "index": <int>, "placeholder": <str>}`:
+        # `modality` is the modality name, `index` is the item's position in
+        # `multi_modal_data[modality]`, and `placeholder` is the exact string
+        # the input processor splices this item's embedding into. Populated by
+        # `add_data` (skipping `is_embedding=True` items — the interleave
+        # manifest addresses raw payload only).
+        self._item_order: list[dict[str, Union[str, int]]] = []
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
-        # time; see `resolve_media_io_kwargs` in `serve/chat_utils.py`.
+        # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
 
     @property
@@ -801,6 +428,27 @@ class MultimodalDataTracker:
             _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
 
+    async def discard_all_async(
+        self
+    ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
+        """Return `(None, None)`, closing the pending loads instead of running them.
+
+        Use instead of `retrieve_all_async` when the caller will not use the
+        media: the per-item loads are coroutines `add_data` parked and never
+        started, and closing them is what keeps Python from reporting them as
+        never awaited. Exactly one of the two may be awaited per tracker.
+
+        Placeholder counts and `item_order` are unaffected; `add_data` builds
+        both synchronously.
+        """
+        for pending in (self._data, self._embeddings):
+            for items in pending.values():
+                for item in items:
+                    if asyncio.iscoroutine(item):
+                        item.close()
+            pending.clear()
+        return None, None
+
     def retrieve_all_sync(
         self
     ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
@@ -827,6 +475,12 @@ class MultimodalDataTracker:
             self._embeddings[media_type]) + 1
         placeholder = retrieve_multimodal_placeholder(self._model_type,
                                                       media_type, current_count)
+        if not is_embedding:
+            self._item_order.append({
+                "modality": media_type,
+                "index": len(self._data[media_type]),
+                "placeholder": placeholder,
+            })
         (self._embeddings
          if is_embedding else self._data)[media_type].append(data)
         if placeholder:
@@ -842,20 +496,63 @@ class MultimodalDataTracker:
         """Get the mapping from placeholder string to modality name."""
         return dict(self._placeholder_to_modality)
 
+    def item_order(self) -> List[Dict[str, Union[str, int]]]:
+        """Prompt-order manifest of data-backed items.
 
-def add_multimodal_placeholders(model_type: str, text_prompt: str,
-                                mm_placeholder_counts: dict[str, int]) -> str:
+        Each entry is `{"modality": <str>, "index": <int>, "placeholder": <str>}`.
+        `index` is the item's position in `multi_modal_data[modality]`;
+        `placeholder` is the exact string the input processor will look
+        for when splicing this item's encoder embedding.
+
+        Items are recorded in chat-part send order. When the model's chat
+        template regroups placeholders by modality (declared via
+        `MultimodalPlaceholderMetadata.prompt_modality_order`), sort by
+        that priority so the returned list matches what the template
+        actually emits — preserving per-modality send order as the tie
+        break.
+        """
+        prompt_order = MULTIMODAL_PLACEHOLDER_REGISTRY.get_prompt_modality_order(
+            self._model_type)
+        if not prompt_order:
+            return list(self._item_order)
+        rank = {m: i for i, m in enumerate(prompt_order)}
+        return sorted(
+            self._item_order,
+            key=lambda e:
+            (rank.get(e["modality"], len(prompt_order)), e["index"]),
+        )
+
+
+def add_multimodal_placeholders(
+    model_type: str,
+    text_prompt: str,
+    mm_placeholder_counts: dict[str, int],
+    item_order: Optional[List[Dict[str, Union[str, int]]]] = None,
+) -> str:
     """Add multimodal placeholders to the text prompt.
 
-    Placeholders that already exist in the text are counted and subtracted
-    from the requested count to avoid double-insertion (e.g. when the
-    client already embeds ``<image>`` in the prompt text).
+    Placeholders already in the text are counted and subtracted to
+    avoid double-insertion (e.g. when the client already embeds
+    `<image>` in the prompt text). When `item_order` is supplied,
+    placeholders are emitted in prompt-arrival order (needed for mixed
+    modality); otherwise they follow `mm_placeholder_counts` iteration
+    order.
     """
+    if item_order:
+        wanted = [e["placeholder"] for e in item_order]
+    else:
+        wanted = [
+            ph for ph, n in mm_placeholder_counts.items() for _ in range(n)
+        ]
+
+    remaining = {ph: text_prompt.count(ph) for ph in set(wanted)}
     placeholders = []
-    for placeholder, count in mm_placeholder_counts.items():
-        existing = text_prompt.count(placeholder)
-        needed = max(0, count - existing)
-        placeholders.extend([placeholder] * needed)
+    for ph in wanted:
+        if remaining[ph] > 0:
+            remaining[ph] -= 1
+        else:
+            placeholders.append(ph)
+
     if not placeholders:
         return text_prompt
     parts = []
@@ -930,6 +627,15 @@ def interleave_mm_placeholders(
                 modality_cursor[media_type] = cursor + 1
 
     return separator.join(parts)
+
+
+def _has_python_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
+    """Return whether a tokenizer overrides Hugging Face's Jinja renderer."""
+    apply_chat_template_method = getattr(type(tokenizer), "apply_chat_template",
+                                         None)
+    return (apply_chat_template_method is not None
+            and apply_chat_template_method
+            is not PreTrainedTokenizerBase.apply_chat_template)
 
 
 def resolve_hf_chat_template(
@@ -1037,12 +743,13 @@ def apply_chat_template(
 
     Uses content-format-driven dispatch:
     - PASSTHROUGH: skip template rendering, just concatenate content strings
+    - PYTHON: use a tokenizer-native renderer when no Jinja template is declared
     - OPENAI: reconstructs content as list of dicts for the template to handle
     - STRING: keeps flattened text with pre-inserted placeholders
     """
 
-    # Handle DeepSeek V32 tokenizer with custom chat template
-    if isinstance(tokenizer, DeepseekV32Tokenizer):
+    # Handle DeepSeek tokenizers with custom chat templates.
+    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
         prompt = tokenizer.apply_chat_template(
             messages=conversation,
             tools=tools,
@@ -1061,6 +768,21 @@ def apply_chat_template(
 
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
+
+    if (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer)):
+        native_kwargs = dict(chat_template_kwargs or {})
+        if documents is not None:
+            native_kwargs["documents"] = documents
+        return tokenizer.apply_chat_template(
+            conversation,
+            tools=tools,
+            tokenize=enable_tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **native_kwargs,
+        )
 
     hf_chat_template = resolve_hf_chat_template(tokenizer, processor,
                                                 chat_template, tools)
@@ -1094,6 +816,163 @@ def apply_chat_template(
     return result
 
 
+async def async_apply_chat_template(
+    *,
+    model_type: str,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
+    processor: ProcessorMixin,
+    conversation: list[ConversationMessage],
+    add_generation_prompt: bool,
+    mm_placeholder_counts: list[dict[str, int]],
+    tools: Optional[list[dict[str, Any]]] = None,
+    documents: Optional[list[dict[str, str]]] = None,
+    chat_template: Optional[str] = None,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+    enable_tokenize: bool = False,
+) -> (str | List[str]):
+    """Apply chat template without blocking the event loop."""
+    return await asyncio.to_thread(
+        apply_chat_template,
+        model_type=model_type,
+        tokenizer=tokenizer,
+        processor=processor,
+        conversation=conversation,
+        add_generation_prompt=add_generation_prompt,
+        mm_placeholder_counts=mm_placeholder_counts,
+        tools=tools,
+        documents=documents,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        enable_tokenize=enable_tokenize,
+    )
+
+
+def apply_mm_placeholders(
+    model_type: str,
+    message: ConversationMessage,
+    placeholder_counts: Dict[str, int],
+    mm_data_tracker: "MultimodalDataTracker",
+    *,
+    item_order_start: int = 0,
+    content_format: Optional[ContentFormat] = None,
+) -> None:
+    """Insert this message's multimodal placeholders into its text, in place.
+
+    Only `ContentFormat.STRING` templates need them. For `OPENAI`,
+    `apply_chat_template` rebuilds `content` from `content_parts` via
+    `_build_openai_content`, so pre-inserting here would render every media
+    item twice: once as text and once as the template's own content part.
+
+    When the model opts into interleaving and `content_parts` is available the
+    placeholders keep their original positions; otherwise they are placed in
+    bulk according to the registered placement.
+    """
+    if not placeholder_counts:
+        return
+
+    if content_format is None:
+        registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            model_type)
+        content_format = (registry_format if registry_format is not None else
+                          ContentFormat.STRING)
+    if content_format != ContentFormat.STRING:
+        return
+
+    content_parts = message.get("content_parts")
+    interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
+        model_type)
+    if content_parts and interleave:
+        message["content"] = interleave_mm_placeholders(
+            model_type, content_parts, placeholder_counts,
+            mm_data_tracker.placeholder_modalities())
+    else:
+        message["content"] = add_multimodal_placeholders(
+            model_type,
+            message["content"],
+            placeholder_counts,
+            item_order=mm_data_tracker.item_order()[item_order_start:],
+        )
+
+
+async def async_build_multimodal_prompt(
+    *,
+    model_type: str,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
+    processor: ProcessorMixin,
+    prompt: str,
+    media: List[str],
+    modality: str = "image",
+    add_generation_prompt: bool = True,
+    chat_template: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
+    media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Package one text prompt plus media URLs into engine inputs.
+
+    For callers whose request format is a plain prompt and a list of media
+    references rather than OpenAI chat messages -- the Triton `llmapi` backend,
+    for example. Runs the same steps `trtllm-serve` runs for
+    `v1/chat/completions`: resolve placeholders for the model's content format,
+    render the chat template, and attach the fetched media.
+
+    The media fetches and the template rendering are awaited together, so
+    several items on one request are loaded concurrently.
+
+    Args:
+        model_type: Top-level HF `model_type`, the multimodal registry key.
+        prompt: The user's text, without any placeholder tokens.
+        media: URLs, `data:` URIs or local paths, one per item.
+        modality: Registered media modality, e.g. `"image"`.
+
+    Returns:
+        A `TextPrompt` carrying `multi_modal_data`, ready for
+        `LLM.generate_async`.
+    """
+    media_io_cls = MEDIA_IO_REGISTRY.get(modality)
+    if media_io_cls is None:
+        raise ValueError(f"Unsupported modality {modality!r}. "
+                         f"Registered modalities: {list(MEDIA_IO_REGISTRY)}")
+    media_io = media_io_cls.create((media_io_kwargs or {}).get(modality), None)
+
+    mm_data_tracker = MultimodalDataTracker(model_type)
+    content_parts: List[Union[str, Dict[str, Any]]] = []
+    for index, item in enumerate(media):
+        # `add_data` takes the un-awaited fetch; they run concurrently below.
+        mm_data_tracker.add_data(modality, media_io.async_load(item))
+        content_parts.append({"type": modality, "media_index": index})
+    content_parts.append(prompt)
+
+    message = ConversationMessage(role="user",
+                                  content=prompt,
+                                  media=[],
+                                  content_parts=content_parts)
+    placeholder_counts = mm_data_tracker.placeholder_counts()
+    apply_mm_placeholders(model_type, message, placeholder_counts,
+                          mm_data_tracker)
+
+    prompt_task = async_apply_chat_template(
+        model_type=model_type,
+        tokenizer=tokenizer,
+        processor=processor,
+        conversation=[message],
+        add_generation_prompt=add_generation_prompt,
+        mm_placeholder_counts=[placeholder_counts],
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    rendered, (mm_data,
+               _) = await asyncio.gather(prompt_task,
+                                         mm_data_tracker.retrieve_all_async())
+
+    inputs = prompt_inputs(rendered)
+    if mm_data:
+        inputs["multi_modal_data"] = mm_data
+        item_order = mm_data_tracker.item_order()
+        if item_order:
+            inputs["mm_item_order"] = item_order
+    return inputs
+
+
 def default_multimodal_input_loader(
     *,
     tokenizer: Optional[Union[TransformersTokenizer, TokenizerBase]],
@@ -1108,6 +987,7 @@ def default_multimodal_input_loader(
                                   List[List[torch.Tensor]]]] = None,
     device: str = "cpu",
     extract_audio: bool = False,
+    trust_remote_code: bool = True,
 ) -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(
@@ -1225,13 +1105,13 @@ def default_multimodal_input_loader(
         model_type) == ContentFormat.PASSTHROUGH)
 
     if tokenizer is None and not is_passthrough:
-        tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
+        tokenizer = ModelLoader.load_hf_tokenizer(
+            model_dir, trust_remote_code=trust_remote_code, use_fast=True)
 
     processor = None
     if not is_passthrough:
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  use_fast=True,
-                                                  trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_dir, use_fast=True, trust_remote_code=trust_remote_code)
 
     inputs = []
     for prompt_idx, (prompt,
@@ -1278,6 +1158,9 @@ def default_multimodal_input_loader(
                 input[
                     "multi_modal_data"], _ = mm_data_tracker.retrieve_all_sync(
                     )
+            item_order = mm_data_tracker.item_order()
+            if item_order:
+                input["mm_item_order"] = item_order
         inputs.append(input)
 
     return inputs

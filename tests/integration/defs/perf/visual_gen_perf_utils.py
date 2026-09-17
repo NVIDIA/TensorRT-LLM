@@ -27,14 +27,18 @@ MAXIMIZE_METRICS = [
 ]
 
 MINIMIZE_METRICS = [
-    "d_mean_e2e_latency",
-    "d_median_e2e_latency",
-    "d_p90_e2e_latency",
-    "d_p99_e2e_latency",
+    "d_mean_latency",
+    "d_median_latency",
+    "d_p90_latency",
+    "d_p99_latency",
+    "d_mean_generation",
+    "d_median_generation",
+    "d_p90_generation",
+    "d_p99_generation",
 ]
 
 REGRESSION_METRICS = [
-    "d_mean_e2e_latency",
+    "d_median_generation",
 ]
 
 MATCH_KEYS = [
@@ -48,9 +52,9 @@ MATCH_KEYS = [
     "b_enable_cuda_graph",
     "b_enable_torch_compile",
     "b_enable_two_stage",
-    "b_enable_parallel_vae",
     "l_cfg_size",
     "l_ulysses_size",
+    "l_parallel_vae_size",
     "s_generation_mode",
     "s_backend",
     "s_size",
@@ -60,14 +64,28 @@ MATCH_KEYS = [
     "l_max_concurrency",
 ]
 
-RESULT_METRIC_PATHS = {
-    "d_request_throughput": "request_throughput",
-    "d_per_gpu_throughput": "per_gpu_throughput",
-    "d_mean_e2e_latency": "mean_e2e_latency_ms",
-    "d_median_e2e_latency": "median_e2e_latency_ms",
-    "d_p90_e2e_latency": "percentiles_e2e_latency_ms.p90",
-    "d_p99_e2e_latency": "percentiles_e2e_latency_ms.p99",
-}
+
+def result_metric_paths(backend: str) -> dict[str, str]:
+    """Where each gated metric lives in the result JSON, per route.
+
+    Both series are client-side wall clock, so what they measure is what a
+    caller of the server waits for. The latency series is the whole request.
+    The generation series ends once generation is done: the video route
+    reports that separately as ``gen_latency``, and the image route, being a
+    single leg, cannot tell it apart from the whole request.
+    """
+    generation = "gen_latency" if backend == "openai-videos" else "e2e_latency"
+    return {
+        "d_request_throughput": "request_throughput",
+        "d_mean_latency": "e2e_latency.mean",
+        "d_median_latency": "e2e_latency.median",
+        "d_p90_latency": "e2e_latency.percentiles.p90",
+        "d_p99_latency": "e2e_latency.percentiles.p99",
+        "d_mean_generation": f"{generation}.mean",
+        "d_median_generation": f"{generation}.median",
+        "d_p90_generation": f"{generation}.percentiles.p90",
+        "d_p99_generation": f"{generation}.percentiles.p99",
+    }
 
 
 def _get_nested_value(data: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -97,7 +115,9 @@ def _infer_generation_mode(client_config: dict[str, Any]) -> str:
         except json.JSONDecodeError:
             extra_body = None
 
-    if isinstance(extra_body, dict) and "input_reference" in extra_body:
+    if isinstance(extra_body, dict) and (
+        "image_reference" in extra_body or "video_reference" in extra_body
+    ):
         return "i2v"
 
     if backend == "openai-videos":
@@ -116,7 +136,7 @@ def extract_visual_gen_metrics(result_data: dict[str, Any]) -> dict[str, float]:
     metrics: dict[str, float] = {}
     missing_paths: list[str] = []
 
-    for metric_name, path in RESULT_METRIC_PATHS.items():
+    for metric_name, path in result_metric_paths(str(result_data.get("backend", ""))).items():
         value = _get_nested_value(result_data, path)
         if value is None:
             missing_paths.append(path)
@@ -143,17 +163,10 @@ def build_visual_gen_db_entry(
     server_config: dict[str, Any],
     client_config: dict[str, Any],
     result_data: dict[str, Any],
-    extra_visual_gen_options_path: str = "",
+    visual_gen_args_path: str = "",
 ) -> dict[str, Any]:
     """Build one OpenSearch document from VisualGen config and result JSON."""
     expected_num_gpus = get_visual_gen_num_gpus_from_server_config(server_config)
-    result_num_gpus = int(result_data.get("num_gpus", expected_num_gpus))
-    if result_num_gpus != expected_num_gpus:
-        raise ValueError(
-            "Benchmark result GPU count mismatch: "
-            f"result={result_num_gpus}, expected={expected_num_gpus}"
-        )
-
     client_name = str(client_config.get("name", "default"))
     entry = {
         "s_runtime": "visual_gen",
@@ -161,33 +174,39 @@ def build_visual_gen_db_entry(
         "s_model_name": str(model_name).lower(),
         "s_server_name": server_name,
         "l_gpus": expected_num_gpus,
-        "s_extra_visual_gen_options_path": str(extra_visual_gen_options_path),
-        "s_attn_backend": str(_get_nested_value(server_config, "attention.backend", "")),
+        "s_visual_gen_args_path": str(visual_gen_args_path),
+        "s_attn_backend": str(_get_nested_value(server_config, "attention_config.backend", "")),
         "s_quant_algo": str(_get_nested_value(server_config, "quant_config.quant_algo", "")),
-        "b_enable_teacache": _get_nested_value(server_config, "cache.cache_backend", "")
+        "b_enable_teacache": _get_nested_value(server_config, "cache_config.cache_backend", "")
         == "teacache",
         "b_enable_cuda_graph": bool(
-            _get_nested_value(server_config, "cuda_graph.enable_cuda_graph", False)
+            _get_nested_value(server_config, "cuda_graph_config.enable", False)
         ),
         "b_enable_torch_compile": bool(
-            _get_nested_value(server_config, "torch_compile.enable_torch_compile", False)
+            _get_nested_value(server_config, "torch_compile_config.enable", False)
         ),
         "b_enable_two_stage": bool(
-            server_config.get("spatial_upsampler_path") or server_config.get("distilled_lora_path")
+            _get_nested_value(server_config, "pipeline_config.spatial_upsampler_path", None)
+            or _get_nested_value(server_config, "pipeline_config.distilled_lora_path", None)
         ),
-        "b_enable_parallel_vae": bool(
-            _get_nested_value(server_config, "parallel.enable_parallel_vae", False)
+        "l_cfg_size": int(_get_nested_value(server_config, "parallel_config.cfg_size", 1)),
+        "l_ulysses_size": int(_get_nested_value(server_config, "parallel_config.ulysses_size", 1)),
+        "l_parallel_vae_size": int(
+            _get_nested_value(server_config, "parallel_config.parallel_vae_size", 1)
         ),
-        "l_cfg_size": int(_get_nested_value(server_config, "parallel.dit_cfg_size", 1)),
-        "l_ulysses_size": int(_get_nested_value(server_config, "parallel.dit_ulysses_size", 1)),
         "s_generation_mode": _infer_generation_mode(client_config),
         "s_backend": str(client_config.get("backend")),
         "s_size": str(client_config.get("size")),
-        "l_num_frames": int(client_config.get("num_frames")),
-        "l_fps": int(client_config.get("fps")),
+        # An image config states neither: the document rejects num_frames on an
+        # image route, so the config cannot carry it. Both stay match keys, and
+        # 1 keeps an image case in the bucket its baselines were recorded under.
+        "l_num_frames": int(client_config.get("num_frames") or 1),
+        "l_fps": int(client_config.get("fps") or 1),
         "l_num_inference_steps": int(client_config.get("num_inference_steps")),
         "l_max_concurrency": int(client_config.get("max_concurrency")),
         "s_test_case_name": f"{server_name}-{client_name}",
     }
     entry.update(extract_visual_gen_metrics(result_data))
+    # The client does not know the topology, so per-GPU throughput is derived here.
+    entry["d_per_gpu_throughput"] = entry["d_request_throughput"] / expected_num_gpus
     return entry

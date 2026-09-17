@@ -1,11 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     create_py_executor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, SchedulerConfig)
+from tensorrt_llm.llmapi import (CapacitySchedulerPolicy, DynamicBatchConfig,
+                                 SchedulerConfig)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, KvCacheConfig,
                                           TorchLlmArgs)
 
@@ -20,10 +35,9 @@ def test_profile_kvcache():
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.9)
     cuda_graph_config = CudaGraphConfig(max_batch_size=512)
-    VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
+    VLM_MODEL = "Qwen3/Qwen3-VL-2B-Instruct"
     VLM_MODEL_PATH = get_model_path(VLM_MODEL)
 
-    build_config = BuildConfig(max_beam_width=1, max_num_tokens=16384)
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
@@ -42,10 +56,8 @@ def test_profile_kvcache():
         "moe_expert_parallel_size": None,
         "gpus_per_node": 1,
         "trust_remote_code": False,
-        "max_batch_size": build_config.max_batch_size,
-        "max_num_tokens": build_config.max_num_tokens,
-        "max_beam_width": build_config.max_beam_width,
-        "max_seq_len": build_config.max_seq_len,
+        "max_num_tokens": 16384,
+        "max_beam_width": 1,
         "kv_cache_config": kv_cache_config,
         "backend": backend,
         "num_postprocess_workers": 0,
@@ -85,14 +97,12 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
 
     Both components must use the same stream for proper synchronization.
     """
-    # Use a simple model for testing
-    MODEL = "llama-3.2-models/Llama-3.2-1B-Instruct"
+    MODEL = "Qwen3/Qwen3-0.6B"
     MODEL_PATH = get_model_path(MODEL)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.5)
 
-    build_config = BuildConfig(max_beam_width=1, max_num_tokens=4096)
     scheduler_config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT, )
     backend = "pytorch"
@@ -105,10 +115,8 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
         "moe_expert_parallel_size": None,
         "gpus_per_node": 1,
         "trust_remote_code": False,
-        "max_batch_size": build_config.max_batch_size,
-        "max_num_tokens": build_config.max_num_tokens,
-        "max_beam_width": build_config.max_beam_width,
-        "max_seq_len": build_config.max_seq_len,
+        "max_num_tokens": 4096,
+        "max_beam_width": 1,
         "kv_cache_config": kv_cache_config,
         "backend": backend,
         "num_postprocess_workers": 0,

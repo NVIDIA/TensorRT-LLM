@@ -135,3 +135,40 @@ Overall verdict: YES (generation phase elevated)
 → CUDA graph replay may be failing (falling back to eager execution)
 → Investigate CUDA graph capture errors or dynamic shape changes
 ```
+
+---
+
+## Case Study: Llama 3.2 1B TP=2 Regression (v1.1 -> main, Feb 2025)
+
+### Symptom
+19.2% throughput regression: 445.63 -> 360.02 req/sec.
+
+### False Starts
+1. **Whole-trace analysis** attributed regression to massive elementwise/reduce kernels -> flashinfer JIT, not inference.
+2. **CUDA graph analysis** suggested graph usage changed -> both versions use similar patterns.
+3. **Kernel density windowing** selected wrong time window -> captured JIT phase.
+
+### Correct Analysis (Detection + Root Cause)
+
+**Detection** confirmed host overhead is the bottleneck (GPU idle ratio high, GPU kernels unchanged).
+
+**Root Cause** via allreduce + NVTX analysis:
+1. Allreduce_fusion grouping (66 per iteration) isolated forward steps
+2. GPU kernel profiles were **identical** between versions
+3. Per-step wall time: 3,317 us -> 3,978 us (+20%)
+4. Inter-step gap P50: 2,543 us -> 4,468 us (+76%)
+
+### Root Cause Breakdown
+
+| Source | Delta (us/step) | Notes |
+|--------|----------------|-------|
+| _update_requests | +310 | Nearly doubled |
+| _fetch_new_requests | +234 | 36 -> 270 us (+643%) |
+| broadcast_requests | +250 | NEW operation for TP sync |
+| prepare_resources | +156 | +81% |
+| Kernel launches | +57 | 3.5x more individual launches |
+| _process_requests | -666 | Improved |
+| _sample_async | -443 | Improved |
+
+### Lesson
+Regression was entirely in the **request management layer** between forward steps. GPU computation was unchanged. Structural iteration isolation and steady-state NVTX comparison were essential for the correct root cause.

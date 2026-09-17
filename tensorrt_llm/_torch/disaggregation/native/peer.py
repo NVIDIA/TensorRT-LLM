@@ -1,21 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
+from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
 from tensorrt_llm._torch.disaggregation.resource.utils import (
-    PoolRole,
-    get_global_layer_ids,
-    get_layer_group_num_layers,
+    get_layer_byte_ranges,
     get_layer_to_layer_group,
-    get_physical_pool,
-    get_pool_role,
     get_pool_view_global_layer_ids,
-    get_pool_view_num_layers,
 )
 
 # Type alias for (lg_idx, pool_idx) pair
@@ -33,9 +48,15 @@ class PeerOverlap:
 
 
 class PeerRegistrar:
+    # Registry: CacheKind -> PolicyClass. Add new layer types here.
+    _POLICY_CLASSES = {
+        CacheKind.PAGED: AttentionPolicy,
+        CacheKind.STATE: MambaPolicy,
+    }
+
     def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
         self._ri = self_rank_info
-        self._attention_policy = AttentionPolicy(self_rank_info)
+        self._policies: Dict[CacheKind, Union[AttentionPolicy, MambaPolicy]] = {}
         self._peer_ri_cache: Dict[str, RankInfo] = {}
         self._kv_map_cache: Dict[
             tuple, RegionMapperBase
@@ -43,6 +64,7 @@ class PeerRegistrar:
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._overlap_cache: Dict[str, PeerOverlap] = {}
+        self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
         self._lg_pool_mapping_cache: Dict[
             str, Dict[LGPoolKey, LGPoolKey]
         ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
@@ -55,9 +77,37 @@ class PeerRegistrar:
             )
         key = self._unique_key(peer_name, peer_rank)
         self._peer_ri_cache[key] = peer_ri
+        self._aux_transfer_layout_cache.pop(key, None)
         peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
         extractor = KVRegionExtractorV1(peer_ri.page_table)
         self._peer_ext_cache[key] = extractor
+
+        head_match, _ = self._get_policy(CacheKind.PAGED).head_match(peer_ri)
+        if not head_match:
+            self_page_table = self._self_ext_cache.page_table
+            nhd_fragments_per_token = sum(
+                len(
+                    self_page_table.layer_groups[layer_group_id].pool_views[pool_idx].buffer_entries
+                )
+                for layer_group_id, pool_idx in self.get_pool_mapping(peer_ri)
+                if self_page_table.layer_groups[layer_group_id].pool_views[pool_idx].mapper_kind
+                == MapperKind.NHD
+            )
+            if nhd_fragments_per_token:
+                local_heads = self._ri.attention.kv_heads_per_rank
+                peer_heads = peer_ri.attention.kv_heads_per_rank
+                logger.warning_once(
+                    "NHD head-mismatched disaggregated KV transfer has no "
+                    "contiguous staging path and will emit approximately "
+                    f"{nhd_fragments_per_token} NIXL descriptors per transferred "
+                    "token per peer, excluding block-level replicated pools "
+                    f"(local_kv_heads={local_heads}, peer_kv_heads={peer_heads}). "
+                    "Long-context TEP/DEP transfers may have high latency.",
+                    key=(
+                        "native-nhd-head-mismatch-"
+                        f"{local_heads}-{peer_heads}-{nhd_fragments_per_token}"
+                    ),
+                )
 
     def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
         return self._peer_ext_cache[self._unique_key(peer_name, peer_rank)]
@@ -73,6 +123,7 @@ class PeerRegistrar:
             del self._peer_ri_cache[key]
         if key in self._peer_ext_cache:
             del self._peer_ext_cache[key]
+        self._aux_transfer_layout_cache.pop(key, None)
         # Clean up kv_map_cache entries for this peer
         keys_to_remove = [k for k in self._kv_map_cache if k[0] == key]
         for k in keys_to_remove:
@@ -83,6 +134,16 @@ class PeerRegistrar:
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
         return self._peer_ri_cache[self._unique_key(peer_name, peer_rank)]
 
+    def get_aux_transfer_layout(
+        self, peer_name: str, peer_rank: int
+    ) -> Optional[AuxTransferLayout]:
+        return self._aux_transfer_layout_cache.get(self._unique_key(peer_name, peer_rank))
+
+    def cache_aux_transfer_layout(
+        self, peer_name: str, peer_rank: int, layout: AuxTransferLayout
+    ) -> None:
+        self._aux_transfer_layout_cache[self._unique_key(peer_name, peer_rank)] = layout
+
     @property
     def self_rank_info(self) -> RankInfo:
         return self._ri
@@ -91,17 +152,30 @@ class PeerRegistrar:
         return name + str(rank)
 
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
-        if not self._attention_policy.check_peer_compatible(peer_ri):
+        if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
+
+        # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a
+        # field-level diagnostic instead of returning False, so the precise
+        # mismatch reaches the caller of register().
+        MambaPolicy.validate_peer_compatible(
+            self._ri,
+            peer_ri,
+            self._self_ext_cache.page_table if self._self_ext_cache is not None else None,
+            peer_ri.page_table,
+        )
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
         if self_layers != peer_layers:
+            # Allow mismatch when one side has speculative (e.g. MTP) layers
+            # that the other side doesn't. The pool_mapping logic will only
+            # transfer layers that exist on both sides.
             logger.warning(
-                "PeerRegistrar: total layer count mismatch "
-                f"(local={self_layers}, peer={peer_layers})."
+                "PeerRegistrar: layer count differs "
+                f"(local={self_layers}, peer={peer_layers}), "
+                "allowing partial layer transfer."
             )
-            return False
 
         return True
 
@@ -110,8 +184,20 @@ class PeerRegistrar:
 
         Two-step matching:
         1. Find peer layer_group via layer_to_layer_group (global_layer_id -> lg_idx).
-        2. Within the matched peer layer_group, find the peer pool by matching
-           pool_role AND global_layer_ids overlap.
+        2. Within the matched peer layer_group, find the unique peer pool whose
+           ``PoolView.pool_role`` equals self's and whose global_layer_ids
+           overlap.
+
+        Layer-overlap is required: a peer pool with the same pool_role but
+        zero layer overlap with self is *not* a match — the two pools cover
+        disjoint layers and have nothing to transfer.
+
+        A self layer group never matches multiple peer layer groups, so the
+        result is one peer pool per self pool. Layer groups partition each
+        rank's layers by attention/life-cycle class, which both sides derive
+        from the same model config; PP only changes which layers overlap (the
+        fan-out across peer PP ranks is handled by calling this method once
+        per peer rank). Step 1 raises if this invariant is ever violated.
         """
         key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
         if key in self._lg_pool_mapping_cache:
@@ -128,62 +214,101 @@ class PeerRegistrar:
             self._lg_pool_mapping_cache[key] = mapping
             return mapping
 
-        peer_layer_to_group = get_layer_to_layer_group(peer_pt)
-        assert self._ri.attention is not None
-        kv_factor = self._ri.attention.kv_factor
+        # Build kind-specific peer layer-to-group mappings lazily. In hybrid
+        # models (e.g. Qwen3Next) a global_layer_id may appear in both a
+        # PAGED and a STATE layer group, so the lookup must be scoped to
+        # the same CacheKind as self's layer group.
+        _peer_l2g_cache: Dict[CacheKind, Dict[int, int]] = {}
+
+        def _peer_l2g(kind: CacheKind) -> Dict[int, int]:
+            if kind not in _peer_l2g_cache:
+                _peer_l2g_cache[kind] = get_layer_to_layer_group(peer_pt, kind)
+            return _peer_l2g_cache[kind]
 
         for self_lg_idx, self_lg in enumerate(self_pt.layer_groups):
-            if not isinstance(self_lg, AttentionLayerGroup):
+            if self_lg.kind not in (CacheKind.PAGED, CacheKind.STATE):
                 continue
             for self_pi, self_pv in enumerate(self_lg.pool_views):
-                is_indexer = len(self_pv.buffer_entries) == 0
-                # For INDEXER (empty buffer_entries), use group-level IDs for step-1 lookup
-                pv_global_ids = (
-                    get_global_layer_ids(self_lg)
-                    if is_indexer
-                    else get_pool_view_global_layer_ids(self_pv, self_lg)
-                )
+                # Every view carries buffer_entries, so a view's exact layer
+                # set always comes from its entries (a view may cover a
+                # subset of the LG when V2 splits an LG into multiple pools
+                # by buffer-size class, or when a role class exists only on
+                # some layers, e.g. sparse-layer index-K).
+                pv_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
                 if not pv_global_ids:
                     continue
 
-                # Step 1: find peer layer_group via any overlapping global_layer_id
-                peer_lg_idx = None
-                for glid in pv_global_ids:
-                    if glid in peer_layer_to_group:
-                        peer_lg_idx = peer_layer_to_group[glid]
-                        break
-                if peer_lg_idx is None:
+                # Step 1: find the peer layer_group via overlapping global_layer_ids.
+                # A self layer group (hence each of its pool views) never matches
+                # multiple peer layer groups: layer groups partition a rank's
+                # layers by attention/life-cycle class, both sides derive that
+                # class from the same model config, and global ids are
+                # PP-invariant. So PP only changes WHICH layers overlap — layers
+                # the peer doesn't hold are a legal skip (PP slices, one-sided
+                # MTP layers) — never how many peer LGs they land in; the PP
+                # fan-out is handled by per-peer-rank calls of this method. A
+                # multi-LG hit therefore means the two peers group layers
+                # differently (unsupported topology), and we fail loudly instead
+                # of silently transferring only the first LG's overlap.
+                peer_layer_to_group = _peer_l2g(self_lg.kind)
+                peer_lg_indices = {
+                    peer_layer_to_group[g] for g in pv_global_ids if g in peer_layer_to_group
+                }
+                if not peer_lg_indices:
                     continue
+                if len(peer_lg_indices) > 1:
+                    raise ValueError(
+                        "PeerRegistrar.get_pool_mapping: pool view "
+                        f"(lg={self_lg_idx}, pool={self_pi}) spans multiple peer "
+                        f"layer groups {sorted(peer_lg_indices)}; mismatched layer "
+                        "grouping between peers is not supported"
+                    )
+                peer_lg_idx = next(iter(peer_lg_indices))
                 peer_lg = peer_pt.layer_groups[peer_lg_idx]
 
-                # Step 2: find peer pool within group by matching pool_role + layer overlap
-                self_pool_role = (
-                    PoolRole.INDEXER if is_indexer else get_pool_role(self_pv, kv_factor=kv_factor)
-                )
+                # Step 2: pick the first peer pool with the same pool_role
+                # whose layers overlap self's (zero-overlap pools cover
+                # disjoint layers — nothing to transfer).
+                #
+                # Uniqueness assumption: at most one peer pool can match on
+                # both ``pool_role`` (frozenset equality) and layer overlap.
+                # We do *not* assume ``pool_role`` is unique within a peer LG
+                # — V2 may split an LG into multiple same-role pools by
+                # buffer-size class (e.g. VSWA). What we rely on is that both
+                # peers run the same pool-grouping logic, so for every self_pv
+                # there is exactly one peer pool with the same role *and* an
+                # overlapping layer set; other same-role peer pools cover
+                # disjoint layers and fall out via the overlap filter.
                 self_layer_set = set(pv_global_ids)
                 matched_peer_pi = None
                 for peer_pi, peer_pv in enumerate(peer_lg.pool_views):
-                    peer_is_indexer = len(peer_pv.buffer_entries) == 0
-                    peer_pool_role = (
-                        PoolRole.INDEXER
-                        if peer_is_indexer
-                        else get_pool_role(peer_pv, kv_factor=kv_factor)
-                    )
-                    if peer_pool_role != self_pool_role:
+                    if peer_pv.pool_role != self_pv.pool_role:
                         continue
-                    if is_indexer:
-                        # INDEXER pools match by role alone
-                        matched_peer_pi = peer_pi
-                        break
-                    if set(get_pool_view_global_layer_ids(peer_pv, peer_lg)) & self_layer_set:
-                        matched_peer_pi = peer_pi
-                        break
+                    peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
+                    if not set(peer_global_ids) & self_layer_set:
+                        continue
+                    if peer_pv.mapper_kind != self_pv.mapper_kind:
+                        raise ValueError(
+                            "PeerRegistrar.get_pool_mapping: incompatible mapper "
+                            f"kinds for pool role {sorted(self_pv.pool_role)} "
+                            f"(local={self_pv.mapper_kind.name}, "
+                            f"peer={peer_pv.mapper_kind.name}, peer_pool={peer_pi})"
+                        )
+                    matched_peer_pi = peer_pi
+                    break
 
                 if matched_peer_pi is not None:
                     mapping[(self_lg_idx, self_pi)] = (peer_lg_idx, matched_peer_pi)
 
         self._lg_pool_mapping_cache[key] = mapping
         return mapping
+
+    def _get_policy(self, kind: CacheKind) -> Union[AttentionPolicy, MambaPolicy]:
+        """Return the policy for a CacheKind (lazily instantiated)."""
+        if kind not in self._policies:
+            cls = self._POLICY_CLASSES[kind]
+            self._policies[kind] = cls(self._ri)
+        return self._policies[kind]
 
     def get_kv_map(
         self,
@@ -214,53 +339,125 @@ class PeerRegistrar:
         self_pv = self_lg.pool_views[self_pi]
         peer_pv = peer_lg.pool_views[peer_pi]
 
-        assert self._ri.attention is not None
-        kv_factor = self._ri.attention.kv_factor
-        is_indexer = len(self_pv.buffer_entries) == 0
-        self_pool_role = (
-            PoolRole.INDEXER if is_indexer else get_pool_role(self_pv, kv_factor=kv_factor)
+        if self_pv.mapper_kind != peer_pv.mapper_kind:
+            raise ValueError(
+                "PeerRegistrar.get_kv_map: incompatible mapper kinds "
+                f"(local={self_pv.mapper_kind.name}, peer={peer_pv.mapper_kind.name})"
+            )
+
+        # Every view is entries-driven: resolve the overlap layers to
+        # slot-relative byte offsets on each side from the views' buffer
+        # entries. Layer selection is explicit, so mappers never assume a
+        # uniform layer stride (other role classes may interleave), and no
+        # convention about global-id/byte-offset ordering is needed.
+        self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
+        peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
+        # Iterate the overlap in self's physical slot order (not sorted by
+        # global id) so that layers whose regions are contiguous on both
+        # sides stay adjacent in the offset arrays and the mappers can merge
+        # them into one fragment even when global-id order diverges from the
+        # physical layout. Order only affects run merging (a perf property):
+        # each layer's byte offset is looked up explicitly below, so any
+        # iteration order transfers correct bytes.
+        overlap = set(self_global_ids) & set(peer_global_ids)
+        overlapping_layers = [gid for gid in self_global_ids if gid in overlap]
+
+        self_starts, self_bytes_per_layer = get_layer_byte_ranges(self_pv)
+        peer_starts, peer_bytes_per_layer = get_layer_byte_ranges(peer_pv)
+        self_g2l = {ll.global_layer_id: ll.local_layer_id for ll in self_lg.local_layers}
+        peer_g2l = {ll.global_layer_id: ll.local_layer_id for ll in peer_lg.local_layers}
+        self_layer_offsets = np.array(
+            [self_starts[self_g2l[gid]] for gid in overlapping_layers], dtype=np.int64
+        )
+        peer_layer_offsets = np.array(
+            [peer_starts[peer_g2l[gid]] for gid in overlapping_layers], dtype=np.int64
+        )
+        # Per-layer buffer count (K and V are separate buffers within a
+        # layer's region); head-mismatch mappers slice heads inside each.
+        self_buffers_per_layer = self._get_buffers_per_layer(
+            self_pv,
+            layer_group_id=self_lg_idx,
+            pool_idx=self_pi,
+        )
+        peer_buffers_per_layer = self._get_buffers_per_layer(
+            peer_pv,
+            layer_group_id=peer_lg_idx,
+            pool_idx=peer_pi,
         )
 
-        # For INDEXER (empty buffer_entries), use group-level global layer IDs
-        if is_indexer:
-            self_global_ids = get_global_layer_ids(self_lg)
-            peer_global_ids = get_global_layer_ids(peer_lg)
-            self_num_layers = get_layer_group_num_layers(self_lg)
-            peer_num_layers = get_layer_group_num_layers(peer_lg)
-        else:
-            self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
-            peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
-            self_num_layers = get_pool_view_num_layers(self_pv)
-            peer_num_layers = get_pool_view_num_layers(peer_pv)
+        # Polymorphic dispatch: attention vs mamba policy
+        policy = self._get_policy(self_lg.kind)
 
-        overlapping_layers = sorted(set(self_global_ids) & set(peer_global_ids))
-        transfer_layers = len(overlapping_layers)
+        # For mamba, compute ptr-array layer offsets for partial PP overlap.
+        # extract_slot returns ptrs for ALL local_layer_ids in sorted order;
+        # the mapper must slice only the overlapping subset.
+        extra_kwargs = {}
+        if self_lg.kind == CacheKind.STATE:
+            # Position of each overlapping layer in the full sorted local_layer_ids
+            # used by extract_slot. These are indices into the ptrs array.
+            self_all_lids = sorted(set(int(e["local_layer_id"]) for e in self_pv.buffer_entries))
+            peer_all_lids = sorted(set(int(e["local_layer_id"]) for e in peer_pv.buffer_entries))
+            self_lid_to_pos = {lid: i for i, lid in enumerate(self_all_lids)}
+            peer_lid_to_pos = {lid: i for i, lid in enumerate(peer_all_lids)}
+            # overlapping_layers are global IDs; map them to local_layer_ids
+            self_overlap_positions = [self_lid_to_pos[self_g2l[gid]] for gid in overlapping_layers]
+            peer_overlap_positions = [
+                peer_lid_to_pos[peer_g2l[gid]] for gid in overlapping_layers if gid in peer_g2l
+            ]
+            # Under contiguous PP partitioning, overlapping layers form a
+            # contiguous block in the ptrs array.
+            extra_kwargs["src_layer_off"] = (
+                self_overlap_positions[0] if self_overlap_positions else 0
+            )
+            extra_kwargs["dst_layer_off"] = (
+                peer_overlap_positions[0] if peer_overlap_positions else 0
+            )
 
-        if transfer_layers > 0:
-            first_overlap_layer = overlapping_layers[0]
-            self_layer_offset = self_global_ids.index(first_overlap_layer)
-            peer_layer_offset = peer_global_ids.index(first_overlap_layer)
-        else:
-            self_layer_offset = 0
-            peer_layer_offset = 0
-
-        self_phys = get_physical_pool(self_pt, self_lg_idx, self_pv.pool_idx)
-        peer_phys = get_physical_pool(peer_pt, peer_lg_idx, peer_pv.pool_idx)
-
-        mapper = self._attention_policy.build_kv_mapper(
+        mapper = policy.build_mapper(
             peer_ri=peer_ri,
-            pool_role=self_pool_role,
-            transfer_layers=transfer_layers,
-            self_layer_offset=self_layer_offset,
-            peer_layer_offset=peer_layer_offset,
-            self_pool_num_layers=self_num_layers,
-            peer_pool_num_layers=peer_num_layers,
-            self_pool_slot_bytes=self_phys.slot_bytes,
-            peer_pool_slot_bytes=peer_phys.slot_bytes,
+            mapper_kind=self_pv.mapper_kind,
+            self_layer_offsets=self_layer_offsets,
+            peer_layer_offsets=peer_layer_offsets,
+            self_bytes_per_layer=self_bytes_per_layer,
+            peer_bytes_per_layer=peer_bytes_per_layer,
+            self_buffers_per_layer=self_buffers_per_layer,
+            peer_buffers_per_layer=peer_buffers_per_layer,
+            self_lg=self_lg,
+            peer_lg=peer_lg,
+            **extra_kwargs,
         )
 
         self._kv_map_cache[cache_key] = mapper
         return mapper
+
+    @staticmethod
+    def _get_buffers_per_layer(
+        pool_view: PoolView,
+        *,
+        layer_group_id: int,
+        pool_idx: int,
+    ) -> int:
+        """Per-layer buffer count of a view (e.g. K+V -> 2, key-only -> 1).
+
+        Views are bucketed per (layer group, pool, mapper kind) at page-table
+        build time, so every layer in a view carries the same role set and
+        hence the same entry count — a skewed distribution should never occur.
+        Still verify it per layer rather than via total-count divisibility:
+        e.g. 1 + 3 entries over two layers passes ``total % layers == 0`` yet
+        would make head-slicing mappers split every layer at wrong offsets.
+        """
+        entries = pool_view.buffer_entries
+        if len(entries) == 0:
+            return 1
+        counts = Counter(int(e["local_layer_id"]) for e in entries)
+        distinct = set(counts.values())
+        if len(distinct) != 1:
+            raise ValueError(
+                "PoolView buffer entries are not evenly distributed across layers: "
+                f"layer_group={layer_group_id}, pool={pool_idx}, "
+                f"per-layer entry counts={sorted(counts.items())}"
+            )
+        return distinct.pop()
 
     @staticmethod
     def _find_overlap(self_val, peer_val, self_rank, peer_rank=None):
@@ -317,11 +514,16 @@ class PeerRegistrar:
 
         ranks: List[int] = []
         for pp in range(peer_start_pp, peer_end_pp):
-            for cp in range(peer_start_cp, peer_end_cp):
-                for tp in range(peer_start_tp, peer_end_tp):
-                    ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + cp * peer_ri.tp_size + tp)
+            for tp in range(peer_start_tp, peer_end_tp):
+                for cp in range(peer_start_cp, peer_end_cp):
+                    # CP-minor flat rank (ppRank*(TP*CP) + tpRank*CP +
+                    # cpRank), matching Mapping and the C++ transceiver; a
+                    # TP-minor formula mis-routes when tp > 1 and cp > 1.
+                    # Loop nesting mirrors the layout so ranks come out in
+                    # ascending order.
+                    ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + tp * peer_ri.cp_size + cp)
 
-        dup_head, peer_dup_head = self._attention_policy.duplicate_head_factors(peer_ri)
+        dup_head, peer_dup_head = self._get_policy(CacheKind.PAGED).duplicate_head_factors(peer_ri)
 
         targets = PeerOverlap(
             overlap_pp_size=overlap_pp_size,
@@ -334,14 +536,52 @@ class PeerRegistrar:
         self._overlap_cache[key] = targets
         return targets
 
-    def should_send_kv(self, peer_overlap: PeerOverlap, peer_rank_info: RankInfo) -> bool:
-        dup_head_factor = peer_overlap.duplicate_head_factor
-        if dup_head_factor <= 1:
-            return True
-        self_tp_rank_in_dp_group = self._ri.tp_rank % self._ri.tp_size_per_dp_group
-        return (peer_rank_info.dp_rank % dup_head_factor) == (
-            self_tp_rank_in_dp_group % dup_head_factor
+    def _owns_tp_fan_in(self, peer_rank_info: RankInfo) -> bool:
+        """Elect one owner when replicated bytes fan in across TP ranks.
+
+        A peer with fewer TP shards receives identical replicated data from
+        several local ranks. Rotate the elected owner by the destination's
+        DP rank (mirroring ``should_send_kv``'s head-duplication pairing) so
+        that with a multi-DP-group generation side the extra replicated
+        traffic spreads across local ranks instead of always landing on the
+        first rank of each fan-in group.
+        """
+        ratio = max(
+            1,
+            self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group,
         )
+        self_tp_rank = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        return self_tp_rank % ratio == peer_rank_info.dp_rank % ratio
+
+    def should_send_pool(
+        self,
+        peer_overlap: PeerOverlap,
+        peer_rank_info: RankInfo,
+        layer_group_id: int,
+        pool_idx: int,
+    ) -> bool:
+        """Return whether this rank owns the transfer of one view pair.
+
+        ``pool_idx`` indexes the layer group's ``pool_views`` list (one view
+        per role class; several views may share a physical pool). Each view
+        is kind-homogeneous, so ownership is a single per-view decision:
+        replicated views use one sender per fan-in group, sharded views
+        retain head-duplication routing.
+
+        For mamba layer groups, ownership is based on mamba's own TP routing
+        (independent of attention's duplicate-head logic):
+        - If mamba_tp == 1 (attention_dp enabled): fan-in election (one sender)
+        - Otherwise: always send (each rank owns unique TP-sharded state)
+        """
+        layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
+        pool_view = layer_group.pool_views[pool_idx]
+        if pool_view.mapper_kind == MapperKind.REPLICATED:
+            return self._owns_tp_fan_in(peer_rank_info)
+
+        # Delegate to the policy's should_send. None means fan-in election.
+        policy = self._get_policy(layer_group.kind)
+        result = policy.should_send(peer_overlap, peer_rank_info)
+        return self._owns_tp_fan_in(peer_rank_info) if result is None else result
 
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated

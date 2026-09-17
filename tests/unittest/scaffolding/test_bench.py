@@ -1,8 +1,9 @@
 import asyncio
 import math
-from typing import List
+from typing import Iterator, List
 
 import numpy as np
+import pytest
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
@@ -16,7 +17,20 @@ from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy, ConstantRateStrategy, LoadGenerationStrategy,
     PoissonRateStrategy, SynchronousStrategy, ThroughputStrategy)
 
+pytestmark = pytest.mark.cpu_only
+
 OUTPUT_STR = "Yes."
+
+
+@pytest.fixture(autouse=True)
+def _restore_native_generation_controller() -> Iterator[None]:
+    original_init = NativeGenerationController.__init__
+    original_process = NativeGenerationController.process
+
+    yield
+
+    NativeGenerationController.__init__ = original_init
+    NativeGenerationController.process = original_process
 
 
 class DummyWorker(Worker):

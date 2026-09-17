@@ -17,7 +17,7 @@
 
 Usage:
     python wan_t2v.py
-    python wan_t2v.py --extra_visual_gen_options ../configs/wan2.2-t2v-fp4-1gpu.yaml
+    python wan_t2v.py --visual_gen_args ../configs/wan2.2-t2v-fp4-1gpu.yaml
 """
 
 import argparse
@@ -34,10 +34,11 @@ def main():
         help="Model path or HuggingFace Hub ID",
     )
     parser.add_argument(
-        "--extra_visual_gen_options",
+        "--visual_gen_args",
+        dest="visual_gen_args",
         type=str,
         default=None,
-        help="Path to YAML config (same as trtllm-serve --extra_visual_gen_options)",
+        help="Path to YAML config (same as trtllm-serve --visual_gen_args)",
     )
     parser.add_argument(
         "--output_path",
@@ -48,19 +49,18 @@ def main():
     args = parser.parse_args()
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
-    extra_args = (
-        VisualGenArgs.from_yaml(args.extra_visual_gen_options)
-        if args.extra_visual_gen_options
-        else None
-    )
+    extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     # --- Model-specific: T2V request construction ---
-    # Query per-model defaults (resolution, steps, guidance, seed, etc.).
+    # Start from per-model defaults (steps, guidance, seed, etc.) and override resolution/frames.
     params = visual_gen.default_params
+    params.height = 480
+    params.width = 832
+    params.num_frames = 165
 
     output = visual_gen.generate(
-        inputs="A cat playing piano in a sunny room",
+        inputs="A cute cat playing piano",
         params=params,
     )
 

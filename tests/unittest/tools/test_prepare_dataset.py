@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import subprocess
@@ -8,6 +23,8 @@ from typing import Any, Dict, List, Tuple
 import pytest
 from utils.llm_data import llm_models_root
 
+pytestmark = pytest.mark.cpu_only
+
 # Constants for test configuration
 _DEFAULT_NUM_REQUESTS = 3
 _DEFAULT_INPUT_MEAN = 100
@@ -16,15 +33,14 @@ _DEFAULT_OUTPUT_MEAN = 100
 _DEFAULT_OUTPUT_STDEV = 10
 _TEST_TASK_IDS = [0, 1, 2]
 _TOKENIZER_SUBPATH = "llama-models-v2/tinyllama-tarot-v1/"
-_PREPARE_DATASET_SCRIPT_PATH = "benchmarks/cpp/prepare_dataset.py"
 
 
 class TestPrepareDatasetLora:
     """
-    Test suite for prepare_dataset.py CLI tool LoRA metadata generation
+    Test suite for the trtllm-bench prepare-dataset LoRA metadata generation
     functionality.
 
-    This test class validates that the prepare_dataset.py script correctly
+    This test class validates that trtllm-bench prepare-dataset correctly
     generates LoRA request metadata when LoRA-specific parameters are provided.
     It covers both fixed task ID and random task ID scenarios.
     """
@@ -50,7 +66,7 @@ class TestPrepareDatasetLora:
 
     def _build_base_command(self, output_path: Path) -> List[str]:
         """
-        Build the base command for running prepare_dataset.py.
+        Build the base command for running trtllm-bench prepare-dataset.
 
         Args:
             output_path: Path to the output dataset file
@@ -71,7 +87,8 @@ class TestPrepareDatasetLora:
         tokenizer_dir = model_cache / _TOKENIZER_SUBPATH
         cmd.extend(["--model", str(tokenizer_dir)])
 
-        # Always add --stdout flag since we parse stdout output
+        # Write to a file via --output rather than --stdout: trtllm-bench prints
+        # an import-time banner on stdout that would corrupt the parsed output.
         cmd.extend(["prepare-dataset", "--output", f"{output_path}"])
 
         return cmd
@@ -110,7 +127,7 @@ class TestPrepareDatasetLora:
 
     def _run_prepare_dataset(self, **kwargs) -> str:
         """
-        Execute prepare_dataset.py with specified parameters and capture
+        Execute trtllm-bench prepare-dataset with specified parameters and capture
         output.
 
         Args:
@@ -130,7 +147,7 @@ class TestPrepareDatasetLora:
             self._add_synthetic_data_arguments(cmd)
 
             # Execute command and capture output
-            subprocess.run(cmd, check=True, cwd=temp_dir)
+            subprocess.run(cmd, check=True, cwd=temp_dir, timeout=300)
 
             data = ""
             with open(output_path, "r") as f:
@@ -140,7 +157,7 @@ class TestPrepareDatasetLora:
 
     def _parse_json_output(self, output: str) -> List[Dict[str, Any]]:
         """
-        Parse JSON lines from prepare_dataset.py output.
+        Parse JSON lines from the prepare-dataset output.
 
         Args:
             output: Raw stdout output containing JSON lines

@@ -60,7 +60,7 @@ The following roofline analysis illustrates why decoupling attention and FFN sha
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_roofline_analysis.png" alt="Roofline analysis for KV cache and Linear weight reads" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_roofline_analysis.png" alt="Roofline analysis for KV cache and Linear weight reads" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Roofline analysis for KV cache and Linear weight reads on GB200 NVLink72. (Left) DRAM read latency vs. TP width - benefits plateau beyond TP=K due to full KV duplication, highlighting the need for KV sharding in Helix. (Middle) DRAM read time vs. KV length S - self-attention cost scales linearly with S, eventually dominating latency. (Right) DRAM read time vs. KVP width - Helix applies KVP in attention to reduce per-GPU memory traffic and achieve linear scaling, enabling multi-million-token inference.</em></sub></p>
@@ -82,7 +82,7 @@ Helix is a hybrid sharding strategy that uses different parallelism strategies f
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_helix_execution_flow.png" alt="Helix execution flow per transformer layer" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_helix_execution_flow.png" alt="Helix execution flow per transformer layer" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. End-to-end Helix workflow for a single transformer layer. (Top) During attention, each KVP GPU independently computes QKV projections and runs FlashAttention on its local KV shard, producing partial outputs and log-sum-exp scalars. A single All-to-All exchanges these fragments across KVP ranks; each GPU rescales and sums them into the exact softmax-normalized result. (Bottom) For FFNs, the same N GPUs are re-provisioned as either TP_F=N for dense models, or TP_F × EP for MoE models. Adapted from <a href="https://arxiv.org/pdf/2507.07120">Bhatia et al., 2025</a>.</em></sub></p>
@@ -95,7 +95,7 @@ Helix applies KV Parallelism (KVP) by sharding the KV cache along the sequence d
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_attention_sharding.png" alt="Comparison of attention sharding strategies" width="900">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_attention_sharding.png" alt="Comparison of attention sharding strategies" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Attention sharding strategies for GQA with Q=4 query heads and K=2 KV heads. (a) No TP: all heads co-located, no duplication. (b) TP=2: clean split since TP ≤ K. (c) TP=4: more shards than KV heads, forcing KV cache duplication. (d) Helix (TP=2, KVP=2): avoids duplication by forming a 2D layout - TP splits heads, KVP splits the sequence dimension. Adapted from <a href="https://arxiv.org/pdf/2507.07120">Bhatia et al., 2025</a>.</em></sub></p>
@@ -180,7 +180,7 @@ The integration in [`DeepseekV3ForCausalLM`](https://github.com/NVIDIA/TensorRT-
 
 1. During model initialization, when `has_cp_helix()` is true, a deep copy of the original mapping (with CP) is saved as `mapping_with_cp`.
 2. The model config's mapping is repurposed via `repurpose_helix_cp_to_tp()`, which converts CP ranks to additional TP ranks (setting `tp_size = tp_size × cp_size`, `cp_size = 1`).
-3. The attention layers (in [`tensorrt_llm/_torch/modules/attention.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/attention.py)) receive the original `mapping_with_cp` to execute with KV parallelism, while all other layers (FFN, MoE, embeddings) use the repurposed TP-only mapping.
+3. The attention layers (in [`tensorrt_llm/_torch/attention/attention.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/attention.py)) receive the original `mapping_with_cp` to execute with KV parallelism, while all other layers (FFN, MoE, embeddings) use the repurposed TP-only mapping.
 
 This design means that from the perspective of non-attention layers, Helix is transparent: they simply see a larger TP group. Only the attention module needs awareness of the CP configuration.
 
@@ -212,7 +212,7 @@ active = (decode_block_id % cp_size) == cp_rank
 ```
 
 - If a rank is **active**, it allocates a new KV slot, increments `seqlen_this_rank_cp`, and runs attention with the new token writing into its local KV cache.
-- If a rank is **inactive** for this step (`req.py_helix_is_inactive_rank = True`), it does not allocate KV and its attention kernels attend over previously cached tokens only. In [`tensorrt_llm/_torch/attention_backend/trtllm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention_backend/trtllm.py), `kv_lens[active_rank] += seq_lens_kv` ensures inactive ranks see no cache growth for the current step.
+- If a rank is **inactive** for this step (`req.py_helix_is_inactive_rank = True`), it does not allocate KV and its attention kernels attend over previously cached tokens only. In [`tensorrt_llm/_torch/attention/backends/trtllm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/backends/trtllm.py), `kv_lens[active_rank] += seq_lens_kv` ensures inactive ranks see no cache growth for the current step.
 
 `total_input_len_cp` and `seqlen_this_rank_cp` are tracked per request so the global position id and per-rank attention length stay correct even though only one CP rank "owns" each new token.
 
@@ -252,7 +252,7 @@ The following results for DeepSeek-R1 are obtained on GB300 NVL72 using TensorRT
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_dsr1_fp4_pareto.png" alt="DeepSeek-R1 FP4 throughput-latency Pareto on GB300 NVL72 with Helix, with parallelism configuration (concurrency, KVP, TP/DP, EP, PP) annotated at each Pareto point" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_dsr1_fp4_pareto.png" alt="DeepSeek-R1 FP4 throughput-latency Pareto on GB300 NVL72 with Helix, with parallelism configuration (concurrency, KVP, TP/DP, EP, PP) annotated at each Pareto point" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. Throughput-latency Pareto frontier of serving DeepSeek-R1 (FP4) on GB300 NVL72 with Helix on the generation servers. Helix pushes the frontier outward, enabling both higher throughput and lower latency.</em></sub></p>

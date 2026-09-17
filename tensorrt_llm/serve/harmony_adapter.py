@@ -1057,7 +1057,70 @@ class HarmonyAdapter:
                 # The last message is complete, we're done
                 break
 
+        # clean_tokens is always a prefix of tokens, so the discarded span is
+        # the remaining suffix.
+        if len(clean_tokens) < len(tokens):
+            self._log_discarded_tokens(tokens[len(clean_tokens):])
+
         return clean_tokens
+
+    def _log_discarded_tokens(self, discarded: list[int]) -> None:
+        """Report tokens dropped by :meth:`_strip_incomplete_messages`.
+
+        A trailing message with no ``<|message|>`` token is usually a
+        generation that was cut short (e.g. ``max_tokens`` was hit), and
+        discarding it is correct and unremarkable.
+
+        It is *not* benign when the discarded span carries a stop token or a
+        tool recipient: that message was complete, merely malformed. With a
+        recipient, dropping it turns a tool call into an empty ``tool_calls``
+        list with ``finish_reason="stop"`` — indistinguishable from the model
+        choosing not to call a tool. Without one, a final or analysis message
+        was lost instead; that is still worth a warning, but the two are
+        reported separately so the log never points at a tool call that never
+        existed.
+
+        The decoded text is only inspected, never logged: it holds the tool
+        call's arguments, which routinely carry user data and occasionally
+        secrets, and this path can fire at warning level in production.
+        """
+        try:
+            text = self._safe_decode_utf8(discarded, "DISCARDED_TOKENS: ")
+        except Exception:  # noqa: BLE001
+            # Diagnostics must never change the response. This helper runs
+            # inside harmony_output_to_openai's outer try, so letting a decode
+            # error escape would downgrade the whole response to the raw-text
+            # fallback -- precisely on the corrupted-token input this code
+            # exists to report. Fall back to a token-count-only warning.
+            text = ""
+
+        stop_tokens = set(self.get_stop_tokens())
+        # Any recipient other than "assistant" denotes a tool call: mirror the
+        # streaming path's `current_recipient != "assistant"` test rather than
+        # matching only "functions.*", so browser/python recipients are named
+        # too instead of falling through to the no-recipient branch.
+        match = re.search(r"to=([\w.-]+)", text)
+        recipient = match.group(1) if match else None
+        if recipient == "assistant":
+            recipient = None
+
+        if recipient:
+            logger.warning(
+                f"Discarded {len(discarded)} token(s) forming a complete but "
+                f"malformed harmony message; a tool call for "
+                f"{recipient} has been dropped from the response.")
+        elif any(token in stop_tokens for token in discarded):
+            # Complete but malformed, with no recipient to name: a final or
+            # analysis message carrying a stop token. Report the loss without
+            # claiming a tool call was involved.
+            logger.warning(
+                f"Discarded {len(discarded)} token(s) forming a complete but "
+                f"malformed harmony message; its content has been dropped "
+                f"from the response.")
+        else:
+            logger.debug(
+                f"Stripped {len(discarded)} token(s) of an incomplete trailing "
+                f"harmony message.")
 
     def harmony_output_to_openai(
             self,
@@ -1427,7 +1490,9 @@ class HarmonyAdapter:
             tokens: list[int],
             available_tools: list[dict[str, Any]] | None = None,
             model_name: str = "harmony-model",
-            tool_choice: str | None = None) -> Tuple[list[str], bool]:
+            tool_choice: str | None = None,
+            stream_response_id: str | None = None,
+            stream_created: int | None = None) -> Tuple[list[str], bool]:
         """
         Create properly formatted OpenAI streaming responses from harmony tokens.
 
@@ -1436,6 +1501,8 @@ class HarmonyAdapter:
             tokens: New tokens from this iteration
             available_tools: Available tools for filtering
             model_name: Model name for response
+            stream_response_id: Response ID shared by all chunks in the stream
+            stream_created: Creation timestamp shared by all chunks in the stream
 
         Returns:
             List of properly formatted streaming response strings
@@ -1536,9 +1603,11 @@ class HarmonyAdapter:
                 finish_reason="stop" if should_stop else None,
                 stop_reason=None)
 
-            stream_response = ChatCompletionStreamResponse(model=model_name,
-                                                           choices=[choice],
-                                                           usage=None)
+            stream_response = _create_stream_response(
+                model=model_name,
+                choices=[choice],
+                stream_response_id=stream_response_id,
+                stream_created=stream_created)
 
             # Convert to string
             response_json = stream_response.model_dump_json(exclude_none=True)
@@ -1631,6 +1700,24 @@ def get_harmony_adapter() -> HarmonyAdapter:
     return _SERVE_HARMONY_ADAPTER
 
 
+def _create_stream_response(
+        model: str,
+        choices: List[ChatCompletionResponseStreamChoice],
+        usage: UsageInfo | None = None,
+        stream_response_id: str | None = None,
+        stream_created: int | None = None) -> ChatCompletionStreamResponse:
+    response_kwargs: dict[str, Any] = {
+        "model": model,
+        "choices": choices,
+        "usage": usage,
+    }
+    if stream_response_id is not None:
+        response_kwargs["id"] = stream_response_id
+    if stream_created is not None:
+        response_kwargs["created"] = stream_created
+    return ChatCompletionStreamResponse(**response_kwargs)
+
+
 def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                               tool_choice: str,
                               result: GenerationResult,
@@ -1640,7 +1727,9 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                               num_prompt_tokens: int,
                               first_iteration: bool,
                               stream_options=None,
-                              cached_tokens: int = 0) -> List[str]:
+                              cached_tokens: int = 0,
+                              stream_response_id: str | None = None,
+                              stream_created: int | None = None) -> List[str]:
     output = result.outputs[0]
 
     # Convert tools to dictionary format for harmony adapter (standard pattern)
@@ -1670,9 +1759,12 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
         usage_info = _create_usage_info(num_prompt_tokens, result.outputs,
                                         cached_tokens)
 
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
-                                                         model=model,
-                                                         usage=usage_info)
+        final_usage_chunk = _create_stream_response(
+            model=model,
+            choices=[],
+            usage=usage_info,
+            stream_response_id=stream_response_id,
+            stream_created=stream_created)
 
         final_usage_json = final_usage_chunk.model_dump_json(exclude_none=True)
 
@@ -1689,14 +1781,18 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                     tokens=output.token_ids_diff,
                     available_tools=tools_for_parser,
                     model_name=model,
-                    tool_choice=tool_choice)
+                    tool_choice=tool_choice,
+                    stream_response_id=stream_response_id,
+                    stream_created=stream_created)
                 if first_iteration and remaining_responses:
                     first_delta = DeltaMessage(role="assistant")
                     choice = ChatCompletionResponseStreamChoice(
                         index=0, delta=first_delta)
-                    first_response = ChatCompletionStreamResponse(
+                    first_response = _create_stream_response(
                         model=model,
                         choices=[choice],
+                        stream_response_id=stream_response_id,
+                        stream_created=stream_created,
                     )
                     response_json = first_response.model_dump_json(
                         exclude_none=True)
@@ -1704,7 +1800,7 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                 res.extend(remaining_responses)
 
             # Send final message with finish_reason
-            final_response = ChatCompletionStreamResponse(
+            final_response = _create_stream_response(
                 model=model,
                 choices=[
                     ChatCompletionResponseStreamChoice(
@@ -1713,6 +1809,8 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                         finish_reason=output.finish_reason,
                         stop_reason=output.stop_reason)
                 ],
+                stream_response_id=stream_response_id,
+                stream_created=stream_created,
             )
 
             final_response_json = final_response.model_dump_json(
@@ -1725,7 +1823,9 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                 tokens=output.token_ids_diff,
                 available_tools=tools_for_parser,
                 model_name=model,
-                tool_choice=tool_choice)
+                tool_choice=tool_choice,
+                stream_response_id=stream_response_id,
+                stream_created=stream_created)
             # Send first response after receiving the first output
             if first_iteration:
                 first_iteration = False
@@ -1734,9 +1834,11 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                 choice = ChatCompletionResponseStreamChoice(index=0,
                                                             delta=first_delta)
 
-                first_response = ChatCompletionStreamResponse(
+                first_response = _create_stream_response(
                     model=model,
                     choices=[choice],
+                    stream_response_id=stream_response_id,
+                    stream_created=stream_created,
                 )
 
                 response_json = first_response.model_dump_json(
@@ -1875,12 +1977,17 @@ def _create_usage_info(num_prompt_tokens,
 
 
 def maybe_transform_reasoning_effort(
-    reasoning_effort: ReasoningEffort | Literal["low", "medium", "high"] | None
+    reasoning_effort: ReasoningEffort
+    | Literal["low", "medium", "high", "max", "none"] | None
 ) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,
-        "high": ReasoningEffort.HIGH
+        "high": ReasoningEffort.HIGH,
+        # Kimi-style efforts accepted by the shared request schema; map to
+        # the nearest harmony level ("none" means no explicit effort).
+        "max": ReasoningEffort.HIGH,
+        "none": None,
     }
     if reasoning_effort and not isinstance(reasoning_effort, ReasoningEffort):
         return str_to_effort[reasoning_effort]

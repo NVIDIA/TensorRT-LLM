@@ -130,6 +130,27 @@ def get_memory_buffers():
     return _buffer
 
 
+def clear_memory_buffers():
+    """Clear all non-reserved buffers from the global buffer pool.
+
+    This should be called after warmup phases (e.g., autotuner warmup) that
+    may allocate large workspace buffers sized for the maximum token count.
+    Clearing these prevents them from inflating the memory baseline used by
+    the KV cache profiler, which would otherwise reduce the memory available
+    for activations during inference.
+    """
+    global _buffer
+    for buffer_name, blocks in list(_buffer.buffers.items()):
+        remaining = [b for b in blocks if b.is_reserved]
+        freed = [b for b in blocks if not b.is_reserved]
+        for block in freed:
+            del block.buffer
+        if remaining:
+            _buffer.buffers[buffer_name] = remaining
+        else:
+            del _buffer.buffers[buffer_name]
+
+
 _shared_pool = None
 
 

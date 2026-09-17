@@ -31,7 +31,7 @@ TEST(TestCudaDriverWrapper, TllmCuCheckFailingWithValidParametersDoesNotThrow)
         CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE,
         CUmemLocation{
             CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-            0,
+            {0},
         },
         nullptr};
     auto const granularity = tensorrt_llm::common::getAllocationGranularity();
@@ -51,7 +51,7 @@ TEST(TestCudaDriverWrapper, TllmCuCheckFailingWithInvalidParametersThrows)
         CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE,
         CUmemLocation{
             CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-            0,
+            {0},
         },
         nullptr};
     ASSERT_THROW(TLLM_CU_CHECK(cuMemCreate(&handle, -1, &prop, 0ULL)), tensorrt_llm::common::TllmException);

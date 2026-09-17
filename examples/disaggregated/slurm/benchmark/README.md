@@ -54,7 +54,18 @@ hardware:
   gpus_per_node: 4  # GPUs per node in your cluster
   num_ctx_servers: 1  # Number of context processing servers
   num_gen_servers: 1  # Number of generation servers
+  # compact_packing: false  # Opt-in; see note below
 ```
+
+By default each worker owns whole nodes (round-robin), so cross-worker
+traffic never crosses a node boundary. Set `compact_packing: true` to pack
+all workers into `ceil(total_gpus / gpus_per_node)` nodes, allowing two
+workers to share a physical node when their GPU counts don't align with
+node boundaries (e.g. two TP=6 ctx workers fit in 3 four-GPU nodes via
+4+2 / 2+4). This is **only recommended on full-mesh NVLink fabrics like
+GB200/GB300 NVL72**, where the cross-worker NVLink traffic on the shared
+node is free; on PCIe or partitioned-NVLink hosts the shared node will
+become a bottleneck and you should leave it off.
 
 ### 4. Environment Configuration
 ```yaml
@@ -65,6 +76,7 @@ environment:
   trtllm_repo: "<trtllm_repo>"  # Path to TensorRT-LLM repository
   build_wheel: false  # Set true to build TensorRT-LLM from source
   trtllm_wheel_path: ""  # Path to pre-built wheel (if not building from source)
+  server_health_timeout: 1800  # Seconds to wait for the server to become healthy
   work_dir: "<full_path_to_work_dir>"  # Working directory for outputs
   worker_env_var: "TLLM_LOG_LEVEL=INFO ..."  # Environment variables for workers
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"  # Environment variables for server

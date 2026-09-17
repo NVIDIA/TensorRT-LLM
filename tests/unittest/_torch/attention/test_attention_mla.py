@@ -7,16 +7,20 @@ import pytest
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.trtllm import \
+    TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             KVCacheManagerV2)
-from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -292,6 +296,36 @@ class RopeConfig:
     model_type: str = "deepseek_v3"
 
 
+def apply_mla_rope(tensor: torch.Tensor, positions: list,
+                   rope_cos_sin: torch.Tensor) -> torch.Tensor:
+    """Apply MLA-style RoPE to the last dimension of tensor.
+
+    Reorders from interleaved to pair format (unflatten/transpose/flatten),
+    then applies standard (cos, sin) rotation. Used to pre-apply RoPE for
+    backends that do not fuse RoPE internally (e.g. FlashInfer MLA).
+
+    Args:
+        tensor: [..., qk_rope_head_dim]
+        positions: list of integer position indices, length = tensor.shape[0]
+        rope_cos_sin: [max_pos, 2, qk_rope_head_dim]
+
+    Returns:
+        tensor with RoPE applied (same shape/dtype)
+    """
+    pos = torch.tensor(positions, dtype=torch.long)
+    cos_sin = rope_cos_sin[pos]  # [num_tokens, 2, qk_rope_head_dim]
+    cos = cos_sin[:, 0]  # [num_tokens, qk_rope_head_dim]
+    sin = cos_sin[:, 1]  # [num_tokens, qk_rope_head_dim]
+    # Expand to match tensor dimensions
+    for _ in range(tensor.dim() - 2):
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    # Reorder: interleaved -> pair format
+    t = tensor.unflatten(-1, [-1, 2]).transpose(-2, -1).flatten(start_dim=-2)
+    rotated = (t * cos + rotate_half(t) * sin).to(tensor.dtype)
+    return rotated
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -312,7 +346,7 @@ random.seed(0)
 min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
-max_num_contexts = 10
+max_num_contexts = 64
 random_context_sequence_lengths = [
     random.randint(min_context_sequence_length, max_context_sequence_length)
     for _ in range(random.randint(min_num_contexts, max_num_contexts))
@@ -324,6 +358,7 @@ context_sequence_lengths = [
     [100, 300, 20, 10],
     [253, 253, 253, 253],
     [100, 1110, 1000, 1000],
+    [10] * 64,
     random_context_sequence_lengths,
 ]
 # Use MTP by default if seqlen_q > 1.
@@ -331,10 +366,12 @@ generation_seq_len_q = [1, 4]
 num_generation_steps = [10]
 
 # tokens_per_block = 32 for blackwell
-tokens_per_block = 32 if torch.cuda.get_device_capability() >= (10, 0) else 64
+cuda_capability = torch.cuda.get_device_capability() if torch.cuda.device_count(
+) > 0 else (0, 0)
+tokens_per_block = 32 if cuda_capability >= (10, 0) else 64
 
 kv_cache_dtype_list = [torch.bfloat16]
-if torch.cuda.get_device_capability() in [(8, 9), (9, 0), (10, 0), (12, 0)]:
+if cuda_capability in [(8, 9), (9, 0), (10, 0), (12, 0)]:
     kv_cache_dtype_list.append(torch.float8_e4m3fn)
 scenarios = [
     Scenario(kv_cache_dtype=kv_cache_dtype,
@@ -347,6 +384,77 @@ accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),
     torch.float8_e4m3fn: (4e-1, 4e-2),
 }
+
+
+@pytest.mark.parametrize(
+    "sm_version,expected_path",
+    [
+        (90, "cached_kv"),
+        (99, "cached_kv"),
+        (100, "chunked_prefill"),
+    ],
+)
+@pytest.mark.cpu_only
+def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
+                                            monkeypatch):
+    import tensorrt_llm._torch.attention.mla as mla_module
+
+    class FakeTrtllmAttention:
+
+        @staticmethod
+        def has_cached_kv_for_mla_context_warmup(_metadata):
+            return False
+
+        @staticmethod
+        def is_chunked_prefill_for_mla_context(_metadata):
+            return True
+
+        @staticmethod
+        def has_cached_kv_for_mla_context(_metadata):
+            return False
+
+    class FakeMetadata:
+        pass
+
+    class FakeAttention:
+
+        def __init__(self):
+            self.mha = FakeTrtllmAttention()
+
+        @staticmethod
+        def forward_context_with_chunked_prefill(*_args, **_kwargs):
+            return "chunked_prefill"
+
+        @staticmethod
+        def forward_context_with_cached_kv(*_args, **_kwargs):
+            return "cached_kv"
+
+        @staticmethod
+        def forward_context_default(*_args, **_kwargs):
+            return "default"
+
+    monkeypatch.setattr(mla_module, "TrtllmAttention", FakeTrtllmAttention)
+    monkeypatch.setattr(mla_module, "TrtllmAttentionMetadata", FakeMetadata)
+    monkeypatch.setattr(mla_module, "get_sm_version", lambda: sm_version)
+
+    q = torch.empty((1, 8), dtype=torch.float16)
+    compressed_kv = torch.empty((1, 4), dtype=torch.float16)
+    k_pe = torch.empty((1, 4), dtype=torch.float16)
+    position_ids = torch.zeros((1, ), dtype=torch.int64)
+    output = torch.empty((1, 8), dtype=torch.float16)
+    latent_cache = torch.empty((1, 1, 8), dtype=torch.float16)
+
+    result = mla_module.MLA.forward_context(
+        FakeAttention(),
+        q,
+        compressed_kv,
+        k_pe,
+        position_ids,
+        FakeMetadata(),
+        output,
+        latent_cache,
+    )
+    assert result == expected_path
 
 
 # Convert parameterized tests to pytest parametrize
@@ -411,13 +519,310 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                           v2_kv_cache)
 
 
-def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
+@pytest.mark.parametrize(
+    "kv_cache_dtype,skip_correction_threshold",
+    [(torch.bfloat16, 32.0), (torch.float8_e4m3fn, 8.0)],
+    ids=["bf16_kv_cache", "fp8_kv_cache"],
+)
+def test_attention_mla_skip_correction(kv_cache_dtype: torch.dtype,
+                                       skip_correction_threshold: float):
+    """Test MLA skip-correction with production shapes and both KV dtypes."""
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("MLA skip-correction is supported only on SM100 and SM103")
+
+    scenario = Scenario(kv_cache_dtype=kv_cache_dtype,
+                        num_layers=1,
+                        kv_cache_tokens_per_block=32)
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    _run_test_for_backend(
+        "TRTLLM",
+        scenario.num_heads,
+        scenario.num_kv_heads,
+        scenario.num_layers,
+        scenario.q_lora_rank,
+        scenario.kv_lora_rank,
+        scenario.qk_nope_head_dim,
+        scenario.qk_rope_head_dim,
+        scenario.v_head_dim,
+        rope_config,
+        scenario.kv_cache_tokens_per_block,
+        torch.device("cuda"),
+        scenario.dtype,
+        scenario.kv_cache_dtype,
+        [127, 255],
+        1,
+        2,
+        True,
+        skip_correction_threshold=skip_correction_threshold,
+    )
+
+
+# FlashInfer MLA test: BF16 only, fewer combos since it's slower
+flashinfer_scenarios = [
+    Scenario(kv_cache_dtype=torch.bfloat16,
+             num_layers=num_layers,
+             kv_cache_tokens_per_block=tokens_per_block) for num_layers in [1]
+]
+
+flashinfer_context_sequence_lengths = [
+    [10, 12, 5],
+    [100, 300, 20, 10],
+]
+
+
+@pytest.mark.parametrize("scenario",
+                         flashinfer_scenarios,
+                         ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize("context_sequence_lengths",
+                         flashinfer_context_sequence_lengths,
+                         ids=lambda x: f"context_sequence_lengths: {x}")
+@pytest.mark.parametrize("generation_seq_len_q", [1],
+                         ids=lambda x: f"generation_seq_len_q: {x}")
+@pytest.mark.parametrize("num_generation_steps", [10],
+                         ids=lambda x: f"num_generation_steps: {x}")
+@pytest.mark.parametrize("v2_kv_cache", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
+def test_attention_mla_flashinfer(scenario: Scenario,
+                                  context_sequence_lengths: List[int],
+                                  generation_seq_len_q: int,
+                                  num_generation_steps: List[int],
+                                  v2_kv_cache: bool):
+    """Test FlashInfer MLA computation for both context and generation phases"""
+    pytest.importorskip("flashinfer")
+    if (not torch.cuda.is_available() or cuda_capability != (10, 0)):
+        pytest.skip("FlashInfer MLA test only runs on SM100 (Blackwell)")
+
+    num_heads = scenario.num_heads
+    num_kv_heads = scenario.num_kv_heads
+    q_lora_rank = scenario.q_lora_rank
+    kv_lora_rank = scenario.kv_lora_rank
+    qk_nope_head_dim = scenario.qk_nope_head_dim
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    v_head_dim = scenario.v_head_dim
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    kv_cache_tokens_per_block = scenario.kv_cache_tokens_per_block
+    num_layers = scenario.num_layers
+    device = torch.device('cuda')
+    dtype = scenario.dtype
+    kv_cache_dtype = scenario.kv_cache_dtype
+
+    _run_test_for_backend("FLASHINFER", num_heads, num_kv_heads, num_layers,
                           q_lora_rank, kv_lora_rank, qk_nope_head_dim,
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
                           kv_cache_dtype, context_sequence_lengths,
                           generation_seq_len_q, num_generation_steps,
-                          v2_kv_cache):
+                          v2_kv_cache)
+
+
+@pytest.mark.parametrize("v2_kv_cache", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
+def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
+    """Cover the CuTe DSL MLA decode AutoTuner path.
+
+    The plain test_attention_mla runs with the autotuner off, so the op
+    always takes the ``default_tactic`` (-1 sentinel) branch. This test
+    drives the tuning path instead: a tuning-mode pass must profile the
+    tactic space (split_kv and is_persistent tactic elements), and a
+    subsequent serving-mode pass must reuse the tuned kernels without
+    triggering any runtime ``cute.compile`` (a compile outside the tuning
+    window stalls the serving loop). A final pass forces the ``choose_one``
+    -1 sentinel at a non-power-of-2 batch and checks that the
+    ``default_tactic`` fallback reuses a bucket-aligned compiled kernel.
+    """
+    from unittest import mock
+
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("CuTe DSL MLA decode requires SM100 or SM103")
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("nvidia-cutlass-dsl is not installed")
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVMlaDecodeBlackwellRunner
+
+    # fp8 KV with (num_heads=128, seq_len_q=1) is admitted by the CuTe DSL
+    # perf gate from batch_size >= 64, so a 64-request decode batch routes
+    # the generation phase through cute_dsl_mla in the default lib order.
+    scenario = Scenario(kv_cache_dtype=torch.float8_e4m3fn,
+                        num_layers=1,
+                        kv_cache_tokens_per_block=tokens_per_block)
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+
+    def run_once(batch_size: int = 64) -> None:
+        # Numerics vs the reference implementation are asserted inside.
+        _run_test_for_backend("TRTLLM", scenario.num_heads,
+                              scenario.num_kv_heads, scenario.num_layers,
+                              scenario.q_lora_rank, scenario.kv_lora_rank,
+                              scenario.qk_nope_head_dim,
+                              scenario.qk_rope_head_dim, scenario.v_head_dim,
+                              rope_config, scenario.kv_cache_tokens_per_block,
+                              torch.device('cuda'), scenario.dtype,
+                              scenario.kv_cache_dtype, [10] * batch_size, 1, 2,
+                              v2_kv_cache)
+
+    AutoTuner.get().clear_cache()
+    CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache.clear()
+
+    with autotune():
+        run_once()
+
+    tuned_ops = {key[0] for key in AutoTuner.get().profiling_cache.cache}
+    assert any("cute_dsl_mla_decode" in str(op) for op in tuned_ops), (
+        f"tuning-mode pass did not tune any cute_dsl_mla_decode op; "
+        f"tuned ops: {tuned_ops}")
+
+    kernel_keys = list(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)
+    assert kernel_keys, "tuning-mode pass compiled no CuTe DSL MLA kernels"
+    # Tactic layout: unique_id + (out_dtype, mma_qk, mma_pv, split_kv,
+    # is_persistent); both tactic elements chosen by the tuner must have
+    # been exercised during profiling.
+    persistent_variants = {key[-1] for key in kernel_keys}
+    assert persistent_variants == {
+        True, False
+    }, (f"expected both is_persistent tactic candidates to be profiled, "
+        f"got {persistent_variants}")
+    split_kv_variants = {key[-2] for key in kernel_keys}
+    assert split_kv_variants, "no split_kv tactic variant was profiled"
+
+    # Serving-mode pass: tuned tactics must be reused as-is -- any new
+    # kernel_cache entry means a runtime cute.compile happened post-tuning.
+    num_compiled = len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)
+    run_once()
+    assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == \
+        num_compiled, (
+        "serving-mode pass cute.compiled new kernel variants after tuning: "
+        f"{set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) - set(kernel_keys)}"
+    )
+
+    # Fallback pass: serve a non-power-of-2 batch (65) with the AutoTuner
+    # cache cleared, so ``choose_one`` misses and returns its -1 sentinel and
+    # the op must take the ``default_tactic`` branch. The fallback rounds the
+    # batch down to its tuning bucket (64), so it must land on a kernel
+    # variant the tuning pass already compiled; deriving split_kv from the
+    # raw batch could cute.compile a fresh variant in the serving loop.
+    AutoTuner.get().clear_cache()
+    fallback_calls = []
+    orig_default_tactic = CuteDSLNVMlaDecodeBlackwellRunner.default_tactic
+
+    def spying_default_tactic(self, batch_size: int):
+        tactic = orig_default_tactic(self, batch_size)
+        fallback_calls.append((self, batch_size, tactic))
+        return tactic
+
+    with mock.patch.object(CuteDSLNVMlaDecodeBlackwellRunner, "default_tactic",
+                           spying_default_tactic):
+        run_once(batch_size=65)
+
+    assert fallback_calls, (
+        "batch-65 serving pass never reached default_tactic: with the "
+        "AutoTuner cache cleared, choose_one must miss and return its -1 "
+        "sentinel")
+    runner = fallback_calls[0][0]
+    for _, batch_size, tactic in fallback_calls:
+        assert batch_size == 65, (
+            f"default_tactic saw batch {batch_size}, expected 65")
+        assert tactic == runner.default_tactic(64), (
+            f"batch-65 fallback tactic {tactic} does not match batch-64's "
+            f"{runner.default_tactic(64)}")
+    assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == \
+        num_compiled, (
+        "batch-65 default_tactic fallback cute.compiled new kernel variants "
+        "instead of reusing a bucket-64 one from tuning: "
+        f"{set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) - set(kernel_keys)}"
+    )
+
+    # The assertions above can hold even for an unbucketed fallback when this
+    # GPU's occupancy makes split_kv(65) == split_kv(64), so also check the
+    # bucketing itself with the occupancy ceiling pinned to a value where the
+    # raw batch and its bucket disagree: 256 // 65 // 2 == 1, while bucket 64
+    # gives 256 // 64 // 2 == 2.
+    with mock.patch.object(CuteDSLNVMlaDecodeBlackwellRunner,
+                           "_cute_dsl_max_active_blocks",
+                           256,
+                           create=True):
+        pinned_tactic = runner.default_tactic(65)
+        assert pinned_tactic == runner.default_tactic(64), (
+            f"default_tactic no longer buckets the batch: got {pinned_tactic} "
+            f"for batch 65 vs {runner.default_tactic(64)} for batch 64")
+        assert pinned_tactic[2] == 2, (
+            f"expected bucket-64 split_kv 2 with max_active_blocks pinned to "
+            f"256, got {pinned_tactic[2]}")
+
+
+def _run_test_for_backend(backend_name,
+                          num_heads,
+                          num_kv_heads,
+                          num_layers,
+                          q_lora_rank,
+                          kv_lora_rank,
+                          qk_nope_head_dim,
+                          qk_rope_head_dim,
+                          v_head_dim,
+                          rope_config,
+                          kv_cache_tokens_per_block,
+                          device,
+                          dtype,
+                          kv_cache_dtype,
+                          context_sequence_lengths,
+                          generation_seq_len_q,
+                          num_generation_steps,
+                          v2_kv_cache,
+                          skip_correction_threshold: float = 0.0):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -580,6 +985,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             q_scaling=q_scaling,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
+            skip_correction_threshold=skip_correction_threshold,
         ) for layer_idx in range(num_layers)
     ]
     gen_layers = [
@@ -592,6 +998,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             q_scaling=q_scaling,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
+            skip_correction_threshold=skip_correction_threshold,
         ) for layer_idx in range(num_layers)
     ]
 
@@ -647,7 +1054,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         max_num_requests=len(context_sequence_lengths),
         num_contexts=len(context_sequence_lengths),
         prompt_lens=context_sequence_lengths,
-        max_num_tokens=max(context_sequence_lengths),
+        max_num_tokens=sum(context_sequence_lengths),
         kv_cache_manager=kv_cache_manager,
         kv_cache_params=KVCacheParams(
             use_cache=True,
@@ -668,7 +1075,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                         kv_cache.capacity += 1
                     else:
                         kv_cache_manager.impl.add_token(req_id)
-            attn_metadata = AttentionCls.Metadata(
+            gen_metadata_kwargs = dict(
                 seq_lens=torch.tensor([generation_seq_len_q] *
                                       len(context_sequence_lengths),
                                       dtype=torch.int),
@@ -676,7 +1083,10 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 max_num_requests=len(context_sequence_lengths),
                 num_contexts=0,
                 prompt_lens=context_sequence_lengths,
-                max_num_tokens=max(context_sequence_lengths),
+                max_num_tokens=max(
+                    sum(context_sequence_lengths),
+                    generation_seq_len_q * len(context_sequence_lengths),
+                ),
                 kv_cache_manager=kv_cache_manager,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -686,8 +1096,11 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                     ],
                 ),
                 mapping=mapping,
-                enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
             )
+            if backend_name == "TRTLLM":
+                gen_metadata_kwargs["enable_flash_mla"] = (cuda_capability == (
+                    9, 0))
+            attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
             attn_metadata.prepare()
         for layer_idx in range(num_layers):
             print(
@@ -702,13 +1115,38 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
                 # q/k will be modified in the forward pass, so we need to clone them
                 # we should not clone v because we need to keep the stride of v
+                if backend_name == "FLASHINFER":
+                    # FlashInfer MLA does not fuse RoPE; pre-apply it here.
+                    ctx_positions = [
+                        pos for ctx_len in context_sequence_lengths
+                        for pos in range(ctx_len)
+                    ]
+                    q_fwd = q.clone().view(-1, num_heads, qk_head_dim)
+                    q_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
+                        q_fwd[..., qk_nope_head_dim:], ctx_positions,
+                        rope_cos_sin)
+                    q_fwd = q_fwd.view(-1, num_heads * qk_head_dim)
+                    k_fwd = k.clone().view(-1, num_kv_heads, qk_head_dim)
+                    k_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
+                        k_fwd[..., qk_nope_head_dim:], ctx_positions,
+                        rope_cos_sin)
+                    k_fwd = k_fwd.view(-1, num_kv_heads * qk_head_dim)
+                    lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
+                    lc_kpe_rope = apply_mla_rope(lc_kpe, ctx_positions,
+                                                 rope_cos_sin).squeeze(1)
+                    latent_cache_fwd = torch.cat(
+                        [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
+                else:
+                    q_fwd = q.clone()
+                    k_fwd = k.clone()
+                    latent_cache_fwd = latent_cache
                 result = ctx_layers[layer_idx].forward(
-                    q.clone(),
-                    k.clone(),
+                    q_fwd,
+                    k_fwd,
                     v,
                     attn_metadata,
                     attention_input_type=AttentionInputType.context_only,
-                    latent_cache=latent_cache,
+                    latent_cache=latent_cache_fwd,
                 )
                 ref_result, latent_cache_ref = calculate_ref_result_ctx(
                     q,
@@ -737,58 +1175,95 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
                 latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
-                num_tokens = fused_q.size(0)
-                num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
-                cu_q_seqlens = torch.empty(num_seqs + 1,
-                                           dtype=torch.int32,
-                                           device=q.device)
-                cu_kv_seqlens = torch.empty(num_seqs + 1,
-                                            dtype=torch.int32,
-                                            device=q.device)
-                fmha_scheduler_counter = torch.empty(1,
-                                                     dtype=torch.uint32,
-                                                     device=q.device)
-                has_fp8_kv_cache = gen_layers[
-                    layer_idx].has_fp8_kv_cache if hasattr(
-                        gen_layers[layer_idx], 'has_fp8_kv_cache') else False
+                if backend_name == "FLASHINFER":
+                    # FlashInfer MLA does not fuse RoPE; pre-apply before
+                    # appending to the KV cache.  Keep original q_pe and
+                    # latent_cache intact for the reference calculation
+                    # (calculate_ref_result_gen applies RoPE internally).
+                    gen_positions = [
+                        ctx_len + (step - 1) * generation_seq_len_q + i
+                        for ctx_len in context_sequence_lengths
+                        for i in range(generation_seq_len_q)
+                    ]
+                    q_pe_for_gen = apply_mla_rope(q_pe, gen_positions,
+                                                  rope_cos_sin)
+                    lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
+                    lc_kpe_rope = apply_mla_rope(lc_kpe, gen_positions,
+                                                 rope_cos_sin).squeeze(1)
+                    latent_cache_for_gen = torch.cat(
+                        [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
+                    # Copy RoPE'd q_pe into the rope portion of fused_q
+                    num_tokens = fused_q.size(0)
+                    fused_q_3d = fused_q.view(num_tokens, num_heads,
+                                              kv_lora_rank + qk_rope_head_dim)
+                    fused_q_3d[..., kv_lora_rank:].copy_(q_pe_for_gen)
 
-                if has_fp8_kv_cache:
-                    mla_bmm1_scale = torch.empty(2,
-                                                 dtype=torch.float32,
-                                                 device=q.device)
-                    mla_bmm2_scale = torch.empty(1,
-                                                 dtype=torch.float32,
-                                                 device=q.device)
-                    quant_q_buffer = torch.empty(
-                        num_tokens,
-                        num_heads * (kv_lora_rank + qk_rope_head_dim),
-                        dtype=torch.uint8,
-                        device=q.device)
+                    result = gen_layers[layer_idx].forward(
+                        fused_q,
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.generation_only,
+                        latent_cache=latent_cache_for_gen,
+                    )
                 else:
-                    mla_bmm1_scale = None
-                    mla_bmm2_scale = None
-                    quant_q_buffer = None
+                    q_pe_for_gen = q_pe
+                    latent_cache_for_gen = latent_cache
 
-                gen_layers[layer_idx].mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer)
+                    num_tokens = fused_q.size(0)
+                    num_seqs = len(context_sequence_lengths)
+                    cu_q_seqlens = torch.empty(num_seqs + 1,
+                                               dtype=torch.int32,
+                                               device=q.device)
+                    cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                                dtype=torch.int32,
+                                                device=q.device)
+                    fmha_scheduler_counter = torch.empty(1,
+                                                         dtype=torch.uint32,
+                                                         device=q.device)
+                    has_fp8_kv_cache = gen_layers[
+                        layer_idx].has_fp8_kv_cache if hasattr(
+                            gen_layers[layer_idx],
+                            'has_fp8_kv_cache') else False
 
-                result = gen_layers[layer_idx].forward(
-                    fused_q,
-                    None,
-                    None,
-                    attn_metadata,
-                    attention_input_type=AttentionInputType.generation_only,
-                    latent_cache=latent_cache,
-                    q_pe=q_pe,
-                    cu_q_seqlens=cu_q_seqlens,
-                    cu_kv_seqlens=cu_kv_seqlens,
-                    fmha_scheduler_counter=fmha_scheduler_counter,
-                    mla_bmm1_scale=mla_bmm1_scale,
-                    mla_bmm2_scale=mla_bmm2_scale,
-                    quant_q_buffer=quant_q_buffer,
-                )
+                    if has_fp8_kv_cache:
+                        mla_bmm1_scale = torch.empty(2,
+                                                     dtype=torch.float32,
+                                                     device=q.device)
+                        mla_bmm2_scale = torch.empty(1,
+                                                     dtype=torch.float32,
+                                                     device=q.device)
+                        quant_q_buffer = torch.empty(
+                            num_tokens,
+                            num_heads * (kv_lora_rank + qk_rope_head_dim),
+                            dtype=torch.uint8,
+                            device=q.device)
+                    else:
+                        mla_bmm1_scale = None
+                        mla_bmm2_scale = None
+                        quant_q_buffer = None
+
+                    gen_layers[layer_idx].mla_rope_generation(
+                        fused_q, q_pe_for_gen, latent_cache_for_gen,
+                        attn_metadata, cu_q_seqlens, cu_kv_seqlens,
+                        fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
+                        quant_q_buffer)
+
+                    result = gen_layers[layer_idx].forward(
+                        fused_q,
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.generation_only,
+                        latent_cache=latent_cache,
+                        q_pe=q_pe,
+                        cu_q_seqlens=cu_q_seqlens,
+                        cu_kv_seqlens=cu_kv_seqlens,
+                        fmha_scheduler_counter=fmha_scheduler_counter,
+                        mla_bmm1_scale=mla_bmm1_scale,
+                        mla_bmm2_scale=mla_bmm2_scale,
+                        quant_q_buffer=quant_q_buffer,
+                    )
                 ref_result, latent_cache_ref = calculate_ref_result_gen(
                     fused_q,
                     q_pe,
@@ -832,3 +1307,129 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
 
     print(f"Test for MLA in {backend_name} backend passed")
     kv_cache_manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# The MLA FMHA prefixes must follow post-`prepare()` edits to the lengths.
+#
+# `mla_cu_q_rows` / `mla_cu_kv_seqlens` replace a per-layer in-kernel scan, so they
+# are built once and reused across the 60+ MLA layers of an iteration. What makes
+# that unsafe is that spec-dec and the overlap scheduler rewrite the lengths
+# *after* `prepare()` and *in place on the device*:
+#
+#   eagle3.py:1110      `_seq_lens[:batch].fill_(1)`      (q_len 4 -> 1 for drafts)
+#   eagle3.py:1122      `kv_lens_cuda -= draft - accepted`
+#   mtp.py:880          `_seq_lens[nc:] -= 1`
+#   model_engine.py:3388 `kv_lens_cuda += previous_kv_lens_offsets_cuda`
+#
+# so a host snapshot taken in `prepare()` sees none of it, and FMHA gets request
+# boundaries that disagree with the packed Q/KV. These tests pin the two properties
+# that make the reuse safe: the invalidation hooks fire, and the rebuild reads the
+# device tensors rather than a host mirror.
+# Merged from test_mla_scheduler_buffers.py.
+# ---------------------------------------------------------------------------
+
+NUM_HEADS = 128
+
+
+class _Prefixes:
+    """The state `mla_prepare_*` touches, with the real methods bound to it.
+
+    Deliberately not a full `TrtllmAttentionMetadata`: that needs a KV cache
+    manager and a resource pool, none of which these methods read. Binding the
+    production functions keeps this a test of the shipped code rather than of a
+    reimplementation.
+    """
+
+    # Bind the unbound functions so any edit to them is exercised here.
+    mla_prepare_scheduler_buffers = TrtllmAttentionMetadata.mla_prepare_scheduler_buffers
+    mla_prepare_ctx_cu_seqlens = TrtllmAttentionMetadata.mla_prepare_ctx_cu_seqlens
+    _invalidate_mla_scheduler_buffers = TrtllmAttentionMetadata._invalidate_mla_scheduler_buffers
+    on_update_kv_lens = TrtllmAttentionMetadata.on_update_kv_lens
+    update_for_spec_dec = TrtllmAttentionMetadata.update_for_spec_dec
+
+    def __init__(self, q_lens, kv_lens, num_contexts=0):
+        device = torch.device("cuda")
+        self.num_contexts = num_contexts
+        self.num_seqs = len(q_lens)
+        self.seq_lens_cuda = torch.tensor(q_lens,
+                                          dtype=torch.int32,
+                                          device=device)
+        self.kv_lens_cuda = torch.tensor(kv_lens,
+                                         dtype=torch.int32,
+                                         device=device)
+        size = self.num_seqs + 1
+        self.mla_cu_q_rows = torch.zeros(size, dtype=torch.int32, device=device)
+        self.mla_cu_kv_seqlens = torch.zeros(size,
+                                             dtype=torch.int32,
+                                             device=device)
+        self.mla_ctx_cu_q_seqlens = torch.zeros(size,
+                                                dtype=torch.int32,
+                                                device=device)
+        # `enable_flash_mla` is the only other attribute the two hooks read.
+        self.enable_flash_mla = False
+        self._invalidate_mla_scheduler_buffers()
+
+    def rebuild(self):
+        cu_q, cu_kv = self.mla_prepare_scheduler_buffers(NUM_HEADS)
+        return cu_q.tolist(), cu_kv.tolist()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_q_rows_follow_a_spec_dec_query_length_change():
+    """MTP3 verify pass runs q_len 4; the draft sub-steps run 3, then 1.
+
+    Without the invalidation the second call returns the first call's prefixes,
+    because the validity flag used to be reset only in `prepare()`.
+    """
+    state = _Prefixes(q_lens=[4, 4], kv_lens=[100, 200])
+    cu_q, _ = state.rebuild()
+    assert cu_q == [0, 4 * NUM_HEADS, 8 * NUM_HEADS]
+
+    # What MTPWorker.change_attn_metadata does to the generation rows.
+    state.seq_lens_cuda -= 1
+    assert state.rebuild(
+    )[0] == cu_q, "no rebuild is expected until a hook fires"
+
+    state.update_for_spec_dec()
+    assert state.rebuild()[0] == [0, 3 * NUM_HEADS, 6 * NUM_HEADS]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_kv_prefix_follows_an_in_place_device_kv_len_change():
+    """The overlap scheduler bumps `kv_lens_cuda` on device, never the host copy.
+
+    A host-derived prefix cannot see this, which is why the rebuild reads
+    `kv_lens_cuda` directly.
+    """
+    state = _Prefixes(q_lens=[1, 1], kv_lens=[100, 200])
+    assert state.rebuild()[1] == [0, 100, 300]
+
+    state.kv_lens_cuda += torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    state.on_update_kv_lens()
+    assert state.rebuild()[1] == [0, 103, 308]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_partial_acceptance_differs_per_request():
+    """Acceptance is per request, so a uniform q_len is not a safe assumption."""
+    state = _Prefixes(q_lens=[4, 4, 4], kv_lens=[100, 200, 300])
+    state.rebuild()
+
+    state.seq_lens_cuda.copy_(
+        torch.tensor([1, 3, 4], dtype=torch.int32, device="cuda"))
+    state.update_for_spec_dec()
+    cu_q, _ = state.rebuild()
+    assert cu_q == [0, 1 * NUM_HEADS, 4 * NUM_HEADS, 8 * NUM_HEADS]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_context_prefix_counts_tokens_not_rows():
+    """`mla_ctx_cu_q_seqlens` feeds the Q RoPE fold, which is indexed by token."""
+    state = _Prefixes(q_lens=[5, 3, 7], kv_lens=[5, 3, 7], num_contexts=3)
+    assert state.mla_prepare_ctx_cu_seqlens().tolist() == [0, 5, 8, 15]
+
+    state.seq_lens_cuda.copy_(
+        torch.tensor([2, 3, 7], dtype=torch.int32, device="cuda"))
+    state.on_update_kv_lens()
+    assert state.mla_prepare_ctx_cu_seqlens().tolist() == [0, 2, 5, 12]

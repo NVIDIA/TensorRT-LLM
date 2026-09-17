@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,6 +71,12 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 
 # Define a constant for process termination timeouts
 GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
+
+# Single source of truth for aiperf artifact location.
+# Passed to aiperf via --output-artifact-dir so writes and reads stay aligned
+# regardless of the pytest cwd.
+ARTIFACTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "artifacts")
 
 
 def _get_default_port() -> int:
@@ -167,14 +173,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for aiperf"""
-    input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
+    input_len_mean: int = 64  # Customized for TinyLlama and Qwen3.5-4B.
     input_len_std: int = 16
-    output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
+    output_len_mean: int = 128  # Customized for TinyLlama and Qwen3.5-4B.
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
+    test_timeout: int = 3600  # One hour for TinyLlama and Qwen3.5-4B.
     concurrency_list: List[int] = field(
         default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
@@ -428,10 +434,9 @@ def is_port_available(port: int,
         ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
                     tp_size=1,
                     memory_requirement=12288),
-        # Configuration for Llama-v3 model
+        # Configuration for Qwen3.5-4B
         # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v3/llama-v3-8b-instruct-hf",
-                    tp_size=1,
+        ModelConfig(model_dir="Qwen3.5-4B", tp_size=1,
                     memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
         # memory_requirement is in MiB (96 GB = 98304 MiB)
@@ -571,6 +576,9 @@ def stress_test(config,
 
     # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+        # Reduce CUDA allocator fragmentation so transient MoE workspace
+        # allocations don't OOM when KV cache reservation is large.
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
@@ -582,7 +590,7 @@ def stress_test(config,
             max_num_tokens=
             8192,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.85,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
+            0.75,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
@@ -954,6 +962,10 @@ def create_aiperf_command(model_name,
         str(request_count),
         "--concurrency",
         str(concurrency),
+        "--output-artifact-dir",
+        os.path.join(
+            ARTIFACTS_DIR,
+            f"{model_name}-openai-completions-concurrency{concurrency}"),
         # "--verbose",
     ]
 
@@ -1365,8 +1377,7 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     # For local testing, the artifacts are at
     # artifacts_dir = os.path.join(script_dir, "artifacts")
     if artifacts_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+        artifacts_dir = ARTIFACTS_DIR
 
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,

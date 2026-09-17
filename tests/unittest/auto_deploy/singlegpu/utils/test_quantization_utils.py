@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 import torch
 
@@ -6,7 +20,7 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
     FP8LinearQuantizationFromConfig,
 )
-from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _shard_fp4_weight_scale
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import _shard_fp4_weight_scale
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     fp4_global_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
@@ -62,6 +76,7 @@ def test_fp4_global_scale():
     assert input_scale == torch.tensor(1.0, dtype=torch.float)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("amax, expected_scale", [(FP8_MAX, 1.0), (FP8_MAX / 2.0, 0.5)])
 def test_fp8_convert_amax_hook(amax, expected_scale):
     config = TransformConfig(stage="pattern_matcher")
@@ -75,6 +90,7 @@ def test_fp8_convert_amax_hook(amax, expected_scale):
     assert mock_state_dict["scale"] == expected_scale
 
 
+@pytest.mark.cpu_only
 def test_fp8_load_hook_maps_prequantized_scales():
     config = TransformConfig(stage="pattern_matcher")
     fp8_imp = FP8LinearQuantizationFromConfig(config)
@@ -94,6 +110,7 @@ def test_fp8_load_hook_maps_prequantized_scales():
     assert "layer.proj.weight_scale_inv" not in mock_state_dict
 
 
+@pytest.mark.cpu_only
 def test_fp8_load_hook_maps_prequantized_scales_with_prefix():
     config = TransformConfig(stage="pattern_matcher")
     fp8_imp = FP8LinearQuantizationFromConfig(config)

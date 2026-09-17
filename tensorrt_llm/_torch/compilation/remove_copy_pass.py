@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from operator import getitem
 
 import torch
@@ -23,13 +37,49 @@ def remove_copy_for_mutates_args(graph: Graph):
         ]
 
         kwargs = {k: v for k, v in node.kwargs.items() if not k.startswith("_")}
+        tensor_list_replacements = {}
         if is_v2:
-            for k, v in mutates_args.items():
-                kwargs[v] = node.kwargs["_all_bases"][k - 1]
+            all_bases = node.kwargs["_all_bases"]
+            # Mutated bases are flattened into consecutive outputs after the
+            # operator's regular outputs.
+            first_mutated_output = min(mutates_args)
+            for arg in inplace_func._schema.arguments:
+                if arg.alias_info is None or not arg.alias_info.is_write:
+                    continue
+                length_key = f"_{arg.name}_length"
+                if length_key in node.kwargs:
+                    length = node.kwargs[length_key]
+                    if length is None:
+                        kwargs[arg.name] = None
+                        continue
+
+                    kwargs[arg.name] = []
+                    for index in range(length):
+                        base_index = node.kwargs[
+                            f"_{arg.name}_{index}_base_index"]
+                        base = (None if base_index is None else
+                                all_bases[base_index])
+                        kwargs[arg.name].append(base)
+                        if base_index is not None:
+                            tensor_list_replacements[first_mutated_output +
+                                                     base_index] = (arg.name,
+                                                                    base)
+                else:
+                    base_index = node.kwargs[f"_{arg.name}_base_index"]
+                    kwargs[arg.name] = (None if base_index is None else
+                                        all_bases[base_index])
 
         for getitem_node in getitem_nodes:
             idx = getitem_node.args[1]
-            getitem_node.replace_all_uses_with(kwargs[mutates_args[idx]])
+            if idx in tensor_list_replacements:
+                mutated_arg, replacement = tensor_list_replacements[idx]
+            else:
+                mutated_arg = mutates_args[idx]
+                replacement = kwargs[mutated_arg]
+            assert replacement is not None, (
+                f"getitem user for optional output '{mutated_arg}' "
+                "has no base tensor -- graph is malformed")
+            getitem_node.replace_all_uses_with(replacement)
             nodes_to_remove.append(getitem_node)
 
         with graph.inserting_before(node):
@@ -51,7 +101,11 @@ def remove_copy_for_mutates_args(graph: Graph):
             # We do not know the inplace op
             continue
 
-        remove_functionalize_inner(node, inplace_map[inplace_func])
+        remove_functionalize_inner(
+            node,
+            inplace_map[inplace_func],
+            is_v2=node.target == auto_functionalized_v2,
+        )
 
     for node in nodes_to_remove:
         graph.erase_node(node)

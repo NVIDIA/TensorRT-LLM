@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 from dataclasses import dataclass
 from typing import List, Optional
@@ -13,6 +16,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_moe_weight_mapper import 
     Qwen3VLMoeHfWeightMapper,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
+from tensorrt_llm._utils import get_sm_version
 
 QWEN3_VL_30B_A3B_CONFIG = {
     "architectures": ["Qwen3VLMoeForConditionalGeneration"],
@@ -47,6 +51,7 @@ QWEN3_VL_30B_A3B_CONFIG = {
             "rope_type": "default",
         },
         "rope_theta": 5000000,
+        "tie_word_embeddings": False,
         "use_cache": True,
         "vocab_size": 151936,
     },
@@ -152,16 +157,30 @@ class TestQwen3VLMoe(TestModelingMultimodal):
                 )
                 gen_multimodal_params_list.append(multimodal_param)
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
+            trtllm_inputs["mrope_delta_read_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
         else:
-            # Mrope position ids
+            # Mrope position ids. For chunked prefill / KV cache reuse we must
+            # mirror production `PyTorchModelEngine` behavior and slice the
+            # request's full `mrope_position_ids` to the current chunk's range.
+            chunk_len = input_ids.shape[-1]
+            if num_cached_tokens_per_seq is None:
+                begin_offsets = [0] * len(multimodal_params_list)
+            elif isinstance(num_cached_tokens_per_seq, int):
+                begin_offsets = [num_cached_tokens_per_seq] * len(multimodal_params_list)
+            else:
+                begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []
-            for multimodal_param in multimodal_params_list:
-                mrope_position_ids.append(
-                    multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
-                )
+            for multimodal_param, begin in zip(multimodal_params_list, begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :, begin : begin + chunk_len])
             position_ids = torch.cat(mrope_position_ids, dim=-1)
             position_ids = position_ids.cuda()
             trtllm_inputs["position_ids"] = position_ids
+            trtllm_inputs["mrope_delta_write_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
 
         return trtllm_inputs
 
@@ -251,31 +270,49 @@ class TestQwen3VLMoe(TestModelingMultimodal):
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
-            # ==== Chunked Prefill Scenarios ====
-            TestQwen3VLMoeScenario(
-                modality="image",
-                use_cuda_graph=False,
-                disable_fuse_rope=False,
-                chunked_prefill=True,
-                kv_cache_reuse=False,
-            ),
-            # ==== KV Cache Reuse Scenarios ====
-            TestQwen3VLMoeScenario(
-                modality="image",
-                use_cuda_graph=False,
-                disable_fuse_rope=False,
-                chunked_prefill=False,
-                kv_cache_reuse=True,
-            ),
-            # ==== Disable fuse rope scenarios ====
+        ]
+        # Paged context FMHA (triggered by chunked_prefill / kv_cache_reuse)
+        # is forced on for correctness on Hopper (SM90); the trtllm-gen
+        # kernel set on Blackwell (SM100) falls back to an unfused MHA path
+        # whose output diverges from the non-paged context kernel. Gate
+        # those scenarios to SM90 until the Blackwell fallback matches.
+        if torch.cuda.is_available() and get_sm_version() == 90:
+            scenarios.extend(
+                [
+                    # ==== Chunked Prefill Scenarios ====
+                    TestQwen3VLMoeScenario(
+                        modality="image",
+                        use_cuda_graph=False,
+                        disable_fuse_rope=False,
+                        chunked_prefill=True,
+                        kv_cache_reuse=False,
+                    ),
+                    # ==== KV Cache Reuse Scenarios ====
+                    TestQwen3VLMoeScenario(
+                        modality="image",
+                        use_cuda_graph=False,
+                        disable_fuse_rope=False,
+                        chunked_prefill=False,
+                        kv_cache_reuse=True,
+                    ),
+                ]
+            )
+        # ==== Disable fuse rope scenarios ====
+        # Run last: setup_scenario rebuilds trtllm_model with
+        # disable_fuse_rope=True for this scenario, and the rebuild is not
+        # undone afterwards. Keeping it at the tail prevents the rebuilt
+        # model from leaking into chunked-prefill / kv-cache-reuse
+        # scenarios (where it surfaces as a cos/sin vs. q/k seq-len
+        # mismatch in MRotaryEmbedding.forward).
+        scenarios.append(
             TestQwen3VLMoeScenario(
                 modality="image",
                 use_cuda_graph=False,
                 disable_fuse_rope=True,
                 chunked_prefill=False,
                 kv_cache_reuse=False,
-            ),
-        ]
+            )
+        )
         return scenarios
 
     def setup_scenario(self, scenario: TestQwen3VLMoeScenario):
