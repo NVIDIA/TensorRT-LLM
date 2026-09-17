@@ -4,7 +4,9 @@
     "repository": "NVIDIA/TensorRT-LLM",
     "implementation": "GVR V2 self-sampling",
     "entry": "run_varlen",
-    "mode": "hint-free"
+    "mode": "hint-free",
+    "pull_request": "https://github.com/NVIDIA/TensorRT-LLM/pull/19076",
+    "commit": "be1b9885e8df9bf070e8cb68459e24a7119afaa9"
   },
   "hardware": "NVIDIA B200 (SM100)",
   "baseline_versions": {
@@ -17,8 +19,8 @@
     "temporal_tiered": "Tiered temporal implementation, public PR #16877"
   },
   "pairing": {
-    "deepselect": "same process as reference",
-    "hpc_ops": "same process as reference",
+    "deepselect": "cross-campaign; existing FP32 baseline matched by workload and batch to PR #19076",
+    "hpc_ops": "cross-campaign; existing FP32 baseline matched by workload and batch to PR #19076",
     "radix_cuda": "cross-campaign",
     "sglang": "cross-campaign; plan + transform",
     "sglang_transform": "cross-campaign; transform only",
@@ -28,12 +30,12 @@
     "temporal_tiered": "cross-campaign, same (cell, batch), not an isolated algorithm ablation"
   },
   "published_files": {
-    "flash_timings.csv.gz": "2a34d4a9baeb6b46522851b11af51b7885f8f01c4227232efd24e9fb9080d8e2",
-    "pro_timings.csv.gz": "e99b97ce0075bd84d4d8713e628cdd37ea84b2e96690db1b97541a14164d6d27",
-    "v32_timings.csv.gz": "02e80a2298bb278ee28e3314c97ceb56b0cc62018ebbc821ce7da933ed927f70",
+    "flash_timings.csv.gz": "b4fd49550dfcc0d9edc61a7dd37af8f00ff1ea9df13ecdabc5fe81171238eb0e",
+    "pro_timings.csv.gz": "3473208ed857807a87a5f18cac4608f2052d72459a232b39e1bc3e919cea1d99",
+    "v32_timings.csv.gz": "052fbf1333c9ee839938d378366528ee59bfcd1e5608fd7c8eb030e510f370f8",
     "temporal_comparison.csv.gz": "0a0973e218209d1f2e4db89e9539a3736753073ad72dc16a30288e79fa9309bb"
   },
-  "scope": "Frozen per-case cold kernel means, not raw repetition traces or captured logits. Blank entries are missing/unsupported; never zero latency.",
+  "scope": "Per-case cold kernel means with PR #19076 as the FP32 GVR V2 reference; all FP32 baseline comparisons are cross-campaign. Blank entries are missing/unsupported, never zero latency. Historical BF16 timings retain their separate paired reference.",
   "roofline_model": {
     "theoretical_bandwidth_tb_s": 8.0,
     "measured_bandwidth_tb_s": 6.912116,

@@ -13,7 +13,7 @@ Selecting 1,024 INT32 indices from 131,072 FP32 scores writes just **4 KiB of ou
 
 GVR V2 makes each full-row pass more useful without depending on the previous decode step to predict the current one. **Self-sampling estimates where the current row's Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.** Together, they concentrate exact refinement on the small group of scores still competing for the final slots. The sampling idea builds on Floyd–Rivest SELECT, adapted to the memory traffic and parallel execution costs of GPU Top-K.
 
-On B200, this design delivers **4.93× geometric-mean speedup over TensorRT-LLM radix CUDA and 1.66× over SGLang v2**, with **2.01× over FlashInfer, 2.37× over DeepSelect FP32, and 1.55× over HPC-ops FP32**. The workloads span DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers. The SGLang result includes planning; the transform-only comparison is **1.42×**.
+On B200, this design delivers **5.05× geometric-mean speedup over TensorRT-LLM radix CUDA and 1.70× over SGLang v2**, with **2.06× over FlashInfer, 2.42× over DeepSelect FP32, and 1.59× over HPC-ops FP32**. The workloads span DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers. The SGLang result includes planning; the transform-only comparison is **1.46×**.
 
 ![Three horizontal bar-chart panels compare GVR V2, temporal GVR R0 and tiered versions, SGLang, FlashInfer, radix CUDA, DeepSelect FP32, and HPC-ops FP32 on common cases per model. GVR V2 is 1.00; shorter bars mean less kernel time.](../media/gvr_v2/speedup.svg)
 
@@ -121,7 +121,7 @@ V1's prior also has a lifecycle outside the kernel. Prefill lacks the same previ
 
 *Figure 3. The design shift removes dependence on temporal overlap and prior state while making each verification pass more informative. Original V1 uses scalar threshold search; later temporal R0 and tiered implementations add broader verification and execution specialization. The bars compare those later temporal implementations with V2 over radix CUDA.*
 
-Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA; V2 reaches **4.93×**. V2 is **1.91× faster than temporal R0** and **1.42× faster than tiered temporal GVR**, combining current-row sampling, multi-threshold verification, and specialized execution paths.
+Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA; V2 reaches **5.05×**. V2 is **1.95× faster than temporal R0** and **1.46× faster than tiered temporal GVR**, combining current-row sampling, multi-threshold verification, and specialized execution paths.
 
 ## Self-Sampling and Multi-Thresholding
 
@@ -217,7 +217,7 @@ This explains the two sources of performance improvement: a better starting thre
 
 #### Benchmark Setup
 
-The benchmarks use FP32 indexer scores from the three models below on NVIDIA B200, with batch sizes from 1 to 1,024. Results report cold-L2 GPU kernel time, excluding compilation, input preparation, and Python overhead. Speedups are geometric means over matched workloads.
+The benchmarks use FP32 indexer scores from the three models below on NVIDIA B200, with batch sizes from 1 to 1,024. GVR V2 uses the merged [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076) implementation. Results report cold-L2 GPU kernel time, excluding compilation, input preparation, and Python overhead. Speedups are geometric means over matched workloads from separate benchmark runs.
 
 | Model | $K$ | Indexer compression | Valid row lengths $N$ |
 | :--- | ---: | ---: | :--- |
@@ -231,11 +231,11 @@ The benchmarks use FP32 indexer scores from the three models below on NVIDIA B20
 
 | Baseline | Geomean speedup | Minimum speedup | GVR V2 faster |
 | :--- | ---: | ---: | ---: |
-| SGLang v2, plan + transform | **1.66×** | 0.95× | 99.91% |
-| FlashInfer 0.6.14 `top_k` | **2.01×** | 1.20× | 100.00% |
-| TensorRT-LLM radix CUDA dispatch | **4.93×** | 1.34× | 100.00% |
-| DeepSelect v1.0.0 FP32 | **2.37×** | 0.84× | 99.60% |
-| HPC-ops FP32 | **1.55×** | 0.71× | 98.38% |
+| SGLang v2, plan + transform | **1.70×** | 0.94× | 99.93% |
+| FlashInfer 0.6.14 `top_k` | **2.06×** | 1.22× | 100.00% |
+| TensorRT-LLM radix CUDA dispatch | **5.05×** | 1.34× | 100.00% |
+| DeepSelect v1.0.0 FP32 | **2.42×** | 0.83× | 99.62% |
+| HPC-ops FP32 | **1.59×** | 0.72× | 98.70% |
 
 The minimum column retains individual regressions. Figure 1 shows the model-level comparison on the common workloads supported by each implementation.
 
@@ -249,7 +249,7 @@ Figure 5 locates the SGLang gains across the full length–batch grid.
 
 *Figure 5. SGLang plan + transform time divided by GVR V2 time, geometrically averaged across layers at each shape. A value of 1.0 means equal performance. Figures 5 and 6 share the same color scale; row lengths are rounded in the axis labels.*
 
-Long rows at intermediate batch sizes show particularly strong gains: **V4 Pro reaches 4.67× at $N=262{,}127$, $B=64$**. This is the strongest shape-average result in the grid; most regions are around 1.3–2.0×.
+Long rows at intermediate batch sizes show particularly strong gains: **V4 Pro reaches 4.69× at $N=262{,}127$, $B=64$**. This is the strongest shape-average result in the grid; most regions are around 1.3–2.0×.
 
 DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long rows at small batch sizes, especially for V3.2.
 
@@ -257,27 +257,27 @@ DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long
 
 *Figure 6. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 5: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
 
-For **V3.2, the gain reaches 7.66× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.23×** and **4.34×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.996×).
+For **V3.2, the gain reaches 7.58× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.26×** and **4.40×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.993×).
 
 These patterns identify useful operating regions. The native API contracts below explain which work is included in each comparison.
 
 #### What Explains the Differences
 
-**SGLang.** The **1.66×** comparison includes both planning and transformation. Serving integrations can amortize planning across layers; against transformation alone, V2 achieves **1.42×** geometric-mean speedup and wins **98.78%** of comparisons.
+**SGLang.** The **1.70×** comparison includes both planning and transformation. Serving integrations can amortize planning across layers; against transformation alone, V2 achieves **1.46×** geometric-mean speedup and wins **99.37%** of comparisons.
 
-**FlashInfer.** Its `top_k` API returns FP32 values and INT64 indices, while GVR V2 returns INT32 indices only. The **2.01×** result includes that additional output work and FlashInfer's scan of the padded row.
+**FlashInfer.** Its `top_k` API returns FP32 values and INT64 indices, while GVR V2 returns INT32 indices only. The **2.06×** result includes that additional output work and FlashInfer's scan of the padded row.
 
-**TensorRT-LLM radix CUDA.** The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2's **4.93×** advantage is consistent with reducing full-row selection passes and matching execution to the workload.
+**TensorRT-LLM radix CUDA.** The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2's **5.05×** advantage is consistent with reducing full-row selection passes and matching execution to the workload.
 
-**DeepSelect.** The FP32 comparison requests unsorted INT32 indices. Its $K=2048$ path emphasizes correctness coverage, which helps explain the larger **2.79×** gap on V3.2.
+**DeepSelect.** The FP32 comparison requests unsorted INT32 indices. Its $K=2048$ path emphasizes correctness coverage, which helps explain the larger **2.85×** gap on V3.2.
 
-**HPC-ops.** FP32 support covers $K \in \lbrace 512,2048\rbrace$. V2's advantage is **2.30×** on Flash and **1.30×** on V3.2, with an overall **1.55×** speedup. HPC-ops retains individual wins on V3.2; Pro is unsupported.
+**HPC-ops.** FP32 support covers $K \in \lbrace 512,2048\rbrace$. V2's advantage is **2.37×** on Flash and **1.33×** on V3.2, with an overall **1.59×** speedup. HPC-ops retains individual wins on V3.2; Pro is unsupported.
 
 #### Latency Across Row Length and Batch Size
 
 ![Cold kernel latency for all six implementations versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
-*Figure 7. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. Solid and dashed lines distinguish benchmark runs. Both axes are logarithmic; 1K means 1,024.*
+*Figure 7. Mean cold kernel time across matching layers. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
 
 At $B=1$, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At $B=1024$, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.
 
@@ -317,7 +317,7 @@ The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a perc
 
 | Operator | V4 Flash | V4 Pro | V3.2 |
 | :--- | ---: | ---: | ---: |
-| **GVR V2** | **41.6% / 78.0%** | **39.0% / 68.4%** | **41.3% / 65.1%** |
+| **GVR V2** | **41.6% / 77.8%** | **39.0% / 68.4%** | **41.5% / 66.5%** |
 | SGLang, plan + transform | 24.7% / 41.2% | 24.7% / 41.3% | 27.1% / 38.0% |
 | FlashInfer | 17.5% / 32.0% | 15.8% / 31.9% | 15.1% / 20.3% |
 | TensorRT-LLM radix CUDA | 7.7% / 16.9% | 7.8% / 16.4% | 8.3% / 17.8% |
@@ -326,7 +326,7 @@ The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a perc
 
 *Each cell shows average / peak. HPC-ops does not support the Pro configuration.*
 
-GVR V2 leads both measures on all three models: its average reachable rate is **39.0–41.6%**, with peaks of **65.1–78.0%**. The nearest baseline varies by model. On V3.2, HPC-ops reaches **31.6% / 53.1%**, compared with V2's **41.3% / 65.1%**. On Flash, DeepSelect reaches a **64.4%** peak but averages **21.2%**, while SGLang averages **24.7%**. Reporting both measures captures the best operating point and the performance sustained across the curve.
+GVR V2 leads both measures on all three models: its average reachable rate is **39.0–41.6%**, with peaks of **66.5–77.8%**. The nearest baseline varies by model. On V3.2, HPC-ops reaches **31.6% / 53.1%**, compared with V2's **41.5% / 66.5%**. On Flash, DeepSelect reaches a **64.4%** peak but averages **21.2%**, while SGLang averages **24.7%**. Reporting both measures captures the best operating point and the performance sustained across the curve.
 
 #### Interpret the Remaining Gap
 

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="977.410034pt" height="409.391719pt" viewBox="0 0 977.410034 409.391719" xmlns="http://www.w3.org/2000/svg" version="1.1">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="981.739627pt" height="409.391719pt" viewBox="0 0 981.739627 409.391719" xmlns="http://www.w3.org/2000/svg" version="1.1">
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
@@ -22,8 +22,8 @@
  <g id="figure_1">
   <g id="patch_1">
    <path d="M 0 409.391719
-L 977.410034 409.391719
-L 977.410034 0
+L 981.739627 409.391719
+L 981.739627 0
 L 0 0
 z
 " style="fill: #ffffff"/>
@@ -345,8 +345,8 @@ z
    </g>
    <g id="patch_15">
     <path d="M 753.12 254.554182
-L 927.020159 254.554182
-L 927.020159 292.372364
+L 931.349752 254.554182
+L 931.349752 292.372364
 L 753.12 292.372364
 z
 " clip-path="url(#p7621fe8e9c)" style="fill: #579600"/>
@@ -368,7 +368,7 @@ L 964.8 301.536
     <text style="font-weight: 700; font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start" x="879.135148" y="204.04725" transform="rotate(-0 879.135148 204.04725)">3.47×</text>
    </g>
    <g id="text_23">
-    <text style="font-weight: 700; font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start" x="930.548159" y="276.774523" transform="rotate(-0 930.548159 276.774523)">4.93×</text>
+    <text style="font-weight: 700; font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start" x="934.877752" y="276.774523" transform="rotate(-0 934.877752 276.774523)">5.05×</text>
    </g>
    <g id="text_24">
     <text style="font-weight: 700; font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start" x="753.12" y="81.936" transform="rotate(-0 753.12 81.936)">Measured evolution</text>

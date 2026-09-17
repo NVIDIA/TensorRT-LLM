@@ -62,11 +62,11 @@ The files contain kernel timings and workload dimensions. They do not contain in
 
 ## Measurement and Comparison Scope
 
-Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,024. Each case has 10 warmup calls, five warm-L2 repetitions, and 10 cold-L2 repetitions. The article reports mean GPU kernel duration from the cold repetitions. A 512 MB cache eviction runs outside the timed region. Compilation, input preparation, allocation during setup, and Python launch overhead are excluded; required device kernels remain timed.
+Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,024. The GVR V2 reference covers 886 row geometries and 9,746 workload/batch cases, all passing tie-aware exactness checks. Each published GVR time is the arithmetic mean of 10 cold-L2 repetitions, rounded to 0.001 µs; five warm-L2 repetitions are excluded from these figures. A 512 MiB cache eviction runs outside the timed region. Compilation, input preparation, allocation during setup, and Python launch overhead are excluded; required device kernels remain timed.
 
-The primary reference is the hint-free GVR V2 `run_varlen` implementation. DeepSelect FP32 and HPC-ops were measured in the same process as that reference. Radix CUDA, SGLang, FlashInfer, and the temporal GVR implementations use matched observations from separate runs. These comparisons describe the bundled implementations and workloads; they are not a current-release, equal-interface benchmark of entire serving frameworks.
+The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). All FP32 comparisons, including DeepSelect and HPC-ops, match existing baseline observations from separate runs by workload identity and batch size, with shape metadata checked where available. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled implementations and workloads; they are not a current-release, equal-interface benchmark of entire serving frameworks.
 
-The article also describes dispatch improvements in [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076). Its targeted B200/B300 measurements are separate from this frozen comparison grid; the existing figures and summaries have not been recomputed for that PR.
+Figures 1, 3, and 5–8 and their numerical summaries all use this PR #19076 reference. B300 measurements are outside the B200 comparison. Historical serving experiments retain their original implementation scope, as described below.
 
 | Implementation | Relevant comparison contract |
 | :--- | :--- |
@@ -79,13 +79,13 @@ The article also describes dispatch improvements in [PR #19076](https://github.c
 
 The public baseline revisions for DeepSelect and HPC-ops are [8e70df71d2](https://github.com/deepseek-ai/DeepSelect/tree/8e70df71d2) and [2a2e265624](https://github.com/Tencent/hpc-ops/tree/2a2e265624). Complete build revisions for the historical SGLang and radix observations are unavailable in the timing export.
 
-SGLang planning can be amortized across layers in a serving integration. FlashInfer's additional outputs and padded-row scan remain part of its timed native API. DeepSelect and HPC-ops receive preallocated output or workspace. The BF16 comparison uses its own paired `gvr_bf16_run_us` reference and preconverted BF16 input for DeepSelect; conversion time is excluded. Each dtype is checked against its own `torch.topk` result, so BF16 speed does not establish preservation of FP32 Top-K membership.
+SGLang planning can be amortized across layers in a serving integration. FlashInfer's additional outputs and padded-row scan remain part of its timed native API. DeepSelect and HPC-ops receive preallocated output or workspace. The historical BF16 comparison remains separate from the PR #19076 FP32 reference. It uses its own paired `gvr_bf16_run_us` reference and preconverted BF16 input for DeepSelect; conversion time is excluded. Each dtype is checked against its own `torch.topk` result, so BF16 speed does not establish preservation of FP32 Top-K membership.
 
 ## Temporal GVR and Algorithm Evolution
 
 The temporal R0 and tiered implementations correspond to public [PR #16457](https://github.com/NVIDIA/TensorRT-LLM/pull/16457) and [PR #16877](https://github.com/NVIDIA/TensorRT-LLM/pull/16877). They already include improvements beyond original scalar-search V1, including a threshold ladder and execution specialization. The original scalar-search implementation has no measurement on this grid. The temporal comparisons span full implementations, including scheduling and integration; they are not an isolated self-sampling ablation.
 
-Figure 3 computes each implementation's speedup directly from its paired radix times. The geometric means are 2.586546× for temporal R0, 3.471858× for tiered temporal GVR, and 4.929143× for V2. Direct temporal/V2 time ratios are 1.905685× and 1.419742×. `summary.json` records these under `evolution_vs_radix` and `temporal_vs_v2`. Historical R0 observations for V3.2 lack explicit N/K metadata; workload identity supplies the join for those records.
+Figure 3 computes each implementation's speedup directly from its paired radix times. The geometric means are 2.586546× for temporal R0, 3.471858× for tiered temporal GVR, and 5.051864× for V2. Direct temporal/V2 time ratios are 1.953131× and 1.455089×. `summary.json` records these under `evolution_vs_radix` and `temporal_vs_v2`. Historical R0 observations for V3.2 lack explicit N/K metadata; workload identity supplies the join for those records.
 
 ## Aggregation and Coverage
 
@@ -105,11 +105,11 @@ The article uses Figure 1 for the model-level comparison. The following table re
 
 | Baseline | V4 Flash, $K=512$ | V4 Pro, $K=1024$ | V3.2, $K=2048$ |
 | :--- | ---: | ---: | ---: |
-| SGLang v2, plan + transform | 1.78× | 1.76× | 1.55× |
-| FlashInfer 0.6.14 | 2.12× | 2.14× | 1.89× |
-| TensorRT-LLM radix CUDA | 4.74× | 4.73× | 5.15× |
-| DeepSelect FP32 | 1.98× | 2.07× | 2.79× |
-| HPC-ops FP32 | 2.30× | Unsupported | 1.30× |
+| SGLang v2, plan + transform | 1.83× | 1.81× | 1.58× |
+| FlashInfer 0.6.14 | 2.18× | 2.20× | 1.93× |
+| TensorRT-LLM radix CUDA | 4.88× | 4.87× | 5.25× |
+| DeepSelect FP32 | 2.03× | 2.13× | 2.85× |
+| HPC-ops FP32 | 2.37× | Unsupported | 1.33× |
 
 *Each model column uses the workloads supported by that baseline.*
 
@@ -119,7 +119,7 @@ For a concrete large-batch slice, the following times are at $B=1024$ and $N\app
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | V4 Flash | **113.1 µs** | 196.8 µs | 275.4 µs | 461.3 µs | 190.5 µs | 199.2 µs |
 | V4 Pro | **132.8 µs** | 199.1 µs | 298.3 µs | 477.7 µs | 209.1 µs | — |
-| V3.2 | **124.0 µs** | 211.0 µs | 388.8 µs | 496.6 µs | 419.6 µs | 159.7 µs |
+| V3.2 | **124.0 µs** | 211.0 µs | 388.7 µs | 496.6 µs | 419.6 µs | 159.7 µs |
 
 
 ## Roofline Definitions

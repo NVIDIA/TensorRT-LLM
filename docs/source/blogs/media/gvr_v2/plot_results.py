@@ -49,7 +49,7 @@ COLORS = {
     "deepselect": "#d97416",
     "hpc_ops": "#bd426b",
 }
-CROSS_CAMPAIGN = {"sglang", "flashinfer", "radix_cuda"}
+CROSS_CAMPAIGN = set(ARMS)
 REACHABLE_BW = 6.912116
 TEMPORAL = ["temporal_r0", "temporal_tiered"]
 COMPARISON_ARMS = ["gvr_v2", *TEMPORAL, *ARMS]
@@ -197,7 +197,7 @@ def _overview(rows: list[dict]) -> None:
     fig.text(
         0.185,
         0.13,
-        "Same workloads within each panel. GVR V2 = 1.00×.",
+        "Same workloads within each panel. GVR V2 (PR #19076) = 1.00×.",
         fontsize=10,
         color="#334155",
     )
@@ -935,6 +935,7 @@ def main() -> None:
     rows = _load()
     summary = {
         "copyright": COPYRIGHT,
+        "reference": json.loads((ROOT / "provenance.json").read_text())["reference"],
         "overall": {a: _stats(rows, a) for a in ARMS},
         "comparison_common_cases": _comparison(rows),
         "by_model": {
