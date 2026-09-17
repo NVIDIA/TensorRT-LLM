@@ -652,6 +652,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_multi_wave(
         "static",
         "m",
         1,
+        4,
     )
     mixed_tactic = (
         "mixed_clusters",
@@ -662,13 +663,14 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_multi_wave(
         False,
         use_prefetch,
         "static",
-        "m",
+        "n",
+        2,
     )
     runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
                                      use_tvm_ffi=True)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert base_tactic in tactics
-    assert mixed_tactic in tactics
+    assert base_tactic[:-1] in tactics
+    assert mixed_tactic[:-1] in tactics
 
     base_output = runner(inputs, tactic=base_tactic)
     mixed_output = runner(inputs, tactic=mixed_tactic)
@@ -714,17 +716,19 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_clc_dynamic_prefetch_multi_wav
         True,
         "static",
         "m",
+        1,
     )
-    dynamic_tactic = (*static_tactic[:-2], "clc_dynamic", "m")
+    dynamic_tactic = (*static_tactic[:-3], "clc_dynamic", "m", 1)
     runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
                                      use_tvm_ffi=True)
     valid_tactics = runner.get_valid_tactics(inputs, None)
+    # Model-selected swizzles extend the validated baseline tactic tuple.
     for raster_order in ("m", "n"):
-        tactic = (*static_tactic[:-2], "static", raster_order)
-        assert tactic in valid_tactics
-    assert dynamic_tactic in valid_tactics
-    unsafe_dynamic_tactic = (*static_tactic[:-2], "clc_dynamic", "n")
-    assert unsafe_dynamic_tactic not in valid_tactics
+        tactic = (*static_tactic[:-3], "static", raster_order, 1)
+        assert tactic[:-1] in valid_tactics
+    assert dynamic_tactic[:-1] in valid_tactics
+    unsafe_dynamic_tactic = (*static_tactic[:-3], "clc_dynamic", "n", 1)
+    assert unsafe_dynamic_tactic[:-1] not in valid_tactics
 
     static_output = runner(inputs, tactic=static_tactic)
     dynamic_output = runner(inputs, tactic=dynamic_tactic)
@@ -769,6 +773,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
         "static",
         "m",
         1,
+        4,
     )
     dynamic_tactic = (
         "base",
@@ -780,31 +785,53 @@ def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
         "clc_dynamic",
         "n",
         1,
+        1,
     )
-    split_k_tactic = (*dynamic_tactic[:-1], 4)
+    split_k_tactic = (*dynamic_tactic[:-2], 4, 1)
+    non_power_split_k_tactic = (*dynamic_tactic[:-2], 3, 1)
     runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
                                      use_tvm_ffi=True)
     valid_tactics = runner.get_valid_tactics(inputs, None)
-    assert static_tactic in valid_tactics
-    assert dynamic_tactic in valid_tactics
-    assert split_k_tactic in valid_tactics
+    # Model-selected swizzles extend the validated baseline tactic tuple.
+    assert static_tactic[:-1] in valid_tactics
+    assert dynamic_tactic[:-1] in valid_tactics
+    assert split_k_tactic[:-1] in valid_tactics
     for scheduler_mode in ("static", "clc_dynamic"):
         for raster_order in ("m", "n"):
-            tactic = (*static_tactic[:-3], scheduler_mode, raster_order, 1)
-            assert tactic in valid_tactics
+            swizzle_sizes = ((1, 2, 4, 8) if scheduler_mode == "static" else
+                             (1, ))
+            for swizzle_size in swizzle_sizes:
+                tactic = (
+                    *static_tactic[:-4],
+                    scheduler_mode,
+                    raster_order,
+                    1,
+                    swizzle_size,
+                )
+                assert tactic[:-1] in valid_tactics
 
     static_output = runner(inputs, tactic=static_tactic)
     dynamic_output = runner(inputs, tactic=dynamic_tactic)
     split_k_output = runner(inputs, tactic=split_k_tactic)
+    non_power_split_k_output = runner(inputs, tactic=non_power_split_k_tactic)
+    non_power_split_k_replay = runner(inputs, tactic=non_power_split_k_tactic)
     torch.cuda.synchronize()
 
     expected = a @ b.t()
     assert torch.isfinite(dynamic_output).all()
     assert torch.isfinite(split_k_output).all()
+    assert torch.isfinite(non_power_split_k_output).all()
+    assert torch.isfinite(non_power_split_k_replay).all()
     assert calc_diff(static_output, expected) < 1e-3
     assert calc_diff(dynamic_output, expected) < 1e-3
     assert calc_diff(split_k_output, expected) < 1e-3
+    assert calc_diff(non_power_split_k_output, expected) < 1e-3
+    assert calc_diff(non_power_split_k_replay, expected) < 1e-3
     torch.testing.assert_close(dynamic_output, static_output, rtol=0, atol=0)
+    torch.testing.assert_close(non_power_split_k_replay,
+                               non_power_split_k_output,
+                               rtol=0,
+                               atol=0)
 
 
 @pytest.mark.skipif(

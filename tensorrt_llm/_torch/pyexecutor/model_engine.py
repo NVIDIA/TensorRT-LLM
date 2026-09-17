@@ -46,7 +46,7 @@ from ..attention.backends.interface import (AttentionMetadata,
                                             AttentionRuntimeFeatures)
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..attention.backends.utils import get_attention_backend
-from ..autotuner import AutoTuner, autotune
+from ..autotuner import AutoTuner, NvMMHConfig, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
@@ -298,6 +298,20 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
             f"budget was not switched: {type(e).__name__}: {e}")
 
 
+def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
+    """Install the per-worker NVMMH policy before tactic enumeration."""
+    config = llm_args.autotuner_nvmmh_config
+    if config is None:
+        policy = NvMMHConfig()
+    else:
+        policy = NvMMHConfig(
+            enabled=True,
+            fields=config.fields,
+            max_tactics=config.max_tactics,
+        )
+    AutoTuner.get().configure_nvmmh(policy)
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -315,6 +329,10 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
+        # Every executor worker receives its own TorchLlmArgs copy. Install the
+        # policy before model loading because CuTe DSL runners may enumerate
+        # tactics while modules are being constructed.
+        _configure_autotuner_nvmmh(llm_args)
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None

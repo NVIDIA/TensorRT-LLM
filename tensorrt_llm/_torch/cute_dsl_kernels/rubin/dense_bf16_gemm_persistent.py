@@ -122,6 +122,9 @@ class PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
             f"_stage{self._max_num_ab_stage}"
             f"_split{self.split_k_slices}"
             f"_direct{int(self.use_direct_split_k_reduce)}"
+            f"_raster{self.raster_along}"
+            f"_swizzle{self.swizzle_size}"
+            f"_tmastore{int(self.use_tma_store)}"
         )
 
     def __repr__(self) -> str:
@@ -298,6 +301,9 @@ class PersistentDenseGemmKernelPreferredCluster(PersistentDenseGemmKernel):
             f"_preferred{self._format_mn_pair(self.preferred_cluster_shape_mn)}"
             f"_fallback{self._format_mn_pair(self.fallback_cluster_shape_mn)}"
             f"_stage{self._max_num_ab_stage}"
+            f"_raster{self.raster_along}"
+            f"_swizzle{self.swizzle_size}"
+            f"_tmastore{int(self.use_tma_store)}"
         )
 
     def _setup_attributes(self):

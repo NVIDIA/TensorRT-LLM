@@ -260,27 +260,96 @@ The same pattern (`@torch.library.custom_op("trtllm::...")`, `register_fake`, co
 
 ### 4.5 Pruning autotuner tactics with nvMatmulHeuristics
 
-A CuTe DSL runner that exposes many tactics (tile / cluster / swap / prefetch combinations) can be expensive to autotune, because the AutoTuner JIT-compiles and benchmarks every candidate returned by `get_valid_tactics`. A runner can therefore rank and prune its own candidate list with [nvMatmulHeuristics](https://pypi.org/project/nvidia-matmul-heuristics/) *inside* `get_valid_tactics`, before the tactics ever reach the compile+benchmark loop — all shapes and inputs are already visible at that point, so no extra AutoTuner hook is needed. The pruning is a no-op by default and must degrade gracefully to the full list on any failure, so tuning never loses a valid candidate.
+A CuTe DSL runner that exposes many tactics (tile / cluster / swap / prefetch combinations) can be expensive to autotune, because the AutoTuner JIT-compiles and benchmarks every candidate returned by `get_valid_tactics`. A runner can therefore rank and prune its own candidate list with [nvMatmulHeuristics](https://pypi.org/project/nvidia-matmul-heuristics/) *inside* `get_valid_tactics`, before the tactics ever reach the compile+benchmark loop — all shapes and inputs are already visible at that point, so no extra AutoTuner hook is needed. The pruning is a no-op by default and must degrade gracefully to the full list on any failure or empty match, so a heuristics failure never *reduces* the tactic set. Successful pruning deliberately does drop valid candidates — that is the point — so it can exclude the full-sweep winner and change the selected tactic and steady-state performance.
 
-Today this is wired up for the SM100/SM103 (Blackwell B200/B300) NVFP4 dense GEMM: `CuteDSLNVFP4BlackwellRunner.get_valid_tactics` builds the full sweep and then hands it to the private `_rank_prune_tactics` helper. The pruned set is a strict, re-validated subset of the full sweep — it never introduces a tactic the kernel validator rejected — so correctness is unchanged and only autotuner wall-time is affected. On a 4096³ NVFP4 GEMM this cuts a cold autotune from ~120 tactics to ~5 (roughly 7× less wall-time) while keeping the selected kernel within a few percent of the full-sweep best.
+This is wired up for the following dense GEMM runners. Each builds its validated sweep and then hands it to a private `_rank_prune_tactics` helper, which honors only the intersection of the configured `fields` with the runner's own modeled fields:
 
-The behavior is controlled entirely by environment variables (all read at tune time; the package must be installed, otherwise the path silently falls back to the full sweep):
-
-| Environment variable | Default | Meaning |
+| Arch | Precision | Modeled fields |
 |---|---|---|
-| `TRTLLM_CUTEDSL_NVMMH_ENABLE` | `0` | Master opt-in switch. Set to `1` to enable heuristic tactic pruning. When unset/`0`, or when `nvidia-matmul-heuristics` is not installed, the full tactic sweep runs unchanged. |
-| `TRTLLM_CUTEDSL_NVMMH_FIELDS` | `tile,cluster` | Comma-separated list of the knobs nvMatmulHeuristics drives; any knob not listed is swept by the runner. Recognized tokens: `tile`, `cluster`, `swizzle`, `cta_order`. `tile` and `cluster` are a coupled pair (the 2-SM encoding maps the joint `(cta, cluster)`), so naming either drives both. Accepted aliases: `cta_tile` / `mma_tiler` → `tile`. Unknown tokens are warned once and ignored. **Top-K tile/cluster pruning happens only when `tile`/`cluster` is selected; with scheduler-only fields (`swizzle` and/or `cta_order`) every valid tile/cluster is swept and merely annotated with the model's scheduler knobs.** |
-| `TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS` | `5` | Top-K distinct `(tile, cluster, swap)` keys to keep from the model's ranking (applies only when `tile`/`cluster` is in `FIELDS`). Both `use_prefetch` variants of a kept key are profiled on top (prefetch is not modeled), so the final tactic count can be up to ~2× this. Larger K = closer to the full-sweep best but slower autotune; smaller K = faster autotune with a larger potential perf gap. |
+| SM100/SM103 | NVFP4 | `tile`, `cluster` (prune); `swizzle`, `cta_order` (annotate only) |
+| SM100/SM103 | blockwise FP8 | `tile`, `cluster` |
+| SM100/SM103 | BF16 | all five |
+| SM107 (Rubin) | block-scaled NVFP4, incl. the uGPU in-place variant | all five |
+| SM107 (Rubin) | block-scaled MXFP8 | all five |
+| SM107 (Rubin) | per-tensor FP8 | `tile`, `cluster`, `cta_order` |
+| SM107 (Rubin) | BF16 | all five |
 
-Example (enable pruning, keep the top 8 tile/cluster candidates):
+Batched (BMM) runners, grouped/MoE runners, and the SM107 blockwise FP8 GEMM are not pruned. A runner whose modeled fields do not intersect the configured `fields` skips pruning entirely and runs its full sweep. Do not confuse the unsupported SM107 blockwise FP8 runner with the block-scaled MXFP8 and NVFP4 dense runners in the table above.
 
-```bash
-export TRTLLM_CUTEDSL_NVMMH_ENABLE=1
-export TRTLLM_CUTEDSL_NVMMH_FIELDS=tile,cluster
-export TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS=8
+The SM107 MXFP8 adapter uses NVMMH's closest per-tensor E4M3 compute model because NVMMH does not expose the UE8M0 block-scale format. CuTe DSL validity checks still enforce the real MXFP8 scale layout before any modeled tactic is retained.
+
+The pruned set preserves the runner's validated tile/cluster templates and falls back to the full sweep when the heuristic cannot produce a usable match. On a 4096³ NVFP4 GEMM with the default `fields=("tile", "cluster")` and `max_tactics=5`, this cuts a cold autotune from ~120 tactics to ~5 ranked tile/cluster keys — roughly 10 tactics once the unmodeled prefetch variants are added back — while keeping the selected kernel within a few percent of the full-sweep best. Scheduler-only fields behave differently: on SM100/SM103 NVFP4 every validated tile/cluster is retained and merely annotated, so the tactic count is unchanged.
+
+The behavior is configured atomically on the process-wide `AutoTuner`. The
+general library default is disabled; when requested but
+`nvidia-matmul-heuristics` is unavailable, tactic generation falls back to the
+full sweep.
+
+| `NvMMHConfig` field | Default | Meaning |
+|---|---|---|
+| `enabled` | `False` | Opt in to heuristic tactic pruning. |
+| `fields` | `("tile", "cluster")` | Knobs selected for nvMatmulHeuristics-guided pruning: `tile`, `cluster`, `swizzle`, `cta_order`, and `split_k`. Knobs not listed remain swept. `tile` and `cluster` are coupled. Direct Python calls also accept `cta_tile` / `mma_tiler` as aliases for `tile`; strict LLM API YAML accepts canonical names only. Unknown fields raise `ValueError`. Scheduler-only fields preserve every valid tile/cluster on the runners that model a scheduler knob. `split_k` is actionable on the SM107 BF16 GEMM runner and the SM107 block-scaled NVFP4/MXFP8 base kernels. On SM107 it enables the bounded local split sweep described below; mixed-CGA block-scaled tactics do not implement split-K and remain at 1. |
+| `max_tactics` | `5` | Top-K distinct model-visible signatures per modeled problem/orientation over the selected `fields` — tile/cluster when those are selected, otherwise the scheduler knobs. A block-scaled runner can query native and swapped M/N orientations separately. Runner-local variants that the model cannot represent (prefetch, MMA instruction shape, cluster-N, scheduler family) ride along with each retained signature, so the final tactic count is usually larger. Must be at least 1. |
+
+Every `configure_nvmmh` keyword defaults to `None`, which *preserves* the currently
+installed value rather than resetting it; the defaults above are the
+`NvMMHConfig` dataclass defaults. Pass a complete `NvMMHConfig` to set all
+fields at once.
+
+Example (enable pruning and keep the top 8 tile/cluster candidates):
+
+```python
+from tensorrt_llm._torch.autotuner import AutoTuner
+
+AutoTuner.get().configure_nvmmh(
+    enabled=True,
+    fields=("tile", "cluster"),
+    max_tactics=8,
+)
 ```
 
-The adapter and env helpers live in [`tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py); the `get_valid_tactics` / `_rank_prune_tactics` pruning is in [`cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py).
+For an LLM API process, configure the same immutable policy through
+`extra_llm_api_options.yaml`; each executor worker installs it before model
+loading and tactic enumeration:
+
+```yaml
+enable_autotuner: true
+autotuner_nvmmh_config:
+  fields: [swizzle, cta_order, split_k]
+  max_tactics: 5  # Top-K signatures per modeled problem/orientation.
+```
+
+Compatible validated runner-specific tactics that NVMMH cannot represent are
+retained automatically and empirically profiled. The BF16 and SM107
+block-scaled runners supplement their validated preferred/fallback-cluster
+family because NVMMH has only one cluster field and cannot encode both shapes.
+Selected `swizzle` and `cta_order` guidance still applies to the block-scaled
+supplement. The current public NVMMH API does not expose its native
+`minTilesKLowerBound`, so selecting `split_k` on SM107 uses a shared TRT-LLM
+admission rule: split 1 is always retained, and larger factors must leave
+strictly more than 6 CTA-K tiles per split. The AutoTuner profiles every
+admitted, runner-validated factor instead of pinning the set to NVMMH's native
+rank-1 split. The admitted set remains a subset of the runner's normal full sweep.
+The CTA-K is 256 for NVFP4, 128 for MXFP8, and 64 for BF16. This SM107 lower
+bound is code-defined and is not user-configurable.
+
+Pass the file with `trtllm-serve --backend pytorch
+--extra_llm_api_options /path/to/extra_llm_api_options.yaml` (or the equivalent
+`--config` alias). Omitting the nested block leaves NVMMH disabled and retains
+the full tactic sweep; setting it to `null` does the same. Any mapping, including
+`autotuner_nvmmh_config: {}`, enables NVMMH. YAML `fields` must use only `tile`,
+`cluster`, `swizzle`, `cta_order`, and `split_k`; aliases and alternate split-K
+spellings are rejected so configuration typos fail early.
+
+The immutable configuration remains installed across `autotune()` contexts
+and `clear_cache()` calls. Profiling-cache keys include the complete nvMMH
+search policy, so full sweep, scheduler-only, and all-fields results cannot
+alias. `AutoTuner.get().configure_nvmmh(...)` is the recommended public entry
+point; the installed policy is class-wide, so every `AutoTuner` instance and
+CuTe DSL runner observes the same snapshot. The adapter lives in
+[`tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py);
+the `get_valid_tactics` / `_rank_prune_tactics` pruning is in
+[`cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py).
 
 ---
 

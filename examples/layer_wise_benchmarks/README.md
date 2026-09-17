@@ -136,6 +136,63 @@ NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --balance-method ImbalancedExperts
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --balance-method ImbalancedExperts --balance-ratio 0.5
 ```
 
+### CuTe DSL nvMMH defaults
+
+The shipped `config_ctx.yaml` and `config_gen.yaml` enable nvMMH in
+scheduler-only mode. nvMMH selects `swizzle`, `cta_order`, and `split_k`; the
+autotuner continues to profile the full tile and cluster search space. The
+layer-wise nvMMH policy is YAML-only so the effective search policy stays with
+the benchmark configuration.
+
+```yaml
+# config_ctx.yaml / config_gen.yaml: scheduler-only nvMMH
+enable_autotuner: true
+autotuner_nvmmh: true
+autotuner_nvmmh_fields: [swizzle, cta_order, split_k]
+autotuner_nvmmh_max_tactics: 5
+
+# To use the full autotuner sweep instead:
+# autotuner_nvmmh: false
+
+# To let nvMMH select every modeled field instead:
+# autotuner_nvmmh_fields: [tile, cluster, swizzle, cta_order, split_k]
+```
+
+The YAML keys are `autotuner_nvmmh`, `autotuner_nvmmh_fields`, and
+`autotuner_nvmmh_max_tactics`. The corresponding `--autotuner-nvmmh*`
+command-line options are intentionally not accepted. A custom layer-wise YAML
+that omits the keys preserves the general library default, where nvMMH is
+disabled.
+
+Validated runner-specific tactics that nvMMH cannot represent are retained
+automatically. BF16 and Rubin block-scaled runners preserve their validated
+preferred/fallback-cluster family. On SM107, split-capable runners admit a
+bounded local set of `split_k` values using TRT-LLM's shared K-tile lower bound,
+then let CUPTI select among them; this avoids depending on nvMMH's fixed native
+`minTilesKLowerBound`. `autotuner_nvmmh_max_tactics` caps the top-K signatures
+for the selected fields per modeled problem/orientation; it is not limited to
+tile/cluster.
+
+These flat keys belong to the layer-wise benchmark's own `config_ctx.yaml` /
+`config_gen.yaml` parser. `run.py` has no `--extra_llm_api_options` flag; the
+typed nested form below applies to PyTorch LLM API files consumed by
+`trtllm-serve` / `trtllm-bench` via `--extra_llm_api_options` or `--config`:
+
+```yaml
+enable_autotuner: true
+autotuner_nvmmh_config:
+  fields: [swizzle, cta_order, split_k]
+  max_tactics: 5  # Top-K signatures per modeled problem/orientation.
+```
+
+For this nested LLM API form, any mapping enables nvMMH; omission or `null`
+disables it. This differs from the layer-wise benchmark's flat
+`autotuner_nvmmh` switch above. Both interfaces preserve the library's disabled
+default when their nvMMH keys are omitted; the shipped layer-wise YAML files
+explicitly opt in to scheduler-only mode. Moving that policy into
+`extra_llm_api_options.yaml` therefore requires adding the nested block
+explicitly, or nvMMH is off.
+
 ### Run with Slurm
 
 > Tips:
