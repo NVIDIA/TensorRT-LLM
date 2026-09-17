@@ -959,12 +959,8 @@ def _yarn_mscale_sq():
 MLA_PAGE = 32
 
 # Two pages so the batch crosses a page boundary -- a single page never
-# exercises the addressing this path exists for. It is no longer a hard
-# requirement: a (1, 1) page table used to be rejected by the CuTe DSL runtime
-# with "Can't deduce the leading dimension from layout", and
-# cute_dsl_custom_ops.py now hands that degenerate shape an already-marked
-# tensor (see test_mla_dspark_cute_dsl_takes_a_single_page_batch_one). The
-# shared CTX_LEN is 24 and is pinned by the SWA tests, so this one is local.
+# exercises this addressing. No longer a hard requirement since
+# cute_dsl_custom_ops.py pre-marks the degenerate (1, 1) table.
 MLA_CTX_LEN = 40  # ceil((40 + MLA_BLOCK) / MLA_PAGE) = 2 pages
 MLA_SHORT_CTX_LEN = 20  # one page, and the block stays inside it
 
@@ -1067,6 +1063,11 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
     comes from a separate fixup (TRTLLM) or from kv_bounds inside one pass
     (CUTEDSL), and that is precisely the part a reference can catch and
     acceptance cannot.
+
+    Two facts say the batch is wired right rather than the tolerance being
+    generous: ctx 20 is IDENTICAL across the eager and paged paths (a wrong page
+    range or kv_bounds for the short request would not be), and ctx 40 is
+    bit-identical to the same request run alone.
     """
     import tensorrt_llm._torch.models.modeling_dspark as md
 
@@ -1125,18 +1126,9 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
 
     diff = (out - expected).abs().max().item()
     diff_swapped = (out - swapped).abs().max().item()
-    # Measured per request against the bf16 reference, job 3049452:
-    #   ctx 40  0.023438 eager / 0.015625 paged
-    #   ctx 20  0.015625 in both
-    # Every value is an exact multiple of 2^-6, which is one bf16 ULP at this
-    # output magnitude -- the residual is the last bit, not an algorithm gap.
-    # 0.03 leaves ~1.5 ULP of headroom, and the negative control lands 89-201x
-    # away, so the bound is nowhere near admitting a degenerate output.
-    #
-    # Two facts say the batch is wired right rather than the tolerance being
-    # generous: ctx 20 is IDENTICAL across the eager and paged paths (a wrong
-    # page range or kv_bounds for the short request would not be), and ctx 40
-    # is bit-identical to the same request run alone.
+    # Job 3049452, per request vs the bf16 reference: ctx 40 is 0.023438 eager /
+    # 0.015625 paged, ctx 20 is 0.015625 in both. Every value is an exact
+    # multiple of 2^-6 -- one bf16 ULP here -- so 0.03 leaves ~1.5 ULP.
     assert diff < 0.03, f"MLA parity failed: max abs diff {diff}"
     assert diff_swapped > 4 * max(diff, 1e-4), (
         f"negative control failed: kv_b K/V halves swapped is too close "
@@ -1505,12 +1497,9 @@ def test_mla_drafter_rejects_a_checkpoint_missing_backbone_weights():
     weights = _tiny_mla_weights()
     drafter = _build_mla_drafter(weights)
 
-    # A whole module, not one tensor: the check is module-granular on purpose,
-    # since a fused module (gate_up_proj) is stored unfused and dropping half of
-    # it is a parameter-level gap the loader's own naming cannot distinguish.
-    # Derive the prefix from the fixture rather than spelling it: DFlash
-    # checkpoints name layers without the `model.` prefix, so a hardcoded key
-    # silently matches nothing and the test passes by not truncating anything.
+    # Module-granular on purpose: a fused module (gate_up_proj) is stored
+    # unfused, and dropping half is a parameter-level gap the loader's naming
+    # cannot see. Derive the prefix -- DFlash checkpoints omit `model.`.
     victim = next(k for k in weights if k.endswith("self_attn.o_proj.weight"))
     truncated = {k: v for k, v in weights.items() if k != victim}
     assert len(truncated) == len(weights) - 1

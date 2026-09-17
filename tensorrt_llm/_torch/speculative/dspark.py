@@ -301,13 +301,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             )
 
         if not self._win_inited:
-            # Published before the RoPE table is built, which happens lazily on
-            # the first forward. The engine's max_seq_len is what positions
-            # actually reach and is strictly above model_config's whenever spec
-            # decoding is on, so the config-derived cap undersizes the table.
-            # Unlike DFlash, the DSv4 block path can advance by a fully accepted
-            # block and then index another full block, so it needs the
-            # DSpark-specific bound.
+            # Published before the RoPE table is built (lazily, on first forward). The
+            # engine's max_seq_len is what positions reach and exceeds model_config's
+            # whenever spec decoding is on, so the config cap undersizes the table.
             max_ctx = getattr(attn_metadata, "max_seq_len", None)
             if max_ctx is not None:
                 ceiling = _dspark_position_ceiling(max_ctx, block_size, self.max_draft_len)
@@ -466,13 +462,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         input_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Bootstrap and advance per-slot decode state without host synchronization."""
-        # ``prepare()`` runs before graph creation, not before every replay. A
-        # CUDA-graph padding / ADP-idle request therefore reuses this one
-        # scratch row across all capture shapes. It has no persistent request
-        # state: reset it in the captured forward so its absolute position
-        # always bootstraps from ``input_positions`` rather than accumulating
-        # until a RoPE-table gather goes out of range. The row is never assigned
-        # to a live request, so this cannot reset user-visible state.
+        # ``prepare()`` runs before graph creation, not before every replay, so a
+        # padding / ADP-idle request reuses this scratch row across capture shapes.
+        # Reset it in the captured forward so its position bootstraps from
+        # ``input_positions`` rather than accumulating past the RoPE table.
         scratch = self._scratch_slot
         self._ctx_len[scratch].zero_()
         self._valid_len[scratch].zero_()

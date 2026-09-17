@@ -843,13 +843,9 @@ class DFlashForCausalLM(nn.Module):
                 remapped[key] = value
 
         # Wrapper-owned and built FROM the checkpoint, so they are never in
-        # draft_model_full's module tree and _assert_backbone_complete cannot
-        # see them: a module conjured from data cannot be reported missing by
-        # walking modules. One tuple drives both the extraction below and this
-        # check, so the two cannot drift. Without fc the drafter has no capture
-        # projection, has_target_features stays False, _ctx_len never advances
-        # and it drafts from an empty context forever (the `hasattr` guards on
-        # that path are degradation, not a supported mode).
+        # draft_model_full's module tree for _assert_backbone_complete to walk.
+        # Without fc the drafter has no capture projection and drafts from an
+        # empty context forever.
         wrapper_missing = [k for k in self.WRAPPER_OWNED_WEIGHTS if k not in remapped]
         if wrapper_missing:
             raise ValueError(
@@ -964,12 +960,9 @@ class DFlashForCausalLM(nn.Module):
         """
         provided = set(weights)
 
-        # Whichever fusion table the load below will actually use, not a third
-        # copy: with a mapper modeling_utils dispatches to _load_weights_impl_v2
-        # and the mapper's own table applies; without one it falls back to
-        # _load_weights_impl, whose table is FUSED_MODULE_COMPONENTS. An empty
-        # `mapping` means init_model_and_config has not run, so the mapper has
-        # no table to offer yet and the constant is still the right answer.
+        # Whichever fusion table the load below uses, not a third copy:
+        # _load_weights_impl_v2 takes the mapper's, _load_weights_impl takes
+        # FUSED_MODULE_COMPONENTS. An empty mapping means the mapper has none yet.
         fusion = dict(getattr(weight_mapper, "mapping", None) or FUSED_MODULE_COMPONENTS)
 
         def _has(prefix: str) -> bool:

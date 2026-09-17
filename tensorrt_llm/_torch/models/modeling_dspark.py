@@ -1113,13 +1113,10 @@ def _runtime_position_cap(model_config, pretrained_config, slack: int = 0) -> in
     return int(runtime or getattr(pretrained_config, "max_position_embeddings", 163840)) + slack
 
 
-# NOTE on slack: this is a construction-time FALLBACK only, for direct
-# construction in tests. Every drafter's real bound comes at runtime from
-# dflash_position_ceiling (published as _runtime_position_ceiling), because the
-# engine raises max_seq_len past model_config's value and never writes it back.
-# DSv4 needs it too: not being driven by DFlashWorker keeps its ctx_len from
-# being clamped to the engine's value, but its positions still come from the
-# target's position_ids, which are bounded by exactly that value.
+# Construction-time FALLBACK only, for direct construction in tests. The
+# real bound is _runtime_position_ceiling: the engine raises max_seq_len
+# past model_config's and never writes back. DSv4 reaches it via the
+# target's position_ids.
 
 
 class DSv4DSparkDraftModel(nn.Module):
@@ -2661,16 +2658,9 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
 
-    # TRTLLM, matching what the shipped K3 configs already pin
-    # (examples/kimi_k3/eval_extra_llm_options_dspark{,_nvfp4}.yaml); VANILLA
-    # additionally needs the optional flash-attn package. AUTO degrades to
-    # VANILLA off SM100/SM103.
-    #
-    # This also moves the drafter's context KV into the manager's paged pool,
-    # and that is the point, not a side effect: dflash.py:592 keys `use_paged`
-    # off the backend name, and this class leaves _paged_ctx_cache False, so
-    # VANILLA is the only way to get the arena that is dense in max_seq_len and
-    # that free_gpu_memory_fraction never bounds.
+    # TRTLLM matches the shipped K3 configs (examples/kimi_k3/
+    # eval_extra_llm_options_dspark{,_nvfp4}.yaml) and pages the context KV;
+    # _paged_ctx_cache is False here, so VANILLA is the only route to the arena.
     _default_attention_backend = "TRTLLM"
 
     def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
@@ -2716,14 +2706,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # head, head_dim 576) would fail both. The backend NAME still selects, via
     # _mla_block_decode_variant below.
     _uses_worker_attention_backend = False
-    # CUTEDSL stays selectable but is NOT the default here: it needs a
-    # cute_dsl_mla_decode_fp16_blackwell that takes per-token kv_bounds, which
-    # this branch's kernel does not have. Flip this one line once it does --
-    # measured 35.7% off the drafter region (947.50 -> 608.95 us/iteration,
-    # jobs 3006025/3006026) at no cost in acceptance or accuracy, on both
-    # aggregated and disaggregated gsm8k (jobs 3006856/3006857, 3006673/3006684).
-    # CUTEDSL never degrades: an explicit request raises in __init__ with the
-    # reason rather than hiding a slower path behind the name.
+    # Selectable but not the default: needs a cute_dsl_mla_decode_fp16_blackwell
+    # taking per-token kv_bounds, absent on this branch. Worth 35.7% off the
+    # drafter region (947.50 -> 608.95 us/iter, jobs 3006025/3006026).
     _default_attention_backend = "TRTLLM"
     _supported_attention_backends = ("VANILLA", "TRTLLM", "CUTEDSL")
     # No AUTO degrade. This drafter needs a 288 GB Blackwell part to hold the
@@ -2944,13 +2929,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         d_latent = self.kv_lora_rank
         self._assert_cute_dsl_can_implement(batch, block_size, page_size, query.dtype)
 
-        # stride[1] == 1 is the kernel's only layout demand (mla_decode_fp16.py:465-470);
-        # a 576-wide row sliced at 512 keeps that on both halves, so no copy.
-        # detach(): cute.runtime.from_dlpack refuses a tensor that requires grad
-        # ("Can't export tensors that require gradient"). Production runs under
-        # inference_mode so nothing here carries grad, but the in-place pool
-        # write above pulls the pool into the autograd graph whenever a caller
-        # does not -- a unit test, for one. Views, so no copy.
+        # stride[1] == 1 is the kernel's only layout demand (mla_decode_fp16.py:465-470),
+        # kept by a 576-wide row sliced at 512. detach() because from_dlpack refuses
+        # grad-requiring tensors, which the pool write adds outside inference_mode.
         q_latent = query.detach()[..., :d_latent].permute(2, 3, 1, 0)
         q_rope = query.detach()[..., d_latent:].permute(2, 3, 1, 0)
         c_latent = pool.detach()[..., :d_latent].permute(1, 2, 0)
@@ -2966,12 +2947,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             q_rope,
             c_latent,
             c_rope,
-            # .t() WITHOUT .contiguous(): the kernel wants (max_blocks, B) with
-            # dim 0 as the leading (stride-1) dimension. contiguous() would make
-            # it row-major, i.e. stride (B, 1), and the kernel rejects it with
-            # "Expected strides[leading_dim] == 1, but got B" for every B > 1
-            # (probe job 3005553; B=1 passes by coincidence). The transposed
-            # view of a row-major (B, max_blocks) already has stride (1, max_blocks).
+            # .t() WITHOUT .contiguous(): the kernel wants (max_blocks, B) with dim 0
+            # stride-1. contiguous() gives stride (B, 1) and it raises "Expected
+            # strides[leading_dim] == 1, but got B" for B > 1 (probe job 3005553).
             fixup.page_tables_i32.t(),
             fixup.seq_lens_i32,
             out.permute(2, 3, 1, 0),
@@ -3056,11 +3034,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         out_upper = torch.einsum("bsht,btc->bshc", probs, blk_kv[..., : self.kv_lora_rank])
 
         # --- log-sum-exp merge (flash-decoding combine), kernel LSE is base 2 ---
-        # The weight pair collapses: w_u / (w_l + w_u) == sigmoid(lse_u - lse_l),
-        # so the merge is one sigmoid and one lerp instead of a peak subtraction,
-        # two exps and a division -- and it needs no explicit max for stability.
-        # The last query has an empty triangle, hence lse_upper -inf, sigmoid 0,
-        # pure kernel output.
+        # w_u / (w_l + w_u) == sigmoid(lse_u - lse_l): one sigmoid and one lerp, no
+        # explicit max needed. The last query's triangle is empty, so sigmoid is 0.
         lse_l = lse_lower.view(batch, block_size, num_heads).float() * _LN2
         weight_upper = torch.sigmoid(lse_upper - lse_l).unsqueeze(-1)
         merged = torch.lerp(out_lower.float(), out_upper.float(), weight_upper)
@@ -3267,13 +3242,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
             q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hs_normed)))
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
-            # The 576-wide query is assembled in one buffer rather than
-            # cat([absorbed, rope]): q's rope half is a 64-slice of a 192-wide
-            # row, so that cat had a non-contiguous input and PyTorch dropped
-            # off CatArrayBatchedCopy_alignedK_contig onto the generic kernel --
-            # 17.3 us vs 1.6 us per launch, five launches per iteration
-            # (measured job 2986420). Mirrors fused_q in modules/mla.py
-            # forward_absorption_generation.
+            # One buffer rather than cat([absorbed, rope]): q's rope half is a 64-slice
+            # of a 192-wide row, so cat fell off CatArrayBatchedCopy onto the generic
+            # kernel -- 17.3 us vs 1.6 us, five launches/iter (measured job 2986420).
             query = torch.empty(
                 (batch, block_size, num_heads, self.kv_lora_rank + self.qk_rope_head_dim),
                 dtype=q.dtype,
@@ -3300,12 +3271,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 )
                 query[..., self.kv_lora_rank :] = q[..., self.qk_nope_head_dim :]
             q_nope = q[..., : self.qk_nope_head_dim]
-            # Absorb the nope half into latent space so the block attends the
-            # stored latent directly (MQA), instead of expanding it per head.
-            # [h, b*s, nope] x [h, nope, kv_lora_rank] straight into the latent
-            # half. view(), never reshape(): both of these are strided views and
-            # reshape would silently stage a copy that bmm_out then writes into
-            # and throws away, whereas view() raises.
+            # Absorb the nope half into latent space so the block attends the stored
+            # latent directly (MQA) instead of expanding per head. view(), never
+            # reshape(): both are strided views and reshape would stage a silent copy.
             torch.ops.trtllm.bmm_out(
                 q_nope.view(batch * block_size, num_heads, self.qk_nope_head_dim).transpose(0, 1),
                 attn._k_b_proj.to(q.dtype),

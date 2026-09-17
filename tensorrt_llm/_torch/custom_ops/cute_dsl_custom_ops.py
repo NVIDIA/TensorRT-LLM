@@ -11686,17 +11686,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key]
             page_table_arg = page_table
             if page_table.shape[0] == 1 and page_table.shape[1] == 1:
-                # A raw torch.Tensor is re-adapted at call time by TensorAdapter,
-                # which runs a bare `from_dlpack(arg).mark_layout_dynamic()`
-                # (cute/runtime.py:915, registered for torch.Tensor at :941), so
-                # the leading_dim=0 given to cute.compile above does not carry
-                # over. A (1, 1) page table -- one page, batch 1 -- has stride
-                # (1, 1), no dimension with size > 1, and the deduction then
-                # raises "Can't deduce the leading dimension from layout" even
-                # though with both extents 1 the choice cannot change an address.
-                # An already-marked tensor has no registered adapter
-                # (jit_executor.py:650), so the bare call is skipped. Only the
-                # degenerate shape pays the wrapper.
+                # leading_dim=0 does not survive TensorAdapter's call-time re-adapt
+                # (cute/runtime.py:915), and a (1, 1) table has no extent > 1, so
+                # deduction raises "Can't deduce the leading dimension from layout".
                 page_table_arg = cute.runtime.from_dlpack(
                     page_table,
                     assumed_align=16).mark_layout_dynamic(leading_dim=0)
