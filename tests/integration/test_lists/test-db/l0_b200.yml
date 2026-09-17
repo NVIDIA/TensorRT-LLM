@@ -178,6 +178,11 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/moe/test_moe_backend.py::test_nvfp4_gate_up_weight_scale_2_resolution
+  - unittest/_torch/moe/test_moe_backend.py::test_nvfp4_reconcile_and_compute_alphas_split_gate_up
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_fallback
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_alphas
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_forward
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_bakes_situ_softcaps_as_uniform_scalars
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_plain_swiglu_carries_no_constants
