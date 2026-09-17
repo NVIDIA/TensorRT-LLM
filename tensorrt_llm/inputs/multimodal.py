@@ -11,7 +11,7 @@ from blake3 import blake3
 
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.inputs.multimodal_data import (BaseModalityData, VideoData,
-                                                 serialize_item)
+                                                 _update_serialized_item)
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -832,7 +832,7 @@ def _update_hash(hasher, item: object) -> None:
     if isinstance(item, BaseModalityData):
         item.update_hash(hasher)
         return
-    hasher.update(serialize_item(item))
+    _update_serialized_item(hasher.update, item)
 
 
 class MMHashResult(NamedTuple):
