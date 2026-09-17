@@ -177,6 +177,7 @@ def _make_manager_for_cache_tier_test(
     is_disagg: bool = False,
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
+    vocab_size: int | None = 16,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -243,11 +244,61 @@ def _make_manager_for_cache_tier_test(
             is_draft=is_draft,
             is_disagg=is_disagg,
             joint_kv_cache_reuse=joint_reuse,
-            vocab_size=16,
+            vocab_size=vocab_size,
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
         )
     return manager, impl_constructor
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "enable_attention_dp,rank",
+    [
+        pytest.param(False, 0, id="rank-zero"),
+        pytest.param(True, 1, id="attention-dp"),
+    ],
+)
+@pytest.mark.parametrize("vocab_size", [131072, None], ids=["multimodal", "text-only"])
+def test_buffered_events_receive_vocab_size(
+    enable_attention_dp: bool, rank: int, vocab_size: int | None
+) -> None:
+    mapping = Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=enable_attention_dp)
+    distributed = Mock()
+    distributed.allreduce.side_effect = lambda value, op: value
+    kv_cache_config = KvCacheConfig(
+        max_gpu_total_bytes=16 << 20,
+        host_cache_size=0,
+        event_buffer_max_size=8,
+    )
+
+    # Exercise the real resource-manager constructor and selected event backend.
+    with (
+        patch.object(kv_cache_v2_module, "mpi_rank", return_value=rank),
+        patch.object(Distributed, "get", return_value=distributed),
+        patch.object(
+            kv_cache_v2_module,
+            "KVCacheEventManager",
+            side_effect=kv_cache_v2_module.KVCacheEventManager,
+        ) as event_constructor,
+    ):
+        manager, impl_constructor = _make_manager_for_cache_tier_test(
+            kv_cache_config,
+            [Mock()],
+            mapping=mapping,
+            vocab_size=vocab_size,
+        )
+
+    event_constructor.assert_called_once()
+    assert event_constructor.call_args.args == (kv_cache_config.event_buffer_max_size,)
+    assert event_constructor.call_args.kwargs["mm_token_id_offset"] == vocab_size
+    if enable_attention_dp:
+        assert event_constructor.call_args.kwargs["attention_dp_rank"] == rank
+        assert event_constructor.call_args.kwargs["attention_dp_gather"] is distributed.allgather
+    else:
+        assert "attention_dp_rank" not in event_constructor.call_args.kwargs
+    assert manager.event_manager.needs_token_digest_context() == (vocab_size is not None)
+    assert impl_constructor.call_args.kwargs["event_manager"] is manager.event_manager
 
 
 def _multi_rank_host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
