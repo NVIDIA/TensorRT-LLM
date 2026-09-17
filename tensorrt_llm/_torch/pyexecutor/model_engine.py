@@ -3282,6 +3282,14 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_draft_tokens=_kv_draft)
             available_tokens = min(available_tokens, draft_available_tokens)
 
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
+            # V2 reserves one generation token beyond the draft/extra tokens.
+            available_tokens -= 1
+            minimum_tokens = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1
+            if available_tokens < minimum_tokens:
+                free_warmup_requests()
+                return None
+
         token_num = max(
             ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
             min(

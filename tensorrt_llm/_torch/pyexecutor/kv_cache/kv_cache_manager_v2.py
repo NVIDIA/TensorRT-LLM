@@ -2690,20 +2690,34 @@ class KVCacheManagerV2(BaseResourceManager):
                     * (self.max_batch_size - 1)
                 )
 
-                # CUDA graph generation warmup uses one request at max_seq_len and
-                # enough minimal decode requests to fill max_batch_size.
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
-                constraints.append(
-                    BatchDesc(
-                        [
-                            KVCacheDesc(
-                                capacity=self.max_seq_len,
-                                history_length=self.max_seq_len - 1,
-                            )
-                        ]
-                        + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (self.max_batch_size - 1)
-                    )
+                gpu_quota = next(
+                    tier.quota for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)
+                )
+                # Native minimum slot counts are divided by the resume watermark.
+                # Normalize the quota before estimating a feasible long request.
+                estimate = self._get_max_tokens_from_quota(
+                    int(gpu_quota * kv_cache_config.max_util_for_resume)
+                )
+                generation_capacity = int(min(self.max_seq_len, max(min_decode_capacity, estimate)))
+                # These are independent workloads. Graph warmup shortens its long
+                # request after allocating the short requests; requiring both at
+                # this estimated length would count their memory twice.
+                constraints.extend(
+                    [
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=generation_capacity,
+                                    history_length=generation_capacity - 1,
+                                )
+                            ]
+                        ),
+                        BatchDesc(
+                            [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                            * self.max_batch_size
+                        ),
+                    ]
                 )
 
                 # General and chunked-prefill warmup uses one fresh context request

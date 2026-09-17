@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -34,6 +35,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -151,6 +154,7 @@ def _make_cache_config_for_test(
     cache_manager.enable_joint_kv_cache_reuse = False
     cache_manager.reuse_match_backoff = 0
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
+    cache_manager._get_max_tokens_from_quota = lambda _: max_seq_len
     # Mirrors __init__: without helix the ledger block equals the physical
     # page (the helper re-enacts construction for partial instances).
     cache_manager._ledger_tokens_per_block = 128
@@ -771,9 +775,15 @@ def test_default_uses_allocator_fallback() -> None:
     assert config.constraints == []
 
 
-def test_avg_seq_len_builds_warmup_constraints() -> None:
+@pytest.mark.parametrize(
+    "kv_cache_type",
+    [CacheType.SELF, CacheType.SELFKONLY],
+    ids=["full_attention", "key_only"],
+)
+def test_avg_seq_len_builds_warmup_constraints(kv_cache_type: CacheType) -> None:
     config = _make_cache_config_for_test(
-        KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
+        KvCacheConfig(use_kv_cache_manager_v2=True, host_cache_size=0, avg_seq_len=1024),
+        kv_cache_type=kv_cache_type,
         max_batch_size=3,
         max_seq_len=1024,
         max_num_tokens=2048,
@@ -788,12 +798,146 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
         BatchDesc(
             [
                 KVCacheDesc(capacity=1024, history_length=1023),
-                KVCacheDesc(capacity=3, history_length=0),
-                KVCacheDesc(capacity=3, history_length=0),
             ]
         ),
+        BatchDesc([KVCacheDesc(capacity=3, history_length=0)] * 3),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
     ]
+
+
+@pytest.fixture(
+    params=[("bytes", False), ("bytes", True), ("tokens", False), ("tokens", True)],
+    ids=["bytes-final", "bytes-estimation", "tokens-final", "tokens-estimation"],
+)
+def _budget_limited_full_attention_manager(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[KVCacheManagerV2]:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    monkeypatch.delenv("TRTLLM_KV_GUARD_PAGE", raising=False)
+    budget_type, is_estimating = request.param
+    budget = {"max_gpu_total_bytes": 17 << 20} if budget_type == "bytes" else {"max_tokens": 8192}
+    config = KvCacheConfig(
+        use_kv_cache_manager_v2=True,
+        enable_block_reuse=False,
+        host_cache_size=0,
+        avg_seq_len=32768,
+        **budget,
+    )
+    manager = KVCacheManagerV2(
+        config,
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=131072,
+        max_batch_size=8,
+        max_num_tokens=2048,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        is_estimating_kv_cache=is_estimating,
+    )
+    try:
+        assert not manager.kv_cache_map
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def test_full_attention_warmup_respects_allocated_budget(
+    _budget_limited_full_attention_manager: KVCacheManagerV2,
+) -> None:
+    manager = _budget_limited_full_attention_manager
+    requested_quota = manager.kv_cache_manager_py_config.cache_tiers[0].quota
+    allocated_bytes = manager.impl.get_quota(kv_cache_v2_module.GPU_LEVEL)
+    # These small quotas round up to a 2 MiB GPU allocation grain. The model's
+    # full context requires at least 256 MiB, far beyond either configured budget.
+    assert 0 < allocated_bytes <= requested_quota + (2 << 20)
+    assert manager.max_num_tokens < manager.max_seq_len < 131072
+
+    requests = manager.add_dummy_requests(
+        [0], token_nums=[manager.max_num_tokens // 2], is_gen=False
+    )
+    assert requests is not None
+    try:
+        cache = manager.kv_cache_map[requests[0].py_request_id]
+        assert cache.resize(manager.max_num_tokens, history_length=0)
+        assert cache.capacity == manager.max_num_tokens
+        cache.suspend()
+        assert cache.resume(torch.cuda.current_stream().cuda_stream)
+    finally:
+        for request in requests:
+            manager.free_resources(request)
+
+
+@pytest.mark.parametrize("max_seq_len", [None, 1], ids=["sufficient", "insufficient"])
+def test_full_attention_budget_supports_cuda_graph_warmup(
+    _budget_limited_full_attention_manager: KVCacheManagerV2,
+    max_seq_len: int | None,
+) -> None:
+    manager = _budget_limited_full_attention_manager
+    # Exercise the real graph request builder against the allocated pool budget.
+    engine = SimpleNamespace()
+    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.spec_config = None
+    engine.max_beam_width = 1
+    engine.max_draft_loop_tokens = manager.max_draft_len
+    engine.max_seq_len = 131072
+    engine.use_mrope = False
+    engine.get_runtime_tokens_per_gen_step = lambda draft_len: draft_len + 1
+    engine._get_draft_kv_cache_manager = lambda _: None
+    engine._is_encoder_decoder_model = lambda: False
+    engine.model = SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+    )
+    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+
+    with (
+        patch.object(
+            manager, "get_num_available_tokens", wraps=manager.get_num_available_tokens
+        ) as get_available_tokens,
+        patch.object(manager, "free_resources", wraps=manager.free_resources) as free_resources,
+    ):
+        batch = PyTorchModelEngine._create_cuda_graph_warmup_request(
+            engine,
+            resources,
+            batch_size=manager.max_batch_size,
+            draft_len=manager.max_draft_len,
+            max_seq_len=max_seq_len,
+        )
+        if max_seq_len == 1:
+            # The one-token budget cannot hold both the prompt and V2's extra
+            # generation token. Short requests must be allocated, then freed.
+            get_available_tokens.assert_called_once_with(
+                token_num_upper_bound=1,
+                batch_size=manager.max_batch_size,
+                max_num_draft_tokens=manager.max_draft_len,
+            )
+            assert batch is None
+            assert free_resources.call_count == manager.max_batch_size - 1
+            assert not manager.kv_cache_map
+            return
+
+    assert batch is not None
+    requests = list(batch.generation_requests)
+    try:
+        assert len(requests) == manager.max_batch_size
+        longest_request = requests[0]
+        cache = manager.kv_cache_map[longest_request.py_request_id]
+        assert cache.capacity > manager.max_num_tokens
+        manager.free_resources(longest_request)
+        requests.remove(longest_request)
+        # Once the longest request finishes, another generation request can
+        # grow across page boundaries into the released capacity.
+        cache = manager.kv_cache_map[requests[0].py_request_id]
+        assert cache.capacity < manager.max_num_tokens
+        assert cache.resize(manager.max_num_tokens, history_length=cache.history_length + 1)
+    finally:
+        for request in requests:
+            manager.free_resources(request)
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
@@ -1047,7 +1191,7 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     )
 
     assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
-    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
+    assert config.constraints[2] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:

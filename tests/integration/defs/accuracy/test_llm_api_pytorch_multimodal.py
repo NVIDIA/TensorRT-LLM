@@ -639,7 +639,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
         ids=["forced_chunked_prefill"],
     )
     def test_auto_dtype(self, max_num_tokens):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, use_kv_cache_manager_v2=True)
         with LLM(
             self.MODEL_PATH,
             kv_cache_config=kv_cache_config,
