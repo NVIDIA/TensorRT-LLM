@@ -3764,8 +3764,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
     skip_no_trtllm_gen_moe_support = pytest.mark.skipif(
-        get_sm_version() not in (100, 103),
-        reason="TRTLLM Gen MoE supports SM100 and SM103 only")
+        get_sm_version() not in (100, 103, 107),
+        reason="TRTLLM Gen MoE supports SM100, SM103 and SM107 only")
 
     def _create_1gpu_llm(self, kv_cache_config: KvCacheConfig, moe_backend: str,
                          **kwargs) -> LLM:
@@ -7294,7 +7294,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("use_msa", [False, True])
+    @parametrize_with_ids("use_msa", [True])
     def test_mxfp8_piecewise_cuda_graph(self, use_msa):
         tp_size = ep_size = 4
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"

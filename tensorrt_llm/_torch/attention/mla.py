@@ -432,6 +432,9 @@ class MLA(nn.Module):
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
+        self._kvbproj_head_weights_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = (
+            None
+        )
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
         if not self.is_lite:
@@ -1023,6 +1026,47 @@ class MLA(nn.Module):
                 latent_cache=latent_cache_gen,
             )
 
+    def _use_kvbproj_strided_out(self) -> bool:
+        """Whether the context KV expansion can skip the k_nope materialization
+        copy by running per-head batched GEMMs that write directly into the
+        strided K buffer (and the v half of a kv-layout buffer).
+
+        Requires SM100f and an unquantized bf16 kv_b_proj without bias;
+        other configs fall back to the wide-GEMM + copy path.
+        """
+        if not is_sm_100f():
+            return False
+        w = getattr(self.kv_b_proj, "weight", None)
+        expected_shape = (
+            self.num_heads_tp * (self.qk_nope_head_dim + self.v_head_dim),
+            self.kv_lora_rank,
+        )
+        expected_numel = math.prod(expected_shape)
+        return (
+            w is not None
+            and w.dtype == torch.bfloat16
+            and tuple(w.shape) == expected_shape
+            and w.numel() == expected_numel
+            and self.kv_b_proj.bias is None
+        )
+
+    def _get_kvbproj_head_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-head views into kv_b_proj.weight, layout [H, N, K] (contiguous).
+
+        kv_b_proj.weight rows are [H*qk_nope (k_nope block) | H*v_head (v
+        block)] with K = kv_lora_rank, so both blocks reshape to head-major
+        [H, N, K] without any copy.
+        """
+        cached = getattr(self, "_kvbproj_head_weights_cache", None)
+        w = self.kv_b_proj.weight
+        if cached is not None and cached[0] is w:
+            return cached[1], cached[2]
+        nope_rows = self.num_heads_tp * self.qk_nope_head_dim
+        w_k = w[:nope_rows].view(self.num_heads_tp, self.qk_nope_head_dim, self.kv_lora_rank)
+        w_v = w[nope_rows:].view(self.num_heads_tp, self.v_head_dim, self.kv_lora_rank)
+        self._kvbproj_head_weights_cache = (w, w_k, w_v)
+        return w_k, w_v
+
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -1034,20 +1078,44 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dense MHA context path: expand KV via kv_b_proj and run attention."""
-        kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            -1,
-        )
-
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
-        maybe_compiled_copy_(
-            k[..., : self.qk_nope_head_dim],
-            k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
-        )
+        if self._use_kvbproj_strided_out():
+            # Expand KV via per-head batched GEMMs that write k_nope directly
+            # into the strided K buffer, skipping the [t, H*256] kv
+            # intermediate and the k_nope materialization copy.
+            num_tokens = compressed_kv.shape[0]
+            w_k, w_v = self._get_kvbproj_head_weights()
+            ckv = compressed_kv.unsqueeze(0).expand(
+                self.num_heads_tp, num_tokens, self.kv_lora_rank
+            )
+            # [H, t, qk_nope] view with strides (qk_head_dim, H*qk_head_dim, 1)
+            k_nope_out = k[..., : self.qk_nope_head_dim].transpose(0, 1)
+            # The MLA fp8 quantize kernel (quantizeCopyInputToFp8Kernel,
+            # mlaKernels.cu) hardcodes the V source token stride as
+            # H*(qk_nope+v) -- the layout of the kv.split() view. Keep that
+            # contract: allocate a kv-shaped buffer and only write its v
+            # half; the k_nope half is never written or read.
+            nope_cols = self.num_heads_tp * self.qk_nope_head_dim
+            v_cols = self.num_heads_tp * self.v_head_dim
+            kv_buf = torch.empty(num_tokens, nope_cols + v_cols, dtype=q.dtype, device=q.device)
+            v = kv_buf[:, nope_cols:]
+            # [H, t, v_head] view with strides (v_head, H*(qk_nope+v), 1)
+            v_out = v.unflatten(-1, (self.num_heads_tp, self.v_head_dim)).transpose(0, 1)
+            # cuBLAS consumes the transposed weights and writes strided
+            # outputs directly, without materializing contiguous copies.
+            torch.ops.trtllm.bmm_out(ckv, w_k.transpose(1, 2), k_nope_out)
+            torch.ops.trtllm.bmm_out(ckv, w_v.transpose(1, 2), v_out)
+        else:
+            kv = self.kv_b_proj(compressed_kv)
+            k_nope, v = kv.split(
+                [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
+                -1,
+            )
+
+            maybe_compiled_copy_(
+                k[..., : self.qk_nope_head_dim],
+                k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
+            )
         # When rope_fusion=True (apply_rotary_emb=False), the rope portion
         # of k is left uninitialized here; the fused attention kernel
         # handles k_pe RoPE via latent_cache instead.
