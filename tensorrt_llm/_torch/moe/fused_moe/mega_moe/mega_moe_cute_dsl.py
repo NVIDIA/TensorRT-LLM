@@ -460,18 +460,15 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
-        # A TEP wrapper must reduce only its local branches: the fused kernel
-        # has already combined the routed output across the expert group.
-        if (
-            d.parallel_size > 1
-            and not d.use_dp
-            and not is_minimax_swiglu_bias
-            and not d.handles_global_routed_output
-        ):
+        # The fused kernel returns a globally combined routed output. MiniMax-M3
+        # accounts for that when composing routed and shared experts; the other
+        # current model wrappers would apply a second AllReduce under TEP.
+        if d.parallel_size > 1 and not d.use_dp and not is_minimax_swiglu_bias:
             return _reject(
                 MoERejectReason.TOPOLOGY_UNSUPPORTED,
-                "MegaMoECuteDsl TEP requires a model composition that handles "
-                "globally combined routed output without reducing it twice.",
+                "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style "
+                "SwigluBias; other model compositions would reduce its already-global "
+                "routed output twice.",
             )
         # ADP wider than EP would need an outer allgather + reducescatter
         # wrapper that this backend does not have.

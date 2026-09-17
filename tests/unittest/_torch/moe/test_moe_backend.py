@@ -1183,34 +1183,6 @@ def test_megamoe_cutedsl_tep_requires_minimax_m3_activation() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("handles_global_output", [False, True])
-def test_megamoe_cutedsl_situ_tep_requires_global_output_composition(handles_global_output):
-    deployment = build_moe_deployment(
-        ModelConfig(
-            mapping=Mapping(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8),
-            moe_handles_global_routed_output=handles_global_output,
-        ),
-        num_experts=8,
-        environment=_make_megamoe_cutedsl_test_deployment().env,
-    )
-    verdict = MegaMoECuteDsl.can_implement(
-        MoEProblem(
-            quant=QuantAlgo.NVFP4.value,
-            dtype_act=torch.bfloat16,
-            hidden_size=512,
-            intermediate_size=512,
-            num_experts=8,
-            top_k=2,
-            activation=ActivationType.SiTu.name,
-        ),
-        deployment,
-    )
-    assert verdict.eligible is handles_global_output
-    if not handles_global_output:
-        assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
-
-
-@pytest.mark.cpu_only
 def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
     moe = _make_megamoe_cutedsl_for_ctor_test(
         activation=SwigluBiasActivation(

@@ -54,7 +54,7 @@ the shared experts use standard MLP TP over the model TP group: gate/up are
 column-sharded and down is row-sharded. Direct MoE-TP combines the shared
 hidden-width partial and routed latent partial into one all-reduce after the
 two streams join, then splits them before the routed norm/up projection.
-Fused-communication routed paths reduce only the shared-expert partial,
+Communication-backed routed paths keep the shared ``GatedMLP`` reduction,
 because their routed result is already combined. Under attention DP the
 shared experts stay replicated. ``lm_head`` uses the stock ``LMHead``
 (vocab-sharded + gather), so logits are identical on all ranks.
@@ -119,7 +119,6 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
-from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -1167,8 +1166,7 @@ class KimiK3MoERuntime(nn.Module):
         # Under attention DP each rank owns different tokens, so the shared
         # expert is replicated (TP size 1) and must not reduce across ranks.
         # Direct MoE-TP leaves both branches as partials for one concatenated
-        # all-reduce. A fused-communication backend has already combined the
-        # routed branch, so only its shared-expert partial needs reduction.
+        # all-reduce.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
         routed_all_reduce = self.routed_experts.all_reduce
         if use_shared_tp and routed_all_reduce is None:
@@ -1176,11 +1174,7 @@ class KimiK3MoERuntime(nn.Module):
                 "Kimi K3 direct MoE tensor parallelism requires the "
                 "ConfigurableMoE all-reduce even when reduce_results=False."
             )
-        routed_output_is_global = (
-            self.routed_experts.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
-        )
-        self._use_combined_all_reduce = use_shared_tp and not routed_output_is_global
-        self._reduce_shared_output = use_shared_tp and routed_output_is_global
+        self._use_combined_all_reduce = use_shared_tp
         self.shared_experts = GatedMLP(
             hidden_size=cfg.hidden_size,
             intermediate_size=shared_intermediate,
@@ -1369,7 +1363,6 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         routed_model_config.mapping = routed_mapping
         routed_model_config.moe_backend = model_config.moe_backend
-        routed_model_config.moe_handles_global_routed_output = True
         # MegaMoE uses this value as global DP SymmBuffer capacity, then
         # divides it by EP size for the per-rank allocation. Other backends
         # keep the user-configured value as their MoE chunking bound.
@@ -1402,11 +1395,7 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
-        moe_all_reduce = (
-            self.routed_experts.all_reduce
-            if self._use_combined_all_reduce or self._reduce_shared_output
-            else None
-        )
+        moe_all_reduce = self.routed_experts.all_reduce if self._use_combined_all_reduce else None
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -1455,8 +1444,6 @@ class KimiK3MoERuntime(nn.Module):
             # a dense last dimension.
             routed_latent = self.routed_expert_norm(routed_latent.contiguous())
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
-        elif self._reduce_shared_output:
-            shared_out = moe_all_reduce(shared_out)
         return routed_out + shared_out
 
 

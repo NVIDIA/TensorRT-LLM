@@ -251,9 +251,6 @@ class ModelConfig(Generic[TConfig]):
     # disables the optimization; hardware support is resolved by the backend.
     skip_correction_threshold: float = 0.0
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
-    # Model composition reduces only local branches when a fused-communication
-    # backend returns an already globally combined routed output.
-    moe_handles_global_routed_output: bool = False
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
