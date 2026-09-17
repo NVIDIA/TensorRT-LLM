@@ -637,7 +637,8 @@ def test_mla_chunked_prefill_output_matches_single_shot():
 
     total_len = cached_len + new_len
     torch.manual_seed(0)
-    hidden_states = torch.empty([total_len, hidden_size], dtype=dtype,
+    hidden_states = torch.empty([total_len, hidden_size],
+                                dtype=dtype,
                                 device=device).uniform_(-1, 1)
     # Give each chunk of the prefix its own magnitude. The merge weights chunks
     # by exp(max_i - max), so an exported max in the wrong units cancels out
@@ -702,7 +703,9 @@ def test_mla_chunked_prefill_output_matches_single_shot():
             out = hidden_states.new_empty(
                 [cached_len, mla.num_heads_tp * mla.v_head_dim])
             mla.forward_impl(position_ids[:, :cached_len],
-                             hidden_states[:cached_len], md, attn_output=[out])
+                             hidden_states[:cached_len],
+                             md,
+                             attn_output=[out])
 
             # Pass two: the tail, attending over the cached prefix.
             features = AttentionRuntimeFeatures(
@@ -713,11 +716,14 @@ def test_mla_chunked_prefill_output_matches_single_shot():
             md = metadata(new_len, cached_len, features)
             if chunked:
                 assert md.chunked_loop_num == expected_chunks, (
-                    f"expected {expected_chunks} chunks, got {md.chunked_loop_num}")
+                    f"expected {expected_chunks} chunks, got {md.chunked_loop_num}"
+                )
             out = hidden_states.new_empty(
                 [new_len, mla.num_heads_tp * mla.v_head_dim])
             mla.forward_impl(position_ids[:, cached_len:],
-                             hidden_states[cached_len:], md, attn_output=[out])
+                             hidden_states[cached_len:],
+                             md,
+                             attn_output=[out])
             return out.float().clone()
         finally:
             kv_cache_manager.shutdown()
