@@ -129,8 +129,8 @@ view = manager._host_source_view
 rows = [cache._host_source_ref for cache in batch_caches]
 read = manager._acquire_host_sources(rows, stream)
 try:
-    # Future ensure_resident consumes selections, model format, codec layout,
-    # this borrowed view, and mutable GPU-cache state.
+    # The view describes whole host pages. Entry addressing and
+    # ensure_resident are future refetch work.
     # Submit GPU reads or graph replay on stream here.
     pass
 finally:
@@ -149,24 +149,18 @@ scopes for the same row use its unchanged metadata; pending copies are published
 on a later acquisition after those scopes close. A per-page reader can still
 outlive request close. Neither read API performs GPU hit lookup, LRU, or refetch.
 
-## Host layout and disk restore
+## Whole-page storage and disk restore
 
-Model `EntryFormat` is keyed by `BufferId` (layer ID and `DataRole`). It describes
-component tensor shapes, dtypes, entry axes, and tokens per entry. Components can
-include KV and scale tensors. It contains no lifecycle, pool, slot-size, or
-coalesced-buffer offset fields.
+Host backup and restore use the existing cold-page codec's whole-page API.
+`HostSourceView` describes retained slots and completed token coverage; it does
+not describe byte offsets within a page or require a codec to expose them.
+A completed host copy is ready for whole-page restore, even if its format cannot
+be read one entry at a time.
 
-Use `manager._host_buffer_layout(BufferId(...))` for physical layout. KVCM validates
-the codec's `ColdBufferLayout` and returns the lifecycle, byte offset and size within
-a cold slot, and number of native model buffers per logical page (`expansion`).
-The view supplies that lifecycle's host pool base, slot size, and pool group.
-The future consumer combines these with the model format to locate entry bytes.
-
-The default codec concatenates hot pool slots in pool order. It computes buffer
-offsets once from KVCM's coalesced-buffer descriptors. Models must not repeat that
-calculation. A custom codec can implement `queryBufferLayout()` only if it exposes
-byte-preserving random access to each buffer. Otherwise host-source initialization
-rejects it clearly; its existing whole-page encode/decode API remains available.
+Model `EntryFormat` stays separate. It describes buffer identity (`BufferId` and
+`DataRole`), tensor shapes, dtypes, entry axes, and tokens per entry. KVCM and the
+codec keep ownership of physical layout. Locating individual entries within
+host pages, and deciding which codec formats support it, belongs to step 5.
 
 If a page is on disk, `backupToHost()` first restores that page through the
 existing codec to GPU, then creates its retained host copy. This needs room for

@@ -188,9 +188,6 @@ void KvCacheManager::initializeHostSourceTable(int maxRequests, int maxPages, in
     {
         throw LogicError("Host source table is already reserved; its addresses must stay fixed");
     }
-    // Reject opaque codecs only when random-access host sources are requested.
-    for (auto const& buffer : allBufferIds())
-        mStorage->hostBufferLayout(buffer);
     mHostSources = std::make_unique<HostSourceTable>(*mStorage, tokensPerBlock(), maxRequests, maxPages, maxBeams);
 }
 
@@ -249,13 +246,6 @@ HostSourceRow KvCacheManager::hostSourceRef(KvCache const& cache) const
     KVCM2_REJECT_IF_POISONED();
     auto const apiLock = lockShared();
     return mHostSources ? mHostSources->requestRef(cache) : HostSourceRow{-1, 0};
-}
-
-ColdBufferLayout KvCacheManager::hostBufferLayout(BufferId const& buffer) const
-{
-    KVCM2_REJECT_IF_POISONED();
-    auto const apiLock = lockShared();
-    return mStorage->hostBufferLayout(buffer);
 }
 
 void KvCacheManager::checkHostSourceCapacity(KvCache const& cache, int capacity) const

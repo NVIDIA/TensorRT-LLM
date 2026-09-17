@@ -78,15 +78,6 @@ public:
         return group == nullptr ? 0 : group->coldPageBytes;
     }
 
-    bool queryBufferLayout(BufferId const& buffer, ColdBufferLayout& layout) const noexcept override
-    {
-        auto const it = mBufferLayouts.find(buffer);
-        if (it == mBufferLayouts.end())
-            return false;
-        layout = it->second;
-        return true;
-    }
-
     [[nodiscard]] LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept override
     {
         GroupConfig const* const group = findGroup(layerGroupId);
@@ -137,8 +128,6 @@ public:
     }
 
 private:
-    std::map<BufferId, ColdBufferLayout> mBufferLayouts;
-
     void configureImpl(PoolGroupDesc const* gpuDescs, PoolGroupIndex numGpuDescs)
     {
         TLLM_CHECK(gpuDescs != nullptr && numGpuDescs.value() > 0 && mGroups.empty() && mLifeCycleToGroup.empty());
@@ -183,17 +172,7 @@ private:
                 TLLM_CHECK(lifeCycleToGroup.at(variant.lifeCycleId).value() < 0);
                 for (PoolIndex poolIndex{0}; poolIndex < gpuDesc.pools.size(); ++poolIndex)
                 {
-                    auto const& buffers = variant.coalescedBuffers.at(poolIndex);
-                    TLLM_CHECK(buffers.size() == gpuDesc.pools.at(poolIndex).slotBytes);
-                    size_t offset = copyPlans.at(poolIndex).coldPageOffset;
-                    for (auto const& buffer : buffers.bufferIds)
-                    {
-                        TLLM_CHECK(mBufferLayouts
-                                       .emplace(buffer,
-                                           ColdBufferLayout{variant.lifeCycleId, offset, buffers.singleBufferSize})
-                                       .second);
-                        offset += buffers.singleBufferSize;
-                    }
+                    TLLM_CHECK(variant.coalescedBuffers.at(poolIndex).size() == gpuDesc.pools.at(poolIndex).slotBytes);
                 }
                 lifeCycleToGroup.at(variant.lifeCycleId) = poolGroupIndex;
                 batchingLayerGroupId = std::min(batchingLayerGroupId, variant.lifeCycleId);
@@ -298,11 +277,6 @@ IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
 LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept
 {
     return layerGroupId;
-}
-
-bool IKvCacheColdPageCodec::queryBufferLayout(BufferId const&, ColdBufferLayout&) const noexcept
-{
-    return false;
 }
 
 std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec()

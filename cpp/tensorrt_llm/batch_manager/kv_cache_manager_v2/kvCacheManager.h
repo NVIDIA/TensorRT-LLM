@@ -141,7 +141,6 @@ public:
     void bindHostSourceRow(KvCache& cache, int row);
     int hostSourceSlot(KvCache const& cache) const;
     HostSourceRow hostSourceRef(KvCache const& cache) const;
-    ColdBufferLayout hostBufferLayout(BufferId const& buffer) const;
 
     //! Internal lifecycle hooks under the exclusive lock. Null cache means a pool update.
     [[nodiscard]] auto updateHostSources(KvCache* cache = nullptr, std::optional<BlockOrdinal> ordinal = std::nullopt,

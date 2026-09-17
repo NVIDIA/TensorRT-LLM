@@ -1678,12 +1678,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
-    nb::class_<kv::ColdBufferLayout>(m, "ColdBufferLayout")
-        .def_prop_ro("life_cycle_id", [](kv::ColdBufferLayout const& self) { return self.lifeCycleId.value(); })
-        .def_ro("offset", &kv::ColdBufferLayout::offset)
-        .def_ro("size", &kv::ColdBufferLayout::size)
-        .def_ro("expansion", &kv::ColdBufferLayout::expansion);
-
     // HostSourceView borrows mapped table storage; obtaining a view never refreshes it.
     nb::class_<kv::HostSourceView>(m, "HostSourceView")
         .def_ro("max_requests", &kv::HostSourceView::maxRequests)
@@ -2429,8 +2423,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
-        .def("_host_buffer_layout", &kv::KvCacheManager::hostBufferLayout, nb::arg("buffer"),
-            nb::call_guard<nb::gil_scoped_release>())
         .def("_initialize_host_source_table", &kv::KvCacheManager::initializeHostSourceTable, nb::arg("max_requests"),
             nb::arg("max_pages"), nb::arg("max_beams") = 1, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("_host_source_view", &kv::KvCacheManager::hostSourceView, nb::call_guard<nb::gil_scoped_release>())

@@ -769,20 +769,6 @@ void StorageManager::checkHostCopiesAllowResize(CacheLevel level, PoolGroupIndex
     }
 }
 
-ColdBufferLayout StorageManager::hostBufferLayout(BufferId const& buffer) const
-{
-    auto const& attr = getBufferAttr(buffer.layerId, buffer.role);
-    ColdBufferLayout layout;
-    if (!mColdPageCodec->queryBufferLayout(buffer, layout))
-        throw LogicError("Cold-page codec does not support byte-preserving random access for this buffer");
-    size_t const bytes = mColdPageCodec->queryColdPageBytes(attr.lifeCycleId);
-    if (layout.lifeCycleId != attr.lifeCycleId || layout.size != attr.size || layout.offset > bytes
-        || layout.size > bytes - layout.offset)
-        throw LogicError("Cold-page codec returned an invalid random-access buffer layout");
-    layout.expansion = attr.expansion;
-    return layout;
-}
-
 void StorageManager::backupPageToHost(Page& page, CacheLevel hostLevel, int validTokens, CUstream stream)
 {
     if (hostLevel <= kHotLevel || hostLevel >= numCacheLevels() || cacheTier(hostLevel) != CacheTier::HOST_MEM)

@@ -161,9 +161,10 @@ pages and performs final commit-state bookkeeping.
   `HostPageRead` handles. Open scopes block changes to those rows, not unrelated rows.
   Closed scopes' CUDA events protect metadata until completion. Pool changes and
   shutdown require all readers to close. Acquire and close outside graph capture.
-- Physical offsets belong to the codec's `queryBufferLayout`, validated by KVCM.
-  Opaque codecs remain valid for whole-page transfers but cannot enable random-access
-  host sources. Model `EntryFormat` contains no lifecycle or pool placement.
+- Host sources describe whole cold slots using existing pool metadata. Offload uses
+  the existing whole-page codec API and does not require per-buffer offsets.
+  Entry addressing belongs to the future refetch adapter. Model `EntryFormat`
+  contains no lifecycle or pool placement.
 
 ## Ownership and lifetime
 

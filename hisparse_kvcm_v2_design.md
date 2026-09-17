@@ -139,11 +139,12 @@ Keep the model's existing scoring and top-K settings:
 2. The copy code fetches duplicate selections once, preserving the order attention expects.
 3. `EntryFormat`, keyed by `BufferId` (layer and `DataRole`), describes tensor shapes, dtypes,
    entry axes, and compression. KVCM and the codec supply physical placement.
-4. The codec exposes byte-preserving random access for each buffer, or host-source setup rejects
-   it. The default codec provides this layout; models do not repeat pool or coalesced offsets.
+4. Define entry addressing and supported codec formats in step 5. Models must not repeat
+   physical pool or coalesced-buffer offsets.
 
-Extra lossy compression needs separate accuracy tests. Whole-page codecs may need changes to
-support these small reads.
+Steps 2–4 offload whole pages through the existing codec API. They record retained host slots
+and completed coverage without exposing entry offsets. Any codec changes needed for small reads
+belong to step 5. Extra lossy compression needs separate accuracy tests.
 
 > **KVCM and attention owner review:** confirm selection IDs, offsets, compressed entries/scales,
 > valid lengths, and shared-prefix mappings.
@@ -178,8 +179,8 @@ KV transfer keeps the request alive; the host copies remain owned by its pages.
 
 The table records request IDs for diagnostics, row generations, retained host slots, completed
 token counts, and host-pool metadata. Batches pass explicit row-and-generation pairs. The future
-kernel checks these directly. KVCM supplies lifecycle and pool mapping; the cold-page codec
-supplies each buffer's byte offset and size through its random-access layout.
+kernel checks these directly. The table describes whole cold slots, using KVCM's existing
+lifecycle and pool mapping. It does not describe entry offsets within those slots.
 
 Updates follow changed requests and pages. Backup and invalidation update the affected page and
 its shared-prefix users. Append updates touch the tail and newly stale pages; other structural
@@ -207,8 +208,9 @@ See [host-source table usage](docs/source/developer-guide/kv-cache-host-copies.m
 ### 3.4 Find GPU hits, fetch misses, and give attention its indices
 
 **Pass logical selections directly to `ensure_resident()`, backed by HiSparse's
-`load_cache_to_device_buffer_kernel`.** Its inputs are `SelectedEntries`, model `EntryFormat` and codec buffer layouts,
-KVCM's `HostSourceView` protected by a read scope, and mutable GPU-cache state. It handles:
+`load_cache_to_device_buffer_kernel`.** Its inputs are `SelectedEntries`, model `EntryFormat`,
+KVCM's `HostSourceView` protected by a read scope, and mutable GPU-cache state. Step 5 must also
+define how the adapter locates entries within supported host-page formats. It handles:
 
 1. Validate selection IDs and bounds.
 2. Find GPU hits and choose replaceable LRU entries for misses.
@@ -265,7 +267,7 @@ Each layer runs these steps on GPU:
 
 1. **Write** new KV and scoring data. Wait for prior uses before overwriting a slot.
 2. **Select** the KV to read. IndexShare layers can share a selection but need their own KV.
-3. **Fetch** missing KV by passing the selection, model format, codec layout, `HostSourceView`, and GPU-cache state directly
+3. **Fetch** missing KV by passing the selection, model format, `HostSourceView`, and GPU-cache state directly
   to `ensure_resident()`. New KV can use its protected GPU copy while backup is pending.
 4. **Run attention** using the returned indices, after the required copies finish.
 

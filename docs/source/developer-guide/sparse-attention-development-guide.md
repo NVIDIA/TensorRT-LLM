@@ -382,7 +382,6 @@ selected KV before model offload is connected. They keep one `KvCache` per reque
 | `SelectionContext` | Borrowed `req_idx_per_token`, `kv_lens_cuda`, and explicit host-source rows/generations. |
 | `SelectedEntries` | Logical positions and an optional validity mask, in attention order. |
 | `EntryFormat` | Model buffer identity (`BufferId`/`DataRole`), component tensor shapes/dtypes/entry axes, and tokens per entry. |
-| `ColdBufferLayout` (C++ KVCM/codec) | Lifecycle, byte offset and size within a cold slot, and native-buffer expansion. |
 | `HostSourceView` (C++ KVCM) | Borrowed row generations, retained host slots, completed token counts, and host-pool metadata. |
 
 `DSATrtllmAttention.select_kv()` exposes logical top-K before page-table conversion.
@@ -399,11 +398,11 @@ row generation, masks, and completed host coverage. Duplicates keep their column
 
 `EntryFormat` describes model data only. For example, a component can be a
 `[entries, heads, channels]` KV tensor with entry axis 0, followed by a scale
-tensor. Head-major data can use entry axis 1. KVCM supplies lifecycle/pool mapping
-and buffer expansion; the codec supplies buffer offsets in host slots. Models
-must not reconstruct physical layouts. Opaque codecs remain usable for whole-page
-transfers but are rejected when random-access host sources are enabled.
-See [codec layouts](kv-cache-host-copies.md#host-layout-and-disk-restore).
+tensor. Head-major data can use entry axis 1. Physical layout remains owned by
+KVCM and the codec. Current host offload uses the existing whole-page codec API.
+Locating individual entries in those pages belongs to the future refetch adapter;
+host-source setup does not require per-buffer offsets.
+See [whole-page storage](kv-cache-host-copies.md#whole-page-storage-and-disk-restore).
 
 KVCM updates the `HostSourceTable` incrementally. `HostSourceView` never builds
 another table or protects memory. Setup derives capacity from existing manager
@@ -413,9 +412,10 @@ counts input tokens; the model format defines conversion to stored entries.
 See [host-source usage](kv-cache-host-copies.md#host-source-table).
 
 The planned HiSparse `ensure_resident()` takes `SelectedEntries`, `EntryFormat`,
-KVCM/codec layouts, `HostSourceView`, and mutable GPU-cache state directly. It
-performs the single hit lookup, LRU replacement, and fetching, returning indices
-protected through attention. Step 5 remains unimplemented.
+`HostSourceView`, and mutable GPU-cache state directly. It performs the single
+hit lookup, LRU replacement, and fetching, returning indices protected through
+attention. Step 5 remains unimplemented, including entry addressing and codec
+compatibility checks for refetch.
 
 A valid selection stays valid on a GPU miss. Fetch it from completed host data;
 report unavailable selected data instead of discarding it. A ready GPU hit can

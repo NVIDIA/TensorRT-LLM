@@ -333,16 +333,6 @@ class _Status(enum.Enum):
 
 IndexSeq = array.array[int] | memoryview[int]
 
-class ColdBufferLayout:
-    @property
-    def life_cycle_id(self) -> LifeCycleId: ...
-    @property
-    def offset(self) -> int: ...
-    @property
-    def size(self) -> int: ...
-    @property
-    def expansion(self) -> int: ...
-
 class HostSourceView:
     """C++ backend: borrowed mapped table arrays; valid until manager shutdown.
 
@@ -596,7 +586,6 @@ class KVCacheManager:
     def _acquire_host_sources(
         self, rows: Sequence[tuple[int, int]], cuda_stream: CudaStream
     ) -> _HostSourceRead: ...
-    def _host_buffer_layout(self, buffer: BufferId) -> ColdBufferLayout: ...
     def __init__(
         self,
         config: KVCacheManagerConfig,

@@ -13,7 +13,9 @@ Follow [the V2 design](hisparse_kvcm_v2_design.md) and
 local residency changes. Targets: GLM5.2, DeepSeek-V4, and MiniMax M3. MTP is out of scope.
 
 **Status (2026-09-16):** Steps 2–4 are implemented locally. The current focus is to finish their
-review and validation. Step 5 is unimplemented; scheduler and model wiring follow later.
+review and validation. This PR covers whole-page host offload, source metadata, and lifetime protection.
+Step 5, including entry addressing and any codec API changes, is unimplemented;
+scheduler and model wiring follow later.
 
 ## Rules shared by all tasks
 
@@ -74,8 +76,8 @@ with prefix reuse disabled. Full-history sparse KV must retain old unselected da
 host-source rows and generations. No separate selection policy or request-ID lookup is needed.
 
 `EntryFormat`, keyed by `BufferId`/`DataRole`, describes model tensor shapes, dtypes, entry axes,
-and compression. KVCM owns lifecycle and pool mapping; the codec supplies byte offsets and sizes.
-Opaque codecs are rejected when host sources are enabled. `HostSourceView` borrows KVCM's table.
+and compression. Physical layout stays owned by KVCM and the codec.
+`HostSourceView` borrows KVCM's whole-page source table. Entry addressing belongs to step 5.
 These interfaces do not move KV. HiSparse will perform the single GPU hit lookup in step 5.
 Model wiring follows in 7, 9, and 10.
 
@@ -96,15 +98,16 @@ host copies and write invalidation. Mark host copies valid after backup finishes
 sources until safe reuse. Keep active host addresses fixed: holding a page alone does not prevent
 movement. Restore needed disk data to host before decode.
 
-**Validation:** 68 native tests passed under CUDA memcheck with zero errors; 12 focused Python
+**Validation:** 67 native tests passed under CUDA memcheck with zero errors; 12 focused Python
 host-source tests and two executor row tests passed. Coverage includes pending/completed copies, partial pages,
 invalidation, offload, shared prefixes, explicit row reuse, stale generations, fixed addresses,
-graph metadata reads, batch-scoped readers, codec offsets, unsupported codecs, and cleanup.
+graph metadata reads, batch-scoped readers, whole-page codec compatibility, and cleanup.
 Validation uses rebuilt C++ components and bindings. The two executor tests ran with isolated
 source methods and the rebuilt `IndexMapper`; full-package and model inference checks remain pending.
 
 The new methods are `backupToHost`, `invalidateHostCopy`, `offloadToHost`, and
-`acquireHostCopy`. They use the configured host tier's budget and codec. Read handles
+`acquireHostCopy`. They use the configured host tier's budget and existing whole-page codec API.
+Host-source setup does not require per-buffer offsets. Read handles
 keep addresses alive through GPU use; live copies prevent host pool movement. Offload
 reuses the host slot, and later full-page GPU restoration keeps that host copy.
 Disk restore uses one full GPU page before creating a retained host copy.
@@ -131,7 +134,9 @@ See [host-copy usage and layout](docs/source/developer-guide/kv-cache-host-copie
 
 **Work:** Use SGLang's [HiSparse kernels][hisparse-kernel] directly behind `ensure_resident()`.
 
-- Accept `SelectedEntries`, model `EntryFormat`, KVCM/codec layouts, `HostSourceView`, and GPU-cache state directly.
+- Accept `SelectedEntries`, model `EntryFormat`, `HostSourceView`, and GPU-cache state directly.
+- Define how to locate entries within host pages using KVCM and codec information. Handle or
+  reject unsupported formats in this refetch path; keep physical offsets out of model formats.
 - Integrate `load_cache_to_device_buffer_kernel` for GPU lookup, LRU replacement, host copies,
   and attention indices. Record the upstream revision and preserve its license.
 - Check host readiness, row generations, capacity, duplicate/padded selections, layouts/scales,

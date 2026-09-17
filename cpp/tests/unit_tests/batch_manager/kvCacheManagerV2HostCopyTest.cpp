@@ -870,45 +870,6 @@ TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableBackupUpdatesExistingSharedR
     firstRead->close();
 }
 
-TEST_F(KvCacheManagerV2HostCopyTest, HostSourceCodecOwnsOffsetsAcrossPoolsAndCoalescedLayers)
-{
-    auto const view = enableHostSources();
-    fill();
-    mCache->backupToHost(kSparse, kPage, 4);
-    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
-    auto read = mManager->acquireHostSources({mManager->hostSourceRef(*mCache)}, mStream);
-    auto const* host = reinterpret_cast<unsigned char const*>(page()->hostCopy()->address());
-    auto const descs = mManager->storage().poolGroupDescs();
-    auto const group = mManager->storage().getPoolGroupIndex(kSparse);
-    auto const& desc = descs[group];
-    size_t poolOffset = 0;
-    for (PoolIndex pool{0}; pool < desc.pools.size(); ++pool)
-    {
-        for (auto const& variant : desc.slotDesc.variants)
-        {
-            if (variant.lifeCycleId != kSparse)
-                continue;
-            auto const& buffers = variant.coalescedBuffers[pool];
-            size_t offset = poolOffset;
-            for (auto const& buffer : buffers.bufferIds)
-            {
-                auto const layout = mManager->hostBufferLayout(buffer);
-                EXPECT_EQ(layout.lifeCycleId, kSparse);
-                EXPECT_EQ(layout.offset, offset);
-                EXPECT_EQ(layout.size, buffers.singleBufferSize);
-                EXPECT_EQ(layout.expansion, 1);
-                EXPECT_EQ(host[layout.offset], 0x40 + pool.value());
-                EXPECT_EQ(host[layout.offset + layout.size - 1], 0x40 + pool.value());
-                offset += buffers.singleBufferSize;
-            }
-        }
-        poolOffset += desc.pools[pool].slotBytes;
-    }
-    EXPECT_EQ(poolOffset, view.poolMetadata[(view.numLifeCycles + kSparse.value()) * 4 + 1]);
-    EXPECT_THROW(mManager->hostBufferLayout(BufferId{99, "key"}), std::out_of_range);
-    read->close();
-}
-
 TEST_F(KvCacheManagerV2HostCopyTest, HostSourceTableAppendUpdatesOnlyChangedOrdinals)
 {
     auto const view = enableHostSources();

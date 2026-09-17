@@ -51,12 +51,15 @@ Use these interfaces:
 
 - **`SelectedEntries`** — borrows model positions and existing batch metadata.
 - **`EntryFormat`** — describes model tensor shapes, dtypes, entry axes, and compression,
-  keyed by `BufferId`/`DataRole`. KVCM and the codec supply physical layout.
+  keyed by `BufferId`/`DataRole`. Physical layout stays owned by KVCM and the codec.
 - **`HostSourceView`** — borrows KVCM's host-source table. KVCM owns its locations
   and completed token counts; read scopes protect the table and host copies.
-- **`ensure_resident()`** — takes logical selections, separate model formats, codec layouts, and `HostSourceView`, and
-  mutable GPU-cache state directly. HiSparse finds hits, replaces GPU copies with
+- **`ensure_resident()`** — takes logical selections, separate model formats, `HostSourceView`,
+  and mutable GPU-cache state directly. HiSparse finds hits, replaces GPU copies with
   LRU, fetches misses, and returns indices protected through attention.
+
+Current host offload uses the existing whole-page codec API. Entry addressing and
+codec compatibility for refetch belong to step 5.
 
 HiSparse is the planned GPU-cache implementation. Future experiments can replace
 its kernel adapter while keeping selection, layout, and ownership interfaces.

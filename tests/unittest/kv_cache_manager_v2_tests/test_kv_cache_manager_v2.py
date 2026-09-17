@@ -1712,14 +1712,52 @@ class TestHostSourceTable(TestKVCacheManagerV2):
             other_read.close()
             other.close()
 
-    def test_codec_supplies_physical_buffer_layout(self) -> None:
-        layout = self.manager._host_buffer_layout(BufferId(LayerId(0), DataRole("key")))
-        self.assertEqual(layout.life_cycle_id, self.group)
-        self.assertEqual(layout.offset, 0)
-        self.assertEqual(layout.size, 4096)
-        self.assertEqual(layout.expansion, 1)
-        with self.assertRaises(IndexError):
-            self.manager._host_buffer_layout(BufferId(LayerId(1000), DataRole("key")))
+    def test_whole_page_codec_backup_offload_and_restore(self) -> None:
+        self.cache.close()
+        self.manager.shutdown()
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(quota=4 << 20), HostCacheTierConfig(quota=4 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0), buffers=[BufferConfig(role=Role.KEY, size=4096)]
+                )
+            ],
+        )
+        codec = _introspection.create_test_padding_cold_page_codec({0: 8192})
+        self.manager = KVCacheManager(self.cfg, cold_page_codec=codec)
+        self.manager._initialize_host_source_table(2, 8)
+        self.view = self.manager._host_source_view
+        self.cache = self.manager.create_kv_cache(id=41)
+        self.cache._bind_host_source_row(0)
+        self.group = self.manager.get_layer_group_id(LayerId(0))
+        self.index = (0, 0, self.group, 1)
+        self.assertTrue(self.cache.resume(self.stream))
+        self.assertTrue(self.cache.resize(20, 0))
+        engine = FakeEngine(self.cfg)
+        history = [TokenId(token) for token in range(16)]
+        engine.execute([Step(self.cache, history, [])], self.stream)
+        self.cache.history_length = len(history)
+        self.cache._backup_to_host(self.group, 1, 4)
+        self.stream_holder.synchronize()
+        read = self.manager._acquire_host_sources([self.cache._host_source_ref], self.stream)
+        try:
+            self.assertEqual(self.view.completed_tokens[self.index], 4)
+            self.assertEqual(self.view.pool_metadata[1, self.group, 1], 8192)
+            slot = int(self.view.slot_ids[self.index])
+            self.assertGreaterEqual(slot, 0)
+        finally:
+            read.close()
+        self.cache._set_residency_window(self.group, 5, num_sink_tokens=4)
+        self.cache._offload_to_host(self.group, 1)
+        self.assertEqual(self.cache.get_base_page_indices(self.group)[1], BAD_PAGE_INDEX)
+        self.assertEqual(self.view.slot_ids[self.index], slot)
+        self.cache._set_residency_window(self.group, None)
+        engine.execute([Step(self.cache, [], history)], self.stream)
+        self.stream_holder.synchronize()
+        self.assertEqual(self.view.slot_ids[self.index], slot)
+        self.cache.close()
+        self.assertEqual(self.view.slot_ids[self.index], -1)
 
 
 class TestLivingKvCacheGuard(TestKVCacheManagerV2):

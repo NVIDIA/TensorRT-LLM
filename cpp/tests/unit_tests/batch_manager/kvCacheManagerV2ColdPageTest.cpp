@@ -753,17 +753,19 @@ TEST(KvCacheManagerV2ColdPageTest, RecursiveFallenPageMergeResortsByPriority)
     EXPECT_EQ(lowestPriorityPage->cacheLevel, kHotLevel);
 }
 
-TEST(KvCacheManagerV2ColdPageTest, OpaqueCodecRejectsRandomAccessWithoutDisablingWholePages)
+TEST(KvCacheManagerV2ColdPageTest, HostSourceTableAcceptsWholePageCodecPoolLayout)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     auto manager = std::make_shared<KvCacheManager>(
         makeSplitColdGroupingConfig(), nullptr, std::make_unique<SplitColdPageCodec>(false));
-    EXPECT_THROW(manager->hostBufferLayout(BufferId{0, "key"}), LogicError);
-    EXPECT_THROW(manager->initializeHostSourceTable(2, 8), LogicError);
-    // An opaque codec still supports the existing whole-page cache API.
-    auto cache = manager->createKvCache();
-    EXPECT_EQ(cache->status(), KvCache::Status::SUSPENDED);
-    cache->close();
+    manager->initializeHostSourceTable(2, 8);
+    auto const view = manager->hostSourceView();
+    // Host-source metadata describes whole cold slots, even when their sizes
+    // differ from the GPU slots. It needs no access to individual buffer offsets.
+    ASSERT_EQ(view.numLifeCycles, 2);
+    EXPECT_EQ(view.poolMetadata[(view.numLifeCycles + 0) * 4 + 1], 1024);
+    EXPECT_EQ(view.poolMetadata[(view.numLifeCycles + 1) * 4 + 1], 2048);
+    EXPECT_NE(view.poolMetadata[(view.numLifeCycles + 0) * 4 + 3], view.poolMetadata[(view.numLifeCycles + 1) * 4 + 3]);
     manager->shutdown();
 }
 
