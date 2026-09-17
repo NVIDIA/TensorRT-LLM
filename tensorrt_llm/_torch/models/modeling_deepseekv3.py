@@ -138,6 +138,40 @@ def weight_dequant(x: torch.Tensor,
     return y
 
 
+def maybe_dequantize_fp8_block_scaled_weight(module: torch.nn.Module,
+                                             module_weights: Dict) -> Dict:
+    """Dequantize an FP8 block-scaled checkpoint weight that targets an
+    unquantized Linear.
+
+    Some checkpoints store weights in FP8 with a 128x128 block scale
+    (``weight_scale_inv``) for modules that TRT-LLM keeps unquantized on
+    purpose, e.g. the DSA indexer ``wk`` projection of DeepSeek-V3.2 / GLM-5,
+    which is built as an fp32 Linear with ``quant_config=None``. Loading such
+    a tensor through ``UnquantizedLinearMethod`` casts the raw FP8 codes to the
+    parameter dtype and silently drops the scale. This helper applies the block
+    scale first so the module receives the real weight; every other case is
+    returned unchanged.
+    """
+    if not isinstance(module, Linear) or getattr(module, "has_any_quant",
+                                                 False):
+        return module_weights
+    weight = module_weights.get("weight")
+    scale = module_weights.get("weight_scale_inv")
+    if weight is None or scale is None:
+        return module_weights
+    weight = weight[:]
+    if weight.dtype != torch.float8_e4m3fn:
+        return module_weights
+    scale = scale[:]
+    dequantized = weight_dequant(weight.cuda().contiguous(),
+                                 scale.cuda().contiguous().float())
+    dequantized = dequantized.to(module.weight.dtype).cpu()
+    result = dict(module_weights)
+    result["weight"] = dequantized
+    del result["weight_scale_inv"]
+    return result
+
+
 @torch.compile(dynamic=True)
 def moe_reduce_add_shared_output(routed_output, shared_output, out=None):
     routed_reduced = torch.sum(routed_output, dim=1, keepdim=False)
@@ -627,6 +661,8 @@ class DeepseekV3WeightLoader:
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
+                    module_weights = maybe_dequantize_fp8_block_scaled_weight(
+                        module, module_weights)
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
                     else:
