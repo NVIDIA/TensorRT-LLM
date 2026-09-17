@@ -301,8 +301,8 @@ def test_recomputed_context_replays_committed_output(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_recomputed_context_raises_on_invalid_committed_token(monkeypatch):
-    """If a committed token cannot be accepted, _build must raise ValueError."""
+def test_recomputed_context_records_failure_on_invalid_committed_token(monkeypatch):
+    """If a committed token cannot be accepted, _build must record a failed request."""
     def fake_factory(*args, **kwargs):
         class _Factory:
             def create(self, params):
@@ -327,8 +327,9 @@ def test_recomputed_context_raises_on_invalid_committed_token(monkeypatch):
         max_num_draft_tokens=0,
     )
 
-    with pytest.raises(ValueError, match="failed to accept committed output token: 999"):
-        decoder._build(requests)
+    failed_requests = decoder._build(requests)
+    assert [req_id for req_id, _ in failed_requests] == [42]
+    assert "failed to accept committed output token: 999" in failed_requests[0][1]
 
 
 def test_from_llm_request_extracts_committed_output():
@@ -364,4 +365,37 @@ def test_from_llm_request_extracts_committed_output():
     snapshot = GuidedRequest.from_llm_request(req)
     assert snapshot.require_matcher_init()
     assert snapshot.committed_output == (10, 20, 30)
+
+
+def test_from_llm_request_extracts_committed_output_fallback():
+    """GuidedRequest.from_llm_request uses get_tokens fallback when range API is missing."""
+    class MockLlmRequestFallback:
+        def __init__(self, prompt_tokens, output_tokens):
+            self.guided_decoding_params = _GUIDED_PARAMS
+            self.py_request_id = 124
+            self.py_target_seq_slot = None
+            self.py_seq_slot = 1
+            self.py_batch_idx = None
+            self.is_context_init_state = True
+            self.is_last_context_chunk = True
+            self.is_generation_in_progress_state = False
+            self.llm_request_type = None
+            self.py_decoding_iter = 0
+            self.py_is_draft = False
+            self.py_draft_tokens = None
+            self.py_num_accepted_draft_tokens = None
+            self.orig_prompt_len = len(prompt_tokens)
+            self._tokens = prompt_tokens + output_tokens
+
+        def get_last_tokens(self, seq_idx):
+            return self._tokens[-1] if self._tokens else None
+
+        def get_tokens(self, seq_idx):
+            return self._tokens
+
+    req = MockLlmRequestFallback(prompt_tokens=[1, 2, 3], output_tokens=[10, 20, 30])
+    snapshot = GuidedRequest.from_llm_request(req)
+    assert snapshot.require_matcher_init()
+    assert snapshot.committed_output == (10, 20, 30)
+
 
