@@ -11,12 +11,23 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (each excl. `.md`) |
-| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
-| `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
-| `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
-| `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
-| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
+| `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (each excl. docs) |
+| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
+| `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
+| `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
+| `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
+| `docs_rule.py` | `DocsRule` | `docsonly` | `docs/**`, `**/*.md`, `**/*.rst` → the dedicated `CPU-Build_Docs` stage |
+| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
+
+## DocsRule
+
+Claims every file under `docs/` plus Markdown and reStructuredText files
+anywhere in the repository. It contributes the literal `CPU-Build_Docs`
+stage, which runs Doxygen and Sphinx `make html`; the stage is not backed by a
+test-db YAML. Documentation files inside another rule's source prefix remain
+excluded from that source rule, so a README-only edit runs docs rather than a
+backend test suite. Mixed documentation and targeted-test changes combine by
+unioning their stages.
 
 ## WaivesRule
 
@@ -252,7 +263,7 @@ Path-only rule. Claims source files under `tensorrt_llm/_torch/speculative/`,
 `tensorrt_llm/models/{eagle,medusa,redrafter}/`,
 `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/`, and the
 single file `examples/llm-api/llm_speculative_decoding.py` (excluding
-`.md`, which `OutOfScopeRule` claims as noop). Other suffixes —
+documentation paths, which `DocsRule` routes to `CPU-Build_Docs`). Other suffixes —
 including images — are NOT excluded: a binary asset under a spec-dec
 path could be a test fixture, so the rule keeps claiming them and
 forces spec-dec stages to re-run.

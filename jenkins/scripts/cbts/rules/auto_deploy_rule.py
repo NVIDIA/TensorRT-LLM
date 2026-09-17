@@ -35,6 +35,7 @@ from blocks import Stage, YAMLIndex, _entry_target
 
 from ._helpers import is_perf_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 # Source paths AutoDeployRule claims. Tests under tests/unittest/auto_deploy/
 # and tests/integration/defs/accuracy/test_llm_api_autodeploy.py are left to
@@ -60,16 +61,16 @@ _AD_LEAKER_PATTERNS: tuple[str, ...] = (
 def _is_ad_claim(path: str) -> bool:
     """Decide whether AutoDeployRule claims `path`.
 
-    `*.md` files are excluded so docs-only PRs (e.g.
-    `examples/auto_deploy/README.md`) don't force AD stages —
-    `OutOfScopeRule` claims them as noop instead. Other suffixes
+    Documentation files are excluded so docs-only PRs (e.g.
+    `examples/auto_deploy/README.md`) don't force AD stages; `DocsRule`
+    routes them to the docs build instead. Other suffixes
     (`.png` / `.jpg` / etc.) are NOT excluded here: a binary asset
     under an AD path could be a test fixture, so the rule keeps
     claiming them and forces AD stages to re-run (safe over-run).
     """
     if not path.startswith(_AD_SRC_PREFIXES):
         return False
-    if path.endswith(".md"):
+    if is_docs_path(path):
         return False
     return True
 
