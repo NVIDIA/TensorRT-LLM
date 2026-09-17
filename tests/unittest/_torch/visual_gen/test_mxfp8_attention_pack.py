@@ -14,6 +14,7 @@
 # limitations under the License.
 """Small GPU regressions for automatic MXFP8 packing, not performance tests."""
 
+import json
 from collections.abc import Callable
 from unittest.mock import patch
 
@@ -184,7 +185,9 @@ def _dispatch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple:
 
 
 @torch.no_grad()
-def test_mxfp8_pack_fullgraph_cache_and_unaligned_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mxfp8_pack_fullgraph_cache_and_unaligned_fallback(
+    monkeypatch: pytest.MonkeyPatch, record_property: Callable[[str, object], None]
+) -> None:
     _require_sm100()
     torch._dynamo.reset()
     monkeypatch.setattr(mxfp8_pack, "_COMPILED", {})
@@ -219,13 +222,45 @@ def test_mxfp8_pack_fullgraph_cache_and_unaligned_fallback(monkeypatch: pytest.M
     assert len(frames) == frame_count
     assert {key: id(value) for key, value in mxfp8_pack._COMPILED.items()} == cache
 
-    # Identical shape/stride but foreign alignment: same fake contract, native runtime arm.
-    _, unaligned = _inputs(4096, offset=1)
+    # Inductor may realign external inputs before the opaque operator. Check the
+    # actual tensors presented to the kernel, while retaining eager physical
+    # misalignment coverage in test_mxfp8_pack_native_fallback.
+    unaligned_storage, unaligned = _inputs(4096, offset=1)
+    original_storage = unaligned_storage.view(torch.uint8).clone()
+    assert all(x.data_ptr() % 16 != 0 for x in unaligned)
+    assert all(not mxfp8_pack._runtime_eligible(x) for x in unaligned)
     expected = tuple(_native(x, kind) for x, kind in zip(unaligned, ("qk", "qk", "v"), strict=True))
-    with patch.object(mxfp8_pack, "_pack", side_effect=AssertionError("unaligned input fused")):
+    real_pack = mxfp8_pack._pack
+    packed_inputs = []
+
+    def checked_pack(x: torch.Tensor, kind: str) -> tuple[torch.Tensor, torch.Tensor]:
+        packed_inputs.append(
+            {"kind": kind, "data_ptr": x.data_ptr(), "shape": list(x.shape), "stride": list(x.stride())}
+        )
+        assert x.data_ptr() % 16 == 0
+        assert mxfp8_pack._runtime_eligible(x)
+        return real_pack(x, kind)
+
+    with patch.object(mxfp8_pack, "_pack", side_effect=checked_pack):
         actual = compiled(*unaligned)
+    record_property("compiled_unaligned_fused_inputs", json.dumps(packed_inputs, sort_keys=True))
     for reference, result, kind in zip(expected, actual, ("qk", "qk", "v"), strict=True):
         _assert_equal(reference, result, kind)
+    assert torch.equal(unaligned_storage.view(torch.uint8), original_storage)
+    assert {key: id(value) for key, value in mxfp8_pack._COMPILED.items()} == cache
+
+    # Force the opaque operator's runtime predicate false to exercise its native
+    # arm through the compiled graph, independently of compiler realignment.
+    with (
+        patch.object(mxfp8_pack, "_runtime_eligible", return_value=False) as eligibility,
+        patch.object(mxfp8_pack, "_pack", side_effect=AssertionError("forced fallback fused")),
+    ):
+        fallback = compiled(*unaligned)
+        assert eligibility.call_count == 3
+    record_property("compiled_runtime_fallback", "forced false eligibility predicate")
+    for reference, result, kind in zip(expected, fallback, ("qk", "qk", "v"), strict=True):
+        _assert_equal(reference, result, kind)
+    assert torch.equal(unaligned_storage.view(torch.uint8), original_storage)
     assert {key: id(value) for key, value in mxfp8_pack._COMPILED.items()} == cache
 
 
