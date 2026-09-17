@@ -1161,8 +1161,13 @@ class _ScratchPreconditionKVCache:
 
 
 @pytest.mark.parametrize("materialize_history", [False, True])
+# A positive draft width keeps the ``_kv_draft`` term of the reservation
+# load-bearing: with 0 draft tokens the assertion below would still hold if the
+# single resize only reserved the generated token.
+@pytest.mark.parametrize("max_num_draft_tokens", [0, 4])
 def test_generation_dummy_reserves_capacity_within_scratch_precondition(
     materialize_history: bool,
+    max_num_draft_tokens: int,
 ) -> None:
     """A generation dummy must not trip the SWA-scratch resize precondition.
 
@@ -1188,12 +1193,13 @@ def test_generation_dummy_reserves_capacity_within_scratch_precondition(
         token_nums=[token_num],
         is_gen=True,
         materialize_history=materialize_history,
+        max_num_draft_tokens=max_num_draft_tokens,
     )
 
     assert requests is not None
-    # Same reserved capacity either way: the sequence, the extra KV tokens and
-    # the slot for the token that generation is about to produce.
-    assert kv_cache.capacity == token_num + num_extra_kv_tokens + 1
+    # Same reserved capacity either way: the sequence, the extra KV tokens, the
+    # draft slots and the slot for the token that generation is about to produce.
+    assert kv_cache.capacity == token_num + num_extra_kv_tokens + max_num_draft_tokens + 1
     if materialize_history:
         # One resize, so the precondition is only ever checked off zero
         # capacity, and the history keeps its own blocks.
