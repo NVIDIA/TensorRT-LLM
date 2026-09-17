@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
     MambaStateLayout,
+    ReplayStateUpdateMetadata,
     SpeculativeMambaLayerCache,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
@@ -134,6 +135,17 @@ def allocate_kda_replay_fields(
 
 class KDAReplayState:
     """Own all V2 state used by the KDA fused multi-token verifier."""
+
+    @property
+    def intermediate_ssm(self) -> torch.Tensor | None:
+        return None
+
+    @property
+    def intermediate_conv(self) -> torch.Tensor | None:
+        return None
+
+    def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None:
+        return None
 
     def __init__(
         self,
@@ -461,17 +473,15 @@ class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> None:
+    def _initialize_model_state(self) -> IntermediateState | KDAReplayState:
         num_spec = self._requested_num_spec
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
         if num_spec is not None:
             self._kda_replay = KDAReplayState(num_spec)
-        else:
-            self._speculative_state = IntermediateState()
-
-        if self._kda_replay is not None:
             self._kda_replay.validate(self._state_layout)
+            return self._kda_replay
+        return IntermediateState()
 
     @property
     def use_kda_replay_update(self) -> bool:
@@ -487,56 +497,6 @@ class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
         )
 
     @override
-    def _setup_model_state(self) -> None:
-        if self._kda_replay is None:
-            self._speculative_state.bind(
-                self._state_layout, self.all_ssm_states, self.all_conv_states
-            )
-        else:
-            self._kda_replay.bind(self._state_layout, self.all_ssm_states, self.all_conv_states)
-
-    @property
-    def intermediate_state_indices(self) -> torch.Tensor | None:
-        if self._kda_replay is not None:
-            return self._kda_replay.intermediate_indices
-        return self._speculative_state.intermediate_indices
-
-    @property
-    def intermediate_ssm_states(self) -> torch.Tensor | None:
-        if self._kda_replay is not None:
-            return None
-        return self._speculative_state.intermediate_ssm
-
-    @property
-    def intermediate_conv_states(self) -> torch.Tensor | None:
-        if self._kda_replay is not None:
-            return None
-        return self._speculative_state.intermediate_conv
-
-    @override
-    def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
-        if self._kda_replay is None:
-            if self.spec_config is None:
-                return super().mamba_layer_cache(layer_idx)
-            return self._speculative_state.make_layer_cache(
-                self.mamba_layer_offsets[layer_idx],
-                self.get_conv_states(layer_idx),
-                self.get_ssm_states(layer_idx),
-            )
-        return self._kda_replay.make_layer_cache(
-            self.mamba_layer_offsets[layer_idx],
-            self.get_conv_states(layer_idx),
-            self.get_ssm_states(layer_idx),
-        )
-
-    @override
-    def _reset_model_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
-        if self._kda_replay is None:
-            self._speculative_state.reset_slots(slots, host_slots)
-        else:
-            self._kda_replay.reset_slots(slots, host_slots)
-
-    @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
         if self._kda_replay is None:
             return
@@ -547,13 +507,6 @@ class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
                 fresh_slots, dtype=torch.long, device=self.cuda_state_indices.device
             )
             self._kda_replay.reset_slots(slots, fresh_slots)
-
-    @override
-    def _update_speculative_state(self, batch: MambaAcceptanceBatch) -> None:
-        if self._kda_replay is None:
-            self._speculative_state.update(batch)
-        else:
-            self._kda_replay.update(batch)
 
     @override
     def update_resources(
@@ -629,13 +582,6 @@ class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
     def seed_kda_replay_caches_for_disagg_gen(self, request_ids: list[int]) -> None:
         """Compatibility entry point; the executor uses the generic transfer hook."""
         self.on_state_transfer_complete(request_ids)
-
-    @override
-    def _shutdown_model_state(self) -> None:
-        if self._kda_replay is not None:
-            self._kda_replay.shutdown()
-        else:
-            self._speculative_state.shutdown()
 
 
 def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):

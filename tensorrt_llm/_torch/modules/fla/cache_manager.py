@@ -21,7 +21,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
     MambaStateLayout,
-    ReplayStateUpdateMetadata,
     _mamba_effective_tp_size,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
@@ -269,59 +268,16 @@ class Qwen35HybridCacheManagerV2(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> None:
-        self._speculative_state = create_gdn_state(self, self._requested_replay)
+    def _initialize_model_state(self) -> IntermediateState | GDNReplayState:
+        state = create_gdn_state(self, self._requested_replay)
 
-        validate_gdn_layout(self, self._speculative_state)
-
-    @override
-    def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
-        state = self._speculative_state
-        return state.get_replay_metadata() if isinstance(state, GDNReplayState) else None
-
-    @property
-    def intermediate_state_indices(self) -> torch.Tensor | None:
-        return self._speculative_state.intermediate_indices
-
-    @property
-    def intermediate_ssm_states(self) -> torch.Tensor | None:
-        state = self._speculative_state
-        return None if isinstance(state, GDNReplayState) else state.intermediate_ssm
-
-    @property
-    def intermediate_conv_states(self) -> torch.Tensor | None:
-        return self._speculative_state.intermediate_conv
+        validate_gdn_layout(self, state)
+        return state
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         state = self._speculative_state
         return isinstance(state, GDNReplayState) and state.has_bound_states
-
-    @override
-    def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
-        if self.spec_config is None:
-            return super().mamba_layer_cache(layer_idx)
-        return self._speculative_state.make_layer_cache(
-            self.mamba_layer_offsets[layer_idx],
-            self.get_conv_states(layer_idx),
-            self.get_ssm_states(layer_idx),
-        )
-
-    @override
-    def _reset_model_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
-        self._speculative_state.reset_slots(slots, host_slots)
-
-    @override
-    def _update_speculative_state(self, batch: MambaAcceptanceBatch) -> None:
-        self._speculative_state.update(batch)
-
-    @override
-    def _setup_model_state(self) -> None:
-        self._speculative_state.bind(self._state_layout, self.all_ssm_states, self.all_conv_states)
-
-    @override
-    def _shutdown_model_state(self) -> None:
-        self._speculative_state.shutdown()
 
 
 def get_gdn_cache_params(config, *, spec_config=None, quant_config=None):

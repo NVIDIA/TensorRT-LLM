@@ -131,6 +131,38 @@ class MambaAcceptanceBatch:
     is_dummy_request: torch.Tensor | None
 
 
+class MambaState(Protocol):
+    """Model-selected recurrent state; persistent views remain pool-owned."""
+
+    @property
+    def intermediate_indices(self) -> torch.Tensor | None: ...
+
+    @property
+    def intermediate_ssm(self) -> torch.Tensor | None: ...
+
+    @property
+    def intermediate_conv(self) -> torch.Tensor | None: ...
+
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None: ...
+
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None: ...
+
+    def update(self, batch: MambaAcceptanceBatch) -> None: ...
+
+    def shutdown(self) -> None: ...
+
+    def make_layer_cache(
+        self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
+    ) -> MambaLayerCache: ...
+
+    def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None: ...
+
+
 class BaseMambaCacheManager(ABC):
     """Abstract interface for accessing Mamba/recurrent state caches."""
 
@@ -336,9 +368,6 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     @override
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
-
-    def get_mamba_ssm_rand_seed(self) -> torch.Tensor | None:
-        return None
 
 
 def _get_mamba_hybrid_pool_size(max_batch_size: int, mapping: Mapping) -> int:
@@ -830,6 +859,9 @@ class IntermediateState:
 
     def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
         """Plain intermediate buffers have no request-persistent bookkeeping."""
+
+    def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None:
+        return None
 
     def update(self, batch: MambaAcceptanceBatch) -> None:
         if self.intermediate_indices is None:

@@ -354,7 +354,7 @@ def test_kimi_explicit_v2_manager_enables_owned_kda_replay_policy(
     mgr.spec_config = spec_config
     mgr._requested_num_spec = None
     mgr._state_layout = SimpleNamespace(spec_config=spec_config, mamba_pp_layers=())
-    mgr._initialize_model_state()
+    mgr._speculative_state = mgr._initialize_model_state()
     policy = mgr._kda_replay
     assert isinstance(policy, KDAReplayState)
     assert policy.num_speculative_tokens == spec_config.tokens_per_gen_step - 1
@@ -569,7 +569,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     mgr._state_layout = SimpleNamespace(
         spec_config=mgr.spec_config, mamba_pp_layers=(), n_groups_per_rank=1
     )
-    mgr._initialize_model_state()
+    mgr._speculative_state = mgr._initialize_model_state()
     assert isinstance(mgr._speculative_state, GDNReplayState)
     assert captured_v2["max_num_tokens"] == 256
     assert "model_type" not in captured_v2
@@ -2294,15 +2294,15 @@ def _build_v2_hybrid_with_mamba_layer(
     class ModelStateManager(model_cls):
         def _initialize_model_state(self):
             if speculative_state is None:
-                super()._initialize_model_state()
+                return super()._initialize_model_state()
             elif isinstance(speculative_state, KDAReplayState):
                 self._kda_replay = speculative_state
                 self._kda_replay.validate(self._state_layout)
             else:
                 from tensorrt_llm._torch.modules.fla.cache_manager import validate_gdn_layout
 
-                self._speculative_state = speculative_state
-                validate_gdn_layout(self, self._speculative_state)
+                validate_gdn_layout(self, speculative_state)
+            return speculative_state
 
     manager_cls = ModelStateManager
     return manager_cls(
@@ -3620,6 +3620,7 @@ def test_v2_kda_replay_policy_records_acceptance_and_skips_dummy_rows():
     policy.intermediate_indices = torch.arange(3, dtype=torch.int32)
     mgr._dummy_request_mask = torch.tensor([False, False, True])
     mgr._kda_replay = policy
+    mgr._speculative_state = policy
 
     mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
     if not hasattr(mgr, "_dummy_request_mask"):
@@ -3647,6 +3648,7 @@ def test_v2_kda_replay_policy_resets_context_slots():
     )
     policy.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
     mgr._kda_replay = policy
+    mgr._speculative_state = policy
     mgr.cuda_state_indices = torch.tensor([2, 1], dtype=torch.int32)
     mgr._host_state_indices = torch.tensor([2, 1], dtype=torch.int32)
 
@@ -3667,6 +3669,7 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     )
     policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
     mgr._kda_replay = policy
+    mgr._speculative_state = policy
     base_update = MagicMock()
     monkeypatch.setattr(KVCacheManagerV2, "update_resources", base_update)
     active = SimpleNamespace(

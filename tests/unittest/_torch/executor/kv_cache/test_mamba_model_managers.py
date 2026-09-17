@@ -188,7 +188,7 @@ def test_qwen_managers_share_gdn_algorithm_not_model_inheritance():
         manager._requested_replay = True
         manager.spec_config = SimpleNamespace(tokens_per_gen_step=3)
         _prepare_model_layout(manager)
-        manager._initialize_model_state()
+        manager._speculative_state = manager._initialize_model_state()
         states.append(manager._speculative_state)
     assert all(type(state) is GDNReplayState for state in states)
     assert states[0] is not states[1]
@@ -258,12 +258,12 @@ def test_k3_initializes_only_the_selected_state(
         selector,
     )
 
-    assert manager._initialize_model_state() is None
+    manager._speculative_state = manager._initialize_model_state()
     num_spec = requested_num_spec if requested_num_spec is not None else selected_num_spec
     if num_spec is not None:
         intermediate_factory.assert_not_called()
         replay_factory.assert_called_once_with(num_spec)
-        assert not hasattr(manager, "_speculative_state")
+        assert manager._speculative_state is manager._kda_replay
         state = manager._kda_replay
     else:
         replay_factory.assert_not_called()
@@ -298,28 +298,90 @@ def test_k3_initializes_only_the_selected_state(
     manager._shutdown_model_state()
     assert shutdown.call_count == 2
     if num_spec is not None:
-        assert not hasattr(manager, "_speculative_state")
+        assert manager._speculative_state is manager._kda_replay
 
 
-def test_base_manager_does_not_own_speculative_state():
-    forbidden = {
-        "_speculative_state",
-        "IntermediateState",
-        "intermediate_ssm_states",
-        "intermediate_conv_states",
-    }
-    for attribute in vars(MambaHybridCacheManagerV2).values():
-        function = attribute.__func__ if isinstance(attribute, classmethod) else attribute
-        if isinstance(function, FunctionType):
-            assert not forbidden.intersection(function.__code__.co_names), function.__name__
-
+def test_base_manager_without_model_state():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.spec_config = None
-    manager._initialize_model_state()
+    manager._speculative_state = manager._initialize_model_state()
+    assert manager._speculative_state is None
     manager._setup_model_state()
     manager._reset_model_slots(object(), [0])
     manager._shutdown_model_state()
-    assert not forbidden.intersection(vars(manager))
+    assert manager.intermediate_state_indices is None
+    assert manager.intermediate_ssm_states is None
+    assert manager.intermediate_conv_states is None
+    assert manager.get_replay_state_update_metadata() is None
+
+
+@pytest.mark.parametrize(
+    "manager_cls",
+    [
+        MambaHybridCacheManager,
+        MambaHybridCacheManagerV2,
+        Qwen35HybridCacheManagerV2,
+        Qwen4ExpHybridCacheManagerV2,
+        KimiK3HybridCacheManagerV2,
+    ],
+)
+def test_seed_accessor_is_not_a_common_manager_capability(manager_cls):
+    assert not hasattr(manager_cls, "get_mamba_ssm_rand_seed")
+
+
+def test_mamba2_seed_lifecycle_without_speculative_decoding():
+    manager = object.__new__(NemotronHybridCacheManagerV2)
+    manager.spec_config = None
+    manager._requested_replay = False
+    manager._state_layout = replace(_layout(), spec_config=None, stochastic_rounding=True)
+    views = _state_views()
+    manager.all_ssm_states = views.all_ssm_states
+    manager.all_conv_states = views.all_conv_states
+    manager._speculative_state = manager._initialize_model_state()
+    manager._setup_model_state()
+    seeds = manager.get_mamba_ssm_rand_seed()
+    before = seeds.clone()
+    manager._reset_model_slots(torch.tensor([1]), [1])
+    assert manager.get_mamba_ssm_rand_seed() is seeds
+    assert seeds[1] != before[1]
+    torch.testing.assert_close(seeds[[0, 2, 3, 4]], before[[0, 2, 3, 4]])
+    assert manager.intermediate_ssm_states is None
+    manager._shutdown_model_state()
+    assert manager.get_mamba_ssm_rand_seed() is None
+
+
+@pytest.mark.parametrize(
+    "state", [IntermediateState(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)]
+)
+def test_common_manager_consumes_model_state_contract(state):
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.spec_config = SimpleNamespace(tokens_per_gen_step=3)
+    manager._speculative_state = state
+    manager._state_layout = _layout()
+    views = _state_views()
+    manager.all_ssm_states = views.all_ssm_states
+    manager.all_conv_states = views.all_conv_states
+    manager.mamba_layer_offsets = {42: 0}
+    manager._setup_model_state()
+    assert manager.intermediate_state_indices is state.intermediate_indices
+    assert manager.intermediate_ssm_states is state.intermediate_ssm
+    assert manager.intermediate_conv_states is state.intermediate_conv
+    payload = manager.mamba_layer_cache(42)
+    assert payload.conv is manager.all_conv_states[0]
+    assert payload.temporal is manager.all_ssm_states[0]
+    if isinstance(state, KDAReplayState):
+        assert payload.kda_qkg_cache is not None
+    elif isinstance(state, ReplayHistory):
+        assert payload.old_x is not None
+    else:
+        assert payload.intermediate_ssm is not None
+    assert (manager.get_replay_state_update_metadata() is not None) == isinstance(
+        state, ReplayHistory
+    )
+    manager._shutdown_model_state()
+    assert manager.intermediate_state_indices is None
+    assert manager.intermediate_ssm_states is None
+    assert manager.intermediate_conv_states is None
 
 
 def test_base_manager_requires_model_for_speculative_decoding():
@@ -327,6 +389,7 @@ def test_base_manager_requires_model_for_speculative_decoding():
     manager.spec_config = SimpleNamespace(tokens_per_gen_step=3)
     with pytest.raises(NotImplementedError, match="model-specific"):
         manager._initialize_model_state()
+    manager._speculative_state = None
     with pytest.raises(NotImplementedError, match="model manager"):
         manager._update_speculative_state(object())
 
@@ -341,7 +404,7 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     manager.spec_config = SimpleNamespace(tokens_per_gen_step=3) if mode != "plain" else None
     manager._requested_replay = mode == "replay"
     _prepare_model_layout(manager)
-    manager._initialize_model_state()
+    manager._speculative_state = manager._initialize_model_state()
     state = manager._speculative_state
     assert isinstance(state, IntermediateState) == (mode != "replay")
     assert isinstance(state, ReplayHistory) == (mode == "replay")
@@ -388,7 +451,7 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     shutdown.assert_called_once_with()
     assert manager.intermediate_ssm_states is None and state.intermediate_conv is None
     if mode == "replay":
-        assert not hasattr(state, "intermediate_ssm")
+        assert state.intermediate_ssm is None
 
 
 def test_ple_adds_buffers_without_overriding_snapshot_or_budget_solver():
@@ -608,8 +671,8 @@ def test_replay_and_intermediate_are_independent_algorithms():
     assert Mamba2State.__bases__ == (IntermediateState,)
     assert not issubclass(ReplayHistory, IntermediateState)
     assert not issubclass(GDNReplayState, Mamba2State)
-    assert not hasattr(ReplayHistory(3), "intermediate_ssm")
-    assert not hasattr(GDNReplayState(3), "intermediate_ssm")
+    assert ReplayHistory(3).intermediate_ssm is None
+    assert GDNReplayState(3).intermediate_ssm is None
     state = IntermediateState()
     assert not {"rand_seed", "_seed_request_counter", "_seed_rank_offset"}.intersection(vars(state))
     assert not hasattr(state, "_promote_conv")
@@ -697,7 +760,7 @@ def test_accepted_state_promotion_preserves_algorithm_boundary(monkeypatch, stat
     assert (cache.intermediate_ssm is None) == replay
     if replay:
         assert state.prev_num_accepted_tokens.tolist() == [0, 0, 3, 0, 1]
-        assert not hasattr(state, "intermediate_ssm")
+        assert state.intermediate_ssm is None
     state.shutdown()
 
 
@@ -1005,8 +1068,9 @@ def test_constructor_validates_before_pool_and_binds_after_slot_capacity(monkeyp
 
     class ObservedQwen4(Qwen4ExpHybridCacheManagerV2):
         def _initialize_model_state(self):
-            super()._initialize_model_state()
+            state = super()._initialize_model_state()
             events.append("validate")
+            return state
 
         def _get_state_buffer(self, local_layer_idx, role, dtype, state_shape):
             assert events[:2] == ["validate", "pool"]

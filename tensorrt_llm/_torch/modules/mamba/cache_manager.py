@@ -191,6 +191,10 @@ class Mamba2State(IntermediateState):
 class ReplayHistory:
     """Own compact Mamba2 replay history, seeds, and bookkeeping."""
 
+    @property
+    def intermediate_ssm(self) -> torch.Tensor | None:
+        return None
+
     def __init__(self, tokens_per_gen_step: int) -> None:
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
@@ -398,6 +402,8 @@ def select_mamba2_state(
 class NemotronHybridCacheManagerV2(MambaHybridCacheManagerV2):
     """Nemotron/Mamba2 geometry, replay selection and seed ownership."""
 
+    _speculative_state: Mamba2State | ReplayHistory
+
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
         self._requested_replay = use_replay_state_update
@@ -405,19 +411,19 @@ class NemotronHybridCacheManagerV2(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> None:
+    def _initialize_model_state(self) -> Mamba2State | ReplayHistory:
         if self._requested_replay is not None:
-            self._speculative_state = create_mamba2_state(
+            state = create_mamba2_state(
                 spec_config=self.spec_config, use_replay=self._requested_replay
             )
         else:
-            self._speculative_state = select_mamba2_state(
+            state = select_mamba2_state(
                 spec_config=self.spec_config,
                 ssm_cache_dtype=self.ssm_state_dtype,
                 stochastic_rounding=self._mamba_ssm_stochastic_rounding,
             )
 
-        if isinstance(self._speculative_state, ReplayHistory):
+        if isinstance(state, ReplayHistory):
             from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
                 _mamba_effective_tp_size,
             )
@@ -426,55 +432,11 @@ class NemotronHybridCacheManagerV2(MambaHybridCacheManagerV2):
                 self._state_layout.mapping
             ):
                 raise ValueError("Replay state groups must be divisible by the effective TP size")
-            self._speculative_state.validate(self._state_layout)
+            state.validate(self._state_layout)
+        return state
 
-    @override
-    def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
-        state = self._speculative_state
-        return state.get_replay_metadata() if isinstance(state, ReplayHistory) else None
-
-    @override
     def get_mamba_ssm_rand_seed(self) -> torch.Tensor | None:
         return self._speculative_state.rand_seed
-
-    @property
-    def intermediate_state_indices(self) -> torch.Tensor | None:
-        return self._speculative_state.intermediate_indices
-
-    @property
-    def intermediate_ssm_states(self) -> torch.Tensor | None:
-        state = self._speculative_state
-        return None if isinstance(state, ReplayHistory) else state.intermediate_ssm
-
-    @property
-    def intermediate_conv_states(self) -> torch.Tensor | None:
-        return self._speculative_state.intermediate_conv
-
-    @override
-    def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
-        if self.spec_config is None:
-            return super().mamba_layer_cache(layer_idx)
-        return self._speculative_state.make_layer_cache(
-            self.mamba_layer_offsets[layer_idx],
-            self.get_conv_states(layer_idx),
-            self.get_ssm_states(layer_idx),
-        )
-
-    @override
-    def _reset_model_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
-        self._speculative_state.reset_slots(slots, host_slots)
-
-    @override
-    def _update_speculative_state(self, batch: MambaAcceptanceBatch) -> None:
-        self._speculative_state.update(batch)
-
-    @override
-    def _setup_model_state(self) -> None:
-        self._speculative_state.bind(self._state_layout, self.all_ssm_states, self.all_conv_states)
-
-    @override
-    def _shutdown_model_state(self) -> None:
-        self._speculative_state.shutdown()
 
 
 def get_nemotron_cache_params(config, *, spec_config=None, quant_config=None):
