@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import tensorrt_llm._torch.modeling_v2 as _modeling_v2
+import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
 
 # The package, not this file: the tree under audit lives under tensorrt_llm/
 # while this test lives under tests/.

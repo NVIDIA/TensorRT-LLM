@@ -5,7 +5,7 @@
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
     flashinfer_silu_and_mul,
 )
 

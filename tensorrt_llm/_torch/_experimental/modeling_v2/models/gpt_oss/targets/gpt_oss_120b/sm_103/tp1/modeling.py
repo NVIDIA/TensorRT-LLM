@@ -42,23 +42,31 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
+    fused_qk_norm_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
+    mxe4m3_mxe2m1_block_scale_moe_runner,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
+    flashinfer_fused_add_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+    flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
+    mxfp8_quantize,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.embedding import embedding
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.empty import empty
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.reshape import reshape
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
-from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
-    mxe4m3_mxe2m1_block_scale_moe_runner,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
-    flashinfer_fused_add_rmsnorm,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
-from tensorrt_llm._torch.modeling_v2.catalog.quantization.mxfp8_quantize import mxfp8_quantize
-from tensorrt_llm._torch.modeling_v2.catalog.torch.embedding import embedding
-from tensorrt_llm._torch.modeling_v2.catalog.torch.empty import empty
-from tensorrt_llm._torch.modeling_v2.catalog.torch.reshape import reshape
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModel,
     DecoderModelForCausalLM,

@@ -4,7 +4,9 @@
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
+    fused_qk_norm_rope,
+)
 
 assert torch.cuda.is_available(), "fused_qk_norm_rope requires a CUDA device"
 
