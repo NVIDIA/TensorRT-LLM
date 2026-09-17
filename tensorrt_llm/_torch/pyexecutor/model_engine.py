@@ -70,11 +70,13 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..speculative.utils import get_static_draft_len, update_draft_len
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig)
 from .engine.cuda_graph import (filter_cuda_graph_batch_sizes,
@@ -127,6 +129,21 @@ def _get_context_prompt_lookahead_token(request: LlmRequest,
 def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
     """Resolve the model-specific Mamba metadata class with a default."""
     return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
+
+
+def resolve_mrope_position_deltas_cache(
+        model: Optional[torch.nn.Module]) -> Optional[torch.Tensor]:
+    """The MRoPE delta cache held by ``model`` or by its draft model.
+
+    ``None`` for every model that does not keep one, which is also how
+    ``should_enable_overlap_headroom`` learns that the seat pool may be widened:
+    the cache is sized from ``max_num_tokens`` rather than from the seat pool.
+    """
+    cache = getattr(model, "mrope_position_deltas_cache", None)
+    if cache is None:
+        cache = getattr(getattr(model, "draft_model", None),
+                        "mrope_position_deltas_cache", None)
+    return cache
 
 
 def _make_single_token_context_graph_batch(
@@ -371,24 +388,13 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        # Disaggregated attention-DP can backfill a batch before the overlap
-        # scheduler releases the previous batch's terminal sequence slots.
         from ._util import (compute_max_num_sequences,
+                            resolved_kv_cache_manager_is_v2,
                             should_enable_adp_dummy_fixes,
-                            should_enable_disagg_adp_overlap_headroom,
                             should_enable_non_overlap_adp_forward_intent,
+                            should_enable_overlap_headroom,
                             should_enable_scheduler_aware_adp_dummy)
-        self._enable_disagg_adp_overlap_headroom = (
-            should_enable_disagg_adp_overlap_headroom(
-                mapping, llm_args.cache_transceiver_config,
-                llm_args.disable_overlap_scheduler))
         self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
-        self.max_num_seq_slots = compute_max_num_sequences(
-            mapping,
-            self.batch_size,
-            llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
-        )
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -490,6 +496,20 @@ class PyTorchModelEngine(ModelEngine):
         self._enable_non_overlap_adp_forward_intent = (
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler))
+        self._enable_overlap_headroom = should_enable_overlap_headroom(
+            mapping,
+            llm_args.disable_overlap_scheduler,
+            kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
+                llm_args.kv_cache_config, self.max_beam_width),
+            is_hybrid=is_hybrid_linear(pretrained_config),
+            has_mrope_delta_cache=resolve_mrope_position_deltas_cache(
+                self.model) is not None)
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping,
+            self.batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=self._enable_overlap_headroom,
+        )
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -690,9 +710,7 @@ class PyTorchModelEngine(ModelEngine):
             # dynamic draft length is enabled; otherwise stays fixed).  Tree
             # modes verify all tree nodes per step, which can be wider than the
             # tree depth used by the drafter loop.
-            self.runtime_draft_len = (self.max_total_draft_tokens
-                                      if not spec_config.is_linear_tree else
-                                      self.max_draft_len)
+            self.runtime_draft_len = get_static_draft_len(self)
 
         else:
             self.without_logits = False
@@ -965,8 +983,7 @@ class PyTorchModelEngine(ModelEngine):
             mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
             spec_config=self.spec_config,
             is_draft_model=self.is_draft_model,
-            num_seq_slots=(self.max_num_seq_slots if
-                           self._enable_disagg_adp_overlap_headroom else None),
+            num_seq_slots=self.max_num_seq_slots,
             original_max_draft_len=self.original_max_draft_len,
             original_max_total_draft_tokens=(
                 self.original_max_total_draft_tokens),
@@ -1170,13 +1187,8 @@ class PyTorchModelEngine(ModelEngine):
         if not self.use_mrope or padded_requests.num_generation_requests == 0:
             return
 
-        mrope_position_deltas_cache = getattr(self.model,
-                                              "mrope_position_deltas_cache",
-                                              None)
-        if mrope_position_deltas_cache is None:
-            mrope_position_deltas_cache = getattr(
-                getattr(self.model, "draft_model", None),
-                "mrope_position_deltas_cache", None)
+        mrope_position_deltas_cache = resolve_mrope_position_deltas_cache(
+            self.model)
         if mrope_position_deltas_cache is None:
             return
 
@@ -2491,11 +2503,7 @@ class PyTorchModelEngine(ModelEngine):
         # Match the runtime_draft_len semantics enforced in _prepare_tp_inputs:
         # logical K for linear-tree modes, total tree tokens for tree decoding.
         # spec_config is None for non-spec models — fall back to max_draft_len (= 0).
-        draft_lengths = [
-            self.max_draft_len if
-            (self.spec_config is None or self.spec_config.is_linear_tree) else
-            self.max_total_draft_tokens
-        ]
+        draft_lengths = [get_static_draft_len(self)]
         should_capture_no_spec = (
             self.max_total_draft_tokens > 0
             and not self.spec_config.spec_dec_mode.use_one_engine()
@@ -2695,7 +2703,6 @@ class PyTorchModelEngine(ModelEngine):
                                 self.spec_config.spec_dec_mode.use_one_engine())
                             self._update_draft_inference_state_for_warmup(
                                 batch, draft_len > 0, resource_manager)
-                            self.runtime_draft_len = draft_len
                             if self._is_encoder_decoder_model():
                                 prepare_cross_batch(batch, resource_manager)
                             self.forward(batch,
@@ -2900,6 +2907,12 @@ class PyTorchModelEngine(ModelEngine):
                                 f"context requests={num_contexts}, "
                                 f"packed encoder tokens={total_encoder_tokens}")
                     saved_enable_spec_decode = self.enable_spec_decode
+                    # The builder above has already set runtime_draft_len to 0,
+                    # so this save/restore cannot recover the pre-builder value.
+                    # This is harmless while encoder-decoder models use
+                    # max_draft_len == 0. Before supporting nonzero drafting,
+                    # save the length before building the batch and extend the
+                    # try/finally to cover batch creation as well.
                     saved_runtime_draft_len = self.runtime_draft_len
                     try:
                         self.enable_spec_decode = False
@@ -3152,6 +3165,7 @@ class PyTorchModelEngine(ModelEngine):
         result = ScheduledRequests()
         result.reset_context_requests(ctx_requests)
         result.generation_requests = gen_requests
+        update_draft_len(self, result, draft_len=get_static_draft_len(self))
         return result
 
     def _create_cuda_graph_warmup_request(
@@ -3347,6 +3361,7 @@ class PyTorchModelEngine(ModelEngine):
             if not self._add_cross_dummy_requests(result.all_requests(),
                                                   resource_manager):
                 return None
+        update_draft_len(self, result, draft_len=draft_len)
         return result
 
     def _get_max_encoder_output_len(self,
@@ -3527,11 +3542,6 @@ class PyTorchModelEngine(ModelEngine):
     def _set_up_spec_metadata(
             self, spec_resource_manager: Optional[BaseResourceManager]):
         spec_config = self.spec_config if self.enable_spec_decode else None
-        # The disaggregated attention-DP overlap path opts into larger metadata
-        # buffers. Passing None preserves the established max_num_requests
-        # fallback for other configurations, including PP.
-        num_seq_slots = (self.max_num_seq_slots
-                         if self._enable_disagg_adp_overlap_headroom else None)
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
@@ -3542,7 +3552,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager=spec_resource_manager,
             is_draft_model=self.is_draft_model,
             max_seq_len=self.max_seq_len,
-            num_seq_slots=num_seq_slots)
+            num_seq_slots=self.max_num_seq_slots)
         return self.spec_metadata
 
     def cleanup(self) -> None:
@@ -4856,7 +4866,7 @@ class PyTorchModelEngine(ModelEngine):
         # For tree decoding, runtime_draft_len should match total tree
         # tokens (not tree depth).  py_executor resets it every iteration.
         if spec_config is not None and not spec_config.is_linear_tree:
-            self.runtime_draft_len = self.max_total_draft_tokens
+            self.runtime_draft_len = get_static_draft_len(self)
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []

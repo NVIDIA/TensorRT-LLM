@@ -1118,8 +1118,10 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator._skip_est = False
     creator._execution_stream = None
     creator._is_disagg = False
+    creator._cache_transceiver_config = None
     creator._mapping = Mock()
     creator._speculative_config = Mock()
+    creator._disable_overlap_scheduler = False
 
     effective_draft_config = Mock()
     effective_draft_config.pretrained_config.torch_dtype = "bfloat16"

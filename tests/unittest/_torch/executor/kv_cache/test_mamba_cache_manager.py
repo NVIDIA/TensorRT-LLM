@@ -949,6 +949,19 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
 
 
+def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_tokens():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 1
+    # The incoming recurrent state replaces the whole local slot, so nothing survives as a hit.
+    assert manager._disagg_transfer_overwrites_whole_cached_prefix()
+
+
+def test_v2_disagg_gen_init_without_local_mamba_layers_keeps_complete_blocks():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 0
+    assert not manager._disagg_transfer_overwrites_whole_cached_prefix()
+
+
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 
@@ -2118,7 +2131,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         config = mgr._build_cache_config(base_config)
         runtime_manager = RuntimeKVCacheManager(config)
         try:
-            statistics = _introspection.storage_statistics(runtime_manager)
+            statistics = runtime_manager.get_storage_statistics()
 
             def _slot_sizes(stat):
                 # cpp binding exposes `slot_sizes`; the Python backend `slot_size`.
@@ -2520,7 +2533,10 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         request_ids = [101, 102, 103, 104]
 
         assert mgr._num_reserved_dummy_slots == 5
-        assert mgr.index_mapper.num_free_slots() == len(request_ids) + 5
+        # The reserved dummy slots sit on top of the admission pool, whose width
+        # depends on the overlap/disagg lease coefficient.
+        initial_free_slots = mgr.index_mapper.num_free_slots()
+        assert initial_free_slots >= len(request_ids) + 5
 
         assert (
             mgr.add_dummy_requests(request_ids, token_nums=[1] * len(request_ids), is_gen=False)
@@ -2543,7 +2559,7 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         all_request_ids = request_ids + cuda_graph_dummy_ids + [ATTENTION_DP_DUMMY_REQUEST_ID]
         state_indices = mgr.get_state_indices(all_request_ids, [False] * len(all_request_ids))
         assert len(set(state_indices)) == len(all_request_ids)
-        assert mgr.index_mapper.num_free_slots() == 0
+        assert mgr.index_mapper.num_free_slots() == initial_free_slots - len(all_request_ids)
     finally:
         mgr.shutdown()
 
