@@ -155,7 +155,8 @@ launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is propagated
 unchanged to every rank and is the way to share downloaded artifacts between
 ranks; populate it before the multi-rank launch, either by installing the
 `flashinfer-cubin` package matching `flashinfer-python` or with a single-rank
-warm-up run.
+warm-up run, and set `FLASHINFER_NO_DOWNLOAD=1` so a missing artifact fails
+instead of being downloaded concurrently into the shared directory.
 
 ### Cannot quit after generation
 

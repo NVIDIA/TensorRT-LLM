@@ -114,6 +114,7 @@ def test_worker_bootstrap_replaces_inherited_managed_workspace(
     rank = mpi_session.mpi4py.MPI.COMM_WORLD.Get_rank()
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(tmp_path / f"rank-{rank}")
     assert os.environ[_FLASHINFER_MANAGED_ENV] == "1"
+    assert _FLASHINFER_CUBIN_ENV not in os.environ
 
 
 def test_worker_bootstrap_falls_back_when_isolation_fails(
@@ -305,13 +306,19 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
     assert env.get(_FLASHINFER_MANAGED_ENV) == expected_marker
 
 
+@pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("explicit_cubin_dir", [False, True])
 def test_mpi_pool_isolates_workspaces_and_keeps_explicit_cubin_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_cubin_dir: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_cubin_dir: bool, nested: bool
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
     monkeypatch.delenv(_FLASHINFER_ISOLATION_ENV, raising=False)
     monkeypatch.delenv(_FLASHINFER_CUBIN_ENV, raising=False)
+    monkeypatch.delenv(_FLASHINFER_MANAGED_ENV, raising=False)
+    if nested:
+        # A pool created inside a TRT-LLM-managed worker replaces the inherited slot.
+        monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, str(tmp_path / "parent-slot"))
+        monkeypatch.setenv(_FLASHINFER_MANAGED_ENV, "1")
     if explicit_cubin_dir:
         monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
     workspace_root = tmp_path / "workspaces"
