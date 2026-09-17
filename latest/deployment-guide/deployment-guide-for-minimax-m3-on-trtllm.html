@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -515,8 +517,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -552,6 +556,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -563,8 +573,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -678,7 +689,7 @@
 <li><p><strong>MXFP8</strong> — an NVIDIA-published checkpoint that quantizes the MoE/Linear weights to MXFP8 while keeping activations and the KV cache in BF16. The weights occupy ~half the memory of BF16, which is the recommended choice for throughput-oriented deployments and is the default for this guide.</p></li>
 </ul>
 <p>The block-sparse attention path does <strong>not</strong> currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.</p>
-<p>This guide deploys MiniMax-M3 on <strong>8x NVIDIA GB200 GPUs across 2 nodes</strong> (4 GPUs per node) using Slurm and the <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see <a class="reference internal" href="#choosing-the-parallelism-strategy-tep-vs-dep"><span class="xref myst">Choosing the Parallelism Strategy</span></a>.</p>
+<p>This guide deploys MiniMax-M3 on <strong>8x NVIDIA GB200 GPUs across 2 nodes</strong> (4 GPUs per node) using Slurm and the <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see <a class="reference internal" href="#recommended-performance-settings">Recommended Performance Settings</a>.</p>
 <p>The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack.</p>
 </section>
 <section id="prerequisites">
@@ -736,7 +747,7 @@ git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/M
 <section id="container-image">
 <h3>Container Image<a class="headerlink" href="#container-image" title="Link to this heading">#</a></h3>
 <p>The TensorRT LLM NVIDIA NGC image is used as the Slurm container:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc26
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc27
 </pre></div>
 </div>
 <p>Note:</p>
@@ -806,7 +817,7 @@ MiniMax-M3’s automatic backend selection and uses the requested policy.</p>
 srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ntasks<span class="w"> </span><span class="m">8</span><span class="w"> </span>--ntasks-per-node<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span>--gres<span class="o">=</span>gpu:4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc26<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc27<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-mounts<span class="o">=</span>/models:/models,/workspace:/workspace,<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>:<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-workdir<span class="w"> </span>/workspace<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">"trtllm-llmapi-launch \</span>
@@ -1220,9 +1231,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -369,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -452,6 +453,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -511,8 +513,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -548,6 +552,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -559,8 +569,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -661,198 +672,14 @@
                   
   <section id="runtime">
 <h1>Runtime<a class="headerlink" href="#runtime" title="Link to this heading">#</a></h1>
-<section id="gptjsonconfig-h">
-<h2>gptJsonConfig.h<a class="headerlink" href="#gptjsonconfig-h" title="Link to this heading">#</a></h2>
+<section id="worldconfig-h">
+<h2>worldConfig.h<a class="headerlink" href="#worldconfig-h" title="Link to this heading">#</a></h2>
 <dl class="cpp type">
 <dt class="sig sig-object cpp" id="_CPPv412tensorrt_llm">
 <span id="_CPPv312tensorrt_llm"></span><span id="_CPPv212tensorrt_llm"></span><span id="tensorrt_llm"></span><span class="target" id="namespacetensorrt__llm"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">tensorrt_llm</span></span></span><br /></dt>
 <dd><dl class="cpp type">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtimeE">
 <span id="_CPPv3N12tensorrt_llm7runtimeE"></span><span id="_CPPv2N12tensorrt_llm7runtimeE"></span><span id="tensorrt_llm::runtime"></span><span class="target" id="namespacetensorrt__llm_1_1runtime"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">runtime</span></span></span><br /></dt>
-<dd><dl class="cpp class">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfigE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfigE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfigE"></span><span id="tensorrt_llm::runtime::GptJsonConfig"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig"></span><span class="k"><span class="pre">class</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">GptJsonConfig</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfigE" title="Link to this definition">#</a><br /></dt>
-<dd><div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-functions">Public Functions</p>
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig13GptJsonConfigENSt6stringENSt6stringENSt6stringE10SizeType3210SizeType3210SizeType3210SizeType3211ModelConfigNSt8optionalI15RuntimeDefaultsEE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig13GptJsonConfigENSt6stringENSt6stringENSt6stringE10SizeType3210SizeType3210SizeType3210SizeType3211ModelConfigNSt8optionalI15RuntimeDefaultsEE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig13GptJsonConfigENSt6stringENSt6stringENSt6stringE10SizeType3210SizeType3210SizeType3210SizeType3211ModelConfigNSt8optionalI15RuntimeDefaultsEE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::GptJsonConfig__ss.ss.ss.SizeType32.SizeType32.SizeType32.SizeType32.ModelConfig.std::optional:RuntimeDefaults:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a712400cdaee8fc97ce35e2299ab1f4af"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">GptJsonConfig</span></span></span><span class="sig-paren">(</span>
-
-<dl>
-<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">name</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">version</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">precision</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">tensorParallelism</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelism</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">contextParallelism</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">gpusPerNode</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfigE" title="tensorrt_llm::runtime::ModelConfig"><span class="n"><span class="pre">ModelConfig</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">modelConfig</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime15RuntimeDefaultsE" title="tensorrt_llm::runtime::RuntimeDefaults"><span class="n"><span class="pre">RuntimeDefaults</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">runtimeDefaults</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">nullopt</span></span></em>,</dd>
-</dl>
-
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig13GptJsonConfigENSt6stringENSt6stringENSt6stringE10SizeType3210SizeType3210SizeType3210SizeType3211ModelConfigNSt8optionalI15RuntimeDefaultsEE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14getModelConfigEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig14getModelConfigEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig14getModelConfigEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getModelConfigC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a5c3285f2c061c1330ca11e1343cf89a2"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfigE" title="tensorrt_llm::runtime::ModelConfig"><span class="n"><span class="pre">ModelConfig</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="sig-name descname"><span class="n"><span class="pre">getModelConfig</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14getModelConfigEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig21getModelConfigMutableEv">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig21getModelConfigMutableEv"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig21getModelConfigMutableEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getModelConfigMutable"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1ad6d1468e250b06a17e67e10b7d94d823"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfigE" title="tensorrt_llm::runtime::ModelConfig"><span class="n"><span class="pre">ModelConfig</span></span></a><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="sig-name descname"><span class="n"><span class="pre">getModelConfigMutable</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig21getModelConfigMutableEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig7getNameEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig7getNameEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig7getNameEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getNameC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a5270fbe10703e1e5fe5d52d104b30cfb"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="sig-name descname"><span class="n"><span class="pre">getName</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig7getNameEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig10getVersionEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig10getVersionEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig10getVersionEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getVersionC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a5900e7d368979420ec10c7635e656ea3"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="sig-name descname"><span class="n"><span class="pre">getVersion</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig10getVersionEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig12getPrecisionEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig12getPrecisionEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig12getPrecisionEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getPrecisionC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a353424dd7b526c63e5d03fedc5314ed1"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="sig-name descname"><span class="n"><span class="pre">getPrecision</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig12getPrecisionEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig20getTensorParallelismEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig20getTensorParallelismEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig20getTensorParallelismEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getTensorParallelismCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1aac7f508e90ae3316d1065b0eb68f8aee"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getTensorParallelism</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig20getTensorParallelismEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig22getPipelineParallelismEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig22getPipelineParallelismEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig22getPipelineParallelismEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getPipelineParallelismCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a075d679a1b8c80bc303441308a9c28bc"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getPipelineParallelism</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig22getPipelineParallelismEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig21getContextParallelismEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig21getContextParallelismEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig21getContextParallelismEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getContextParallelismCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1ad441fbfc413a64d424510520526a38b7"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getContextParallelism</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig21getContextParallelismEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14getGpusPerNodeEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig14getGpusPerNodeEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig14getGpusPerNodeEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getGpusPerNodeCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1ad3b5423d2e378a551e73abce93609667"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getGpusPerNode</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14getGpusPerNodeEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig12getWorldSizeEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig12getWorldSizeEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig12getWorldSizeEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getWorldSizeCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a3023e339b22eca5cf4ba14304c46b567"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getWorldSize</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig12getWorldSizeEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig18getRuntimeDefaultsEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig18getRuntimeDefaultsEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig18getRuntimeDefaultsEv"></span><span id="tensorrt_llm::runtime::GptJsonConfig::getRuntimeDefaultsC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1ac8e7e4aa82a1c14146563b5ee7acd7b8"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime15RuntimeDefaultsE" title="tensorrt_llm::runtime::RuntimeDefaults"><span class="n"><span class="pre">RuntimeDefaults</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getRuntimeDefaults</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig18getRuntimeDefaultsEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfigRKNSt6stringE">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfigRKNSt6stringE"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfigRKNSt6stringE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::engineFilename__WorldConfigCR.ssCRC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1ac663861699ef7f573f64d5fdb89f14af"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">engineFilename</span></span></span><span class="sig-paren">(</span>
-
-<dl>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfigE" title="tensorrt_llm::runtime::WorldConfig"><span class="n"><span class="pre">WorldConfig</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">worldConfig</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">model</span></span></em>,</dd>
-</dl>
-
-<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfigRKNSt6stringE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfig">
-<span id="_CPPv3NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfig"></span><span id="_CPPv2NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfig"></span><span id="tensorrt_llm::runtime::GptJsonConfig::engineFilename__WorldConfigCRC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a9ce08952a809fbe5859a685215dd7258"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">engineFilename</span></span></span><span class="sig-paren">(</span>
-
-<dl>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfigE" title="tensorrt_llm::runtime::WorldConfig"><span class="n"><span class="pre">WorldConfig</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">worldConfig</span></span></em>,</dd>
-</dl>
-
-<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfig" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-<div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-static-functions">Public Static Functions</p>
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt6stringE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt6stringE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt6stringE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::parse__ssCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a258c808e0e2c5445c807ae2f0a257782"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfigE" title="tensorrt_llm::runtime::GptJsonConfig"><span class="n"><span class="pre">GptJsonConfig</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">parse</span></span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">json</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt6stringE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERNSt7istreamE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig5parseERNSt7istreamE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig5parseERNSt7istreamE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::parse__isR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1af74ea4db9854b1f0ddd8aaa0d4a48f39"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfigE" title="tensorrt_llm::runtime::GptJsonConfig"><span class="n"><span class="pre">GptJsonConfig</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">parse</span></span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">istream</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">json</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERNSt7istreamE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt10filesystem4pathE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt10filesystem4pathE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt10filesystem4pathE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::parse__std::filesystem::pathCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a959c20c852124ced898b12bbdeb5d79f"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfigE" title="tensorrt_llm::runtime::GptJsonConfig"><span class="n"><span class="pre">GptJsonConfig</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">parse</span></span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">filesystem</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">path</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt10filesystem4pathE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-<div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-private-members">Private Members</p>
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5mNameE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig5mNameE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig5mNameE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mName__ssC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1aa23cc7f0c9ad465ffdb3c1950876b470"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mName</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5mNameE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig8mVersionE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig8mVersionE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig8mVersionE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mVersion__ssC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a254b88b5fe490e3835177dd32ecb2c8f"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mVersion</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig8mVersionE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig10mPrecisionE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig10mPrecisionE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig10mPrecisionE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mPrecision__ssC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1acf01c9bba53cd18d0ece1026ef19e485"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mPrecision</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig10mPrecisionE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig18mTensorParallelismE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig18mTensorParallelismE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig18mTensorParallelismE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mTensorParallelism__SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1ae1cc00036f7255a4d9580f833f8ab146"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mTensorParallelism</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig18mTensorParallelismE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig20mPipelineParallelismE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig20mPipelineParallelismE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig20mPipelineParallelismE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mPipelineParallelism__SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a5eef99e58f6d89bb63040884a26f4dd6"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mPipelineParallelism</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig20mPipelineParallelismE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig19mContextParallelismE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig19mContextParallelismE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig19mContextParallelismE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mContextParallelism__SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a401239ff678e6761f2ab44f2da2e8480"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mContextParallelism</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig19mContextParallelismE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig12mGpusPerNodeE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig12mGpusPerNodeE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig12mGpusPerNodeE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mGpusPerNode__SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1a719eb6ee79619bdf2997de06d7d93d52"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mGpusPerNode</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig12mGpusPerNodeE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig12mModelConfigE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig12mModelConfigE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig12mModelConfigE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mModelConfig__ModelConfig"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1ada6b440f8e35d7cc663ae5aee2202655"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfigE" title="tensorrt_llm::runtime::ModelConfig"><span class="n"><span class="pre">ModelConfig</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mModelConfig</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig12mModelConfigE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13GptJsonConfig16mRuntimeDefaultsE">
-<span id="_CPPv3N12tensorrt_llm7runtime13GptJsonConfig16mRuntimeDefaultsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13GptJsonConfig16mRuntimeDefaultsE"></span><span id="tensorrt_llm::runtime::GptJsonConfig::mRuntimeDefaults__std::optional:RuntimeDefaults:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptJsonConfig_1abb7f59b5946ca00c70649e7c2554028a"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime15RuntimeDefaultsE" title="tensorrt_llm::runtime::RuntimeDefaults"><span class="n"><span class="pre">RuntimeDefaults</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mRuntimeDefaults</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig16mRuntimeDefaultsE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-</dd></dl>
-
-</dd></dl>
-
-</dd></dl>
-
-</section>
-<section id="worldconfig-h">
-<h2>worldConfig.h<a class="headerlink" href="#worldconfig-h" title="Link to this heading">#</a></h2>
-<dl class="cpp type">
-<dt class="sig sig-object cpp">
-<span class="target" id="namespacetensorrt__llm"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">tensorrt_llm</span></span></span><br /></dt>
-<dd><dl class="cpp type">
-<dt class="sig sig-object cpp">
-<span class="target" id="namespacetensorrt__llm_1_1runtime"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">runtime</span></span></span><br /></dt>
 <dd><dl class="cpp class">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime11WorldConfigE">
 <span id="_CPPv3N12tensorrt_llm7runtime11WorldConfigE"></span><span id="_CPPv2N12tensorrt_llm7runtime11WorldConfigE"></span><span id="tensorrt_llm::runtime::WorldConfig"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1WorldConfig"></span><span class="k"><span class="pre">class</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">WorldConfig</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfigE" title="Link to this definition">#</a><br /></dt>
@@ -1454,41 +1281,6 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode18updatesPositionIdsEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode18updatesPositionIdsEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode18updatesPositionIdsEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::updatesPositionIdsCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1a3ebdee2a9c4aebd54efa347ac4b48d33"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">updatesPositionIds</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode18updatesPositionIdsEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode21requiresAttentionMaskEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode21requiresAttentionMaskEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode21requiresAttentionMaskEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::requiresAttentionMaskCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1adc3b3407372f26c7caf42f09ad5457a8"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">requiresAttentionMask</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode21requiresAttentionMaskEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode19predictsDraftTokensEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode19predictsDraftTokensEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode19predictsDraftTokensEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::predictsDraftTokensCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1a546d33fe11fea48eea7242d4d4279060"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">predictsDraftTokens</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode19predictsDraftTokensEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode18needsKVCacheRewindEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode18needsKVCacheRewindEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode18needsKVCacheRewindEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::needsKVCacheRewindCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1adc46b81262fd8e85146857dee395a438"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">needsKVCacheRewind</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode18needsKVCacheRewindEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode19variableDraftLengthEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode19variableDraftLengthEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode19variableDraftLengthEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::variableDraftLengthCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1a1fbbcb52a29d01aa4326fb6587502539"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">variableDraftLength</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode19variableDraftLengthEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode14hasDraftLogitsEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode14hasDraftLogitsEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode14hasDraftLogitsEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::hasDraftLogitsCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1a013f7fdcadf107956d33adcde8ad38f2"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">hasDraftLogits</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode14hasDraftLogitsEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode20needsDecoderPrologueEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode20needsDecoderPrologueEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode20needsDecoderPrologueEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::needsDecoderPrologueCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1a9153eb4a918de5a7e093e426888d3986"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">needsDecoderPrologue</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode20needsDecoderPrologueEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingModeeqERK23SpeculativeDecodingMode">
 <span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingModeeqERK23SpeculativeDecodingMode"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingModeeqERK23SpeculativeDecodingMode"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::eq-operator__SpeculativeDecodingModeCRC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1a545625bd71856b9ed609b9424ad09fef"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="k"><span class="pre">operator</span></span><span class="o"><span class="pre">==</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingModeE" title="tensorrt_llm::runtime::SpeculativeDecodingMode"><span class="n"><span class="pre">SpeculativeDecodingMode</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">other</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingModeeqERK23SpeculativeDecodingMode" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
@@ -1543,11 +1335,6 @@
 <dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode9anyBitSetE14UnderlyingType">
 <span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode9anyBitSetE14UnderlyingType"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode9anyBitSetE14UnderlyingType"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::anyBitSet__UnderlyingTypeCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1a0a63f2f97f693e4c860330753711cdd6"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">anyBitSet</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode14UnderlyingTypeE" title="tensorrt_llm::runtime::SpeculativeDecodingMode::UnderlyingType"><span class="n"><span class="pre">UnderlyingType</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">bits</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode9anyBitSetE14UnderlyingType" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode9allBitSetE14UnderlyingType">
-<span id="_CPPv3NK12tensorrt_llm7runtime23SpeculativeDecodingMode9allBitSetE14UnderlyingType"></span><span id="_CPPv2NK12tensorrt_llm7runtime23SpeculativeDecodingMode9allBitSetE14UnderlyingType"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingMode::allBitSet__UnderlyingTypeCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingMode_1abc67823d81ebe2d45fbdbd7908e11153"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">allBitSet</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode14UnderlyingTypeE" title="tensorrt_llm::runtime::SpeculativeDecodingMode::UnderlyingType"><span class="n"><span class="pre">UnderlyingType</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">bits</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode9allBitSetE14UnderlyingType" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -4744,16 +4531,6 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig25getMaxDecodingDraftTokensEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig25getMaxDecodingDraftTokensEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig25getMaxDecodingDraftTokensEv"></span><span id="tensorrt_llm::runtime::ModelConfig::getMaxDecodingDraftTokensC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a5fea542584ac51d190be4ad18ebb3489"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getMaxDecodingDraftTokens</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig25getMaxDecodingDraftTokensEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig20getMaxDecodingTokensEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig20getMaxDecodingTokensEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig20getMaxDecodingTokensEv"></span><span id="tensorrt_llm::runtime::ModelConfig::getMaxDecodingTokensCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a3c891a1c7a4a982505fc6c6b8df196fd"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getMaxDecodingTokens</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig20getMaxDecodingTokensEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime11ModelConfig14setContextFMHAEb">
 <span id="_CPPv3N12tensorrt_llm7runtime11ModelConfig14setContextFMHAEb"></span><span id="_CPPv2N12tensorrt_llm7runtime11ModelConfig14setContextFMHAEb"></span><span id="tensorrt_llm::runtime::ModelConfig::setContextFMHA__bCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a462afcfe43deb94f020e90849000455e"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setContextFMHA</span></span></span><span class="sig-paren">(</span><em class="sig-param"><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">contextFMHA</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig14setContextFMHAEb" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
@@ -7660,16 +7437,15 @@
 <dd><div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-functions">Public Functions</p>
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType3210SizeType32">
-<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::SpeculativeDecodingModule__SizeType32.SizeType32.SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1aabf35face1ea9413d8b378bd70a33280"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="k"><span class="pre">explicit</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">SpeculativeDecodingModule</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType32">
+<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::SpeculativeDecodingModule__SizeType32.SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a8590ec4655b1db243e6c676a860781de"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="k"><span class="pre">explicit</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">SpeculativeDecodingModule</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxDraftPathLen</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxDecodingDraftTokens</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxNumPaths</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp function">
@@ -7742,39 +7518,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dl>
 </dd></dl>
 
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule17getNumPackedMasksEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime25SpeculativeDecodingModule17getNumPackedMasksEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime25SpeculativeDecodingModule17getNumPackedMasksEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::getNumPackedMasksC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a78cb7cbc32f4f2cb9a2864c65c3c0d0a"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getNumPackedMasks</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule17getNumPackedMasksEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule14getMaxNumPathsEv">
-<span id="_CPPv3NK12tensorrt_llm7runtime25SpeculativeDecodingModule14getMaxNumPathsEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime25SpeculativeDecodingModule14getMaxNumPathsEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::getMaxNumPathsC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a462630e52247e02e3c01c98a23d1f705"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getMaxNumPaths</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule14getMaxNumPathsEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule17setMaxDraftTokensE10SizeType32">
-<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule17setMaxDraftTokensE10SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule17setMaxDraftTokensE10SizeType32"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::setMaxDraftTokens__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a6bfb797bb4ba7bfba00fbbdec168e983"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setMaxDraftTokens</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxDraftTokens</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule17setMaxDraftTokensE10SizeType32" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule18setMaxDraftPathLenE10SizeType32">
-<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule18setMaxDraftPathLenE10SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule18setMaxDraftPathLenE10SizeType32"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::setMaxDraftPathLen__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a6f550a2b2d37b70fd653b5738da40be3"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setMaxDraftPathLen</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxDraftPathLen</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule18setMaxDraftPathLenE10SizeType32" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule14setMaxNumPathsE10SizeType32">
-<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule14setMaxNumPathsE10SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule14setMaxNumPathsE10SizeType32"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::setMaxNumPaths__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a84e469ace7d51c3fe1d38d02a679480f"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setMaxNumPaths</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxNumPaths</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule14setMaxNumPathsE10SizeType32" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-<div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-private-functions">Private Functions</p>
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule21computeNumPackedMasksEv">
-<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule21computeNumPackedMasksEv"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule21computeNumPackedMasksEv"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::computeNumPackedMasks"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1af7f830a6266ee46c0b91414b70c36c6b"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">computeNumPackedMasks</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule21computeNumPackedMasksEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
 </div>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-private-members">Private Members</p>
@@ -7786,16 +7529,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule23mMaxDecodingDraftTokensE">
 <span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule23mMaxDecodingDraftTokensE"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule23mMaxDecodingDraftTokensE"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::mMaxDecodingDraftTokens__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1af863071adbd70ecffa6659a361c200de"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mMaxDecodingDraftTokens</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule23mMaxDecodingDraftTokensE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule12mMaxNumPathsE">
-<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule12mMaxNumPathsE"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule12mMaxNumPathsE"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::mMaxNumPaths__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a00d82632302e77fd010e983272e65410"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mMaxNumPaths</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule12mMaxNumPathsE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule18mMaxNumPackedMasksE">
-<span id="_CPPv3N12tensorrt_llm7runtime25SpeculativeDecodingModule18mMaxNumPackedMasksE"></span><span id="_CPPv2N12tensorrt_llm7runtime25SpeculativeDecodingModule18mMaxNumPackedMasksE"></span><span id="tensorrt_llm::runtime::SpeculativeDecodingModule::mMaxNumPackedMasks__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1SpeculativeDecodingModule_1a0229e91e73bbb60aa933cc5c37e1deab"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mMaxNumPackedMasks</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule18mMaxNumPackedMasksE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -9038,84 +8771,52 @@ one more than decoding draft tokens for prediction from primary head </p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gptjsonconfig-h">gptJsonConfig.h</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worldconfig-h">worldConfig.h</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv412tensorrt_llm"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtimeE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfigE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::GptJsonConfig</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig13GptJsonConfigENSt6stringENSt6stringENSt6stringE10SizeType3210SizeType3210SizeType3210SizeType3211ModelConfigNSt8optionalI15RuntimeDefaultsEE"><code class="docutils literal notranslate"><span class="pre">GptJsonConfig()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14getModelConfigEv"><code class="docutils literal notranslate"><span class="pre">getModelConfig()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig21getModelConfigMutableEv"><code class="docutils literal notranslate"><span class="pre">getModelConfigMutable()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig7getNameEv"><code class="docutils literal notranslate"><span class="pre">getName()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig10getVersionEv"><code class="docutils literal notranslate"><span class="pre">getVersion()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig12getPrecisionEv"><code class="docutils literal notranslate"><span class="pre">getPrecision()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig20getTensorParallelismEv"><code class="docutils literal notranslate"><span class="pre">getTensorParallelism()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig22getPipelineParallelismEv"><code class="docutils literal notranslate"><span class="pre">getPipelineParallelism()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig21getContextParallelismEv"><code class="docutils literal notranslate"><span class="pre">getContextParallelism()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14getGpusPerNodeEv"><code class="docutils literal notranslate"><span class="pre">getGpusPerNode()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig12getWorldSizeEv"><code class="docutils literal notranslate"><span class="pre">getWorldSize()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig18getRuntimeDefaultsEv"><code class="docutils literal notranslate"><span class="pre">getRuntimeDefaults()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfigRKNSt6stringE"><code class="docutils literal notranslate"><span class="pre">engineFilename()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime13GptJsonConfig14engineFilenameERK11WorldConfig"><code class="docutils literal notranslate"><span class="pre">engineFilename()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt6stringE"><code class="docutils literal notranslate"><span class="pre">parse()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERNSt7istreamE"><code class="docutils literal notranslate"><span class="pre">parse()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt10filesystem4pathE"><code class="docutils literal notranslate"><span class="pre">parse()</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5mNameE"><code class="docutils literal notranslate"><span class="pre">mName</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig8mVersionE"><code class="docutils literal notranslate"><span class="pre">mVersion</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig10mPrecisionE"><code class="docutils literal notranslate"><span class="pre">mPrecision</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig18mTensorParallelismE"><code class="docutils literal notranslate"><span class="pre">mTensorParallelism</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig20mPipelineParallelismE"><code class="docutils literal notranslate"><span class="pre">mPipelineParallelism</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig19mContextParallelismE"><code class="docutils literal notranslate"><span class="pre">mContextParallelism</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig12mGpusPerNodeE"><code class="docutils literal notranslate"><span class="pre">mGpusPerNode</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig12mModelConfigE"><code class="docutils literal notranslate"><span class="pre">mModelConfig</span></code></a></li>
-<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig16mRuntimeDefaultsE"><code class="docutils literal notranslate"><span class="pre">mRuntimeDefaults</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfigE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::WorldConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig11WorldConfigE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt8optionalINSt6vectorI10SizeType32EEEEb"><code class="docutils literal notranslate"><span class="pre">WorldConfig()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig7getSizeEv"><code class="docutils literal notranslate"><span class="pre">getSize()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig20getTensorParallelismEv"><code class="docutils literal notranslate"><span class="pre">getTensorParallelism()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig16isTensorParallelEv"><code class="docutils literal notranslate"><span class="pre">isTensorParallel()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig22getPipelineParallelismEv"><code class="docutils literal notranslate"><span class="pre">getPipelineParallelism()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig18isPipelineParallelEv"><code class="docutils literal notranslate"><span class="pre">isPipelineParallel()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig21getContextParallelismEv"><code class="docutils literal notranslate"><span class="pre">getContextParallelism()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig17isContextParallelEv"><code class="docutils literal notranslate"><span class="pre">isContextParallel()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig7getRankEv"><code class="docutils literal notranslate"><span class="pre">getRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig14getGpusPerNodeEv"><code class="docutils literal notranslate"><span class="pre">getGpusPerNode()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig15getGpusPerGroupEv"><code class="docutils literal notranslate"><span class="pre">getGpusPerGroup()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig9getDeviceEv"><code class="docutils literal notranslate"><span class="pre">getDevice()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig11getDeviceOfE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getDeviceOf()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig23getPipelineParallelRankEv"><code class="docutils literal notranslate"><span class="pre">getPipelineParallelRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig21getTensorParallelRankEv"><code class="docutils literal notranslate"><span class="pre">getTensorParallelRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig22getContextParallelRankEv"><code class="docutils literal notranslate"><span class="pre">getContextParallelRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig12getLocalRankEv"><code class="docutils literal notranslate"><span class="pre">getLocalRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig11getNodeRankEv"><code class="docutils literal notranslate"><span class="pre">getNodeRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig13getNodeRankOfE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getNodeRankOf()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig27isFirstPipelineParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isFirstPipelineParallelRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig26isLastPipelineParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isLastPipelineParallelRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig25isFirstTensorParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isFirstTensorParallelRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig26isFirstContextParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isFirstContextParallelRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig11getLastRankEv"><code class="docutils literal notranslate"><span class="pre">getLastRank()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig17enableAttentionDPEv"><code class="docutils literal notranslate"><span class="pre">enableAttentionDP()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig24getPipelineParallelGroupEv"><code class="docutils literal notranslate"><span class="pre">getPipelineParallelGroup()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig22getTensorParallelGroupEv"><code class="docutils literal notranslate"><span class="pre">getTensorParallelGroup()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig23getContextParallelGroupEv"><code class="docutils literal notranslate"><span class="pre">getContextParallelGroup()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig14validMpiConfigEv"><code class="docutils literal notranslate"><span class="pre">validMpiConfig()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig3mpiE10SizeType32NSt8optionalI10SizeType32EENSt8optionalI10SizeType32EENSt8optionalI10SizeType32EERKNSt8optionalINSt6vectorI10SizeType32EEEEb"><code class="docutils literal notranslate"><span class="pre">mpi()</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig19kDefaultGpusPerNodeE"><code class="docutils literal notranslate"><span class="pre">kDefaultGpusPerNode</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig18mTensorParallelismE"><code class="docutils literal notranslate"><span class="pre">mTensorParallelism</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig20mPipelineParallelismE"><code class="docutils literal notranslate"><span class="pre">mPipelineParallelism</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig19mContextParallelismE"><code class="docutils literal notranslate"><span class="pre">mContextParallelism</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig5mRankE"><code class="docutils literal notranslate"><span class="pre">mRank</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig12mGpusPerNodeE"><code class="docutils literal notranslate"><span class="pre">mGpusPerNode</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig18mEnableAttentionDPE"><code class="docutils literal notranslate"><span class="pre">mEnableAttentionDP</span></code></a></li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig10mDeviceIdsE"><code class="docutils literal notranslate"><span class="pre">mDeviceIds</span></code></a></li>
 </ul>
 </li>
 </ul>
 </li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worldconfig-h">worldConfig.h</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfigE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::WorldConfig</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig11WorldConfigE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt8optionalINSt6vectorI10SizeType32EEEEb"><code class="docutils literal notranslate"><span class="pre">WorldConfig()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig7getSizeEv"><code class="docutils literal notranslate"><span class="pre">getSize()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig20getTensorParallelismEv"><code class="docutils literal notranslate"><span class="pre">getTensorParallelism()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig16isTensorParallelEv"><code class="docutils literal notranslate"><span class="pre">isTensorParallel()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig22getPipelineParallelismEv"><code class="docutils literal notranslate"><span class="pre">getPipelineParallelism()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig18isPipelineParallelEv"><code class="docutils literal notranslate"><span class="pre">isPipelineParallel()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig21getContextParallelismEv"><code class="docutils literal notranslate"><span class="pre">getContextParallelism()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig17isContextParallelEv"><code class="docutils literal notranslate"><span class="pre">isContextParallel()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig7getRankEv"><code class="docutils literal notranslate"><span class="pre">getRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig14getGpusPerNodeEv"><code class="docutils literal notranslate"><span class="pre">getGpusPerNode()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig15getGpusPerGroupEv"><code class="docutils literal notranslate"><span class="pre">getGpusPerGroup()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig9getDeviceEv"><code class="docutils literal notranslate"><span class="pre">getDevice()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig11getDeviceOfE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getDeviceOf()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig23getPipelineParallelRankEv"><code class="docutils literal notranslate"><span class="pre">getPipelineParallelRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig21getTensorParallelRankEv"><code class="docutils literal notranslate"><span class="pre">getTensorParallelRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig22getContextParallelRankEv"><code class="docutils literal notranslate"><span class="pre">getContextParallelRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig12getLocalRankEv"><code class="docutils literal notranslate"><span class="pre">getLocalRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig11getNodeRankEv"><code class="docutils literal notranslate"><span class="pre">getNodeRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig13getNodeRankOfE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getNodeRankOf()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig27isFirstPipelineParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isFirstPipelineParallelRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig26isLastPipelineParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isLastPipelineParallelRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig25isFirstTensorParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isFirstTensorParallelRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig26isFirstContextParallelRankEv"><code class="docutils literal notranslate"><span class="pre">isFirstContextParallelRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig11getLastRankEv"><code class="docutils literal notranslate"><span class="pre">getLastRank()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig17enableAttentionDPEv"><code class="docutils literal notranslate"><span class="pre">enableAttentionDP()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig24getPipelineParallelGroupEv"><code class="docutils literal notranslate"><span class="pre">getPipelineParallelGroup()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig22getTensorParallelGroupEv"><code class="docutils literal notranslate"><span class="pre">getTensorParallelGroup()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig23getContextParallelGroupEv"><code class="docutils literal notranslate"><span class="pre">getContextParallelGroup()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11WorldConfig14validMpiConfigEv"><code class="docutils literal notranslate"><span class="pre">validMpiConfig()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig3mpiE10SizeType32NSt8optionalI10SizeType32EENSt8optionalI10SizeType32EENSt8optionalI10SizeType32EERKNSt8optionalINSt6vectorI10SizeType32EEEEb"><code class="docutils literal notranslate"><span class="pre">mpi()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig19kDefaultGpusPerNodeE"><code class="docutils literal notranslate"><span class="pre">kDefaultGpusPerNode</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig18mTensorParallelismE"><code class="docutils literal notranslate"><span class="pre">mTensorParallelism</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig20mPipelineParallelismE"><code class="docutils literal notranslate"><span class="pre">mPipelineParallelism</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig19mContextParallelismE"><code class="docutils literal notranslate"><span class="pre">mContextParallelism</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig5mRankE"><code class="docutils literal notranslate"><span class="pre">mRank</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig12mGpusPerNodeE"><code class="docutils literal notranslate"><span class="pre">mGpusPerNode</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig18mEnableAttentionDPE"><code class="docutils literal notranslate"><span class="pre">mEnableAttentionDP</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11WorldConfig10mDeviceIdsE"><code class="docutils literal notranslate"><span class="pre">mDeviceIds</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -9183,13 +8884,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode19isLookaheadDecodingEv"><code class="docutils literal notranslate"><span class="pre">isLookaheadDecoding()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode21isExplicitDraftTokensEv"><code class="docutils literal notranslate"><span class="pre">isExplicitDraftTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode7isEagleEv"><code class="docutils literal notranslate"><span class="pre">isEagle()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode18updatesPositionIdsEv"><code class="docutils literal notranslate"><span class="pre">updatesPositionIds()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode21requiresAttentionMaskEv"><code class="docutils literal notranslate"><span class="pre">requiresAttentionMask()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode19predictsDraftTokensEv"><code class="docutils literal notranslate"><span class="pre">predictsDraftTokens()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode18needsKVCacheRewindEv"><code class="docutils literal notranslate"><span class="pre">needsKVCacheRewind()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode19variableDraftLengthEv"><code class="docutils literal notranslate"><span class="pre">variableDraftLength()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode14hasDraftLogitsEv"><code class="docutils literal notranslate"><span class="pre">hasDraftLogits()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode20needsDecoderPrologueEv"><code class="docutils literal notranslate"><span class="pre">needsDecoderPrologue()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingModeeqERK23SpeculativeDecodingMode"><code class="docutils literal notranslate"><span class="pre">operator==()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode23SpeculativeDecodingModeE14UnderlyingType"><code class="docutils literal notranslate"><span class="pre">SpeculativeDecodingMode()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode4NoneEv"><code class="docutils literal notranslate"><span class="pre">None()</span></code></a></li>
@@ -9199,7 +8893,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode19ExplicitDraftTokensEv"><code class="docutils literal notranslate"><span class="pre">ExplicitDraftTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode5EagleEv"><code class="docutils literal notranslate"><span class="pre">Eagle()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode9anyBitSetE14UnderlyingType"><code class="docutils literal notranslate"><span class="pre">anyBitSet()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime23SpeculativeDecodingMode9allBitSetE14UnderlyingType"><code class="docutils literal notranslate"><span class="pre">allBitSet()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode6mStateE"><code class="docutils literal notranslate"><span class="pre">mState</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode5kNoneE"><code class="docutils literal notranslate"><span class="pre">kNone</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23SpeculativeDecodingMode20kDraftTokensExternalE"><code class="docutils literal notranslate"><span class="pre">kDraftTokensExternal</span></code></a></li>
@@ -9683,8 +9376,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig23computeGenerationLogitsEb"><code class="docutils literal notranslate"><span class="pre">computeGenerationLogits()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig15getModelVariantEv"><code class="docutils literal notranslate"><span class="pre">getModelVariant()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig15setModelVariantE12ModelVariant"><code class="docutils literal notranslate"><span class="pre">setModelVariant()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig25getMaxDecodingDraftTokensEv"><code class="docutils literal notranslate"><span class="pre">getMaxDecodingDraftTokens()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig20getMaxDecodingTokensEv"><code class="docutils literal notranslate"><span class="pre">getMaxDecodingTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig14setContextFMHAEb"><code class="docutils literal notranslate"><span class="pre">setContextFMHA()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig14getContextFMHAEv"><code class="docutils literal notranslate"><span class="pre">getContextFMHA()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig19setPagedContextFMHAEb"><code class="docutils literal notranslate"><span class="pre">setPagedContextFMHA()</span></code></a></li>
@@ -10067,7 +9758,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#speculativedecodingmodule-h">speculativeDecodingModule.h</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModuleE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::SpeculativeDecodingModule</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">SpeculativeDecodingModule()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">SpeculativeDecodingModule()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleEv"><code class="docutils literal notranslate"><span class="pre">SpeculativeDecodingModule()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModuleD0Ev"><code class="docutils literal notranslate"><span class="pre">~SpeculativeDecodingModule()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule25SpeculativeDecodingModuleERK25SpeculativeDecodingModule"><code class="docutils literal notranslate"><span class="pre">SpeculativeDecodingModule()</span></code></a></li>
@@ -10076,16 +9767,8 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule13getMaxPathLenEv"><code class="docutils literal notranslate"><span class="pre">getMaxPathLen()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule25getMaxDecodingDraftTokensEv"><code class="docutils literal notranslate"><span class="pre">getMaxDecodingDraftTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule20getMaxDecodingTokensEv"><code class="docutils literal notranslate"><span class="pre">getMaxDecodingTokens()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule17getNumPackedMasksEv"><code class="docutils literal notranslate"><span class="pre">getNumPackedMasks()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime25SpeculativeDecodingModule14getMaxNumPathsEv"><code class="docutils literal notranslate"><span class="pre">getMaxNumPaths()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule17setMaxDraftTokensE10SizeType32"><code class="docutils literal notranslate"><span class="pre">setMaxDraftTokens()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule18setMaxDraftPathLenE10SizeType32"><code class="docutils literal notranslate"><span class="pre">setMaxDraftPathLen()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule14setMaxNumPathsE10SizeType32"><code class="docutils literal notranslate"><span class="pre">setMaxNumPaths()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule21computeNumPackedMasksEv"><code class="docutils literal notranslate"><span class="pre">computeNumPackedMasks()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule16mMaxDraftPathLenE"><code class="docutils literal notranslate"><span class="pre">mMaxDraftPathLen</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule23mMaxDecodingDraftTokensE"><code class="docutils literal notranslate"><span class="pre">mMaxDecodingDraftTokens</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule12mMaxNumPathsE"><code class="docutils literal notranslate"><span class="pre">mMaxNumPaths</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModule18mMaxNumPackedMasksE"><code class="docutils literal notranslate"><span class="pre">mMaxNumPackedMasks</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -10399,9 +10082,9 @@ one more than decoding draft tokens for prediction from primary head </p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

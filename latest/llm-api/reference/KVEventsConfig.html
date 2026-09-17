@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>VisualGen CUDA Graphs &#8212; TensorRT LLM</title>
+    <title>KVEventsConfig &#8212; TensorRT LLM</title>
   
   
   
@@ -59,11 +59,11 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'visual-gen/features/cuda-graph';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/KVEventsConfig';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,11 +73,13 @@
 
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="MambaStateConfig" href="MambaStateConfig.html" />
+    <link rel="prev" title="KvCacheConfig" href="KvCacheConfig.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -369,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -437,72 +440,73 @@
 </details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../reference.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MultimodalConfig.html">MultimodalConfig</a></li>
 </ul>
 </details></li>
 </ul>
@@ -511,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -548,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -559,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -642,7 +655,10 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">VisualGen CUDA Graphs</span></li>
+    
+    <li class="breadcrumb-item"><a href="../reference.html" class="nav-link">API Reference</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KVEventsConfig</span></li>
   </ul>
 </nav>
 </div>
@@ -659,83 +675,121 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="visualgen-cuda-graphs">
-<h1>VisualGen CUDA Graphs<a class="headerlink" href="#visualgen-cuda-graphs" title="Link to this heading">#</a></h1>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>This page is an unindexed draft until the VisualGen documentation hub is introduced.</p>
-</div>
-<ul class="simple">
-<li><p><a class="reference internal" href="#overview">Overview</a></p></li>
-<li><p><a class="reference internal" href="#configuration">Configuration</a></p></li>
-<li><p><a class="reference internal" href="#capture-scope">Capture Scope</a></p></li>
-<li><p><a class="reference internal" href="#graph-keys">Graph Keys</a></p></li>
-<li><p><a class="reference internal" href="#extra-keys">Extra Keys</a></p></li>
-<li><p><a class="reference internal" href="#capture-and-replay">Capture and Replay</a></p></li>
-<li><p><a class="reference internal" href="#implementation-notes">Implementation Notes</a></p></li>
+  <section id="kveventsconfig">
+<h1>KVEventsConfig<a class="headerlink" href="#kveventsconfig" title="Link to this heading">#</a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">KVEventsConfig</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_cache_events</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">publisher</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'null'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'zmq'</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">endpoint</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Annotated</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">MinLen</span><span class="p"><span class="pre">(</span></span><span class="n"><span class="pre">min_length</span></span><span class="o"><span class="pre">=</span></span><span class="m"><span class="pre">1</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'tcp://*:5557'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">replay_endpoint</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Annotated</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">MinLen</span><span class="p"><span class="pre">(</span></span><span class="n"><span class="pre">min_length</span></span><span class="o"><span class="pre">=</span></span><span class="m"><span class="pre">1</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">buffer_steps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Annotated</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Gt</span><span class="p"><span class="pre">(</span></span><span class="n"><span class="pre">gt</span></span><span class="o"><span class="pre">=</span></span><span class="m"><span class="pre">0</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">10000</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hwm</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Annotated</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Gt</span><span class="p"><span class="pre">(</span></span><span class="n"><span class="pre">gt</span></span><span class="o"><span class="pre">=</span></span><span class="m"><span class="pre">0</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">100000</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_queue_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Annotated</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Gt</span><span class="p"><span class="pre">(</span></span><span class="n"><span class="pre">gt</span></span><span class="o"><span class="pre">=</span></span><span class="m"><span class="pre">0</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">100000</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">topic</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">''</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#KVEventsConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">StrictBaseModel</span></code></p>
+<p>Configuration for streaming (push-based) KV cache event publishing.</p>
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.buffer_steps">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">buffer_steps</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">10000</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.buffer_steps" title="Link to this definition">#</a></dt>
+<dd><p>Number of previously published batches retained for replay.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Constraints<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>gt</strong> = 0</p></li>
 </ul>
-<section id="overview">
-<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
-<p>VisualGen CUDA graphs reduce Python and CUDA launch overhead during the denoising loop by capturing transformer forward calls and replaying them for later denoising steps with compatible inputs.</p>
-<p>This is separate from LLM generation-only CUDA graphs and from the PyTorch backend’s torch.compile / Piecewise CUDA Graph flow. VisualGen pipelines have their own <code class="docutils literal notranslate"><span class="pre">CUDAGraphRunner</span></code> because diffusion inference has a different execution shape: a fixed denoising loop, model-specific transformer inputs, optional cache acceleration, and optional multi-component pipelines.</p>
-</section>
-<section id="configuration">
-<h2>Configuration<a class="headerlink" href="#configuration" title="Link to this heading">#</a></h2>
-<p>CUDA graph capture is controlled by <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.cuda_graph_config</span></code>:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cuda_graph_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">enable</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-</pre></div>
-</div>
-<p>The public option is intentionally small. Warmup shapes are configured through <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>, which is shared with torch.compile warmup.</p>
-</section>
-<section id="capture-scope">
-<h2>Capture Scope<a class="headerlink" href="#capture-scope" title="Link to this heading">#</a></h2>
-<p>VisualGen captures transformer component forward calls, not the full pipeline.</p>
-<p>Captured:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">transformer.forward</span></code> for the primary diffusion transformer.</p></li>
-<li><p>Additional transformer components such as <code class="docutils literal notranslate"><span class="pre">transformer_2</span></code> when a pipeline has multiple transformer stages.</p></li>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.enable_kv_cache_events">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_kv_cache_events</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.enable_kv_cache_events" title="Link to this definition">#</a></dt>
+<dd><p>Whether to produce and publish KV cache events over the streaming (push) path.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.endpoint">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">endpoint</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'tcp://*:5557'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.endpoint" title="Link to this definition">#</a></dt>
+<dd><p>Base ZeroMQ endpoint the publisher binds. Each attention-DP rank binds base_port+rank, so co-located engines (e.g. disaggregated prefill and decode on one host) must use distinct base ports.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Constraints<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>min_length</strong> = 1</p></li>
 </ul>
-<p>Not captured:</p>
-<ul class="simple">
-<li><p>Prompt encoding.</p></li>
-<li><p>Scheduler step logic.</p></li>
-<li><p>VAE decode.</p></li>
-<li><p>Python-side denoising-loop control flow.</p></li>
-<li><p>TeaCache cache-hit decisions.</p></li>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.hwm">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">hwm</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">100000</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.hwm" title="Link to this definition">#</a></dt>
+<dd><p>ZeroMQ publisher socket high-water mark. 0 means unlimited in ZeroMQ, so it is disallowed here.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Constraints<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>gt</strong> = 0</p></li>
 </ul>
-<p>TeaCache wraps on top of the CUDA graph wrapper. When TeaCache decides a step must compute, it calls the graphed transformer forward. When TeaCache skips a step, no transformer graph replay is needed for that step.</p>
-</section>
-<section id="graph-keys">
-<h2>Graph Keys<a class="headerlink" href="#graph-keys" title="Link to this heading">#</a></h2>
-<p>Each captured graph is stored under a graph key. The default key contains tensor shapes from the wrapped <code class="docutils literal notranslate"><span class="pre">model.forward</span></code> arguments and keyword arguments.</p>
-<p>A graph key is a tuple of named key parts. Shape key parts are derived by the runner, for example <code class="docutils literal notranslate"><span class="pre">(&quot;hidden_states&quot;,</span> <span class="pre">(1,</span> <span class="pre">4096,</span> <span class="pre">3072))</span></code>. Extra key parts can be registered by the model when a non-shape forward input changes graph-visible behavior.</p>
-<p>This separation matters because tensor shapes alone are not always enough. If two forwards have the same shapes but different graph-visible behavior, they must not share a captured graph.</p>
-</section>
-<section id="extra-keys">
-<h2>Extra Keys<a class="headerlink" href="#extra-keys" title="Link to this heading">#</a></h2>
-<p>Models add non-shape graph-key contributors through <code class="docutils literal notranslate"><span class="pre">BaseDiffusionModel.register_cuda_graph_extra_key_fns()</span></code>. The hook receives the model’s <code class="docutils literal notranslate"><span class="pre">CUDAGraphRunner</span></code>; implementations call <code class="docutils literal notranslate"><span class="pre">runner.register_extra_key_fn(name,</span> <span class="pre">fn)</span></code> to register a named callback.</p>
-<p>During key construction, the runner calls each registered callback with the same <code class="docutils literal notranslate"><span class="pre">*args</span></code> and <code class="docutils literal notranslate"><span class="pre">**kwargs</span></code> passed to the wrapped <code class="docutils literal notranslate"><span class="pre">model.forward</span></code>. If the callback returns a non-<code class="docutils literal notranslate"><span class="pre">None</span></code> hashable value, the runner appends <code class="docutils literal notranslate"><span class="pre">(name,</span> <span class="pre">value)</span></code> to the graph key. If it returns <code class="docutils literal notranslate"><span class="pre">None</span></code>, that key part is omitted for the current call.</p>
-<p>Use an extra key when a forward input affects captured kernels or control flow but is not already represented by tensor shapes. For example, <a class="reference internal" href="sparse-attention.html"><span class="std std-doc">Skip Softmax Attention</span></a> can require separate CUDA graphs across its dense and sparse phases even when tensor shapes are identical. The base <code class="docutils literal notranslate"><span class="pre">BaseDiffusionModel</span></code> implementation registers a callback through <code class="docutils literal notranslate"><span class="pre">runner.register_extra_key_fn(...)</span></code> for this case.</p>
-<p>Subclasses can override <code class="docutils literal notranslate"><span class="pre">register_cuda_graph_extra_key_fns()</span></code> to add model-specific contributors. They should call <code class="docutils literal notranslate"><span class="pre">super()</span></code> unless they intentionally replace the shared registrations. This changes graph capture partitioning without exposing internal CUDA graph keys as public model-forward arguments.</p>
-</section>
-<section id="capture-and-replay">
-<h2>Capture and Replay<a class="headerlink" href="#capture-and-replay" title="Link to this heading">#</a></h2>
-<p>Capture is lazy:</p>
-<ol class="arabic simple">
-<li><p>On the first call with a new graph key, VisualGen runs a short warmup, captures a CUDA graph, and stores static input buffers for that key.</p></li>
-<li><p>On later calls with the same key, VisualGen copies new tensor values into the static buffers in place and replays the captured graph.</p></li>
-<li><p>On a call with a different key, VisualGen captures a separate graph.</p></li>
-</ol>
-<p>This means the first denoising step for a new shape or phase pays capture cost. Later matching steps replay the graph.</p>
-<p>When a pipeline has multiple transformer components that do not execute concurrently, VisualGen can share a CUDA graph memory pool across their runners so graph memory can be reused between components.</p>
-</section>
-<section id="implementation-notes">
-<h2>Implementation Notes<a class="headerlink" href="#implementation-notes" title="Link to this heading">#</a></h2>
-<p>The base runner is implemented in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/visual_gen/cuda_graph_runner.py</span></code>. Model components can participate by overriding or extending <code class="docutils literal notranslate"><span class="pre">BaseDiffusionModel.register_cuda_graph_extra_key_fns()</span></code> when they need model-specific graph-key behavior.</p>
-<p>Most VisualGen models use the base runner, which understands flat tensor arguments. LTX-2 uses a model-specific runner because its transformer forward accepts <code class="docutils literal notranslate"><span class="pre">Modality</span></code> dataclasses and other structured inputs that need custom keying, cloning, and replay copying.</p>
-<p>Model authors should add an extra key function or a custom runner whenever non-shape forward inputs affect graph-visible execution. Otherwise, CUDA graph replay may reuse a graph captured for incompatible behavior.</p>
-</section>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.max_queue_size">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_queue_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">100000</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.max_queue_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of batches queued for background publishing. Must be positive; 0 would make the queue unbounded.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Constraints<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>gt</strong> = 0</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.publisher">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">publisher</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'null'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'zmq'</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.publisher" title="Link to this definition">#</a></dt>
+<dd><p>Publisher implementation. Defaults to ‘zmq’ when events are enabled and ‘null’ otherwise.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.replay_endpoint">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">replay_endpoint</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.replay_endpoint" title="Link to this definition">#</a></dt>
+<dd><p>Optional base ZeroMQ endpoint used to replay KV cache events. Ranks apply the same global base_port+rank convention as <cite>endpoint</cite>. Only ranks sharing a host contend for a port, so the two base ports must be at least ranks-per-host apart or a rank’s replay bind collides with another rank’s publish bind on that host.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Constraints<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>min_length</strong> = 1</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.topic">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">topic</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">''</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.topic" title="Link to this definition">#</a></dt>
+<dd><p>ZeroMQ subscription topic used for KV cache event batches.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KVEventsConfig.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">data</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.KVEventsConfig.__init__" title="Link to this definition">#</a></dt>
+<dd><p>Create a new model by parsing and validating input data from keyword arguments.</p>
+<p>Raises [<cite>ValidationError</cite>][pydantic_core.ValidationError] if the input data cannot be
+validated to form a valid model.</p>
+<p><cite>self</cite> is explicitly positional-only to allow <cite>self</cite> as a field name.</p>
+</dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -748,6 +802,24 @@
                 <footer class="prev-next-footer d-print-none">
                   
 <div class="prev-next-area">
+    <a class="left-prev"
+       href="KvCacheConfig.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">KvCacheConfig</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="MambaStateConfig.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">MambaStateConfig</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
 </div>
                 </footer>
               
@@ -769,13 +841,18 @@
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration">Configuration</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#capture-scope">Capture Scope</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#graph-keys">Graph Keys</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#extra-keys">Extra Keys</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#capture-and-replay">Capture and Replay</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#implementation-notes">Implementation Notes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig"><code class="docutils literal notranslate"><span class="pre">KVEventsConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.buffer_steps"><code class="docutils literal notranslate"><span class="pre">buffer_steps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.enable_kv_cache_events"><code class="docutils literal notranslate"><span class="pre">enable_kv_cache_events</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.endpoint"><code class="docutils literal notranslate"><span class="pre">endpoint</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.hwm"><code class="docutils literal notranslate"><span class="pre">hwm</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.max_queue_size"><code class="docutils literal notranslate"><span class="pre">max_queue_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.publisher"><code class="docutils literal notranslate"><span class="pre">publisher</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.replay_endpoint"><code class="docutils literal notranslate"><span class="pre">replay_endpoint</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.topic"><code class="docutils literal notranslate"><span class="pre">topic</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KVEventsConfig.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -867,9 +944,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -367,6 +367,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -450,6 +451,7 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -509,8 +511,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -546,6 +550,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -557,8 +567,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -921,6 +932,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">secondary_offload_min_priority</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">event_buffer_max_size</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_events_gather_period_ms</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_events_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_partial_reuse</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">copy_on_partial_reuse</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_uvm</span></span></em>,</dd>
@@ -947,6 +959,26 @@
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#KvCacheConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
 <dd><p><a class="reference internal" href="reference/KvCacheConfig.html"><span class="doc">View the full KvCacheConfig reference</span></a></p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">KVEventsConfig</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_cache_events</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">publisher</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">endpoint</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">replay_endpoint</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">buffer_steps</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hwm</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_queue_size</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">topic</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#KVEventsConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<dd><p><a class="reference internal" href="reference/KVEventsConfig.html"><span class="doc">View the full KVEventsConfig reference</span></a></p>
 </dd></dl>
 
 <dl class="py class">
@@ -1050,13 +1082,10 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_penalty</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_type</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle_choices</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">greedy_sampling</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">posterior_threshold</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_dynamic_tree</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dynamic_tree_max_topK</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_eagle_layers</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_non_leaves_per_layer</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">eagle3_one_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_layers_to_capture</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_model_arch</span></span></em>,</dd>
 </dl>
@@ -1085,13 +1114,10 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_penalty</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_type</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle_choices</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">greedy_sampling</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">posterior_threshold</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_dynamic_tree</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dynamic_tree_max_topK</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_eagle_layers</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_non_leaves_per_layer</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">eagle3_one_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_layers_to_capture</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_model_arch</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sa_config</span></span></em>,</dd>
@@ -1124,7 +1150,6 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">relaxed_topk</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">relaxed_delta</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_mtp_vanilla</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">mtp_eagle_one_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_dynamic_tree</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dynamic_tree_max_topK</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sa_config</span></span></em>,</dd>
@@ -1592,6 +1617,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_mla_skip_correction</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mla_skip_correction_threshold</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sampler_force_async_worker</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_in_graph_sampling</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_speculative_beam_history_d2h</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_early_first_token_response</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_low_latency_host_dispatch</span></span></em>,</dd>
@@ -1774,6 +1800,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">q_split_threshold</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">indexer_rope_interleave</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_heuristic_topk</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_self_sampling_topk</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_gvr_emission</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">indexer_k_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">index_share_for_mtp_iteration</span></span></em>,</dd>
 </dl>
@@ -1800,6 +1828,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">q_split_threshold</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">indexer_rope_interleave</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_heuristic_topk</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_self_sampling_topk</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_gvr_emission</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">indexer_k_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">index_share_for_mtp_iteration</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">compress_ratios</span></span></em>,</dd>
@@ -1844,6 +1874,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_rank</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_relax</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">agent_hierarchy</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">subagent_affinity_id</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/scheduling_params.html#SchedulingParams"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
@@ -2097,9 +2128,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

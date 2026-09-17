@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Sparse Attention Development Guide" href="sparse-attention-development-guide.html" />
-    <link rel="prev" title="KVCacheManagerV2 Cold-Page Codec Design" href="kv-cache-cold-page-codec.html" />
+    <link rel="next" title="Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html" />
+    <link rel="prev" title="Sparse Attention Development Guide" href="sparse-attention-development-guide.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="current nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -667,9 +678,9 @@
 Sphinx docs build by rendering the committed telemetry manifest
 (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/usage/llm_args_golden_manifest.json</span></code>).</p>
 <p>Start with the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9/README.md">Telemetry Data Collection section in the root README</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/README.md">Telemetry Data Collection section in the root README</a>
 for the user-facing collection and opt-out overview, and the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9/tensorrt_llm/usage/schemas/README.md">telemetry schema reference</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/tensorrt_llm/usage/schemas/README.md">telemetry schema reference</a>
 for the wire schema.</p>
 <p><strong>No PII or free-form fields are captured.</strong> LLM API configuration capture is
 <em>type-driven</em>: fields whose type is categorical (<code class="docutils literal notranslate"><span class="pre">Literal</span></code>/<code class="docutils literal notranslate"><span class="pre">Enum</span></code>/<code class="docutils literal notranslate"><span class="pre">bool</span></code>) or
@@ -686,7 +697,7 @@ below; the runtime can capture nothing absent from this list.</p>
 unset or when the safety sanitizer rejects the runtime value.</p>
 <section id="torchllmargs">
 <h3><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code><a class="headerlink" href="#torchllmargs" title="Link to this heading">#</a></h3>
-<p>296 captured fields.</p>
+<p>300 captured fields.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Captured key</p></th>
@@ -1021,329 +1032,365 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_iter_perf_stats</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_in_graph_sampling</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_iter_req_stats</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_iter_perf_stats</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_layerwise_nvtx_marker</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_iter_req_stats</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_lm_head_tp_in_adp</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_layerwise_nvtx_marker</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_lora</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_lm_head_tp_in_adp</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_low_latency_host_dispatch</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_lora</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_min_latency</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_low_latency_host_dispatch</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_mla_skip_correction</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_min_latency</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_resource_governor</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_mla_skip_correction</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_speculative_beam_history_d2h</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_resource_governor</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encode_only</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_speculative_beam_history_d2h</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.batch_sizes</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encode_only</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.batch_sizes</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[int]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.enable_padding</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.enable_padding</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.max_batch_size</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.max_batch_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.max_num_token</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.max_num_token</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.max_seq_len</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.max_seq_len</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.mode</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.mode</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['encode']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">encode</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.num_tokens</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.num_tokens</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[Annotated[int,</span> <span class="pre">Gt(gt=0)]]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.seq_lens</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config.seq_lens</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[Annotated[int,</span> <span class="pre">Gt(gt=0)]]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">force_dynamic_quantization</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">force_dynamic_quantization</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">garbage_collection_gen0_threshold</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">garbage_collection_gen0_threshold</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gather_generation_logits</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gather_generation_logits</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">generation_config</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">generation_config</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['auto',</span> <span class="pre">'trtllm']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">trtllm</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gms_config.mode</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gms_config.mode</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['auto',</span> <span class="pre">'rw',</span> <span class="pre">'ro']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">rw</span></code>, <code class="docutils literal notranslate"><span class="pre">ro</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gpus_per_node</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gpus_per_node</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">guided_decoding_backend</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">guided_decoding_backend</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Literal['xgrammar',</span> <span class="pre">'llguidance']]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">xgrammar</span></code>, <code class="docutils literal notranslate"><span class="pre">llguidance</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">iter_stats_max_iterations</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">iter_stats_max_iterations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.algorithm</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.algorithm</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['triattention']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p>allowlist</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">quantization_for_cold_page</span></code>, <code class="docutils literal notranslate"><span class="pre">triattention</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.beta</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.beta</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.budget</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.budget</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.eviction_mode</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.eviction_mode</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['union',</span> <span class="pre">'per_head',</span> <span class="pre">'per_layer_perhead']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">union</span></code>, <code class="docutils literal notranslate"><span class="pre">per_head</span></code>, <code class="docutils literal notranslate"><span class="pre">per_layer_perhead</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.normalize_scores</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.normalize_scores</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.quant</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config.quant</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['nvfp4']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.attention_dp_events_gather_period_ms</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.attention_dp_events_gather_period_ms</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.avg_seq_len</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.avg_seq_len</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Annotated[int,</span> <span class="pre">Gt(gt=0)]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.block_reuse_config.max_num_turns</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.block_reuse_config.max_num_turns</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.block_reuse_config.policy</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.block_reuse_config.policy</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['all_reusable',</span> <span class="pre">'per_request',</span> <span class="pre">'per_conversation']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">all_reusable</span></code>, <code class="docutils literal notranslate"><span class="pre">per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">per_conversation</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.copy_on_partial_reuse</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.copy_on_partial_reuse</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.cross_kv_cache_fraction</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.cross_kv_cache_fraction</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.disk_cache_size</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.disk_cache_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Annotated[int,</span> <span class="pre">Ge(ge=0)]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.disk_prefetch_num_reqs</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.disk_prefetch_num_reqs</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'str'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p>allowlist</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">float16</span></code>, <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>, <code class="docutils literal notranslate"><span class="pre">float32</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8_ds_mla</span></code>, <code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_kv_pool_rebalance</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_kv_pool_rebalance</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_partial_reuse</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_partial_reuse</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_swa_scratch_reuse</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_swa_scratch_reuse</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.event_buffer_max_size</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.event_buffer_max_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.fp8_context_mla_kv_len_cap</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.fp8_context_mla_kv_len_cap</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.host_cache_size</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.host_cache_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.iteration_stats_interval</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.iteration_stats_interval</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_cache_event_hash_algo</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_cache_event_hash_algo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['auto',</span> <span class="pre">'v1_block_key',</span> <span class="pre">'v2_sha256',</span> <span class="pre">'v2_sha256_64']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">v1_block_key</span></code>, <code class="docutils literal notranslate"><span class="pre">v2_sha256</span></code>, <code class="docutils literal notranslate"><span class="pre">v2_sha256_64</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_events_config.buffer_steps</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_events_config.enable_kv_cache_events</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_events_config.hwm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_events_config.max_queue_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.kv_events_config.publisher</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Optional[Literal['null',</span> <span class="pre">'zmq']]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
+<td><p></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code>, <code class="docutils literal notranslate"><span class="pre">zmq</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_ssm_cache_dtype</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Literal['auto',</span> <span class="pre">'float16',</span> <span class="pre">'bfloat16',</span> <span class="pre">'float32']</span></code></p></td>
@@ -2107,6 +2154,18 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.use_gvr_emission</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.use_self_sampling_topk</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sparse_attention_config.window_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
@@ -2138,10 +2197,10 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.attention_backend</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Literal['VANILLA',</span> <span class="pre">'TRTLLM']</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Literal['VANILLA',</span> <span class="pre">'TRTLLM',</span> <span class="pre">'FA4']</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">categorical</span></code></p></td>
 <td><p></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, <code class="docutils literal notranslate"><span class="pre">FA4</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.begin_thinking_phase_token</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
@@ -2179,44 +2238,32 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">llama3</span></code>, <code class="docutils literal notranslate"><span class="pre">mistral_large3</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle3_one_model</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle_choices</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.eagle_choices</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[List[List[int]]]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.enable_global_pool</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.enable_global_pool</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.enable_penalty</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.enable_penalty</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.end_thinking_phase_token</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.end_thinking_phase_token</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'int'&gt;</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.global_pool_size</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.global_pool_size</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[Annotated[int,</span> <span class="pre">Gt(gt=0)]]</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.greedy_sampling</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Optional[bool]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -2287,26 +2334,14 @@ unset or when the safety sanitizer rejects the runtime value.</p>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.mtp_eagle_one_model</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">&lt;class</span> <span class="pre">'bool'&gt;</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.num_eagle_layers</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.num_eagle_layers</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.num_nextn_predict_layers</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.num_nextn_predict_layers</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Optional[int]</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_config.posterior_threshold</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Optional[float]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">value</span></code></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -2491,20 +2526,20 @@ unset or when the safety sanitizer rejects the runtime value.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="kv-cache-cold-page-codec.html"
+       href="sparse-attention-development-guide.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">KVCacheManagerV2 Cold-Page Codec Design</p>
+        <p class="prev-next-title">Sparse Attention Development Guide</p>
       </div>
     </a>
     <a class="right-next"
-       href="sparse-attention-development-guide.html"
+       href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Sparse Attention Development Guide</p>
+        <p class="prev-next-title">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -2624,9 +2659,9 @@ unset or when the safety sanitizer rejects the runtime value.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

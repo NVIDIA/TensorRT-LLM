@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -369,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -452,6 +453,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -511,8 +513,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -548,6 +552,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -559,8 +569,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -660,7 +671,7 @@
                 <article class="bd-article">
                   
   <section class="tex2jax_ignore mathjax_ignore" id="tensorrt-llm-build-workflow">
-<h1>TensorRT-LLM Build Workflow<a class="headerlink" href="#tensorrt-llm-build-workflow" title="Link to this heading">#</a></h1>
+<span id="workflow"></span><h1>TensorRT-LLM Build Workflow<a class="headerlink" href="#tensorrt-llm-build-workflow" title="Link to this heading">#</a></h1>
 <div class="admonition caution">
 <p class="admonition-title">Caution</p>
 <p>The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.</p>
@@ -711,7 +722,7 @@ or the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM
 </pre></div>
 </div>
 <p>Then, in the convert_checkpoint.py script in the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama/"><code class="docutils literal notranslate"><span class="pre">examples/models/core/llama/</span></code></a> directory of the GitHub repo,
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.0/examples/models/core/llama/"><code class="docutils literal notranslate"><span class="pre">examples/models/core/llama/</span></code></a> directory of the GitHub repo,
 the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the <code class="docutils literal notranslate"><span class="pre">from_hugging_face</span></code> API will keep the same, thus the existing workflow using this interface will not be affected.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1">#other args omitted for simplicity here.</span>
 <span class="n">llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">)</span>
@@ -747,7 +758,7 @@ directory support JAX and Keras formats in addition to Hugging Face. The model d
 <p>In TensorRT-LLM 0.8 version:</p>
 <ul class="simple">
 <li><p>For Modelopt-supported quantization algorithms, a standalone script,
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/quantization/quantize.py">example/quantization/quantize.py</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/quantization/quantize.py">example/quantization/quantize.py</a>
 can export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.</p></li>
 <li><p>For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.</p></li>
 </ul>
@@ -985,9 +996,9 @@ The usage of this API looks like this:</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

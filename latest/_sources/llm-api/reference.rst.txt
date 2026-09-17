@@ -47,6 +47,7 @@ API Reference
     reference/DisaggScheduleStyle
     reference/BlockReuseConfig
     reference/KvCacheConfig
+    reference/KVEventsConfig
     reference/MambaStateConfig
     reference/KvCacheRetentionConfig
     reference/CudaGraphConfig
@@ -160,6 +161,11 @@ This page provides a searchable index of API names and parameters. Open an entry
     :no-index:
 
     :doc:`View the full KvCacheConfig reference <reference/KvCacheConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.KVEventsConfig
+    :no-index:
+
+    :doc:`View the full KVEventsConfig reference <reference/KVEventsConfig>`
 
 .. autoclass:: tensorrt_llm.llmapi.MambaStateConfig
     :no-index:

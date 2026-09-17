@@ -8,4 +8,4 @@ TorchLlmArgs
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: copy,model_fields,model_copy,validate,parse_obj,model_validate_strings,model_rebuild,model_post_init,from_orm,model_json_schema,model_extra,model_dump_json,model_config,dict,schema,update_forward_refs,model_dump,model_validate_json,json,construct,model_validate,model_fields_set,model_computed_fields,model_construct,parse_file,model_parametrized_name,schema_json,parse_raw
+    :exclude-members: model_post_init,construct,validate,model_extra,model_fields,model_config,model_copy,parse_raw,schema,model_json_schema,model_construct,schema_json,model_computed_fields,model_validate,parse_obj,Config,model_fields_set,parse_file,update_forward_refs,model_rebuild,model_dump_json,model_dump,json,model_parametrized_name,copy,model_validate_strings,from_orm,dict,model_validate_json

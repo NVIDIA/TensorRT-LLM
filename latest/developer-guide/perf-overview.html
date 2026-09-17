@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -369,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -452,6 +453,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -511,8 +513,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -548,6 +552,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -559,8 +569,9 @@
 <li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -723,29 +734,28 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 <li><p><a class="reference internal" href="#deepseek-r1-0528">Deepseek R1 0528</a></p></li>
 <li><p><a class="reference internal" href="#gpt-oss-120b">GPT-OSS 120B</a></p></li>
 <li><p><a class="reference internal" href="#gpt-oss-20b">GPT-OSS 20B</a></p></li>
-<li><p><a class="reference internal" href="#llama-v3-3-70b">LLaMA v3.3 70B</a></p>
+<li><p><a class="reference internal" href="#llama-v33-70b">LLaMA v3.3 70B</a></p>
 <ul>
-<li><p><a class="reference internal" href="#llama-v33-70b-rtx-configurations"><span class="xref myst">LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition</span></a></p></li>
+<li><p><a class="reference internal" href="#llama-v33-70b-rtx-configurations">LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#llama-v4-maverick">LLaMA v4 Maverick</a></p></li>
 <li><p><a class="reference internal" href="#qwen3-235b-a22b">Qwen3 235B A22B</a></p>
 <ul>
-<li><p><a class="reference internal" href="#qwen3-235b-a22b-rtx-configurations"><span class="xref myst">Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition</span></a></p></li>
+<li><p><a class="reference internal" href="#qwen3-235b-a22b-rtx-configurations">Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#qwen3-30b-a3b">Qwen3 30B A3B</a></p>
 <ul>
-<li><p><a class="reference internal" href="#qwen3-30b-a3b-rtx-configurations"><span class="xref myst">Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition</span></a></p></li>
+<li><p><a class="reference internal" href="#qwen3-30b-a3b-rtx-configurations">Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition</a></p></li>
 </ul>
 </li>
 </ul>
 <hr class="docutils" />
-<p><a id="deepseek-r1-0528"></a></p>
 </section>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="deepseek-r1-0528">
-<h1>Deepseek R1 0528<a class="headerlink" href="#deepseek-r1-0528" title="Link to this heading">#</a></h1>
+<span id="id1"></span><h1>Deepseek R1 0528<a class="headerlink" href="#deepseek-r1-0528" title="Link to this heading">#</a></h1>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
@@ -785,10 +795,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="gpt-oss-120b"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="gpt-oss-120b">
-<h1>GPT-OSS 120B<a class="headerlink" href="#gpt-oss-120b" title="Link to this heading">#</a></h1>
+<span id="id2"></span><h1>GPT-OSS 120B<a class="headerlink" href="#gpt-oss-120b" title="Link to this heading">#</a></h1>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
@@ -840,10 +849,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="gpt-oss-20b"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="gpt-oss-20b">
-<h1>GPT-OSS 20B<a class="headerlink" href="#gpt-oss-20b" title="Link to this heading">#</a></h1>
+<span id="id3"></span><h1>GPT-OSS 20B<a class="headerlink" href="#gpt-oss-20b" title="Link to this heading">#</a></h1>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
@@ -895,10 +903,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="llama-v33-70b"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="llama-v3-3-70b">
-<h1>LLaMA v3.3 70B<a class="headerlink" href="#llama-v3-3-70b" title="Link to this heading">#</a></h1>
+<span id="llama-v33-70b"></span><h1>LLaMA v3.3 70B<a class="headerlink" href="#llama-v3-3-70b" title="Link to this heading">#</a></h1>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
@@ -944,10 +951,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="llama-v33-70b-rtx-configurations"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="llama-v3-3-70b-rtx-6000-pro-blackwell-server-edition">
-<h1>LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition<a class="headerlink" href="#llama-v3-3-70b-rtx-6000-pro-blackwell-server-edition" title="Link to this heading">#</a></h1>
+<span id="llama-v33-70b-rtx-configurations"></span><h1>LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition<a class="headerlink" href="#llama-v3-3-70b-rtx-6000-pro-blackwell-server-edition" title="Link to this heading">#</a></h1>
 <p><em>Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations</em></p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -978,10 +984,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="llama-v4-maverick"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="llama-v4-maverick">
-<h1>LLaMA v4 Maverick<a class="headerlink" href="#llama-v4-maverick" title="Link to this heading">#</a></h1>
+<span id="id4"></span><h1>LLaMA v4 Maverick<a class="headerlink" href="#llama-v4-maverick" title="Link to this heading">#</a></h1>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
@@ -1026,10 +1031,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="qwen3-235b-a22b"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="qwen3-235b-a22b">
-<h1>Qwen3 235B A22B<a class="headerlink" href="#qwen3-235b-a22b" title="Link to this heading">#</a></h1>
+<span id="id5"></span><h1>Qwen3 235B A22B<a class="headerlink" href="#qwen3-235b-a22b" title="Link to this heading">#</a></h1>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
@@ -1081,10 +1085,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="qwen3-235b-a22b-rtx-configurations"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="qwen3-235b-a22b-rtx-6000-pro-blackwell-server-edition">
-<h1>Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition<a class="headerlink" href="#qwen3-235b-a22b-rtx-6000-pro-blackwell-server-edition" title="Link to this heading">#</a></h1>
+<span id="qwen3-235b-a22b-rtx-configurations"></span><h1>Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition<a class="headerlink" href="#qwen3-235b-a22b-rtx-6000-pro-blackwell-server-edition" title="Link to this heading">#</a></h1>
 <p><em>Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations</em></p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -1115,10 +1118,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="qwen3-30b-a3b"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="qwen3-30b-a3b">
-<h1>Qwen3 30B A3B<a class="headerlink" href="#qwen3-30b-a3b" title="Link to this heading">#</a></h1>
+<span id="id6"></span><h1>Qwen3 30B A3B<a class="headerlink" href="#qwen3-30b-a3b" title="Link to this heading">#</a></h1>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
@@ -1156,10 +1158,9 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </div>
 <p>unit: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">tokens</span> <span class="pre">per</span> <span class="pre">second</span> <span class="pre">per</span> <span class="pre">GPU</span></code></p>
 <hr class="docutils" />
-<p><a id="qwen3-30b-a3b-rtx-configurations"></a></p>
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="qwen3-30b-a3b-rtx-6000-pro-blackwell-server-edition">
-<h1>Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition<a class="headerlink" href="#qwen3-30b-a3b-rtx-6000-pro-blackwell-server-edition" title="Link to this heading">#</a></h1>
+<span id="qwen3-30b-a3b-rtx-configurations"></span><h1>Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition<a class="headerlink" href="#qwen3-30b-a3b-rtx-6000-pro-blackwell-server-edition" title="Link to this heading">#</a></h1>
 <p><em>Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations</em></p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -1330,7 +1331,7 @@ remain in the system longer and therefore require less requests to achieve stead
 <h3>Running the Benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading">#</a></h3>
 <p>To run the benchmark with the generated data set, simply use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand. The benchmarker will
 run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
-a model name (HuggingFace reference or path to a local model), a <a class="reference internal" href="#preparing-a-dataset">generated dataset</a>, and a file containing any desired extra options to the LLM APIs (details in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9/tensorrt_llm/llmapi/llm_args.py">tensorrt_llm/llmapi/llm_args.py:LlmArgs</a>).</p>
+a model name (HuggingFace reference or path to a local model), a <a class="reference internal" href="#preparing-a-dataset">generated dataset</a>, and a file containing any desired extra options to the LLM APIs (details in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/tensorrt_llm/llmapi/llm_args.py">tensorrt_llm/llmapi/llm_args.py:LlmArgs</a>).</p>
 <p>For dense / non-MoE models:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--tp<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--pp<span class="w"> </span><span class="nv">$pp_size</span><span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--config<span class="w"> </span><span class="nv">$llm_options</span>
 </pre></div>
@@ -1596,9 +1597,9 @@ using the <code class="docutils literal notranslate"><span class="pre">--kv_cach
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

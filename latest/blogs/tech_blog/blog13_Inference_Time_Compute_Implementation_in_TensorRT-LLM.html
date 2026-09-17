@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -669,31 +680,31 @@
 <ul class="simple">
 <li><p><a class="reference internal" href="#inference-time-compute-implementation-in-tensorrt-llm">Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation)</a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-content"><span class="xref myst">Table of Content</span></a></p></li>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Content</a></p></li>
 <li><p><a class="reference internal" href="#background-and-motivation">Background and Motivation</a></p></li>
-<li><p><a class="reference internal" href="#introduction-for-scaffolding"><span class="xref myst">Introduction for Scaffolding: A Framework for inference-time compute</span></a></p>
+<li><p><a class="reference internal" href="#introduction-for-scaffolding-a-framework-for-inference-time-compute">Introduction for Scaffolding: A Framework for inference-time compute</a></p>
 <ul>
-<li><p><a class="reference internal" href="#scaffolding-core-feature"><span class="xref myst">Core Features</span></a></p></li>
-<li><p><a class="reference internal" href="#scaffolding-architecture"><span class="xref myst">Architecture</span></a></p>
+<li><p><a class="reference internal" href="#core-features">Core Features</a></p></li>
+<li><p><a class="reference internal" href="#architecture">Architecture</a></p>
 <ul>
-<li><p><a class="reference internal" href="#scaffolding-architecture-worker"><span class="xref myst">Worker</span></a></p></li>
-<li><p><a class="reference internal" href="#scaffolding-architecture-controller"><span class="xref myst">Controller</span></a></p></li>
-<li><p><a class="reference internal" href="#scaffolding-architecture-scaffoldingllm"><span class="xref myst">ScaffoldingLlm</span></a></p></li>
+<li><p><a class="reference internal" href="#worker">Worker</a></p></li>
+<li><p><a class="reference internal" href="#controller">Controller</a></p></li>
+<li><p><a class="reference internal" href="#scaffoldingllm">ScaffoldingLlm</a></p></li>
 </ul>
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#example-for-scaffolding"><span class="xref myst">An Example: Implement Dynasor on Scaffolding</span></a></p>
+<li><p><a class="reference internal" href="#an-example-implement-dynasor-cot-on-scaffolding">An Example: Implement Dynasor on Scaffolding</a></p>
 <ul>
-<li><p><a class="reference internal" href="#dynasor-introduction"><span class="xref myst">Introduction for Dynasor</span></a></p></li>
-<li><p><a class="reference internal" href="#dynasor-cot-implement-in-scaffolding"><span class="xref myst">Implement Dynasor-CoT in Scaffolding</span></a></p></li>
-<li><p><a class="reference internal" href="#dynasor-cot-based-majority-vote-in-scaffolding"><span class="xref myst">Implement Dynasor-CoT based Majority Voting in Scaffolding</span></a></p></li>
-<li><p><a class="reference internal" href="#dynasor-acknowledgements"><span class="xref myst">Acknowledgements</span></a></p></li>
-<li><p><a class="reference internal" href="#dynasor-reference"><span class="xref myst">Reference</span></a></p></li>
+<li><p><a class="reference internal" href="#introduction-for-dynasor-cot">Introduction for Dynasor</a></p></li>
+<li><p><a class="reference internal" href="#implement-dynasor-cot-in-scaffolding">Implement Dynasor-CoT in Scaffolding</a></p></li>
+<li><p><a class="reference internal" href="#implement-dynasor-cot-based-majority-voting-in-scaffolding">Implement Dynasor-CoT based Majority Voting in Scaffolding</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgements">Acknowledgements</a></p></li>
+<li><p><a class="reference internal" href="#reference">Reference</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#scaffolding-feature-list"><span class="xref myst">Feature List on Scaffolding</span></a></p></li>
-<li><p><a class="reference internal" href="#scaffolding-future-work"><span class="xref myst">Future Work</span></a></p></li>
+<li><p><a class="reference internal" href="#feature-list-on-scaffolding">Feature List on Scaffolding</a></p></li>
+<li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
 </ul>
 </li>
 </ul>
@@ -1228,9 +1239,9 @@ is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

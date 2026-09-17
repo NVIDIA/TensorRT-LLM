@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -515,8 +517,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -552,6 +556,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -563,8 +573,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -710,9 +721,9 @@
 <ul>
 <li><p><a class="reference internal" href="#id3">The effect of EP Load Balancer</a></p>
 <ul>
-<li><p><a class="reference internal" href="#step-1-run-inference-and-collect-statistics"><span class="xref myst">Step 1: Run inference and collect statistics</span></a></p></li>
-<li><p><a class="reference internal" href="#step-2-generate-the-eplb-configuration"><span class="xref myst">Step 2: Generate the EPLB configuration</span></a></p></li>
-<li><p><a class="reference internal" href="#step-3-run-inference-with-the-eplb-configuration"><span class="xref myst">Step 3: Run inference with the EPLB configuration</span></a></p></li>
+<li><p><a class="reference internal" href="#step-1-run-inference-and-collect-statistics">Step 1: Run inference and collect statistics</a></p></li>
+<li><p><a class="reference internal" href="#step-2-generate-the-eplb-configuration">Step 2: Generate the EPLB configuration</a></p></li>
+<li><p><a class="reference internal" href="#step-3-run-inference-with-the-eplb-configuration">Step 3: Run inference with the EPLB configuration</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#miscellaneous">Miscellaneous</a></p></li>
@@ -870,7 +881,7 @@ Based on Figure 8, it can be observed that the workload imbalance is relatively 
 </section>
 <section id="high-level-design-introduction">
 <h2>High-level design introduction<a class="headerlink" href="#high-level-design-introduction" title="Link to this heading">#</a></h2>
-<p>Based on the detailed analysis and study in section <a class="reference internal" href="#motivation-of-large-scale-ep"><span class="xref myst">Motivation of large-scale EP</span></a>, it can clearly be observed that expert imbalance in EP is a common pattern for large-scale EP. This EP imbalance can clearly impede the overall system performance in the following ways:</p>
+<p>Based on the detailed analysis and study in section <a class="reference internal" href="#motivation-for-large-scale-ep">Motivation of large-scale EP</a>, it can clearly be observed that expert imbalance in EP is a common pattern for large-scale EP. This EP imbalance can clearly impede the overall system performance in the following ways:</p>
 <ul class="simple">
 <li><p>The hot EP rank will consume more memory (for activations) which can limit the effective max batch size scheduled during the inference process.</p></li>
 <li><p>More data will be sent to/received from the hot EP rank.</p></li>
@@ -1228,7 +1239,7 @@ Clearly in Figure 25, we can see that EPLB brings a clear performance improvemen
 <span class="nb">export</span><span class="w"> </span><span class="nv">EXPERT_STATISTIC_ITER_RANGE</span><span class="o">=</span><span class="m">100</span>-200
 </pre></div>
 </div>
-<p>Prepare a dataset following the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-benchmarking.md#preparing-a-dataset">benchmarking documentation</a> and save it as <code class="docutils literal notranslate"><span class="pre">./dataset.json</span></code>.</p>
+<p>Prepare a dataset following the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-benchmarking.md#preparing-a-dataset">benchmarking documentation</a> and save it as <code class="docutils literal notranslate"><span class="pre">./dataset.json</span></code>.</p>
 <p>Run 32-way expert parallelism inference on the prepared dataset. Please refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_bench.sh">LLM API MGMN example</a> for details on running <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> on Slurm.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span>&gt;<span class="w"> </span>./config.yaml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
 <span class="s">enable_attention_dp: true</span>
@@ -1253,7 +1264,7 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="
 </pre></div>
 </div>
 <p>The output would look like:</p>
-<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>Load statistics:
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Load statistics:
            mean         std  imbalance-ratio
 3        1024.0  187.955200         0.498043
 4        1024.0  202.728516         0.537602
@@ -1325,7 +1336,7 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="
 </pre></div>
 </div>
 <p>The output would look like:</p>
-<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>Load statistics:
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Load statistics:
            mean        std  imbalance-ratio
 3        1024.0  37.612328         0.081947
 4        1024.0  42.367714         0.093256
@@ -1607,9 +1618,9 @@ Based on our current performance analysis, when you plan to apply large-scale EP
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

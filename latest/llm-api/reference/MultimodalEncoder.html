@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -988,6 +999,56 @@ A default one will be used if not provided.</p></li>
 <dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> None</p>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.MultimodalEncoder.start_profile">
+<span class="sig-name descname"><span class="pre">start_profile</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_dir</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">num_steps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">start_step</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">activities</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.MultimodalEncoder.start_profile" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Start iteration-scoped profiling of the backend engine.</p>
+<p>Mirrors the <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_START_STOP</span></code> / <code class="docutils literal notranslate"><span class="pre">TLLM_TORCH_PROFILE_TRACE</span></code>
+environment-variable behaviour but can be triggered at runtime (for
+example via the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> <code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> HTTP endpoint).
+Only supported when running the PyTorch / AutoDeploy backend; on the
+TensorRT backend this is a no-op.</p>
+<p>See <code class="docutils literal notranslate"><span class="pre">PyExecutor.start_profile</span></code> for full argument semantics.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>output_dir</strong> (<em>str</em><em>, </em><em>optional</em>) – Directory where chrome traces are
+written. If <code class="docutils literal notranslate"><span class="pre">None</span></code>, falls back to the
+<code class="docutils literal notranslate"><span class="pre">TLLM_TORCH_PROFILER_DIR</span></code> environment variable and finally
+to <code class="docutils literal notranslate"><span class="pre">/tmp</span></code>. Defaults to None.</p></li>
+<li><p><strong>num_steps</strong> (<em>int</em><em>, </em><em>optional</em>) – Number of engine iterations to
+capture. When set, the engine stops the window automatically
+and <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> does not need to be called. When
+<code class="docutils literal notranslate"><span class="pre">None</span></code>, profiling runs until <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> is called.
+Defaults to None.</p></li>
+<li><p><strong>start_step</strong> (<em>int</em>) – Additional iterations to skip before profiling actually begins, relative to the current iteration counter. Defaults to 0.</p></li>
+<li><p><strong>activities</strong> (<em>List</em><em>[</em><em>str</em><em>]</em><em>, </em><em>optional</em>) – Subset of
+<code class="docutils literal notranslate"><span class="pre">[&quot;CPU&quot;,</span> <span class="pre">&quot;GPU&quot;,</span> <span class="pre">&quot;CUDA_PROFILER&quot;]</span></code> selecting which profiler
+activities to record. When <code class="docutils literal notranslate"><span class="pre">CUDA_PROFILER</span></code> is the only
+entry, <code class="docutils literal notranslate"><span class="pre">torch.profiler</span></code> is not started so only
+<code class="docutils literal notranslate"><span class="pre">cudaProfilerStart</span></code>/<code class="docutils literal notranslate"><span class="pre">cudaProfilerStop</span></code> brackets run,
+which is suitable for nsys capture. Defaults to None, which
+resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;CPU&quot;,</span> <span class="pre">&quot;GPU&quot;]</span></code>.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.MultimodalEncoder.stop_profile">
+<span class="sig-name descname"><span class="pre">stop_profile</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.MultimodalEncoder.stop_profile" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Stop any in-progress runtime profiling.</p>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.MultimodalEncoder.disaggregated_params">
 <em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">disaggregated_params</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">dict</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.MultimodalEncoder.disaggregated_params" title="Link to this definition">#</a></dt>
@@ -1085,6 +1146,8 @@ A default one will be used if not provided.</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.get_stats_async"><code class="docutils literal notranslate"><span class="pre">get_stats_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.preprocess"><code class="docutils literal notranslate"><span class="pre">preprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.shutdown"><code class="docutils literal notranslate"><span class="pre">shutdown()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.start_profile"><code class="docutils literal notranslate"><span class="pre">start_profile()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.stop_profile"><code class="docutils literal notranslate"><span class="pre">stop_profile()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.disaggregated_params"><code class="docutils literal notranslate"><span class="pre">disaggregated_params</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.llm_id"><code class="docutils literal notranslate"><span class="pre">llm_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MultimodalEncoder.startup_metrics"><code class="docutils literal notranslate"><span class="pre">startup_metrics</span></code></a></li>
@@ -1182,9 +1245,9 @@ A default one will be used if not provided.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

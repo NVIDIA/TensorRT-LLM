@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -680,8 +691,10 @@
 <li><p><code class="docutils literal notranslate"><span class="pre">/health</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">/metrics</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">/version</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> (prototype)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code> (prototype)</p></li>
 </ul>
-<p>The <code class="docutils literal notranslate"><span class="pre">metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The <code class="docutils literal notranslate"><span class="pre">start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> endpoints control iteration-scoped profiling of the backend engine; see <a class="reference internal" href="#runtime-profiling-endpoints"><span class="std std-ref">Runtime Profiling Endpoints</span></a> below.</p>
 <p>For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">embeddings</span></code> subcommand starts a server that exposes an OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">/v1/embeddings</span></code> endpoint with native dynamic batching. See <a class="reference internal" href="../../features/embeddings.html"><span class="doc">Embeddings</span></a> for details.</p>
 </section>
 <section id="starting-a-server">
@@ -1091,8 +1104,79 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 </pre></div>
 </div>
 </section>
+<section id="runtime-profiling-endpoints">
+<span id="id1"></span><h2>Runtime Profiling Endpoints<a class="headerlink" href="#runtime-profiling-endpoints" title="Link to this heading">#</a></h2>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code> endpoints are <strong>prototype</strong> and only apply to the default PyTorch backend (<code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code>). They are no-ops on the TensorRT backend. APIs, parameters, and behaviour may change in future releases.</p>
+</div>
+<p>The server exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime, without restarting <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and without setting <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_START_STOP</span></code> / <code class="docutils literal notranslate"><span class="pre">TLLM_TORCH_PROFILE_TRACE</span></code>. Under TP/PP &gt; 1, both endpoints broadcast the window to every rank, so each rank writes its own chrome trace (distinguished by a <code class="docutils literal notranslate"><span class="pre">rank-&lt;N&gt;</span></code> suffix in the filename) and all ranks profile the same iterations in lockstep.</p>
+<section id="post-start-profile">
+<h3>POST /start_profile<a class="headerlink" href="#post-start-profile" title="Link to this heading">#</a></h3>
+<p>Start a profile window. All fields in the JSON body are optional.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 21.7%" />
+<col style="width: 18.1%" />
+<col style="width: 60.2%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">output_dir</span></code></p></td>
+<td><p>string</p></td>
+<td><p>Directory where chrome traces are written. Defaults to <code class="docutils literal notranslate"><span class="pre">$TLLM_TORCH_PROFILER_DIR</span></code> if set, otherwise <code class="docutils literal notranslate"><span class="pre">/tmp</span></code>. One trace file per rank is written as <code class="docutils literal notranslate"><span class="pre">trtllm-trace-&lt;profile_id&gt;-rank-&lt;N&gt;.json</span></code>; <code class="docutils literal notranslate"><span class="pre">&lt;profile_id&gt;</span></code> is a timestamp + short uuid so successive cycles don’t collide.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_steps</span></code></p></td>
+<td><p>int</p></td>
+<td><p>Number of engine iterations to capture. When set, the engine stops the window automatically and you do not need to call <code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code>. When omitted, profiling runs until <code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code> is called.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">start_step</span></code></p></td>
+<td><p>int (default <code class="docutils literal notranslate"><span class="pre">0</span></code>)</p></td>
+<td><p>Iterations to skip after the call before profiling starts. Use to exclude warmup-like transients from the capture.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">activities</span></code></p></td>
+<td><p>list of string</p></td>
+<td><p>Subset of <code class="docutils literal notranslate"><span class="pre">[&quot;CPU&quot;,</span> <span class="pre">&quot;GPU&quot;,</span> <span class="pre">&quot;CUDA_PROFILER&quot;]</span></code> (default <code class="docutils literal notranslate"><span class="pre">[&quot;CPU&quot;,</span> <span class="pre">&quot;GPU&quot;]</span></code>). When <code class="docutils literal notranslate"><span class="pre">[&quot;CUDA_PROFILER&quot;]</span></code> is specified, <code class="docutils literal notranslate"><span class="pre">torch.profiler</span></code> is not started and only <code class="docutils literal notranslate"><span class="pre">cudaProfilerStart</span></code> / <code class="docutils literal notranslate"><span class="pre">cudaProfilerStop</span></code> are called — this composes cleanly with <code class="docutils literal notranslate"><span class="pre">nsys</span> <span class="pre">profile</span> <span class="pre">-c</span> <span class="pre">cudaProfilerApi</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Response: <code class="docutils literal notranslate"><span class="pre">200</span></code> with <code class="docutils literal notranslate"><span class="pre">{&quot;message&quot;:</span> <span class="pre">&quot;Profiling</span> <span class="pre">started&quot;}</span></code> on success. <code class="docutils literal notranslate"><span class="pre">409</span></code> with <code class="docutils literal notranslate"><span class="pre">{&quot;success&quot;:</span> <span class="pre">false,</span> <span class="pre">&quot;message&quot;:</span> <span class="pre">...}</span></code> if a profile window is already active or pending (the backend does not silently queue a second window).</p>
+</section>
+<section id="post-stop-profile">
+<h3>POST /stop_profile<a class="headerlink" href="#post-stop-profile" title="Link to this heading">#</a></h3>
+<p>Stop an in-progress profile window and flush the chrome trace to disk. Takes no body. The call blocks until <code class="docutils literal notranslate"><span class="pre">export_chrome_trace()</span></code> has run on the backend thread, so by the time the handler returns the file is on disk. Call this only if <code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> was invoked without <code class="docutils literal notranslate"><span class="pre">num_steps</span></code>; otherwise the window self-terminates.</p>
+</section>
+<section id="example">
+<h3>Example<a class="headerlink" href="#example" title="Link to this heading">#</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Start a 30-iteration profile window into /tmp/traces.</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://127.0.0.1:8000/start_profile<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">'{"output_dir": "/tmp/traces", "num_steps": 30}'</span>
+
+<span class="c1"># ... drive load via /v1/completions or /v1/chat/completions ...</span>
+
+<span class="c1"># If you started the window without num_steps, stop it:</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://127.0.0.1:8000/stop_profile
+
+<span class="c1"># Inspect the resulting chrome traces.</span>
+ls<span class="w"> </span>/tmp/traces/
+<span class="c1"># trtllm-trace-1778480665-7993d824-rank-0.json</span>
+<span class="c1"># trtllm-trace-1778480665-7993d824-rank-1.json   (TP=2)</span>
+</pre></div>
+</div>
+<p>Open the trace files in <a class="reference external" href="https://ui.perfetto.dev/">ui.perfetto.dev</a> or <code class="docutils literal notranslate"><span class="pre">chrome://tracing</span></code>. Each captured iteration is wrapped in a <code class="docutils literal notranslate"><span class="pre">step[EXTEND</span> <span class="pre">bs=N</span> <span class="pre">toks=M]</span></code> or <code class="docutils literal notranslate"><span class="pre">step[DECODE</span> <span class="pre">bs=N]</span></code> user-annotation scope.</p>
+<p>With the overlap scheduler enabled, sampling for an iteration runs after the previous batch is updated, so it cannot share the forward scope. That region is emitted as a separate <code class="docutils literal notranslate"><span class="pre">step[...]</span> <span class="pre">sample</span></code> scope. Only the bare <code class="docutils literal notranslate"><span class="pre">step[...]</span></code> labels mark iteration boundaries; ignore the <code class="docutils literal notranslate"><span class="pre">sample</span></code>-suffixed ones when counting iterations.</p>
+<p>For a full benchmarking + profiling workflow (including multi-cycle capture under steady-state load), see <a class="reference internal" href="run-benchmark-with-trtllm-serve.html"><span class="doc">Run benchmarking with trtllm-serve</span></a>.</p>
+</section>
+</section>
 <section id="configuring-with-yaml-files">
-<span id="id1"></span><h2>Configuring with YAML Files<a class="headerlink" href="#configuring-with-yaml-files" title="Link to this heading">#</a></h2>
+<span id="id2"></span><h2>Configuring with YAML Files<a class="headerlink" href="#configuring-with-yaml-files" title="Link to this heading">#</a></h2>
 <p>You can configure various options of <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> using YAML files by setting the <code class="docutils literal notranslate"><span class="pre">--config</span></code> option to the path of a YAML file. Explicit CLI flags take precedence over values in the YAML; un-set CLI flags fall back to the YAML.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
@@ -1110,7 +1194,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </div>
 </section>
 <section id="syntax">
-<h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
+<span id="id3"></span><h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
 <p>This syntax section lists all command line arguments for <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>’s subcommands. Some of the arguments are accompanied with a stability tag indicating their development status. Refer to our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html">API Reference</a> for details</p>
 <section id="trtllm-serve">
 <h3>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h3>
@@ -1853,6 +1937,12 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-serving-with-slurm">Multi-node Serving with Slurm</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics-endpoint">Metrics Endpoint</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-profiling-endpoints">Runtime Profiling Endpoints</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#post-start-profile">POST /start_profile</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#post-stop-profile">POST /stop_profile</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example">Example</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuring-with-yaml-files">Configuring with YAML Files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#syntax">Syntax</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve">trtllm-serve</a><ul class="nav section-nav flex-column">
@@ -1956,9 +2046,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

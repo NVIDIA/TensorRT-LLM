@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -866,7 +877,7 @@
 <ol class="arabic simple">
 <li><p>During model initialization, when <code class="docutils literal notranslate"><span class="pre">has_cp_helix()</span></code> is true, a deep copy of the original mapping (with CP) is saved as <code class="docutils literal notranslate"><span class="pre">mapping_with_cp</span></code>.</p></li>
 <li><p>The model config’s mapping is repurposed via <code class="docutils literal notranslate"><span class="pre">repurpose_helix_cp_to_tp()</span></code>, which converts CP ranks to additional TP ranks (setting <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">=</span> <span class="pre">tp_size</span> <span class="pre">×</span> <span class="pre">cp_size</span></code>, <code class="docutils literal notranslate"><span class="pre">cp_size</span> <span class="pre">=</span> <span class="pre">1</span></code>).</p></li>
-<li><p>The attention layers (in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/attention.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/modules/attention.py</span></code></a>) receive the original <code class="docutils literal notranslate"><span class="pre">mapping_with_cp</span></code> to execute with KV parallelism, while all other layers (FFN, MoE, embeddings) use the repurposed TP-only mapping.</p></li>
+<li><p>The attention layers (in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/attention.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention/attention.py</span></code></a>) receive the original <code class="docutils literal notranslate"><span class="pre">mapping_with_cp</span></code> to execute with KV parallelism, while all other layers (FFN, MoE, embeddings) use the repurposed TP-only mapping.</p></li>
 </ol>
 <p>This design means that from the perspective of non-attention layers, Helix is transparent: they simply see a larger TP group. Only the attention module needs awareness of the CP configuration.</p>
 </section>
@@ -895,7 +906,7 @@
 </div>
 <ul class="simple">
 <li><p>If a rank is <strong>active</strong>, it allocates a new KV slot, increments <code class="docutils literal notranslate"><span class="pre">seqlen_this_rank_cp</span></code>, and runs attention with the new token writing into its local KV cache.</p></li>
-<li><p>If a rank is <strong>inactive</strong> for this step (<code class="docutils literal notranslate"><span class="pre">req.py_helix_is_inactive_rank</span> <span class="pre">=</span> <span class="pre">True</span></code>), it does not allocate KV and its attention kernels attend over previously cached tokens only. In <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention_backend/trtllm.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/trtllm.py</span></code></a>, <code class="docutils literal notranslate"><span class="pre">kv_lens[active_rank]</span> <span class="pre">+=</span> <span class="pre">seq_lens_kv</span></code> ensures inactive ranks see no cache growth for the current step.</p></li>
+<li><p>If a rank is <strong>inactive</strong> for this step (<code class="docutils literal notranslate"><span class="pre">req.py_helix_is_inactive_rank</span> <span class="pre">=</span> <span class="pre">True</span></code>), it does not allocate KV and its attention kernels attend over previously cached tokens only. In <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/backends/trtllm.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention/backends/trtllm.py</span></code></a>, <code class="docutils literal notranslate"><span class="pre">kv_lens[active_rank]</span> <span class="pre">+=</span> <span class="pre">seq_lens_kv</span></code> ensures inactive ranks see no cache growth for the current step.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">total_input_len_cp</span></code> and <code class="docutils literal notranslate"><span class="pre">seqlen_this_rank_cp</span></code> are tracked per request so the global position id and per-rank attention length stay correct even though only one CP rank “owns” each new token.</p>
 </section>
@@ -1138,9 +1149,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       

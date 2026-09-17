@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc26" />
+  <meta name="docsearch:version" content="1.3.0rc27" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
@@ -513,8 +515,10 @@
 <li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
@@ -550,6 +554,12 @@
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-connector.html">KV Cache Connector</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -561,8 +571,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -791,6 +802,15 @@ load format, or known partial-model loading selects native I/O before any
 rank-striped communicator or reader setup. An explicit incompatible
 <code class="docutils literal notranslate"><span class="pre">rank_striped_read_ahead</span></code> request emits a warning instead of failing startup;
 <code class="docutils literal notranslate"><span class="pre">auto</span></code> records the native selection at info level.</p>
+<p>Sessionless compatibility is a separate structural fallback:</p>
+<ul class="simple">
+<li><p>Direct <code class="docutils literal notranslate"><span class="pre">load_weights()</span></code> calls use native I/O because they cannot keep
+<code class="docutils literal notranslate"><span class="pre">open_weight_session()</span></code> alive through model materialization. Current callers
+include separate draft/MTP checkpoint loading and the GMS restore path; the
+primary built-in HF path remains eligible for rank-striped read-ahead. This
+structural fallback is reported at info level even for an explicit
+<code class="docutils literal notranslate"><span class="pre">rank_striped_read_ahead</span></code> request.</p></li>
+</ul>
 <p>Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
 loading, raw-weight caching, layer overrides, insufficient host-memory
 headroom, and <code class="docutils literal notranslate"><span class="pre">.bin</span></code>/<code class="docutils literal notranslate"><span class="pre">.pth</span></code> select native materialization before readers start
@@ -810,9 +830,34 @@ node, not a host-wide arbitration mechanism across colocated independent
 TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
 effective policy, so <code class="docutils literal notranslate"><span class="pre">auto</span></code> selection and native fallback remain observable;
 activation logs also report the local reader assignment.</p>
-<p>This policy remains separate from future ModelStreamer, MX, GMS, or snapshot
-integration. Those systems may change the source or bypass raw loading without
+<section id="ci-startup-experiment">
+<h3>CI startup experiment<a class="headerlink" href="#ci-startup-experiment" title="Link to this heading">#</a></h3>
+<p>Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
+built-in PyTorch/HF launches to the default <code class="docutils literal notranslate"><span class="pre">auto</span></code> policy, so merge decisions do
+not depend on an unrelated CI identifier. Post-merge telemetry runs use the
+numeric root Jenkins build number modulo 4 to assign one native bucket and
+three auto buckets before generated server configs are written. Every rank and
+node in one distributed startup therefore receives the same concrete policy.
+Non-telemetry runs, invalid or missing post-merge build identities,
+incompatible configurations, and purpose-built configs with an explicit
+<code class="docutils literal notranslate"><span class="pre">checkpoint_io_policy</span></code> are not assigned and retain their normal configuration,
+whose checkpoint I/O default remains <code class="docutils literal notranslate"><span class="pre">auto</span></code>.</p>
+<p>Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY=auto</span></code> or <code class="docutils literal notranslate"><span class="pre">native</span></code> to reproduce an
+experiment arm without bucket assignment. Uploaded rows record the experiment
+version, bucket, assigned arm, assignment source, PR number or root build
+number, actual checkpoint loader/source metadata,
+requested/selected/activated/effective policy, and a bounded fallback category
+and reason. The primary comparison is intent-to-treat across post-merge rows
+whose assignment source is <code class="docutils literal notranslate"><span class="pre">postmerge_build_number</span></code>: an <code class="docutils literal notranslate"><span class="pre">auto</span></code> assignment that
+executes native I/O remains an auto fallback, not a native control. Pre-merge
+rows use <code class="docutils literal notranslate"><span class="pre">premerge_default</span></code> and are excluded from that comparison.
+Multiple client rows can share one server startup; use
+<code class="docutils literal notranslate"><span class="pre">s_startup_observation_id</span></code> to group them and filter
+<code class="docutils literal notranslate"><span class="pre">b_startup_observation_primary_row:true</span></code> to count each startup once.</p>
+<p>This policy remains separate from ModelStreamer, MX, GMS, or snapshot
+integrations. Those systems may change the source or bypass raw loading without
 requiring a new combined checkpoint format.</p>
+</section>
 </section>
 <section id="using-checkpoint-loaders">
 <h2>Using Checkpoint Loaders<a class="headerlink" href="#using-checkpoint-loaders" title="Link to this heading">#</a></h2>
@@ -1112,7 +1157,10 @@ requiring a new combined checkpoint format.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#modelexpress-mx-loading-path">ModelExpress (MX) Loading Path</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checkpoint-i-o-policies">Checkpoint I/O Policies</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checkpoint-i-o-policies">Checkpoint I/O Policies</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ci-startup-experiment">CI startup experiment</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-checkpoint-loaders">Using Checkpoint Loaders</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#basic-usage">Basic Usage</a></li>
 </ul>
@@ -1216,9 +1264,9 @@ requiring a new combined checkpoint format.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 04, 2026.</p>
+  <p>Last updated on September 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
   
 </div></div>
       
