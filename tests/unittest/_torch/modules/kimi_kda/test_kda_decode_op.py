@@ -596,18 +596,22 @@ def test_decode_reads_row_strided_projection_slices(num_heads: int) -> None:
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("num_heads", "indexed_state"),
+    ("num_heads", "batch_size", "indexed_state"),
     [
-        (2, False),
-        (96, True),
+        (2, 1, False),
+        (96, 1, True),
+        (64, 1, False),
+        (64, 2, True),
+        (64, 3, True),
     ],
 )
 def test_kda_decode_is_cuda_graph_safe(
     num_heads: int,
+    batch_size: int,
     indexed_state: bool,
 ) -> None:
     args = _make_direct_decode_args(
-        1,
+        batch_size,
         num_heads,
         indexed_state=indexed_state,
     )
