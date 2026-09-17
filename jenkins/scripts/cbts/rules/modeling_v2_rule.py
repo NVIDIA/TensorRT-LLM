@@ -14,7 +14,7 @@
 """ModelingV2Rule — narrows CI when the modeling_v2 subtree changes.
 
 modeling_v2 is a second modeling path living entirely under
-`tensorrt_llm/_torch/modeling_v2/`: one self-contained forward per
+`tensorrt_llm/_torch/_experimental/modeling_v2/`: one self-contained forward per
 (checkpoint, GPU arch, parallel topology), assembled from a catalog of
 op wrappers.
 
@@ -66,7 +66,7 @@ from .base import PRInputs, Rule, RuleResult
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
-_MV2_SRC_PREFIXES: tuple[str, ...] = ("tensorrt_llm/_torch/modeling_v2/",)
+_MV2_SRC_PREFIXES: tuple[str, ...] = ("tensorrt_llm/_torch/_experimental/modeling_v2/",)
 
 # Substrings that mark a test entry as modeling_v2. Both are unambiguous:
 #   - "unittest/_torch/modeling_v2/" → the op-level catalog matrix, taken

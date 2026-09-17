@@ -1,7 +1,7 @@
 from typing import Generic, Optional, Type
 
+from .._experimental.modeling_v2 import modeling_v2_resolve
 from ..model_config import ModelConfig
-from ..modeling_v2 import modeling_v2_resolve
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
                              get_registered_model_class,

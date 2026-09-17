@@ -397,7 +397,8 @@ class BaseLLM:
             # target. Only the pytorch backend reaches the resolver that could
             # select one, so on any other backend the promise would be broken
             # silently -- the one failure that mode exists to prevent.
-            from .._torch.modeling_v2 import assert_backend_can_route
+            from .._torch._experimental.modeling_v2 import \
+                assert_backend_can_route
             assert_backend_can_route(backend)
 
             # check the kwargs and raise ValueError directly

@@ -5,8 +5,8 @@
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import fused_moe
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.modeling_v2.catalog.moe.fused_moe import fused_moe
 
 assert torch.cuda.is_available(), "fused_moe requires a CUDA device"
 

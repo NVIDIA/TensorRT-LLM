@@ -55,48 +55,54 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
+    flashinfer_silu_and_mul,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (  # noqa: E501
+    load_paged_kv_cache_for_mla,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
+    mla_rope_append_paged_kv_assign_q,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_generation import (
+    mla_rope_generation,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
+    fp4_block_scale_moe_runner,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import fused_moe
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
+    flashinfer_fused_add_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+    flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.add import add
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.concat import concat
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.copy_ import copy_
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.embedding import embedding
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.empty import empty
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.expand import expand
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.pad import pad
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.reshape import reshape
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.split import split
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.transpose import transpose
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.view_dtype import view_dtype
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
-    flashinfer_silu_and_mul,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (  # noqa: E501
-    load_paged_kv_cache_for_mla,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
-    mla_rope_append_paged_kv_assign_q,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_generation import (
-    mla_rope_generation,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
-from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
-from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
-from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
-from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
-from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
-    fp4_block_scale_moe_runner,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.moe.fused_moe import fused_moe
-from tensorrt_llm._torch.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
-    flashinfer_fused_add_rmsnorm,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
-from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
-from tensorrt_llm._torch.modeling_v2.catalog.torch.add import add
-from tensorrt_llm._torch.modeling_v2.catalog.torch.concat import concat
-from tensorrt_llm._torch.modeling_v2.catalog.torch.copy_ import copy_
-from tensorrt_llm._torch.modeling_v2.catalog.torch.embedding import embedding
-from tensorrt_llm._torch.modeling_v2.catalog.torch.empty import empty
-from tensorrt_llm._torch.modeling_v2.catalog.torch.expand import expand
-from tensorrt_llm._torch.modeling_v2.catalog.torch.pad import pad
-from tensorrt_llm._torch.modeling_v2.catalog.torch.reshape import reshape
-from tensorrt_llm._torch.modeling_v2.catalog.torch.split import split
-from tensorrt_llm._torch.modeling_v2.catalog.torch.transpose import transpose
-from tensorrt_llm._torch.modeling_v2.catalog.torch.view_dtype import view_dtype
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModel,
     DecoderModelForCausalLM,

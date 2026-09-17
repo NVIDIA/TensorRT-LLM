@@ -916,8 +916,8 @@ def _run_one_rank() -> int:
     global COMM, RANK, WORLD, GROUP, allgather, DIST, MPI
     from mpi4py import MPI as _MPI
 
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as entry
     from tensorrt_llm._torch.distributed import Distributed
-    from tensorrt_llm._torch.modeling_v2.catalog.comm import allgather as entry
     from tensorrt_llm.mapping import Mapping
 
     allgather = entry.allgather

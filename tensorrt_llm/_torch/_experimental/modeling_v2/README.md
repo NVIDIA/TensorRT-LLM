@@ -5,7 +5,7 @@ built-in model zoo rather than inside it.
 
 Where `_torch/models/modeling_deepseekv3.py` is one class serving V3, V3-Lite,
 R1 and V3.2 across every GPU generation and parallel topology,
-`_torch/modeling_v2/models/deepseek_v3/` is one flat forward per (checkpoint,
+`_torch/_experimental/modeling_v2/models/deepseek_v3/` is one flat forward per (checkpoint,
 GPU architecture, parallel topology) triple — assembled only from `catalog/`
 entries, sharing nothing with its siblings, and trusted through accuracy gates
 instead of shared abstractions. The one-to-one correspondence between
@@ -68,7 +68,7 @@ which also exists only as a `_resolve_class` rewrite.
 To ask why a configuration landed where it did:
 
 ```
-python -m tensorrt_llm._torch.modeling_v2.explain \
+python -m tensorrt_llm._torch._experimental.modeling_v2.explain \
     --model /path/to/DeepSeek-R1-0528-NVFP4 --tp 4 --ep 4 --attention-dp
 ```
 

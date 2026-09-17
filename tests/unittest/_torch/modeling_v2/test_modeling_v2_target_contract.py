@@ -25,9 +25,12 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2._router_index import MODELING_V2_ROUTERS, routing_module
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    MODELING_V2_ROUTERS,
+    routing_module,
+)
 
-_PACKAGE = "tensorrt_llm._torch.modeling_v2"
+_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 _ARCHS = sorted(MODELING_V2_ROUTERS)
 
 
