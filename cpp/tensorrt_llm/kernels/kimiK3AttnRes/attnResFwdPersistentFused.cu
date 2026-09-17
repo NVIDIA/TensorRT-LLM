@@ -1100,8 +1100,15 @@ bool attnResPersistentFusedSupported(AttnResFwdParams const& params)
     // have no residual add to fold. Requiring one would have left them on the
     // per-token path and halved whatever this kernel is worth.
     bool const add_ok = params.layerResidualAdd == nullptr || params.updatedLayerResidual != nullptr;
+    // The kernel takes layerResidual and updatedLayerResidual as separate
+    // __restrict__ pointers, so folding the add in place is undefined
+    // behaviour. Reject the aliased form here rather than relying on every
+    // caller to pass a freshly allocated destination.
+    bool const alias_ok = params.updatedLayerResidual == nullptr
+        || static_cast<void const*>(params.updatedLayerResidual) != static_cast<void const*>(params.layerResidual);
     return params.hiddenSize == 7168 && params.batchSize == 1 && params.numCandidates >= 2 && params.numCandidates <= 9
-        && params.blockResidual != nullptr && params.outputRmsWeight != nullptr && add_ok && params.seqLen >= 1;
+        && params.blockResidual != nullptr && params.outputRmsWeight != nullptr && add_ok && alias_ok
+        && params.seqLen >= 1;
 }
 
 void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream)

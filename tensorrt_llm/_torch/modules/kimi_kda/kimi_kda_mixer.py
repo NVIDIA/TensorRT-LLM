@@ -841,10 +841,14 @@ class KimiKDALinearAttention(nn.Module):
         x = x2d.unsqueeze(1)  # [B, 1, hidden]
         cs = conv_pool.index_select(0, slot_indices_long)
         conv_q, conv_k, conv_v = _kda_split_conv_sections(cs, d)
+        if ssm_pool.dtype != torch.float32:
+            # The decode kernel and the FLA core carry the state in fp32:
+            # gather and widen the rows here, narrow on the write-back below.
+            ssm_state_indices = None
         state = (
             ssm_pool
             if ssm_state_indices is not None
-            else ssm_pool.index_select(0, slot_indices_long)
+            else _stage_state_rows(ssm_pool, slot_indices_long)
         )
 
         q_proj = self.q_proj(x)
@@ -948,7 +952,7 @@ class KimiKDALinearAttention(nn.Module):
             torch.cat([new_conv_q, new_conv_k, new_conv_v], dim=1).to(conv_pool.dtype),
         )
         if ssm_state_indices is None:
-            ssm_pool.index_copy_(0, slot_indices_long, state.to(ssm_pool.dtype))
+            _writeback_state_rows(ssm_pool, slot_indices_long, state)
         # Fused-verify replay caches: keep the committed conv window in
         # sync with the plain-decode advance. NOTE: this path is only
         # correct for requests with no pending accepted drafts
@@ -1228,7 +1232,7 @@ class KimiKDALinearAttention(nn.Module):
         conv_q = _kda_expand_fla_conv_cache(conv_q)
         conv_k = _kda_expand_fla_conv_cache(conv_k)
         conv_v = _kda_expand_fla_conv_cache(conv_v)
-        state = ssm_pool.index_select(0, slot_indices_long)
+        state = _stage_state_rows(ssm_pool, slot_indices_long)
 
         step_outputs: List[torch.Tensor] = []
         for t in range(num_steps):

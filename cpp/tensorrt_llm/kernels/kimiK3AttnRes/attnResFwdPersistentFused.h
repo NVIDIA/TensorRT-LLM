@@ -43,7 +43,8 @@ namespace kernels::kimiK3AttnRes
 //! layerResidual: the kernel takes both as __restrict__, so folding in place
 //! is undefined behaviour even though the residual it consumes comes from a
 //! shared-memory copy rather than a reload. Every in-tree caller passes a
-//! freshly allocated tensor.
+//! freshly allocated tensor, and attnResPersistentFusedSupported rejects the
+//! aliased form so a caller that stops doing so fails loudly.
 void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream);
 
 //! True when invokeAttnResPersistentFusedFwd can serve this shape, so callers

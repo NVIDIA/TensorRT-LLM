@@ -486,7 +486,11 @@ def _apply_attn_res_fused(
     layout. Candidate order matches the reference: snapshots first, the
     running prefix sum last.
     """
-    if prefix_sum.dtype is not torch.bfloat16:
+    if (
+        prefix_sum.dtype is not torch.bfloat16
+        or not prefix_sum.is_cuda
+        or not block_residual.is_cuda
+    ):
         return None
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
