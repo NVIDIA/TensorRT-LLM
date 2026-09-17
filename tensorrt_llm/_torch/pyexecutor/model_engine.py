@@ -318,8 +318,12 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
             f"budget was not switched: {type(e).__name__}: {e}")
 
 
-def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
-    """Install the per-worker NVMMH policy before tactic enumeration."""
+def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs, owner: object) -> None:
+    """Install and pin an engine's NVMMH policy before tactic enumeration.
+
+    Engines in one worker share the autotuner, so simultaneous owners must
+    agree on the effective policy, including the disabled default.
+    """
     config = llm_args.autotuner_nvmmh_config
     if config is None:
         policy = NvMMHConfig()
@@ -329,7 +333,7 @@ def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
             fields=config.fields,
             max_tactics=config.max_tactics,
         )
-    AutoTuner.get().configure_nvmmh(policy)
+    AutoTuner.get()._acquire_nvmmh_policy(owner, policy)
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -349,10 +353,11 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
+        """Pin the worker policy and initialize model loading and execution resources."""
         # Every executor worker receives its own TorchLlmArgs copy. Install the
         # policy before model loading because CuTe DSL runners may enumerate
         # tactics while modules are being constructed.
-        _configure_autotuner_nvmmh(llm_args)
+        _configure_autotuner_nvmmh(llm_args, self)
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
@@ -3657,6 +3662,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # Release model weights.
         release_gc()
+        AutoTuner.get()._release_nvmmh_policy(self)
         self._cleanup_done = True
 
     def __del__(self) -> None:

@@ -668,6 +668,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
         def tactic_search_cache_key(self):
+            """Return the active NVMMH search policy discriminator for profiling caches."""
             return _cutedsl_nvmmh_tactic_search_cache_key()
 
         def __hash__(self):
@@ -685,6 +686,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[Tuple[int, int]]:
             # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 and SM 103
+            """Enumerate supported Blackwell NVFP4 tactics and apply optional NVMMH guidance."""
             if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
                     f"CuteDSL: SM version {sm_version} is not supported. "
@@ -4516,6 +4518,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.use_tvm_ffi = use_tvm_ffi
 
         def tactic_search_cache_key(self):
+            """Return the active NVMMH search policy discriminator for profiling caches."""
             return _cutedsl_nvmmh_tactic_search_cache_key()
 
         def get_valid_tactics(
@@ -4524,6 +4527,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[int]:
+            """Enumerate blockwise FP8 tactics and retain NVMMH-ranked structural families."""
             if not is_sm_100f():
                 logger.debug(
                     f"CuteDSL: SM version {get_sm_version()} is not supported. "
@@ -9463,6 +9467,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         target_sm = "blackwell"
 
         def tactic_search_cache_key(self):
+            """Return the active NVMMH search policy discriminator for profiling caches."""
             return _cutedsl_nvmmh_tactic_search_cache_key()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
@@ -9479,7 +9484,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[int]:
-
+            """Generate Blackwell BF16 tactics with optional tile and scheduler guidance."""
             if not is_sm_100f():
                 logger.debug(
                     f"CuteDSL: SM version {get_sm_version()} is not supported. "
@@ -9756,6 +9761,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # normal full-sweep candidates.
 
                     def _split_k(tactic):
+                        """Read the tactic split factor, defaulting unsplit variants to one."""
                         if (isinstance(tactic, tuple) and len(tactic) >= 6
                                 and tactic[0] == "base"):
                             return max(1, int(tactic[5]))
@@ -10064,6 +10070,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 raster_along: str = "m",
                                 swizzle_size: int = 1,
                                 use_tma_store: bool = True):
+        """Compile and cache the Rubin BF16 kernel for its shape and scheduler options."""
         kernel_class = _sm107_bf16_kernel_class(kernel_variant)
         if kernel_variant == "preferred_cluster":
             return kernel_class(
@@ -10134,6 +10141,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs: List[torch.Tensor],
             tactic,
         ) -> None:
+            """Launch a Rubin batched GEMM into the supplied output tensor."""
             (kernel_variant, use_2cta_instrs, mma_tiler_mn,
              preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
              _) = _parse_sm107_bf16_tactic(tactic)
@@ -10336,6 +10344,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         nvmmh_split_k_cta_k = 64
 
         def tactic_search_cache_key(self):
+            """Return the active NVMMH search policy discriminator for profiling caches."""
             return _cutedsl_nvmmh_tactic_search_cache_key()
 
         # See CuteDSLBf16RubinBmmRunner.tuning_config.
@@ -10364,6 +10373,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple]:
+            """Generate Rubin BF16 tactics and apply configured NVMMH search fields."""
             if not _is_sm107_cute_dsl_available():
                 logger.debug(
                     f"CuteDSL: SM version {get_sm_version()} is not supported. "
@@ -10399,6 +10409,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs: List[torch.Tensor],
             tactic,
         ) -> None:
+            """Launch the selected Rubin BF16 GEMM with its scheduler and split-K settings."""
             (kernel_variant, use_2cta_instrs, mma_tiler_mn,
              preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
              split_k_slices) = _parse_sm107_bf16_tactic(tactic)
@@ -12959,6 +12970,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.use_tvm_ffi)
 
             def tactic_search_cache_key(self):
+                """Return the active NVMMH search policy discriminator for profiling caches."""
                 if (self.nvmmh_precision is None or self.nvmmh_layout is None):
                     return None
                 return _cutedsl_nvmmh_tactic_search_cache_key()
@@ -12979,6 +12991,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 **kwargs,
             ) -> List[Tuple[int, int]]:
                 # SM107 dense block-scaled GEMM only.
+                """Enumerate valid Rubin block-scaled families before optional heuristic pruning."""
                 if (sm_version := get_sm_version()) != 107:
                     logger.debug(
                         f"CuteDSL: SM version {sm_version} is not supported. "
@@ -13383,6 +13396,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if "split_k" in fields:
 
                         def _split_k(tactic):
+                            """Read the tactic split factor, defaulting unsplit variants to one."""
                             if (isinstance(tactic, tuple) and tactic
                                     and tactic[0] == "base"
                                     and len(tactic) >= 9):
@@ -13436,6 +13450,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         return fallback_tactics
 
                     def model_key(signature):
+                        """Drop locally swept cluster fields from a model-matching signature."""
                         return self._nvmmh_cluster_family(
                             signature,
                             match_fields,
@@ -13488,7 +13503,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         if annotated is not None:
                             selected.append(annotated)
                     selected.extend(
-                        tactic for tactic in fallback_tactics
+                        tactic for tactic in candidate_tactics
                         if ((signature := self._nvmmh_tactic_signature(
                             tactic, match_fields)) is not None
                             and signature[-1] in unmatched_swaps))
@@ -14578,6 +14593,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_tvm_ffi = use_tvm_ffi
 
             def tactic_search_cache_key(self):
+                """Return the active NVMMH search policy discriminator for profiling caches."""
                 return _cutedsl_nvmmh_tactic_search_cache_key()
 
             def get_valid_tactics(
@@ -14586,7 +14602,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 profile: OptimizationProfile,
                 **kwargs,
             ) -> List[int]:
-
+                """Generate per-tensor Rubin FP8 tactics and apply optional NVMMH filtering."""
                 if (sm_version := get_sm_version()) != 107:
                     logger.debug(
                         f"CuteDSL: SM version {sm_version} is not supported. "
