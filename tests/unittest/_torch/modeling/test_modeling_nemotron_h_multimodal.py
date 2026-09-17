@@ -15,15 +15,15 @@ from test_modeling_multimodal import llm_models_root
 from test_modeling_nemotron_h import extract_decode_logprobs
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.models import modeling_nemotron_nano as nemotron_nano
+from tensorrt_llm._torch.models import modeling_nemotron_h_multimodal as nemotron_h_multimodal
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
-from tensorrt_llm._torch.models.modeling_nemotron_nano import (
-    NanoV2VLInputProcessor,
-    NanoV2VLMultimodalEncoder,
-    NanoV2VLVisionEncoder,
-    NemotronH_Nano_VL_V2,
+from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+    NemotronHMultimodalEncoder,
+    NemotronHMultimodalInputProcessor,
+    NemotronHMultimodalModel,
+    NemotronHVisionEncoder,
     _get_vision_encoder_cuda_graph_config,
     _normalize_vision_weights,
 )
@@ -71,17 +71,17 @@ def _make_minimal_nano_model_config():
 
 @pytest.mark.cpu_only
 def test_nemotron_nano_registers_native_multimodal_epd_components():
-    """Every arch served by the native Nano VL class advertises MM EPD support."""
+    """Every arch served by the native Nemotron H multimodal class advertises MM EPD support."""
     for arch in (
         "NemotronH_Nano_VL_V2",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
     ):
         vision_encoder_cls, vlm_base_model = MODEL_CLASS_VISION_ENCODER_MAPPING[arch]
-        assert vision_encoder_cls is NanoV2VLMultimodalEncoder
+        assert vision_encoder_cls is NemotronHMultimodalEncoder
         assert vlm_base_model is None
-    assert NanoV2VLInputProcessor.support_mm_disagg is True
-    assert NemotronH_Nano_VL_V2.support_mm_disagg is True
+    assert NemotronHMultimodalInputProcessor.support_mm_disagg is True
+    assert NemotronHMultimodalModel.support_mm_disagg is True
 
 
 def _assert_nano_video_handoff(handoff):
@@ -111,7 +111,7 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     input_field, input_value, asserts_encode_not_called
 ):
     """Split video prompt runs stay grouped under one MM item, with or without prompt text."""
-    processor = object.__new__(NanoV2VLInputProcessor)
+    processor = object.__new__(NemotronHMultimodalInputProcessor)
     processor._config = SimpleNamespace(
         llm_config=SimpleNamespace(vocab_size=1000, hidden_size=16),
     )
@@ -186,10 +186,10 @@ def test_nemotron_nano_multimodal_encoder_load_by_worker_role(env_value, expects
 
     with (
         mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": env_value}),
-        mock.patch.object(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls),
-        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", mapper_cls),
+        mock.patch.object(nemotron_h_multimodal, "NemotronHVisionEncoder", vision_encoder_cls),
+        mock.patch.object(nemotron_h_multimodal, "NemotronHHfWeightMapper", mapper_cls),
     ):
-        NemotronH_Nano_VL_V2.load_weights(model, weights)
+        NemotronHMultimodalModel.load_weights(model, weights)
 
     if expects_encoder:
         vision_encoder_cls.assert_called_once_with(model._mm_model_config)
@@ -214,7 +214,7 @@ def test_nemotron_nano_rejects_evs_attached_video_embeddings():
     )
 
     with pytest.raises(ValueError, match="EVS video pruning is not supported"):
-        NemotronH_Nano_VL_V2.forward(
+        NemotronHMultimodalModel.forward(
             model,
             attn_metadata,
             input_ids=torch.tensor([[20]], dtype=torch.long),
@@ -241,7 +241,7 @@ def test_nemotron_nano_forward_threads_spec_decoding_args():
     spec_metadata = object()
     resource_manager = object()
 
-    NemotronH_Nano_VL_V2.forward(
+    NemotronHMultimodalModel.forward(
         model,
         attn_metadata,
         input_ids=input_ids,
@@ -260,7 +260,7 @@ def test_nemotron_nano_forward_threads_spec_decoding_args():
 def test_nemotron_nano_forward_keeps_prompt_ids_when_embeds_are_fused(monkeypatch):
     """Fusion nulls input_ids, so orig_input_ids is the drafter's only token source."""
     monkeypatch.setattr(
-        nemotron_nano,
+        nemotron_h_multimodal,
         "fuse_input_embeds",
         lambda *args, **kwargs: (None, torch.zeros(3, 4)),
     )
@@ -268,7 +268,7 @@ def test_nemotron_nano_forward_keeps_prompt_ids_when_embeds_are_fused(monkeypatc
     attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
     input_ids = torch.tensor([5, 6, 7], dtype=torch.long)
 
-    NemotronH_Nano_VL_V2.forward(
+    NemotronHMultimodalModel.forward(
         model,
         attn_metadata,
         input_ids=input_ids,
@@ -287,7 +287,7 @@ def test_nemotron_nano_forward_passes_through_spec_worker_dict():
     model.llm.forward.return_value = spec_output
     attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
 
-    out = NemotronH_Nano_VL_V2.forward(
+    out = NemotronHMultimodalModel.forward(
         model,
         attn_metadata,
         input_ids=torch.tensor([5, 6, 7], dtype=torch.long),
@@ -663,7 +663,7 @@ def test_nemotron_nano_v2_vl_defaults_keep_block_reuse_opt_in():
     """
     llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
-    defaults = NemotronH_Nano_VL_V2.get_model_defaults(llm_args)
+    defaults = NemotronHMultimodalModel.get_model_defaults(llm_args)
 
     assert defaults == NemotronHForCausalLM.get_model_defaults(llm_args), (
         "VL wrapper defaults diverged from the inner LM they delegate to"
@@ -691,7 +691,7 @@ def test_nemotron_nano_v2_vl_set_guided_decoder_reaches_inner_lm():
     # skipping `__init__` keeps this on CPU and off the checkpoint.
     # `nn.Module.__init__` still has to run first, since `nn.Module.__setattr__`
     # refuses submodules otherwise.
-    model = object.__new__(NemotronH_Nano_VL_V2)
+    model = object.__new__(NemotronHMultimodalModel)
     torch.nn.Module.__init__(model)
     model.llm = _InnerWithGuidedDecoder()
 
@@ -723,7 +723,9 @@ class TestSoundPlaceholderInjection:
         model._sound_context_token = self.SOUND_TOKEN
         model._audio_extractor = MagicMock()  # not None → passes early return
         model._prepare_audio_features = MagicMock(side_effect=lambda text, _: (text, {}))
-        return NanoV2VLInputProcessor._extract_audio_from_video(model, text_prompt, video_audios)
+        return NemotronHMultimodalInputProcessor._extract_audio_from_video(
+            model, text_prompt, video_audios
+        )
 
     def _make_audio(self) -> AudioData:
         return AudioData(samples=np.zeros(16000), sample_rate=16000)
@@ -783,7 +785,7 @@ class TestInterleaveVideoAudioEmbeddings:
         vision_enc.patch_size = patch_size
         vision_enc.downsample_ratio = downsample_ratio
         vision_enc._video_tubelet_geometry = (
-            lambda t, T, ih, iw: NanoV2VLVisionEncoder._video_tubelet_geometry(
+            lambda t, T, ih, iw: NemotronHVisionEncoder._video_tubelet_geometry(
                 vision_enc, t, T, ih, iw
             )
         )
@@ -809,7 +811,7 @@ class TestInterleaveVideoAudioEmbeddings:
         a2 = torch.randn(5, hidden)
         audio_emb = torch.cat([a1, a2], dim=0)
 
-        result = NemotronH_Nano_VL_V2._interleave_video_audio_embeddings(
+        result = NemotronHMultimodalModel._interleave_video_audio_embeddings(
             model,
             vision_emb=vision_emb,
             audio_emb=audio_emb,
@@ -843,7 +845,7 @@ class TestInterleaveVideoAudioEmbeddings:
         a3 = torch.randn(4, hidden)
         audio_emb = torch.cat([a1, a3], dim=0)
 
-        result = NemotronH_Nano_VL_V2._interleave_video_audio_embeddings(
+        result = NemotronHMultimodalModel._interleave_video_audio_embeddings(
             model,
             vision_emb=vision_emb,
             audio_emb=audio_emb,
@@ -869,7 +871,7 @@ class TestInterleaveVideoAudioEmbeddings:
         # Two clips: 3 tokens + 2 tokens = 5 audio tokens total
         audio_emb = torch.randn(5, hidden)
 
-        result = NemotronH_Nano_VL_V2._interleave_video_audio_embeddings(
+        result = NemotronHMultimodalModel._interleave_video_audio_embeddings(
             model,
             vision_emb=v1,
             audio_emb=audio_emb,
@@ -953,7 +955,7 @@ class TestEncodeAudio:
         """
         torch.manual_seed(0)
         stub = self._make_stub_sound_encoder()
-        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
+        model = mock.MagicMock(spec=NemotronHMultimodalModel)
         model.sound_encoder = stub
         model.model_dtype = torch.float32
 
@@ -962,10 +964,10 @@ class TestEncodeAudio:
         a2 = self._make_audio_data(num_clips=1, time_len=14, valid_lens=[12])
 
         per_input_results = [
-            NemotronH_Nano_VL_V2._encode_audio(model, [a1])[0],
-            NemotronH_Nano_VL_V2._encode_audio(model, [a2])[0],
+            NemotronHMultimodalModel._encode_audio(model, [a1])[0],
+            NemotronHMultimodalModel._encode_audio(model, [a2])[0],
         ]
-        batched_results = NemotronH_Nano_VL_V2._encode_audio(model, [a1, a2])
+        batched_results = NemotronHMultimodalModel._encode_audio(model, [a1, a2])
 
         assert len(batched_results) == 2
         for (b_emb, b_counts), (s_emb, s_counts) in zip(batched_results, per_input_results):
@@ -973,8 +975,8 @@ class TestEncodeAudio:
             assert torch.allclose(b_emb, s_emb, atol=1e-6, rtol=1e-6)
 
     def test_empty_input(self):
-        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
-        assert NemotronH_Nano_VL_V2._encode_audio(model, []) == []
+        model = mock.MagicMock(spec=NemotronHMultimodalModel)
+        assert NemotronHMultimodalModel._encode_audio(model, []) == []
 
 
 @pytest.mark.cpu_only
@@ -985,7 +987,7 @@ class TestChunkedPrefillCaching:
     caches the returned tensor into `multimodal_data["multimodal_embedding"]`.
     A second call with the same params must skip the encoder. The
     encoder_fn here is `encode_multimodal_by_groups` bound to the model's
-    three per-modality groups — the shape all Nemotron production forwards
+    three per-modality groups — the shape all Nemotron H production forwards
     take.
     """
 
@@ -993,8 +995,8 @@ class TestChunkedPrefillCaching:
     NUM_TOKENS = 10
 
     def _make_mock_model(self):
-        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
-        model.vision_encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
+        model = mock.MagicMock(spec=NemotronHMultimodalModel)
+        model.vision_encoder = mock.MagicMock(spec=NemotronHVisionEncoder)
         model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
         return model
 
@@ -1025,7 +1027,7 @@ class TestChunkedPrefillCaching:
     def _make_encoder_fn(self, model):
         """Route through `encode_multimodal_by_groups` with real group methods
         bound to the mock's stubbed sub-encoders — matches the production
-        `NemotronH_Nano_VL_V2.forward` path.
+        `NemotronHMultimodalModel.forward` path.
 
         The group encoder_fns are invoked via `**build_batched_input(...)`,
         which spreads the pack dict as kwargs — so the wrappers must accept
@@ -1043,9 +1045,15 @@ class TestChunkedPrefillCaching:
             return lambda multimodal_params: method(model, multimodal_params)
 
         groups = (
-            EncoderGroup(("image",), _run_group(NemotronH_Nano_VL_V2._encode_image_group), _pack),
-            EncoderGroup(("video",), _run_group(NemotronH_Nano_VL_V2._encode_video_group), _pack),
-            EncoderGroup(("audio",), _run_group(NemotronH_Nano_VL_V2._encode_audio_group), _pack),
+            EncoderGroup(
+                ("image",), _run_group(NemotronHMultimodalModel._encode_image_group), _pack
+            ),
+            EncoderGroup(
+                ("video",), _run_group(NemotronHMultimodalModel._encode_video_group), _pack
+            ),
+            EncoderGroup(
+                ("audio",), _run_group(NemotronHMultimodalModel._encode_audio_group), _pack
+            ),
         )
         return lambda params: encode_multimodal_by_groups(groups, params)
 
@@ -1303,9 +1311,9 @@ def test_nemotron_nano_frees_the_modelopt_projector_shard():
 
     with (
         mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "0"}),
-        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", MagicMock()),
+        mock.patch.object(nemotron_h_multimodal, "NemotronHHfWeightMapper", MagicMock()),
     ):
-        NemotronH_Nano_VL_V2.load_weights(model, weights)
+        NemotronHMultimodalModel.load_weights(model, weights)
 
     assert "vision_projector.mlp1.linear1.weight" not in weights
     assert "vision_model.radio_model.weight" not in weights
