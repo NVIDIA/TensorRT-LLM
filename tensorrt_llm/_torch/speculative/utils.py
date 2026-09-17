@@ -12,6 +12,8 @@ import torch
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from ..pyexecutor.config_utils import match_nemotron_h_layer_types
@@ -934,3 +936,84 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
 
     # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
     return 0
+
+
+def get_static_draft_len(model_engine: "ModelEngine") -> int:
+    """Return logical K for linear modes or total tree tokens for tree modes.
+
+    This selects the static maximum without applying a batch-size schedule or
+    changing engine state. PARD's physical buffer width is derived separately.
+    """
+    spec_config = model_engine.spec_config
+    if spec_config is None or spec_config.is_linear_tree:
+        return model_engine.max_draft_len
+    return model_engine.max_total_draft_tokens
+
+
+def update_draft_len(model_engine: "ModelEngine",
+                     scheduled_batch: "ScheduledRequests",
+                     *,
+                     draft_len: Optional[int] = None,
+                     speculation_permanently_disabled: bool = False) -> None:
+    """Resolve this batch's draft length and synchronize its draft buffers.
+
+    Normal iterations must call this before ``prepare_resources`` so KV cache
+    allocation uses the selected draft length. Dynamic and explicit lengths
+    pad or truncate generation-request buffers to a uniform width, as required
+    by CUDA graph replay and the attention kernel. Static normal decoding
+    preserves the drafter's proposals instead.
+
+    Warmup supplies the explicit length used to allocate its dummy batch,
+    including graph shapes that differ from the normal batch-size schedule.
+    """
+    if not hasattr(model_engine, 'max_draft_len'):
+        return
+
+    if speculation_permanently_disabled:
+        for request in scheduled_batch.generation_requests:
+            request.py_draft_tokens = []
+        model_engine.runtime_draft_len = 0
+        return
+
+    spec_config = model_engine.spec_config
+    if draft_len is None:
+        if (spec_config is not None
+                and spec_config.draft_len_schedule is not None
+                and spec_config.spec_dec_mode.support_dynamic_draft_len()):
+            draft_len = get_draft_len_for_batch_size(
+                spec_config.draft_len_schedule, scheduled_batch.batch_size,
+                model_engine.max_draft_len)
+        else:
+            # Static decoding preserves the proposals produced by the drafter,
+            # including requests intentionally entering with no draft tokens.
+            model_engine.runtime_draft_len = get_static_draft_len(model_engine)
+            return
+
+    draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
+    rejection_on = getattr(spec_config, "use_rejection_sampling", False)
+    for request in scheduled_batch.generation_requests:
+        current_num_draft_tokens = len(request.py_draft_tokens)
+        # A generation request without a prior proposal has no draft-probability
+        # scatter. Preserve that fact before padding so input preparation can
+        # populate the one-hot placeholder instead of reading a stale row.
+        request.py_needs_onehot_draft_probs |= (rejection_on and
+                                                current_num_draft_tokens == 0)
+        if spec_config is not None and spec_config.spec_dec_mode.is_pard():
+            # PARD carries K proposals followed by K-1 placeholders.
+            buffer_width = spec_config.get_runtime_tokens_per_gen_step(
+                draft_len) - 1
+            current_draft_len = ((current_num_draft_tokens + 1) //
+                                 2 if current_num_draft_tokens > 0 else 0)
+            draft_tokens = request.py_draft_tokens[:min(current_draft_len,
+                                                        draft_len)]
+            draft_tokens.extend([draft_buffer_pad] *
+                                (draft_len - len(draft_tokens)))
+            request.py_draft_tokens = draft_tokens + [draft_buffer_pad] * (
+                buffer_width - len(draft_tokens))
+        elif current_num_draft_tokens < draft_len:
+            request.py_draft_tokens.extend(
+                [draft_buffer_pad] * (draft_len - current_num_draft_tokens))
+        elif current_num_draft_tokens > draft_len:
+            request.py_draft_tokens = request.py_draft_tokens[:draft_len]
+
+    model_engine.runtime_draft_len = draft_len

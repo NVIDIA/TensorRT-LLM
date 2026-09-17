@@ -70,6 +70,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..speculative.utils import get_static_draft_len, update_draft_len
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      set_per_request_prefill_cuda_graph_flag,
@@ -690,9 +691,7 @@ class PyTorchModelEngine(ModelEngine):
             # dynamic draft length is enabled; otherwise stays fixed).  Tree
             # modes verify all tree nodes per step, which can be wider than the
             # tree depth used by the drafter loop.
-            self.runtime_draft_len = (self.max_total_draft_tokens
-                                      if not spec_config.is_linear_tree else
-                                      self.max_draft_len)
+            self.runtime_draft_len = get_static_draft_len(self)
 
         else:
             self.without_logits = False
@@ -2491,11 +2490,7 @@ class PyTorchModelEngine(ModelEngine):
         # Match the runtime_draft_len semantics enforced in _prepare_tp_inputs:
         # logical K for linear-tree modes, total tree tokens for tree decoding.
         # spec_config is None for non-spec models — fall back to max_draft_len (= 0).
-        draft_lengths = [
-            self.max_draft_len if
-            (self.spec_config is None or self.spec_config.is_linear_tree) else
-            self.max_total_draft_tokens
-        ]
+        draft_lengths = [get_static_draft_len(self)]
         should_capture_no_spec = (
             self.max_total_draft_tokens > 0
             and not self.spec_config.spec_dec_mode.use_one_engine()
@@ -2695,7 +2690,6 @@ class PyTorchModelEngine(ModelEngine):
                                 self.spec_config.spec_dec_mode.use_one_engine())
                             self._update_draft_inference_state_for_warmup(
                                 batch, draft_len > 0, resource_manager)
-                            self.runtime_draft_len = draft_len
                             if self._is_encoder_decoder_model():
                                 prepare_cross_batch(batch, resource_manager)
                             self.forward(batch,
@@ -2900,6 +2894,12 @@ class PyTorchModelEngine(ModelEngine):
                                 f"context requests={num_contexts}, "
                                 f"packed encoder tokens={total_encoder_tokens}")
                     saved_enable_spec_decode = self.enable_spec_decode
+                    # The builder above has already set runtime_draft_len to 0,
+                    # so this save/restore cannot recover the pre-builder value.
+                    # This is harmless while encoder-decoder models use
+                    # max_draft_len == 0. Before supporting nonzero drafting,
+                    # save the length before building the batch and extend the
+                    # try/finally to cover batch creation as well.
                     saved_runtime_draft_len = self.runtime_draft_len
                     try:
                         self.enable_spec_decode = False
@@ -3152,6 +3152,7 @@ class PyTorchModelEngine(ModelEngine):
         result = ScheduledRequests()
         result.reset_context_requests(ctx_requests)
         result.generation_requests = gen_requests
+        update_draft_len(self, result, draft_len=get_static_draft_len(self))
         return result
 
     def _create_cuda_graph_warmup_request(
@@ -3347,6 +3348,7 @@ class PyTorchModelEngine(ModelEngine):
             if not self._add_cross_dummy_requests(result.all_requests(),
                                                   resource_manager):
                 return None
+        update_draft_len(self, result, draft_len=draft_len)
         return result
 
     def _get_max_encoder_output_len(self,
@@ -4856,7 +4858,7 @@ class PyTorchModelEngine(ModelEngine):
         # For tree decoding, runtime_draft_len should match total tree
         # tokens (not tree depth).  py_executor resets it every iteration.
         if spec_config is not None and not spec_config.is_linear_tree:
-            self.runtime_draft_len = self.max_total_draft_tokens
+            self.runtime_draft_len = get_static_draft_len(self)
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []

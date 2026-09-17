@@ -73,6 +73,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from ..speculative.utils import update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
@@ -3458,94 +3459,11 @@ class PyExecutor:
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
-        """Handle dynamic draft length for the current batch.
-
-        Must be called BEFORE prepare_resources so that KV cache allocation
-        uses the correct draft length.
-
-        Two things happen here:
-        1. Determine the runtime draft length from the draft_len_schedule
-           based on the current batch size, and store it on model_engine so
-           that the rest of the forward path can read it.
-        2. Pad / truncate each request's py_draft_tokens to exactly match
-           the determined draft length, ensuring uniform draft token counts across the
-           batch (required by CUDA graph replay and the attention kernel).
-
-        When dynamic draft length is not enabled, runtime_draft_len is simply
-        set to max_draft_len (the static maximum).
-        """
-        if not hasattr(self.model_engine, 'max_draft_len'):
-            return
-
-        if self.speculation_permanently_disabled:
-            for request in scheduled_batch.generation_requests:
-                request.py_draft_tokens = []
-            self.model_engine.runtime_draft_len = 0
-            return
-
-        if (self.model_engine.spec_config is not None
-                and self.model_engine.spec_config.draft_len_schedule is not None
-                and self.model_engine.spec_config.spec_dec_mode.
-                support_dynamic_draft_len()):
-            from tensorrt_llm._torch.speculative.utils import \
-                get_draft_len_for_batch_size
-
-            spec_dec_mode = self.model_engine.spec_config.spec_dec_mode
-
-            # 1. Resolve runtime draft length from schedule
-            runtime_draft_len = get_draft_len_for_batch_size(
-                self.model_engine.spec_config.draft_len_schedule,
-                scheduled_batch.batch_size, self.model_engine.max_draft_len)
-            # 2. Pad or truncate draft tokens to the resolved length
-            DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
-            rejection_on = getattr(self.model_engine.spec_config,
-                                   "use_rejection_sampling", False)
-            for request in scheduled_batch.generation_requests:
-                current_num_draft_tokens = len(request.py_draft_tokens)
-                # One-model rejection: a gen request entering with 0 real draft
-                # tokens produced no draft-prob scatter for its slot last iter,
-                # so next iter's rejection kernel would read a stale draft_probs
-                # row. Mark it (pre-pad signal) so _prepare_tp_inputs writes a
-                # one-hot placeholder row after spec_metadata.prepare().
-                request.py_needs_onehot_draft_probs |= (
-                    rejection_on and current_num_draft_tokens == 0)
-                if spec_dec_mode.is_pard():
-                    # special case: PARD carries 2K-1 draft tokens per request
-                    runtime_draft_token_buffer_width = (
-                        self.model_engine.spec_config.
-                        get_runtime_tokens_per_gen_step(runtime_draft_len) - 1)
-                    current_runtime_draft_len = (
-                        current_num_draft_tokens +
-                        1) // 2 if current_num_draft_tokens > 0 else 0
-                    real_draft_tokens = request.py_draft_tokens[:min(
-                        current_runtime_draft_len, runtime_draft_len)]
-                    real_draft_tokens.extend(
-                        [DRAFT_BUFFER_PAD] *
-                        (runtime_draft_len - len(real_draft_tokens)))
-                    request.py_draft_tokens = real_draft_tokens + [
-                        DRAFT_BUFFER_PAD
-                    ] * (runtime_draft_token_buffer_width -
-                         len(real_draft_tokens))
-                else:
-                    if current_num_draft_tokens < runtime_draft_len:
-                        padding_needed = (runtime_draft_len -
-                                          current_num_draft_tokens)
-                        request.py_draft_tokens.extend([DRAFT_BUFFER_PAD] *
-                                                       padding_needed)
-                    elif current_num_draft_tokens > runtime_draft_len:
-                        request.py_draft_tokens = request.py_draft_tokens[:
-                                                                          runtime_draft_len]
-
-            self.model_engine.runtime_draft_len = runtime_draft_len
-        else:
-            # Linear-tree modes (incl. PARD) use logical K; tree decoding
-            # (e.g. EAGLE3 dynamic tree) uses total tree tokens. Same
-            # selection as _prepare_tp_inputs and _get_graphs_to_capture.
-            spec_config = self.model_engine.spec_config
-            self.model_engine.runtime_draft_len = (
-                self.model_engine.max_draft_len
-                if spec_config is not None and spec_config.is_linear_tree else
-                self.model_engine.max_total_draft_tokens)
+        """Synchronize draft length and buffers before preparing resources."""
+        update_draft_len(self.model_engine,
+                         scheduled_batch,
+                         speculation_permanently_disabled=self.
+                         speculation_permanently_disabled)
 
     @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
