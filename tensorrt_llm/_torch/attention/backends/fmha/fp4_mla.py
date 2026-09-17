@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -230,8 +230,12 @@ class Fp4MlaFmha(PhasedFmha):
         *,
         kv_lens_cuda: torch.Tensor,
         kv_lens_cpu: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run one explicit-KV partition through the FP8 MLA context kernel."""
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run one explicit-KV partition through the FP8 MLA context kernel.
+
+        Returns whatever ``TrtllmAttention.forward`` returns for the FP8
+        context copy: the attention output plus its optional output scale.
+        """
         if forward_args.output is None:
             raise RuntimeError("FP4 MLA context partition requires an output buffer.")
         if forward_args.latent_cache is not None:

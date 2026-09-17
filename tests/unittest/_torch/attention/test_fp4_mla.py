@@ -39,7 +39,11 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BASE_GENERATION_TOKEN_COUNT,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -267,12 +271,17 @@ def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:
     manager.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
     manager.enable_swa_scratch_reuse = False
     manager._has_cp_helix = False
+    manager._generation_kv_capacity_headroom = BASE_GENERATION_TOKEN_COUNT
     manager._get_runtime_cache_size_layer_components = lambda: ([10, 8], [None, 19])
 
     quota = manager._get_quota_from_max_tokens(manager.max_num_tokens)
 
+    # KVCacheManagerV2 charges every resident generation request the pages that
+    # the live window interval can straddle, which is two 128-token pages for a
+    # 19-token HP ring plus the base generation headroom.
     hp_page_bytes = FP4_MLA_TOKENS_PER_BLOCK * 8
-    expected_quota = manager.max_num_tokens * (10 + 8) + 6 * hp_page_bytes
+    hp_pages_per_request = 2
+    expected_quota = manager.max_num_tokens * (10 + 8) + 6 * hp_pages_per_request * hp_page_bytes
     assert quota == expected_quota
     assert manager._get_max_tokens_from_quota(quota) == manager.max_num_tokens
 
