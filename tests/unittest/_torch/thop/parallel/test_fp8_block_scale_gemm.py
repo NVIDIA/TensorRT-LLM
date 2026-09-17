@@ -789,7 +789,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_clc_dynamic_prefetch_multi_wav
     getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and SM107 CuTe DSL support.",
 )
-def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
+def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave(monkeypatch):
     """CLC dynamic scheduling supports Boolean-enabled prefetch."""
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLMXFP8RubinLinear
@@ -835,24 +835,46 @@ def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
     non_power_split_k_tactic = (*dynamic_tactic[:-2], 3, 1)
     runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
                                      use_tvm_ffi=True)
+    from tensorrt_llm._torch import autotuner
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from tensorrt_llm._torch.custom_ops import \
+        cutedsl_matmul_heuristics as heuristics
+
+    # Isolate this test from the process-wide policy of preceding tests.
+    monkeypatch.setattr(autotuner.AutoTuner, "_nvmmh_config",
+                        autotuner.NvMMHConfig())
     valid_tactics = runner.get_valid_tactics(inputs, None)
     # Model-selected swizzles extend the validated baseline tactic tuple.
     assert static_tactic[:-1] in valid_tactics
     assert dynamic_tactic[:-1] in valid_tactics
     assert split_k_tactic[:-1] in valid_tactics
-    for scheduler_mode in ("static", "clc_dynamic"):
-        for raster_order in ("m", "n"):
-            swizzle_sizes = ((1, 2, 4, 8) if scheduler_mode == "static" else
-                             (1, ))
-            for swizzle_size in swizzle_sizes:
-                tactic = (
-                    *static_tactic[:-4],
-                    scheduler_mode,
-                    raster_order,
-                    1,
-                    swizzle_size,
-                )
-                assert tactic[:-1] in valid_tactics
+    monkeypatch.setattr(ops, "IS_NVMMH_AVAILABLE", True)
+    monkeypatch.setattr(
+        autotuner.AutoTuner, "_nvmmh_config",
+        autotuner.NvMMHConfig(enabled=True, fields=("swizzle", )))
+    for swizzle_size in (1, 2, 4, 8):
+        config = heuristics.HeuristicConfig((128, 256), (4, 2), swizzle_size, 0)
+        monkeypatch.setattr(ops,
+                            "rank_configs",
+                            lambda *args, _config=config, **kwargs: [_config])
+        annotated_tactics = runner.get_valid_tactics(inputs, None)
+        base_tactics = [t for t in annotated_tactics if t[0] == "base"]
+        assert base_tactics and all(len(t) == 10 for t in base_tactics)
+        for scheduler_mode in ("static", "clc_dynamic"):
+            for raster_order in ("m", "n"):
+                baseline = (*static_tactic[:-4], scheduler_mode, raster_order,
+                            1)
+                assert baseline in valid_tactics
+                expected = (*baseline, swizzle_size)
+                annotated = runner._apply_nvmmh_scheduler(
+                    baseline, config, {"swizzle"})
+                if scheduler_mode == "clc_dynamic" and swizzle_size != 1:
+                    assert annotated is None
+                    assert expected not in annotated_tactics
+                else:
+                    assert annotated == expected
+                    assert expected in annotated_tactics
+        assert all(t[-1] == 1 for t in base_tactics if t[6] == "clc_dynamic")
 
     static_output = runner(inputs, tactic=static_tactic)
     dynamic_output = runner(inputs, tactic=dynamic_tactic)

@@ -326,6 +326,7 @@ def rank_configs(
                 raise ValueError(f"Unsupported nvMatmulHeuristics split-K kind {split_k_kind!r}")
 
             def _method(*names):
+                """Resolve a supported method name across NVMMH Python API versions."""
                 for name in names:
                     method = getattr(interface, name, None)
                     if method is not None:
@@ -457,6 +458,7 @@ def filter_fp8_tactics(
     if sweep_cluster_n and fields & {"tile", "cluster"}:
 
         def _cluster_n_family(signature):
+            """Ignore the locally swept cluster-N dimension in the matching key."""
             cta, cluster, *remaining = signature
             return (cta, int(cluster[0]), *remaining)
 

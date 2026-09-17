@@ -22,7 +22,9 @@ import itertools
 import json
 import math
 import os
+import threading
 import time
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -183,6 +185,7 @@ class NvMMHConfig:
     max_tactics: int = 5
 
     def __post_init__(self) -> None:
+        """Validate policy values and normalize aliases and coupled search fields."""
         if not isinstance(self.enabled, bool):
             raise ValueError("NvMMHConfig.enabled must be a bool")
         if isinstance(self.max_tactics,
@@ -371,9 +374,11 @@ class CuteDSLTunableRunner(TunableRunner):
     """Marker base for CuTe DSL runners that prefer CUPTI timing."""
 
     def use_torch_profiler(self, tactic: Any) -> bool:
+        """Prefer CUDA activity timing for every CuTe DSL tactic."""
         return True
 
     def profiling_timer_cache_key(self) -> Optional[str]:
+        """Separate CUPTI-ranked tactics from legacy timer cache entries."""
         return _TORCH_PROFILER_TIMER_KEY
 
 
@@ -670,6 +675,7 @@ class AutoTunerProfilingCache:
         apply_map_to_tuning_buckets: bool = True,
         timer_key_override: Optional[str] = None,
     ) -> Tuple:
+        """Combine operation, runner, shapes, search policy, and timing backend."""
         cache_key = (
             custom_op,
             runner.__class__.__name__,
@@ -1072,12 +1078,15 @@ class AutoTuner:
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
     _nvmmh_config = NvMMHConfig()
+    _nvmmh_policy_lock = threading.RLock()
+    _nvmmh_policy_owners: weakref.WeakSet = weakref.WeakSet()
     # CUPTI availability is process-wide. Keep the failure sticky across
     # AutoTuner instances so every tactic does not repeat the same failed
     # profiler initialization before falling back to CUDA events.
     _torch_profiler_unavailable = False
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
+        """Initialize profiling settings, distributed state, statistics, and caches."""
         # Increase log level for AutoTuner associated logger`
         self._log_level_to_info = os.getenv(
             "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", '0') == '1'
@@ -1148,31 +1157,57 @@ class AutoTuner:
         is replaced, so an invalid update leaves the previous policy intact.
         Every ``AutoTuner`` instance shares this process-wide policy, which is
         intentionally persistent across ``autotune`` contexts, instance
-        construction, and profiling-cache clears.
+        construction, and profiling-cache clears. Active model engines pin
+        this policy: a differing update raises without changing any state.
         """
-        keyword_values = (
-            enabled,
-            fields,
-            max_tactics,
-        )
-        if config is not None:
-            if any(value is not None for value in keyword_values):
-                raise ValueError(
-                    "Pass either config or NVMMH keyword settings, not both")
-            if not isinstance(config, NvMMHConfig):
-                raise TypeError("config must be an NvMMHConfig")
-            new_config = config
-        else:
-            current = AutoTuner._nvmmh_config
-            new_config = NvMMHConfig(
-                enabled=current.enabled if enabled is None else enabled,
-                fields=current.fields if fields is None else fields,
-                max_tactics=(current.max_tactics
-                             if max_tactics is None else max_tactics),
+        with AutoTuner._nvmmh_policy_lock:
+            keyword_values = (
+                enabled,
+                fields,
+                max_tactics,
             )
+            if config is not None:
+                if any(value is not None for value in keyword_values):
+                    raise ValueError(
+                        "Pass either config or NVMMH keyword settings, not both"
+                    )
+                if not isinstance(config, NvMMHConfig):
+                    raise TypeError("config must be an NvMMHConfig")
+                new_config = config
+            else:
+                current = AutoTuner._nvmmh_config
+                new_config = NvMMHConfig(
+                    enabled=current.enabled if enabled is None else enabled,
+                    fields=current.fields if fields is None else fields,
+                    max_tactics=(current.max_tactics
+                                 if max_tactics is None else max_tactics),
+                )
 
-        AutoTuner._nvmmh_config = new_config
-        return new_config
+            if new_config == AutoTuner._nvmmh_config:
+                return AutoTuner._nvmmh_config
+            if AutoTuner._nvmmh_policy_owners:
+                raise ValueError(
+                    "All active model engines in one process must use the same "
+                    "autotuner_nvmmh_config; clean up existing engines before "
+                    "changing the policy.")
+            AutoTuner._nvmmh_config = new_config
+            return new_config
+
+    def _acquire_nvmmh_policy(self, owner: object, config: NvMMHConfig) -> None:
+        """Pin one policy until the owning engine is cleaned up or collected.
+
+        Weak ownership also releases failed, partially initialized engines.
+        Registering an owner and validating its policy share the configuration
+        lock, so concurrent engine construction cannot replace a pinned policy.
+        """
+        with AutoTuner._nvmmh_policy_lock:
+            self.configure_nvmmh(config)
+            AutoTuner._nvmmh_policy_owners.add(owner)
+
+    def _release_nvmmh_policy(self, owner: object) -> None:
+        """Release an engine's policy pin without resetting the current policy."""
+        with AutoTuner._nvmmh_policy_lock:
+            AutoTuner._nvmmh_policy_owners.discard(owner)
 
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.
@@ -1782,6 +1817,7 @@ class AutoTuner:
 
     @classmethod
     def _disable_torch_profiler(cls, error: Exception) -> None:
+        """Latch a process-wide CUPTI failure and report the CUDA-event fallback."""
         cls._torch_profiler_unavailable = True
         logger.warning_once(
             "[Autotuner] torch.profiler/CUPTI is unavailable; falling back "
@@ -1826,6 +1862,7 @@ class AutoTuner:
         use_torch_profiler = runner.use_torch_profiler(tactic)
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
+            """Measure repeated launches on one stream using the selected timer."""
             graph = torch.cuda.CUDAGraph() if use_cuda_graph else None
 
             with torch.cuda.stream(stream):
@@ -1845,6 +1882,7 @@ class AutoTuner:
                     self._dist.tp_barrier()
 
                 def launch_profiled_work():
+                    """Replay the captured batch or launch the same batch eagerly."""
                     if use_cuda_graph:
                         graph.replay()
                     else:
@@ -1899,12 +1937,15 @@ class AutoTuner:
                     end_ts = torch.empty(1, dtype=torch.int64, device="cuda")
 
                     def record_start():
+                        """Record the start of the measured interval on the profiling stream."""
                         record_global_timer(start_ts.data_ptr(), stream)
 
                     def record_end():
+                        """Record the end of the measured interval on the profiling stream."""
                         record_global_timer(end_ts.data_ptr(), stream)
 
                     def elapsed_time():
+                        """Return the recorded profiling interval in milliseconds."""
                         # GPU %globaltimer counts in ns; convert to ms to match
                         # the units of torch.cuda.Event.elapsed_time().
                         return (end_ts.item() - start_ts.item()) / 1e6
@@ -1913,12 +1954,15 @@ class AutoTuner:
                     end_evt = torch.cuda.Event(enable_timing=True)
 
                     def record_start():
+                        """Record the start of the measured interval on the profiling stream."""
                         start_evt.record()
 
                     def record_end():
+                        """Record the end of the measured interval on the profiling stream."""
                         end_evt.record()
 
                     def elapsed_time():
+                        """Return the recorded profiling interval in milliseconds."""
                         return start_evt.elapsed_time(end_evt)
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
