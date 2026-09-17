@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import hashlib
+import json
 import os
 import platform
 import re
@@ -130,8 +131,13 @@ def configure_args_fingerprint(args: Sequence[str]) -> str:
 
     The arguments are sorted first so that ordering differences (e.g. the
     set() expansion of --extra-cmake-vars) don't change the fingerprint.
+
+    The sorted list is JSON-serialized rather than newline-joined so that an
+    argument whose value contains a newline can't collide with the separator
+    (cmake flags/paths don't today, but the JSON form removes the ambiguity).
     """
-    return hashlib.sha256("\n".join(sorted(args)).encode()).hexdigest()
+    payload = json.dumps(sorted(args), separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def stored_configure_fingerprint(build_dir) -> Optional[str]:

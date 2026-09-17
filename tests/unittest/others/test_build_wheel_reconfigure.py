@@ -54,9 +54,24 @@ def test_fingerprint_changes_when_an_argument_changes(build_wheel):
 
 
 def test_fingerprint_is_a_sha256_hex_digest(build_wheel):
-    fingerprint = build_wheel.configure_args_fingerprint(["-DFAST_BUILD=ON"])
-    assert len(fingerprint) == 64
-    assert set(fingerprint) <= set("0123456789abcdef")
+    # A golden literal, not a recomputation with hashlib.sha256 in the test
+    # (which would just re-implement the function): this pins the serialization
+    # so a future change to it fails loudly instead of silently invalidating
+    # every developer's stored fingerprint.
+    assert (
+        build_wheel.configure_args_fingerprint(["-DFAST_BUILD=ON"])
+        == "41e0e41eb5c37990d53366cdf090648a9ec747cf22fd828986a39db7a0baea41"
+    )
+
+
+def test_fingerprint_serialization_is_unambiguous(build_wheel):
+    # A newline inside a value must not collide with the separator between
+    # values. Under a plain "\n".join these two sort to the same string.
+    embedded_newline = ["-DNCCL_ROOT=x\n-DNIXL_ROOT=y"]
+    two_values = ["-DNCCL_ROOT=x", "-DNIXL_ROOT=y"]
+    assert build_wheel.configure_args_fingerprint(
+        embedded_newline
+    ) != build_wheel.configure_args_fingerprint(two_values)
 
 
 def test_stored_fingerprint_missing_file_is_none(build_wheel, tmp_path):
