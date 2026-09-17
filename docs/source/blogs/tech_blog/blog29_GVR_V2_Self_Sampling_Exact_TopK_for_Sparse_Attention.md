@@ -428,11 +428,13 @@ sparse_attention_config:
   use_self_sampling_topk: true
 ```
 
-Use `algorithm: dsa` for DeepSeek-V3.2. The checkpoint supplies the model's Top-K width. For example:
+Use `algorithm: dsa` for DeepSeek-V3.2. The checkpoint supplies the model's Top-K width. With a prepared benchmark dataset in `dataset.jsonl`, run:
 
 ```bash
-trtllm-serve deepseek-ai/DeepSeek-V4-Flash \
-  --config gvr_v2.yaml --tp_size 8 --ep_size 8
+trtllm-bench --model deepseek-ai/DeepSeek-V4-Flash throughput \
+  --dataset dataset.jsonl \
+  --config gvr_v2.yaml \
+  --tp 8 --ep 8
 ```
 
 `enable_heuristic_topk` defaults to `false`. Once it is enabled, `use_self_sampling_topk` defaults to `true`; the second field is explicit here for clarity. Supported prefill layers follow the same V2 selection. Setting `use_self_sampling_topk: false` selects temporal GVR for decode, whose prefill path remains radix.
