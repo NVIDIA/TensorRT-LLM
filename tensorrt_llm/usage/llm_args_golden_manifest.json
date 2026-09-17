@@ -1512,7 +1512,9 @@
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
-        "FA4"
+        "FA4",
+        "AUTO",
+        "CUTEDSL"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
