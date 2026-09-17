@@ -1,0 +1,43 @@
+You are reading a technical brief. Answer the question at the end in one short paragraph.
+
+GPU inference systems keep a key-value cache so that attention does not recompute the
+representations of tokens it has already seen. Each request occupies a set of cache pages, and a
+page holds the keys and values for a fixed number of tokens across the layers that share a cache
+life cycle. When a model applies the same attention pattern to every layer, one pool of pages is
+enough, and a page index means the same thing everywhere in the model.
+
+Modern models increasingly break that assumption. Interleaved architectures alternate between
+layers that attend to a short sliding window and layers that attend to the whole sequence. The
+sliding layers need far fewer pages per request, because once the window has moved past a block of
+tokens those keys and values are never read again and the page can be reclaimed. The full-attention
+layers need a page for every block for as long as the request lives. Sizing one pool for both
+wastes memory on the sliding layers or starves the full-attention ones, so the cache allocates a
+separate pool group per distinct window size and gives each its own slot address space.
+
+That decision has a consequence that matters to anything reading or writing the cache from outside.
+A page index is no longer meaningful on its own. Slot seven of the sliding pool and slot seven of
+the full-attention pool are different memory holding the keys and values of different layers. Any
+component that transfers cache contents must therefore carry the layer group alongside the slot,
+and must key whatever external store it maintains on the pair rather than on the token range alone.
+Two layer groups covering the same tokens hold genuinely different data, and a store keyed only by
+tokens will overwrite one with the other and later restore it into the wrong layers.
+
+The sliding window introduces a second consequence. Because pages are reclaimed once the window has
+passed them, a component that saves cache contents can persist at most one window of tokens for a
+sliding layer group, not the whole prompt. Blocks the window has passed are reported with a sentinel
+index rather than being dropped from the list, so that positions stay aligned with token ranges
+across every layer group, and the component is expected to skip them. Skipping is not merely
+tolerated but required: the sentinel is a valid subscript in most array libraries, so treating it as
+an index silently reads or writes the last page of the pool, corrupting an unrelated request.
+
+Restoring a previously computed prefix interacts with all of this. When an external source supplies
+the keys and values for a leading range of tokens, the runtime advances its notion of how much
+history the request already has, and skips computing that range. For a full-attention layer group
+every block of the restored prefix must be supplied. For a sliding layer group only the blocks that
+remain inside the window need to be supplied, because the earlier ones will never be read. A correct
+implementation therefore transfers different amounts of data to different layer groups for the very
+same restored prefix, and a test that does not observe that difference has not observed the feature
+working at all.
+
+Question: why is a page index meaningless without its layer group, and what does that imply for a
+component that caches attention state outside the runtime?

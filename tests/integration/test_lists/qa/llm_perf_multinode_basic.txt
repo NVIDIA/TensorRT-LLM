@@ -40,3 +40,11 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con256_c
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con30_ctx1_tep2_gen2_tp4_eplb0_eagle3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_wideep_deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_con1024_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+
+# vr200: 6 case(s), 10800 s of measured compute
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_deepseek-v4-pro-fp4_8k1k_con1229_ctx7_dep4_gen1_dep8_eplb384_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep16_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con30_ctx1_tep2_gen2_tp4_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_nemotron-ultra-v3-fp4_50k2k_con178_ctx5_dep4_gen1_dep4_eplb0_mtp6_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL]

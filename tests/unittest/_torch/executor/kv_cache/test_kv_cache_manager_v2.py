@@ -14,9 +14,10 @@
 # limitations under the License.
 
 import array
+import os
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 import pytest
@@ -54,11 +55,14 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
+    CacheLevel,
+    CudaStream,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
+    KVCacheManager,
     KVCacheManagerConfig,
     LayerId,
     SsmLayerConfig,
@@ -714,7 +718,9 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     kv_cache = Mock(num_committed_tokens=2)
     manager = object.__new__(KVCacheManagerV2)
     manager.conversation_manager = None
+    manager.kv_connector_manager = None
     manager.enable_block_reuse = True
+    manager.is_estimating_kv_cache = False
     manager._has_cp_helix = False
     manager.kv_cache_map = {} if fresh_cache else {request.py_request_id: kv_cache}
     manager._stream = SimpleNamespace(cuda_stream=Mock())
@@ -1225,6 +1231,7 @@ def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     manager._can_publish_block_reuse = True
     manager.block_reuse_policy = policy
     manager.conversation_manager = None
+    manager.kv_connector_manager = None
     manager.kv_cache_map = {}
     return manager
 
@@ -1336,6 +1343,7 @@ class _ContextRequest:
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
     context_current_position: int = 0
+    py_connector_served_position: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
     multimodal_positions: None = None
@@ -1667,6 +1675,8 @@ def test_per_conversation_policy_retains_configured_number_of_turns(
 
         assert manager.prepare_context(request_a_probe)
         assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
+        probe_kv_cache = manager.kv_cache_map[request_a_probe.py_request_id]
+        assert list(probe_kv_cache.cached_tokens_by_level)[0] == 7
         _free_if_active(manager, request_a_probe)
 
         _run_context(manager, request_c)
@@ -1731,6 +1741,43 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_a)
 
 
+def test_live_storage_stats_use_the_manager_api() -> None:
+    init_cuda_once()
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=8 << 20), HostCacheTierConfig(quota=8 << 20)],
+            layers=[
+                AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4096)])
+            ],
+        )
+    )
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock(wraps=core, cache_tier_list=core.cache_tier_list)
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager._storage_pool_groups_by_window = lambda: {}
+    manager._cold_pool_group_membership_cache = None
+    cache = core.create_kv_cache()
+    try:
+        assert manager._cold_pool_group_membership() == ((0, frozenset({0})),)
+        before = manager.get_kv_cache_stats()
+        cache.resume(CudaStream(torch.cuda.Stream().cuda_stream))
+        cache.resize(TOKENS_PER_BLOCK)
+        after = manager.get_kv_cache_stats()
+        manager.impl.get_life_cycle_pool_group_indices.assert_called_once_with(CacheLevel(1))
+        assert manager.impl.get_storage_statistics.call_args_list == [
+            call(CacheLevel(0)),
+            call(CacheLevel(0)),
+        ]
+        assert before.used_num_blocks == 0
+        assert after.used_num_blocks == 1
+        assert after.free_num_blocks == before.free_num_blocks - 1
+        assert after.max_num_blocks == before.max_num_blocks
+    finally:
+        cache.close()
+        core.shutdown()
+
+
 def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.enable_stats = True
@@ -1748,10 +1795,15 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         get_and_reset_iteration_stats=lambda: {},
         get_and_reset_ssm_snapshot_iteration_stats=lambda: {3: snapshot_delta},
         get_and_reset_iteration_suspend_resume_stats=lambda: (0, 0),
+        get_and_reset_iteration_disk_prefetch_blocks=lambda: 7,
+        get_and_reset_iteration_cached_tokens_by_level=lambda: [5, 2, 1],
+        get_and_reset_iteration_reused_blocks_by_level=lambda: {},
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
-    manager._get_and_reset_iteration_peak_block_stats = lambda _level: [None, None]
+    manager._get_and_reset_iteration_peak_block_stats_by_level = lambda num_levels: [
+        [None, None] for _ in range(num_levels)
+    ]
     manager._get_storage_statistics = lambda _level: [object(), object()]
     manager._build_pool_group_iteration_stats = lambda pool_group_id, *_args: pool_group_id
 
@@ -1763,6 +1815,161 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.pool_group_id == 1
     assert ssm_stats.snapshot_stats.iter_snapshot_hit_rate == 0.5
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
+    assert stats.disk_prefetch_blocks == 7
+    assert stats.cached_tokens_by_level == [5, 2, 1]
+
+
+def _make_admission_manager(
+    *,
+    is_estimating_kv_cache: bool = False,
+    overwrites_whole_cached_prefix: bool = False,
+) -> tuple[KVCacheManagerV2, SimpleNamespace]:
+    """Partial manager whose kv_cache_map already holds a cache for request 1.
+
+    Exercises the cached-token attribution branch of prepare_context_cache without a GPU. The
+    attribution itself is staged inside the core; the manager only decides when to drop it.
+    """
+    manager = object.__new__(KVCacheManagerV2)
+    manager.conversation_manager = None
+    manager.enable_block_reuse = True
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager.is_draft = False
+    manager.kv_cache_type = CacheType.SELF
+    manager.is_estimating_kv_cache = is_estimating_kv_cache
+    manager._disagg_transfer_overwrites_whole_cached_prefix = lambda: overwrites_whole_cached_prefix
+    manager._resume_and_restore = lambda _req_id, _kv_cache: True
+    kv_cache = SimpleNamespace(
+        num_committed_tokens=7,
+        enable_swa_scratch_reuse=True,
+        drop_cached_token_attribution=Mock(),
+        drop_partial_block_cached_token_attribution=Mock(),
+    )
+    manager.kv_cache_map = {1: kv_cache}
+    return manager, kv_cache
+
+
+def test_prepare_context_keeps_cached_token_attribution_staged_by_the_core() -> None:
+    manager, kv_cache = _make_admission_manager()
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+
+    assert manager.prepare_context(request)
+
+    kv_cache.drop_cached_token_attribution.assert_not_called()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
+    assert request.prepopulated_prompt_len == 7
+
+
+def test_prepare_context_drops_cached_token_attribution_while_estimating() -> None:
+    manager, kv_cache = _make_admission_manager(is_estimating_kv_cache=True)
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+
+    assert manager.prepare_context(request)
+
+    kv_cache.drop_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
+
+
+def test_disagg_gen_init_drops_only_the_partial_block() -> None:
+    manager, kv_cache = _make_admission_manager()
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+
+    assert manager.prepare_context_cache(request) == kv_cache.num_committed_tokens
+
+    kv_cache.drop_partial_block_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_cached_token_attribution.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_stats", [True, False])
+def test_disagg_partial_attribution_survives_admission_retry(enable_stats: bool) -> None:
+    """A failed resume preserves the cache, so retrying must not exclude its tail again."""
+    init_cuda_once()
+    stream = torch.cuda.Stream()
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=8 << 20)],
+            layers=[
+                AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4096)])
+            ],
+            enable_stats=enable_stats,
+            enable_partial_reuse=True,
+            max_util_for_resume=0.5,
+        )
+    )
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    seed = core.create_kv_cache(None, tokens)
+    blocker = core.create_kv_cache()
+    kv_cache = None
+    try:
+        assert seed.resume(CudaStream(stream.cuda_stream))
+        assert seed.resize(len(tokens))
+        seed.commit(tokens, is_end=True)
+        seed.close()
+
+        kv_cache = core.create_kv_cache(None, tokens[:-1])
+        assert kv_cache.num_committed_tokens == len(tokens) - 1
+        initial_attribution = list(kv_cache.cached_tokens_by_level)
+        assert initial_attribution == [len(tokens) - 1]
+
+        manager, _ = _make_admission_manager()
+        manager.kv_cache_map = {1: kv_cache}
+        manager._stream = stream
+        # Use the real resume/utilization check. Output-index restoration is unrelated to admission.
+        del manager._resume_and_restore
+        manager._restore_page_index_bufs = Mock()
+        request = _ContextRequest(
+            1, tokens, len(tokens), "conv-1", is_disagg_generation_init_state=True
+        )
+
+        assert blocker.resume(CudaStream(stream.cuda_stream))
+        total_slots = core.get_storage_statistics()[0].total
+        assert blocker.resize((total_slots // 2 + 1) * TOKENS_PER_BLOCK)
+        assert manager.prepare_context_cache(request) is None
+        assert manager.kv_cache_map[1] is kv_cache
+        assert not kv_cache.is_active
+        manager._restore_page_index_bufs.assert_not_called()
+
+        blocker.close()
+        assert manager.prepare_context_cache(request) == len(tokens) - 1
+        manager._restore_page_index_bufs.assert_called_once_with(1, kv_cache)
+        assert list(kv_cache.cached_tokens_by_level) == initial_attribution
+
+        kv_cache.commit_pending_stats()
+        expected = [2 * TOKENS_PER_BLOCK] if enable_stats else []
+        assert list(core.get_and_reset_iteration_cached_tokens_by_level()) == expected
+        # Once attribution is committed, a later drop must not recreate it.
+        kv_cache.drop_partial_block_cached_token_attribution()
+        kv_cache.commit_pending_stats()
+        assert list(core.get_and_reset_iteration_cached_tokens_by_level()) == []
+    finally:
+        if kv_cache is not None:
+            kv_cache.close()
+        blocker.close()
+        seed.close()
+        core.shutdown()
+
+
+def test_disagg_gen_init_drops_everything_when_the_transfer_overwrites_the_prefix() -> None:
+    manager, kv_cache = _make_admission_manager(overwrites_whole_cached_prefix=True)
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+
+    assert manager.prepare_context_cache(request) == kv_cache.num_committed_tokens
+
+    kv_cache.drop_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
+
+
+def test_disagg_gen_init_drops_everything_in_gen_only_benchmark_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
+    manager, kv_cache = _make_admission_manager()
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+
+    assert manager.prepare_context_cache(request) == kv_cache.num_committed_tokens
+
+    kv_cache.drop_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
 
 
 def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
@@ -1815,6 +2022,132 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
         Role.ALL: MapperKind.INDEXED,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+
+
+def _index_mapper_capacity_for(
+    *,
+    max_batch_size: int,
+    pp_size: int = 1,
+    is_disagg: bool = False,
+    num_reserved_index_slots: int = 1,
+    disable_overlap_scheduler: bool = True,
+) -> tuple[int, int, int]:
+    """Construct a manager and return the three sizes it derives.
+
+    ``(IndexMapper capacity, page-table capacity, max_admissible_sequences)``.
+
+    The first two must agree: ``host_kv_cache_block_offsets`` is indexed by the
+    index the mapper hands out, so a page table sized below the mapper's capacity
+    would be an out-of-bounds write. The third is the published admission bound
+    that ``validate_seq_slot_pool_covers_admission`` checks the seat pool against
+    at startup, and it is the capacity minus the reserved dummy slots.
+    """
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+    fake_impl = Mock()
+    fake_impl.layer_grouping = [[0]]
+    fake_impl.pool_group_descs = []
+    fake_impl.get_layer_group_id.side_effect = lambda _: 0
+
+    def build_base_config(
+        self: KVCacheManagerV2,
+        config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        cache_tiers: list[object],
+    ) -> _FakeManagerConfig:
+        del self, config, tokens_per_block
+        return _FakeManagerConfig(cache_tiers=cache_tiers)
+
+    with (
+        # Pin both diagnostics off: the guard page would add an index slot.
+        patch.dict(
+            os.environ,
+            {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
+        ),
+        patch(f"{module}.IndexMapper") as index_mapper_cls,
+        patch(f"{module}.KVCacheManagerPy", Mock(return_value=fake_impl)),
+        patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor") as page_table,
+        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+    ):
+        manager = KVCacheManagerV2(
+            # A quota must be set or __init__ asserts; the value is irrelevant here.
+            KvCacheConfig(max_gpu_total_bytes=16 << 20),
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=max_batch_size,
+            mapping=Mapping(
+                world_size=pp_size,
+                rank=0,
+                tp_size=1,
+                pp_size=pp_size,
+            ),
+            dtype=DataType.HALF,
+            vocab_size=16,
+            execution_stream=Mock(),
+            is_disagg=is_disagg,
+            num_reserved_index_slots=num_reserved_index_slots,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+        )
+    index_mapper_cls.assert_called_once()
+    page_table.assert_called_once()
+    return (
+        index_mapper_cls.call_args.args[0],
+        page_table.call_args.args[0],
+        manager.max_admissible_sequences,
+    )
+
+
+# (max_batch_size, pp_size, disable_overlap_scheduler, is_disagg, reserved, expected)
+#
+# capacity == max_batch_size * pp_size
+#             * (2 if is_disagg or (overlap on and pp_size == 1) else 1)
+#             + reserved
+_INDEX_MAPPER_CAPACITY_CASES = [
+    # Overlap on, no PP: both cohorts are resident, so the mapper needs 2B.
+    pytest.param(2, 1, False, False, 1, 5, id="overlap_on"),
+    pytest.param(8, 1, False, False, 1, 17, id="overlap_on_b8"),
+    pytest.param(2, 1, True, False, 1, 3, id="overlap_off"),
+    pytest.param(2, 1, False, True, 1, 5, id="disagg_does_not_compound"),
+    pytest.param(2, 1, True, True, 1, 5, id="disagg_only"),
+    pytest.param(2, 4, True, False, 1, 9, id="pp4_plain"),
+    pytest.param(2, 4, False, False, 1, 9, id="pp4_overlap_excluded"),
+    # ... while the pre-existing disagg 2x under PP is left exactly as it was.
+    pytest.param(2, 4, True, True, 1, 17, id="pp4_disagg_unchanged"),
+    # Reserved slots are still added on top of the widened pool.
+    pytest.param(2, 1, False, False, 5, 9, id="reserved_slots_still_added"),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "max_batch_size,pp_size,disable_overlap_scheduler,is_disagg,reserved,expected",
+    _INDEX_MAPPER_CAPACITY_CASES,
+)
+def test_index_mapper_capacity_covers_the_overlapping_cohorts(
+    max_batch_size: int,
+    pp_size: int,
+    disable_overlap_scheduler: bool,
+    is_disagg: bool,
+    reserved: int,
+    expected: int,
+) -> None:
+    capacity, page_table_capacity, max_admissible_sequences = _index_mapper_capacity_for(
+        max_batch_size=max_batch_size,
+        pp_size=pp_size,
+        is_disagg=is_disagg,
+        num_reserved_index_slots=reserved,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+    )
+    assert capacity == expected
+    assert page_table_capacity == expected
+    assert max_admissible_sequences == expected - reserved
 
 
 @pytest.mark.parametrize(
