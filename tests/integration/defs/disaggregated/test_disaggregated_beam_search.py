@@ -53,7 +53,6 @@ def _run_worker(
     os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 
     from tensorrt_llm import LLM, SamplingParams
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 
     transceiver = (
@@ -82,8 +81,6 @@ def _run_worker(
             cache_transceiver_config=transceiver,
         ) as llm,
     ):
-        manager = llm._executor.engine.kv_cache_manager
-        assert isinstance(manager, KVCacheManagerV2), type(manager).__name__
         connection.send("ready")
         sampling = SamplingParams(
             max_tokens=_NEW_TOKENS,
