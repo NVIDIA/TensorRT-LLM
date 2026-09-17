@@ -3158,10 +3158,17 @@ def classifyFailure(def pipeline, Throwable error, String scope, Map retryContex
 {
     if (error instanceof TrtllmCiException) return FailureClassifier.classify(error, scope)
 
-    Map evidence = retryContext?.failureEvidence
+    // Reuse evidence only when it was collected for this exact error and classification scope.
+    boolean cachedForFailure = retryContext?.failureEvidence != null &&
+        retryContext.failureEvidenceError?.is(error) && retryContext.failureEvidenceScope == scope
+    Map evidence = cachedForFailure ? retryContext.failureEvidence : null
     if (evidence == null) {
         evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, error, FailureClassifier.failureEvidenceQueries(scope))
-        if (retryContext != null) retryContext.failureEvidence = evidence
+        if (retryContext != null) {
+            retryContext.failureEvidence = evidence
+            retryContext.failureEvidenceError = error
+            retryContext.failureEvidenceScope = scope
+        }
     }
     return FailureClassifier.classify(error, scope, evidence)
 }
