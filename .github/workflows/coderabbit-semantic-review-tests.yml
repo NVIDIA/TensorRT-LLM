@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: CodeRabbit Semantic Review Tests
+name: CodeRabbit Semantic Review Preview
 
 on:
   pull_request:
+    branches: [main]
     paths:
+      - '.coderabbit.yaml'
       - '.github/workflows/coderabbit-semantic-review*.yml'
       - '.github/scripts/coderabbit_semantic_review*.js'
   workflow_dispatch:
@@ -31,7 +33,15 @@ concurrency:
 
 jobs:
   test:
-    name: Semantic review workflow tests
+    name: Automation tests and result lookup (not AI approval)
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      verdict: ${{ steps.result.outputs.verdict }}
+      summary: ${{ steps.result.outputs.summary }}
+      message: ${{ steps.result.outputs.message }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -40,3 +50,37 @@ jobs:
           persist-credentials: false
       - name: Test semantic review automation
         run: node --test .github/scripts/coderabbit_semantic_review.test.js
+      - name: Read CodeRabbit verdict for the current PR and main
+        id: result
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const readResult = require('./.github/scripts/coderabbit_semantic_review_result.js');
+            await readResult({github, context, core});
+
+  verdict:
+    name: >-
+      ${{ needs.test.outputs.verdict == 'PASS' && 'AI - no conflict found (advisory)' ||
+          needs.test.outputs.verdict == 'FAIL' && 'AI - possible conflict (advisory)' ||
+          'AI - no current verdict (advisory)' }}
+    needs: test
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(fromJSON('["PASS", "FAIL"]'), needs.test.outputs.verdict)
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Display the verified AI verdict
+        uses: actions/github-script@v8
+        env:
+          SEMANTIC_VERDICT: ${{ needs.test.outputs.verdict }}
+          SEMANTIC_SUMMARY: ${{ needs.test.outputs.summary }}
+          SEMANTIC_MESSAGE: ${{ needs.test.outputs.message }}
+        with:
+          script: |
+            await core.summary.addRaw(process.env.SEMANTIC_SUMMARY).write();
+            if (process.env.SEMANTIC_VERDICT === 'FAIL') {
+              core.setFailed(process.env.SEMANTIC_MESSAGE);
+            }
