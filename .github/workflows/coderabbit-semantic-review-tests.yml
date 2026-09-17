@@ -60,10 +60,7 @@ jobs:
             await readResult({github, context, core});
 
   verdict:
-    name: >-
-      ${{ needs.test.outputs.verdict == 'PASS' && 'AI - no conflict found (advisory)' ||
-          needs.test.outputs.verdict == 'FAIL' && 'AI - possible conflict (advisory)' ||
-          'AI - no current verdict (advisory)' }}
+    name: AI verdict (advisory; skipped = unavailable)
     needs: test
     if: >-
       github.event_name == 'pull_request' &&
