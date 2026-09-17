@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmResponse,
     SamplingConfig,
 )
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     EncoderStepResult,
@@ -180,11 +181,10 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
         ),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = types.SimpleNamespace(
-        encoder_cuda_graph_runner=types.SimpleNamespace(
-            feature_mode=False, enabled=True, supported_batch_sizes=batch_sizes
-        )
-    )
+    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine._cleanup_done = True
+    executor.model_engine._encoder_graph_batch_sizes = tuple(batch_sizes)
+    executor.model_engine._encoder_graph_pad_to_limit = True
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -197,7 +197,7 @@ def _make_feature_encoder_batch_wait_executor(
 
     A feature encoder leaves `num_tokens` / `seq_lens` unset and may have had
     its `batch_sizes` derived rather than configured, so the resolved sizes come
-    from the engine's encoder graph runner rather than the config.
+    from the encoder manager's resolved startup settings rather than the config.
     """
     executor = object.__new__(PyExecutor)
     executor.max_batch_size = 32
@@ -205,13 +205,12 @@ def _make_feature_encoder_batch_wait_executor(
         encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = types.SimpleNamespace(
-        encoder_cuda_graph_runner=types.SimpleNamespace(
-            supported_batch_sizes=runner_batch_sizes,
-            enabled=runner_enabled,
-            feature_mode=True,
-        )
+    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine._cleanup_done = True
+    executor.model_engine._encoder_graph_batch_sizes = (
+        tuple(runner_batch_sizes) if runner_enabled else ()
     )
+    executor.model_engine._encoder_graph_pad_to_limit = False
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -224,7 +223,9 @@ def _make_encoder_fallback_batch_wait_executor():
         encoder_cuda_graph_config=None,
         encoder_max_batch_size=None,
     )
-    executor.model_engine = types.SimpleNamespace(encoder_cuda_graph_runner=None)
+    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine._cleanup_done = True
+    executor.model_engine._runner = None
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
@@ -1150,109 +1151,11 @@ class TestDisaggTransferIdleProgress:
 
         transceiver.check_gen_transfer_status.assert_not_called()
 
-    def test_polls_context_transfers_without_blocking(self):
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=1)
-        executor._disagg_coordinator = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
-
-    def test_does_not_repeat_gen_status_polled_by_loop_head(self):
-        """The loop head already polls GEN status every iteration."""
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=1)
-        executor._disagg_coordinator = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
-
-    def test_idle_poll_enters_no_extra_collective(self):
-        """The context poll is rank-symmetric, so no gating collective is needed."""
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=4, cp_size=4, world_size=16)
-        executor._disagg_coordinator = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
-        executor.dist.tp_cp_allgather.assert_not_called()
-        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
-
-    def test_gen_only_no_context_benchmark_polls_context_when_idle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor._disagg_coordinator = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
-        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
-
-    def test_sync_transfer_skips_idle_progress_collectives(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
-        executor._disagg_coordinator = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
-        executor.dist.tp_cp_allgather.assert_not_called()
-        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
-        executor._disagg_coordinator.reap_context_sends.assert_not_called()
-
-    def test_sync_single_rank_ctx_skips_poll_without_inflight_transfer(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.has_any_inflight_requests.return_value = False
-        executor._disagg_coordinator = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
-        executor._disagg_coordinator.reap_context_sends.assert_not_called()
-
-    def test_sync_single_rank_ctx_reaps_idle_transfer(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
-        executor._disagg_coordinator = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
-
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
-        executor.dist.tp_cp_allgather.assert_not_called()
-        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
-        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
-
     def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._disagg_coordinator = Mock()
-        executor._check_cache_transfer_errors = Mock()
         requests = [
             Mock(state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE),
             Mock(state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE),
@@ -1266,7 +1169,9 @@ class TestDisaggTransferIdleProgress:
         ] == requests
         executor.kv_cache_transceiver.request_and_receive_async.assert_not_called()
         executor._disagg_coordinator.reap_gen_receives.assert_not_called()
-        executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
+        executor._disagg_coordinator.check_transfer_errors.assert_called_once_with(
+            "generation requests"
+        )
 
     def test_sync_receive_drains_batch_before_rank_aligned_error_vote(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -1282,7 +1187,9 @@ class TestDisaggTransferIdleProgress:
             {"error_ids": [], "blocked_ids": []},
         ]
         executor._handle_errors = Mock()
-        executor._check_cache_transfer_errors = Mock()
+        executor.canceled_req_ids = []
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.requests_in_transfer.return_value = {}
         error_request = Mock(
             py_request_id=1,
             state=LlmRequestState.DISAGG_GENERATION_INIT,
@@ -1303,6 +1210,9 @@ class TestDisaggTransferIdleProgress:
             )
 
         executor.kv_cache_transceiver.request_and_receive_sync.side_effect = complete_or_error
+        # Build the real coordinator now that its inputs are set; observe the
+        # rank-local check without replacing it.
+        executor.disagg.check_transfer_errors = Mock(wraps=executor.disagg.check_transfer_errors)
 
         PyExecutor._recv_disagg_gen_cache(executor, [error_request, following_request])
 
@@ -1314,13 +1224,13 @@ class TestDisaggTransferIdleProgress:
         assert following_request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
         executor.kv_cache_transceiver.cancel_request.assert_not_called()
         executor._handle_errors.assert_not_called()
-        executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
+        executor.disagg.check_transfer_errors.assert_called_once_with("generation requests")
 
-        PyExecutor._handle_disagg_cache_errors_synced(executor)
+        executor.disagg.handle_errors_synced()
 
         executor.dist.tp_allgather.assert_called_once_with(local_vote)
         executor._handle_errors.assert_called_once_with(
-            "Disagg KV cache transfer error",
+            error_msg="Disagg KV cache transfer error",
             requests=[error_request],
             charge_budget=False,
         )
@@ -1488,7 +1398,6 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     executor._profiler = Mock(return_value=profiler)
     executor.hang_detector = MagicMock()
     executor.enable_iter_perf_stats = False
-    executor._handle_disagg_cache_errors_synced = Mock()
     executor._fetch_and_activate_new_requests = Mock(return_value=[])
     executor.is_shutdown = False
     executor._handle_control_request = Mock()
@@ -1544,12 +1453,10 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     executor._is_kv_manager_v2 = True
     executor._pp_rebalance_drain_iters = None
     executor._can_pause_for_rebalance = Mock(return_value=False)
-    executor._handle_disagg_cache_errors_synced = Mock()
     executor._fetch_and_activate_new_requests = Mock(return_value=[])
     executor.is_shutdown = False
     executor._handle_control_request = Mock()
     executor.kv_cache_transceiver = Mock()
-    executor._check_disagg_ctx_schedulable_status = Mock()
     executor._pad_attention_dp_dummy_request = Mock()
     executor._pp_retry_until_can_schedule = Mock()
     executor._mm_encoder_item_scheduling_enabled = False
@@ -2898,191 +2805,6 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
-# ---------------------------------------------------------------------------
-# ADP-safe disagg cache error handling (#13900): all TP ranks enter _handle_errors together.
-# ---------------------------------------------------------------------------
-def _err_req(request_id=1):
-    return _make_adp_request(LlmRequestState.DISAGG_TRANS_ERROR, request_id=request_id)
-
-
-def _disagg_error_vote(error_ids=(), blocked_ids=()):
-    return {
-        "error_ids": list(error_ids),
-        "blocked_ids": list(blocked_ids),
-    }
-
-
-_DEFAULT_KV_CACHE_TRANSCEIVER = object()
-
-
-def _make_disagg_err_stub(
-    *,
-    enable_attention_dp=True,
-    kv_cache_transceiver=_DEFAULT_KV_CACHE_TRANSCEIVER,
-    world_size=2,
-    active_requests=None,
-    tp_allgather_result=None,
-):
-    stub = types.SimpleNamespace()
-    stub.enable_attention_dp = enable_attention_dp
-    if kv_cache_transceiver is _DEFAULT_KV_CACHE_TRANSCEIVER:
-        kv_cache_transceiver = Mock()
-        kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
-        kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
-    stub.kv_cache_transceiver = kv_cache_transceiver
-    stub.disagg = types.SimpleNamespace(
-        inflight_cancel_active=lambda: False,
-        take_pending_context_failures=set,
-    )
-    stub.active_requests = active_requests if active_requests is not None else []
-    stub.dist = Mock()
-    stub.dist.world_size = world_size
-    stub.dist.rank = 0
-    if tp_allgather_result is not None:
-        stub.dist.tp_allgather = Mock(return_value=tp_allgather_result)
-    else:
-        stub.dist.tp_allgather = Mock(side_effect=lambda v: [v])
-    stub.handle_errors_calls = []
-
-    def _rec_handle_errors(error_msg, requests=None, charge_budget=True):
-        stub.handle_errors_calls.append(
-            {"error_msg": error_msg, "requests": requests, "charge_budget": charge_budget}
-        )
-
-    stub._handle_errors = _rec_handle_errors
-    stub._request_vote_id = PyExecutor._request_vote_id
-    for helper in (
-        "_handle_disagg_cache_errors_synced",
-        "_is_disagg_error_cleanup_blocked",
-        "_get_disagg_reqs_in_error_state",
-        "_check_cache_transfer_errors",
-    ):
-        setattr(stub, helper, types.MethodType(getattr(PyExecutor, helper), stub))
-    return stub
-
-
-class TestDisaggCacheErrorsSynced:
-    def test_guard_short_circuits_without_transceiver(self):
-        stub = _make_disagg_err_stub(kv_cache_transceiver=None, active_requests=[_err_req()])
-        stub._handle_disagg_cache_errors_synced()
-        stub.dist.tp_allgather.assert_not_called()
-        assert stub.handle_errors_calls == []
-
-    def test_guard_short_circuits_without_adp(self):
-        stub = _make_disagg_err_stub(enable_attention_dp=False, active_requests=[_err_req()])
-        stub._handle_disagg_cache_errors_synced()
-        stub.dist.tp_allgather.assert_not_called()
-        assert stub.handle_errors_calls == []
-
-    def test_guard_short_circuits_single_rank(self):
-        stub = _make_disagg_err_stub(world_size=1, active_requests=[_err_req()])
-        stub._handle_disagg_cache_errors_synced()
-        stub.dist.tp_allgather.assert_not_called()
-        assert stub.handle_errors_calls == []
-
-    def test_all_ranks_enter_when_a_peer_has_error(self):
-        # A peer reports request 7. This rank must fail its matching replica,
-        # while leaving an unrelated request active.
-        matching = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=7)
-        unrelated = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=8)
-        stub = _make_disagg_err_stub(
-            active_requests=[matching, unrelated],
-            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote([7])],
-        )
-        stub._handle_disagg_cache_errors_synced()
-        assert len(stub.handle_errors_calls) == 1
-        assert stub.handle_errors_calls[0]["requests"] == [matching]
-        assert stub.handle_errors_calls[0]["charge_budget"] is False
-
-    def test_no_handle_when_no_rank_has_error(self):
-        stub = _make_disagg_err_stub(
-            active_requests=[],
-            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote()],
-        )
-        stub._handle_disagg_cache_errors_synced()
-        assert stub.handle_errors_calls == []
-
-    def test_peer_error_without_local_replica_still_enters_handler(self):
-        unrelated = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=8)
-        stub = _make_disagg_err_stub(
-            active_requests=[unrelated],
-            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote([7])],
-        )
-
-        stub._handle_disagg_cache_errors_synced()
-
-        assert stub.handle_errors_calls[0]["requests"] == []
-
-    def test_local_error_req_forwarded_request_scoped(self):
-        err = _err_req()
-        ok = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2)
-        stub = _make_disagg_err_stub(
-            active_requests=[ok, err], tp_allgather_result=[_disagg_error_vote([1])]
-        )
-        stub._handle_disagg_cache_errors_synced()
-        assert len(stub.handle_errors_calls) == 1
-        assert stub.handle_errors_calls[0]["requests"] == [err]
-        assert stub.handle_errors_calls[0]["charge_budget"] is False
-
-    def test_child_request_votes_by_parent_id(self):
-        child = _make_adp_request(
-            _STATE_GENERATION_IN_PROGRESS,
-            request_id=101,
-            is_child=True,
-            parent_request_id=9,
-        )
-        stub = _make_disagg_err_stub(
-            active_requests=[child],
-            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote([9])],
-        )
-
-        stub._handle_disagg_cache_errors_synced()
-
-        assert stub.handle_errors_calls[0]["requests"] == [child]
-
-    def test_peer_vote_does_not_clean_up_locally_deferred_request(self):
-        request = _err_req(request_id=7)
-        request.is_context_only_request = True
-        stub = _make_disagg_err_stub(
-            active_requests=[request],
-            tp_allgather_result=[
-                _disagg_error_vote(blocked_ids=[7]),
-                _disagg_error_vote([7]),
-            ],
-        )
-        stub.canceled_req_ids = []
-        stub.async_transfer_manager = Mock()
-        stub.async_transfer_manager.requests_in_transfer.return_value = {
-            request.py_request_id: request
-        }
-
-        stub._handle_disagg_cache_errors_synced()
-
-        assert stub.handle_errors_calls == []
-
-
-class TestCheckCacheTransferErrorsAdpNoop:
-    def test_noop_under_adp_multirank(self):
-        # Even with an error req present, ADP+world_size>1 defers to the synced handler.
-        stub = _make_disagg_err_stub(active_requests=[_err_req()])
-        stub._check_cache_transfer_errors("ctx")
-        assert stub.handle_errors_calls == []
-
-    def test_handles_error_when_not_adp(self):
-        err = _err_req()
-        stub = _make_disagg_err_stub(enable_attention_dp=False, active_requests=[err])
-        stub._check_cache_transfer_errors("ctx")
-        assert len(stub.handle_errors_calls) == 1
-        assert stub.handle_errors_calls[0]["requests"] == [err]
-        assert stub.handle_errors_calls[0]["charge_budget"] is False
-
-    def test_handles_error_on_single_rank(self):
-        err = _err_req()
-        stub = _make_disagg_err_stub(world_size=1, active_requests=[err])
-        stub._check_cache_transfer_errors("gen")
-        assert len(stub.handle_errors_calls) == 1
-
-
 class TestPendingTransferResponseFlush:
     def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
         """A lone fatal rank must fail locally rather than desynchronize TP."""
@@ -3176,7 +2898,6 @@ class TestPendingTransferResponseFlush:
         executor._is_kv_manager_v2 = False
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
-        executor._handle_disagg_cache_errors_synced = Mock()
         executor._flush_pending_transfer_responses = Mock()
         return executor
 
@@ -3349,7 +3070,6 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
         spec_config = MTPDecodingConfig(
             max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
-            mtp_eagle_one_model=True,
             use_rejection_sampling=use_rejection_sampling,
             draft_len_schedule={1: cls.MAX_TOTAL_DRAFT_TOKENS},
         )
@@ -3368,7 +3088,6 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.waiting_queue = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prefetch_for_context_requests = Mock()
         ex._prepare_disagg_gen_init = Mock()

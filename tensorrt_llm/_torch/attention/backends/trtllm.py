@@ -46,8 +46,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
-from .sparse.params import SparseParams
-from .sparse.skip_softmax import SkipSoftmaxParams
+from .sparse.params import BlockSparseForwardInputs, SparseParams
+from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -1333,9 +1333,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 2: static tree (target model only)
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert (spec_metadata.spec_dec_mode.is_eagle3()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-                        ), "Tree decoding is only supported for Eagle3 now"
+                assert spec_metadata.spec_dec_mode.is_eagle3_one_model(
+                ), "Tree decoding is only supported for Eagle3 now"
                 assert not getattr(spec_metadata, 'is_draft_model', False), (
                     "Static tree spec-dec params are only prepared for the target model"
                 )
@@ -1520,9 +1519,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                           mapping: "Mapping") -> int:
         """Context-MLA workspace sized by summed attended KV length.
 
-        Dense fp8 context-MLA stages expanded K/V. NVFP4 DSA stages selected
-        latent rows in fp8 plus selection/scan workspace. Cached tokens can
-        grow both beyond the fresh-prefill profiling floor.
+        Dense fp8 context-MLA stages expanded K/V. NVFP4 sparse MLA stages
+        selected latent rows in fp8 plus selection/scan workspace. Cached
+        tokens can grow both beyond the fresh-prefill profiling floor.
         """
         config = model_config.pretrained_config
         if not is_mla(config):
@@ -1543,6 +1542,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             nvfp4_gather_aux_bytes_per_token = 64
             return int(config.kv_lora_rank + config.qk_rope_head_dim +
                        nvfp4_gather_aux_bytes_per_token)
+
+        nvfp4_dsv4_context = (quant_mode is not None and getattr(
+            quant_mode, "has_fp4_kv_cache", lambda: False)()
+                              and sparse_algorithm == "deepseek_v4"
+                              and get_sm_version() >= 100)
+        if nvfp4_dsv4_context:
+            compress_ratios = [
+                ratio for ratio in getattr(model_config.sparse_attention_config,
+                                           "compress_ratios", []) if ratio > 1
+            ]
+            if not compress_ratios:
+                return 0
+            # Context compaction allocates one fp8 latent row and its
+            # selection/scan workspace per active compressed token. Express
+            # that in raw-KV-token units for the estimator and use the least
+            # compressed layer as the whole-model upper bound.
+            min_compress_ratio = min(compress_ratios)
+            latent_dim = config.kv_lora_rank + config.qk_rope_head_dim
+            nvfp4_gather_aux_bytes_per_compressed_token = 64
+            return math.ceil(
+                (latent_dim + nvfp4_gather_aux_bytes_per_compressed_token) /
+                min_compress_ratio)
 
         fp8_context_mla = (quant_config is not None
                            and quant_config.quant_mode.has_fp8_kv_cache()
@@ -1582,7 +1603,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def runtime_workspace_is_chunked_prefill_bounded(
             cls, model_config: "ModelConfig") -> bool:
-        """NVFP4 DSA gathers from the complete attended prefix."""
+        """NVFP4 sparse MLA gathers from the complete attended prefix."""
         config = model_config.pretrained_config
         if not is_mla(config):
             return True
@@ -1592,7 +1613,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    "algorithm", None)
         return not (quant_mode is not None
                     and getattr(quant_mode, "has_fp4_kv_cache", lambda: False)()
-                    and sparse_algorithm == "dsa" and get_sm_version() >= 100)
+                    and sparse_algorithm in ("dsa", "deepseek_v4")
+                    and get_sm_version() >= 100)
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
@@ -1929,7 +1951,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 )
 
         forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
-            self, q, k, metadata, forward_args)
+            self, q, k, v, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata
@@ -2059,14 +2081,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
 
-        sparse_params = self.sparse_params
-        if isinstance(sparse_params, SkipSoftmaxParams):
-            forward_args.sparse_runtime_params = (
-                sparse_params.scheduler.get_runtime_params(
-                    runtime_params=forward_args.sparse_runtime_params,
-                    timestep=forward_args.timestep,
-                ))
-
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:
             assert metadata.is_cuda_graph
@@ -2079,7 +2093,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
-        fmha.forward(q, k, v, metadata, forward_args)
+        try:
+            fmha.forward(q, k, v, metadata, forward_args)
+        except RuntimeError as exc:
+            log_attention_failure_context(
+                type(self).__name__, self.layer_idx, metadata,
+                forward_args.attention_window_size, exc)
+            raise
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat
@@ -2285,6 +2305,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Predict sparse KV indices when required by an algorithm."""
         return None, None
+
+    def block_sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[BlockSparseForwardInputs]:
+        """Predict the block-sparse routing payload for one attention call.
+
+        The default hands through routes that the attention module predicted
+        before the core forward via ``sparse_backend_args``. Algorithms that
+        predict inside the backend override this method and return ``None``
+        for dense phases.
+        """
+        backend_args = forward_args.sparse_backend_args
+        if backend_args is None:
+            return None
+        return backend_args.block_sparse_inputs
 
     def sparse_attn_predict(
         self,

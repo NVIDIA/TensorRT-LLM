@@ -94,6 +94,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..._utils import is_sm_100f
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import AllReduceParams
+from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
@@ -1055,6 +1056,7 @@ class DSv4DSparkDraftModel(nn.Module):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         num_stages: Optional[int] = None,
         block_size: Optional[int] = None,
+        draft_moe_backend: Optional[str] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -1115,7 +1117,9 @@ class DSv4DSparkDraftModel(nn.Module):
         #     buffers. The draft experts are physically MXFP4 (same as the main
         #     MoE layers), so copy a main MoE layer's experts quant onto the
         #     draft layer keys.
-        draft_model_config = self._derive_draft_model_config(model_config, base, self.num_stages)
+        draft_model_config = self._derive_draft_model_config(
+            model_config, base, self.num_stages, draft_moe_backend=draft_moe_backend
+        )
         self.mtp_layers = nn.ModuleList(
             [
                 DSv4DSparkBlock(
@@ -1275,7 +1279,9 @@ class DSv4DSparkDraftModel(nn.Module):
         return cached
 
     @classmethod
-    def _derive_draft_model_config(cls, model_config, base: int, num_stages: int):
+    def _derive_draft_model_config(
+        cls, model_config, base: int, num_stages: int, draft_moe_backend: Optional[str] = None
+    ):
         """Return a draft-only ``model_config`` copy with draft-specific fixes.
 
         Applies (1) the ``compress_ratios`` draft slice and (2) the
@@ -1283,23 +1289,30 @@ class DSv4DSparkDraftModel(nn.Module):
         experts. A single shallow copy is made (and only when something needs to
         change) so the shared ``model_config`` and the target model are untouched.
 
-        The draft MoE backend is **inherited** from the target's
-        ``model_config.moe_backend`` (carried by the shallow copy) — not pinned —
-        matching every other drafter (the MTP module reuses the V4 decoder layer,
-        whose MoE is built with ``moe_backend=model_config.moe_backend``; separate
-        Eagle3/DFlash drafts resolve it from their own config the same way). The
-        draft ``mtp.*`` stages are full V4 blocks, so they share the target's
-        MXFP4 ``n_routed_experts=384`` / ``n_group=8`` (= 48 experts/group) layout
-        and therefore the same backend constraints: pick a backend that supports
-        it (CUTLASS today, DeepGEMM megaMoE once available) on the target and the
-        draft follows. Note the TRTLLM-Gen ``blockScaleMoe`` routing kernel asserts
-        ``experts/group <= 32`` (warp size), so it is incompatible with this layout
-        for both the target and the draft.
+        The draft MoE backend inherits ``model_config.moe_backend`` unless
+        ``draft_moe_backend`` is set. AUTO is resolved after the draft-specific
+        quantization normalization below, so backend selection uses the draft
+        weights rather than the target's resolved backend. The draft ``mtp.*``
+        stages are full V4 blocks, so they share the target's MXFP4
+        ``n_routed_experts=384`` / ``n_group=8`` (= 48 experts/group) layout
+        and therefore the same backend constraints: select a backend that
+        supports it (CUTLASS today, DeepGEMM megaMoE once available). The
+        TRTLLM-Gen ``blockScaleMoe`` routing kernel asserts
+        ``experts/group <= 32`` (warp size), so it is incompatible with this
+        layout for both the target and the draft.
         """
         new_sa = cls._draft_sparse_config(model_config, base, num_stages)
         new_qcd = cls._draft_quant_config_dict(model_config, base, num_stages)
         new_qc = cls._draft_normalized_quant_config(model_config)
-        if new_sa is None and new_qcd is None and new_qc is None:
+        resolved_moe_backend = None
+        if draft_moe_backend is not None:
+            architectures = getattr(model_config.pretrained_config, "architectures", None) or []
+            architecture = architectures[0] if architectures else ""
+            draft_quant_config = new_qc if new_qc is not None else model_config.quant_config
+            resolved_moe_backend = ModelConfig.resolve_moe_backend(
+                draft_moe_backend, architecture, quant_config=draft_quant_config
+            )
+        if new_sa is None and new_qcd is None and new_qc is None and resolved_moe_backend is None:
             return model_config
         draft_cfg = copy.copy(model_config)
         # ModelConfig is a frozen dataclass; bypass the guard for these fields.
@@ -1309,6 +1322,8 @@ class DSv4DSparkDraftModel(nn.Module):
             object.__setattr__(draft_cfg, "quant_config_dict", new_qcd)
         if new_qc is not None:
             object.__setattr__(draft_cfg, "quant_config", new_qc)
+        if resolved_moe_backend is not None:
+            object.__setattr__(draft_cfg, "moe_backend", resolved_moe_backend)
         return draft_cfg
 
     @staticmethod
@@ -1870,13 +1885,21 @@ class DSv4DSparkForCausalLM(nn.Module):
     attention weights from the in-memory state dict.
     """
 
-    def __init__(self, draft_config, aux_stream_dict=None, num_stages=None, block_size=None):
+    def __init__(
+        self,
+        draft_config,
+        aux_stream_dict=None,
+        num_stages=None,
+        block_size=None,
+        draft_moe_backend: Optional[str] = None,
+    ):
         super().__init__()
         self.dspark_model = DSv4DSparkDraftModel(
             draft_config,
             aux_stream_dict,
             num_stages=num_stages,
             block_size=block_size,
+            draft_moe_backend=draft_moe_backend,
         )
         # Generic handles expected by the loader / weight mappers.
         self.model = self.dspark_model
@@ -2169,6 +2192,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             getattr(model, "aux_stream_dict", None),
             num_stages=num_stages,
             block_size=model_config.spec_config.block_size,
+            draft_moe_backend=getattr(model_config.spec_config, "moe_backend", None),
         )
 
     # No per-model_type table here. ``DFlashForCausalLM.__init__`` already

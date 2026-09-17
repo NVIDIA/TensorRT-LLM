@@ -14,9 +14,11 @@
 # limitations under the License.
 """Tests for KV cache budget splitting between target and draft managers."""
 
+import math
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
@@ -47,8 +49,8 @@ def _make_creator(
     """Minimal KvCacheCreator for budget-split helpers.
 
     ``*_intercept`` model the affine fixed cost (e.g. mamba SSM state) that a
-    manager pays per batch regardless of token count. The draft cost is derived
-    as ``total - target`` for both slope and intercept.
+    manager pays per batch regardless of token count. The draft mock receives
+    the component-wise ``total - target`` values directly.
     """
     c = object.__new__(KvCacheCreator)
 
@@ -60,6 +62,7 @@ def _make_creator(
     )
     c._tokens_per_block = 64
     c._max_seq_len = 1024
+    c._max_num_tokens = 0
     c._max_batch_size = 1
     c._speculative_config = None
     c._mapping = Mock()
@@ -78,11 +81,92 @@ def _make_creator(
         )
     )
     c._should_create_separate_draft_kv_cache = Mock(return_value=True)
+    c._get_draft_cache_cost = Mock(
+        return_value=CacheCost(
+            slope=total_kv_per_token - target_kv_per_token,
+            intercept=total_kv_intercept - target_kv_intercept,
+        )
+    )
 
     return c
 
 
 class TestSplitGpuBudgetForDraft:
+    @pytest.mark.parametrize(
+        "long_window, max_batch_size", [(32768, 2048), (32768, 1), (131072, 1)]
+    )
+    def test_native_full_target_cost_preserves_draft_capacity(
+        self, long_window, max_batch_size
+    ) -> None:
+        """Bounded full layers must not reserve saturated windows or starve the draft."""
+        max_seq_len = 131072
+        target_layer_bytes = 1024
+        draft_layer_bytes = 512
+        # Include 25% slack above the full history plus native SWA window cost.
+        single_request_bytes = (
+            12 * (max_seq_len + 128) * target_layer_bytes + max_seq_len * draft_layer_bytes
+        )
+        total_budget = single_request_bytes * 5 // 4 if max_batch_size == 1 else 10 * GB
+        c = _make_creator(max_gpu_total_bytes=total_budget)
+        del c._get_draft_cache_cost
+        c._kv_cache_config.enable_block_reuse = False
+        c._kv_cache_config.max_attention_window = [128, long_window]
+        c._kv_cache_manager_cls = KVCacheManagerV2
+        c._max_seq_len = max_seq_len
+        c._max_batch_size = max_batch_size
+        c._max_num_tokens = 8192
+        c._mapping = Mock(enable_attention_dp=False, tp_size=2)
+        c._mapping.pp_layers.return_value = list(range(24))
+        c._mapping.is_last_pp_rank.return_value = True
+        c._speculative_config = SimpleNamespace(
+            spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+            max_draft_len=3,
+            max_total_draft_tokens=3,
+            tokens_per_gen_step=4,
+            use_dynamic_tree=False,
+            _use_shared_kv_cache=False,
+        )
+        target_model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            quant_config=None,
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=24,
+                hidden_size=2880,
+                num_attention_heads=64,
+                num_key_value_heads=8,
+                head_dim=64,
+                layer_types=["sliding_attention", "full_attention"] * 12,
+            ),
+            get_num_attention_layers=lambda: 24,
+        )
+        draft_model_config = SimpleNamespace(
+            quant_config=None,
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=1,
+                hidden_size=2880,
+                num_attention_heads=64,
+                num_key_value_heads=4,
+                head_dim=64,
+            ),
+        )
+        c._model_engine.model.model_config = target_model_config
+        c._draft_model_engine = None
+        c._get_effective_draft_config = Mock(return_value=draft_model_config)
+        c._get_num_draft_layers = Mock(return_value=1)
+
+        target, draft = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+        assert draft is not None
+        assert target.max_gpu_total_bytes > 0
+        assert draft.max_gpu_total_bytes > 0
+        if max_batch_size == 1:
+            # A necessary capacity bound, not just an assertion of the split formula.
+            # Counting native SWA in the slope instead would fail this bound.
+            assert draft.max_gpu_total_bytes >= max_seq_len * draft_layer_bytes
+            assert target.max_gpu_total_bytes >= 12 * (max_seq_len + 128) * target_layer_bytes
+        assert target.max_gpu_total_bytes + draft.max_gpu_total_bytes == total_budget
+        assert c._kv_cache_config.max_gpu_total_bytes == total_budget
+        assert c._kv_cache_config.max_attention_window == [128, long_window]
+
     @pytest.mark.parametrize(
         "mode",
         [
@@ -136,7 +220,14 @@ class TestSplitGpuBudgetForDraft:
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
-        creator._speculative_config = SimpleNamespace(spec_dec_mode=mode)
+        creator._speculative_config = SimpleNamespace(
+            spec_dec_mode=mode,
+            max_draft_len=1,
+            max_total_draft_tokens=0,
+            tokens_per_gen_step=1,
+            use_dynamic_tree=False,
+            _use_shared_kv_cache=False,
+        )
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=target_model_config)
         )
@@ -153,9 +244,13 @@ class TestSplitGpuBudgetForDraft:
         )
 
         # The draft layer stores 64 bytes/token in a fixed 512-token window.
+        # Generation retains one additional 64-token boundary block and the
+        # 128-token context budget consumes two more blocks.
         # Leaking the target's 16K window would instead count it as 64 bytes/token.
         cost = creator._get_kv_size_per_token()
-        assert cost == CacheCost(slope=10, intercept=512 * 64)
+        usable_slots = 11
+        configured_slots = math.ceil(usable_slots / float(np.float32(0.95)))
+        assert cost == CacheCost(slope=10, intercept=configured_slots * 64 * 64)
         assert len(draft_kv_configs) == 1
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]
@@ -164,6 +259,204 @@ class TestSplitGpuBudgetForDraft:
             assert get_manager_cls.call_args.args[1] is draft_kv_config
         else:
             get_manager_cls.assert_not_called()
+
+    def test_target_cost_uses_derived_layer_type_windows(self) -> None:
+        """A target with a mixed sliding/full `layer_types` schedule on
+        KVCacheManagerV2 is costed from the same derived per-layer windows
+        `_create_kv_cache_manager` builds it with: its three sliding layers
+        become a fixed per-request cost and only the full layer is charged per
+        token, so the split matches the manager's pools. Without the derivation
+        the target counted four full layers per token and no fixed cost."""
+
+        class TargetModelConfig:
+            quant_config = None
+            is_encoder_decoder = False
+            pretrained_config = SimpleNamespace(
+                num_hidden_layers=4,
+                hidden_size=1024,
+                num_attention_heads=8,
+                num_key_value_heads=8,
+                sliding_window=512,
+                layer_types=[
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                ],
+            )
+
+            def get_num_attention_layers(self) -> int:
+                return 4
+
+        class DraftModelConfig:
+            """A one-layer full-attention draft head without window metadata."""
+
+            quant_config = None
+            pretrained_config = SimpleNamespace(
+                num_hidden_layers=1,
+                hidden_size=1024,
+                num_attention_heads=8,
+                num_key_value_heads=8,
+            )
+
+            def get_num_attention_layers(self) -> int:
+                return 1
+
+        target_model_config = TargetModelConfig()
+        draft_model_config = DraftModelConfig()
+        # Block reuse off: with it on, the estimator also extends every sliding
+        # window by the one-model draft's prompt lookahead, a separate charge
+        # covered in test_kv_cache_estimation.py; this test is about the windows.
+        target_kv_config = KvCacheConfig(enable_block_reuse=False)
+        mode = Mock()
+        mode.is_external_drafter.return_value = False
+        # A Mock's truthy return would send get_num_extra_kv_tokens down the
+        # one-engine arm; this test's config is a two-model drafter.
+        mode.use_one_engine.return_value = False
+        costed_windows: list[tuple[object, list[int] | None]] = []
+
+        class RecordingKVCacheManager(KVCacheManagerV2):
+            @staticmethod
+            def get_cache_size_per_token(
+                model_config: object, *args: object, **kwargs: object
+            ) -> tuple[int, int]:
+                costed_windows.append(
+                    (model_config, kwargs["kv_cache_config"].max_attention_window)
+                )
+                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+
+        max_batch_size = 2
+        creator = object.__new__(KvCacheCreator)
+        creator._kv_cache_config = target_kv_config
+        creator._tokens_per_block = 64
+        creator._max_seq_len = 16384
+        creator._max_batch_size = max_batch_size
+        creator._max_num_tokens = 128
+        creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.pp_layers.return_value = [0, 1, 2, 3]
+        creator._mapping.is_last_pp_rank.return_value = True
+        # Neutral speculative fields: _get_generation_kv_capacity reads them
+        # to size the generation headroom; these values keep it at the
+        # non-speculative baseline of one token so the window math below stays
+        # the point of the test.
+        creator._speculative_config = SimpleNamespace(
+            spec_dec_mode=mode,
+            max_total_draft_tokens=0,
+            max_draft_len=0,
+            tokens_per_gen_step=1,
+        )
+        creator._model_engine = SimpleNamespace(
+            model=SimpleNamespace(model_config=target_model_config)
+        )
+        creator._draft_model_engine = None
+        creator._draft_config = draft_model_config
+        creator._kv_cache_manager_cls = RecordingKVCacheManager
+        creator._is_disagg = False
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
+        creator._get_effective_draft_config = Mock(return_value=draft_model_config)
+        creator._get_num_draft_layers = Mock(return_value=1)
+
+        target_kv, draft_kv = creator._get_target_and_draft_cache_costs()
+
+        # K and V, 8 heads x 128 dims, bf16.
+        layer_bytes_per_token = 2 * 8 * 128 * 2
+        # Each sliding layer retains page-granular window blocks per request:
+        # a 512-token window with one headroom token spans
+        # ceil((512 + 1 - 2) / 64) + 1 = 9 blocks = 576 tokens. Context
+        # additionally retains each sliding layer for the in-flight token
+        # batch (max_num_tokens).
+        window_tokens = (math.ceil((512 + 1 - 2) / 64) + 1) * 64
+        sliding_bytes_per_request = 3 * window_tokens * layer_bytes_per_token
+        context_batch_bytes = 3 * layer_bytes_per_token * creator._max_num_tokens
+        assert target_kv == CacheCost(
+            slope=layer_bytes_per_token,
+            intercept=sliding_bytes_per_request * max_batch_size + context_batch_bytes,
+        )
+        assert draft_kv == CacheCost(slope=layer_bytes_per_token, intercept=0)
+        target_windows = [
+            windows
+            for model_config, windows in costed_windows
+            if model_config is target_model_config
+        ]
+        assert target_windows and all(
+            windows == [512, 512, 16384, 512] for windows in target_windows
+        )
+        draft_windows = [
+            windows
+            for model_config, windows in costed_windows
+            if model_config is draft_model_config
+        ]
+        assert draft_windows == [None]
+        # The creator's own config is left untouched.
+        assert target_kv_config.max_attention_window is None
+
+    def test_target_cost_projects_derived_windows_onto_the_rank_layers(self) -> None:
+        """On a pipeline rank other than the first, the static cost model reads
+        the derived per-layer windows through the rank's global layer ids, as
+        the runtime manager does. Global windows [S, S, F, S] on the second of
+        two PP ranks (layers 2 and 3) cost one full layer per token and one
+        sliding window per request; a local 0..N-1 read would have costed the
+        rank as two sliding layers and no per-token bytes."""
+
+        class TargetModelConfig:
+            quant_config = None
+            is_encoder_decoder = False
+            pretrained_config = SimpleNamespace(
+                num_hidden_layers=4,
+                hidden_size=1024,
+                num_attention_heads=8,
+                num_key_value_heads=8,
+                sliding_window=512,
+                layer_types=[
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                ],
+            )
+
+            def get_num_attention_layers(self) -> int:
+                return 4
+
+        target_model_config = TargetModelConfig()
+        costed_windows: list[list[int] | None] = []
+
+        class RecordingKVCacheManager(KVCacheManagerV2):
+            @staticmethod
+            def get_cache_size_per_token(
+                model_config: object, *args: object, **kwargs: object
+            ) -> tuple[int, int]:
+                costed_windows.append(kwargs["kv_cache_config"].max_attention_window)
+                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+
+        max_batch_size = 2
+        creator = object.__new__(KvCacheCreator)
+        creator._kv_cache_config = KvCacheConfig()
+        creator._tokens_per_block = 64
+        creator._max_seq_len = 16384
+        creator._max_batch_size = max_batch_size
+        creator._max_num_tokens = 128
+        creator._speculative_config = None
+        # The second of two pipeline ranks: it holds global layers 2 and 3.
+        creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.pp_layers.return_value = [2, 3]
+
+        target_kv = creator._per_manager_cache_cost(RecordingKVCacheManager, target_model_config)
+
+        # K and V, 8 heads x 128 dims, bf16.
+        layer_bytes_per_token = 2 * 8 * 128 * 2
+        # The rank's one sliding layer retains ceil((512 + 1 - 2) / 64) + 1 = 9
+        # blocks = 576 tokens per request, plus the context charge for the
+        # in-flight token batch (max_num_tokens).
+        window_tokens = (math.ceil((512 + 1 - 2) / 64) + 1) * 64
+        assert target_kv == CacheCost(
+            slope=layer_bytes_per_token,
+            intercept=window_tokens * layer_bytes_per_token * max_batch_size
+            + layer_bytes_per_token * creator._max_num_tokens,
+        )
+        # The cost model receives the global list; the projection onto the
+        # rank's layers happens inside the manager's static estimator.
+        assert costed_windows == [[512, 512, 16384, 512]]
 
     def test_v1_mixed_draft_build_uses_original_max_seq_len(self, mocker):
         c = _make_creator(max_gpu_total_bytes=10 * GB)
@@ -269,9 +562,7 @@ class TestSplitGpuBudgetForDraft:
 
     def test_fixed_only_draft_uses_manager_estimated_quota(self):
         total_gpu = 10 * GB
-        slot_bytes = 327_680
-        configured_slots = 2_561
-        configured_bytes = configured_slots * slot_bytes
+        configured_bytes = 2_561 * 327_680
         c = _make_creator(
             max_gpu_total_bytes=total_gpu,
             total_kv_per_token=80,

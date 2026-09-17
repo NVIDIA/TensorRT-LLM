@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (kv-cache-reuse)=
 
 # KV cache reuse

@@ -41,6 +41,7 @@ from _torch.moe.moe_test_utils import (
 )
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
+from utils.util import check_accuracy
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
@@ -54,14 +55,19 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
+    MoEActivation,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
     SwigluBiasActivation,
     materialize_activation_params,
 )
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
+    CuteDslFusedMoE,
+    CuteDslFusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
@@ -78,6 +84,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEStaticCapability,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+    MoEDep,
     collect_moe_environment,
     override_moe_environment,
 )
@@ -88,6 +95,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     impl_class_for,
     resolve_moe_impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -149,6 +157,308 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
 
     with pytest.raises(RuntimeError, match="no valid fallback tactic"):
         _select_explicit_fallback_tactic([])
+
+
+def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts() -> None:
+    forward_impl = MagicMock(return_value=torch.empty(1))
+    runner = CuteDslFusedMoENvfp4Runner(
+        forward_impl=forward_impl,
+        num_experts=256,
+        top_k=1,
+        num_local_experts=8,
+        local_expert_offset=0,
+        use_direct_expert_metadata=True,
+    )
+    counts = torch.tensor([0, 1, 31, 32, 7, 0, 16, 2], dtype=torch.int32)
+    inputs = [torch.empty(8 * 32, 1) for _ in range(6)] + [counts]
+
+    runner.forward(inputs, tactic=256)
+
+    assert runner.unique_id()[-1] == "direct_expert_metadata"
+    assert runner.get_valid_tactics([], OptimizationProfile()) == [128, 256]
+    assert runner.get_tuning_config().inputs_pre_hook is None
+    assert forward_impl.call_args.kwargs["recv_expert_count"] is counts
+    assert forward_impl.call_args.kwargs["deep_ep_expert_capacity"] == 32
+    assert forward_impl.call_args.kwargs["use_count_native_expert_metadata"] is True
+
+
+def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens() -> None:
+    common_kwargs = {
+        "forward_impl": MagicMock(),
+        "num_experts": 256,
+        "top_k": 1,
+        "num_local_experts": 3,
+        "local_expert_offset": 13,
+    }
+    direct_runner = CuteDslFusedMoENvfp4Runner(
+        **common_kwargs,
+        use_direct_expert_metadata=True,
+    )
+
+    direct_config = direct_runner.get_tuning_config()
+    assert len(direct_config.dynamic_tensor_specs) == 1
+    assert len(direct_config.constraint_specs) == 4
+    assert direct_config.inputs_pre_hook is None
+    assert direct_runner.unique_id()[-1] == "direct_expert_metadata"
+    direct_dynamic_spec = direct_config.dynamic_tensor_specs[0]
+    expert_capacity_rows = 3 * 257
+    assert direct_dynamic_spec.gen_tuning_buckets(expert_capacity_rows) == (384, 768)
+    assert direct_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 768
+
+    legacy_runner = CuteDslFusedMoENvfp4Runner(**common_kwargs)
+    legacy_config = legacy_runner.get_tuning_config()
+    assert len(legacy_config.dynamic_tensor_specs) == 1
+    assert legacy_config.inputs_pre_hook is not None
+    legacy_dynamic_spec = legacy_config.dynamic_tensor_specs[0]
+    assert legacy_dynamic_spec.gen_tuning_buckets(expert_capacity_rows)[-1] == 512
+    assert legacy_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 512
+
+
+@pytest.mark.parametrize(
+    "disable_value,expected_disabled",
+    [
+        (None, False),
+        ("0", False),
+        ("1", True),
+    ],
+)
+def test_cutedsl_deep_ep_direct_metadata_disable_env(
+    monkeypatch: pytest.MonkeyPatch,
+    disable_value: Optional[str],
+    expected_disabled: bool,
+) -> None:
+    env_name = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
+    if disable_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, disable_value)
+
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=object()))
+    monkeypatch.setattr(torch.cuda, "Event", MagicMock(return_value=object()))
+
+    constructor_kwargs = {
+        "routing_method": MagicMock(),
+        "num_experts": 8,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "model_config": ModelConfig(skip_create_weights_in_init=True),
+    }
+
+    backend = CuteDslFusedMoE(**constructor_kwargs)
+    assert backend.disable_deep_ep_direct_metadata is expected_disabled
+
+
+def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    is_capturing = MagicMock(side_effect=AssertionError("CPU path queried CUDA capture state"))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", is_capturing)
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=2)
+    comm.num_slots = 4
+    comm.deep_ep_max_num_tokens = 8
+    comm._adapter_free_placeholder_cache = {}
+    comm.deep_ep_buffer = object()
+
+    hidden_states = torch.arange(24, dtype=torch.bfloat16).view(2, 3, 4)
+    hidden_states_sf = torch.arange(12, dtype=torch.uint8).view(2, 3, 2)
+    recv_expert_count = torch.tensor([2, 1], dtype=torch.int32)
+
+    legacy = comm._modify_output_to_adapt_fused_moe(
+        hidden_states,
+        hidden_states_sf,
+        recv_expert_count,
+        torch.float32,
+    )
+    adapter_free = comm._modify_output_to_adapt_fused_moe(
+        hidden_states,
+        hidden_states_sf,
+        recv_expert_count,
+        torch.float32,
+        remove_adapter=True,
+    )
+    adapter_free_reused = comm._modify_output_to_adapt_fused_moe(
+        hidden_states,
+        hidden_states_sf,
+        recv_expert_count,
+        torch.float32,
+        remove_adapter=True,
+    )
+
+    torch.testing.assert_close(adapter_free[0], legacy[0])
+    torch.testing.assert_close(adapter_free[1], legacy[1])
+    assert adapter_free[2].shape == legacy[2].shape
+    assert adapter_free[2].shape == (hidden_states.shape[0] * hidden_states.shape[1], 1)
+    assert adapter_free[2].dtype == legacy[2].dtype
+    torch.testing.assert_close(adapter_free[3], legacy[3])
+    assert (
+        adapter_free_reused[2].untyped_storage().data_ptr()
+        == adapter_free[2].untyped_storage().data_ptr()
+    )
+    assert (
+        adapter_free_reused[3].untyped_storage().data_ptr()
+        == adapter_free[3].untyped_storage().data_ptr()
+    )
+    assert torch.all(adapter_free[2] == -1)
+    assert len(comm._adapter_free_placeholder_cache) == 1
+
+    smaller_hidden_states = torch.arange(16, dtype=torch.bfloat16).view(2, 2, 4)
+    smaller_hidden_states_sf = torch.arange(8, dtype=torch.uint8).view(2, 2, 2)
+    smaller = comm._modify_output_to_adapt_fused_moe(
+        smaller_hidden_states,
+        smaller_hidden_states_sf,
+        recv_expert_count,
+        torch.float32,
+        remove_adapter=True,
+    )
+    assert smaller[2].shape == (4, 1)
+    assert smaller[2].untyped_storage().data_ptr() == adapter_free[2].untyped_storage().data_ptr()
+    assert len(comm._adapter_free_placeholder_cache) == 1
+    is_capturing.assert_not_called()
+
+    comm.destroy()
+    assert comm._adapter_free_placeholder_cache == {}
+    assert comm.deep_ep_buffer is None
+
+
+def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", MagicMock(return_value=True))
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm._adapter_free_placeholder_cache = {}
+    hidden_states = MagicMock(
+        shape=(2, 3, 4),
+        device=torch.device("cuda:0"),
+        is_cuda=True,
+    )
+
+    with pytest.raises(RuntimeError, match="must be warmed up before CUDA graph capture"):
+        comm._modify_output_to_adapt_fused_moe(
+            hidden_states,
+            None,
+            torch.tensor([2, 1], dtype=torch.int32),
+            torch.float32,
+            remove_adapter=True,
+        )
+    assert comm._adapter_free_placeholder_cache == {}
+
+
+@pytest.mark.parametrize(
+    "disabled,has_nvfp4,supports_post_quant,expected",
+    [
+        (False, True, True, True),
+        (True, True, True, False),
+        (False, False, True, False),
+        (False, True, False, False),
+    ],
+)
+def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
+    disabled: bool, has_nvfp4: bool, supports_post_quant: bool, expected: bool
+) -> None:
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.disable_deep_ep_direct_metadata = disabled
+    backend.use_fused_finalize = True
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=has_nvfp4),
+        ),
+    )
+    assert backend.can_use_deep_ep_direct_metadata(supports_post_quant) is expected
+
+
+def test_other_backend_rejects_deep_ep_direct_metadata() -> None:
+    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    assert backend.can_use_deep_ep_direct_metadata(True) is False
+
+
+def test_cutedsl_rejects_direct_metadata_without_fused_finalize() -> None:
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.disable_deep_ep_direct_metadata = False
+    backend.use_fused_finalize = False
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=True),
+        ),
+    )
+    assert backend.can_use_deep_ep_direct_metadata(True) is False
+
+
+def test_cutedsl_direct_metadata_request_fails_without_fused_finalize() -> None:
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.activation_type = ActivationType.Swiglu
+    backend._locality_domain_runtime = None
+    backend.use_fused_finalize = False
+    backend.hidden_size = 4
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=True),
+        ),
+    )
+    token_selected_experts = torch.full((2, 1), -1, dtype=torch.int32)
+    token_final_scales = torch.ones((2, 1), dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="requires fused finalize"):
+        backend.run_moe_nvfp4(
+            x=torch.empty((2, 2), dtype=torch.uint8),
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            moe_output=torch.empty((2, 4), dtype=torch.bfloat16),
+            weight_view=MagicMock(),
+            recv_expert_count=torch.tensor([2], dtype=torch.int32),
+            deep_ep_expert_capacity=2,
+            use_deep_ep_direct_metadata=True,
+        )
+
+
+@pytest.mark.parametrize("disabled,expected", [(False, True), (True, False)])
+def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
+    disabled: bool, expected: bool
+) -> None:
+    recv_expert_count = torch.tensor([3, 0, 5], dtype=torch.int32)
+    expert_capacity = 8
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm._dispatch_state = {
+        "recv_expert_count": recv_expert_count,
+        "expert_capacity": expert_capacity,
+    }
+    comm.enable_postquant_alltoall = False
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.disable_deep_ep_direct_metadata = disabled
+    backend.use_fused_finalize = True
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=True),
+        ),
+    )
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        backend=backend,
+        comm=comm,
+        enable_alltoall=False,
+        routing_method=SimpleNamespace(experts_per_token=1),
+    )
+
+    use_direct_metadata = backend.can_use_deep_ep_direct_metadata(True)
+    assert use_direct_metadata is expected
+
+    plan = scheduler._build_comm_plan(
+        all_rank_num_tokens=None,
+        output_dtype=torch.bfloat16,
+        use_deep_ep_direct_metadata=use_direct_metadata,
+    )
+
+    if expected:
+        assert plan.recv_expert_count is recv_expert_count
+        assert plan.deep_ep_expert_capacity == expert_capacity
+    else:
+        assert plan.recv_expert_count is None
+        assert plan.deep_ep_expert_capacity is None
+    assert plan.use_deep_ep_direct_metadata is expected
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
@@ -560,8 +870,10 @@ def _make_trtllm_gen_moe(
     top_k: int = 2,
     hidden_size: int = 512,
     intermediate_size: int = 256,
+    tp_size: int = 1,
+    tp_rank: int = 0,
 ) -> TRTLLMGenFusedMoE:
-    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override."""
+    """A TRTLLM-Gen MoE, with or without the SiTu override."""
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
     pretrained_config.hidden_size = hidden_size
@@ -570,7 +882,7 @@ def _make_trtllm_gen_moe(
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        mapping=Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank),
         moe_backend="TRTLLM",
     )
     return TRTLLMGenFusedMoE(
@@ -740,18 +1052,20 @@ def test_nvfp4_trtllm_gen_resolve_alignments_matches_create_weights(
 
 
 @_situ_supported
-def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
-    """Why the MoE-TP check cannot read the class attribute.
+def test_nvfp4_trtllm_gen_tp_accepts_logical_group_aligned_shard() -> None:
+    """Logical TP alignment is independent of the padded kernel layout."""
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        situ=True,
+        hidden_size=7168,
+        intermediate_size=3072,
+        tp_size=16,
+    )
 
-    ``hidden=1536``/``intermediate=192`` resolves to a 128 weight alignment.
-    192 is divisible by the class default (32) but not by 128, so validating
-    against ``NVFP4TRTLLMGenFusedMoEMethod.weight_alignment`` admits a shard
-    the loader cannot lay out. Pins the gap, so reverting the check to the
-    class attribute fails here rather than in a multi-GPU accuracy run.
-    """
-    resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
-    assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
-    assert 192 % resolved != 0
+    assert backend.intermediate_size_per_partition == 192
+    assert backend.intermediate_size_per_partition % 16 == 0
+    assert backend.quant_method.weight_alignment == 128
+    assert backend.intermediate_size_per_partition % backend.quant_method.weight_alignment != 0
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
@@ -1054,7 +1368,10 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
-def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
+def _make_megamoe_cutedsl_for_ctor_test(
+    *,
+    activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
+) -> MegaMoECuteDsl:
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
         moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
@@ -1068,7 +1385,147 @@ def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
         dtype=torch.bfloat16,
         model_config=model_config,
         init_load_balancer=False,
+        activation=activation,
     )
+
+
+def _make_megamoe_cutedsl_minimax_problem(
+    *,
+    bias: bool,
+    activation: ActivationType,
+) -> MoEProblem:
+    return MoEProblem(
+        quant=QuantAlgo.NVFP4.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=512,
+        intermediate_size=512,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=True,
+        bias=bias,
+        activation=activation.name,
+        activation_constants=frozenset({"alpha", "beta", "clamp"}),
+    )
+
+
+def _make_megamoe_cutedsl_test_deployment(
+    *, ep_size: int = 1, parallel_size: int = 1, use_dp: bool = False
+) -> MoEDeployment:
+    return MoEDeployment(
+        ep_size=ep_size,
+        tp_size=1,
+        parallel_size=parallel_size,
+        use_dp=use_dp,
+        num_slots=8,
+        env=MoEEnvironment(
+            sm=100,
+            available_deps=(MoEDep.MEGAMOE_CUTEDSL_RUNTIME, MoEDep.MEGAMOE_CUTEDSL_OP),
+        ),
+    )
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_accepts_minimax_m3_problem() -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(
+            bias=False,
+            activation=ActivationType.SwigluBias,
+        ),
+        _make_megamoe_cutedsl_test_deployment(),
+    )
+
+    assert verdict.eligible, verdict.detail
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "bias, activation",
+    [
+        (True, ActivationType.SwigluBias),
+        (False, ActivationType.Swiglu),
+    ],
+    ids=["expert_bias", "wrong_activation"],
+)
+def test_megamoe_cutedsl_rejects_non_minimax_swiglu_bias_package(
+    bias: bool,
+    activation: ActivationType,
+) -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(bias=bias, activation=activation),
+        _make_megamoe_cutedsl_test_deployment(),
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_tep_requires_minimax_m3_activation() -> None:
+    deployment = _make_megamoe_cutedsl_test_deployment(ep_size=4, parallel_size=4)
+    minimax_verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(
+            bias=False,
+            activation=ActivationType.SwigluBias,
+        ),
+        deployment,
+    )
+    plain_swiglu_verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            swiglu_gptoss_style=False,
+            bias=False,
+            activation=ActivationType.Swiglu.name,
+        ),
+        deployment,
+    )
+
+    assert minimax_verdict.eligible, minimax_verdict.detail
+    assert not plain_swiglu_verdict.eligible
+    assert plain_swiglu_verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test(
+        activation=SwigluBiasActivation(
+            gate_sigmoid_scale=torch.full((8,), 1.702),
+            linear_offset=torch.ones(8),
+            clamp=torch.full((8,), 7.0),
+        )
+    )
+
+    assert moe.act_alpha == pytest.approx(1.702)
+    assert moe.act_beta == pytest.approx(1.0)
+    assert moe.act_clamp == pytest.approx(7.0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("parameter_name", "register_name"),
+    [
+        ("gate_sigmoid_scale", "alpha"),
+        ("clamp", "clamp"),
+    ],
+)
+def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(
+    parameter_name: str, register_name: str
+) -> None:
+    parameters = {
+        "gate_sigmoid_scale": torch.full((8,), 1.702),
+        "linear_offset": torch.ones(8),
+        "clamp": torch.full((8,), 7.0),
+    }
+    parameters[parameter_name][-1] += 1.0
+
+    with pytest.raises(ValueError, match=rf"uniform .*activation {register_name}"):
+        _make_megamoe_cutedsl_for_ctor_test(
+            activation=SwigluBiasActivation(**parameters),
+        )
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
@@ -1109,6 +1566,165 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
     invalid_tactic[2] = 511
     with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
         megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+
+
+@pytest.mark.gpu
+def test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 100)
+    runner_kwargs = {
+        "world_size": 1,
+        "local_rank": 0,
+        "num_topk": 2,
+        "num_experts_per_rank": 8,
+        "hidden_size": 512,
+        "intermediate_size_per_partition": 512,
+        "expand_intermediate_size_per_partition": 1024,
+        "max_tokens_per_rank": 64,
+        "output_dtype": torch.bfloat16,
+        "gate_up_clamp": 7.0,
+    }
+    runner = megamoe_op.Sm100MegaMoENvfp4Runner(
+        **runner_kwargs,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+    )
+    different_alpha = megamoe_op.Sm100MegaMoENvfp4Runner(
+        **runner_kwargs,
+        swiglu_alpha=1.0,
+        swiglu_beta=1.0,
+    )
+    different_beta = megamoe_op.Sm100MegaMoENvfp4Runner(
+        **runner_kwargs,
+        swiglu_alpha=1.702,
+        swiglu_beta=0.0,
+    )
+    tactic = megamoe_op.default_megamoe_tactic(64)
+
+    assert runner.unique_id() != different_alpha.unique_id()
+    assert runner.unique_id() != different_beta.unique_id()
+    assert runner._tactic_cache_key(tactic) != different_alpha._tactic_cache_key(tactic)
+    assert runner._tactic_cache_key(tactic) != different_beta._tactic_cache_key(tactic)
+
+
+@pytest.mark.gpu
+def test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics() -> None:
+    """Run bias-free MiniMax SwiGLU through the B200 kernel and its reference."""
+    backend_type = MoeBackendType.MEGAMOE_CUTEDSL
+    dtype = torch.bfloat16
+    num_experts = 8
+    top_k = 2
+    hidden_size = 512
+    intermediate_size = 512
+    seq_len = 16
+    swiglu_alpha = 1.702
+    swiglu_beta = 1.0
+    swiglu_limit = 7.0
+
+    verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(
+            bias=False,
+            activation=ActivationType.SwigluBias,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping(rank=mpi_rank())
+    _ensure_single_proc_dist_for_megamoe(backend_type, mapping.rank)
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        # The larger input range makes the dequantized FC1 gate/up values cross
+        # MiniMax's clamp boundary in both directions.
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda") * 8.0
+        router_logits = torch.full((seq_len, num_experts), -100.0, dtype=dtype, device="cuda")
+        router_logits[:, 0] = 100.0
+        router_logits[:, 1] = 90.0
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=True,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            activation_type=ActivationType.SwigluBias,
+        )
+        swiglu_tensors = quantize_util.get_swiglu_tensors()
+        assert swiglu_tensors is not None
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            bias=False,
+            swiglu_alpha=swiglu_tensors["swiglu_alpha"],
+            swiglu_beta=swiglu_tensors["swiglu_beta"],
+            swiglu_limit=swiglu_tensors["swiglu_limit"],
+            activation_type=ActivationType.SwigluBias,
+        )
+        ref_cls = quant_kwargs.pop("ref_cls")
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = quantize_util.create_ref_module(
+            routing_method,
+            ref_cls=ref_cls,
+        )
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            gate_up = ref_fused_moe.experts[0].gate_up_proj(x)
+            gate, up = gate_up.chunk(2, dim=-1)
+            assert torch.any(gate > swiglu_limit)
+            assert torch.any(gate < swiglu_limit)
+            assert torch.any(up < -swiglu_limit)
+            assert torch.any((up < 0) & (up > -swiglu_limit))
+            ref_output = ref_fused_moe(x, router_logits)
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+
+        # This clamp-heavy input is intentionally wider than the generic
+        # MegaMoE sweep and needs one percentage point of NVFP4 headroom.
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
 
 
 def run_backend_moe(
@@ -1588,6 +2204,8 @@ def test_moe_backend(
         # swiglu_gptoss_style is True when any swiglu parameter deviates from default
         # Default values: alpha=1, beta=0, limit=inf
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
+    expert_bias = swiglu_gptoss_style and not is_minimax_megamoe
 
     locality_domain_runtime_skip = should_skip_locality_domain_runtime(enable_locality_domains)
     if locality_domain_runtime_skip:
@@ -1648,7 +2266,7 @@ def test_moe_backend(
             intermediate_size=intermediate_size,
             hidden_size=hidden_size,
             quant_config=quant_config,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_gptoss_style=swiglu_gptoss_style,
             swiglu_alpha=swiglu_alpha if swiglu_gptoss_style else None,
             swiglu_beta=swiglu_beta if swiglu_gptoss_style else None,
@@ -1680,7 +2298,7 @@ def test_moe_backend(
             dtype=dtype_activation,
             quant_config=quant_config,
             mapping=mapping,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
             swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,

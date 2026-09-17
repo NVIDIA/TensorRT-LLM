@@ -39,6 +39,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CorruptedError,
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
@@ -58,6 +59,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         _introspection,
         _KVCache,
         gen_multimodal_cache_key_tokens,
+        num_live_managers,
+        poison_reason,
+        take_poison,
     )
     from kv_cache_manager_v2._block_radix_tree import Hasher
     from kv_cache_manager_v2._common import (
@@ -93,6 +97,7 @@ else:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CorruptedError,
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
@@ -173,15 +178,15 @@ def get_cached_cuda_event_type():
     backend = KV_CACHE_MANAGER_V2_BACKEND
     if backend == "cpp":
         try:
-            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
         except ImportError:
             from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
-                CachedCudaEvent,
+                _introspection,
             )
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
 
     if find_spec("kv_cache_manager_v2") is not None:
         from kv_cache_manager_v2._utils import CachedCudaEvent
@@ -264,6 +269,17 @@ class TestTypedSlotIds(unittest.TestCase):
 
 
 class TestCacheLevelStorage(unittest.TestCase):
+    def test_grains_to_slots_rejects_zero_divisors(self) -> None:
+        invalid_inputs = [
+            (1, [0], 16 << 20),
+            (1, [16 << 20], 0),
+        ]
+
+        for grains, slot_sizes, granularity in invalid_inputs:
+            with self.subTest(slot_sizes=slot_sizes, granularity=granularity):
+                with self.assertRaisesRegex((ValueError, RuntimeError), "must be positive"):
+                    _introspection.grains_to_slots(grains, slot_sizes, granularity)
+
     def test_grains_to_slots_refines_proportional_lower_bound(self) -> None:
         granularity = 16 << 20
         slot_size_list = [16_252_928, 4_063_232]
@@ -361,8 +377,13 @@ class TestKVCacheManagerV2(unittest.TestCase):
     def tearDown(self) -> None:
         gc.enable()
         if hasattr(self, "manager"):
-            self.manager.shutdown()
-            del self.manager
+            # Drop the manager even if shutdown() raises, which it does when a test leaves a KV
+            # cache open. Holding on to it would keep the poison latch un-clearable and fail
+            # every later test instead of just this one.
+            try:
+                self.manager.shutdown()
+            finally:
+                del self.manager
 
     def next_token(self) -> TokenIdExt:
         token_id = next(self._token_id_gen)
@@ -1007,7 +1028,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(
             self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
         )
-        with self.assertRaisesRegex(ValueError, "already been dropped"):
+        with self.assertRaisesRegex(RuntimeError, "already been dropped"):
             long_handle.drop()
 
     @requires_python_backend
@@ -5112,6 +5133,71 @@ class TestBlockKeyHashing(unittest.TestCase):
         for digest_size in (31, 33):
             with self.subTest(digest_size=digest_size), self.assertRaises(ValueError):
                 gen_multimodal_cache_key_tokens(100, bytes(digest_size), 1)
+
+
+class TestPoison(TestKVCacheManagerV2):
+    """The refusal path taken once KVCM2 records a broken invariant.
+
+    Poisoning is set directly rather than by provoking a real violation, so these exercise the
+    refusal and recovery machinery without depending on a specific bug.
+
+    Each test disposes of its manager itself: leaving one alive would keep the latch
+    un-clearable, and every test after it would then be blamed for this test's poisoning.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not hasattr(_introspection, "poison_for_testing"):
+            raise unittest.SkipTest("the poison latch is C++-backend only")
+
+    def _discard_poisoned_manager(self) -> None:
+        del self.manager
+        gc.collect()
+        self.assertEqual(num_live_managers(), 0)
+
+    def test_poisoned_manager_rejects_api_calls(self) -> None:
+        self.prepare(5619712, 0, 0, 8, None, 0)
+        # Held open across the poisoning. Disposal is exempt in two ways, and an open cache is
+        # what separates them: shutdown() must return rather than raise CorruptedError, and it
+        # must skip its cleanup, whose _checkNoLivingKvCaches() this cache would otherwise trip.
+        kv_cache = self.manager.create_kv_cache()
+        _introspection.poison_for_testing("deliberate test poisoning")
+
+        # The refusal names the original violation, not whatever inconsistency the refused call
+        # would have tripped over.
+        with self.assertRaisesRegex(CorruptedError, "deliberate test poisoning"):
+            self.manager.create_kv_cache()
+
+        # A caller that detects corruption still has to be able to tear the manager down.
+        self.manager.shutdown()
+
+        del kv_cache
+        self._discard_poisoned_manager()
+        self.assertIn("deliberate test poisoning", take_poison())
+
+    def test_take_poison_only_clears_once_no_manager_is_alive(self) -> None:
+        self.prepare(5619712, 0, 0, 8, None, 0)
+        # Two managers, so that "every manager is gone" is distinguishable from "a manager is
+        # gone": with only one, an implementation that cleared on any destruction would pass.
+        second = KVCacheManager(self.cfg)
+        _introspection.poison_for_testing("deliberate test poisoning")
+
+        # A live manager skipped its own cleanup when it was poisoned, so clearing now would
+        # resume work on structures known to be inconsistent. The reason is still reported.
+        self.assertEqual(num_live_managers(), 2)
+        self.assertIn("deliberate test poisoning", take_poison())
+        self.assertIsNotNone(poison_reason())
+
+        del second
+        gc.collect()
+        self.assertEqual(num_live_managers(), 1)
+        self.assertIn("deliberate test poisoning", take_poison())
+        self.assertIsNotNone(poison_reason())
+
+        self._discard_poisoned_manager()
+
+        self.assertIn("deliberate test poisoning", take_poison())
+        self.assertIsNone(poison_reason())
 
 
 if __name__ == "__main__":

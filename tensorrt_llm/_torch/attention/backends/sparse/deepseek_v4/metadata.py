@@ -44,6 +44,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
+        self.nvfp4_compress_fp8_scratch: Optional[torch.Tensor] = None
         self._ctx_output_sizes: Optional[Dict[int, int]] = None
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):

@@ -3,7 +3,6 @@
 
 import dataclasses
 import datetime
-import functools
 import math
 import os
 import sys
@@ -11,7 +10,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
@@ -43,16 +42,16 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
-from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
 from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
-from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
-    get_global_profiler, host_profiler_context)
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
+    host_profiler_context
 
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
@@ -76,6 +75,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
@@ -100,6 +100,8 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import PPCommTag
+from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
+from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
@@ -130,10 +132,6 @@ class _ADPForwardIntent(IntEnum):
 def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
-
-# Environment variable to specify iteration ranges for profiling start/stop.
-# Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
-PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
@@ -269,32 +267,6 @@ def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
     """Receive a sleep/wakeup ACK with a bounded nonblocking poll loop."""
     return _recv_sleep_wakeup_ack_until(comm, source,
                                         time.monotonic() + timeout_s)
-
-
-@functools.cache
-def _load_iteration_indexes(env_var: str):
-    spans = os.environ.get(env_var, None)
-    starts, stops = [], []
-
-    if spans:
-        spans = spans.split(',')
-
-        for span in spans:
-            try:
-                if '-' in span:
-                    start, stop = span.strip().split('-')
-                    starts.append(int(start))
-                    stops.append(int(stop))
-                else:
-                    it = int(span.strip())
-                    starts.append(it)
-                    stops.append(it)
-            except ValueError as e:
-                raise ValueError(
-                    f"Cannot parse span in environment variable `{env_var}`: {e}"
-                ) from None
-
-    return frozenset(starts), frozenset(stops)
 
 
 def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
@@ -455,8 +427,52 @@ class PyExecutor:
 
         self.iter_counter = 0
         # profile config
-        self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
+        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
+        # Convert to mutable sets so start_profile()/stop_profile() can
+        # .add() runtime-configured iteration indices.
+        # _load_iteration_indexes returns frozensets.
+        self.profile_start_iters = set(_env_start_iters)
+        self.profile_stop_iters = set(_env_stop_iters)
+
+        # Runtime-configurable profiling state. Populated by start_profile()
+        # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
+        # or API calls. When these are None/False the _profiler() context
+        # falls back to the environment-variable driven configuration.
+        self._runtime_profile_trace_path: Optional[str] = None
+        self._runtime_profile_activities: Optional[List[str]] = None
+        self._runtime_profile_cuda_only: bool = False
+        # Iteration markers added by the most recent runtime start_profile().
+        # Tracked so stop_profile() can cancel a start that has not fired
+        # yet (e.g. the caller stops before sending any requests) without
+        # leaking a pending profile window that would start later.
+        self._runtime_profile_pending_start_iter: Optional[int] = None
+        self._runtime_profile_pending_stop_iter: Optional[int] = None
+
+        # Mirrors the in-loop profile window state (maintained by
+        # ``_profiler()``) so external callers can query whether a profile
+        # is currently active. torch.profiler is not thread-safe so we do
+        # NOT call .stop() from other threads; ``stop_profile()`` schedules
+        # the iteration-scoped stop and (when triggered via an HTTP
+        # handler) the server tickles the executor loop so the stop fires
+        # even when the engine is otherwise idle.
+        #
+        # ``_profile_state_lock`` guards every read and write of
+        # ``_profile_enabled`` AND of the pending markers /
+        # ``_runtime_profile_*`` window fields above. Both the
+        # re-entrancy guard in ``start_profile()`` and the
+        # cancel-vs-schedule decision in ``apply_stop_config()`` depend
+        # on that combined state, and they race against the executor
+        # thread flipping the same fields inside ``profile_step``.
+        self._profile_state_lock = threading.Lock()
+        self._profile_enabled: bool = False
+
+        # The profile-state machine (start/stop scheduling, broadcast
+        # apply, per-iteration torch.profiler driver) lives in the
+        # ``PyExecutorProfileManager``. ``PyExecutor`` keeps the state
+        # fields above on ``self`` for backward-compat introspection;
+        # the manager operates on those fields via a weakref.
+        self._profile_manager = PyExecutorProfileManager(self)
 
         # related modules
         self.resource_manager = resource_manager
@@ -1053,8 +1069,43 @@ class PyExecutor:
                     "connector scheduler / worker hooks and are not "
                     "distinguished from real requests.")
 
+            if self.kv_cache_manager is None:
+                raise ValueError(
+                    "KV Cache Connector requires a KV Cache Manager.")
+
+            is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
+                                                KVCacheManagerV2)
+
+            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with speculative "
+                    "decoding. Rejected draft tokens "
+                    "shrink a request's page list, and the freed slot goes to "
+                    "whichever request allocates next. The connector is only "
+                    "told about pages appended since the last report, so it "
+                    "would keep addressing a slot another request now owns. "
+                    "Disable speculative decoding to run a connector.")
+
+            scheduler_config = getattr(self.llm_args, 'scheduler_config', None)
+            capacity_scheduler_policy = getattr(scheduler_config,
+                                                'capacity_scheduler_policy',
+                                                None)
+            if (not is_kv_cache_manager_v2
+                    and capacity_scheduler_policy is not None
+                    and capacity_scheduler_policy
+                    != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT):
+                raise NotImplementedError(
+                    "KV Cache Connector in this configuration is only "
+                    "supported with the GUARANTEED_NO_EVICT capacity "
+                    "scheduler policy. A policy that destroys and replays a "
+                    "live request leaves the connector's per-request block "
+                    "delta measured against pages that were freed with it. "
+                    "Set kv_cache_config.use_kv_cache_manager_v2=True, which "
+                    "drops the delta when an allocation dies.")
+
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
-            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+            if not is_kv_cache_manager_v2 and (kv_cache_config is not None and
+                                               kv_cache_config.host_cache_size):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KV cache host "
                     "offloading (KvCacheConfig.host_cache_size). The connector "
@@ -1064,11 +1115,11 @@ class PyExecutor:
                     "streams are not synchronized with the internal "
                     "onboard/offload streams.")
 
-            if self.kv_cache_manager is None:
-                raise ValueError(
-                    "KV Cache Connector requires a KV Cache Manager.")
-
-            if getattr(self.kv_cache_manager, 'is_vswa', False):
+            # VSWA allocates one pool per window size, which a single-tensor
+            # registration cannot describe. `register_kv_cache_layout` can, so
+            # the rejection only applies to the flat-tensor path.
+            if not is_kv_cache_manager_v2 and getattr(self.kv_cache_manager,
+                                                      'is_vswa', False):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with variable "
                     "sliding-window attention (per-layer max_attention_window "
@@ -1084,8 +1135,24 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
-            kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
-            self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
+            if is_kv_cache_manager_v2:
+                # Registered regions are device addresses, so every page has
+                # to stay pinned to GPU for as long as the connector holds
+                # them.
+                self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
+                self._reject_connector_prefix_without_block_reuse(
+                    self.kv_cache_manager)
+                layout = build_kv_cache_layout_v2(self.kv_cache_manager)
+                self.kv_connector_manager.reject_flat_only_scheduler(
+                    len(layout.groups))
+                window = (layout.groups[0].window_size
+                          if len(layout.groups) == 1 else None)
+                self.kv_connector_manager.warn_flat_scheduler_under_swa(window)
+                self.kv_connector_manager.worker.register_kv_cache_layout(
+                    layout)
+            else:
+                kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
+                self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
@@ -1097,6 +1164,66 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+
+    @staticmethod
+    def _reject_connector_prefix_without_block_reuse(kv_cache_manager) -> None:
+        """Reject a connector on KVCacheManagerV2 with block reuse disabled.
+
+        V2 honours a connector-served prefix whatever ``enable_block_reuse``
+        says -- the flag governs the local radix tree, and the connector is a
+        separate source. With reuse off it honours the offer and the restored
+        KV is wrong: prefill is skipped for the served range and generation
+        drifts within a few tokens. Measured on the reference connector with a
+        plain full-attention model, so it is neither VSWA- nor
+        connector-specific.
+
+        Read off the manager rather than ``KvCacheConfig.enable_block_reuse``,
+        which ``create_py_executor`` coerces to False for several unrelated
+        reasons (SM version, KV cache quantization algorithm, hybrid linear
+        models). A user who never touched the flag can still land here, and a
+        config-level check would not see it.
+
+        V1 is deliberately not guarded. It never honours the offer in this
+        configuration -- it asks the connector, then schedules the whole prompt
+        anyway -- so it miscomputes nothing. That it silently discards the
+        connector's work, and reports a negative ``computed_position`` while
+        doing so, is a separate defect tracked in the backlog.
+        """
+        if getattr(kv_cache_manager, "enable_block_reuse", True):
+            return
+        raise NotImplementedError(
+            "KV Cache Connector is not supported with KV cache block reuse "
+            "disabled. The connector's prefix is honoured "
+            "regardless of that setting, and restores incorrect KV without it, "
+            "so the request would silently produce wrong output. Set "
+            "kv_cache_config.enable_block_reuse=True. Note that block reuse is "
+            "also disabled automatically for some quantization and model "
+            "combinations, so this can trigger without the flag being set "
+            "explicitly.")
+
+    @staticmethod
+    def _reject_non_gpu_cache_tiers(kv_cache_manager) -> None:
+        """Reject cache tiers below GPU while a connector runs.
+
+        A registered region is only a valid device address while its page is
+        pinned to GPU, and eviction to another tier reassigns that page's slot.
+        The resolved tier list is read from the manager rather than from
+        ``KvCacheConfig.host_cache_size``, whose default of ``None`` is falsy
+        but still yields a host tier.
+        """
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+        cache_tiers = kv_cache_manager.impl.init_config.cache_tiers
+        extra = [tier for tier in cache_tiers if tier.tier != CacheTier.GPU_MEM]
+        if extra:
+            names = ", ".join(str(tier.tier) for tier in extra)
+            raise NotImplementedError(
+                "KV Cache Connector is not supported with "
+                f"cache tiers below GPU (found: {names}). Pages evicted to "
+                "another tier have their GPU slot reassigned, which would "
+                "invalidate the addresses registered with the connector. Set "
+                "KvCacheConfig.host_cache_size=0 and "
+                "KvCacheConfig.disk_cache_size=0 to run GPU-only.")
 
     def _release_transfer(self, request: LlmRequest) -> None:
         """Release one transfer claim held by the KV connector or transceiver.
@@ -1498,6 +1625,12 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
+        # Tear down any profile window an HTTP caller left open (i.e.
+        # /start_profile without a matching /stop_profile).  Runs before the
+        # hang-detector early return below so the leaked window is closed on
+        # every shutdown path.  A no-op when the executor loop already
+        # unwound its own profiling state.
+        self._profile_manager.cleanup()
         if self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
@@ -1686,185 +1819,83 @@ class PyExecutor:
 
     @contextmanager
     def _profiler(self):
-        it = -1
-        enabled = False
-        start_time = None
+        """Per-iteration profile bookkeeping driver.
 
-        # These events are used to record the time of the previous batch.
-        # We need two set of the start-end events to record the time through
-        # a ping-pong way so that it works with overlap scheduler.
-        start_event_1 = None
-        end_event_1 = torch.cuda.Event(enable_timing=True)
-        start_event_2 = None
-        end_event_2 = torch.cuda.Event(enable_timing=True)
-        prev_device_step_time = None
+        Forwards to ``PyExecutorProfileManager.profile_step``; see
+        ``profiling.py`` for the full state machine. Kept as a method
+        on ``PyExecutor`` so the executor loop's ``with self._profiler()``
+        call site is unchanged.
+        """
+        with self._profile_manager.profile_step() as step:
+            yield step
 
-        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
-        if torch_trace_path is not None:
-            # Append the rank so each rank writes to its own file. Without
-            # this, TP/PP/DP > 1 runs have every rank calling
-            # torch_profiler.export_chrome_trace() on the same path
-            # concurrently, producing interleaved output that fails to
-            # parse in Chrome tracing / Perfetto.
-            trace_base, trace_ext = os.path.splitext(torch_trace_path)
-            torch_trace_path = f"{trace_base}-rank-{self.global_rank}{trace_ext}"
-        profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
-                                            None)
-        enable_torch_trace = bool(torch_trace_path and profile_start_stop)
-        if torch_trace_path and profile_start_stop is None:
-            logger.warning(
-                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
-                "needs to be set to enable the torch trace. Example to profile "
-                f"iteration 10-20: export {PROFILE_START_STOP_ENV_VAR_NAME}=10-20"
-            )
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start iteration-scoped profiling.
 
-        if enable_torch_trace:
-            activities = [
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-                torch.profiler.ProfilerActivity.XPU,
-            ]
-            torch_profiler = torch.profiler.profile(activities=activities,
-                                                    record_shapes=True,
-                                                    with_modules=True)
+        Mirrors the functionality of the ``TLLM_PROFILE_START_STOP`` /
+        ``TLLM_TORCH_PROFILE_TRACE`` environment variables but is
+        triggerable at runtime (e.g. via ``trtllm-serve``'s
+        ``/start_profile`` HTTP endpoint).
 
-        log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
-        if log_ranks_str.strip().lower() == "all":
-            log_all_ranks = True
-            log_ranks = set()
-        else:
-            log_all_ranks = False
-            log_ranks = {int(r) for r in log_ranks_str.split(",")}
+        Args:
+            output_dir: Directory where chrome traces are written. If
+                ``None``, falls back to the ``TLLM_TORCH_PROFILER_DIR``
+                environment variable and finally to ``/tmp``.
+            num_steps: Number of iterations to profile. If ``None``,
+                profiling runs until ``stop_profile`` is called.
+            start_step: Additional iterations to skip before profiling
+                starts (relative to the current iteration counter).
+            activities: Subset of ``["CPU", "GPU", "CUDA_PROFILER"]``.
 
-        calibrator = get_calibrator()
+        See ``PyExecutorProfileManager.start_profile`` for the full
+        state-machine contract.
+        """
+        return self._profile_manager.start_profile(
+            output_dir=output_dir,
+            num_steps=num_steps,
+            start_step=start_step,
+            activities=activities,
+        )
 
-        def profile_step():
-            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
-            calibrator.post_step(it)
-            if (self.iter_counter in self.profile_stop_iters
-                    and not self.is_warmup):
-                assert enabled, "Inconsistent CUDA profiling state"
-                if enable_torch_trace:
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(
-                        f"Profiling stopped at iteration {self.iter_counter}, "
-                        f"trace saved to {torch_trace_path}")
-                # Persist calibration data and quiesce the device before
-                # cudaProfilerStop(): profiling tools may stop collecting or
-                # even end the process (e.g. nsys with
-                # --capture-range-end=stop-shutdown) as soon as the capture
-                # range closes, so the calibration file dump must happen
-                # before the stop, and the capture should end on an idle
-                # device with no in-flight async copies.
-                calibrator.stop()
-                torch.cuda.synchronize()
-                torch.cuda.cudart().cudaProfilerStop()
-                enabled = False
+    def stop_profile(self) -> None:
+        """Schedule the in-progress runtime profiling to stop on the
+        next executor iteration.
 
-            # Capture per-loop timing whenever stats or the iter log are
-            # enabled. The reading of the OTHER parity's event pair (the
-            # ping-pong) is what keeps synchronize() from blocking the GPU
-            # — the events being read have already passed by the time we
-            # read them. Stashing on self lets the /metrics serializer pick
-            # up the values without going through the log line.
-            should_capture_timing = self.print_log or self.enable_iter_perf_stats
-            if should_capture_timing and start_time is not None:
-                end_time = time.time()
-                if it % 2 == 0:
-                    end_event_1.record()
-                    if start_event_2 is not None:
-                        end_event_2.synchronize()
-                        prev_device_step_time = start_event_2.elapsed_time(
-                            end_event_2)
-                else:
-                    end_event_2.record()
-                    if start_event_1 is not None:
-                        end_event_1.synchronize()
-                        prev_device_step_time = start_event_1.elapsed_time(
-                            end_event_1)
+        See ``PyExecutorProfileManager.stop_profile`` for details.
+        """
+        return self._profile_manager.stop_profile()
 
-                host_step_time = (end_time - start_time) * 1000  # milliseconds
-                self._latest_host_step_time_ms = host_step_time
-                self._latest_prev_device_step_time_ms = prev_device_step_time
+    def _apply_profile_start_config(self, config: Dict) -> None:
+        """Apply a broadcasted profile-start config on this rank.
 
-                if self.print_log and (log_all_ranks
-                                       or self.dist.rank in log_ranks):
-                    if prev_device_step_time is None:
-                        prev_device_step_time_str = "N/A"  # Handle first iteration
-                    else:
-                        prev_device_step_time_str = f"{prev_device_step_time}ms"
-                    kv_util_str = "N/A"
-                    if self.kv_cache_manager is not None:
-                        kv_stats = self.kv_cache_manager.get_kv_cache_stats()
-                        if kv_stats.max_num_blocks > 0:
-                            kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
-                    formatted_timestamp = datetime.datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S")
-                    logger.info(
-                        f"iter = {self.iter_counter}, "
-                        f"global_rank = {self.global_rank}, "
-                        f"rank = {self.dist.rank}, "
-                        f"num_scheduled_requests = {self.num_scheduled_requests}, "
-                        f"adp_dummy_ctx_tokens = {self._iter_adp_dummy_ctx_tokens}, "
-                        f"adp_dummy_gen_tokens = {self._iter_adp_dummy_gen_tokens}, "
-                        f"kv_cache_util = {kv_util_str}, "
-                        f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
-                        f"{self.num_fetch_requests}, "
-                        f"host_step_time = {host_step_time}ms, "
-                        f"prev_device_step_time = {prev_device_step_time_str}, "
-                        f"timestamp = {formatted_timestamp}, "
-                        f"states = {self.model_engine.iter_states}")
+        Forwards to ``PyExecutorProfileManager.apply_start_config``.
+        Kept on ``PyExecutor`` so ``_handle_special_queue_items`` and
+        unit tests that patch this name continue to work unchanged.
+        """
+        return self._profile_manager.apply_start_config(config)
 
-            # profile_step runs at the start of each executor loop after
-            # logging the preceding loop. Clear the counters before the next
-            # batch records its ADP dummy work.
-            self._iter_adp_dummy_ctx_tokens = 0
-            self._iter_adp_dummy_gen_tokens = 0
-            it += 1
+    def _apply_profile_stop_config(self) -> bool:
+        """Apply a broadcasted profile-stop on this rank.
 
-            if (self.iter_counter in self.profile_start_iters
-                    and not self.is_warmup):
-                assert not enabled, "Inconsistent CUDA profiling state"
-                calibrator.start()
-                torch.cuda.cudart().cudaProfilerStart()
-                if enable_torch_trace:
-                    torch_profiler.start()
-                logger.info(
-                    f"Profiling started at iteration {self.iter_counter}.")
-                enabled = True
+        Forwards to ``PyExecutorProfileManager.apply_stop_config``.
 
-            # Notify host line profiler of iteration for iteration-aware profiling
-            host_profiler = get_global_profiler()
-            if host_profiler is not None:
-                host_profiler.notify_iteration(self.iter_counter)
+        Returns:
+            ``True`` when a pending start was cancelled before it
+            fired, ``False`` when a stop iteration was scheduled.
+        """
+        return self._profile_manager.apply_stop_config()
 
-            calibrator.pre_step(it)
-            start_time = time.time()
-            if should_capture_timing:
-                if it % 2 == 0:
-                    if start_event_1 is None:
-                        start_event_1 = torch.cuda.Event(enable_timing=True)
-                    start_event_1.record()
-                else:
-                    if start_event_2 is None:
-                        start_event_2 = torch.cuda.Event(enable_timing=True)
-                    start_event_2.record()
-
-        try:
-            yield profile_step
-        finally:
-            if enabled:
-                # Stop on early exit / exception
-                if enable_torch_trace:
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(f"Profiling stopped at iteration {it}, "
-                                f"trace saved to {torch_trace_path}")
-                # See the ordering rationale at the in-loop cudaProfilerStop().
-                calibrator.stop()
-                torch.cuda.synchronize()
-                torch.cuda.cudart().cudaProfilerStop()
+    # _wake_executor_loop_for_profile was previously used to enqueue a
+    # sentinel cancel-request to unblock the idle executor loop.  It is
+    # no longer needed: the profile-start / profile-stop broadcast
+    # items (enqueued by start_profile/stop_profile on rank 0) land on
+    # the same queue and already wake the fetch. The broadcast of those
+    # items via RequestBroadcaster also synchronizes all ranks, so we
+    # don't need a separate wake on non-zero ranks.
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
@@ -2764,17 +2795,22 @@ class PyExecutor:
                         gpu_forward_events_from_perf_pool = True
 
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
+                    # Per-iteration step[...] scope. Appears in Kineto traces
+                    # under the user_annotation / gpu_user_annotation
+                    # categories so trtllm-serve /start_profile output exposes
+                    # per-iteration boundaries to downstream trace viewers.
+                    # Elided entirely when no profile window is active.
                     if not self.dist.is_last_pp_rank:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
-                        ):
+                        ), self._step_scope(scheduled_batch):
                             sample_state = self._forward_step_inter_pp(
                                 scheduled_batch, gpu_forward_start,
                                 gpu_forward_end)
                     else:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
-                        ):
+                        ), self._step_scope(scheduled_batch):
                             # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                             if self.guided_decoder is not None and self.kv_cache_transceiver:
                                 self.guided_decoder.add_batch(scheduled_batch)
@@ -3663,19 +3699,12 @@ class PyExecutor:
             force_terminate_ctx_for_partial_reuse=getattr(
                 self, "force_terminate_ctx_for_partial_reuse", False),
             delegates=DisaggLoopDelegates(
-                handle_errors_synced=self._handle_disagg_cache_errors_synced,
-                prepare_context_schedulable=self.
-                _check_disagg_ctx_schedulable_status,
                 admit=self._apply_disagg_transfer_admission,
                 revert_deferred_gen_init=self.
                 _revert_deferred_disagg_gen_init_alloc,
                 receive_gen_init=self._prepare_disagg_gen_init,
-                poll_progress_when_idle=self.
-                _check_disagg_transfer_progress_when_idle,
                 prepare_transmission_completed=self.
                 _prepare_disagg_gen_transmission_complete,
-                check_transfer_errors=self._check_cache_transfer_errors,
-                requests_in_error_state=self._get_disagg_reqs_in_error_state,
             ))
 
     def _get_disagg_transfer_admission_controller(
@@ -3805,26 +3834,6 @@ class PyExecutor:
         if self._dist_size(self.dist, "tp_size") > 1:
             return self.dist.tp_allgather(local_status)
         return [local_status]
-
-    def _check_disagg_transfer_progress_when_idle(self) -> None:
-        """Reap completed context KV transfers so their blocks can be freed.
-
-        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
-        must not enter the context status collective here. A single-rank
-        worker cannot diverge and polls only while a send is in flight.
-        """
-        uses_synchronous_gen_transfer = (
-            not self._uses_async_disagg_gen_transfer()
-            and not self._is_disagg_gen_only_no_context_benchmark())
-        should_poll_synchronous_context_status = (
-            uses_synchronous_gen_transfer
-            and self._dist_size(self.dist, "world_size") == 1
-            and self.async_transfer_manager.has_any_inflight_requests())
-        if (uses_synchronous_gen_transfer
-                and not should_poll_synchronous_context_status):
-            return
-
-        self.disagg.reap_context_sends(0)
 
     def _pp_ring_is_drained(self) -> bool:
         """Return whether no microbatch is queued or awaiting handling."""
@@ -4240,97 +4249,6 @@ class PyExecutor:
             f"completing; the loop would otherwise retry forever without "
             f"advancing iter_counter.")
 
-    @nvtx_range("_handle_disagg_cache_errors_synced")
-    def _handle_disagg_cache_errors_synced(self):
-        """Rank-safe disagg cache error and poison handler.
-
-        Called from the top of every executor iteration. Buffer poison is
-        reduced over the full executor world because one poisoned PP/DP rank
-        requires the whole distributed executor to stop. ADP TP ranks then
-        vote on failed request IDs and fail matching local replicas together;
-        otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
-        deadlocks or leaves peer replicas running.
-        """
-        if not self.kv_cache_transceiver:
-            return
-
-        pending_ids = self.disagg.take_pending_context_failures()
-        pending_requests = ([
-            request for request in self.active_requests
-            if get_unique_rid(request) in pending_ids
-        ] if pending_ids else [])
-        for request in pending_requests:
-            request.state = LlmRequestState.DISAGG_TRANS_ERROR
-
-        if self.disagg.inflight_cancel_active():
-            local_poisoned = self.kv_cache_transceiver.has_poisoned_transfer_buffer(
-            )
-            if self.dist.world_size != 1:
-                any_poisoned = bool(
-                    self.dist.allreduce(int(local_poisoned), op=ReduceOp.MAX))
-            else:
-                any_poisoned = local_poisoned
-            if any_poisoned:
-                error_msg = (
-                    "Disagg KV cache transfer buffer is poisoned; process "
-                    "restart is required")
-                self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
-                self.is_shutdown = True
-                self._handle_errors(error_msg,
-                                    requests=None,
-                                    charge_budget=False,
-                                    fatal_is_collective_aligned=True)
-                return
-
-        if not (self.enable_attention_dp and self.dist.world_size != 1):
-            if pending_requests:
-                self._check_cache_transfer_errors("context requests")
-            return
-
-        local_error_requests = [
-            request for request in self.active_requests
-            if request.state == LlmRequestState.DISAGG_TRANS_ERROR
-        ]
-        local_vote = {
-            "error_ids": [
-                self._request_vote_id(request)
-                for request in local_error_requests
-            ],
-            "blocked_ids": [
-                self._request_vote_id(request)
-                for request in local_error_requests
-                if self._is_disagg_error_cleanup_blocked(request)
-            ],
-        }
-        all_votes = self.dist.tp_allgather(local_vote)
-        voted_error_ids = {
-            request_id
-            for rank_vote in all_votes
-            for request_id in rank_vote["error_ids"]
-        }
-        blocked_error_ids = {
-            request_id
-            for rank_vote in all_votes
-            for request_id in rank_vote["blocked_ids"]
-        }
-        ready_error_ids = voted_error_ids - blocked_error_ids
-        if not ready_error_ids:
-            return
-        local_voted_error_requests = [
-            request for request in self.active_requests
-            if self._request_vote_id(request) in ready_error_ids
-        ]
-        logger.warning(
-            f"Disagg KV cache transfer error: rank={self.dist.rank} "
-            f"local_err_count={len(local_error_requests)}, "
-            f"voted_err_count={len(voted_error_ids)}, "
-            f"blocked_err_count={len(voted_error_ids & blocked_error_ids)}")
-        self._handle_errors(
-            "Disagg KV cache transfer error",
-            requests=local_voted_error_requests,
-            charge_budget=False,
-        )
-
     def _emit_initial_stats(self) -> None:
         """Emit a startup stats snapshot so that cache_config_info is
         immediately available to external metric scrapers (e.g. the
@@ -4349,6 +4267,86 @@ class PyExecutor:
             kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
             stats.kv_cache_stats = kv_stats_to_save
         self._append_iter_stats(stats)
+
+    def _build_step_scope_label(self,
+                                scheduled_batch: ScheduledRequests,
+                                phase: Optional[str] = None) -> str:
+        """Format a per-iteration scope label for ``torch.profiler``.
+
+        The label uses a ``step[...]`` convention that exposes per-iteration
+        boundaries in chrome traces and can be parsed programmatically. The
+        label appears in the Kineto ``user_annotation`` /
+        ``gpu_user_annotation`` lanes.
+
+        Format:
+          - ``step[DECODE bs=N]`` when every scheduled request is in
+            generation phase (no context requests this iteration).
+          - ``step[EXTEND bs=N toks=M]`` when any context requests are
+            scheduled. ``bs`` is the number of extend (context) requests
+            and ``toks`` is the total number of context tokens being
+            processed this iteration (sum of each request's
+            ``context_chunk_size``).
+
+        Exactly one bare ``step[...]`` scope is emitted per iteration, so a
+        trace consumer can derive iteration boundaries by counting them.
+        The overlap-scheduler loop cannot wrap the whole iteration in a
+        single scope -- ``_update_requests`` for the previous batch runs
+        between the forward and the sampling region -- so it emits its
+        second, non-nested scope with a ``phase`` suffix
+        (``step[...] sample``). Suffixed labels are distinct strings and
+        must not be counted as iteration boundaries.
+
+        Args:
+            scheduled_batch: The batch scheduled for this iteration.
+            phase: Optional sub-iteration phase name. When set, it is
+                appended after the bracketed body to keep the resulting
+                label distinguishable from the bare per-iteration label.
+        """
+        num_ctx = scheduled_batch.num_context_requests
+        num_gen = scheduled_batch.num_generation_requests
+        if num_ctx == 0:
+            label = f"step[DECODE bs={num_gen}]"
+        else:
+            total_toks = 0
+            for req in scheduled_batch.context_requests:
+                total_toks += int(getattr(req, "context_chunk_size", 0) or 0)
+            label = f"step[EXTEND bs={num_ctx} toks={total_toks}]"
+        return f"{label} {phase}" if phase else label
+
+    def _step_scope(self,
+                    scheduled_batch: ScheduledRequests,
+                    phase: Optional[str] = None):
+        """Return the per-iteration ``step[...]`` profiler scope.
+
+        Only builds the label and enters ``torch.profiler.record_function``
+        while a profile window is actually active. Both cost real time on
+        every executor iteration -- ``_build_step_scope_label`` formats a
+        string and sums ``context_chunk_size`` over the scheduled context
+        requests, and ``record_function`` traps into the profiler
+        machinery -- and none of that is observable unless someone is
+        profiling.
+
+        This matters beyond raw throughput: on a single-GPU deployment the
+        executor loop shares the GIL with the FastAPI event loop, so
+        per-iteration Python work in this loop delays HTTP handlers. The
+        disaggregated clock handshake (``/steady_clock_offset``) estimates
+        its offset from a single round trip, so a few milliseconds of added
+        latency there skews every timestamp the server reports afterwards.
+
+        ``_profile_enabled`` is read without ``_profile_state_lock`` on
+        purpose: this is a per-iteration fast path, and the worst case is
+        that a window that just opened or closed is reflected one
+        iteration late in the trace. Taking the lock here would put a
+        mutex in the hot loop to buy nothing.
+
+        Returns:
+            A context manager -- ``nullcontext()`` when no profile window
+            is active, otherwise a ``record_function`` for this iteration.
+        """
+        if not self._profile_enabled:
+            return nullcontext()
+        return torch.profiler.record_function(
+            self._build_step_scope_label(scheduled_batch, phase))
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -4376,8 +4374,8 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
-                    # _handle_disagg_cache_errors_synced() can buffer a
-                    # non-fatal response before scheduling observes shutdown.
+                    # handle_errors_synced() can buffer a non-fatal response
+                    # before scheduling observes shutdown.
                     # Drain it before leaving the loop so the client does not
                     # wait for its own timeout. Scheduling shutdown is
                     # model-parallel synchronized, so every ADP rank reaches
@@ -4493,27 +4491,35 @@ class PyExecutor:
                         )
                         gpu_forward_events_from_perf_pool = True
 
-                    if scheduled_batch.encoder_requests:
-                        self._submit_encoder_step(
-                            scheduled_batch.encoder_requests)
+                    # Emit a step[...] user_annotation scope around the
+                    # forward+sample region so Kineto traces from
+                    # trtllm-serve /start_profile expose per-iteration
+                    # boundaries with a consistent category and label
+                    # format.
+                    with self._step_scope(scheduled_batch):
+                        if scheduled_batch.encoder_requests:
+                            self._submit_encoder_step(
+                                scheduled_batch.encoder_requests)
 
-                    with self.perf_manager.record_perf_events(
-                            gpu_forward_start, gpu_forward_end) as fwd_timing:
-                        if self.dwdp_manager is not None:
-                            self.dwdp_manager.prefetch_first_layers()
-                        batch_outputs = self._forward_step(scheduled_batch)
+                        with self.perf_manager.record_perf_events(
+                                gpu_forward_start,
+                                gpu_forward_end) as fwd_timing:
+                            if self.dwdp_manager is not None:
+                                self.dwdp_manager.prefetch_first_layers()
+                            batch_outputs = self._forward_step(scheduled_batch)
 
-                    self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
+                        self._maybe_prefetch_next_iter_mm_encoders(
+                            scheduled_batch)
 
-                    guided_decoder_failed_requests = None
-                    if self.guided_decoder is not None:
-                        guided_decoder_failed_requests = self.guided_decoder.execute(
-                            batch_outputs['logits'])
+                        guided_decoder_failed_requests = None
+                        if self.guided_decoder is not None:
+                            guided_decoder_failed_requests = self.guided_decoder.execute(
+                                batch_outputs['logits'])
 
-                    with self.perf_manager.record_perf_events(
-                            None, gpu_sample_end) as sample_timing:
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs)
+                        with self.perf_manager.record_perf_events(
+                                None, gpu_sample_end) as sample_timing:
+                            sample_state = self._sample_async(
+                                scheduled_batch, batch_outputs)
 
                     if self.perf_manager.enabled:
                         self.perf_manager.save_timing_to_requests(
@@ -4728,9 +4734,9 @@ class PyExecutor:
     def _can_pause_for_rebalance(self) -> bool:
         """Gate KV pool rebalance to the cases the hook supports.
 
-        Scope: no in-flight disagg transfer, no beam search, no drafter, not
-        during warmup or shutdown.  Honors the ``enable_kv_pool_rebalance``
-        opt-in flag (default off).
+        Scope: no in-flight disagg transfer, no KV connector, no beam search,
+        no drafter, not during warmup or shutdown.  Honors the
+        ``enable_kv_pool_rebalance`` opt-in flag (default off).
 
         Pipeline parallelism *is* supported, but not in the same shape as the
         other two loops.  ``_executor_loop`` and ``_executor_loop_overlap``
@@ -4755,6 +4761,14 @@ class PyExecutor:
         if not self.enable_kv_pool_rebalance:
             return False
         if self.kv_cache_transceiver is not None:
+            return False
+        if self.kv_connector_manager is not None:
+            # Rebalance suspends every active request and runs a defragmenting
+            # migration, which reassigns slot_id -- the same field a tier
+            # eviction reassigns, and the reason tiers below GPU are rejected
+            # at bring-up. The addresses a connector holds come from
+            # update_state_after_alloc and outlive the iteration, so every
+            # connector run is exposed, synchronous included.
             return False
         if self.is_warmup:
             return False
@@ -5229,6 +5243,17 @@ class PyExecutor:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
+                # Per-iteration scope labels for torch.profiler. The
+                # overlap loop runs ``_update_requests`` for the previous
+                # batch between the forward and the sampling region, so the
+                # two cannot share one enclosing scope. Only the forward
+                # scope carries the bare ``step[...]`` label that marks an
+                # iteration boundary; the sampling scope gets a ``sample``
+                # phase suffix so trace consumers counting ``step[...]``
+                # annotations still see exactly one per iteration. Both
+                # are elided when no profile window is active -- see
+                # ``_step_scope``.
+
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
 
@@ -5344,9 +5369,10 @@ class PyExecutor:
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
-                        batch_outputs = self._forward_step(
-                            scheduled_batch, previous_tensors_device,
-                            num_accepted_tokens_device)
+                        with self._step_scope(scheduled_batch):
+                            batch_outputs = self._forward_step(
+                                scheduled_batch, previous_tensors_device,
+                                num_accepted_tokens_device)
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
@@ -5393,14 +5419,15 @@ class PyExecutor:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
-                        if self.guided_decoder is not None:
-                            # add_batch must be called again to have updated new tokens.
-                            self.guided_decoder.add_batch(scheduled_batch)
-                            guided_decoder_failed_requests = self.guided_decoder.execute(
-                                batch_outputs['logits'])
+                        with self._step_scope(scheduled_batch, phase="sample"):
+                            if self.guided_decoder is not None:
+                                # add_batch must be called again to have updated new tokens.
+                                self.guided_decoder.add_batch(scheduled_batch)
+                                guided_decoder_failed_requests = self.guided_decoder.execute(
+                                    batch_outputs['logits'])
 
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs)
+                            sample_state = self._sample_async(
+                                scheduled_batch, batch_outputs)
 
                     assert sample_state is not None, "Sampling failed"
 
@@ -6069,6 +6096,14 @@ class PyExecutor:
                 if self.dist.rank == 0:
                     self.request_accumulated.extend(new_requests[idx + 1:])
                 break
+            elif req_item.is_profile_start_request:
+                # Broadcasted from rank 0 via RequestBroadcaster; apply
+                # on this rank so every PyExecutor has the same
+                # profile_start_iters / pending markers.  Idempotent on
+                # rank 0 (start_profile already applied locally).
+                self._apply_profile_start_config(req_item.profile_config or {})
+            elif req_item.is_profile_stop_request:
+                self._apply_profile_stop_config()
             else:
                 accepted_new_requests.append(req_item)
 
@@ -6303,43 +6338,13 @@ class PyExecutor:
 
         encoder_max_batch_size = self.llm_args.encoder_max_batch_size
         encoder_cuda_graph_config = self.llm_args.encoder_cuda_graph_config
-        # A fixed-shape feature encoder has no token/seq-len buckets to gate on.
-        runner = getattr(self.model_engine, 'encoder_cuda_graph_runner', None)
-        is_feature_encoder = bool(getattr(runner, 'feature_mode', False))
         if (encoder_max_batch_size is not None
-                and encoder_cuda_graph_config is not None
-                and (is_feature_encoder or
-                     (bool(encoder_cuda_graph_config.num_tokens)
-                      and bool(encoder_cuda_graph_config.seq_lens)))):
+                and encoder_cuda_graph_config is not None):
             encoder_batch_size_limit = min(encoder_max_batch_size,
                                            self.max_batch_size)
-            if is_feature_encoder:
-                # Feature batch sizes may have been derived rather than
-                # configured, so take the ones the runner actually resolved.
-                # They stay populated even when capture was declined, so
-                # waiting on them would delay a batch that can only run eager.
-                configured_batch_sizes = (list(runner.supported_batch_sizes)
-                                          if runner.enabled else [])
-            else:
-                configured_batch_sizes = (encoder_cuda_graph_config.batch_sizes
-                                          or [])
-            supported_batch_sizes = [
-                batch_size for batch_size in configured_batch_sizes
-                if batch_size <= encoder_batch_size_limit
-            ]
-            # Targeting a size the runner never captured only pays off on the
-            # token path, where the pads are single tokens and the batch still
-            # rounds up into a captured bucket. A feature pad slot is a whole
-            # fixed_seq_len request, so `pad_batch` refuses any gap wider than
-            # 12.5% and such a batch would run eager; target the largest
-            # captured size within the limit instead.
-            if (not is_feature_encoder
-                    and encoder_cuda_graph_config.enable_padding
-                    and any(batch_size > encoder_batch_size_limit
-                            for batch_size in configured_batch_sizes) and
-                (not supported_batch_sizes
-                 or supported_batch_sizes[-1] != encoder_batch_size_limit)):
-                supported_batch_sizes.append(encoder_batch_size_limit)
+            supported_batch_sizes = (
+                self.model_engine._get_encoder_cuda_graph_batch_sizes(
+                    encoder_batch_size_limit))
 
             if supported_batch_sizes:
                 microbatch_target = supported_batch_sizes[-1]
@@ -6868,26 +6873,6 @@ class PyExecutor:
             req.py_encoder_output = None
             req.py_skip_cross_kv_projection = True
 
-    @nvtx_range("_check_disagg_ctx_schedulable_status")
-    def _check_disagg_ctx_schedulable_status(self,
-                                             new_requests: List[LlmRequest]):
-        """
-        In context-first mode, context requests are schedulable immediately,
-        otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
-        """
-        if not self.kv_cache_transceiver:
-            return
-        gen_first_ctx_requests = [
-            req for req in new_requests
-            if req.is_context_only_request and req.py_disaggregated_params.
-            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        ]
-        # Always call prepare_context_requests when there are new requests
-        # or previously-waiting requests, so the tp_allgather consensus
-        # can promote requests whose peer info has arrived on all ranks.
-        self.kv_cache_transceiver.prepare_context_requests(
-            gen_first_ctx_requests)
-
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
@@ -7277,8 +7262,8 @@ class PyExecutor:
             # so the connector's per-request state advances exactly as before.
             kv_cache_manager = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
-                kv_cache_manager.publish_connector_scheduler_output(
+            if hasattr(kv_cache_manager, "report_batch_to_connector"):
+                kv_cache_manager.report_batch_to_connector(
                     disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
@@ -7518,7 +7503,7 @@ class PyExecutor:
             # prepared request is left in DISAGG_GENERATION_INIT.
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
-            self._check_cache_transfer_errors("generation requests")
+            self.disagg.check_transfer_errors("generation requests")
             return
 
         for req in new_gen_reqs:
@@ -7548,15 +7533,27 @@ class PyExecutor:
             return
 
         def kv_connector_request_finished(req: LlmRequest):
+            by_layer_group = None
             try:
-                cache_block_ids = self.kv_cache_manager.get_cache_indices(req)
+                # KVCacheManagerV2 has no primary-pool block list, so
+                # `get_cache_indices` raises there. The warning path below
+                # swallows that, leaving `request_finished` uncalled and the
+                # connector never told to save anything.
+                if isinstance(self.kv_cache_manager, KVCacheManagerV2):
+                    by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+                        req)
+                    cache_block_ids = by_layer_group[0] if len(
+                        by_layer_group) == 1 else []
+                else:
+                    cache_block_ids = self.kv_cache_manager.get_cache_indices(
+                        req)
             except Exception as e:
                 logger.warning(
                     f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
                 )
             else:
                 if self.kv_connector_manager.request_finished(
-                        req, cache_block_ids):
+                        req, cache_block_ids, by_layer_group):
                     self.async_transfer_manager.start_transfer(req)
 
         if not self.disable_overlap_scheduler:
@@ -7567,45 +7564,6 @@ class PyExecutor:
         for req in requests:
             if req.is_finished:
                 kv_connector_request_finished(req)
-
-    @staticmethod
-    def _request_vote_id(request: LlmRequest) -> int:
-        return (request.parent_request_id
-                if request.is_child else request.py_request_id)
-
-    def _is_disagg_error_cleanup_blocked(self, request: LlmRequest) -> bool:
-        request_id = self._request_vote_id(request)
-        if request_id in getattr(self, "canceled_req_ids", ()):
-            return True
-
-        async_transfer_manager = getattr(self, "async_transfer_manager", None)
-        if (getattr(request, "is_context_only_request", False) is True
-                and async_transfer_manager is not None and request.py_request_id
-                in async_transfer_manager.requests_in_transfer()):
-            return True
-        return False
-
-    def _get_disagg_reqs_in_error_state(self):
-        return [
-            req for req in self.active_requests
-            if req.state == LlmRequestState.DISAGG_TRANS_ERROR
-            and not self._is_disagg_error_cleanup_blocked(req)
-        ]
-
-    def _check_cache_transfer_errors(self, error_msg_prefix: str):
-        """Check and handle cache transfer errors.
-
-        Under ADP this is a no-op: errors are handled by
-        ``_handle_disagg_cache_errors_synced`` at the loop top.
-        """
-        if self.enable_attention_dp and self.dist.world_size != 1:
-            return
-        error_requests = self._get_disagg_reqs_in_error_state()
-        if error_requests:
-            error_msg = f"Error in kv cache transfer for {error_msg_prefix}"
-            self._handle_errors(error_msg,
-                                requests=error_requests,
-                                charge_budget=False)
 
     def _maybe_prefetch_next_iter_mm_encoders(
             self, scheduled_batch: ScheduledRequests) -> None:
@@ -7935,7 +7893,8 @@ class PyExecutor:
         multi_rank_adp = (self.enable_attention_dp
                           and self.dist.world_size != 1)
         # ``fatal_is_collective_aligned`` is set only by the synchronized caller
-        # (_handle_disagg_cache_errors_synced, after its world allreduce), which
+        # (the coordinator's handle_errors_synced, through fail_fatal after its
+        # world allreduce), which
         # guarantees every ADP rank enters the fatal path in the same collective
         # order. Do NOT infer it from ``self._fatal_error is not None``: a
         # rank-local setter would then route into a tp_gather while peers are
