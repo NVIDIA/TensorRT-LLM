@@ -1663,8 +1663,8 @@ def executor_request_to_llm_request(
     return llm_request
 
 
-def _rewind_context_after_cache_drop(request: LlmRequest,
-                                     tokens_per_block: int) -> None:
+def rewind_context_after_cache_drop(request: LlmRequest,
+                                    tokens_per_block: int) -> None:
     """Reset context progress after callers release the request's KV caches."""
     request.set_prepopulated_prompt_len(0, tokens_per_block)
     # Clearing prepopulation does not rewind the native context cursor.

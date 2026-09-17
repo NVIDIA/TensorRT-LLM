@@ -23,8 +23,8 @@ from tensorrt_llm.logger import logger
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
-    _rewind_context_after_cache_drop,
     get_draft_token_length,
+    rewind_context_after_cache_drop,
 )
 from .scheduler import (
     RequestList,
@@ -760,7 +760,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 if manager is not None and req.py_request_id in manager.kv_cache_map:
                     manager.free_resources(req)
-            _rewind_context_after_cache_drop(req, self.tokens_per_block)
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
 
         return result
 

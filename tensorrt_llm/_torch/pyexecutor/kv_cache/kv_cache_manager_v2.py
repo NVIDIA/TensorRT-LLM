@@ -103,8 +103,8 @@ from ..kv_cache_stats import (
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
-    _rewind_context_after_cache_drop,
     get_draft_token_length,
+    rewind_context_after_cache_drop,
 )
 from ..resource_manager import (
     BaseResourceManager,
@@ -3343,7 +3343,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return True
         if kv_cache.history_length > pre_cap:
             self.free_resources(req)
-            _rewind_context_after_cache_drop(req, self.tokens_per_block)
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
             return False
         history_length = min(kv_cache.history_length, pre_cap)
         if not kv_cache.resize(pre_cap, history_length):

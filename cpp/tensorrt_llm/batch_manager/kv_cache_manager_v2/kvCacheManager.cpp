@@ -246,7 +246,7 @@ std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
     // A partial match can end in a block with a different suffix, so only the
     // preceding fully matched block supplies the query's exact prefix key.
     BlockKey const previousKey
-        = blockIndex == 0 ? Hasher(reuseScope).digest() : match.blocks[BlockOrdinal{blockIndex - 1}]->key;
+        = blockIndex == 0 ? RootBlock::makeKey(reuseScope) : match.blocks[BlockOrdinal{blockIndex - 1}]->key;
     return Block::makeKey(previousKey, inputTokens.begin() + begin, static_cast<size_t>(blockSize), knownNoDigest);
 }
 

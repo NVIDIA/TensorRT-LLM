@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, cast
 
 from .. import rawref
-from .._block_radix_tree import BlockRadixTree, Hasher, ReuseMatch, ReuseScope
+from .._block_radix_tree import Block, BlockRadixTree, ReuseMatch, ReuseScope, RootBlock
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
@@ -542,11 +542,11 @@ class KVCacheManager:
         # Use the final, pruned match. Its last block can be partial and have a
         # different suffix; only a full predecessor has the query's exact key.
         previous_key = (
-            Hasher(reuse_scope.to_bytes()).digest
+            RootBlock.make_key(reuse_scope)
             if block_index == 0
             else match.blocks[block_index - 1].key
         )
-        return Hasher(previous_key).update(input_tokens[begin:end]).digest
+        return Block.make_key(previous_key, input_tokens[begin:end])
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """
