@@ -28,6 +28,40 @@ This example run the generation with TensorRT LLM backend. It shows the step of 
 [More examples](../../examples/scaffolding)
 These examples shows how to run more complex methods including majority voting and best-of-n, how to static the output tokens with the decorator, how to run the dataset on concurrency and static the results.
 
+### Building a Controller from a config file
+A `Controller` can also be described declaratively instead of being constructed in code, which makes a
+method easier to share and to migrate between projects.
+
+``` bash
+python examples/scaffolding/run_from_config.py \
+    --config examples/scaffolding/configs/majority_vote.json \
+    --model_dir PATH/TO/MODEL
+```
+
+Controllers compose recursively, so a config is a tree. Any object with a `type` key is a controller node
+and its `args` are passed to the constructor; nested controller arguments are built first.
+
+``` json
+{
+  "controller": {
+    "type": "MajorityVoteController",
+    "args": {
+      "default_sample_num": 3,
+      "generation_controller": {
+        "type": "NativeGenerationController",
+        "args": {"sampling_params": {"max_tokens": 1024, "temperature": 0.9}}
+      }
+    }
+  }
+}
+```
+
+Both JSON and YAML are accepted. `load_controller_config(path)` returns the built `Controller`, and
+`build_controller(spec)` does the same for a config already in memory. Controllers that need a live object
+rather than a literal, such as the tokenizer of `PRMController`, take it through `{"$ref": "name"}` with the
+object passed in as `build_controller(spec, objects={"name": obj})`. Controllers under `contrib` can make
+themselves available by calling `register_controller(name, cls)`.
+
 ### [Contribute Guide](contrib)
 
 
