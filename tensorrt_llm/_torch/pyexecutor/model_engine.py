@@ -114,6 +114,7 @@ from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
+from .workspace import EagerWorkspaceReclaimer
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest,
@@ -730,6 +731,8 @@ class PyTorchModelEngine(ModelEngine):
         # NOTE: This can be simplified by decoupling the model config loading and
         # the model engine.
         self.attn_metadata = None
+        self._eager_workspace_reclaimer: Optional[
+            EagerWorkspaceReclaimer] = None
         self.spec_metadata = None
         self.iter_states = {}
         # Let the first CUDA graph capture create its private pool. Piecewise
@@ -1415,6 +1418,7 @@ class PyTorchModelEngine(ModelEngine):
         # CUDA graph capture pass exercises the non-greedy sampler, so with
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
+        self._eager_workspace_reclaimer = None
         warmup_sampling_module()
         if self.enable_in_graph_sampling:
             # The fast tier samples inside the captured graph via a
@@ -1551,6 +1555,32 @@ class PyTorchModelEngine(ModelEngine):
         # .fdata reflects steady-state serving only. No-op on normal builds.
         from ..bolt_profiling import maybe_bolt_clear_counters
         maybe_bolt_clear_counters()
+
+        self._freeze_eager_workspace_floor()
+
+    def _freeze_eager_workspace_floor(self) -> None:
+        if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
+            return
+        metadata = self.attn_metadata
+        if (self.is_spec_decode or self.mapping.cp_size != 1
+                or self._is_encoder_decoder_model()
+                or self.sparse_attention_config is not None
+                or self._torch_compile_backend is not None
+                or self.breakable_cuda_graph_runner is not None):
+            logger.info(
+                "Eager workspace reclamation is disabled for speculative, "
+                "CP, encoder-decoder, sparse, compiled, or breakable-graph models"
+            )
+            return
+        if (type(metadata) is not TrtllmAttentionMetadata
+                or not metadata.workspace_reclaimable
+                or metadata.workspace is None
+                or metadata.workspace.untyped_storage().nbytes() == 0):
+            logger.info(
+                "Eager workspace reclamation requires warmup of pure fallback scratch"
+            )
+            return
+        self._eager_workspace_reclaimer = EagerWorkspaceReclaimer(metadata)
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
@@ -6222,10 +6252,17 @@ class PyTorchModelEngine(ModelEngine):
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self.model.forward)(**kwargs)
-        else:
-            return self.model.forward(**kwargs)
+        reclaimer = self._eager_workspace_reclaimer
+        metadata = kwargs['attn_metadata']
+        reclaim_scope = (reclaimer.forward(metadata)
+                         if reclaimer is not None and not self.is_warmup
+                         and isinstance(metadata, TrtllmAttentionMetadata) else
+                         contextlib.nullcontext())
+        with reclaim_scope:
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                return trace_func(self.model.forward)(**kwargs)
+            else:
+                return self.model.forward(**kwargs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,
