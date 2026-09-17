@@ -256,14 +256,14 @@ def _evolution(rows: list[dict]) -> None:
     ax.text(
         0.2,
         5.55,
-        "Original GVR V1: temporal warm start + scalar threshold search",
+        "Later temporal V1: hint calibration + multi-thresholding",
         fontsize=11,
         weight="bold",
         color="#7557a6",
     )
     for x, label in [
         (0.2, "Previous indices\n→ current-score gather"),
-        (3.6, "Guess T → full-row count\n→ adjust T if needed"),
+        (3.6, "Hint-derived thresholds\n→ multiple exact counts"),
         (7.0, "Collect candidates\n→ exact refinement"),
     ]:
         _box(ax, (x, 3.8), (2.8, 1.2), label, "#f2eef9", 10)
@@ -342,7 +342,7 @@ def _evolution(rows: list[dict]) -> None:
     fig.text(
         0.035,
         0.005,
-        "Bars compare the temporal R0, temporal tiered, and self-sampling V2 implementations.",
+        "Flows show streaming paths; bars compare complete R0, tiered temporal, and V2 implementations.",
         fontsize=9,
         color="#475569",
     )

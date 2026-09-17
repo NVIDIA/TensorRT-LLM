@@ -108,15 +108,15 @@ z
 " clip-path="url(#p5b26b816df)" style="fill: #edf5df; stroke: #ccd5dd; stroke-width: 0.8; stroke-linejoin: miter"/>
    </g>
    <g id="text_1">
-    <text style="font-weight: 700; font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7557a6" x="19.4976" y="80.4816" transform="rotate(-0 19.4976 80.4816)">Original GVR V1: temporal warm start + scalar threshold search</text>
+    <text style="font-weight: 700; font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7557a6" x="19.4976" y="80.4816" transform="rotate(-0 19.4976 80.4816)">Later temporal V1: hint calibration + multi-thresholding</text>
    </g>
    <g id="text_2">
     <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(65.31205 129.825503)">Previous indices</text>
     <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(48.442519 143.302847)">→ current-score gather</text>
    </g>
    <g id="text_3">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(253.0025 129.825503)">Guess T → full-row count</text>
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(263.782969 143.302847)">→ adjust T if needed</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(255.914219 129.825503)">Hint-derived thresholds</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(254.832969 143.302847)">→ multiple exact counts</text>
    </g>
    <g id="text_4">
     <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #17202b" transform="translate(477.570294 129.825503)">Collect candidates</text>
@@ -381,7 +381,7 @@ L 964.8 301.536
    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #475569" x="22.32" y="378.144" transform="rotate(-0 22.32 378.144)">Design goals: improve the practical performance floor and average latency; remove the temporal prior's framework lifecycle.</text>
   </g>
   <g id="text_27">
-   <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #475569" x="22.32" y="400.32" transform="rotate(-0 22.32 400.32)">Bars compare the temporal R0, temporal tiered, and self-sampling V2 implementations.</text>
+   <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #475569" x="22.32" y="400.32" transform="rotate(-0 22.32 400.32)">Flows show streaming paths; bars compare complete R0, tiered temporal, and V2 implementations.</text>
   </g>
  </g>
  <defs>

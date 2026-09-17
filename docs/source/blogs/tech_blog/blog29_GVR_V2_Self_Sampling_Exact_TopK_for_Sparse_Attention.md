@@ -66,13 +66,15 @@ On a GPU, doing more work on chip can be worthwhile if it avoids another full-ro
 
 ### From GVR V1 to V2: Why Move Beyond Temporal Hints?
 
-Original GVR V1 gathers the current scores at the previous step's Top-K indices, estimates a bracket from their minimum, maximum, and mean, then uses a secant-style search on the monotone count function
+Temporal GVR V1 gathers current scores at the previous step's Top-K indices to predict admission thresholds. **Later V1 already uses multi-thresholding.** Its [R0 path](https://github.com/NVIDIA/TensorRT-LLM/pull/16457) builds a histogram over those gathered scores, proposes a threshold ladder, and counts its rungs together in one full-row pass. The [tiered streaming path](https://github.com/NVIDIA/TensorRT-LLM/pull/16877) also uses multiple thresholds, including exact counts at a pivot and a rescue rung. These are the temporal implementations compared with V2 below.
+
+Their admission objective is expressed through the monotone count function
 
 $$
 C(T)=\sum_{i=0}^{N-1}\mathbf{1}[x_i\ge T].
 $$
 
-It seeks an admission threshold with enough survivors to contain Top-K, but few enough to fit its candidate capacity. A high-quality temporal hint can make this search very short. The difficulty is making that benefit reliable across inference workloads.
+An admission threshold should leave enough survivors to contain Top-K, but few enough to fit candidate capacity. A high-quality temporal hint can make admission very cheap. The difficulty is making that benefit reliable across inference workloads, even with several thresholds checked together.
 
 #### A Biased Sample with Variable Value
 
@@ -99,30 +101,28 @@ V4 Pro's mean changes from **71.5% to 57.9%** between these inputs, and its rand
 
 A row's true hit rate is known only after the current selection is established. Verification can expose a poor threshold, but the hint gather and initial work have already been paid for. Conservative admission, repeated counts, capacity checks, and exact recovery keep weak hints safe; their overhead and extra reads reduce average speedup and make latency less predictable.
 
-V2 calibrates from the **current row**, removing dependence on temporal overlap and the read through old indices. Multi-thresholding addresses the other major cost: repeated scalar threshold queries. Together, they target a stronger practical performance floor and better average latency, without a fixed worst-case latency guarantee.
-
-V1 already used a histogram for local refinement. V2 moves multi-threshold population information into verification, so refinement starts from an identified crossing bin.
+V2 calibrates from the **current row**, removing dependence on temporal overlap and the read through old indices. It combines this calibration with histogram-based multi-threshold verification and crossing-bin refinement. **The defining change from later V1 is the source of the guess and the removal of temporal state; multi-thresholding is part of the design continuity.** These choices target a stronger practical performance floor and better average latency, without a fixed worst-case latency guarantee.
 
 #### A Hint That Crosses Framework Boundaries
 
 V1's prior also has a lifecycle outside the kernel. Prefill lacks the same previous-decode-step hint, so its seeding policy differs. That phase-dependent history complicates a common selection architecture. V2's current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The [integration section](#decode-and-prefill-in-tensorrt-llm) traces the consequences for CUDA Graph preparation and disaggregated serving.
 
-| Algorithm question | Original GVR V1 | Streaming GVR V2 |
+| Algorithm question | Later temporal V1: R0 / tiered streaming | Streaming GVR V2 |
 | :--- | :--- | :--- |
 | Where does the guess come from? | Current scores gathered through previous-step indices | A coalesced sample of the current row |
 | What makes the guess useful? | High, stable overlap with previous winners | Coverage of the current row's score distribution |
-| What guides admission? | Hint statistics and scalar secant-style count queries | Sample-derived primary threshold, lower safety floor, and upper anchor |
-| What does verification learn? | A count for the trial threshold | Exact bin populations and counts at many boundaries |
-| Where is the remaining uncertainty? | The admitted candidate set | The crossing bin containing rank $K$ |
+| What guides admission? | A hint-derived ladder, with path-specific pivot and rescue choices | Sample-derived primary threshold, lower safety floor, and upper anchor |
+| What does verification learn? | Exact counts at multiple admission thresholds | Exact bin populations and counts at many boundaries |
+| Where does exact refinement start? | The admitted candidate set, with path-specific local refinement | The crossing bin containing rank $K$ |
 | What state crosses decode steps? | Per-layer prior indices | No Top-K prior |
 | How do prefill and decode relate? | Different hint availability and seeding policies | Shared streaming selection with phase-specific row adapters |
-| How does a bad guess affect the result? | More verification/refinement work | Lower admission or exact recovery; membership remains exact |
+| How does a bad guess affect the result? | More admission/refinement work or recovery; membership remains exact | Lower admission or exact recovery; membership remains exact |
 
-![V1's temporal bias makes threshold quality depend on changing overlap; V2 calibrates from the current row with no temporal prior. Beside these flows, measured bars compare temporal R0, tiered temporal GVR, and V2.](../media/gvr_v2/evolution.svg)
+![Later temporal V1 and streaming V2 both use multi-thresholding. V1 calibrates through previous winners; V2 samples the current row without a temporal prior. Measured bars compare temporal R0, tiered temporal GVR, and V2.](../media/gvr_v2/evolution.svg)
 
-*Figure 3. The design shift removes dependence on temporal overlap and prior state while making each verification pass more informative. Original V1 uses scalar threshold search; later temporal R0 and tiered implementations add broader verification and execution specialization. The bars compare those later temporal implementations with V2 over radix CUDA.*
+*Figure 3. Multi-thresholding is shared by later temporal V1 and V2. The flows emphasize their calibration and refinement choices on streaming paths; the bars compare complete R0, tiered temporal, and V2 implementations over radix CUDA. V2 removes the temporal-overlap dependency and prior-state lifecycle.*
 
-Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA; V2 reaches **5.05×**. V2 is **1.95× faster than temporal R0** and **1.46× faster than tiered temporal GVR**, combining current-row sampling, multi-threshold verification, and specialized execution paths.
+Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA; V2 reaches **5.05×**. V2 is **1.95× faster than temporal R0** and **1.46× faster than tiered temporal GVR**. These gains compare complete implementations, including their calibration, verification, refinement, and execution paths.
 
 ## Self-Sampling and Multi-Thresholding
 
@@ -198,7 +198,7 @@ In the variable-length `main` route, warp 0 computes sampling geometry and publi
 
 ### Multi-Thresholding: Make Each Full-Row Pass Count
 
-A scalar verification pass answers one question: how many scores exceed $T$? Multi-thresholding obtains a family of answers from the same classification work.
+A scalar verification pass answers one question: how many scores exceed $T$? Later V1 already amortizes row reads across several admission thresholds. V2's streaming path uses a verification histogram to obtain a dense family of counts from the same classification work and locate the boundary for exact refinement.
 
 Conceptually, divide the bracket $[T,H]$ into $M$ ordered bins, with boundaries $t_0,\ldots,t_M$, and let $h_j$ be the exact population of bin $j$. A descending cumulative scan yields
 
