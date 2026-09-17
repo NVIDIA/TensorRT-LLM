@@ -84,9 +84,13 @@ The files contain kernel timings and workload dimensions. They do not contain in
 
 Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,024. The GVR V2 reference covers 886 row geometries and 9,746 workload/batch cases, all passing tie-aware exactness checks. Each published GVR time is the arithmetic mean of 10 cold-L2 repetitions, rounded to 0.001 µs; five warm-L2 repetitions are excluded from these figures. A 512 MiB cache eviction runs outside the timed region. Compilation, input preparation, allocation during setup, and Python launch overhead are excluded; required device kernels remain timed.
 
+Each workload/batch case repeats one captured layer/step score row into distinct batch rows. This controls the input distribution and valid width while measuring batch scaling; it is not a heterogeneous batch of independent serving requests. GVR uses `next_n=1` and sets `max_seq_len` to that case's valid row length times its compression ratio. A serving graph may use a larger stable envelope and choose a different execution plan. The bundled grid does not independently benchmark ragged mixed-length batches, MTP, or prefill.
+
 The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). All FP32 comparisons, including DeepSelect and HPC-ops, match existing baseline observations from separate runs by workload identity and batch size, with shape metadata checked where available. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled implementations and workloads; they are not a current-release, equal-interface benchmark of entire serving frameworks.
 
-Figures 1, 3, and 5–8 and their numerical summaries all use this PR #19076 reference. B300 measurements are outside the B200 comparison. Historical serving experiments retain their original implementation scope, as described below.
+The device kernel and host dispatcher at the [main revision audited on September 17, 2026](https://github.com/NVIDIA/TensorRT-LLM/commit/73c70633b2547eedf0c91f85e760aec534f6af84) are byte-identical to those measured for the reference. This establishes source continuity for those files, not a new whole-framework performance measurement.
+
+Figures 1, 3, and 7–10 and their numerical summaries all use this PR #19076 reference. B300 measurements are outside the B200 comparison. Historical serving experiments retain their original implementation scope, as described below.
 
 | Implementation | Relevant comparison contract |
 | :--- | :--- |
@@ -156,6 +160,8 @@ Reachable rate is `100 * P / min(R, BW*I)` percent, using the calibrated roof. C
 
 The read-dominated roof is optimistic; mixed read/write behavior and additional kernel work can lower achievable throughput. Reachable rate describes useful selection work relative to this model, not measured DRAM bandwidth utilization.
 
+The input-read term applies to nontrivial selection with more valid scores than output slots. Short-row identity/padding paths can skip score reads; they are outside the measured grid and should not be evaluated against this traffic bound.
+
 ## Serving Results
 
-Decode TPOT results come from public [PR #18410](https://github.com/NVIDIA/TensorRT-LLM/pull/18410); prefill results come from public [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702). These are separate serving experiments, not transformations of the operator speedups. The 2.9–4.5% throughput increase isolates adding V2 prefill to a deployment already using V2 decode. It is not the throughput gain of replacing radix in both phases.
+Decode TPOT results come from public [PR #18410](https://github.com/NVIDIA/TensorRT-LLM/pull/18410); prefill results come from public [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702). These are separate historical serving experiments, not transformations of the operator speedups or measurements of the current complete framework. The 1.84–2.61× prefill-kernel range compares aggregate rank-0 Top-K kernel durations within measured Flash/Pro prefill windows; it is not the latency of a single Top-K invocation. The 2.9–4.5% throughput increase isolates adding V2 prefill to a deployment already using V2 decode on the tested long-input, batched configurations. It is not the throughput gain of replacing radix in both phases.
