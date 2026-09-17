@@ -365,8 +365,10 @@ kv_cache_compression_config:
 `scale_checkpoint_path` supplies optional metadata; it is not the model path.
 TensorRT-LLM does not derive KV activation scales from ordinary model weights.
 These per-layer K/V global scales apply to the conventional two-buffer K/V
-layout. Key-only MLA and draft-model cold Pages currently use identity global
-scales.
+layout. For the DeepSeek-V4 CSA cache, `scale_checkpoint_path` supplies only
+the per-layer K scale; the V scale is not used, and CSA cold Pages use identity
+scales when no scale metadata is supplied. Key-only MLA and draft-model cold
+Pages currently use identity global scales.
 
 ## Enablement Checklist
 
