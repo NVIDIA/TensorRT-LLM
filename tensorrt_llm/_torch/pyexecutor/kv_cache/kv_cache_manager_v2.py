@@ -2292,6 +2292,10 @@ class KVCacheManagerV2(BaseResourceManager):
             attention_windows.append(self.max_attention_window_vec[local_layer_idx])
         return layer_sizes, attention_windows
 
+    def _get_generation_request_capacity(self) -> int:
+        """Return the resident generation requests used for SWA sizing."""
+        return self.max_batch_size
+
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
         tokens = self._get_max_tokens_from_quota_impl(quota)
@@ -2316,7 +2320,7 @@ class KVCacheManagerV2(BaseResourceManager):
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
         )
-        size_per_batch = self.max_batch_size * generation_swa_size_per_request
+        size_per_batch = self._get_generation_request_capacity() * generation_swa_size_per_request
         if quota < size_per_batch:
             return 0
         context_limit_quota = self.max_num_tokens * context_size_per_token + size_per_batch
@@ -2357,7 +2361,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return int(
             context_tokens * context_size_per_token
             + generation_tokens * generation_size_per_token
-            + self.max_batch_size * generation_swa_size_per_request
+            + self._get_generation_request_capacity() * generation_swa_size_per_request
         )
 
     def _get_event_num_blocks_per_cache_level(
@@ -2729,7 +2733,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
             if typical_seq_len is not None:
                 # Model one context request and enough generation requests to fill
-                # max_batch_size without over-provisioning windowed cache pools.
+                # the resident request capacity without over-provisioning windowed
+                # cache pools.
+                generation_request_capacity = self._get_generation_request_capacity()
                 context_capacity = (
                     self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
                 ) + self.num_extra_kv_tokens
@@ -2742,20 +2748,24 @@ class KVCacheManagerV2(BaseResourceManager):
                             history_length=generation_history_length,
                         )
                     ]
-                    * (self.max_batch_size - 1)
+                    * (generation_request_capacity - 1)
                 )
 
+                # CUDA graph generation warmup uses one request at max_seq_len and
+                # enough minimal decode requests to fill the resident capacity.
                 if (
                     self.max_cuda_graph_batch_size is not None
                     and self.max_cuda_graph_batch_size > 0
                     and self.is_estimating_kv_cache
                     and all(window is None for window in self.max_attention_window_vec)
                 ):
-                    # Estimation graph warmup needs the smaller of the configured batch
-                    # limit and the largest captured CUDA graph batch.
-                    constraint_batch_size = min(self.max_batch_size, self.max_cuda_graph_batch_size)
+                    # Estimation graph warmup needs the smaller of the resident
+                    # capacity and the largest captured CUDA graph batch.
+                    constraint_batch_size = min(
+                        generation_request_capacity, self.max_cuda_graph_batch_size
+                    )
                 else:
-                    constraint_batch_size = self.max_batch_size
+                    constraint_batch_size = generation_request_capacity
                 constraint_batch_size = max(1, constraint_batch_size)
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 # Model one request at max_seq_len plus minimal decode requests

@@ -94,7 +94,6 @@ class Fp4MlaFmha(PhasedFmha):
                 and sparse_runtime_params.sparse_attn_indices.numel() > 0
             )
             or metadata.num_sparse_topk > 0
-            or sparse_runtime_params.uses_spcompress
         ):
             raise NotImplementedError("FP4 MLA does not support sparse attention.")
 
@@ -273,7 +272,6 @@ class Fp4MlaFmha(PhasedFmha):
                 sparse_runtime_params.sparse_attn_indices is not None
                 and sparse_runtime_params.sparse_attn_indices.numel() > 0
             )
-            or sparse_runtime_params.uses_spcompress
             or metadata.num_sparse_topk > 0
         ):
             raise NotImplementedError("FP4 MLA chunked prefill does not support sparse attention.")
