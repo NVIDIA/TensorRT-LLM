@@ -37,7 +37,7 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 import torch
 
@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 # (tensorrt_llm/logger.py:284-287), so the key survives a run that printed
 # nothing; a test that wants to observe the warning has to clear it first.
 V2_RETENTION_IGNORED_LOG_KEY = "kv_connector_v2_retention_config_ignored"
+
+_SchedulerResult = TypeVar("_SchedulerResult")
 
 
 # Used to store data for a single inflight request.
@@ -112,6 +114,10 @@ class SchedulerOutput:
     # Requests being scheduled, that have already shown up in `new_requests`.
     cached_requests: List[RequestData] = field(default_factory=list)
 
+    # Owner of the local block IDs under attention DP. None denotes the
+    # shared-request tensor-parallel path. This is not a storage namespace.
+    attention_dp_rank: int | None = None
+
 
 def _flat_form_unavailable(flat: str, grouped: str) -> Callable:
     """A stand-in for ``flat`` that names the form this connector implements."""
@@ -154,6 +160,10 @@ def _satisfy_flat_abstracts(cls: type, base: type, pairs: Dict[str, str]) -> Non
 
 
 class KvCacheConnectorWorker(ABC):
+    # Opt in only when transfers, endpoints and completion are owner-local,
+    # and the backend can safely share compatible cache content across owners.
+    supports_attention_dp: bool = False
+
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
         self._metadata = None
@@ -288,12 +298,17 @@ class KvCacheConnectorWorker(ABC):
         provided in the ``finished_gen_req_ids`` and
         ``started_loading_req_ids`` arguments.  Additionally, the runtime
         will only take action based on these returned IDs once they've
-        been returned by ALL workers. This allows some workers to take
-        longer than others to complete the operations.
+        been returned by all workers holding the request's attention shards.
+        With attention DP each request has one local worker; unrelated DP
+        owners do not participate in its completion.
         """
 
 
 class KvCacheConnectorScheduler(ABC):
+    # ADP creates one adapter per rank. Adapters may connect to the same
+    # logical storage pool; their request and allocation state stays local.
+    supports_attention_dp: bool = False
+
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
         super().__init__()
@@ -576,7 +591,8 @@ class KvCacheConnectorSchedulerOutputRequest:
 
 
 class KvCacheConnectorSchedulerOutputManager:
-    def __init__(self):
+    def __init__(self, *, enable_attention_dp: bool = False) -> None:
+        self.enable_attention_dp = enable_attention_dp
         self.requests = defaultdict(KvCacheConnectorSchedulerOutputRequest)
         self.external_loads = dict()
 
@@ -585,10 +601,12 @@ class KvCacheConnectorSchedulerOutputManager:
         scheduled_batch: ScheduledRequests,
         new_async_requests: AsyncRequests,
         kv_cache_manager: "KVCacheManager",
-    ):
+    ) -> SchedulerOutput:
         scheduler_output = SchedulerOutput()
 
         for req in scheduled_batch.context_requests:
+            if self.enable_attention_dp and req.is_dummy_request:
+                continue
             if req.request_id in new_async_requests.loading_ids:
                 continue
 
@@ -608,6 +626,8 @@ class KvCacheConnectorSchedulerOutputManager:
                 scheduler_output.cached_requests.append(request_data)
 
         for req in scheduled_batch.generation_requests:
+            if self.enable_attention_dp and req.is_dummy_request:
+                continue
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager
             )
@@ -640,24 +660,32 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     It has the following responsibilities:
     1. Managing the state of async requests (both offload and onboard)
-    2. Handling MPI communication. We only run the leader on one rank,
-       but need the results of the leader API on all ranks.
+    2. Handling MPI communication for tensor parallelism. Under attention DP,
+       each rank runs its own scheduler adapter and worker without connector
+       collectives. Adapters can use a shared external storage pool.
 
     Note: This class is solely an implementation detail, and is not part of the connector interface itself.
     When implementing a connector API, you do not need to implement this class.
     """
 
     def __init__(
-        self, worker: KvCacheConnectorWorker, scheduler: Optional[KvCacheConnectorScheduler]
-    ):
-        assert (scheduler is not None) == (mpi_rank() == 0), (
-            "The scheduler may only exist on rank 0!"
+        self,
+        worker: KvCacheConnectorWorker,
+        scheduler: Optional[KvCacheConnectorScheduler],
+        *,
+        enable_attention_dp: bool = False,
+    ) -> None:
+        assert (scheduler is not None) == (enable_attention_dp or mpi_rank() == 0), (
+            "A scheduler is required on every attention-DP owner, or only rank 0 for TP."
         )
+        if enable_attention_dp:
+            self.validate_attention_dp(type(worker), type(scheduler))
 
         super().__init__()
 
         self.worker = worker
         self.scheduler = scheduler
+        self.enable_attention_dp = enable_attention_dp
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -672,12 +700,30 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.finished_async_loading_requests = dict()
 
         self._scheduler_output = None
-        self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
+        self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager(
+            enable_attention_dp=enable_attention_dp
+        )
 
-    def _run_on_leader(self, f: Callable[[], Any]) -> Any:
+    @staticmethod
+    def validate_attention_dp(
+        worker_cls: type[KvCacheConnectorWorker],
+        scheduler_cls: type[KvCacheConnectorScheduler],
+    ) -> None:
+        for connector_cls in (worker_cls, scheduler_cls):
+            if getattr(connector_cls, "supports_attention_dp", False) is not True:
+                raise NotImplementedError(
+                    "The connector must declare supports_attention_dp=True "
+                    "and implement owner-local scheduling/transfers against a shared pool."
+                )
+
+    def _run_on_leader(self, f: Callable[[], _SchedulerResult]) -> _SchedulerResult:
         """
-        Run a function on the leader rank, and broadcast the result to all other ranks.
+        Run locally under ADP, or broadcast the TP leader's result to its workers.
         """
+        if self.enable_attention_dp:
+            # V2 request callbacks are owner-local. ADP owners can call
+            # them in different orders and counts, so never broadcast here.
+            return f()
         if self.scheduler is not None:
             assert mpi_rank() == 0, "The scheduler may only exist on rank 0!"
             res = f()
@@ -703,6 +749,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``KVCacheManagerV2`` holds the Python subclass where it is a method, so
         no single spelling of the check reads correctly in both.
         """
+        if self.enable_attention_dp and request.is_dummy_request:
+            return 0, False
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
         )
@@ -737,6 +785,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``cancel_load``, and a parked request carries no honoured count into
         ``build_connector_meta``.
         """
+        if self.enable_attention_dp and request.is_dummy_request:
+            return
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded
         # asynchronously, we need to suspend its execution. This is
@@ -861,12 +911,25 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         req_id = request.request_id
         return req_id not in self.finished_async_loading_requests
 
+    def has_pending_transfers(self, request_id: int) -> bool:
+        """Keep canceled requests allocated until the worker releases DMA access."""
+        return any(
+            request_id in requests.saving or request_id in requests.loading
+            for requests in (
+                self.new_async_requests,
+                self.pending_async_requests,
+                self.local_finished_async_requests,
+            )
+        )
+
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
-    ):
+    ) -> None:
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, self.new_async_requests, kv_cache_manager
         )
+        if self.enable_attention_dp:
+            self._scheduler_output.attention_dp_rank = mpi_rank()
 
     def take_scheduled_requests_pending_load(self, scheduled_requests: ScheduledRequests):
         """
@@ -928,6 +991,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             free_resources on the request.
         """
 
+        if self.enable_attention_dp and req.is_dummy_request:
+            return False
+
         if req.request_id in self.finished_async_loading_requests:
             del self.finished_async_loading_requests[req.request_id]
 
@@ -952,6 +1018,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if saving_async:
             self.new_async_requests.saving[req.request_id] = req
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+        if self.enable_attention_dp:
+            self.scheduler_output_manager.reset_request(req.request_id)
 
         return saving_async
 
@@ -987,7 +1056,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         finished_saving = list(self.local_finished_async_requests.saving_ids)
         finished_loading = list(self.local_finished_async_requests.loading_ids)
 
-        all_results = mpi_allgather((finished_saving, finished_loading))
+        all_results = (
+            [(finished_saving, finished_loading)]
+            if self.enable_attention_dp
+            else mpi_allgather((finished_saving, finished_loading))
+        )
 
         # Find only the requests that have been reported complete by all workers.
         intersect_finished_saving = set.intersection(*[set(res[0]) for res in all_results])
@@ -1012,8 +1085,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         req: LlmRequest,
         block_ids: List[int],
         block_ids_by_layer_group: Optional[List[List[int]]] = None,
-    ):
-        if self.scheduler is None:
+    ) -> None:
+        if self.scheduler is None or (self.enable_attention_dp and req.is_dummy_request):
             return
         # A cache that reports per layer group is reported that way, whatever
         # the group count -- including one empty list per group for a request
