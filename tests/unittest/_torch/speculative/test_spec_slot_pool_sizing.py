@@ -231,10 +231,8 @@ def test_slot_pool_managers_accept_an_optional_pool_size(manager):
 def _tree_manager(num_seq_slots):
     return SpecTreeManager(
         max_num_requests=R,
-        use_dynamic_tree=True,
         max_total_draft_tokens=3,
         max_draft_len=3,
-        eagle_choices=None,
         dynamic_tree_max_topK=2,
         num_seq_slots=num_seq_slots,
     )
@@ -413,7 +411,6 @@ def test_eagle3_one_model_dynamic_tree_forwards_the_slot_pool():
         use_dynamic_tree=True,
         max_draft_len=3,
         tokens_per_gen_step=4,
-        eagle_choices=None,
         dynamic_tree_max_topK=2,
     )
 
