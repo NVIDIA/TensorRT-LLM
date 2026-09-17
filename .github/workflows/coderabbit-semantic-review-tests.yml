@@ -17,7 +17,7 @@ name: CodeRabbit Semantic Review Preview
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'release/**']
     paths:
       - '.coderabbit.yaml'
       - '.github/workflows/coderabbit-semantic-review*.yml'
@@ -50,7 +50,7 @@ jobs:
           persist-credentials: false
       - name: Test semantic review automation
         run: node --test .github/scripts/coderabbit_semantic_review.test.js
-      - name: Read CodeRabbit verdict for the current PR and main
+      - name: Read CodeRabbit verdict for the current PR and target branch
         id: result
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v8

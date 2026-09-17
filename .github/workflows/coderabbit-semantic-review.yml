@@ -17,16 +17,16 @@ name: CodeRabbit Semantic Conflict Review
 
 on:
   pull_request_target:
-    branches: [main]
-    types: [opened, reopened, synchronize, ready_for_review, labeled, edited, auto_merge_enabled]
-  push:
-    branches: [main]
+    branches: [main, 'release/**']
+    types: [opened, reopened, synchronize, ready_for_review, labeled, edited, auto_merge_enabled, closed]
+  schedule:
+    - cron: '23 * * * *'
   issue_comment:
     types: [created, edited]
   workflow_dispatch:
     inputs:
       pull_number:
-        description: 'Open PR number to recheck (requires ai: semantic-conflict label)'
+        description: 'Main/release PR to recheck; merged PRs receive a post-merge audit'
         required: true
         type: string
 
@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   request-review:
-    name: Request advisory semantic review
+    name: Request advisory semantic review or audit
     permissions:
       contents: read
       pull-requests: read
@@ -43,134 +43,92 @@ jobs:
       checks: write
     if: >-
       github.repository == 'NVIDIA/TensorRT-LLM' &&
-      contains(fromJSON('["push", "pull_request_target", "workflow_dispatch"]'), github.event_name) &&
-      (github.event_name != 'pull_request_target' ||
-       contains(github.event.pull_request.labels.*.name, 'ai: semantic-conflict'))
-    # Automatic runs sweep opted-in PRs so coalesced events are not lost.
-    # Manual retries have their own group and cannot replace a pending sweep.
+      contains(fromJSON('["schedule", "pull_request_target", "workflow_dispatch"]'), github.event_name) &&
+      (github.event.action != 'closed' || github.event.pull_request.merged) &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ci: full pre-merge approved')
+    # Requests and publications share a queue: hourly scans cannot race PR events.
+    # ponytail: one queue, 100 pending; use per-PR dispatch if scans delay events.
     concurrency:
-      group: ${{ github.event_name == 'workflow_dispatch' && format('coderabbit-semantic-retry-{0}', inputs.pull_number) || 'coderabbit-semantic-conflict-requests' }}
-      cancel-in-progress: false
+      group: coderabbit-semantic-state
+      queue: max
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
-      # API-only trusted workflow code; no repository checkout is needed.
-      - name: Request CodeRabbit checks for the current SHA pair
+      - uses: actions/checkout@v6
+        with:
+          # Always execute the default branch's trusted code, including release events.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            /.coderabbit.yaml
+            /.github/scripts/coderabbit_semantic_review*.js
+          sparse-checkout-cone-mode: false
+      - name: Verify approval-label author using the existing approver team
+        id: approval
+        if: github.event.action == 'labeled'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+          result-encoding: string
+          script: |
+            const {data: pr} = await github.rest.pulls.get({
+              ...context.repo, pull_number: context.payload.pull_request.number,
+            });
+            if (!pr.labels.some(l => l.name === 'ci: full pre-merge approved')) return false;
+            const events = await github.paginate(github.rest.issues.listEventsForTimeline, {
+              ...context.repo, issue_number: pr.number, per_page: 100,
+            });
+            const latest = events.filter(e => e.event === 'labeled' &&
+              e.label?.name === 'ci: full pre-merge approved').at(-1);
+            if (!latest?.actor?.login || latest.actor.login !== context.payload.sender?.login) return false;
+            try {
+              const {data} = await github.rest.teams.getMembershipForUser({
+                org: 'NVIDIA', team_slug: 'trt-llm-ci-approvers', username: latest.actor.login,
+              });
+              return data.state === 'active';
+            } catch (error) {
+              if (![403, 404].includes(error.status)) throw error;
+              core.warning('The approval-label author could not be verified; no immediate AI request.');
+              return false;
+            }
+      - name: Apply the threshold, cooldown and audit policy
+        if: github.event.action != 'labeled' || steps.approval.outputs.result == 'true'
         uses: actions/github-script@v8
         env:
           DISPATCH_PULL_NUMBER: ${{ inputs.pull_number }}
+          SEMANTIC_APPROVAL_VALIDATED: ${{ steps.approval.outputs.result }}
         with:
           script: |
-            const LABEL = 'ai: semantic-conflict';
-            const BOT = 'github-actions[bot]';
-
-            const pullNumber = process.env.DISPATCH_PULL_NUMBER;
-            const repo = context.repo;
-            let retryNumber;
-            if (context.eventName === 'workflow_dispatch') {
-              const raw = (pullNumber || '').trim();
-              retryNumber = Number(raw);
-              if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(retryNumber)) {
-                throw new Error('pull_number must be a positive integer');
-              }
-            } else if (!['push', 'pull_request_target'].includes(context.eventName)) {
-              throw new Error(`Unsupported event: ${context.eventName}`);
-            }
-            const pulls = await github.paginate(github.rest.pulls.list, {
-              ...repo, state: 'open', base: 'main', per_page: 100,
-            });
-            const numbers = pulls.filter(pr => !pr.draft && pr.labels.some(l => l.name === LABEL))
-              .map(pr => pr.number).filter(number => !retryNumber || number === retryNumber);
-            let retryPosted = false;
-
-            for (const number of numbers) {
-              // Read current metadata instead of trusting a possibly queued event payload.
-              const {data: pr} = await github.rest.pulls.get({...repo, pull_number: number});
-              if (pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' ||
-                  !pr.labels.some(l => l.name === LABEL)) {
-                core.info(`PR #${number}: not an open, non-draft, opted-in main PR; skipped.`);
-                continue;
-              }
-              const {data: ref} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
-              const head = pr.head.sha;
-              const base = ref.object.sha;
-              const marker = `<!-- coderabbit-semantic-request:${number}:${head}:${base} -->`;
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                ...repo, issue_number: number, per_page: 100,
-              });
-              // Only our own bot's comments can suppress an automatic request. A manual
-              // dispatch always retries, including after a CodeRabbit timeout or failure.
-              if (number !== retryNumber && comments.some(comment =>
-                comment.user?.login === BOT && comment.body?.includes(marker))) {
-                core.info(`PR #${number}: this SHA pair has already been requested.`);
-                continue;
-              }
-              // A posted request is not a semantic pass. Keep a neutral check
-              // until a matching, verified CodeRabbit result arrives.
-              await github.rest.checks.create({
-                ...repo,
-                name: 'Semantic conflict with target branch',
-                head_sha: head,
-                external_id: `semantic-conflict:${number}:${head}:${base}`,
-                status: 'completed',
-                conclusion: 'neutral',
-                output: {
-                  title: 'Awaiting CodeRabbit analysis',
-                  summary: `No AI verdict yet for PR #${number}, head ${head} + main ${base}. ` +
-                    'CodeRabbit can make mistakes. This check is advisory and must remain non-required; ' +
-                    'its failure does not block merging under that configuration.',
-                },
-              });
-              const body = [
-                '@coderabbitai run pre-merge checks',
-                '',
-                marker,
-                `Semantic compatibility review requested for PR head \`${head}\` and main \`${base}\`.`,
-                'Run the configured "Semantic conflict with target branch" check against these revisions.',
-                'Verify both live refs. If either differs or cannot be inspected, return Inconclusive.',
-                'Report the actual head, target, and merge-base SHAs with the analysis.',
-                '',
-                'This is an advisory request, not a passing check. Previous results for a different',
-                'SHA pair are stale; a successful workflow only means the request was posted.',
-              ].join('\n');
-              const {data: comment} = await github.rest.issues.createComment({
-                ...repo, issue_number: number, body,
-              });
-              if (number === retryNumber) retryPosted = true;
-              core.info(`PR #${number}: requested ${head} + ${base}: ${comment.html_url}`);
-              await core.summary.addRaw(
-                `PR #${number}: [requested CodeRabbit analysis](${comment.html_url}) for ` +
-                `head \`${head}\` + main \`${base}\`. No AI verdict is asserted.\n\n`
-              ).write();
-            }
-            if (retryNumber && !retryPosted) {
-              throw new Error(`PR #${retryNumber}: retry not posted; requires an open, non-draft main PR with the ${LABEL} label.`);
-            }
+            const request = require('./.github/scripts/coderabbit_semantic_review_request.js');
+            await request({github, context, core});
 
   publish-result:
     name: Publish advisory semantic result
     permissions:
       contents: read
       pull-requests: read
-      issues: read
+      issues: write
       checks: write
     if: >-
       github.repository == 'NVIDIA/TensorRT-LLM' &&
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       github.event.comment.user.login == 'coderabbitai[bot]' &&
-      contains(github.event.comment.body, 'Semantic conflict with target branch')
+      (contains(github.event.comment.body, 'pre-merge-checks-results') ||
+       contains(github.event.comment.body, 'pre_merge_checks_walkthrough_start'))
+    concurrency:
+      group: coderabbit-semantic-state
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # Load only the trusted workflow revision, never PR code with write access.
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github/scripts/coderabbit_semantic_review_result.js
           sparse-checkout-cone-mode: false
-      - name: Publish a result only for the current requested revision pair
+      - name: Verify the requested revisions and publish the advisory verdict
         uses: actions/github-script@v8
         with:
           script: |
