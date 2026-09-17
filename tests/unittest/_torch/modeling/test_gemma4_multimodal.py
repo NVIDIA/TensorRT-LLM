@@ -1548,7 +1548,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
 # ---------------------------------------------------------------------------
 #
 # Reuses ``test_modeling_multimodal.TestModelingMultimodal`` (the abstract
-# base used by qwen3vl / nemotron_nano_v2_vl / etc.). Mirrors the qwen3vl
+# base used by qwen3vl / nemotron_h_multimodal / etc.). Mirrors the qwen3vl
 # pattern: provide config + class hooks, gate on LLM_MODELS_ROOT.
 #
 # Audio scenarios are intentionally not included — audio tower refactor is

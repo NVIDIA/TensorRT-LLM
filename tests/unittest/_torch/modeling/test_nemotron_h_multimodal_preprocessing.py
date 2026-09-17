@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Preprocessing unit tests for modeling_nemotron_nano.py."""
+"""Preprocessing unit tests for modeling_nemotron_h_multimodal.py."""
 
 import functools
 import importlib
@@ -13,13 +13,13 @@ import pytest
 import torch
 from PIL import Image
 
-from tensorrt_llm._torch.models.modeling_nemotron_nano import (
+from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
     AUDIO_PLACEHOLDER,
     DynamicResolutionImageTiler,
     DynamicResolutionParams,
-    NanoV2VLInputProcessor,
-    NanoV2VLVisionEncoder,
-    NemotronH_Nano_VL_V2,
+    NemotronHMultimodalInputProcessor,
+    NemotronHMultimodalModel,
+    NemotronHVisionEncoder,
     _compute_aspect_preserving_size,
     get_video_target_size_and_feature_size,
     video_to_pixel_values,
@@ -181,12 +181,12 @@ def test_compute_params_raises_on_unconvergeable():
 
 
 def _make_processor(**overrides):
-    """Create a NanoV2VLInputProcessor with mocked heavy dependencies."""
+    """Create a NemotronHMultimodalInputProcessor with mocked heavy dependencies."""
     return _make_nano_processor(sound_config=None, **overrides)
 
 
 def _make_nano_processor(*, sound_config, **overrides):
-    """Shared factory for NanoV2VLInputProcessor with mocked heavy deps.
+    """Shared factory for NemotronHMultimodalInputProcessor with mocked heavy deps.
 
     Args:
         sound_config: Value for config.sound_config (None disables audio).
@@ -235,11 +235,11 @@ def _make_nano_processor(*, sound_config, **overrides):
     )
 
     with mock.patch(
-        "tensorrt_llm._torch.models.modeling_nemotron_nano.transformers"
+        "tensorrt_llm._torch.models.modeling_nemotron_h_multimodal.transformers"
         ".AutoImageProcessor.from_pretrained",
         return_value=hf_processor,
     ):
-        proc = NanoV2VLInputProcessor(
+        proc = NemotronHMultimodalInputProcessor(
             model_path="/fake",
             config=config,
             tokenizer=tokenizer,
@@ -275,8 +275,8 @@ def _make_nano_processor(*, sound_config, **overrides):
     return proc
 
 
-class TestNanoV2VLInputProcessor:
-    """Verify token counts produced by NanoV2VLInputProcessor methods."""
+class TestNemotronHMultimodalInputProcessor:
+    """Verify token counts produced by NemotronHMultimodalInputProcessor methods."""
 
     # NOTE: there are always 2 special tokens added to the count.
     @pytest.mark.parametrize(
@@ -382,8 +382,8 @@ class TestNanoV2VLInputProcessor:
 
 @pytest.fixture
 def vision_encoder():
-    """Create a mock NanoV2VLVisionEncoder with required attributes."""
-    encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
+    """Create a mock NemotronHVisionEncoder with required attributes."""
+    encoder = mock.MagicMock(spec=NemotronHVisionEncoder)
     encoder.llm_hidden_size = 512
     encoder.video_pruning_rate = 0.0
     encoder.norm_mean = [0.1, 0.2, 0.3]
@@ -430,7 +430,7 @@ def test_forward_dynamic_path(vision_encoder):
     mm_param = mock.MagicMock()
     mm_param.multimodal_data = mm_data
 
-    NanoV2VLVisionEncoder.forward(vision_encoder, [mm_param])
+    NemotronHVisionEncoder.forward(vision_encoder, [mm_param])
 
     vision_encoder.extract_feature_dynamic.assert_called_once()
     vision_encoder.extract_feature.assert_not_called()
@@ -453,7 +453,7 @@ def test_forward_fixed_tile_path(vision_encoder):
     mm_param = mock.MagicMock()
     mm_param.multimodal_data = mm_data
 
-    NanoV2VLVisionEncoder.forward(vision_encoder, [mm_param])
+    NemotronHVisionEncoder.forward(vision_encoder, [mm_param])
 
     vision_encoder.extract_feature.assert_called_once()
     vision_encoder.extract_feature_dynamic.assert_not_called()
@@ -474,7 +474,7 @@ def _make_extractor_config(**overrides):
 
 
 def _make_audio_processor(*, extractor_overrides=None, **overrides):
-    """Create a NanoV2VLInputProcessor with audio support and mocked deps."""
+    """Create a NemotronHMultimodalInputProcessor with audio support and mocked deps."""
     return _make_nano_processor(
         sound_config=_make_extractor_config(**(extractor_overrides or {})),
         **overrides,
@@ -520,19 +520,23 @@ class TestAudioInputProcessor:
 
     def test_resample_audios_passthrough(self):
         audio = np.random.randn(16000).astype(np.float32)
-        result = NanoV2VLInputProcessor._resample_audios([(audio, 16000)], target_sr=16000)
+        result = NemotronHMultimodalInputProcessor._resample_audios(
+            [(audio, 16000)], target_sr=16000
+        )
         np.testing.assert_array_equal(result[0], audio)
 
     def test_resample_audios_resamples(self):
         pytest.importorskip("librosa")
         audio = np.random.randn(16000).astype(np.float32)
-        result = NanoV2VLInputProcessor._resample_audios([(audio, 44100)], target_sr=16000)
+        result = NemotronHMultimodalInputProcessor._resample_audios(
+            [(audio, 44100)], target_sr=16000
+        )
         # Resampled length should differ from the original.
         assert len(result[0]) < len(audio)
 
     def test_resample_audios_bare_array_uses_target_sr(self):
         audio = np.random.randn(16000).astype(np.float32)
-        result = NanoV2VLInputProcessor._resample_audios([audio], target_sr=16000)
+        result = NemotronHMultimodalInputProcessor._resample_audios([audio], target_sr=16000)
         np.testing.assert_array_equal(result[0], audio)
 
     # `torch.compile` uses a thread pool to compile.
@@ -718,11 +722,11 @@ class TestVideoToPixelValues:
 
 
 class TestBuildTubeletSeparators:
-    """Tests for `NanoV2VLInputProcessor._build_tubelet_separators`."""
+    """Tests for `NemotronHMultimodalInputProcessor._build_tubelet_separators`."""
 
     def test_4_frames_T2(self):
         timestamps = [0.0, 0.5, 1.0, 1.5]
-        seps = NanoV2VLInputProcessor._build_tubelet_separators(
+        seps = NemotronHMultimodalInputProcessor._build_tubelet_separators(
             timestamps=timestamps, frames_indices=[0, 1, 2, 3], T=2
         )
         assert len(seps) == 2
@@ -741,7 +745,7 @@ class TestBuildTubeletSeparators:
 
     def test_5_frames_T2_last_group_has_1(self):
         timestamps = [0.0, 0.5, 1.0, 1.5, 2.0]
-        seps = NanoV2VLInputProcessor._build_tubelet_separators(
+        seps = NemotronHMultimodalInputProcessor._build_tubelet_separators(
             timestamps=timestamps, frames_indices=list(range(5)), T=2
         )
         # ceil(5/2) = 3 groups.
@@ -752,7 +756,7 @@ class TestBuildTubeletSeparators:
 
     def test_3_frames_T1(self):
         timestamps = [0.0, 1.0, 2.0]
-        seps = NanoV2VLInputProcessor._build_tubelet_separators(
+        seps = NemotronHMultimodalInputProcessor._build_tubelet_separators(
             timestamps=timestamps, frames_indices=[0, 1, 2], T=1
         )
         assert len(seps) == 3
@@ -762,7 +766,7 @@ class TestBuildTubeletSeparators:
 
     def test_separator_ends_with_colon_space(self):
         timestamps = [0.0, 0.5]
-        seps = NanoV2VLInputProcessor._build_tubelet_separators(
+        seps = NemotronHMultimodalInputProcessor._build_tubelet_separators(
             timestamps=timestamps, frames_indices=[0, 1], T=2
         )
         assert len(seps) > 0
@@ -854,15 +858,15 @@ _IMG_END = 51
 
 def _make_merge_model():
     """Create a minimal mock with the attrs/helpers that `merge_evs_mm_embeds` reads."""
-    model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
+    model = mock.MagicMock(spec=NemotronHMultimodalModel)
     model.img_context_token_id = _IMG_CTX_ID
     model.video_context_token_id = _VIDEO_CTX_ID
     model.sound_context_token_id = _SOUND_CTX_ID
     model._build_evs_adjusted_context_ids = functools.partial(
-        NemotronH_Nano_VL_V2._build_evs_adjusted_context_ids, model
+        NemotronHMultimodalModel._build_evs_adjusted_context_ids, model
     )
     model._refresh_evs_runtime_and_slice_context_ids = functools.partial(
-        NemotronH_Nano_VL_V2._refresh_evs_runtime_and_slice_context_ids, model
+        NemotronHMultimodalModel._refresh_evs_runtime_and_slice_context_ids, model
     )
     return model
 
@@ -888,7 +892,7 @@ def _make_mm_param(modality: str, evs_ids, runtime=None, input_ids_start_offset=
 
 
 class TestMergeEvsMMEmbeds:
-    """Tests for `NemotronH_Nano_VL_V2.merge_evs_mm_embeds`."""
+    """Tests for `NemotronHMultimodalModel.merge_evs_mm_embeds`."""
 
     def test_single_video_two_tubelets(self):
         """Each video_context_token_id placeholder is replaced with the right count."""
@@ -912,7 +916,7 @@ class TestMergeEvsMMEmbeds:
         num_tokens_in_videos = [torch.tensor([5, 3])]
         input_ids = torch.zeros(30, dtype=torch.long)
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [param], input_ids
         )
 
@@ -952,7 +956,7 @@ class TestMergeEvsMMEmbeds:
         num_tokens_in_videos = [torch.tensor([4, 2]), image_evs]
         input_ids = torch.zeros(20, dtype=torch.long)
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, params, input_ids
         )
 
@@ -995,7 +999,7 @@ class TestMergeEvsMMEmbeds:
         num_tokens_in_videos = [torch.tensor([2]), None]
         input_ids = torch.zeros(20, dtype=torch.long)
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, params, input_ids
         )
 
@@ -1020,7 +1024,7 @@ class TestMergeEvsMMEmbeds:
         num_tokens_in_videos = [torch.tensor([1])]
         input_ids = torch.zeros(10, dtype=torch.long)
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [param], input_ids
         )
 
@@ -1066,7 +1070,7 @@ class TestMergeEvsMMEmbeds:
         generation_tail = torch.tensor([700, 701], dtype=torch.long)
         input_ids = torch.cat([torch.zeros(5, dtype=torch.long), generation_tail.clone()])
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [param], input_ids
         )
 
@@ -1111,7 +1115,7 @@ class TestMergeEvsMMEmbeds:
         num_tokens_in_videos = [torch.tensor([5, 4])]
         input_ids = torch.zeros(4, dtype=torch.long)
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [param], input_ids
         )
 
@@ -1135,7 +1139,7 @@ class TestMergeEvsMMEmbeds:
             [text_prefix.clone(), torch.zeros(5, dtype=torch.long), decode_tail.clone()]
         )
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [param], input_ids
         )
 
@@ -1159,7 +1163,7 @@ class TestMergeEvsMMEmbeds:
             [torch.zeros(5, dtype=torch.long), text_suffix.clone(), decode_tail.clone()]
         )
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [param], input_ids
         )
 
@@ -1194,7 +1198,7 @@ class TestMergeEvsMMEmbeds:
             ]
         )
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [b_param, d_param], input_ids
         )
 
@@ -1245,7 +1249,7 @@ class TestMergeEvsMMEmbeds:
             [text_prefix.clone(), torch.zeros(5, dtype=torch.long), generation_tail.clone()]
         )
 
-        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+        result = NemotronHMultimodalModel.merge_evs_mm_embeds(
             model, num_tokens_in_videos, [param], input_ids
         )
 
