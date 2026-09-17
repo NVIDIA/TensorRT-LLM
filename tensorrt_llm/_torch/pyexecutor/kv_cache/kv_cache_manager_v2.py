@@ -240,9 +240,12 @@ def _make_gpu_cache_tier_config(
         return GpuCacheTierConfig(quota=int(quota))
     try:
         return GpuCacheTierConfig(quota=int(quota), enable_locality_domains=True)
-    except TypeError:
+    except TypeError as exc:
         # The C++ binding only accepts quota; locality domains are Python-only.
-        return GpuCacheTierConfig(quota=int(quota))
+        raise NotImplementedError(
+            "Locality domains require the Python KVCacheManagerV2 backend; "
+            "set TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"
+        ) from exc
 
 
 def _make_reuse_scope(

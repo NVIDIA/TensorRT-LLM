@@ -185,25 +185,7 @@ else:
     CoalescedBuffer = _cpp.CoalescedBuffer
     CacheTier = _cpp.CacheTier
     DiskCacheTierConfig = _cpp.DiskCacheTierConfig
-    _CppGpuCacheTierConfig = _cpp.GpuCacheTierConfig
-
-    class _GpuCacheTierConfigMeta(type):
-        """Shim for C++ GpuCacheTierConfig with Python-only enable_locality_domains."""
-
-        def __call__(cls, quota: int, enable_locality_domains: bool = False):
-            if enable_locality_domains:
-                raise NotImplementedError(
-                    "Locality domains require the Python KVCacheManagerV2 backend; "
-                    "set TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"
-                )
-            return _CppGpuCacheTierConfig(int(quota))
-
-        def __instancecheck__(cls, instance):
-            return isinstance(instance, _CppGpuCacheTierConfig)
-
-    class GpuCacheTierConfig(metaclass=_GpuCacheTierConfigMeta):
-        pass
-
+    GpuCacheTierConfig = _cpp.GpuCacheTierConfig
     ExpandedBuffer = _cpp.ExpandedBuffer
     HostCacheTierConfig = _cpp.HostCacheTierConfig
     KVCacheDesc = _cpp.KVCacheDesc
