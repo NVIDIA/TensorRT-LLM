@@ -212,6 +212,20 @@ def _fp8_mla_model_config(sparse_algorithm):
     )
 
 
+@pytest.mark.parametrize("library", ["fallback", "prims_ts"])
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_prims_ts_bf16_mla_v_packing_reserve(monkeypatch, library, attention_dp):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", library)
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 100)
+    config = _fp8_mla_model_config(None)
+    config.quant_config.quant_mode.has_fp8_kv_cache = lambda: False
+    mapping = SimpleNamespace(enable_attention_dp=attention_dp, tp_size=16)
+    local_heads = 128 if attention_dp else 8
+    assert get_attention_workspace_bytes_per_token(config, mapping) == (
+        local_heads * 128 * 2 if library == "prims_ts" else 0
+    )
+
+
 @pytest.mark.parametrize(
     "sparse_algorithm,sm,short_seq_mha,expect_zero",
     [

@@ -347,24 +347,37 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     run_case(case)
 
 
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-def test_prims_ts_fp8_mla_preprocessing(
-    monkeypatch: pytest.MonkeyPatch, num_heads: int, use_kv_cache_manager_v2: bool
+def test_prims_ts_mla_preprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+    num_heads: int,
+    use_kv_cache_manager_v2: bool,
+    kv_cache_dtype: torch.dtype,
 ) -> None:
     from test_attention_mla import RopeConfig, _run_test_for_backend
 
     from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
     from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 
-    # Context remains on the regular backend; every decode must select PrimTS.
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts,fallback")
+    # No fallback: both context and every decode must select PrimTS.
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     original_run = PrimsTSFmha.run_mla_generation
+    original_context = PrimsTSFmha.run_mla_context
     calls = []
+    context_calls = []
+
+    def run_context(fmha: PrimsTSFmha, params: FmhaParams) -> None:
+        original_context(fmha, params)
+        context_calls.append(params.attn.local_layer_idx)
+
+    monkeypatch.setattr(PrimsTSFmha, "run_mla_context", run_context)
 
     def run_and_capture(fmha: PrimsTSFmha, params: FmhaParams) -> None:
         assert params.qkv_input.dtype == torch.bfloat16
-        assert params.fwd.quant_q_buffer.dtype == torch.uint8
+        if kv_cache_dtype == torch.float8_e4m3fn:
+            assert params.fwd.quant_q_buffer.dtype == torch.uint8
         original_run(fmha, params)
         eager = params.context_buf.clone()
         graph = torch.cuda.CUDAGraph()
@@ -403,13 +416,185 @@ def test_prims_ts_fp8_mla_preprocessing(
         kv_cache_tokens_per_block=32,
         device=torch.device("cuda"),
         dtype=torch.bfloat16,
-        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_dtype=kv_cache_dtype,
         context_sequence_lengths=[129, 191],
         generation_seq_len_q=1,
         num_generation_steps=2,
         v2_kv_cache=use_kv_cache_manager_v2,
     )
     assert calls == [0, 1, 0, 1]
+    assert context_calls == [0, 1]
+
+
+@pytest.mark.parametrize("num_heads", [6, 96], ids=["tp16-local-heads", "dp-heads"])
+@pytest.mark.parametrize("fp8_kv", [False, True], ids=["bf16-kv", "fp8-kv"])
+@pytest.mark.parametrize("chunked", [False, True], ids=["cached", "chunked"])
+def test_prims_ts_kimi_k3_full_attention(
+    monkeypatch: pytest.MonkeyPatch, num_heads: int, fp8_kv: bool, chunked: bool
+) -> None:
+    """Exercise K3's real NoPE/gated MLA module, without full-model weights.
+
+    Head counts cover the TP16-local and attention-DP geometries, not distributed
+    collectives. The full-model GB300 test covers those separately.
+    """
+    import tensorrt_llm
+    from tensorrt_llm._torch.attention.backends import TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import KimiK3MLAAttention
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._utils import torch_dtype_to_binding
+    from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization import QuantAlgo
+
+    context_calls = []
+    generation_calls = []
+    run_context = PrimsTSFmha.run_mla_context
+    run_generation = PrimsTSFmha.run_mla_generation
+
+    def record_context(fmha, params):
+        context_calls.append(
+            (params.fwd.softmax_stats_tensor is not None, params.key_input.shape[0])
+        )
+        run_context(fmha, params)
+
+    def record_generation(fmha, params):
+        generation_calls.append(params.batch_size)
+        run_generation(fmha, params)
+
+    monkeypatch.setattr(PrimsTSFmha, "run_mla_context", record_context)
+    monkeypatch.setattr(PrimsTSFmha, "run_mla_generation", record_generation)
+    kv_dtype = torch.float8_e4m3fn if fp8_kv else torch.bfloat16
+    lengths = [[129, 65], [17, 193], [1, 1]]
+    torch.manual_seed(2718)
+    hidden_steps = [
+        torch.randn(sum(q_lengths), 256, dtype=torch.bfloat16, device="cuda")
+        for q_lengths in lengths
+    ]
+    results = {}
+    for library in ("fallback", "prims_ts"):
+        monkeypatch.setenv("TLLM_FMHA_LIBS", library)
+        torch.manual_seed(1729)
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        module = (
+            KimiK3MLAAttention(
+                hidden_size=256,
+                num_heads=num_heads,
+                q_lora_rank=128,
+                kv_lora_rank=512,
+                qk_nope_head_dim=128,
+                qk_rope_head_dim=64,
+                v_head_dim=128,
+                dtype=torch.bfloat16,
+                model_config=ModelConfig(
+                    mapping=mapping,
+                    quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv else None),
+                ),
+                aux_stream_dict={},
+            )
+            .cuda()
+            .eval()
+        )
+        # Use the module's eager entry, retaining the real projection, cache,
+        # context/chunk-merge, absorption, gate and output-projection paths.
+        module.register_to_config = False
+        with torch.no_grad():
+            for name, parameter in module.named_parameters():
+                if "layernorm" in name:
+                    parameter.fill_(1.0)
+                else:
+                    parameter.normal_(std=0.02)
+            k_weight, v_weight = module.kv_b_proj.weight.split(num_heads * 128)
+            module.k_b_proj_trans.copy_(k_weight.view(num_heads, 128, 512).transpose(1, 2))
+            module.v_b_proj.copy_(v_weight.view(num_heads, 128, 512))
+        manager = KVCacheManager(
+            KvCacheConfig(max_tokens=1024, enable_block_reuse=False),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=576,
+            tokens_per_block=64,
+            max_seq_len=512,
+            max_batch_size=2,
+            mapping=mapping,
+            dtype=torch_dtype_to_binding(kv_dtype),
+        )
+        # Both decode implementations require finite values in unused cache
+        # slots. Reused BF16 allocations can contain FP8 NaN byte patterns;
+        # keep padding deterministic while real context writes every live slot.
+        manager.get_buffers(0).fill_(1.0)
+        requests = []
+        for request_id, length in enumerate(lengths[0]):
+            request = LlmRequest(
+                request_id=request_id,
+                input_tokens=[1] * length,
+                max_new_tokens=256,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+                is_streaming=False,
+            )
+            request.paged_kv_block_ids = []
+            manager.impl.add_sequence_batch([(request_id, length, 1)], [request])
+            requests.append(request)
+        cached = [0, 0]
+        results[library] = []
+        try:
+            with torch.inference_mode():
+                for step, q_lengths in enumerate(lengths):
+                    if step:
+                        for request_id, length in enumerate(q_lengths):
+                            for _ in range(length):
+                                manager.impl.add_token(request_id)
+                    metadata = TrtllmAttention.Metadata(
+                        seq_lens=torch.tensor(q_lengths, dtype=torch.int32),
+                        request_ids=[0, 1],
+                        max_num_requests=2,
+                        num_contexts=2 if step < 2 else 0,
+                        prompt_lens=q_lengths,
+                        max_num_tokens=512,
+                        kv_cache_manager=manager,
+                        kv_cache_params=KVCacheParams(
+                            use_cache=True, num_cached_tokens_per_seq=cached
+                        ),
+                        mapping=mapping,
+                        enable_context_mla_with_cached_kv=True,
+                        runtime_features=AttentionRuntimeFeatures(
+                            cache_reuse=True,
+                            chunked_prefill=chunked,
+                            chunk_size=128,
+                            chunked_prefill_buffer_batch_size=1,
+                        ),
+                    )
+                    metadata.prepare()
+                    hidden = hidden_steps[step]
+                    positions = torch.cat(
+                        [
+                            torch.arange(start, start + length, device="cuda")
+                            for start, length in zip(cached, q_lengths)
+                        ]
+                    )
+                    result = module(positions, hidden, metadata)
+                    assert torch.isfinite(result).all(), (library, step, "eager")
+                    results[library].append(result.clone())
+                    if step == 2 and library == "prims_ts":
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            captured = module(positions, hidden, metadata)
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        torch.testing.assert_close(captured, result, atol=0, rtol=0)
+                    cached = [start + length for start, length in zip(cached, q_lengths)]
+        finally:
+            manager.shutdown()
+    for actual, expected in zip(results["prims_ts"], results["fallback"]):
+        torch.testing.assert_close(actual, expected, atol=0.02 if fp8_kv else 0.003, rtol=0.03)
+    assert len(context_calls) == (4 if chunked else 2)
+    assert any(has_stats for has_stats, _ in context_calls) == chunked
+    assert generation_calls == [2, 2]  # Eager and graph capture; replay is device-only.
 
 
 @pytest.mark.parametrize("num_heads", [6, 12, 96])

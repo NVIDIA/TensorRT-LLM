@@ -1569,6 +1569,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                            and quant_config.quant_mode.has_fp8_kv_cache()
                            and get_sm_version() in (90, 100, 103, 107, 120))
         if not fp8_context_mla:
+            # PrimTS packs the strided kv_b_proj V view even with BF16 KV.
+            # Cached prefixes can exceed the fresh-prefill profiling extent.
+            from .fmha.prims_ts import PrimsTSFmha
+            from .fmha.registry import get_enabled_fmha_lib_classes
+
+            if (sparse_algorithm is None and get_sm_version() in (100, 103)
+                    and PrimsTSFmha in get_enabled_fmha_lib_classes()):
+                attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+                return config.num_attention_heads // attn_tp * config.v_head_dim * 2
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
         # mNumAttnHeads).

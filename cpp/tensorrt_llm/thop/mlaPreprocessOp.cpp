@@ -105,6 +105,132 @@ void mergeChunkedAttentionForMLAHelper(torch::Tensor& merged_attn, torch::Tensor
 
 } // namespace
 
+// Shared dense-MLA context prologue, without dispatching an attention kernel.
+// Cached/chunked callers pass no latent_cache: their Q/K RoPE and cache append
+// have already run. Output buffers are owned and accounted for by the caller.
+void mlaContextPreprocess(torch::Tensor q, torch::Tensor k, torch::Tensor const& v,
+    torch::optional<torch::Tensor> latent_cache, torch::Tensor const& cu_q_seqlens,
+    torch::Tensor const& sequence_lengths, torch::Tensor const& cos_sin_cache,
+    torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_pool_pointers,
+    torch::Tensor const& host_kv_cache_pool_mapping, torch::optional<torch::Tensor> kv_scale_orig_quant,
+    torch::optional<torch::Tensor> kv_scale_quant_orig, int64_t num_heads, int64_t max_input_seq_len, int64_t layer_idx,
+    int64_t tokens_per_block, int64_t attention_window_size, int64_t quant_mode, double sm_scale, torch::Tensor q_out,
+    torch::Tensor k_out, torch::Tensor v_out, torch::Tensor bmm1_scale, torch::Tensor bmm2_scale)
+{
+    TORCH_CHECK(q.scalar_type() == torch::kBFloat16 || q.scalar_type() == torch::kFloat16);
+    CHECK_INPUT(q, q.scalar_type());
+    CHECK_INPUT(k, q.scalar_type());
+    TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && v.dim() == 2 && num_heads > 0);
+    TORCH_CHECK(q.size(1) == num_heads * 192 && k.size(1) == num_heads * 192);
+    TORCH_CHECK(v.device() == q.device() && k.device() == q.device());
+    TORCH_CHECK(v.scalar_type() == q.scalar_type() && v.size(0) == k.size(0));
+    TORCH_CHECK(v.size(1) == num_heads * 128 && v.stride(1) == 1);
+    CHECK_INPUT(cu_q_seqlens, torch::kInt32);
+    CHECK_INPUT(sequence_lengths, torch::kInt32);
+    CHECK_INPUT(cos_sin_cache, torch::kFloat32);
+    TORCH_CHECK(cu_q_seqlens.device() == q.device() && sequence_lengths.device() == q.device()
+        && cos_sin_cache.device() == q.device());
+    TORCH_CHECK(cu_q_seqlens.dim() == 1 && cu_q_seqlens.numel() > 1);
+    auto const batch_size = cu_q_seqlens.numel() - 1;
+    TORCH_CHECK(sequence_lengths.numel() >= batch_size && max_input_seq_len > 0);
+    TORCH_CHECK(cos_sin_cache.numel() >= attention_window_size * 64);
+    auto const mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
+    TORCH_CHECK(!mode.hasInt8KvCache() && !mode.hasFp4KvCache());
+    bool const fp8 = mode.hasFp8KvCache();
+    auto const output_dtype = fp8 ? torch::kFloat8_e4m3fn : q.scalar_type();
+    for (auto const& tensor : {q_out, k_out, v_out})
+    {
+        CHECK_INPUT(tensor, output_dtype);
+        TORCH_CHECK(tensor.device() == q.device());
+    }
+    TORCH_CHECK(q_out.sizes() == q.sizes() && k_out.sizes() == k.sizes() && v_out.sizes() == v.sizes());
+    CHECK_INPUT(bmm1_scale, torch::kFloat32);
+    CHECK_INPUT(bmm2_scale, torch::kFloat32);
+    TORCH_CHECK(bmm1_scale.numel() == 2 && bmm2_scale.numel() == 1);
+    TORCH_CHECK(bmm1_scale.device() == q.device() && bmm2_scale.device() == q.device());
+    if (fp8)
+    {
+        // The shared quantizer consumes the kv_b_proj split view of V.
+        TORCH_CHECK(v.stride(0) == num_heads * 256);
+    }
+    else
+    {
+        TORCH_CHECK(q_out.data_ptr() == q.data_ptr() && k_out.data_ptr() == k.data_ptr());
+    }
+    for (auto const& scale : {kv_scale_orig_quant, kv_scale_quant_orig})
+    {
+        if (scale.has_value())
+        {
+            CHECK_INPUT(scale.value(), torch::kFloat32);
+            TORCH_CHECK(scale->device() == q.device() && scale->numel() >= 1);
+        }
+    }
+    if (latent_cache.has_value())
+    {
+        CHECK_INPUT(latent_cache.value(), q.scalar_type());
+        TORCH_CHECK(latent_cache->device() == q.device());
+        TORCH_CHECK(latent_cache->numel() == q.size(0) * 576 && k.size(0) == q.size(0));
+    }
+    auto cache
+        = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets), std::optional(host_kv_cache_pool_pointers),
+            std::optional(host_kv_cache_pool_mapping), mode, layer_idx, batch_size, tokens_per_block, 1, 576,
+            attention_window_size, attention_window_size, 1, 0, true, q.element_size())
+              .kvCacheBuffer;
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    auto launch = [&](auto type_tag)
+    {
+        using T = decltype(type_tag);
+        tk::MlaParams<T> params{};
+        params.q_buf = static_cast<T*>(q.data_ptr());
+        params.k_buf = static_cast<T*>(k.data_ptr());
+        params.v_buf = static_cast<T const*>(v.data_ptr());
+        params.latent_cache = latent_cache ? static_cast<T const*>(latent_cache->data_ptr()) : nullptr;
+        params.cu_q_seqlens = cu_q_seqlens.data_ptr<int>();
+        params.cache_seq_lens = sequence_lengths.data_ptr<int>();
+        params.cos_sin_cache = static_cast<float2 const*>(cos_sin_cache.data_ptr());
+        params.batch_size = batch_size;
+        params.acc_q_len = q.size(0);
+        params.head_num = num_heads;
+        params.max_input_seq_len = max_input_seq_len;
+        params.meta.kv_lora_rank = 512;
+        params.meta.qk_nope_head_dim = 128;
+        params.meta.qk_rope_head_dim = 64;
+        params.meta.v_head_dim = 128;
+        params.cache_type = tk::cacheTypeFromQuantMode(mode);
+        params.quant_scale_kv = kv_scale_orig_quant ? kv_scale_orig_quant->data_ptr<float>() : nullptr;
+        if (latent_cache)
+        {
+            tk::invokeMLARopeContext(params, cache, stream);
+        }
+        if (fp8)
+        {
+            params.quant_q_buf = q_out.data_ptr();
+            params.quant_k_buf = k_out.data_ptr();
+            params.quant_v_buf = v_out.data_ptr();
+            params.quant_scale_qkv = params.quant_scale_kv;
+            params.dequant_scale_q = kv_scale_quant_orig ? kv_scale_quant_orig->data_ptr<float>() : nullptr;
+            params.dequant_scale_kv = params.dequant_scale_q;
+            params.host_bmm1_scale = sm_scale;
+            params.bmm1_scale = bmm1_scale.data_ptr<float>();
+            params.bmm2_scale = bmm2_scale.data_ptr<float>();
+            tk::invokeMLAContextFp8Quantize(params, k.size(0), stream);
+        }
+    };
+    if (q.scalar_type() == torch::kBFloat16)
+    {
+        launch(__nv_bfloat16{});
+    }
+    else
+    {
+        launch(half{});
+    }
+    if (!fp8)
+    {
+        // Q/K alias the caller's inputs; only V's split projection needs packing.
+        v_out.copy_(v);
+    }
+}
+
 std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const num_contexts,
     int64_t const num_ctx_cached_tokens, int64_t const max_ctx_cached_kv_len, torch::Tensor& cu_ctx_cached_kv_lens,
     torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_pool_pointers,
@@ -420,6 +546,13 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
+        "mla_context_preprocess(Tensor(a!) q, Tensor(b!) k, Tensor v, Tensor? latent_cache, "
+        "Tensor cu_q_seqlens, Tensor sequence_lengths, Tensor cos_sin_cache, Tensor kv_cache_block_offsets, "
+        "Tensor host_kv_cache_pool_pointers, Tensor host_kv_cache_pool_mapping, Tensor? kv_scale_orig_quant, "
+        "Tensor? kv_scale_quant_orig, int num_heads, int max_input_seq_len, int layer_idx, int tokens_per_block, "
+        "int attention_window_size, int quant_mode, float sm_scale, Tensor(a!) q_out, Tensor(b!) k_out, "
+        "Tensor(c!) v_out, Tensor(d!) bmm1_scale, Tensor(e!) bmm2_scale) -> ()");
+    m.def(
         "load_paged_kv_cache_for_mla("
         "ScalarType out_dtype"
         ", int num_contexts"
@@ -442,6 +575,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("mla_context_preprocess", &tensorrt_llm::torch_ext::mlaContextPreprocess);
     m.impl("load_paged_kv_cache_for_mla", &tensorrt_llm::torch_ext::loadPagedKVCacheForMLA);
 }
 

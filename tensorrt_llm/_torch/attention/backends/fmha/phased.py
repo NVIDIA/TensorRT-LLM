@@ -247,6 +247,11 @@ class PhasedFmha(Fmha):
             params.value_input = (
                 v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
             )
+            if attn.is_mla_enable:
+                # MLA's module dispatches context separately and may expand a
+                # cached prefix or a KV chunk longer than the current Q span.
+                params.key_input = k
+                params.value_input = v
             params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]

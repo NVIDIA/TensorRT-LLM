@@ -28,6 +28,7 @@ from tensorrt_llm.llmapi import (
     SamplingParams,
     SchedulingParams,
 )
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_pre_blackwell
@@ -164,6 +165,48 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(16)
     @pytest.mark.skip_less_device_memory(200000)
+    @pytest.mark.parametrize("fp8_kv", [False, True], ids=["bf16-kv", "fp8-kv"])
+    def test_prims_ts(self, fp8_kv: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Full K3: strict PrimTS MLA context/decode, chunking, reuse and graphs.
+
+        An exact FMHA list makes an unsupported full-attention phase fail on
+        the workers rather than silently falling back. KDA is unchanged.
+        This shares the existing DEP16 GB300 NVL72 qualification envelope.
+        """
+        monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+        self._assert_checkpoint_routing()
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=16,
+            moe_expert_parallel_size=16,
+            enable_attention_dp=True,
+            max_batch_size=32,
+            # The explicit 4096-token reuse probe must span context chunks.
+            max_num_tokens=2048,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
+            moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
+            quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv else None),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=True,
+                free_gpu_memory_fraction=0.25,
+                tokens_per_block=64,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+            ),
+            enable_iter_perf_stats=True,
+            max_stats_len=256,
+            return_perf_metrics=True,
+        ) as llm:
+            self._assert_resolved_args(llm, "reuse")
+            assert llm.args.quant_config.kv_cache_quant_algo == (QuantAlgo.FP8 if fp8_kv else None)
+            self._assert_kv_cache_reuse(llm, prompt_length=4096)
+            GSM8K(self.MODEL_NAME).evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_less_device_memory(200000)
     def test_gpqa_diamond_w4a16_mxfp4(self) -> None:
         """Run GPQA Diamond on the K3 checkpoint with DEP16."""
         max_seq_len = GPQADiamond.MAX_INPUT_LEN + GPQADiamond.MAX_OUTPUT_LEN
@@ -294,8 +337,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             )
 
     @staticmethod
-    def _assert_kv_cache_reuse(llm: LLM) -> None:
-        prompt_token_ids = [1] + [42] * 510 + [43]
+    def _assert_kv_cache_reuse(llm: LLM, prompt_length: int = 512) -> None:
+        prompt_token_ids = [1] + [42] * (prompt_length - 2) + [43]
         output_length = 8
         sampling_params = SamplingParams(
             max_tokens=output_length,
