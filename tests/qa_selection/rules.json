@@ -2,8 +2,12 @@
   "_comment": [
     "Skip rules for QA test selection.",
     "",
-    "'reason'    the reason= string of a pytest.mark.skipif decorator in",
-    "            tests/integration/defs/conftest.py, copied byte for byte.",
+    "'decorator' the module-level `skip_* = pytest.mark.skipif(...)` this rule",
+    "            mirrors. It must name a module-level decorator, never an inline",
+    "            skipif: a skip worth curating is a skip worth naming, and the",
+    "            drift check resolves every rule through this name.",
+    "'reason'    that decorator's reason= string, copied byte for byte. This is",
+    "            the only key a collected mark carries, so selection matches on it.",
     "'skip_when' every field, and every operator under it, must hold for the",
     "            target machine to skip the test.",
     "'note'      free text for the reader.",
@@ -19,61 +23,70 @@
 
   "rules": [
     {
+      "decorator": "skip_pre_ada",
       "reason": "This test is not supported in pre-Ada architecture",
       "skip_when": {"sm": {"lt": 89}}
     },
     {
+      "decorator": "skip_pre_hopper",
       "reason": "This test is not supported in pre-Hopper architecture",
       "skip_when": {"sm": {"lt": 90}}
     },
     {
+      "decorator": "skip_post_hopper",
       "reason": "This test is not supported in post-Hopper architecture",
       "skip_when": {"sm": {"gt": 90}}
     },
     {
+      "decorator": "skip_pre_blackwell",
       "reason": "This test is not supported in pre-Blackwell architecture",
       "skip_when": {"sm": {"lt": 100}}
     },
     {
+      "decorator": "skip_post_blackwell",
       "reason": "This test is not supported in post-Blackwell architecture",
       "skip_when": {"sm": {"ge": 100}}
     },
     {
+      "decorator": "skip_post_blackwell_ultra",
       "reason": "This test is not supported in post-Blackwell-Ultra architecture",
       "skip_when": {"sm": {"ge": 103}}
     },
     {
+      "decorator": "skip_pre_rubin",
       "reason": "This test is not supported in pre-Rubin architecture",
       "skip_when": {"sm": {"lt": 107}}
     },
     {
+      "decorator": "skip_no_rubin",
       "reason": "This test is only supported in Rubin architecture",
+      "note": "A support gate, not a feature gate: the inline 'fine-grained sync requires SM107' skipifs share its condition today but say something else. See README, 'Deferred: the SM107 sites'.",
       "skip_when": {"sm": {"ne": 107}}
     },
     {
+      "decorator": "skip_no_hopper",
       "reason": "This test is only  supported in Hopper architecture",
       "note": "Double space after 'only' is intentional: it is in the decorator.",
       "skip_when": {"sm": {"ne": 90}}
     },
     {
+      "decorator": "skip_no_sm120",
       "reason": "This test is for SM120",
       "skip_when": {"sm": {"ne": 120}}
     },
     {
+      "decorator": "skip_device_contain_gb200",
       "reason": "This test is not supported on GB200 or GB100",
       "note": "device_name is the first line of `nvidia-smi -L`; matching is case-sensitive.",
       "skip_when": {"device_name": {"contains": "GB200"}}
     },
     {
-      "reason": "nvbugs/5446119: MXFP4 swizzle not supported on H20",
-      "note": "'H20' is a substring of 'H200'; not_contains keeps H200 selected.",
-      "skip_when": {"device_name": {"contains": "H20", "not_contains": "H200"}}
-    },
-    {
+      "decorator": "skip_arm",
       "reason": "This test is not supported on ARM architecture",
       "skip_when": {"cpu_arch": {"eq": "aarch64"}}
     },
     {
+      "decorator": "skip_x86",
       "reason": "This test is not supported on x86 architecture",
       "skip_when": {"cpu_arch": {"eq": "x86_64"}}
     }
