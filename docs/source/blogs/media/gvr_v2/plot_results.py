@@ -351,114 +351,164 @@ def _evolution(rows: list[dict]) -> None:
 
 def _candidate_work() -> None:
     """Illustrate tail counts and candidate amplification without measured data."""
-    fig = plt.figure(figsize=(16.7, 6.4))
+    fig = plt.figure(figsize=(16.7, 7.5), facecolor="white")
     ink, muted = "#17202b", "#52616f"
-    green, blue, orange = "#447a00", "#386781", "#b56b0b"
-    fig.text(0.04, 0.94, "A   Thresholds control candidate count", fontsize=17, weight="bold")
+    green, blue, orange, rose = "#447a00", "#386781", "#b56b0b", "#ad4b70"
+    canvas = fig.add_axes((0, 0, 1, 1))
+    canvas.set(xlim=(0, 1), ylim=(0, 1))
+    canvas.axis("off")
+    for x, width in ((0.025, 0.47), (0.52, 0.455)):
+        canvas.add_patch(
+            FancyBboxPatch(
+                (x, 0.205),
+                width,
+                0.65,
+                boxstyle="round,pad=0.008,rounding_size=0.014",
+                facecolor="#f8fafc",
+                edgecolor="#dce3e9",
+                linewidth=0.9,
+            )
+        )
+    fig.text(
+        0.04, 0.947, "Threshold quality sets candidate work", fontsize=23, weight="bold", color=ink
+    )
     fig.text(
         0.04,
-        0.885,
-        "Sampled anchors guide exact counts at many boundaries",
-        fontsize=12,
+        0.90,
+        "A tighter threshold reduces extra candidates; exact counts keep admission safe.",
+        fontsize=12.5,
         color=muted,
     )
-    ax = fig.add_axes((0.075, 0.26, 0.425, 0.56))
-    ax.set(xlim=(0, 9.5), ylim=(0.14, 17), yscale="log")
-    ax.axhspan(3.5, 17, color="#f6eeee", zorder=0)
-    ax.axhspan(1, 3.5, color="#edf5df", zorder=0)
-    ax.axhspan(0.14, 1, color="#fff7e9", zorder=0)
+    fig.text(
+        0.044, 0.80, "A   Choose an admission threshold", fontsize=15.5, weight="bold", color=ink
+    )
+    fig.text(
+        0.54, 0.80, "B   Explain the admitted population", fontsize=15.5, weight="bold", color=ink
+    )
+
+    # One finite row defines both panels, including the left-continuous tie jump.
+    scores = np.array([0.8, 1.4, 2.2, 3.0, 3.8, 4.6, 5.4, 6.1, 6.8, 7.5, 8.2, 8.8, 9.4])
+    multiplicities = np.array([60, 40, 45, 40, 25, 20, 30, 35, 35, 58, 27, 20, 25])
+    row = np.repeat(scores, multiplicities)
+    k, q, tau = 100, 5.0, 7.5
+    admitted = int(np.count_nonzero(row >= q))
+    at_boundary = int(np.count_nonzero(row >= tau))
+    above_boundary = int(np.count_nonzero(row > tau))
+    excess = at_boundary - k
+    shell = admitted - at_boundary
+
+    ax = fig.add_axes((0.089, 0.32, 0.379, 0.425), facecolor="#f8fafc")
+    ax.set(xlim=(0, 10), ylim=(0, 4.85))
+    ax.axhspan(1, 3.5, color="#eaf3de", zorder=0)
     for level in (1, 3.5):
-        ax.axhline(level, color="#94a3b8", linewidth=1, linestyle=(0, (4, 4)))
-    thresholds = np.array([0, 1, 2, 2.9, 3.8, 4.8, 5.4, 6.2, 7.1, 7.8, 8.6, 9.5])
-    counts = np.array([14, 10, 7.5, 5.5, 3.1, 2.3, 1.8, 1.3, 0.72, 0.42, 0.24, 0.16])
-    ax.step(thresholds, counts, where="post", color=ink, linewidth=2.5, zorder=3)
-    boundaries = np.linspace(3.95, 7.65, 9)
-    populations = counts[np.searchsorted(thresholds, boundaries, side="left") - 1]
-    ax.scatter(
-        boundaries, populations, s=34, color=blue, edgecolor="white", linewidth=0.8, zorder=4
-    )
-    ax.text(9.15, 8.7, "Over capacity", color="#91515a", fontsize=12, ha="right")
-    ax.text(
-        9.15, 2.55, "Bounded Top-K\nsuperset", color=green, fontsize=12, ha="right", va="center"
-    )
-    ax.text(0.35, 0.31, "Too few candidates\nLower the threshold", color=orange, fontsize=12)
-    ax.vlines(5, 0.14, 2.3, color=green, linewidth=1.4, linestyles="dashed")
-    ax.scatter([5], [2.3], s=95, color=green, edgecolor="white", linewidth=1, zorder=5)
+        ax.axhline(level, color="#adc096", linewidth=1, linestyle=(0, (4, 4)))
+    thresholds = np.r_[0, scores, 10]
+    counts = np.array([np.count_nonzero(row >= t) / k for t in thresholds])
+    ax.step(thresholds, counts, where="pre", color=ink, linewidth=2.3, zorder=3)
+    boundaries = np.array([2.6, 3.4, 4.2, 5.8, 6.4, 7.1, 7.9])
+    populations = np.array([np.count_nonzero(row >= t) / k for t in boundaries])
+    ax.scatter(boundaries, populations, s=32, color=blue, edgecolor="white", linewidth=1, zorder=4)
+    ax.text(9.7, 4.3, "Over capacity", color=muted, fontsize=11.5, ha="right")
+    ax.text(0.25, 1.25, "Feasible admission", color=green, fontsize=11.5)
+    ax.text(0.25, 0.28, "Too few candidates", color=orange, fontsize=11.5)
+    ax.vlines(q, 0, admitted / k, color=green, linewidth=1.2, linestyles=(0, (3, 3)))
+    ax.scatter([q], [admitted / k], s=110, color=green, edgecolor="white", linewidth=1.4, zorder=5)
     ax.annotate(
-        r"Accepted $q$",
-        (5, 2.3),
-        (4.25, 7.6),
+        rf"$C(q)={admitted / k:.1f}K$",
+        (q, admitted / k),
+        (5.1, 3.0),
         color=green,
-        fontsize=12,
-        arrowprops={"arrowstyle": "->", "color": green, "connectionstyle": "arc3,rad=-0.2"},
-    )
-    ax.vlines(7.1, 0.14, 1.3, color="#bd426b", linewidth=1.2, linestyles="dashed")
-    ax.plot([7.1, 7.1], [0.72, 1.3], color="#bd426b", linewidth=3, zorder=5)
-    ax.scatter([7.1], [1.3], s=30, color="#bd426b", zorder=6)
-    ax.scatter([7.1], [0.72], s=30, facecolor="white", edgecolor="#bd426b", zorder=6)
-    ax.annotate(
-        r"$\tau$: boundary tie",
-        (7.1, 1.05),
-        (8.25, 1.38),
+        fontsize=14,
         ha="center",
-        fontsize=10.5,
-        color="#9d3c5b",
-        arrowprops={"arrowstyle": "->", "color": "#9d3c5b"},
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#c6d9b2"},
+        arrowprops={"arrowstyle": "-", "color": green, "lw": 1.2},
     )
-    ax.set_yticks([1, 3.5], [r"$K$", r"$B_r$"])
-    ax.minorticks_off()
-    ax.set_xticks([])
-    ax.set_ylabel(r"Candidates $C(t)$ · log scale", fontsize=12, labelpad=12)
-    ax.set_xlabel(r"Threshold $t$  →", fontsize=12, labelpad=12)
-    ax.tick_params(axis="y", length=0, pad=9, labelsize=12)
+    ax.vlines(tau, 0, at_boundary / k, color=rose, linewidth=1.1, linestyles=(0, (3, 3)))
+    ax.plot([tau, tau], [above_boundary / k, at_boundary / k], color=rose, linewidth=3, zorder=5)
+    ax.scatter([tau], [at_boundary / k], s=42, color=rose, zorder=6)
+    ax.scatter([tau], [above_boundary / k], s=35, facecolor="white", edgecolor=rose, zorder=6)
+    ax.annotate(
+        rf"$C(\tau)={at_boundary / k:.1f}K$",
+        (tau, at_boundary / k),
+        (8.1, 2.0),
+        ha="center",
+        fontsize=12.5,
+        color=rose,
+        arrowprops={"arrowstyle": "-", "color": rose, "lw": 1.1},
+    )
+    ax.set_yticks([0, 1, 3.5], ["0", r"$K$", r"$B_r$"])
+    ax.set_xticks([q, tau], [r"$q$", r"$\tau$"])
+    for tick, color in zip(ax.get_xticklabels(), (green, rose)):
+        tick.set_color(color)
+    ax.set_ylabel(r"Candidates $C(t)$", fontsize=12.5, labelpad=10)
+    ax.set_xlabel("Higher threshold →", fontsize=12, labelpad=7)
+    ax.tick_params(length=0, pad=7, labelsize=13)
     ax.spines["left"].set_color("#cbd5e1")
     ax.spines["bottom"].set_color("#cbd5e1")
-    fig.text(0.075, 0.155, "●  Exact counts from shared classification", fontsize=11, color=blue)
+    fig.text(0.089, 0.223, "●  Exact counts from one classification", fontsize=11.5, color=blue)
 
-    right = fig.add_axes((0.56, 0.19, 0.4, 0.66))
-    right.set(xlim=(0, 10), ylim=(0, 7))
+    fig.text(0.55, 0.732, "CANDIDATE AMPLIFICATION", fontsize=10.5, weight="bold", color=muted)
+    fig.text(0.55, 0.66, f"{admitted / k:.1f}×", fontsize=33, weight="bold", color=green)
+    fig.text(0.652, 0.677, r"$C(q)\,/\,K$", fontsize=19, color=ink)
+    right = fig.add_axes((0.55, 0.564, 0.392, 0.072))
+    right.set(xlim=(0, admitted), ylim=(0, 1))
     right.axis("off")
-    fig.text(0.56, 0.94, "B   Where extra candidates come from", fontsize=17, weight="bold")
-    fig.text(
-        0.56, 0.885, r"All scores at or above $q$ · schematic population", fontsize=12, color=muted
-    )
     segments = [
-        (0, 4, "#e3efcd", green, r"$K$", "Top-K output"),
-        (4, 1.2, "#f6dfe7", "#9d3c5b", r"$E$", "Extra ties"),
-        (5.2, 4, "#ffe9c9", orange, r"$D$", "Boundary shell"),
+        (k, "#deedc8", green, r"$K$", "Required output"),
+        (excess, "#f3dce5", rose, r"$E$", r"Excess ties at $\tau$"),
+        (shell, "#fae6c7", orange, r"$D$", r"Shell: $q\leq x<\tau$"),
     ]
-    for left, width, fill, color, symbol, label in segments:
+    left = 0
+    for i, (width, fill, color, symbol, label) in enumerate(segments):
         right.add_patch(
-            Rectangle((left, 4.6), width, 1.25, facecolor=fill, edgecolor="white", linewidth=2)
+            Rectangle((left, 0), width, 1, facecolor=fill, edgecolor="white", linewidth=2)
         )
         right.text(
-            left + width / 2, 5.22, symbol, fontsize=22, ha="center", va="center", color=color
+            left + width / 2, 0.5, symbol, fontsize=21, ha="center", va="center", color=color
         )
-        label_y = 3.8 if symbol == r"$E$" else 4.12
-        right.text(left + width / 2, label_y, label, fontsize=11, ha="center", color=color)
-    right.text(4.6, 3.0, r"$C_p=C(q)=K+E+D(q,\tau)$", fontsize=20, ha="center", color=ink)
-    right.text(
-        0, 2.04, r"$C(q)$  →  classify and handle admitted candidates", fontsize=12, color=blue
+        y = 0.499 - i * 0.079
+        fig.text(0.555, y, symbol, fontsize=18, color=color, va="center")
+        fig.text(0.589, y, label, fontsize=13, color=ink, va="center")
+        fig.text(
+            0.94,
+            y,
+            f"{width / k:.1f}K",
+            fontsize=13,
+            color=color,
+            ha="right",
+            va="center",
+            weight="bold",
+        )
+        canvas.plot([0.55, 0.943], [y - 0.037, y - 0.037], color="#e1e7ec", lw=0.8)
+        left += width
+    fig.text(0.746, 0.24, r"$C_p=C(q)=K+E+D(q,\tau)$", fontsize=19, ha="center", color=ink)
+
+    canvas.add_patch(
+        FancyBboxPatch(
+            (0.027, 0.07),
+            0.941,
+            0.096,
+            boxstyle="round,pad=0.008,rounding_size=0.013",
+            facecolor="#edf4e5",
+            edgecolor="none",
+        )
     )
-    right.text(0, 1.20, r"$m$      →  refine only the crossing bin in V2", fontsize=12, color=green)
-    right.text(
-        0, 0.35, "A dense boundary can amplify a small threshold error.", fontsize=11, color=muted
+    fig.text(0.045, 0.113, "V2", fontsize=17, weight="bold", color=green)
+    fig.text(0.11, 0.112, r"$C(q)$  Candidate handling", fontsize=14, color=ink)
+    canvas.annotate(
+        "",
+        (0.624, 0.108),
+        (0.413, 0.108),
+        arrowprops={"arrowstyle": "->", "color": green, "lw": 1.4},
     )
+    fig.text(0.515, 0.132, "Exact bin counts", fontsize=10.5, color=green, ha="center")
+    fig.text(0.65, 0.112, r"$m$  Crossing-bin refinement", fontsize=14, color=green)
     fig.text(
         0.04,
-        0.055,
-        "Optimize full-row passes AND candidate work",
-        fontsize=16,
-        weight="bold",
-        color=green,
-    )
-    fig.text(
-        0.96,
-        0.055,
-        "Fewer scans can still leave more work after admission.",
-        fontsize=12,
+        0.025,
+        "Schematic finite-score example · population counts only",
+        fontsize=10.5,
         color=muted,
-        ha="right",
     )
     _save(fig, "candidate_work")
 

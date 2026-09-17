@@ -139,11 +139,11 @@ $$
 
 Here $E$ counts excess entries tied at the boundary, and $D$ counts scores in the shell $q\le x_i\lt\tau$. Dense scores near the boundary can turn a small threshold error into large **candidate amplification**. Temporal overlap alone therefore cannot predict refinement work.
 
-![Two panels connect thresholds to exact candidate counts and decompose the admitted population into K output entries, excess boundary ties, and a below-boundary shell. V2 distinguishes this population from its crossing-bin refinement size.](../media/gvr_v2/candidate_work.svg)
+![Threshold admission and candidate amplification for one schematic score row. A staircase tail count marks feasible admission and boundary ties; a proportional bar splits 2.3K candidates into K output, 0.3K excess ties, and a K-sized shell.](../media/gvr_v2/candidate_work.svg)
 
-*Figure 4.* A: exact tail counts identify thresholds satisfying $K\le C(q)\le B_r$, where $B_r$ is candidate capacity; failed admission requires continued verification or exact recovery. B: extra ties and the boundary shell enlarge the candidate population. The curve and population sizes are schematic. Exact handling of ties preserves the Top-K value multiset.
+*Figure 4.* A: exact tail counts identify thresholds satisfying $K\le C(q)\le B_r$, where $B_r$ is candidate capacity; failed admission requires continued verification or exact recovery. B: the same schematic row yields 2.3× candidate amplification, split into required output, excess ties, and the boundary shell. Exact handling of ties preserves the Top-K value multiset.
 
-Self-sampling aims to place admission near the current tail. Multi-thresholding then distinguishes certain winners, the crossing bin, and unnecessary lower bins. The admitted count $C(q)$ governs candidate handling; the crossing population $m$ sets the size of the remaining exact selection problem. V2 controls both, while balancing those costs against full-row reads. Figure 5 shows how these steps fit together.
+Self-sampling aims to place admission near the current tail; multi-thresholding separates certain winners, the crossing bin, and lower bins. V2 balances full-row reads against candidate handling over $C(q)$ entries and exact refinement over $m$ crossing-bin candidates (Figure 5).
 
 ### Self-Sampling: Calibrate the Search to This Row
 
