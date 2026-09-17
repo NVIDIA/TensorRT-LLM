@@ -2295,9 +2295,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # so the conditional and unconditional CFG branches of one step
             # always select the same path even though each calls this
             # separately. No-op unless the checkpoint declares a step policy.
-            self.transformer.set_denoising_step(
-                step_index=step_index, num_steps=len(self.scheduler.timesteps)
-            )
+            # getattr: the transformer is not always a Cosmos3Transformer.
+            # Distilled-pipeline tests substitute a lightweight stand-in, and a
+            # transformer with no step policy has no reason to carry these.
+            set_step = getattr(self.transformer, "set_denoising_step", None)
+            if set_step is not None:
+                set_step(step_index=step_index, num_steps=len(self.scheduler.timesteps))
 
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
             current_action = extra_stream_latents.get("action") if extra_stream_latents else None
@@ -2409,7 +2412,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # latched. The transfer path runs the transformer without selecting
             # a step, so it would inherit whatever the failed request left
             # behind and run every call in 16-bit with nothing to indicate it.
-            self.transformer.reset_denoising_step()
+            reset_step = getattr(self.transformer, "reset_denoising_step", None)
+            if reset_step is not None:
+                reset_step()
 
         action_latents = prepared.action_latents
         if extra_streams is not None:
