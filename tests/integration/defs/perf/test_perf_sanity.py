@@ -296,7 +296,7 @@ DEVICE_STEP_TIME_METRICS = (
 #
 # Every name here must also appear in MINIMIZE_METRICS (or MAXIMIZE_METRICS):
 # check_regression only iterates those two lists, so a gated name absent from
-# both is silently never checked. test_perf_sanity_helpers.py pins that.
+# both is silently never checked.
 #
 # gen_only ONLY. The other modes in DEVICE_STEP_TIME_MODES upload the same five
 # statistics but keep the default REGRESSION_METRICS (throughput), so for them
