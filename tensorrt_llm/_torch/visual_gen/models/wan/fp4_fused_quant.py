@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused SiLU + NVFP4 activation quantization for the FP4 Wan VAE.
+"""Fused NVFP4 activation quantization for the FP4 Wan VAE.
 
 The NVFP4 conv kernel consumes a pre-quantized activation (packed FP4 values +
 un-swizzled FP8-E4M3 block scale factors). Un-fused, the residual block writes a
@@ -52,36 +52,34 @@ def _build_kernel() -> tuple[Any, Any, Any]:
     triton, tl = _lazy_triton()
 
     @triton.jit
-    def _e2m1_code(v):
-        # Round-to-nearest-even among {0,.5,1,1.5,2,3,4,6}; comparison
-        # strictness alternates so exact midpoints select the even code.
-        # Inspect the fp32 sign bit so negative zero matches the hardware cvt.
-        s = v.to(tl.uint32, bitcast=True) >> 31
-        a = tl.abs(v)
-        m = tl.where(
-            a <= 0.25,
-            0,
-            tl.where(
-                a < 0.75,
-                1,
-                tl.where(
-                    a <= 1.25,
-                    2,
-                    tl.where(
-                        a < 1.75,
-                        3,
-                        tl.where(a <= 2.5, 4, tl.where(a < 3.5, 5, tl.where(a <= 5.0, 6, 7))),
-                    ),
-                ),
-            ),
+    def _rcp_approx(v):
+        return tl.inline_asm_elementwise(
+            "rcp.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            [v],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
         )
-        return (m | (s << 3)).to(tl.uint8)
+
+    @triton.jit
+    def _pack_e2m1(even, odd):
+        # Match the CUDA quantize kernel's hardware conversion. The first PTX
+        # source becomes the high nibble, hence the reversed operand order.
+        return tl.inline_asm_elementwise(
+            "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u16.u8 $0, t; }",
+            "=h,f,f",
+            [even, odd],
+            dtype=tl.uint16,
+            is_pure=True,
+            pack=1,
+        ).to(tl.uint8)
 
     # Row-tiled: BM rows/program, 3D tiles [BM, SF_K, 8] (even/odd channel pairs).
     # Autotuned per (C, M): optimal BM/num_warps shift with channel count and row count.
     _CONFIGS = [triton.Config({"BM": bm}, num_warps=nw) for bm in (2, 4, 8, 16) for nw in (2, 4, 8)]
 
-    @triton.autotune(configs=_CONFIGS, key=["C", "M"])
+    @triton.autotune(configs=_CONFIGS, key=["C", "M", "APPLY_SILU"])
     @triton.jit
     def _silu_nvfp4_quant_kernel(
         x_ptr,
@@ -95,7 +93,9 @@ def _build_kernel() -> tuple[Any, Any, Any]:
         stride_sm,
         BM: tl.constexpr,
         SF_K: tl.constexpr,
+        SF_STORAGE_K: tl.constexpr,
         BLOCK_SF_K: tl.constexpr,
+        APPLY_SILU: tl.constexpr,
     ):
         pid = tl.program_id(0)
         rows = pid * BM + tl.arange(0, BM)
@@ -111,30 +111,30 @@ def _build_kernel() -> tuple[Any, Any, Any]:
         c_odd = c_even + 1
         base = r3 * stride_xm
         rm = rmask[:, None, None] & kmask[None, :, None]
-        xe = tl.load(x_ptr + base + c_even, mask=rm, other=0.0).to(tl.float32)
-        xo = tl.load(x_ptr + base + c_odd, mask=rm, other=0.0).to(tl.float32)
-        xe = xe * (1.0 / (1.0 + tl.exp(-xe)))
-        xo = xo * (1.0 / (1.0 + tl.exp(-xo)))
-        # Match torch SiLU on a BF16 VAE activation at its BF16 rounding point.
-        xe = xe.to(tl.bfloat16).to(tl.float32)
-        xo = xo.to(tl.bfloat16).to(tl.float32)
+        xe = tl.load(x_ptr + base + c_even, mask=rm & (c_even < C), other=0.0).to(tl.float32)
+        xo = tl.load(x_ptr + base + c_odd, mask=rm & (c_odd < C), other=0.0).to(tl.float32)
+        if APPLY_SILU:
+            xe = xe * (1.0 / (1.0 + tl.exp(-xe)))
+            xo = xo * (1.0 / (1.0 + tl.exp(-xo)))
+            # Match torch SiLU on a BF16 VAE activation at its BF16 rounding point.
+            xe = xe.to(tl.bfloat16).to(tl.float32)
+            xo = xo.to(tl.bfloat16).to(tl.float32)
         amax = tl.maximum(tl.max(tl.abs(xe), axis=2), tl.max(tl.abs(xo), axis=2))
-        # Match the saturating E4M3 conversion used by fp4_quantize. Static
-        # calibration can be exceeded by a later activation block.
-        sf = tl.minimum(amax * gs / 6.0, 448.0)
-        sf_e4 = sf.to(tl.float8e4nv)
-        sf_dec = sf_e4.to(tl.float32)
-        inv = tl.where(sf_dec > 0, gs / sf_dec, 0.0)[:, :, None]
-        lo = _e2m1_code(xe * inv)
-        hi = _e2m1_code(xo * inv)
-        packed = (lo | (hi << 4)).to(tl.uint8)
+        # Match cvt_warp_fp16_to_fp4 in quantization.cuh, including its
+        # approximate reciprocal instructions and hardware E2M1 conversion.
+        rcp6 = _rcp_approx(tl.full((BM, BLOCK_SF_K), 6.0, tl.float32))
+        sf_e4 = (gs * (amax * rcp6)).to(tl.float8e4nv)
+        rcpgs = _rcp_approx(tl.full((BM, BLOCK_SF_K), 0.0, tl.float32) + gs)
+        inv = _rcp_approx(sf_e4.to(tl.float32) * rcpgs)
+        inv = tl.where(amax != 0.0, inv, 0.0)[:, :, None]
+        packed = _pack_e2m1(xe * inv, xo * inv)
         qidx = r3 * stride_qm + (k3 * 8 + j3)
         tl.store(xq_ptr + qidx, packed, mask=rm)
         sidx = rows[:, None] * stride_sm + kk[None, :]
         tl.store(
             sf_ptr + sidx,
-            sf_e4.to(tl.uint8, bitcast=True),
-            mask=rmask[:, None] & kmask[None, :],
+            tl.where(kmask[None, :], sf_e4.to(tl.uint8, bitcast=True), 0),
+            mask=rmask[:, None] & (kk < SF_STORAGE_K)[None, :],
         )
 
     # Fold WanRMSNorm (channel-wise L2 normalize * sqrt(C) * gamma) into the
@@ -156,6 +156,7 @@ def _build_kernel() -> tuple[Any, Any, Any]:
         stride_sm,
         BM: tl.constexpr,
         SF_K: tl.constexpr,
+        SF_STORAGE_K: tl.constexpr,
         BLOCK_SF_K: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -172,8 +173,8 @@ def _build_kernel() -> tuple[Any, Any, Any]:
         c_odd = c_even + 1
         base = r3 * stride_xm
         rm = rmask[:, None, None] & kmask[None, :, None]
-        xe = tl.load(x_ptr + base + c_even, mask=rm, other=0.0).to(tl.float32)
-        xo = tl.load(x_ptr + base + c_odd, mask=rm, other=0.0).to(tl.float32)
+        xe = tl.load(x_ptr + base + c_even, mask=rm & (c_even < C), other=0.0).to(tl.float32)
+        xo = tl.load(x_ptr + base + c_odd, mask=rm & (c_odd < C), other=0.0).to(tl.float32)
         # per-row L2 norm over all C (pad channels are 0)
         ss = tl.sum(tl.sum(xe * xe, axis=2), axis=1) + tl.sum(tl.sum(xo * xo, axis=2), axis=1)
         inv_norm = (1.0 / tl.maximum(tl.sqrt(ss), 1e-12))[:, None, None]  # [BM,1,1]
@@ -196,20 +197,19 @@ def _build_kernel() -> tuple[Any, Any, Any]:
         xe = xe.to(tl.bfloat16).to(tl.float32)
         xo = xo.to(tl.bfloat16).to(tl.float32)
         amax = tl.maximum(tl.max(tl.abs(xe), axis=2), tl.max(tl.abs(xo), axis=2))
-        sf = tl.minimum(amax * gs / 6.0, 448.0)
-        sf_e4 = sf.to(tl.float8e4nv)
-        sf_dec = sf_e4.to(tl.float32)
-        inv = tl.where(sf_dec > 0, gs / sf_dec, 0.0)[:, :, None]
-        lo = _e2m1_code(xe * inv)
-        hi = _e2m1_code(xo * inv)
-        packed = (lo | (hi << 4)).to(tl.uint8)
+        rcp6 = _rcp_approx(tl.full((BM, BLOCK_SF_K), 6.0, tl.float32))
+        sf_e4 = (gs * (amax * rcp6)).to(tl.float8e4nv)
+        rcpgs = _rcp_approx(tl.full((BM, BLOCK_SF_K), 0.0, tl.float32) + gs)
+        inv = _rcp_approx(sf_e4.to(tl.float32) * rcpgs)
+        inv = tl.where(amax != 0.0, inv, 0.0)[:, :, None]
+        packed = _pack_e2m1(xe * inv, xo * inv)
         qidx = r3 * stride_qm + (k3 * 8 + j3)
         tl.store(xq_ptr + qidx, packed, mask=rm)
         sidx = rows[:, None] * stride_sm + kk[None, :]
         tl.store(
             sf_ptr + sidx,
-            sf_e4.to(tl.uint8, bitcast=True),
-            mask=rmask[:, None] & kmask[None, :],
+            tl.where(kmask[None, :], sf_e4.to(tl.uint8, bitcast=True), 0),
+            mask=rmask[:, None] & (kk < SF_STORAGE_K)[None, :],
         )
 
     _KERNEL_CACHE["fn"] = (
@@ -229,27 +229,48 @@ def _validate_inputs(x2d: torch.Tensor, gs: torch.Tensor) -> None:
         raise ValueError("NVFP4 global scale must be one float32 value on the input device")
 
 
+def _validate_padded_channels(channels: int, padded_channels: int | None) -> int:
+    output_channels = channels if padded_channels is None else padded_channels
+    if output_channels < channels or output_channels % 16 != 0:
+        raise ValueError(
+            "NVFP4 padded channels must be a 16-aligned value no smaller than the "
+            f"input channels, got input={channels}, padded={output_channels}"
+        )
+    return output_channels
+
+
+def _scale_storage_blocks(output_channels: int) -> int:
+    """Pad the SFA row stride to the four-byte TMA alignment."""
+    scale_blocks = output_channels // 16
+    return ((scale_blocks + 3) // 4) * 4
+
+
 def silu_nvfp4_quant(
     x2d: torch.Tensor,
     gs: torch.Tensor,
+    padded_channels: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused ``SiLU(x)`` then NVFP4 quantize.
 
     Args:
         x2d: BF16 ``[M, C]`` *pre-SiLU* activation, C a multiple of 16.
         gs: FP32 scalar divisor-form global scale ``(448*6)/amax``.
+        padded_channels: Optional output channel count. Channels in ``[C, padded_channels)``
+            are quantized directly as zero without materializing a BF16 padded tensor.
     Returns:
-        (xq uint8 ``[M, C//2]``, sf uint8 ``[M, C//16]``) matching
-        ``fp4_quantize(silu(x), gs, 16, False, isSfSwizzledLayout=False)``.
+        (xq uint8 ``[M, Cp//2]``, sf uint8 ``[M, round_up(Cp//16, 4)]``), where
+        ``Cp`` is ``padded_channels`` or ``C``. The scale tail is storage-only.
     """
     _validate_inputs(x2d, gs)
     triton, kernel, _ = _build_kernel()
     M, C = x2d.shape
-    SF_K = C // 16
-    block_sf_k = triton.next_power_of_2(SF_K)
+    output_channels = _validate_padded_channels(C, padded_channels)
+    SF_K = output_channels // 16
+    sf_storage_k = _scale_storage_blocks(output_channels)
+    block_sf_k = triton.next_power_of_2(sf_storage_k)
     x2d = x2d.contiguous()
-    xq = torch.empty((M, C // 2), dtype=torch.uint8, device=x2d.device)
-    sf = torch.empty((M, SF_K), dtype=torch.uint8, device=x2d.device)
+    xq = torch.empty((M, output_channels // 2), dtype=torch.uint8, device=x2d.device)
+    sf = torch.empty((M, sf_storage_k), dtype=torch.uint8, device=x2d.device)
 
     def grid(meta: dict[str, int]) -> tuple[int]:
         return (triton.cdiv(M, meta["BM"]),)
@@ -265,7 +286,53 @@ def silu_nvfp4_quant(
         xq.stride(0),
         sf.stride(0),
         SF_K=SF_K,
+        SF_STORAGE_K=sf_storage_k,
         BLOCK_SF_K=block_sf_k,
+        APPLY_SILU=True,
+    )
+    return xq, sf
+
+
+def nvfp4_quant(
+    x2d: torch.Tensor,
+    gs: torch.Tensor,
+    padded_channels: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize BF16 activation and directly emit zero-padded NVFP4 blocks.
+
+    This is the dynamic-scale counterpart of :func:`silu_nvfp4_quant`: the
+    caller derives ``gs`` from the real input channels, while this kernel emits
+    the kernel-required padded channel extent without materializing a padded
+    BF16 tensor.
+    """
+    _validate_inputs(x2d, gs)
+    triton, kernel, _ = _build_kernel()
+    M, C = x2d.shape
+    output_channels = _validate_padded_channels(C, padded_channels)
+    SF_K = output_channels // 16
+    sf_storage_k = _scale_storage_blocks(output_channels)
+    block_sf_k = triton.next_power_of_2(sf_storage_k)
+    x2d = x2d.contiguous()
+    xq = torch.empty((M, output_channels // 2), dtype=torch.uint8, device=x2d.device)
+    sf = torch.empty((M, sf_storage_k), dtype=torch.uint8, device=x2d.device)
+
+    def grid(meta: dict[str, int]) -> tuple[int]:
+        return (triton.cdiv(M, meta["BM"]),)
+
+    kernel[grid](
+        x2d,
+        gs,
+        xq,
+        sf,
+        M,
+        C,
+        x2d.stride(0),
+        xq.stride(0),
+        sf.stride(0),
+        SF_K=SF_K,
+        SF_STORAGE_K=sf_storage_k,
+        BLOCK_SF_K=block_sf_k,
+        APPLY_SILU=False,
     )
     return xq, sf
 
@@ -275,23 +342,27 @@ def rmsnorm_silu_nvfp4_quant(
     gs: torch.Tensor,
     gamma: torch.Tensor,
     scale: float,
+    padded_channels: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused WanRMSNorm(channel-wise) -> SiLU -> NVFP4 quantize.
 
     Args:
-        x2d: BF16 ``[M, C]`` *pre-norm* activation (C == padded Cp; pad channels 0).
+        x2d: BF16 ``[M, C]`` *pre-norm* activation before channel padding.
         gs: FP32 scalar divisor-form global scale ``(448*6)/amax`` (calibrated on the
             SiLU(norm) output).
-        gamma: FP32/BF16 ``[C]`` RMSNorm weight, padded to Cp with 0 for pad channels.
+        gamma: FP32/BF16 RMSNorm weight, padded to ``padded_channels`` with zero when needed.
         scale: ``sqrt(real_C)`` (WanRMSNorm ``self.scale``; uses the *unpadded* channel count).
+        padded_channels: Optional output channel count. Channels in ``[C, padded_channels)``
+            are quantized directly as zero without materializing a BF16 padded tensor.
     Returns:
-        (xq uint8 ``[M, C//2]``, sf uint8 ``[M, C//16]``) matching
-        ``fp4_quantize(silu(rmsnorm(x)), gs, 16, False, isSfSwizzledLayout=False)``.
+        (xq uint8 ``[M, Cp//2]``, sf uint8 ``[M, round_up(Cp//16, 4)]``), where
+        ``Cp`` is ``padded_channels`` or ``C``. The scale tail is storage-only.
     """
     _validate_inputs(x2d, gs)
-    if gamma.ndim != 1 or gamma.numel() != x2d.shape[1]:
+    output_channels = _validate_padded_channels(x2d.shape[1], padded_channels)
+    if gamma.ndim != 1 or gamma.numel() != output_channels:
         raise ValueError(
-            f"RMSNorm gamma must have shape ({x2d.shape[1]},), got {tuple(gamma.shape)}"
+            f"RMSNorm gamma must have shape ({output_channels},), got {tuple(gamma.shape)}"
         )
     if gamma.device != x2d.device or gamma.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("RMSNorm gamma must be bfloat16/float32 on the input device")
@@ -299,12 +370,13 @@ def rmsnorm_silu_nvfp4_quant(
         raise ValueError(f"RMSNorm scale must be positive, got {scale}")
     triton, _, kernel = _build_kernel()
     M, C = x2d.shape
-    SF_K = C // 16
-    block_sf_k = triton.next_power_of_2(SF_K)
+    SF_K = output_channels // 16
+    sf_storage_k = _scale_storage_blocks(output_channels)
+    block_sf_k = triton.next_power_of_2(sf_storage_k)
     x2d = x2d.contiguous()
     gamma = gamma.contiguous()
-    xq = torch.empty((M, C // 2), dtype=torch.uint8, device=x2d.device)
-    sf = torch.empty((M, SF_K), dtype=torch.uint8, device=x2d.device)
+    xq = torch.empty((M, output_channels // 2), dtype=torch.uint8, device=x2d.device)
+    sf = torch.empty((M, sf_storage_k), dtype=torch.uint8, device=x2d.device)
 
     def grid(meta: dict[str, int]) -> tuple[int]:
         return (triton.cdiv(M, meta["BM"]),)
@@ -322,6 +394,7 @@ def rmsnorm_silu_nvfp4_quant(
         xq.stride(0),
         sf.stride(0),
         SF_K=SF_K,
+        SF_STORAGE_K=sf_storage_k,
         BLOCK_SF_K=block_sf_k,
     )
     return xq, sf
