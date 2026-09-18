@@ -86,18 +86,19 @@ class Fp4MlaState:
                 f"{HP_BLOCK_SIZE}-token quantization tile, got {hp_ring_size} slots."
             )
         hp_pool = manager.get_fp4_mla_hp_pool()
+        fp4_layers = manager._fp4_mla_compact_to_local
         if (
             not isinstance(hp_pool, torch.Tensor)
             or hp_pool.dtype != torch.bfloat16
             or hp_pool.device.type != "cuda"
             or hp_pool.ndim != 4
-            or hp_pool.shape[1] != manager.num_local_layers
+            or hp_pool.shape[1] != len(fp4_layers)
             or hp_pool.shape[2] != manager.kv_factor
-            or hp_pool.shape[3] != hp_ring_size * manager.head_dim
+            or hp_pool.shape[3] != hp_ring_size * manager.head_dim_per_layer[fp4_layers[0]]
         ):
             raise RuntimeError(
                 "FP4 MLA V2 HP pool must be a CUDA BF16 tensor shaped "
-                "[pages, local_layers, kv_factor, ring * head_dim], got "
+                "[pages, fp4_layers, kv_factor, ring * head_dim], got "
                 f"{getattr(hp_pool, 'shape', None)}."
             )
 
