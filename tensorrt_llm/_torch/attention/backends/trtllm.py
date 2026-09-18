@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -40,6 +40,8 @@ from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs)
 from .fmha.manager import FmhaManager
+from .fp4_mla import can_fuse_fp4_mla_q_quant, scatter_fp4_mla_kv_cache
+from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -126,6 +128,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _max_seq_len_storage: Optional[int] = field(default=None,
                                                 init=True,
                                                 repr=False)
+    _page_size_override: Optional[int] = field(init=False,
+                                               default=None,
+                                               repr=False)
 
     # Encoder CUDA graph compatibility: overrides host-side max_context_q_len
     # so FMHA kernel launch params are stable across graph capture/replay even
@@ -191,6 +196,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     draft_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
 
+    # Batch-shared FP4 state; other attention paths allocate none of it.
+    fp4_mla_state: Optional[Fp4MlaState] = field(init=False,
+                                                 default=None,
+                                                 repr=False,
+                                                 compare=False)
+
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
     flash_mla_tile_scheduler_metadata: Optional[torch.Tensor] = None
@@ -213,10 +224,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _mla_ctx_cu_seqlens_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
-    _fp4_mla_fp8_context_state: Optional[Tuple[Any, Any]] = field(init=False,
-                                                                  default=None,
-                                                                  repr=False,
-                                                                  compare=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
@@ -273,6 +280,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Returns the number of tokens per block from the KV cache manager.
         """
         return self.kv_cache_manager.tokens_per_block if self.kv_cache_manager is not None else None
+
+    @property
+    def page_size(self) -> int:
+        """
+        Number of tokens per cache page.
+        """
+        page_size_override = getattr(self, '_page_size_override', None)
+        if page_size_override is not None:
+            return page_size_override
+        assert self.kv_cache_manager is not None, "page_size requires a KV cache manager"
+        return self.kv_cache_manager.tokens_per_block
+
+    @page_size.setter
+    def page_size(self, value: int) -> None:
+        self._page_size_override = value
 
     @property
     def host_kv_cache_pool_pointers(self) -> Optional[torch.Tensor]:
@@ -530,6 +552,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=prefer_pinned(),
                 )
 
+        if callable(
+                getattr(self.kv_cache_manager, "get_fp4_mla_page_table_spec",
+                        None)):
+            self.fp4_mla_state = Fp4MlaState.create(self, buffers)
+
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:
             self.helix_position_offsets = self.get_empty(
@@ -558,25 +585,32 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
 
     def on_update_kv_lens(self):
-        # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
-        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        # KV lengths can change between speculative decoding sub-steps.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
+        state = getattr(self, "fp4_mla_state", None)
+        if state is not None:
+            state.on_update_kv_lens(self)
 
     def update_for_spec_dec(self) -> None:
-        # MTP updates kv_lens_cuda in-place between sub-steps, which changes
-        # cache_seq_lens seen by the C++ attention op.  Invalidate the metadata
-        # so that forward() recomputes it for the next sub-step.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
+        state = getattr(self, "fp4_mla_state", None)
+        if state is not None:
+            state.update_for_spec_dec(self)
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
+
+    def restore_from_spec_dec(self) -> None:
+        super().restore_from_spec_dec()
+        if self.fp4_mla_state is not None:
+            self.fp4_mla_state.restore_from_spec_dec(self)
 
     def update_helix_param(
         self,
@@ -687,9 +721,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return None
 
     def prepare(self) -> None:
-        # The FP8 scratch metadata view is shared by every local FP4 MLA layer
-        # in one eager context forward and must be rebuilt for the next batch.
-        self._fp4_mla_fp8_context_state = None
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
@@ -808,13 +839,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # tokens. Use the actual KV length (without extra tokens) for
         # kv_lens_runtime, which becomes host_past_key_value_lengths and
         # eventually mMaxSeqLenKv.
+        if self.fp4_mla_state is not None:
+            # FP4 MLA needs the per-forward append lengths rather than the
+            # original prompt lengths. Context scratch-cache metadata and MTP
+            # generation both consume these runtime views.
+            kv_lens_runtime = kv_lens[:self.num_seqs]
+            prompt_lens_cuda_runtime = self.seq_lens_kv_cuda[:self.num_seqs]
+            prompt_lens_cpu_runtime = self.seq_lens_kv[:self.num_seqs]
+        else:
+            kv_lens_runtime = kv_lens[:self.num_seqs]
+            prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
+            prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self._bind_runtime_views(
             kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
-            kv_lens=kv_lens[:self.num_seqs],
-            prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
-            prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
+            kv_lens=kv_lens_runtime,
+            prompt_lens_cuda=prompt_lens_cuda_runtime,
+            prompt_lens_cpu=prompt_lens_cpu_runtime,
             host_request_types=self.host_request_types[:self.num_seqs],
         )
+
+        if self.fp4_mla_state is not None:
+            self.fp4_mla_state.prepare(self, kv_lens)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
@@ -1472,6 +1517,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
+    @property
+    def uses_fp4_mla_attention(self) -> bool:
+        """Whether this layer executes dense FP4 MLA, not sparse NVFP4 storage."""
+        return (self.is_mla_enable and self.has_fp4_kv_cache
+                and self.sparse_params is None)
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = int(self.quant_config.layer_quant_mode)
@@ -1683,8 +1734,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
 
     def _ensure_rope_table_size(self, required_max_positions: int) -> None:
-        if required_max_positions > self.rope_params.max_positions:
-            self.rope_params.max_positions = required_max_positions
+        floats_per_position = self.rope_params.dim * (
+            2 if self.rope_params.duplicate_data else 1)
+        table_max_positions = (self.rotary_cos_sin.numel() //
+                               floats_per_position
+                               if self.rotary_cos_sin is not None else 0)
+        self.rope_params.max_positions = max(self.rope_params.max_positions,
+                                             table_max_positions,
+                                             required_max_positions)
+        if required_max_positions > table_max_positions:
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
 
@@ -2126,6 +2184,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def support_mla(cls) -> bool:
         return True
 
+    @classmethod
+    def support_fp4_kv_cache(cls) -> bool:
+        return True
+
     def has_cached_kv_for_mla_context(
         self,
         metadata: TrtllmAttentionMetadata,
@@ -2357,6 +2419,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_only: bool = False,
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
+        fuse_fp4_q_quant: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2377,6 +2440,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_only (bool): Run the KV half only; the Q half already ran (q_b_layernorm folded the Q RoPE). Mutually exclusive with kv_done_elsewhere.
             kv_done_elsewhere (bool): Run the Q half only; the KV half already ran, hoisted onto an aux stream. Mutually exclusive with kv_only. With both halves done, do not call this at all.
             quant_scale_qkv (torch.Tensor): Non-None means q_nope in quant_q_buffer is already FP8, so the kernel drops the q_nope quantize rows from its grid.
+            fuse_fp4_q_quant (bool): Quantize Q in the fused FP4 RoPE/cache update.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -2385,6 +2449,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Ensure RoPE cos/sin table covers the sequence length before the
         # kernel reads it.
         self._ensure_rope_table_size(metadata.max_seq_len)
+
+        if self.uses_fp4_mla_attention:
+            self._fp4_mla_rope_generation(
+                fused_q,
+                q_pe,
+                latent_cache,
+                metadata,
+                fuse_q_quant=fuse_fp4_q_quant,
+            )
+            return
 
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
@@ -2439,3 +2513,72 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_done_elsewhere,
             quant_scale_qkv,
         )
+
+    def _fp4_mla_rope_generation(
+        self,
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        *,
+        fuse_q_quant: bool = False,
+    ) -> None:
+        """Apply fused generation RoPE, Q quantization, and cache update."""
+        assert self.kv_lora_rank is not None
+        assert self.qk_rope_head_dim is not None
+
+        if q_pe.shape[-1] != self.qk_rope_head_dim:
+            raise RuntimeError(
+                f"FP4 MLA q_pe last dimension must be {self.qk_rope_head_dim}, "
+                f"got {q_pe.shape[-1]}.")
+        if latent_cache.shape[-1] != self.kv_lora_rank + self.qk_rope_head_dim:
+            raise RuntimeError(
+                "FP4 MLA latent_cache last dimension must be "
+                f"{self.kv_lora_rank + self.qk_rope_head_dim}, got "
+                f"{latent_cache.shape[-1]}.")
+        if not fuse_q_quant:
+            raise RuntimeError(
+                "FP4 MLA generation requires fused Q quantization.")
+        if not self.rope_params.duplicate_data:
+            raise RuntimeError(
+                "FP4 MLA requires RopeParams.duplicate_data=True.")
+        if not self.can_fuse_fp4_mla_q_quant(fused_q, q_pe, latent_cache,
+                                             metadata):
+            raise RuntimeError(
+                "FP4 MLA fused Q quantization eligibility changed before "
+                "launch.")
+        if (self.rotary_cos_sin is None or q_pe.dtype != torch.bfloat16
+                or fused_q.dtype != torch.bfloat16
+                or latent_cache.dtype != torch.bfloat16
+                or self.rotary_cos_sin.dtype != torch.float32):
+            raise RuntimeError(
+                "FP4 MLA generation requires fused BF16 RoPE/cache update "
+                "with an FP32 rotary table.")
+
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache,
+            self.layer_idx,
+            token_offset=getattr(metadata, "num_ctx_tokens", 0),
+            phase="generation",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=fused_q[..., self.kv_lora_rank:],
+            q_quant_input=fused_q,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "Fused FP4 MLA RoPE/cache scatter did not update the HP pool.")
+
+    def can_fuse_fp4_mla_q_quant(
+        self,
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> bool:
+        return bool(
+            self.uses_fp4_mla_attention
+            and can_fuse_fp4_mla_q_quant(metadata, fused_q, q_pe, latent_cache))
