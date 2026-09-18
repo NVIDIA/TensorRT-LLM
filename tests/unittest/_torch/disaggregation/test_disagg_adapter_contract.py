@@ -29,6 +29,8 @@ def _executor() -> PyExecutor:
     executor._pending_response_terminations = []
     executor._terminate_request = Mock()
     executor._handle_errors = Mock()
+    executor._prepare_disagg_gen_resources = Mock()
+    executor._revert_ctx_alloc = Mock()
     executor._fatal_error = None
     executor.is_shutdown = False
     executor.active_requests = []
@@ -107,6 +109,24 @@ def test_fail_fatal_marks_the_executor_fatal_before_the_aligned_error_path_runs(
     assert state_on_entry["is_shutdown"] is True
 
 
+def test_prepare_gen_resources_reaches_the_executor_resource_prep() -> None:
+    executor = _executor()
+    requests = [Mock()]
+
+    PyExecutorEffects(executor).prepare_gen_resources(requests)
+
+    executor._prepare_disagg_gen_resources.assert_called_once_with(requests)
+
+
+def test_revert_ctx_alloc_reaches_the_executor_v2_revert() -> None:
+    executor = _executor()
+    requests = [Mock()]
+
+    PyExecutorEffects(executor).revert_ctx_alloc(requests)
+
+    executor._revert_ctx_alloc.assert_called_once_with(requests)
+
+
 def test_registry_reads_the_executor_lists_live() -> None:
     """The executor rebinds active_requests; the registry must not cache."""
     executor = _executor()
@@ -146,6 +166,8 @@ def test_fake_and_adapter_record_the_same_effects() -> None:
         ("stage_transfer_response", (7, response, late_request), {}),
         ("fail_requests", ("boom", [request]), {"charge_budget": False}),
         ("fail_fatal", ("poisoned",), {}),
+        ("prepare_gen_resources", ([request],), {}),
+        ("revert_ctx_alloc", ([late_request],), {}),
     ]
     fake = FakeExecutorEffects()
     executor = _executor()
@@ -166,6 +188,10 @@ def test_fake_and_adapter_record_the_same_effects() -> None:
         call(error_msg="boom", requests=[request], charge_budget=False),
         call("poisoned", requests=None, charge_budget=False, fatal_is_collective_aligned=True),
     ]
+    assert fake.prepared == [[request]]
+    executor._prepare_disagg_gen_resources.assert_called_once_with([request])
+    assert fake.reverted == [[late_request]]
+    executor._revert_ctx_alloc.assert_called_once_with([late_request])
 
 
 def test_fake_registry_reads_live_and_removes_like_the_adapter() -> None:

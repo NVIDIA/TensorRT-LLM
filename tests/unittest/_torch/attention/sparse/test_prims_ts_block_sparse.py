@@ -20,7 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from utils.util import isSM100Family
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends import prims_ts
 from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse as block_sparse_fmha
@@ -41,7 +41,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 pytestmark = pytest.mark.cpu_only
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
-    not isSM100Family(),
+    getSMVersion() not in (100, 103),
     reason="PrimTS block-sparse attention requires SM100 or SM103",
 )
 
