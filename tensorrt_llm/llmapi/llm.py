@@ -1483,15 +1483,6 @@ class BaseLLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-        # auto enable context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-        if self.args.backend not in ["pytorch", "_autodeploy"]:
-            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                sampling_params.return_context_logits = True
-                sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
-                sampling_params.return_generation_logits = True
-                sampling_params._generation_logits_auto_enabled = True
-
         if sampling_params._stream_interval is None:
             sampling_params._stream_interval = getattr(self.args,
                                                        "stream_interval", 1)
