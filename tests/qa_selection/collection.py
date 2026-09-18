@@ -160,10 +160,9 @@ class SelectionRequest:
     def out_dir_for(text: Optional[str], target_rung: Optional[int]) -> Optional[Path]:
         """Where to write, or None when nothing is written.
 
-        Naming a rung and asking for artifacts at once is a usage error. The
-        rung's list is one of the files the same command writes *without*
-        `--gpus`, so the combination can only ever produce a subset of an
-        artifact you would get anyway, with the other rungs truncated.
+        Naming a rung and asking for artifacts at once is a usage error: the
+        rung's list is one of the files the same command writes without
+        `--gpus`.
         """
         if text is None:
             return None
@@ -226,8 +225,7 @@ class SelectionRequest:
         if gpus is None:
             return node
         if gpus > node.max_gpu_per_node:
-            # Same veto the ladder gets: an allocation this large cannot be
-            # requested, and sizing a profile past the node over-selects.
+            # The veto the ladder gets: that allocation cannot be requested.
             raise pytest.UsageError(
                 f"--gpus: {gpus} exceeds {node.name}, which has "
                 f"{node.max_gpu_per_node} GPUs per node"
@@ -285,8 +283,8 @@ class Selection:
         test can run on the machine, and the rung says which allocation it
         belongs to.
 
-        The views are kept beside the assignments because the report reads them
-        for one fact no `Decision` carries: a `skipif` with no `reason=` at all.
+        The views are kept beside the assignments: the report reads them for
+        one fact no `Decision` carries, a `skipif` with no `reason=`.
         """
         selector = Selector(request.profile)
         views = tuple(ItemView.of(item) for item in items)
