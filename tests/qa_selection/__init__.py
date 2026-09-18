@@ -14,17 +14,11 @@
 # limitations under the License.
 """Select the tests a target machine can run, before Slurm allocates it.
 
-The package splits on what the code is allowed to depend on:
-
-    core/          the decision layer -- stdlib only, never pytest
-    collection.py  options, markers, the item adapter, the decisions
-    report.py      the .ids files, the JSON record, the terminal summary
+    core/          the decision layer; imports no pytest
+    collection.py  the options, the markers, ItemView, Selection
+    report.py      the .ids lists, the JSON record, the terminal summary
     plugin.py      the pytest hooks; the `-p qa_selection.plugin` entry point
 
-Code outside `core/` may import pytest; code inside it may not. That is what
-lets `core/` be exercised with no pytest session, no hardware and no wheel --
-see `core/__init__.py` for its own reading order.
-
-No executable statements: pytest imports this package before any conftest in
-order to load the plugin, so it must stay cheap.
+No executable statements: pytest imports this package before any conftest, to
+load the plugin.
 """
