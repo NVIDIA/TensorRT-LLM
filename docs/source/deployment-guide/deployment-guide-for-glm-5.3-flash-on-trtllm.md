@@ -451,4 +451,4 @@ The horizontal axis is `1000 / mean_tpot_ms`, excluding TTFT. The vertical axis 
 
 ![GLM-5.3-Flash FP8 performance on 4x B200](../media/glm_5_3_flash_fp8_perf.png)
 
-With TP4 / EP4, MTP3 improves single-user decode speed from approximately 153 to 372 tok/s/user. At concurrency 128, the four configurations deliver approximately 5.9K–6.3K output tok/s in aggregate. Attention DP4 / EP4 was also repeated in ascending and descending concurrency order; earlier TTFT spikes at concurrency 8 and 32 did not consistently recur, and all matching samples remain included. MTP uses natural acceptance; random-token workloads can have different acceptance rates from real conversations. This sweep covers the plotted concurrency range, not peak throughput or maximum-context validation.
+With TP4 / EP4, MTP3 improves single-user decode speed from approximately 153 to 372 tok/s/user. At concurrency 128, the four configurations deliver approximately 5.9K–6.3K output tok/s in aggregate. MTP acceptance and speedup depend on the workload; these measurements use random-token prompts.
