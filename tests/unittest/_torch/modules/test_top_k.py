@@ -607,7 +607,7 @@ def test_gvr_v2_prefill_routes_to_selfsampling_runner(monkeypatch) -> None:
     args, kwargs = runner.call_args
     assert args[0] is scores and args[1] is row_starts and args[2] is row_ends
     assert args[3] is output
-    assert kwargs == {}
+    assert kwargs == {"max_row_len": scores.shape[1]}
 
 
 def test_gvr_v2_prefill_format_gate_falls_back_to_radix(monkeypatch) -> None:
@@ -696,7 +696,9 @@ def test_gvr_v2_prefill_capture_uncompiled_uses_radix(monkeypatch) -> None:
     row_starts, row_ends, output = _prefill_call(top_k, scores)
 
     runner.assert_not_called()
-    fake.selfsampling_topk_prefill_ready.assert_called_once_with(scores, output)
+    fake.selfsampling_topk_prefill_ready.assert_called_once_with(
+        scores, output, max_row_len=scores.shape[1]
+    )
     radix.assert_called_once_with(scores, row_starts, row_ends, output, 2)
 
 
@@ -708,3 +710,23 @@ def test_gvr_v2_prefill_capture_compiled_uses_engine(monkeypatch) -> None:
     _prefill_call(top_k, torch.randn(3, 8))
 
     runner.assert_called_once()
+
+
+@pytest.mark.parametrize("width", [2048, 2052, 4096, 4100, 16388])
+def test_gvr_v2_prefill_uses_same_logical_bound_for_ready_and_run(monkeypatch, width) -> None:
+    """A packed window may be short while its safe static envelope remains wide."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    fake = sys.modules["tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k"]
+    monkeypatch.setattr(TopK, "_prefill_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(1024, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    scores = torch.randn(3, width + 256)[:, :width]
+    starts = torch.tensor([0, 3, width - 1025], dtype=torch.int32)
+    ends = starts + torch.tensor([0, 17, 1025], dtype=torch.int32)
+    output = torch.full((3, 1024), -7, dtype=torch.int32)
+
+    result = top_k(scores, output, is_prefill=True, row_starts=starts, row_ends=ends)
+
+    assert result is output
+    assert scores.stride(0) != width
+    fake.selfsampling_topk_prefill_ready.assert_called_once_with(scores, output, max_row_len=width)
+    runner.assert_called_once_with(scores, starts, ends, output, max_row_len=width)

@@ -1073,6 +1073,69 @@ def _prefill_cache_key(tier: int, k: int, n_bucket: int):
     return (tier, k, n_bucket if tier == 0 else 0)
 
 
+# FP32 register-resident prefill windows share the decode kernel template.
+_PREFILL_REG_CACHE = {}
+
+
+def _prefill_reg_route(
+    rows: int, k: int, n_hint: int, num_sms: int = 148, sm_version: int = 100
+) -> dict | None:
+    """Pure SM100 plan using a trusted maximum window length in compressed columns."""
+    if sm_version != 100 or k not in (512, 1024, 2048) or n_hint <= k or n_hint > 8192:
+        return None
+    if n_hint <= 2048:
+        blk, vpt, minb = 512, 1, 4
+    elif n_hint <= 4096:
+        blk, vpt, minb = 512, 2, 4
+    elif k == 2048:
+        blk, vpt, minb = 512, 4, 2
+    else:
+        return None
+    n = blk * vpt * 4
+    cmp_ = min(n, 2560)
+    cure = not (n < 2 * k and rows > num_sms)
+    dege = n <= 4 * k + 64
+    if dege:
+        cmp_ = n
+    nbsel = 2 * NB if n // 4 > 512 and rows <= num_sms else NB
+    kpt = 1 if dege or k <= blk else 2 if k <= 2 * blk else 4
+    tpl = (blk, vpt, minb, kpt, cure, dege, False, nbsel)
+    # Retain the existing QC=QUADC for the window specialization.
+    return {
+        "kernel": "reg",
+        "tpl": tpl,
+        "rt": {"CMP": cmp_, "QC": QUADC},
+        "smem": (nbsel + 2 * cmp_) * 4,
+        "capacity": n,
+    }
+
+
+def _prefill_reg_key(plan: dict, k: int, device_index: int) -> tuple:
+    """Key every constexpr/resource dimension and isolate per-device launchers."""
+    return (device_index, tuple(plan["tpl"]), k, plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"])
+
+
+def _prefill_reg_launcher(plan: dict, k: int, device_index: int) -> tuple:
+    """Compile a window-local FP32 register specialization with TRT start/end ABI."""
+    key = _prefill_reg_key(plan, k, device_index)
+    hit = _PREFILL_REG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    dev = _device()
+    with torch.cuda.device(device_index):
+        fn = dev.get_compiled__reg(tuple(plan["tpl"]), varlen=True, hint_free=True, prefill=True)
+    lc = (fn, (plan["rt"]["CMP"], plan["rt"]["QC"], dev.STATIC_BYTES + plan["smem"]))
+    _PREFILL_REG_CACHE[key] = lc
+    return lc
+
+
+def _prefill_window_bound(max_row_len: int | None, width: int) -> int:
+    """Share the existing host-bound clamping across both prefill entry points."""
+    if max_row_len is None:
+        return max(width, 1)
+    return max(min(_index(max_row_len), width), 1)
+
+
 def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
     """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
     r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
@@ -2136,7 +2199,16 @@ def run_prefill(
     """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
     ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
     with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
-    No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1]."""
+    No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1].
+
+    ``max_row_len`` may be None (streaming Main) or an integer upper
+    bound on every ``row_ends - row_starts``. A provided bound enables the
+    register-resident window path on supported shapes. The caller must keep
+    this bound valid across CUDA graph replays; no device-to-host length read
+    is performed. Zero is valid for an all-empty batch. The existing clamping
+    to [1, shape[1]] is retained. Omitting it preserves the streaming fallback. Output indices
+    remain window-local and all short-row padding is -1.
+    """
     if logits.dtype is not _F32:
         raise RuntimeError(
             f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
@@ -2184,6 +2256,8 @@ def run_prefill(
     if logits.data_ptr() & 15:
         raise RuntimeError("logits base must be 16-byte aligned")
     d = logits.get_device()
+    if any(t.device != logits.device for t in (row_starts, row_ends, indices)):
+        raise RuntimeError("prefill tensors must share the logits device")
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
     lg = logits
@@ -2199,11 +2273,32 @@ def run_prefill(
         ws = _ws_hot.get(d)
         if ws is None:
             ws = default_workspace(logits)
-    n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
-    n_env = min(max(n_env, 1), npad)
+    n_env = _prefill_window_bound(max_row_len, logits.shape[1])
+    num_sms, sm_version = _unpack_device_profile(_device_profile_key(d))
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
+        plan = (
+            _prefill_reg_route(r1 - r0, k, n_env, num_sms, sm_version)
+            if max_row_len is not None
+            else None
+        )
+        if plan is not None:
+            lc_reg = _PREFILL_REG_CACHE.get(_prefill_reg_key(plan, k, d))
+            if lc_reg is None:
+                if _is_capturing():
+                    raise RuntimeError("register prefill launcher not warmed before capture")
+                lc_reg = _prefill_reg_launcher(plan, k, d)
+            fn_reg, args_reg = lc_reg
+            fn_reg(
+                lg[r0:r1],
+                row_starts[r0:r1],
+                row_ends[r0:r1],
+                indices[r0:r1],
+                logits.shape[1],
+                *args_reg,
+            )
+            continue
         tier = _prefill_tier(r1 - r0, n_env, k)
         lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
         if lc is None:
@@ -2233,12 +2328,22 @@ def prefill_ready(
     if num_rows == 0:
         return True
     k = indices.shape[1]
-    npad = logits.stride(0)
-    n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
-    n_env = min(max(n_env, 1), max(npad, 1))
+    n_env = _prefill_window_bound(max_row_len, logits.shape[1])
+    d = logits.get_device()
+    num_sms, sm_version = _unpack_device_profile(_device_profile_key(d))
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
-        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
+        rows = min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0
+        plan = (
+            _prefill_reg_route(rows, k, n_env, num_sms, sm_version)
+            if max_row_len is not None
+            else None
+        )
+        if plan is not None:
+            if _prefill_reg_key(plan, k, d) not in _PREFILL_REG_CACHE:
+                return False
+            continue
+        tier = _prefill_tier(rows, n_env, k)
         if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
             return False
     return True
@@ -2460,12 +2565,13 @@ def warmup_prefill(
     """Compile every prefill engine ``run_prefill`` can request before serving:
     the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
     (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
-    one launch each. ``max_cols`` is the compressed max column count;
+    one launch each, plus each supported register-window plan for the requested
+    row-count bands. ``max_cols`` is the compressed max column count;
     idempotent per done-key."""
     dev = torch.cuda.current_device()
     k = int(top_k)
     max_cols = int(max_cols)
-    lo = _prefill_bucket(k + 1)
+    lo = _prefill_bucket(1)
     hi = _prefill_bucket(max_cols)
     buckets = []
     b = lo
@@ -2475,7 +2581,11 @@ def warmup_prefill(
     if not buckets:
         buckets = [hi]
     keys = {}  # cache_key -> (tier, bucket, envelope) representative for the launch
-    for rows in num_rows_list:
+    warmup_slab_rows = set()
+    for row_count in num_rows_list:
+        for row_start in range(0, int(row_count), _PREFILL_ROW_SLAB):
+            warmup_slab_rows.add(min(_PREFILL_ROW_SLAB, int(row_count) - row_start))
+    for rows in sorted(warmup_slab_rows):
         for bk in buckets:
             for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
                 tier = _prefill_tier(int(rows), n_env, k)
@@ -2493,7 +2603,38 @@ def warmup_prefill(
         ks = torch.zeros((rows,), dtype=torch.int32, device=dev)
         ke = torch.full((rows,), n_env, dtype=torch.int32, device=dev)
         out = torch.empty((rows, k), dtype=torch.int32, device=dev)
-        run_prefill(logits[:, :bk], ks, ke, out, max_row_len=n_env)
+        _, fn, (scap, cmp_), tail = _prefill_launcher(tier, k, bk)
+        ws = kernel_view(default_workspace(logits))
+        pre = (0, stride, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
+        fn(logits, ke, out, ws, *pre, ks, *tail)
+        del logits, ks, ke, out
+    num_sms, sm_version = _unpack_device_profile(_device_profile_key(dev))
+    reg_plans = {}
+    slab_rows = set()
+    for row_count in num_rows_list:
+        for row_start in range(0, int(row_count), _PREFILL_ROW_SLAB):
+            slab_rows.add(min(_PREFILL_ROW_SLAB, int(row_count) - row_start))
+    for row_count in sorted(slab_rows):
+        for bound in (2048, 4096, 8192):
+            hint = min(bound, max_cols)
+            plan = _prefill_reg_route(int(row_count), k, hint, num_sms, sm_version)
+            if plan is not None:
+                key = _prefill_reg_key(plan, k, dev)
+                # Only the <= num_sms band affects the row-dependent template
+                # options. Launch the smallest representative of that band;
+                # large requested slabs must not inflate warmup allocations.
+                representative_rows = 1 if row_count <= num_sms else num_sms + 1
+                reg_plans.setdefault(key, (plan, representative_rows, hint))
+    for plan, rows, hint in reg_plans.values():
+        width = plan["capacity"] + 4
+        stride = max(width, row_stride or 0)
+        stride = (stride + 3) // 4 * 4
+        logits = torch.zeros((rows, stride), dtype=torch.float32, device=dev)
+        ks = torch.ones((rows,), dtype=torch.int32, device=dev)
+        ke = torch.full((rows,), hint + 1, dtype=torch.int32, device=dev)
+        out = torch.empty((rows, k), dtype=torch.int32, device=dev)
+        fn, args_reg = _prefill_reg_launcher(plan, k, dev)
+        fn(logits, ks, ke, out, width, *args_reg)
         del logits, ks, ke, out
     torch.cuda.synchronize()
     with _PREFILL_WARMUP_LOCK:

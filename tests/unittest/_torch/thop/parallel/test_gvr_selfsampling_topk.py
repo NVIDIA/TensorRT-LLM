@@ -1671,13 +1671,19 @@ def test_prefill_warmup_idempotent_and_no_rejit():
     ss_host.warmup_prefill(k, 32768)
     assert len(ss_host._PREFILL_WARMUP_DONE) == before, "warmup not idempotent"
     orig = dev.get_compiled
+    orig_reg = dev.get_compiled__reg
     calls = {"n": 0}
 
     def counting(*a, **kw):
         calls["n"] += 1
         return orig(*a, **kw)
 
+    def counting_reg(*a, **kw):
+        calls["n"] += 1
+        return orig_reg(*a, **kw)
+
     dev.get_compiled = counting
+    dev.get_compiled__reg = counting_reg
     try:
         for rows in (1, 8, 37, 74, 100, 296, 297, 4096):
             for nkv in (4096, 16384, 32768):
@@ -1689,6 +1695,7 @@ def test_prefill_warmup_idempotent_and_no_rejit():
                 ss_host.run_prefill(lg, rs, re, out, max_row_len=nkv)
     finally:
         dev.get_compiled = orig
+        dev.get_compiled__reg = orig_reg
     assert calls["n"] == 0, f"warmup missed keys: {calls['n']} live compiles"
     # the reachable engine set for this k above the k-th column: one tier-0 key
     # per bucket where a <= 148-row launch keeps the BLK=1024 plan at either
@@ -1779,7 +1786,14 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan():
             ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
             torch.cuda.synchronize()
             bucket = ss_host._prefill_bucket(n)
-            assert ss_host._prefill_cache_key(tier, k, bucket) in ss_host._PREFILL_CACHE
+            profile = ss_host._unpack_device_profile(ss_host._device_profile_key(lg.get_device()))
+            plan = ss_host._prefill_reg_route(rows, k, n, *profile)
+            if plan is None:
+                assert ss_host._prefill_cache_key(tier, k, bucket) in ss_host._PREFILL_CACHE
+            else:
+                assert (
+                    ss_host._prefill_reg_key(plan, k, lg.get_device()) in ss_host._PREFILL_REG_CACHE
+                )
             assert ss_host.prefill_ready(lg, out, max_row_len=n)
             _check_prefill_exact(lg, out, rs, re, k)
         # prefix-cache-hit window on the small-envelope tier-1 engine: ks % 4 == 1
@@ -2139,3 +2153,88 @@ def test_selfsampling_topk_regclus_mixed_dtype(monkeypatch: pytest.MonkeyPatch) 
         torch.cuda.synchronize()
         reference = torch.topk(logits, top_k, dim=1).values
         _check_exact(logits, indices, n_valid, reference)
+
+
+@pytest.mark.parametrize("top_k,window", [(512, 2048), (1024, 4096), (2048, 8192)])
+@pytest.mark.parametrize("rows", [32, 160])
+@pytest.mark.parametrize("distribution", ["randn", "equal", "neginf", "posinf"])
+def test_prefill_register_windows_exact(top_k, window, rows, distribution):
+    """Register windows retain exact local indices across lead lanes and short rows."""
+    starts = [r % 4 for r in range(rows)]
+    lengths = [0, 1, top_k - 1, top_k, top_k + 1, window - 1, window]
+    ends = [start + lengths[r % len(lengths)] for r, start in enumerate(starts)]
+    logits, ks, ke = _make_prefill_case(
+        rows,
+        window + 4,
+        starts,
+        ends,
+        top_k=top_k,
+        seed=window + rows,
+        dist="equal" if distribution in ("neginf", "posinf") else distribution,
+    )
+    if distribution in ("neginf", "posinf"):
+        value = float("-inf") if distribution == "neginf" else float("inf")
+        for row, (start, end) in enumerate(zip(starts, ends)):
+            logits[row, start:end] = value
+    before = logits.view(torch.int32).clone()
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(logits, ks, ke, indices, max_row_len=window)
+    torch.cuda.synchronize()
+    _check_prefill_exact(logits, indices, ks, ke, top_k)
+    assert torch.equal(logits.view(torch.int32), before)
+    assert ss_host.prefill_ready(logits, indices, max_row_len=window)
+    num_sms, sm_version = ss_host._unpack_device_profile(
+        ss_host._device_profile_key(logits.get_device())
+    )
+    plan = ss_host._prefill_reg_route(rows, top_k, window, num_sms, sm_version)
+    if sm_version == 100:
+        assert plan is not None
+        assert (
+            ss_host._prefill_reg_key(plan, top_k, logits.get_device()) in ss_host._PREFILL_REG_CACHE
+        )
+
+
+def test_prefill_register_static_bound_rungs():
+    """Logical width is conservative: four packed lead columns may change the route."""
+    for rows in (1, 148, 149, 32768):
+        assert ss_host._prefill_reg_route(rows, 1024, 2048)["capacity"] == 2048
+        assert ss_host._prefill_reg_route(rows, 1024, 2052)["capacity"] == 4096
+        assert ss_host._prefill_reg_route(rows, 1024, 4096)["capacity"] == 4096
+        assert ss_host._prefill_reg_route(rows, 1024, 4100) is None
+        assert ss_host._prefill_reg_route(rows, 2048, 8196) is None
+        assert ss_host._prefill_reg_route(rows, 1024, 2048, sm_version=103) is None
+    for bound in (False, True, -4, 0, 1):
+        assert ss_host._prefill_window_bound(bound, 4096) == 1
+    assert ss_host._prefill_window_bound(8192, 4096) == 4096
+    with pytest.raises(TypeError):
+        ss_host._prefill_window_bound(1.5, 4096)
+
+
+def test_prefill_register_graph_replay_updates_windows():
+    """A captured bound stays fixed while starts and ends change at stable addresses."""
+    rows, top_k, window = 32, 1024, 4096
+    stride = window + 256
+    logits = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)[:, : window + 4]
+    before = logits.view(torch.int32).clone()
+    ks = torch.zeros(rows, dtype=torch.int32, device=_DEV)
+    ke = torch.full((rows,), window, dtype=torch.int32, device=_DEV)
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.warmup_prefill(top_k, window + 4, num_rows_list=(rows,), row_stride=stride)
+    assert ss_host.prefill_ready(logits, indices)
+    assert ss_host.prefill_ready(logits, indices, max_row_len=window)
+    pointers = tuple(t.data_ptr() for t in (logits, ks, ke, indices))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_prefill(logits, ks, ke, indices, max_row_len=window)
+    for shift in (0, 1, 3):
+        starts = [(row + shift) % 4 for row in range(rows)]
+        lengths = [0, 1, top_k - 1, top_k, top_k + 1, window - 1, window]
+        ends = [start + lengths[(row + shift) % len(lengths)] for row, start in enumerate(starts)]
+        ks.copy_(torch.tensor(starts, dtype=torch.int32, device=_DEV))
+        ke.copy_(torch.tensor(ends, dtype=torch.int32, device=_DEV))
+        indices.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_prefill_exact(logits, indices, ks, ke, top_k)
+        assert tuple(t.data_ptr() for t in (logits, ks, ke, indices)) == pointers
+        assert torch.equal(logits.view(torch.int32), before)

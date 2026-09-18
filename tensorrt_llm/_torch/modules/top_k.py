@@ -170,7 +170,7 @@ class TopK(nn.Module):
                 )
 
                 if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
-                    scores, output_indices
+                    scores, output_indices, max_row_len=scores.shape[1]
                 ):
                     # the engine never JIT-compiles under capture; an engine
                     # missed by warmup takes the exact radix path in the graph
@@ -189,7 +189,13 @@ class TopK(nn.Module):
                     # ks/ke are already in compressed column units; run_prefill
                     # writes the local (column - ks) frame with -1 pad and no
                     # host reads (envelope from scores.shape[1]).
-                    selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
+                    selfsampling_topk_run_prefill(
+                        scores,
+                        row_starts,
+                        row_ends,
+                        output_indices,
+                        max_row_len=scores.shape[1],
+                    )
                     return output_indices
             else:
                 # engine hardware-format gate missed (e.g. a non-fp4 layer with
