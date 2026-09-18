@@ -675,6 +675,54 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Nemotron-3.5-Lightning-30B with MTP=3, NVFP4 and BF16.
+        {
+            'patterns': [
+                'nemotron_3.5_lightning_30b_nvfp4_mtp-serve-pytorch-streaming-',
+                'nemotron_3.5_lightning_30b_bf16_mtp-serve-pytorch-streaming-',
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+                'stream_interval': 10,
+                'num_postprocess_workers': 4,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 16,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.8,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                    'mamba_state_config': {
+                        'periodic_snapshot_interval': 8192,
+                    },
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        {
+            'patterns':
+            ['nemotron_3.5_lightning_30b_nvfp4_mtp-serve-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
+        {
+            'patterns':
+            ['nemotron_3.5_lightning_30b_bf16_mtp-serve-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+            }
+        },
         # Nemotron-3-Super-120B-NVFP4 (streaming/low-latency variant for spark perf)
         # Streaming serve cases use small cuda_graph batch and no attention DP for latency.
         {
