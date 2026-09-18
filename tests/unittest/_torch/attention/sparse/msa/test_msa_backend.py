@@ -312,6 +312,34 @@ def test_msa_buffers_include_graph_stable_block_table():
     assert requested["msa_seq_lens_cuda"] == ((MAX_NUM_SEQUENCES,), torch.int32, True)
 
 
+@pytest.mark.cpu_only
+def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage zero-copy cache views only for sparse layers on the local rank."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(sparse_layer_ids=[3, 4], layer_offsets={3: 0})
+    main_cache = torch.zeros(2, 2, 1, 128, 128)
+    index_cache = torch.zeros(2, 1, 128, 128)
+    manager = metadata.kv_cache_manager
+    manager.get_buffers = lambda layer_idx, kv_layout: main_cache
+    manager.get_index_k_buffer = lambda layer_idx, kv_layout: index_cache
+    monkeypatch.setattr(
+        metadata,
+        "get_empty",
+        lambda buffers, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]),
+    )
+    # No native pool in this CPU test; only zero-copy cache-view staging is under test.
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+    metadata._create_msa_buffers()
+    assert set(metadata.msa_layer_cache_tensors) == {3}
+    main, index = metadata.msa_layer_cache_tensors[3]
+    assert main is main_cache and index is index_cache
+    main.fill_(2)
+    index.fill_(3)
+    torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
+    torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("factors", "expected"),

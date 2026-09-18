@@ -3334,6 +3334,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 and self.use_cutlass)
 
     def _load_flashinfer(self, *, required: bool) -> bool:
+        """Load the optional GEMM backend, raising only when explicitly required."""
         if not self.use_cutlass:
             if required:
                 raise RuntimeError(
@@ -3424,6 +3425,7 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])

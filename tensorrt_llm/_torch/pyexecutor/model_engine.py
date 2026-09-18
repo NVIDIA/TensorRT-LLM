@@ -10,8 +10,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
-                    Union, cast)
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
+                    Tuple, Type, Union, cast)
 
 import torch
 import torch._dynamo.config
@@ -205,17 +205,33 @@ class _ContextOnlyCompiledModel(torch.nn.Module):
 
     def __init__(self, eager_model: torch.nn.Module,
                  compiled_model: torch.nn.Module) -> None:
+        """Keep eager and compiled entry points sharing the same model weights."""
         super().__init__()
         self.eager_model = eager_model
         self.compiled_model = compiled_model
 
+    def named_modules(
+        self,
+        memo: Optional[set[torch.nn.Module]] = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ) -> Iterator[Tuple[str, torch.nn.Module]]:
+        """Expose checkpoint-compatible module names for partial weight reloads."""
+        # Weight reloads match checkpoint prefixes against this traversal.
+        # Neither routing wrapper owns parameters; expose the original tree
+        # once, including when the loader requests remove_duplicate=False.
+        yield from self.eager_model.named_modules(memo, prefix,
+                                                  remove_duplicate)
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Use the compiled path only for globally eligible prefill batches."""
         model = (self.compiled_model
                  if get_per_request_prefill_cuda_graph_flag() else
                  self.eager_model)
         return model(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
+        """Delegate model-specific attributes to the original eager model."""
         # Model-specific epilogues (including M3 Eagle3) access embed_tokens
         # and other transformer attributes after the wrapped forward returns.
         try:
@@ -362,6 +378,7 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
+        """Initialize model execution, cache management, and graph configuration."""
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
@@ -6281,6 +6298,7 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
+        """Run the full model under the current batch's compile and graph flags."""
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])

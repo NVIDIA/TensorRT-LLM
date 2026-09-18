@@ -522,6 +522,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
 def test_piecewise_captured_producer_preserves_symbolic_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Retain an unbacked symbolic token count in both fake query outputs."""
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -535,7 +536,12 @@ def test_piecewise_captured_producer_preserves_symbolic_shapes(
         num_tokens = mode.shape_env.create_unbacked_symint()
         hidden = torch.empty((num_tokens, 512), dtype=torch.bfloat16)
         positions = torch.empty((1, num_tokens), dtype=torch.int32)
-        q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(hidden, positions, "3")
+        kv_cache = torch.empty((2, 2, 1, 128, 128), dtype=torch.float8_e4m3fn)
+        index_cache = torch.empty((2, 1, 128, 128), dtype=torch.float8_e4m3fn)
+        slots = torch.empty((4096,), dtype=torch.int32)
+        q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+            hidden, positions, kv_cache, index_cache, slots, "3"
+        )
     for output, width in ((q, 1024), (idx_q, 128)):
         assert output.shape[0].node.expr == num_tokens.node.expr
         assert output.shape[1] == width
@@ -546,6 +552,7 @@ def test_piecewise_captured_producer_preserves_symbolic_shapes(
 def test_piecewise_captures_horizontal_producer_before_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Run the captured producer before eager sparse attention consumes caches."""
     from unittest.mock import Mock
 
     backend = object.__new__(MiniMaxM3MsaSparseAttention)
@@ -554,12 +561,18 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     q = torch.empty((4, 3), dtype=torch.float8_e4m3fn)
     idx_q = torch.empty((4, 1), dtype=torch.float8_e4m3fn)
     output = torch.empty((4, 3), dtype=torch.bfloat16)
-    metadata = SimpleNamespace(num_tokens=2)
+    kv_cache = torch.empty(8, dtype=torch.float8_e4m3fn)
+    index_cache = torch.empty_like(kv_cache)
+    slots = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_tokens=2, msa_layer_cache_tensors={3: (kv_cache, index_cache)}, msa_out_cache_loc=slots
+    )
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
         register_to_config=True,
         attn=backend,
         _emit_fp8_main_qkv=lambda: True,
+        layer_idx=3,
         layer_idx_str="3",
         qkv_proj=Mock(return_value=packed),
         _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=(q, idx_q)),
@@ -578,13 +591,156 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     assert result is output
     layer.qkv_proj.assert_called_once_with(hidden)
     layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once_with(
-        packed, positions, metadata
+        packed, positions, metadata, cache_tensors=(kv_cache, index_cache, slots)
     )
     layer._forward_attention_core.assert_called_once_with(q, None, None, idx_q, None, metadata)
 
 
 @pytest.mark.cpu_only
+def test_piecewise_captured_producer_rejects_unavailable_fusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject unsupported fused geometry without an eager fallback in capture."""
+    from unittest.mock import Mock
+
+    layer = SimpleNamespace(
+        qkv_proj=Mock(side_effect=lambda hidden: hidden.clone()),
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=None),
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (None, layer)
+    )
+    with pytest.raises(RuntimeError) as exc:
+        torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+            torch.zeros(2, 4),
+            torch.arange(2),
+            torch.zeros(4),
+            torch.zeros(4),
+            torch.arange(2, dtype=torch.int32),
+            "3",
+        )
+    assert str(exc.value) == (
+        "MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer."
+    )
+    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("restore_inplace", [False, True])
+def test_piecewise_captured_producer_declares_cache_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+    restore_inplace: bool,
+) -> None:
+    """Real custom-op schema/AOT checks with CPU cache writes in place of CUDA math."""
+    from torch._dynamo.backends.common import aot_autograd
+    from torch._functorch.aot_autograd import make_boxed_func
+    from torch._higher_order_ops.auto_functionalize import (
+        auto_functionalized,
+        auto_functionalized_v2,
+    )
+
+    from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
+
+    def producer(
+        packed: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: object,
+        *,
+        cache_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Emulate native cache writes using only the explicit tensor arguments."""
+        kv_cache, index_cache, slots = cache_tensors
+        # Deliberately use only the explicit caches, not the runtime metadata.
+        valid = slots >= 0
+        indices = slots[valid].long()
+        kv_cache.index_copy_(0, indices, packed[valid, :3].float())
+        index_cache.index_copy_(0, indices, packed[valid, :1].float() + 1)
+        return packed[:, :3].to(torch.float8_e4m3fn), packed[:, :1].to(torch.float8_e4m3fn)
+
+    layer = SimpleNamespace(
+        q_size=3,
+        index_q_size=1,
+        qkv_proj=lambda hidden: hidden + 2,
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=producer,
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (None, layer)
+    )
+    op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer.default
+    assert {
+        arg.name for arg in op._schema.arguments if arg.alias_info and arg.alias_info.is_write
+    } == {"kv_cache", "index_k_cache"}
+    hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    positions = torch.arange(4)
+    kv_cache = torch.zeros(8, 3)
+    index_cache = torch.zeros(8, 1)
+    slots = torch.tensor([1, 3, -1, -1], dtype=torch.int32)
+    args = (hidden, positions, kv_cache, index_cache, slots, "3")
+    assert all(result == "SUCCESS" for result in torch.library.opcheck(op, args).values())
+
+    def run(
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        main: torch.Tensor,
+        index: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Expose query results and immediate observations of both live caches."""
+        q, idx_q = op(hidden, positions, main, index, slots, "3")
+        return q.float(), idx_q.float(), main.clone(), index.clone()
+
+    optimized_graphs = []
+
+    def optimize(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]) -> object:
+        """Apply the production in-place recovery pass and inspect its aliases."""
+        remove_copy_for_mutates_args(gm.graph)
+        gm.graph.lint()
+        gm.recompile()
+        producer_nodes = [node for node in gm.graph.nodes if node.target == op]
+        assert len(producer_nodes) == 1
+        # No full-pool functionalization clones between the graph inputs and
+        # the producer: MSA's eager boundary must observe the original pools.
+        assert producer_nodes[0].kwargs["kv_cache"].op == "placeholder"
+        assert producer_nodes[0].kwargs["index_k_cache"].op == "placeholder"
+        assert all(
+            node.target not in (auto_functionalized, auto_functionalized_v2)
+            for node in gm.graph.nodes
+        )
+        optimized_graphs.append(gm)
+        return make_boxed_func(gm.forward)
+
+    # Match the production backend's functionalization version.
+    monkeypatch.setattr(torch._inductor.config, "enable_auto_functionalized_v2", False)
+    compiled = torch.compile(
+        run,
+        backend=aot_autograd(fw_compiler=optimize) if restore_inplace else "aot_eager",
+        fullgraph=True,
+    )
+    for offset in (0, 4):
+        kv_cache.zero_()
+        index_cache.zero_()
+        q, idx_q, observed_main, observed_index = compiled(
+            hidden + offset, positions, kv_cache, index_cache, slots
+        )
+        packed = hidden + offset + 2
+        expected_main = torch.zeros_like(kv_cache)
+        expected_index = torch.zeros_like(index_cache)
+        expected_main[[1, 3]] = packed[:2, :3]
+        expected_index[[1, 3]] = packed[:2, :1] + 1
+        torch.testing.assert_close(kv_cache, expected_main)
+        torch.testing.assert_close(index_cache, expected_index)
+        torch.testing.assert_close(observed_main, expected_main)
+        torch.testing.assert_close(observed_index, expected_index)
+        torch.testing.assert_close(q, packed[:, :3].to(torch.float8_e4m3fn).float())
+        torch.testing.assert_close(idx_q, packed[:, :1].to(torch.float8_e4m3fn).float())
+        torch.testing.assert_close(slots, torch.tensor([1, 3, -1, -1], dtype=torch.int32))
+    if restore_inplace:
+        assert len(optimized_graphs) == 1
+
+
+@pytest.mark.cpu_only
 def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep index-cache mutation outside capture when projections are separate."""
     from unittest.mock import Mock
 
     backend = object.__new__(MiniMaxM3MsaSparseAttention)

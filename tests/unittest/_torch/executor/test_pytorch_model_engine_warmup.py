@@ -14,6 +14,7 @@ import contextlib
 import os
 import sys
 import unittest
+from collections import OrderedDict
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -25,6 +26,8 @@ import tensorrt_llm
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
@@ -33,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine,
     _ContextOnlyCompiledModel,
 )
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.speculative.utils import update_draft_len
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
@@ -52,6 +56,7 @@ def test_context_only_compile_uses_all_rank_prefill_decision(
     monkeypatch: pytest.MonkeyPatch,
     local_contexts: int,
 ) -> None:
+    """Route using the global prefill decision, regardless of local contexts."""
     eager = torch.nn.Linear(4, 4)
     compiled = torch.nn.Module()
     compiled.shared = eager
@@ -75,6 +80,49 @@ def test_context_only_compile_uses_all_rank_prefill_decision(
 
 
 @pytest.mark.cpu_only
+def test_context_only_compile_preserves_partial_weight_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reload selected weights by original names into both model entry points."""
+    import tensorrt_llm._torch.models.modeling_utils as modeling_utils
+
+    eager = torch.nn.Sequential(OrderedDict(layers=torch.nn.Sequential(torch.nn.Linear(4, 4))))
+    compiled = torch.compile(eager, backend="eager")
+    model = DecoderModelForCausalLM.__new__(DecoderModelForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(tie_word_embeddings=False)
+    model.model = _ContextOnlyCompiledModel(eager, compiled)
+    mapper = HfWeightMapper()
+    mapper._model = model
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.weight_mapper = mapper
+    monkeypatch.setenv("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
+    monkeypatch.setattr(modeling_utils, "local_mpi_rank", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    weight = eager.layers[0].weight
+    old_bias = eager.layers[0].bias.detach().clone()
+    replacement = torch.full_like(weight, 3)
+    for remove_duplicate in (False, True):
+        names = dict(model.named_modules(remove_duplicate=remove_duplicate))
+        assert names["model.layers.0"] is eager.layers[0]
+        assert not any("eager_model" in name or "compiled_model" in name for name in names)
+    loader.reload(model, {"model.layers.0.weight": replacement}, allow_partial_loading=True)
+
+    assert eager.layers[0].weight is weight
+    assert compiled.layers[0].weight is weight
+    torch.testing.assert_close(weight, replacement)
+    torch.testing.assert_close(eager.layers[0].bias, old_bias)
+    inputs = torch.ones(2, 4)
+    for eligible in (False, True):
+        monkeypatch.setattr(
+            model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+        )
+        torch.testing.assert_close(model.model(inputs), inputs @ replacement.t() + old_bias)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("eligible", [False, True])
 @pytest.mark.parametrize("raises", [False, True])
 def test_context_only_compile_scopes_whole_model_forward(
@@ -82,9 +130,11 @@ def test_context_only_compile_scopes_whole_model_forward(
     eligible: bool,
     raises: bool,
 ) -> None:
+    """Keep compile state active through model epilogues and restore it on exit."""
     observed = []
 
     def forward(**kwargs: object) -> str:
+        """Record compile state as a stand-in for a model-specific epilogue."""
         observed.append(is_torch_compiling())
         # This represents work after the transformer, such as Eagle3 drafting.
         if raises:
@@ -899,6 +949,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(engine.forward.call_count, 1)
 
     def test_native_mxfp8_respects_disabled_global_autotuner(self):
+        """Avoid native MXFP8 warmup when the global autotuner is disabled."""
         with (
             patch(
                 "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",

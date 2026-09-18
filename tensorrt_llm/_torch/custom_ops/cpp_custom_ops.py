@@ -15,6 +15,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
+    """Register shape-only implementations for native operators during tracing."""
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
@@ -405,6 +406,7 @@ def _register_fake():
           high: float, attention_factor: float, is_qk_norm: bool,
           use_gemma: bool, use_mrope: bool, mrope_section1: int,
           mrope_section2: int) -> torch.Tensor:
+        """Infer FP8 QKV output geometry while preserving symbolic token counts."""
         del rotary_dim, eps, q_weight, k_weight, base, is_neox, position_ids
         del factor, low, high, attention_factor, is_qk_norm, use_gemma
         del use_mrope, mrope_section1, mrope_section2
@@ -419,6 +421,7 @@ def _register_fake():
           num_heads_v: int, head_dim: int, rotary_dim: int, eps: float,
           q_weight: torch.Tensor, k_weight: torch.Tensor, base: float,
           is_neox: bool, position_ids: torch.Tensor) -> torch.Tensor:
+        """Infer FP8 query geometry without performing the KV-cache write."""
         del kv_cache, out_cache_loc, num_heads_k, num_heads_v, rotary_dim, eps
         del q_weight, k_weight, base, is_neox, position_ids
         return qkv.new_empty((qkv.shape[0], num_heads_q, head_dim),
@@ -433,6 +436,7 @@ def _register_fake():
           k_weight: torch.Tensor, index_q_weight: torch.Tensor,
           index_k_weight: torch.Tensor, rotary_cos_sin: torch.Tensor,
           position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Infer main and index query shapes without mutating either cache."""
         del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
         del eps, q_weight, k_weight, index_q_weight, index_k_weight
         del rotary_cos_sin, position_ids

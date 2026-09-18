@@ -7292,6 +7292,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("use_msa", [False, True])
     def test_nvfp4(self, use_msa):
+        """Check mixed-precision M3 accuracy with MSA or Triton attention."""
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
         # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
         # Triton path keeps the KV cache in BF16.
@@ -7302,6 +7303,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
     def test_nvfp4_piecewise_cuda_graph(
             self, fuse_qkv_index_projection: bool) -> None:
+        """Check PCG accuracy with separate or fused QKV and index projections."""
         self._run_nvfp4(True,
                         piecewise=True,
                         fuse_qkv_index_projection=fuse_qkv_index_projection)
@@ -7311,6 +7313,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                    *,
                    piecewise: bool = False,
                    fuse_qkv_index_projection: bool = False) -> None:
+        """Run the shared four-GPU NVFP4 M3 accuracy workload."""
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"

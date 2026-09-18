@@ -838,36 +838,49 @@ def _minimax_m3_qkv_index_proj_fake(
     return hidden_states.new_empty((hidden_states.shape[0], sum(qkv_proj.local_output_sizes)))
 
 
-@torch.library.custom_op("trtllm::minimax_m3_fused_sparse_qkv_producer", mutates_args=())
+@torch.library.custom_op(
+    "trtllm::minimax_m3_fused_sparse_qkv_producer",
+    mutates_args=("kv_cache", "index_k_cache"),
+)
 def minimax_m3_fused_sparse_qkv_producer(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
+    kv_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
     layer_idx: str,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture projection, norm, RoPE and FP8 cache insertion together."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     packed = attn_layer.qkv_proj(hidden_states)
     result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
-        packed, position_ids, attn_metadata
+        packed,
+        position_ids,
+        attn_metadata,
+        cache_tensors=(kv_cache, index_k_cache, out_cache_loc),
     )
     if result is None:
         raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
-    return list(result)
+    return result
 
 
 @minimax_m3_fused_sparse_qkv_producer.register_fake
 def _minimax_m3_fused_sparse_qkv_producer_fake(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
+    kv_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
     layer_idx: str,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Infer FP8 query shapes while retaining the symbolic token dimension."""
     del position_ids
     _, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = hidden_states.shape[0]
-    return [
+    return (
         hidden_states.new_empty((num_tokens, attn_layer.q_size), dtype=torch.float8_e4m3fn),
         hidden_states.new_empty((num_tokens, attn_layer.index_q_size), dtype=torch.float8_e4m3fn),
-    ]
+    )
 
 
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
@@ -1324,6 +1337,8 @@ class MiniMaxM3Attention(Attention):
         packed: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        *,
+        cache_tensors: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the vLLM-style horizontal producer for every sparse batch.
 
@@ -1369,12 +1384,15 @@ class MiniMaxM3Attention(Attention):
         if any(weight.dtype != torch.bfloat16 or not weight.is_cuda for weight in norm_weights):
             return None
 
-        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
-        if kv_cache_manager is None:
-            return None
-        buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
-        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
-        out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        if cache_tensors is None:
+            kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+            if kv_cache_manager is None:
+                return None
+            buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
+            index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+            out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        else:
+            buffers, index_k_cache, out_cache_loc = cache_tensors
         num_tokens = int(packed.shape[0])
         supported_main_cache = (
             buffers is not None
@@ -1968,8 +1986,16 @@ class MiniMaxM3Attention(Attention):
                 and self._emit_fp8_main_qkv()
                 and self.attn.indexer_kv_dtype == "fp8"
             ):
+                # Metadata stages these zero-copy views before compilation;
+                # tracing the cache manager's native pointer access is unsafe.
+                kv_cache, index_k_cache = attn_metadata.msa_layer_cache_tensors[self.layer_idx]
                 q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
-                    hidden_states, position_ids, self.layer_idx_str
+                    hidden_states,
+                    position_ids,
+                    kv_cache,
+                    index_k_cache,
+                    attn_metadata.msa_out_cache_loc,
+                    self.layer_idx_str,
                 )
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
                 return self.o_proj(o, all_reduce_params=all_reduce_params)
@@ -2044,6 +2070,7 @@ class MiniMaxM3Attention(Attention):
             return q, k, v
 
         def _index_norm_rope():
+            """Project and normalize index queries, with RoPE and cache updates."""
             idx_qk = (
                 packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
             )

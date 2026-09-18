@@ -146,6 +146,7 @@ if IS_FLASHINFER_AVAILABLE:
                                 weight: torch.Tensor,
                                 weight_scale: torch.Tensor,
                                 output_dtype: torch.dtype) -> torch.Tensor:
+            """Run CUTLASS MXFP8 GEMM with row-major weights and swizzled scales."""
             # Argument order mirrors trtllm::mxfp8_mxfp8_gemm: weight arrives as
             # [N, K] and mm_mxfp8 wants [K, N]. Both scale buffers are the 1D
             # padded swizzled CUTLASS layout, hence use_8x4_sf_layout=False.
@@ -161,5 +162,6 @@ if IS_FLASHINFER_AVAILABLE:
         def _(act: torch.Tensor, act_scale: torch.Tensor, weight: torch.Tensor,
               weight_scale: torch.Tensor,
               output_dtype: torch.dtype) -> torch.Tensor:
+            """Infer the GEMM output shape and dtype without invoking FlashInfer."""
             return act.new_empty((act.size(0), weight.size(0)),
                                  dtype=output_dtype)
