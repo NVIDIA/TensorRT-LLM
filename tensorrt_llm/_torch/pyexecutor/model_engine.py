@@ -7,11 +7,12 @@ import gc
 import inspect
 import math
 import os
+import time
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
-                    Union, cast)
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
+                    Tuple, Type, Union, cast)
 
 import torch
 import torch._dynamo.config
@@ -112,6 +113,16 @@ from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
+
+
+@contextmanager
+def _log_warmup_phase(phase: str) -> Iterator[None]:
+    """Report host wall time without adding CUDA synchronization or collectives."""
+    start = time.perf_counter()
+    logger.info(f"[ModelEngine warmup][pid={os.getpid()}] Starting {phase}")
+    yield
+    logger.info(f"[ModelEngine warmup][pid={os.getpid()}] Completed {phase} in "
+                f"{time.perf_counter() - start:.3f}s")
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest,
@@ -1375,6 +1386,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
+    @_log_warmup_phase("model warmup")
     def warmup(self,
                resource_manager: Optional[ResourceManager] = None) -> None:
         """
@@ -1403,7 +1415,8 @@ class PyTorchModelEngine(ModelEngine):
         # CUDA graph capture pass exercises the non-greedy sampler, so with
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
-        warmup_sampling_module()
+        with _log_warmup_phase("FlashInfer sampling module JIT"):
+            warmup_sampling_module()
         if self.enable_in_graph_sampling:
             # The fast tier samples inside the captured graph via a
             # torch.compile'd op; compile it now so capture does not.
@@ -1742,6 +1755,7 @@ class PyTorchModelEngine(ModelEngine):
                 attn_meta.warmup_selfsampling_topk(
                     next_n, batch_sizes=self._cuda_graph_batch_sizes)
 
+    @_log_warmup_phase("general warmup")
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
         """
@@ -1979,6 +1993,7 @@ class PyTorchModelEngine(ModelEngine):
                             f"Failed to reset MoE A2A state on {type(module).__name__}.{attr_name}: {e}"
                         )
 
+    @_log_warmup_phase("TRTLLM-Gen FMHA JIT")
     def _run_attention_warmup(self,
                               resource_manager: ResourceManager,
                               can_run_general_warmup: bool = True) -> None:
@@ -2062,6 +2077,7 @@ class PyTorchModelEngine(ModelEngine):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
+    @_log_warmup_phase("autotuner warmup")
     def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
         from ..custom_ops.torch_custom_ops import (
@@ -2506,6 +2522,7 @@ class PyTorchModelEngine(ModelEngine):
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes
                 for draft_len in draft_lengths]
 
+    @_log_warmup_phase("CUDA graph warmup")
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
         if not (self.cuda_graph_runner.enabled
