@@ -75,7 +75,7 @@ def make_stub_manager(
     mgr._stream = Mock()
     mgr.impl = Mock()
     mgr.impl.probe_reuse.return_value = num_reusable
-    mgr.impl.create_kv_cache.return_value = Mock(num_committed_tokens=0)
+    mgr.impl.create_kv_cache.return_value = Mock(num_committed_tokens=0, beam_width=1)
     # Resume touches real CUDA state; the token marshalling is already done.
     mgr._resume_and_restore = lambda req_id, kv_cache: True
     return mgr

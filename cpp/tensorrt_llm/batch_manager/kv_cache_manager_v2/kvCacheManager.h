@@ -127,13 +127,17 @@ public:
 
     // ---- KvCache creation -------------------------------------------------
 
-    // Create a new KvCache. Returned cache is SUSPENDED; call activate() with a stream.
+    // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.
     // input_tokens:         optional sequence to match against existing cached blocks.
     // priorityCb:           optional priority override per block.
-    // expectedPromptLength: token count marking the prefill->generation boundary; once
-    //                       historyLength reaches it, later capacity growth is recorded as
-    //                       generation-phase allocation stats (defaults to inputTokens.size()).
-    //                       Stats-only: no effect on allocation, reuse, or correctness.
+    // expectedPromptLength: full prompt token count marking the prefill->generation boundary.
+    //                       Beam expansion shares blocks entirely before this boundary and
+    //                       copies the writable tail into each additional beam. For beam search,
+    //                       pass the actual prompt length if inputTokens is absent or shortened
+    //                       for reuse matching. Defaults to non-empty inputTokens.size(); without
+    //                       either value, beam expansion uses a zero shared-prefix boundary.
+    //                       Once historyLength reaches it, later capacity growth is also recorded
+    //                       as generation-phase allocation stats.
     // textOnly:             per-sequence override of the text-only (digest-free) guarantee;
     //                       nullopt inherits the manager config default.
     // enableRequestStats:   collect request-local allocation and reuse statistics even when
@@ -177,6 +181,10 @@ public:
 
     int tokensPerBlock() const noexcept;
     bool enablePartialMatch() const noexcept;
+
+    // Partial commit is independent of partial matching so beam search can
+    // retain full-block reuse without publishing a writable prompt tail.
+    bool enablePartialCommit() const noexcept;
 
     bool commitMinSnapshot() const noexcept
     {
@@ -339,6 +347,16 @@ public:
         mAvgSqrHistoryLength.update(v);
     }
 
+    void updateAvgBeamWidth(double v)
+    {
+        mAvgBeamWidth.update(v);
+    }
+
+    void updateAvgPromptLength(double v)
+    {
+        mAvgPromptLength.update(v);
+    }
+
     void incrementNumSampledKvCaches()
     {
         ++mNumSampledKvCaches;
@@ -414,6 +432,10 @@ private:
     MovingAverage mAvgReusedLength;
     MovingAverage mAvgSqrCapacity;
     MovingAverage mAvgSqrHistoryLength;
+    // Beam search replicates only the blocks past the prompt tail, so the tuner
+    // needs both the typical beam width and where that tail sits.
+    MovingAverage mAvgBeamWidth;
+    MovingAverage mAvgPromptLength;
 
     TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
     TypedVec<PoolGroupIndex, float> mTargetRatioListCold;

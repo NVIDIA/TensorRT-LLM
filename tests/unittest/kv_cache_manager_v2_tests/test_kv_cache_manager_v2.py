@@ -117,6 +117,9 @@ else:
         _introspection,
         _KVCache,
         gen_multimodal_cache_key_tokens,
+        num_live_managers,
+        poison_reason,
+        take_poison,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Hasher
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (

@@ -1018,6 +1018,7 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+    creator._is_disagg = False
 
     if expected is None:
         assert (

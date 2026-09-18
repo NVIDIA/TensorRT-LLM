@@ -829,6 +829,10 @@ class KVCacheManager:
         return self._init_config.enable_partial_reuse
 
     @property
+    def enable_partial_commit(self) -> bool:
+        return self._init_config.enable_partial_commit
+
+    @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self._init_config.enable_swa_scratch_reuse
 

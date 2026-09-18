@@ -208,6 +208,8 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    beam_width: int = 1
+    prompt_length: int = 0
 
 @dataclass(slots=True)
 class BatchDesc:
@@ -237,6 +239,7 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    enable_partial_commit: bool = True
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -385,7 +388,15 @@ class _KVCache:
     @property
     def beam_width(self) -> BeamIndex: ...
     @beam_width.setter
-    def beam_width(self, beam_width: BeamIndex) -> None: ...
+    def beam_width(self, beam_width: BeamIndex) -> None:
+        """Expand before the first generation step, never during generation (C++ only).
+
+        First resume the cache and materialize prompt storage (or prepare synthetic
+        warmup state). Full prompt blocks are shared; the writable tail, including
+        preallocated blocks, is copied using the boundary set by
+        ``expected_prompt_length`` at cache creation.
+        """
+        ...
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
@@ -571,7 +582,17 @@ class KVCacheManager:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
-    ) -> _KVCache: ...
+    ) -> _KVCache:
+        """Create a suspended cache with a prefill-to-generation boundary.
+
+        On the C++ backend, ``expected_prompt_length`` also determines which full
+        prompt blocks are shared by beams. Pass the actual full prompt length for
+        beam search if ``input_tokens`` is absent or shortened for reuse matching.
+        It defaults to the non-empty input length; without either value, the beam
+        sharing boundary is zero and the statistics boundary is unset. When set,
+        it also marks generation-phase allocation stats.
+        """
+        ...
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,
@@ -620,6 +641,8 @@ class KVCacheManager:
     def allow_seq_rebasing(self) -> bool: ...
     @property
     def enable_partial_match(self) -> bool: ...
+    @property
+    def enable_partial_commit(self) -> bool: ...
     def supports_index_mode(self, mode: PageIndexMode) -> bool | None: ...
     @property
     def num_layers(self) -> int: ...

@@ -86,7 +86,8 @@ struct SeqBlock
         bool ret = treeBlock != nullptr;
         if (TLLM_UNLIKELY(gDebug))
         {
-            // When committed: must have 1 beam, all non-null pages must be CommittedPage.
+            // When committed: must have one canonical beam, and all non-null
+            // pages must be CommittedPage.
             if (ret)
             {
                 TLLM_CHECK(pages.size() == BeamIndex{1});
@@ -217,6 +218,8 @@ public:
 
     // Commit tokens: finalises the oldest uncommitted block and makes it
     // available for reuse by other KvCaches.
+    // For beam search, tokens must already be finalized and their KV data must
+    // be in beam 0. Committing a full block releases the other beam pages.
     // is_end: if true, records a final reusable snapshot and stops committing.
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
@@ -365,6 +368,16 @@ public:
     {
         return mBeamWidth;
     }
+
+    // Beam widths greater than one are generation-only. Before increasing the
+    // width, the caller must resume the cache and materialize prompt storage
+    // (or prepare synthetic warmup state). Expansion must happen before the first
+    // generation step, never during generation. Full prompt blocks remain unmapped
+    // for new beams and are shared through cache indirection; the writable tail,
+    // including preallocated blocks, is copied from beam 0. The boundary is
+    // expectedPromptLength from createKvCache(). Decreasing the width discards
+    // the removed alternatives.
+    void setBeamWidth(BeamIndex beamWidth);
 
     CUstream cudaStream() const;
 
@@ -537,6 +550,8 @@ private:
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
+    void _truncateBlockBeams(SeqBlock& block, BeamIndex beamWidth);
+    void _appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth);
 
     // Release stale held uncommitted pages for SWA layers after committing stops.
     // Mirrors Python's _on_stop_committing().
