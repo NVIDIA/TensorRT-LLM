@@ -9,6 +9,14 @@ IS_CUTLASS_DSL_AVAILABLE = False
 # existing fallback paths.
 # TODO: flips to True once a Rubin-capable CuTe DSL package ships in the image.
 IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
+# The Rubin fused FC1+FC2 MoE kernel (cute_dsl_kernels/rubin/moe/
+# rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py) needs a newer CuTe
+# DSL build than the bare rubin_helpers probe guarantees: it reaches
+# ``cutlass.memory`` / ``cutlass.tensor_utils`` as real submodules, and older
+# builds (e.g. 0.3.0+20260518) that lack them also miscompile its MXFP8
+# block-scaled path even when the attribute access is shimmed. Treat the
+# presence of both submodules as the capability marker for that kernel.
+IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE = False
 
 if platform.system() != "Windows":
     try:
@@ -24,6 +32,20 @@ if platform.system() != "Windows":
         else:
             logger.info("cutlass dsl Rubin helpers are available")
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
+
+        if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            try:
+                import cutlass.memory  # noqa
+                import cutlass.tensor_utils  # noqa
+                logger.info(
+                    "cutlass dsl supports the Rubin fused FC12 MoE kernel"
+                )
+                IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE = True
+            except ImportError:
+                logger.info(
+                    "cutlass dsl build is too old for the Rubin fused "
+                    "FC12 MoE kernel (no cutlass.memory / cutlass.tensor_utils); "
+                    "MXFP8 CuTe DSL MoE is disabled")
     except ImportError:
         pass
 

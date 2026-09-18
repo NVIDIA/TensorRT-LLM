@@ -702,6 +702,28 @@ def should_skip_cutedsl(
 
     intermediate_size = model_config.intermediate_size
 
+    # MXFP8 is served by the Rubin fused FC1+FC2 CuTe DSL kernel, whose
+    # geometry is fixed: the FC1 scale-factor gather reads 16-byte chunks
+    # (16 UE8M0 scales x 32 elements = 512 K elements per row), the FC2 K /
+    # FC1 N extents must be whole 128-wide MMA tiles, and the gate/up
+    # interleave needs a 128-aligned expanded intermediate. Mirrors the
+    # checks in MXFP8CuteDslFusedMoEMethod.create_weights and the fused op.
+    if quant_algo == QuantAlgo.MXFP8:
+        hidden_size = model_config.hidden_size
+        per_shard = intermediate_size // moe_tp_size if moe_tp_size > 1 else intermediate_size
+        if hidden_size % 512 != 0:
+            return (
+                f"CuteDslFusedMoE MXFP8: hidden_size={hidden_size} must be a "
+                "multiple of 512 (16-byte FC1 scale-factor gather in the fused "
+                "FC12 kernel)."
+            )
+        if per_shard % 128 != 0:
+            return (
+                f"CuteDslFusedMoE MXFP8: per-shard intermediate_size={per_shard} "
+                "must be a multiple of 128 (fused FC12 kernel MMA tile / gate-up "
+                "interleave)."
+            )
+
     # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
     # at i=14336, threshold 3%). Both CuteDSL and reference have FP4 intermediate
     # storage, but produce DIFFERENT FP4 values due to:

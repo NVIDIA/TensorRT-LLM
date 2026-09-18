@@ -533,12 +533,11 @@ class FusedMoEMethodBase(ABC):
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
         if allow_partial_loading:
-            if not isinstance(self,
-                              (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
-                               NVFP4FusedMoEMethod,
-                               MXFP8CutlassFusedMoEMethod)):
+            if not isinstance(
+                    self, (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           NVFP4FusedMoEMethod, MXFP8CutlassFusedMoEMethod)):
                 raise NotImplementedError(
                     f"Partial loading is not supported for {type(self).__name__}"
                 )
@@ -6618,7 +6617,8 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                 w1_sf, w3_sf, w2_sf = None, None, None
                 gate_up_sf = weights.get("gate_up_proj_weight_scale")
                 if gate_up_sf is not None:
-                    w1_w3_sf = gate_up_sf[expert_id].transpose(0, 1).contiguous()
+                    w1_w3_sf = gate_up_sf[expert_id].transpose(0,
+                                                               1).contiguous()
                     w1_sf, w3_sf = w1_w3_sf.chunk(2, dim=0)
                 down_sf = weights.get("down_proj_weight_scale")
                 if down_sf is not None:
@@ -6704,6 +6704,120 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
             for local_slot_id in sorted(pending):
                 self._swizzle_slot_scale(scale_data, local_slot_id)
             pending.clear()
+
+
+class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
+    """MXFP8 weights for the Rubin (SM107) fused FC1+FC2 CuTe DSL MoE kernel.
+
+    Parameter storage, checkpoint loading, and the deferred 128x4 block-scale
+    swizzle are inherited from ``MXFP8CutlassFusedMoEMethod``: the fused
+    kernel views its weight scales through ``tile_atom_to_shape_SF``, whose
+    byte layout for a ``[rows, K/32]`` UE8M0 matrix is exactly what
+    ``block_scale_interleave`` produces (the NVFP4 CuTe DSL path relies on the
+    same equivalence with vector size 16).
+
+    The one additional transform is the SwiGLU gate/up interleave of the FC1
+    weight *and* its block scales at granularity 64 along the expanded
+    intermediate dim: the fused epilogue reads the accumulator as
+    ``[up 0:64, gate 64:128, up 128:192, ...]``, i.e. the ``[w3, w1]`` halves
+    interleaved, the same layout ``NVFP4CuteDslFusedMoEMethod`` prepares.
+
+    Like the swizzle, the interleave is a non-involutive read-modify-write, so
+    it is staged per local slot and applied exactly once in
+    ``process_weights_after_loading``: RLHF partial refit streams weights
+    bucket by bucket and its finalize walk calls both post-load hooks.
+    """
+    # The fused kernel gathers per-token FC1 scales in 16-byte chunks, i.e.
+    # 16 UE8M0 scales covering 16 * 32 = 512 K elements per row.
+    FC1_K_ALIGNMENT = 16 * MXFP8CutlassFusedMoEMethod.BLOCK_SIZE
+    # Gate/up interleave granularity expected by the fused SwiGLU epilogue.
+    INTERLEAVE_GROUP_SIZE = 64
+
+    def create_weights(self, module: torch.nn.Module):
+        if module.hidden_size % self.FC1_K_ALIGNMENT != 0:
+            raise ValueError(
+                f"hidden_size={module.hidden_size} must be a multiple of "
+                f"{self.FC1_K_ALIGNMENT} for the CuTe DSL MXFP8 fused FC12 "
+                "MoE kernel (16-byte FC1 scale-factor gather).")
+        super().create_weights(module)
+        if module.expand_intermediate_size_per_partition % (
+                2 * self.INTERLEAVE_GROUP_SIZE) != 0:
+            raise ValueError(
+                "expand_intermediate_size_per_partition="
+                f"{module.expand_intermediate_size_per_partition} must be a "
+                f"multiple of {2 * self.INTERLEAVE_GROUP_SIZE} for the CuTe "
+                "DSL MXFP8 gate/up interleave.")
+        # Local slots whose staged FC1 weight bytes still owe the gate/up
+        # interleave. Mirrors ``_mxfp8_w3_w1_sf_pending_slots`` in the parent.
+        module._cute_dsl_mxfp8_w3_w1_interleave_pending = set()
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False,
+                                 expert_idx: int = -1):
+        # Stage the plain [w3, w1] concat; the interleave is deferred (see the
+        # class docstring). Arm the slot only when FC1 bytes actually arrive so
+        # a down_proj-only bucket cannot re-interleave a finalized slot.
+        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                         dst_w3_w1_weight,
+                                         allow_partial_loading)
+        if (w1_weight is not None or w3_weight is not None) and expert_idx >= 0:
+            module._cute_dsl_mxfp8_w3_w1_interleave_pending.add(expert_idx)
+
+    @classmethod
+    def _interleave_w3_w1_weight(cls, dst_w3_w1_weight: torch.Tensor) -> None:
+        """Interleave one slot's [2N, K] e4m3 FC1 weight in place."""
+        w3_w1_u8 = dst_w3_w1_weight.view(torch.uint8)
+        w3_w1_u8.copy_(
+            interleave_linear_and_gate(w3_w1_u8,
+                                       group_size=cls.INTERLEAVE_GROUP_SIZE,
+                                       dim=0))
+
+    def _interleave_w3_w1_weight_scale(
+            self, module: torch.nn.Module,
+            dst_w3_w1_weight_scale: torch.Tensor) -> None:
+        """Interleave one slot's swizzled [2N, K/32] UE8M0 block scales.
+
+        The slot is stored int32-packed and already swizzled by the parent, so
+        unswizzle -> interleave rows -> swizzle, then write the same bytes back
+        through the int32 view.
+        """
+        rows = module.expand_intermediate_size_per_partition
+        k = module.hidden_size
+        sf_u8 = dst_w3_w1_weight_scale.view(torch.uint8)
+        unswizzled = unswizzle_sf(sf_u8, rows, k,
+                                  self.BLOCK_SIZE).view(rows,
+                                                        k // self.BLOCK_SIZE)
+        interleaved = interleave_linear_and_gate(
+            unswizzled, group_size=self.INTERLEAVE_GROUP_SIZE, dim=0)
+        swizzled = swizzle_sf(interleaved, rows, k, self.BLOCK_SIZE)
+        dst_w3_w1_weight_scale.copy_(
+            swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(
+                dst_w3_w1_weight_scale.shape))
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        # Snapshot the scale slots the parent is about to swizzle: those are
+        # exactly the slots whose FC1 scales were (re)staged and therefore owe
+        # the interleave once the swizzle has been applied.
+        scale_slots = set(
+            getattr(module, "_mxfp8_w3_w1_sf_pending_slots", ()) or ())
+        super().process_weights_after_loading(module)
+
+        weight_slots = getattr(module,
+                               "_cute_dsl_mxfp8_w3_w1_interleave_pending", None)
+        if weight_slots:
+            weight_data = module.w3_w1_weight.data
+            for local_slot_id in sorted(weight_slots):
+                self._interleave_w3_w1_weight(weight_data[local_slot_id])
+            weight_slots.clear()
+        if scale_slots:
+            scale_data = module.w3_w1_weight_scale.data
+            for local_slot_id in sorted(scale_slots):
+                self._interleave_w3_w1_weight_scale(module,
+                                                    scale_data[local_slot_id])
 
 
 # Serializes the duplicate-check + slot-claim step of

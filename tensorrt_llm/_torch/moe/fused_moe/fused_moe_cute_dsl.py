@@ -28,6 +28,7 @@ from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
 from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from ...cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                               IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ...locality_domain.autotune import \
     LocalityDomainConcurrentTunableRunner as \
@@ -52,6 +53,7 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
 from .impl_environment import MoEDep
 from .interface import _reject
 from .quantization import (BF16CuteDslFusedMoEMethod, MoEWeightLoadingMode,
+                           MXFP8CuteDslFusedMoEMethod,
                            NVFP4CuteDslFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
@@ -655,6 +657,123 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
         )
 
 
+class CuteDslFusedMoEMxfp8Runner(TunableRunner):
+    """Autotuner runner for MXFP8 MoE on Rubin (SM107).
+
+    Selects the routing tile size from {128, 256} and delegates to
+    ``run_moe_mxfp8_impl``, which drives the single fused FC1+FC2 CuTe DSL
+    kernel. The fused kernel has no B-reuse geometry, so the routing tile is
+    exactly the MMA tile M: 128 (1-CTA MMA) or 256 (2-CTA MMA).
+    """
+    tuning_config_cache = dict()
+
+    def __init__(self,
+                 forward_impl: Callable,
+                 num_experts: int,
+                 top_k: int,
+                 num_local_experts: int,
+                 local_expert_offset: int,
+                 enable_alltoall: bool = False,
+                 output_dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.forward_impl = forward_impl
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.enable_alltoall = enable_alltoall
+        assert output_dtype == torch.bfloat16
+        self.output_dtype = output_dtype
+
+    def unique_id(self):
+        return (
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            self.enable_alltoall,
+            self.output_dtype,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        return self._tile_sizes()
+
+    @staticmethod
+    def _tile_sizes() -> List[int]:
+        return [128, 256]
+
+    def get_tuning_config(self) -> TuningConfig:
+        key = self.unique_id()
+        if key not in self.__class__.tuning_config_cache:
+            # The helper only regenerates token_selected_experts, so the
+            # NVFP4 helper serves the MXFP8 inputs unchanged.
+            helper = CuteDslFusedMoENvfp4InputsHelper(self.num_experts,
+                                                      self.top_k,
+                                                      self.num_local_experts,
+                                                      self.local_expert_offset)
+            # MXFP8 inputs: [x, token_selected_experts, token_final_scales,
+            #                x_sf, moe_output]
+            self.__class__.tuning_config_cache[key] = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(
+                    ConstraintSpec(1, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(2, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(3, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(4, 0, helper.infer_shape_num_tokens),
+                ),
+                inputs_pre_hook=helper.inputs_pre_hook,
+                use_cold_l2_cache=True,
+            )
+        return self.__class__.tuning_config_cache[key]
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: Optional[int],
+                do_preparation: bool = False) -> torch.Tensor:
+        if do_preparation:
+            # See the NVFP4 runner: the nested fused-kernel tuning must
+            # complete before the outer tile is profiled under CUDA graph
+            # capture.
+            for tile_size in self._tile_sizes():
+                self.forward_impl(*inputs,
+                                  enable_alltoall=self.enable_alltoall,
+                                  tile_size=tile_size)
+            return inputs[4]
+
+        if isinstance(tactic, int) and tactic > 0:
+            tile_size = tactic
+        else:
+            tile_size = 128
+        return self.forward_impl(*inputs,
+                                 enable_alltoall=self.enable_alltoall,
+                                 tile_size=tile_size)
+
+    @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
+    @staticmethod
+    def runner_tactic_comb_checker(
+            comb: List[Tuple[TunableRunner, Any]]) -> bool:
+        # The fused FC12 runner's tactic starts with mma_tiler, whose M must
+        # equal the outer routing tile.
+        checked_runner_types = []
+        if IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
+            from ...custom_ops.cute_dsl_custom_ops import \
+                Sm107Mxfp8FusedFc12MoeRunner
+            checked_runner_types.append(Sm107Mxfp8FusedFc12MoeRunner)
+
+        return _runner_tactics_match_tile_size(
+            comb,
+            CuteDslFusedMoEMxfp8Runner,
+            tuple(checked_runner_types),
+        )
+
+
 class CuteDslFusedMoE(MoEImplBase):
     # CuteDSL dispatch/combine path exercises the ceil/floor partition
     # (NVLinkOneSided alltoall with kernel-level remainder handling), so this
@@ -739,7 +858,8 @@ class CuteDslFusedMoE(MoEImplBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103, bfloat16 activations."""
+        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103/SM107; BF16 and MXFP8
+        (fused FC1+FC2 kernel) on SM107."""
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
@@ -819,6 +939,22 @@ class CuteDslFusedMoE(MoEImplBase):
                 return rejection
             return MoEEligibility.ok()
 
+        # MXFP8 (W8A8 e4m3 x e4m3, UE8M0 1x32 block scales) - SM107 only,
+        # served by the fused FC1+FC2 CuTe DSL kernel.
+        if quant_algo == QuantAlgo.MXFP8:
+            if sm_version != 107:
+                return _reject(
+                    MoERejectReason.SM_UNSUPPORTED,
+                    f"CuteDslFusedMoE MXFP8 requires SM107 (Rubin), got "
+                    f"SM{sm_version}")
+            if not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
+                return _reject(
+                    MoERejectReason.DEP_MISSING,
+                    "MXFP8 on SM107 (Rubin) requires a CuTE DSL internal build "
+                    "that supports the fused FC12 MoE kernel (cutlass.memory / "
+                    "cutlass.tensor_utils submodules; e.g. 0.3.0+20260803 or "
+                    "newer)")
+            return MoEEligibility.ok()
         # FP8_BLOCK_SCALES lands here on purpose. ``run_moe_fp8_block_scales``
         # exists, but its GEMM is ``cute_dsl_fp8_group_blockwise_gemm_ref`` --
         # an fp32 einsum-per-expert reference, not a CuteDSL kernel -- so
@@ -936,6 +1072,10 @@ class CuteDslFusedMoE(MoEImplBase):
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CuteDslFusedMoEMethod()
+            if self.quant_config.layer_quant_mode.has_mxfp8():
+                # Cutlass MXFP8 storage/swizzle + the gate/up interleave the
+                # fused FC12 kernel expects.
+                return MXFP8CuteDslFusedMoEMethod()
         elif get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             # Unquantized on SM107: the BF16 method interleaves FC1 weights for
             # the fused gather + grouped GEMM + SwiGLU kernel, which serves no
@@ -945,11 +1085,11 @@ class CuteDslFusedMoE(MoEImplBase):
                     "Unquantized CuteDslFusedMoE fuses SwiGLU only, got "
                     f"{ActivationType(self.activation_type).name}")
             return BF16CuteDslFusedMoEMethod()
-        # ``can_implement`` admits NVFP4, plus unquantized BF16 on SM107, so
-        # selection never lands here. Raise rather than fall back: any other
-        # method owns a weight layout these kernels cannot read.
+        # ``can_implement`` admits NVFP4, MXFP8 on SM107 and unquantized BF16 on
+        # SM107, so selection never lands here. Raise rather than fall back: any
+        # other method owns a weight layout these kernels cannot read.
         raise ValueError(
-            f"CuteDslFusedMoE only supports NVFP4, got {self.quant_config}")
+            f"CuteDslFusedMoE only supports NVFP4 or MXFP8, got {self.quant_config}")
 
     def _supports_load_balancer(self) -> bool:
         return True
@@ -960,8 +1100,8 @@ class CuteDslFusedMoE(MoEImplBase):
             assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
 
     def supports_moe_output_in_alltoall_workspace(self):
-        return self.has_nvfp4 or (not self.has_any_quant
-                                  and get_sm_version() == 107)
+        return self.has_nvfp4 or self.has_mxfp8 or (not self.has_any_quant
+                                                    and get_sm_version() == 107)
 
     def can_use_deep_ep_direct_metadata(
             self, supports_post_quant_dispatch: bool) -> bool:
@@ -991,6 +1131,7 @@ class CuteDslFusedMoE(MoEImplBase):
         - scaling_vector_size is typically the group size for block-wise quantization
         """
         x_sf = None
+        sf_vec_size = self.scaling_vector_size
         if self.has_nvfp4:
             if isinstance(x, Fp4QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
@@ -1001,6 +1142,15 @@ class CuteDslFusedMoE(MoEImplBase):
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
                     x, self.fc31_input_scale, self.scaling_vector_size, False,
                     False)
+        elif self.has_mxfp8:
+            # Dynamic MXFP8 activation quantization (e4m3 + UE8M0 1x32 block
+            # scales). The fused FC12 kernel gathers the per-token scales row
+            # by row, so they are always produced in the linear layout; the
+            # same layout is what post-quant communication transports.
+            x_row = x.shape[0]
+            sf_vec_size = self.quant_method.BLOCK_SIZE
+            x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                x, False, alignment=self.quant_method.weight_alignment)
         elif self.has_deepseek_fp8_block_scales:
             # FP8 block scales doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe_fp8_block_scales.
@@ -1017,8 +1167,7 @@ class CuteDslFusedMoE(MoEImplBase):
             # ``view(0, -1)`` is ambiguous for an empty micro-batch. The
             # scale width is fixed by the logical hidden size, so spell it
             # out for both empty and non-empty inputs.
-            scale_cols = (self.hidden_size + self.scaling_vector_size -
-                          1) // self.scaling_vector_size
+            scale_cols = (self.hidden_size + sf_vec_size - 1) // sf_vec_size
             x_sf = x_sf.view(x_row, scale_cols)
         return x, x_sf
 
@@ -1363,6 +1512,184 @@ class CuteDslFusedMoE(MoEImplBase):
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 topk_scales=token_final_scales,
             )
+        return moe_output
+
+    def _mxfp8_fused_fc12_constants(
+            self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the (per-expert alpha, FC1 norm const) inputs of the kernel.
+
+        MXFP8 carries all scaling in the UE8M0 block scales, so both the
+        per-expert dequantization alphas and the FC1 output normalization
+        constant are exactly 1. They are kernel inputs nonetheless (the
+        kernel is shared with NVFP4), so keep one cached copy per module
+        rather than allocating on every forward.
+        """
+        num_local_experts = self.expert_size_per_partition
+        cached = getattr(self, "_mxfp8_fused_fc12_consts", None)
+        if (cached is None or cached[0].device != device
+                or cached[0].numel() != num_local_experts):
+            cached = (
+                torch.ones(num_local_experts,
+                           dtype=torch.float32,
+                           device=device),
+                torch.ones(1, dtype=torch.float32, device=device),
+            )
+            self._mxfp8_fused_fc12_consts = cached
+        return cached
+
+    def run_moe_mxfp8(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+        moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: bool = False,
+    ) -> torch.Tensor:
+        """Autotuner wrapper for MXFP8 MoE on Rubin (SM107).
+
+        The whole expert computation (gather, FC1, SwiGLU, MXFP8 requant, FC2,
+        top-k finalize) runs in one fused CuTe DSL kernel, so this path has no
+        separate FC1/FC2 ops and always finalizes in-kernel.
+        """
+        assert self.has_mxfp8
+        assert x_sf is not None, "MXFP8 MoE requires the activation block scales"
+        if self.activation_type != ActivationType.Swiglu:
+            raise NotImplementedError(
+                "CuteDSL MXFP8 fused FC12 MoE supports SwiGLU only; "
+                f"got {self.activation_type.name}")
+        if not self.use_fused_finalize:
+            raise NotImplementedError(
+                "CuteDSL MXFP8 fused FC12 MoE always finalizes in-kernel; "
+                "use_fused_finalize=False is not supported.")
+        if self._locality_domain_runtime is not None:
+            raise NotImplementedError(
+                "CuteDSL MXFP8 fused FC12 MoE does not support locality "
+                "domain execution.")
+        output_dtype = torch.bfloat16
+
+        if moe_output is None:
+            moe_output = torch.empty(
+                (token_final_scales.size(0), self.hidden_size),
+                dtype=output_dtype,
+                device=x.device)
+        else:
+            assert moe_output.size() == (token_final_scales.size(0),
+                                         self.hidden_size)
+            assert moe_output.dtype == output_dtype
+
+        # Empty micro-batches are valid at the backend boundary. Avoid
+        # entering autotuning because its synthetic grouped-GEMM inputs
+        # require at least one output row.
+        if token_selected_experts.size(0) == 0:
+            return moe_output
+
+        effective_top_k = token_selected_experts.size(-1)
+        tuner = AutoTuner.get()
+        runner = CuteDslFusedMoEMxfp8Runner(
+            forward_impl=self.run_moe_mxfp8_impl,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+            enable_alltoall=enable_alltoall,
+        )
+        inputs = [
+            x, token_selected_experts, token_final_scales, x_sf, moe_output
+        ]
+        _, best_tactic = tuner.choose_one(
+            "CuteDslFusedMoE::run_moe_mxfp8",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        return runner(inputs, tactic=best_tactic)
+
+    def run_moe_mxfp8_impl(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: torch.Tensor,
+        moe_output: torch.Tensor,
+        enable_alltoall: bool = False,
+        tile_size: int = 128,
+    ) -> torch.Tensor:
+        """MXFP8 MoE via the fused FC1+FC2 CuTe DSL kernel (Rubin)."""
+        effective_top_k = token_selected_experts.size(1)
+        esp = self.expert_size_per_partition
+        slot_start = self.slot_start
+
+        tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            local_expert_offset=slot_start,
+            local_num_experts=esp,
+            tile_tokens_dim=tile_size,
+        )
+
+        # The fused finalize scatter-adds into moe_output, so the rows this
+        # rank produces must be zero on entry. Overlap the sparse memset with
+        # the routing metadata on the aux stream when one is available.
+        memset_kwargs = dict(
+            input=moe_output,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_tokens_dim=tile_size,
+            top_k=effective_top_k,
+            ep_size=self.mapping.moe_ep_size,
+            enable_alltoall=enable_alltoall,
+        )
+        has_aux_streams = self._has_moe_output_memset_aux_stream()
+        if has_aux_streams:
+            memset_stream = self._moe_output_memset_run_stream()
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(memset_stream)
+            with torch.cuda.stream(memset_stream):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
+                self.event_dict[EventType.MoeOutputMemset].record()
+            self.event_dict[EventType.MoeOutputMemset].wait()
+        else:
+            torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
+
+        fc_alpha, fc1_norm_const = self._mxfp8_fused_fc12_constants(x.device)
+        # The block scales are stored int32-packed (4 UE8M0 per int32 along
+        # K); the kernel reads them as a [E, N, K/32] byte matrix.
+        fc1_weight_scale = self.quant_scales.fc31_weight_block_scale.view(
+            torch.uint8)
+        fc2_weight_scale = self.quant_scales.fc2_weight_block_scale.view(
+            torch.uint8)
+        swiglu_limit = (self.swiglu_limit_scalar
+                        if self.swiglu_limit_scalar != float("inf") else -1.0)
+
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            input=x,
+            fc1_weight=self.w3_w1_weight,
+            input_scale=x_sf,
+            fc1_weight_scale=fc1_weight_scale,
+            fc1_alpha=fc_alpha,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            fc1_norm_const=fc1_norm_const,
+            fc2_weight=self.w2_weight,
+            fc2_weight_scale=fc2_weight_scale,
+            fc2_alpha=fc_alpha,
+            output=moe_output,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=esp,
+            local_expert_offset=slot_start,
+            tile_size=tile_size,
+            swiglu_limit=swiglu_limit,
+        )
         return moe_output
 
     def run_moe_bf16(
@@ -1954,6 +2281,15 @@ class CuteDslFusedMoE(MoEImplBase):
                 recv_expert_count=plan.recv_expert_count,
                 deep_ep_expert_capacity=plan.deep_ep_expert_capacity,
                 use_deep_ep_direct_metadata=plan.use_deep_ep_direct_metadata,
+            )
+        elif self.has_mxfp8:
+            result = self.run_moe_mxfp8(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf,
+                moe_output=moe_output,
+                enable_alltoall=enable_alltoall,
             )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(
