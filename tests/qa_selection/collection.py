@@ -87,30 +87,43 @@ class SelectionOptions:
         group.addoption(
             "--machine",
             dest=cls.MACHINE,
+            metavar="NAME",
             default=None,
             choices=cls.machine_choices(),
-            help="target machine to select for; absent leaves collection untouched",
+            help="target machine to select for, from the profile catalogue. "
+            "Absent leaves collection untouched, so loading this plugin "
+            "without it changes nothing",
         )
         group.addoption(
             "--gpus",
             dest=cls.GPUS,
+            metavar="N",
             type=int,
             default=None,
-            help="GPUs to select for: a rung of --ladder, or a feasibility "
-            "ceiling without one (default: the machine's GPUs per node)",
+            help="GPUs to select for. With --ladder this names a rung and "
+            "selects the tests assigned to that allocation, which includes "
+            "the smaller ones between it and the rung below. Without "
+            "--ladder it is a feasibility ceiling: everything that fits in N. "
+            "Must not exceed the machine's GPUs per node (the default)",
         )
         group.addoption(
             "--ladder",
             dest=cls.LADDER,
+            metavar="RUNGS",
             default=None,
-            help="ascending allocation sizes, e.g. 1,4,8; partitions the output",
+            help="ascending allocation sizes, comma separated, e.g. 1,4,8. "
+            "Partitions the output into one list per rung, and turns --gpus "
+            "into a rung selector. No rung may exceed the machine's GPUs per node",
         )
         group.addoption(
             "--selection-out-dir",
             dest=cls.OUT_DIR,
+            metavar="DIR",
             default=None,
-            help="where to write the record and the identifier lists; "
-            "must be passed as --selection-out-dir=PATH",
+            help="write <machine>.json and the .ids lists here, creating the "
+            "directory if needed. Absent writes nothing. Cannot be combined "
+            "with both --gpus and --ladder: that rung's list is already one "
+            "of the files written without --gpus",
         )
 
     @classmethod
