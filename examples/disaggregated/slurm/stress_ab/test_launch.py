@@ -42,6 +42,13 @@ from pathlib import Path
 args = sys.argv[1:]
 output = Path(args[args.index('--output') + 1])
 arm = args[args.index('--order') + 1]
+if os.environ['TEST_MODE'] == 'profile':
+    profile = Path(args[args.index('--profile') + 1])
+    if json.loads(profile.read_text()).get('name') != 'current':
+        sys.exit(2)
+    script = next(value for value in args if value.endswith('/run_ab.py'))
+    if '/runner/' not in script or args[args.index('--harness') + 1].endswith('/runner'):
+        sys.exit(2)
 with (output.parent / 'calls.txt').open('a') as stream:
     stream.write(arm + '\\n')
 if os.environ['TEST_MODE'] == 'launch_error':
@@ -68,6 +75,8 @@ sys.exit(1 if status == 'fail' else 0)
             provenance.touch()
             run = root / "run"
             env = dict(os.environ)
+            for name in ("AB_PROFILE", "AB_RUNNER_ROOT", "AB_TRIAL_TIMEOUT"):
+                env.pop(name, None)
             env.update(
                 AB_PROJECT_ROOT=str(root),
                 AB_HARNESS=str(harness),
@@ -83,6 +92,14 @@ sys.exit(1 if status == 'fail' else 0)
                 PATH=f"{binaries}:{os.environ['PATH']}",
                 TEST_MODE=mode,
             )
+            if mode == "profile":
+                profile = root / "profile.json"
+                profile.write_text(json.dumps({"name": "current"}))
+                runner = root / "runner"
+                runner_scripts = runner / "examples/disaggregated/slurm/stress_ab"
+                runner_scripts.mkdir(parents=True)
+                shutil.copy2(SCRIPTS / "summarize.py", runner_scripts)
+                env.update(AB_PROFILE=str(profile), AB_RUNNER_ROOT=str(runner))
             result = subprocess.run(
                 ["bash", str(SCRIPTS / "launch.slurm")],
                 env=env,
@@ -111,6 +128,12 @@ sys.exit(1 if status == 'fail' else 0)
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 4)
         self.assertEqual(summary["counts"]["control"]["fail"], 2)
+
+    def test_profile_uses_separate_runner_and_common_test_checkout(self):
+        code, calls, summary = self._launch("profile")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(summary["status"], "pass")
 
     def test_srun_exit_one_without_evidence_stops_matrix(self):
         code, calls, summary = self._launch("launch_error")

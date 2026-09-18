@@ -37,12 +37,20 @@ set -Eeuo pipefail
 [[ $AB_IMAGE_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Invalid image digest' >&2; exit 2; }
 [[ $AB_IMAGE =~ ^[a-zA-Z0-9._/-]+:[a-zA-Z0-9._-]+$ ]] || { echo 'Use a registry/repository:tag image' >&2; exit 2; }
 [[ ! -e $AB_RUN_ROOT ]] || { echo 'Run directory already exists; refusing to overwrite' >&2; exit 2; }
-for path in "$AB_PROJECT_ROOT" "$AB_HARNESS" "$AB_WHEEL" "$AB_PROVENANCE" "$AB_PYTHON" "$AB_MODELS_ROOT" "$AB_RUN_ROOT"; do
+runner_root=${AB_RUNNER_ROOT:-$AB_HARNESS}
+profile_args=()
+if [[ -n ${AB_PROFILE:-} ]]; then
+    [[ -f $AB_PROFILE && $AB_PROFILE == "$AB_PROJECT_ROOT/"* && $AB_PROFILE != *','* && $AB_PROFILE != *':'* && $AB_PROFILE != *$'\n'* ]] || {
+        echo 'Profile must be an existing file under AB_PROJECT_ROOT' >&2; exit 2;
+    }
+    profile_args=(--profile "$AB_PROFILE")
+fi
+for path in "$AB_PROJECT_ROOT" "$AB_HARNESS" "$runner_root" "$AB_WHEEL" "$AB_PROVENANCE" "$AB_PYTHON" "$AB_MODELS_ROOT" "$AB_RUN_ROOT"; do
     [[ $path == /* && $path != *','* && $path != *':'* && $path != *$'\n'* ]] || {
         echo 'Use absolute mount paths without comma, colon or newline' >&2; exit 2;
     }
 done
-for path in "$AB_HARNESS" "$AB_WHEEL" "$AB_PROVENANCE" "$AB_PYTHON" "$AB_RUN_ROOT"; do
+for path in "$AB_HARNESS" "$runner_root" "$AB_WHEEL" "$AB_PROVENANCE" "$AB_PYTHON" "$AB_RUN_ROOT"; do
     [[ $path == "$AB_PROJECT_ROOT/"* ]] || { echo 'Project artifacts must be under AB_PROJECT_ROOT' >&2; exit 2; }
 done
 [[ -f $AB_WHEEL && -f $AB_PROVENANCE && -d $AB_HARNESS && -d $AB_MODELS_ROOT ]] || {
@@ -65,23 +73,25 @@ print(int(days)*86400 + parts[0]*3600 + parts[1]*60 + parts[2])')
 (( job_time_limit >= required_seconds )) || { echo 'Allocation cannot fit the bounded ABBA plan' >&2; exit 2; }
 
 mkdir -p "$AB_RUN_ROOT"
-runner_dir="$AB_HARNESS/examples/disaggregated/slurm/stress_ab"
+runner_dir="$runner_root/examples/disaggregated/slurm/stress_ab"
 export TLLM_AB_IMAGE="$AB_IMAGE" TLLM_AB_IMAGE_DIGEST="$AB_IMAGE_DIGEST"
 image_repo=${AB_IMAGE%:*}
 container_image="${image_repo/\//#}@${AB_IMAGE_DIGEST}"
 # Preserve absolute paths so detached worktree .git pointers remain valid.
 mounts="$AB_PROJECT_ROOT:$AB_PROJECT_ROOT,$AB_MODELS_ROOT:$AB_MODELS_ROOT:ro"
 printf 'index\tarm\texit_code\n' > "$AB_RUN_ROOT/slurm-steps.tsv"
-python3 - "$AB_RUN_ROOT/plan.json" "$AB_HARNESS" "$AB_IMAGE" "$AB_IMAGE_DIGEST" "$trial_timeout" <<'PY'
+python3 - "$AB_RUN_ROOT/plan.json" "$AB_HARNESS" "$AB_IMAGE" "$AB_IMAGE_DIGEST" "$trial_timeout" "$runner_root" "${AB_PROFILE:-}" <<'PY'
 import json, os, socket, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
-path, harness, image, digest, timeout = sys.argv[1:]
+path, harness, image, digest, timeout, runner, profile = sys.argv[1:]
 plan = {
     'schema_version': 1, 'order': ['control', 'treatment', 'treatment', 'control'],
     'slurm_job_id': os.environ['SLURM_JOB_ID'], 'node': socket.gethostname(),
     'started_at': datetime.now(timezone.utc).isoformat(), 'trial_timeout': int(timeout),
     'harness_sha': subprocess.check_output(['git', '-C', harness, 'rev-parse', 'HEAD'], text=True).strip(),
+    'runner_sha': subprocess.check_output(['git', '-C', runner, 'rev-parse', 'HEAD'], text=True).strip(),
+    'profile': json.loads(Path(profile).read_text()) if profile else None,
     'image': image, 'image_digest': digest, 'same_node': True,
     'cleanup_boundary': 'fresh Slurm step and container for each trial',
 }
@@ -112,7 +122,7 @@ for arm in control treatment treatment control; do
         "$AB_PYTHON" "$runner_dir/run_ab.py" --harness "$AB_HARNESS" \
         --wheel "$AB_WHEEL" --provenance "$AB_PROVENANCE" \
         --models-root "$AB_MODELS_ROOT" --output "$trial_dir" \
-        --order "$arm" --trial-timeout "$trial_timeout"; then
+        --order "$arm" --trial-timeout "$trial_timeout" ${profile_args[@]+"${profile_args[@]}"}; then
         step_status=0
     else
         step_status=$?

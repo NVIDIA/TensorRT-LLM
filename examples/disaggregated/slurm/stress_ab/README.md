@@ -3,10 +3,11 @@
 # NVBUG 6649384: full disaggregated stress A/B
 
 This investigation harness compares the executor before and after the revert
-of PR #16687 in PR #18327. It does not establish that #16687 caused the bug,
+of PR #16687 in PR #18327. It supports the historical comparison by default
+and explicitly pinned current-head profiles. It does not establish that #16687 caused the bug,
 and the revert PR must not be merged as a production fix on this evidence.
 
-| Identity | Pinned revision |
+| Historical default identity | Pinned revision |
 | --- | --- |
 | Control A: historical source with #16687 | `0f2c3a95f9415045bdf06a7230759475692483b6` |
 | Treatment B: exact executor revert | `3245fc3ecd76e2fb610f42f2422102e2430c28fe` |
@@ -18,6 +19,59 @@ The driver extracts the two executor files directly from the immutable Git
 revisions, verifies the original wheel contains the control file, and checks
 compiled artifact hashes. Do not rebase the PR, change these runtime revisions,
 or replace the historical wheel with an rc25 or current release overlay.
+
+## Current-head comparison
+
+To investigate whether the behavior still matters today, pin a current control
+commit, prepare a reviewed semantic revert on that same commit, and build the
+control once. Later refactors can move the original behavior across files: for
+example, the September 18 comparison changes both `py_executor.py` and
+`disagg_adapter.py`. A historical single-file overlay on a newer wheel is not
+the same experiment.
+
+Pass an explicit JSON profile to both the builder and runner with `--profile`;
+the Slurm launcher forwards `AB_PROFILE`. Its schema is:
+
+```json
+{
+  "schema_version": 1,
+  "name": "current-head-comparison",
+  "control": "<full 40-character control commit>",
+  "treatment": "<full 40-character treatment commit>",
+  "harness_sha": "<full 40-character common test-harness commit>",
+  "runtime_files": [
+    "tensorrt_llm/_torch/pyexecutor/disagg_adapter.py",
+    "tensorrt_llm/_torch/pyexecutor/py_executor.py"
+  ],
+  "non_runtime_files": [],
+  "expected_requests": 60000,
+  "dependency_versions": {
+    "aiperf": "0.8.0",
+    "lm_eval": "0.4.10",
+    "nixl-cu13": "1.4.0"
+  }
+}
+```
+
+Use actual full commit IDs and source-verified dependency pins. The profile
+must match the wheel provenance, the entire control/treatment diff and the
+clean common test checkout. Runtime changes are limited to explicitly listed
+Python files; compiled changes require a different comparison strategy.
+All overlaid modules are checked for exact import paths and file hashes.
+
+Keep the common test checkout at `AB_HARNESS` and the runner checkout at
+`AB_RUNNER_ROOT` when they differ. Both must be inside the mounted project
+root. Fetch the exact Git objects for both variants before running, including
+any local treatment and harness commits transferred with a Git bundle.
+Record the current source's test/configuration changes from the historical
+case. Both arms use the same current test and its original gates.
+
+Resolve the current source's build environment to an immutable digest. A
+verified public base used by its Dockerfile can support a source build when
+the CI development image is inaccessible; record that environment difference
+and validate its prerequisites. Do not present such a run as historical or
+complete CI reproduction. If both current arms pass, the finding is simply
+no reproduction under the current conditions.
 
 ## Experiment
 
@@ -88,6 +142,13 @@ image digest, build log, wheel hash and prepared build virtual environment.
 The build's six-hour limit is separate from the test allocation. Select a
 permitted build allocation with time for preparation and artifact flush too.
 
+With an explicit profile, use that control revision's build script and pass
+the same `--profile /persistent/path/profile.json` to the builder. Optional
+`--cpp-build-dir /node-local/path/cpp` puts large CMake intermediates on local
+scratch while preserving the build venv, wheel and logs persistently.
+`--skip-stubs` skips Python type-stub generation for a CPU-only build; it does
+not skip native compilation. These choices are recorded in the build command.
+
 **Retain the build virtual environment.** `build_wheel.py` installs the pinned
 source's development requirements there, not into the base image's Python.
 The experiment runs with the recorded interpreter and verifies its dependency
@@ -131,6 +192,10 @@ export AB_RUN_ROOT="$AB_PROJECT_ROOT/results/abba-<unique-run-id>"
 export AB_IMAGE='<verified-registry/repository:historical-tag>'
 export AB_IMAGE_DIGEST='sha256:<verified-64-hex-digest>'
 export AB_TRIAL_TIMEOUT=12600
+
+# For an explicit current-head comparison, also set:
+# export AB_PROFILE="$AB_PROJECT_ROOT/profile.json"
+# export AB_RUNNER_ROOT="$AB_PROJECT_ROOT/runner"
 
 sbatch --parsable --account='<approved-account>' \
   --partition='<eight-B200-partition>' --qos='<approved-long-qos>' \

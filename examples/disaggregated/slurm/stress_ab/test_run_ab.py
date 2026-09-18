@@ -51,6 +51,9 @@ class TrialEvidenceTests(unittest.TestCase):
         self.profile.write_text('{"metrics": {}}\n' * 59999)
         with self.assertRaisesRegex(ValueError, "expected 60000"):
             run_ab._classify(self.root, 0, False)
+        self.assertEqual(
+            run_ab._classify(self.root, 0, False, expected_requests=59999)["status"], "pass"
+        )
 
     def test_known_shutdown_storm_is_failure_not_invalid_or_pass(self) -> None:
         self.profile.write_text(
@@ -114,7 +117,7 @@ class TrialEvidenceTests(unittest.TestCase):
         provenance = {
             "status": "built",
             "source_unchanged_after_build": True,
-            "source_sha": run_ab.CONTROL,
+            "source_sha": build_runtime.CONTROL,
             "clean_source": True,
             "wheel": wheel.name,
             "wheel_sha256": run_ab._sha(wheel),
@@ -152,7 +155,9 @@ class TrialEvidenceTests(unittest.TestCase):
         }
         with patch.object(run_ab, "_command", return_value="AB_RUNTIME=" + json.dumps(report)):
             with self.assertRaisesRegex(ValueError, "outside selected runtime"):
-                run_ab._runtime_preflight(self.root, "a", {}, self.root / "preflight.log")
+                run_ab._runtime_preflight(
+                    self.root, {build_runtime.EXECUTOR: "a"}, {}, self.root / "preflight.log", {}
+                )
 
     def test_environment_does_not_import_checkout_or_user_overlay(self) -> None:
         with patch.dict(
@@ -189,6 +194,7 @@ class TrialEvidenceTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", arguments),
             patch.object(run_ab, "_prepare_runtime", return_value={}),
+            patch.object(run_ab, "_validate_provenance", return_value=None),
             patch.object(run_ab, "_gpu_inventory", return_value=[]),
             patch.object(run_ab, "_models", return_value={}),
             patch.object(run_ab, "_accuracy_inputs", return_value={}),
@@ -226,6 +232,155 @@ class TrialEvidenceTests(unittest.TestCase):
                 if child.poll() is None:
                     child.kill()
                 child.wait(timeout=10)
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.profile = json.loads(json.dumps(build_runtime.HISTORICAL_PROFILE))
+        self.profile.update(
+            name="current-test",
+            control="a" * 40,
+            treatment="b" * 40,
+            harness_sha="c" * 40,
+            non_runtime_files=[],
+            runtime_files=["tensorrt_llm/executor.py", "tensorrt_llm/adapter.py"],
+        )
+        self.profile["dependency_versions"]["nixl-cu13"] = "1.4.0"
+
+    def _load(self, profile: dict) -> dict:
+        path = self.root / "profile.json"
+        path.write_text(json.dumps(profile))
+        return build_runtime.load_profile(path)
+
+    def test_profile_requires_immutable_commits_and_python_allowlist(self) -> None:
+        self.assertEqual(self._load(self.profile), self.profile)
+        for key, value in (
+            ("control", "main"),
+            ("harness_sha", None),
+            ("runtime_files", ["tensorrt_llm/../../escape.py"]),
+            ("runtime_files", ["tensorrt_llm/bindings.so"]),
+            ("runtime_files", []),
+            ("expected_requests", True),
+            ("non_runtime_files", ["cpp/engine.cpp"]),
+        ):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self._load({**self.profile, key: value})
+
+    def test_source_validation_rejects_unlisted_compiled_changes_and_dependency_skew(self) -> None:
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(self.root), *args], text=True).strip()
+
+        git("init", "--quiet")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.invalid")
+        for relative in self.profile["runtime_files"]:
+            path = self.root / relative
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("value = 'control'\n")
+        (self.root / "requirements-dev.txt").write_text(
+            "aiperf==0.8.0\nlm_eval[api]==0.4.10\nnixl-cu13==1.4.0\n"
+        )
+        git("add", ".")
+        git("commit", "--quiet", "-m", "control")
+        self.profile["control"] = git("rev-parse", "HEAD")
+        for relative in self.profile["runtime_files"]:
+            (self.root / relative).write_text("value = 'treatment'\n")
+        git("commit", "--quiet", "-am", "treatment")
+        self.profile["treatment"] = git("rev-parse", "HEAD")
+        build_runtime.validate_source_profile(self.root, self.profile)
+        skew = {
+            **self.profile,
+            "dependency_versions": {**self.profile["dependency_versions"], "nixl-cu13": "1.3.1"},
+        }
+        with self.assertRaisesRegex(ValueError, "control requirements"):
+            build_runtime.validate_source_profile(self.root, skew)
+        (self.root / "compiled.cpp").write_text("compiled change\n")
+        git("add", ".")
+        git("commit", "--quiet", "-m", "compiled")
+        self.profile["treatment"] = git("rev-parse", "HEAD")
+        with self.assertRaisesRegex(ValueError, "unexpected source changes"):
+            build_runtime.validate_source_profile(self.root, self.profile)
+
+    def test_multifile_overlay_does_not_mutate_control_or_compiled_artifacts(self) -> None:
+        base = self.root / "base"
+        (base / "bin").mkdir(parents=True)
+        (base / "bin/trtllm-serve").write_text("console entry point")
+        files = {relative: b"treatment" for relative in self.profile["runtime_files"]}
+        for relative in files:
+            path = base / relative
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b"control")
+        binary = base / "bindings.so"
+        binary.write_bytes(b"compiled control")
+        target = self.root / "treatment"
+        run_ab._overlay_runtime(base, target, files, {"bindings.so": run_ab._sha(binary)})
+        for relative in files:
+            self.assertEqual((base / relative).read_bytes(), b"control")
+            self.assertEqual((target / relative).read_bytes(), b"treatment")
+            self.assertNotEqual((base / relative).stat().st_ino, (target / relative).stat().st_ino)
+        self.assertEqual(binary.stat().st_ino, (target / "bindings.so").stat().st_ino)
+        report = {
+            "package": str(target / "tensorrt_llm/__init__.py"),
+            "bindings": str(target / "bindings.so"),
+            "versions": {},
+            "runtime_files": {
+                relative: {"path": str(target / relative), "sha256": run_ab._sha(target / relative)}
+                for relative in files
+            },
+        }
+        hashes = {relative: run_ab._sha(target / relative) for relative in files}
+
+        def preflight():
+            with patch.object(run_ab, "_command", return_value="AB_RUNTIME=" + json.dumps(report)):
+                return run_ab._runtime_preflight(
+                    target, hashes, {}, self.root / "preflight.log", {}
+                )
+
+        preflight()
+        second = self.profile["runtime_files"][1]
+        report["runtime_files"][second]["path"] = str(base / second)
+        with self.assertRaisesRegex(ValueError, "outside selected runtime"):
+            preflight()
+        report["runtime_files"][second]["path"] = str(target / second)
+        report["runtime_files"][second]["sha256"] = "wrong"
+        with self.assertRaisesRegex(ValueError, "differs from pinned source"):
+            preflight()
+
+    def test_current_profile_cannot_use_historical_provenance(self) -> None:
+        wheel = self.root / "wheel.whl"
+        wheel.write_bytes(b"baseline")
+        provenance = {
+            "status": "built",
+            "source_unchanged_after_build": True,
+            "source_sha": self.profile["control"],
+            "profile": self.profile,
+            "clean_source": True,
+            "wheel": wheel.name,
+            "wheel_sha256": run_ab._sha(wheel),
+            "build_log": "log",
+            "build_command": ["build"],
+            "image": "image:tag",
+            "image_digest": "sha256:" + "a" * 64,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "TLLM_AB_IMAGE": provenance["image"],
+                "TLLM_AB_IMAGE_DIGEST": provenance["image_digest"],
+            },
+        ):
+            run_ab._validate_provenance(wheel, provenance, self.profile)
+            with self.assertRaisesRegex(ValueError, "profiles differ"):
+                run_ab._validate_provenance(
+                    wheel, {**provenance, "profile": build_runtime.load_profile()}, self.profile
+                )
+            with self.assertRaisesRegex(ValueError, "pinned control"):
+                run_ab._validate_provenance(
+                    wheel, {**provenance, "source_sha": build_runtime.CONTROL}, self.profile
+                )
 
 
 class DependencyEnvironmentTests(unittest.TestCase):
