@@ -44,7 +44,7 @@ sys.path.insert(0, str(CBTS_ROOT))
 sys.path.insert(0, str(CBTS_ROOT / "coverage_selection"))
 sys.path.insert(0, str(CBTS_ROOT / "coverage_utils"))
 
-from blocks import Stage, YAMLIndex  # noqa: E402
+from blocks import Block, Stage, YAMLIndex  # noqa: E402
 from compact_db import write_leaf_database  # noqa: E402
 from main import Selector, _combine_scopes  # noqa: E402
 from python_change_analysis import analyze_python_changes  # noqa: E402
@@ -55,9 +55,9 @@ from rules.agent_flow_rule import (  # noqa: E402
     AgentFlowRule,
     _is_agent_flow_claim,
 )
-from rules.auto_deploy_rule import _is_ad_claim  # noqa: E402
+from rules.auto_deploy_rule import _ad_entries, _is_ad_claim  # noqa: E402
 from rules.base import PRInputs  # noqa: E402
-from rules.docs_rule import DOCS_STAGE, DocsRule, is_docs_path  # noqa: E402
+from rules.docs_rule import CPU_TEST_YAML_STEM, DOCS_STAGE, DocsRule, is_docs_path  # noqa: E402
 from rules.openengine_rule import _is_openengine_claim  # noqa: E402
 from rules.out_of_scope_rule import is_out_of_scope  # noqa: E402
 from rules.spec_dec_rule import _is_spec_claim  # noqa: E402
@@ -97,6 +97,37 @@ def _load_main() -> ModuleType:
 artifact = _load_artifact()
 cbts_main = _load_main()
 
+_CPU_STAGE_NAMES = {"CPU-Generic-x86-1", "CPU-Generic-arm-1"}
+
+
+def _docs_rule() -> DocsRule:
+    yaml_index = YAMLIndex()
+    yaml_index.blocks = [
+        Block(
+            yaml_stem=CPU_TEST_YAML_STEM,
+            block_index=0,
+            condition={},
+            tests=["unittest/tools", "unittest/usage -k telemetry"],
+        ),
+        Block(
+            yaml_stem="l0_h100",
+            block_index=0,
+            condition={},
+            tests=["unittest/_torch"],
+        ),
+    ]
+    stages = {
+        name: Stage(
+            name=name,
+            yaml_stem=CPU_TEST_YAML_STEM,
+            cpu_arch="x86_64" if "x86" in name else "aarch64",
+            split_id=1,
+            total_splits=1,
+        )
+        for name in _CPU_STAGE_NAMES
+    }
+    return DocsRule(yaml_index, stages)
+
 
 @pytest.mark.parametrize(
     "path",
@@ -125,8 +156,8 @@ def test_docs_rule_rejects_non_documentation_paths(path: str) -> None:
     assert not is_docs_path(path)
 
 
-def test_docs_rule_routes_changes_to_dedicated_stage() -> None:
-    rule = DocsRule(YAMLIndex(), {})
+def test_docs_rule_routes_changes_to_docs_and_complete_cpu_suite() -> None:
+    rule = _docs_rule()
     result = rule.apply(
         PRInputs(
             changed_files=["docs/source/conf.py", "README.md", ".github/CODEOWNERS"],
@@ -136,10 +167,24 @@ def test_docs_rule_routes_changes_to_dedicated_stage() -> None:
 
     assert result is not None
     assert result.handled_files == {"docs/source/conf.py", "README.md"}
-    assert result.affected_stages == {DOCS_STAGE}
+    assert result.affected_stages == _CPU_STAGE_NAMES | {DOCS_STAGE}
     assert result.scope == "docsonly"
+    assert result.block_filters == {
+        (CPU_TEST_YAML_STEM, 0): {
+            "unittest/tools": {"unittest/tools"},
+            "unittest/usage": {"unittest/usage -k telemetry"},
+        }
+    }
     assert not result.sanity_relevant
     assert not result.perfsanity_relevant
+
+
+def test_docs_rule_falls_back_when_cpu_suite_cannot_be_resolved() -> None:
+    result = DocsRule(YAMLIndex(), {}).apply(PRInputs(changed_files=["README.md"], diffs={}))
+
+    assert result is not None
+    assert result.scope is None
+    assert not result.affected_stages
 
 
 def test_markdown_is_not_out_of_scope() -> None:
@@ -161,6 +206,22 @@ def test_documentation_does_not_trigger_backend_rules() -> None:
     assert not _is_vg_claim("examples/visual_gen/guide.rst")
 
 
+def test_auto_deploy_rule_keeps_standalone_tests_from_generic_blocks() -> None:
+    standalone = (
+        "unittest/auto_deploy/standalone/test_standalone_package.py::"
+        "TestStandalonePackage::test_run_unit_tests"
+    )
+    unrelated = "unittest/_torch/multimodal/test_mm_encoder_standalone.py"
+    block = Block(
+        yaml_stem="l0_b200",
+        block_index=0,
+        condition={"terms": {"backend": "pytorch"}},
+        tests=[standalone, unrelated],
+    )
+
+    assert _ad_entries(block) == [standalone]
+
+
 def test_documentation_under_tests_is_left_to_docs_rule() -> None:
     rule = CbtsTestsDefRule(YAMLIndex(), {}, repo_root=REPO_ROOT)
 
@@ -168,14 +229,14 @@ def test_documentation_under_tests_is_left_to_docs_rule() -> None:
 
 
 def test_docs_rule_combines_with_other_targeted_rules() -> None:
-    rules = [DocsRule(YAMLIndex(), {}), AgentFlowRule(YAMLIndex(), {})]
+    rules = [_docs_rule(), AgentFlowRule(YAMLIndex(), {})]
     result = Selector({}).run(
         PRInputs(changed_files=["README.md", "agent-flow/agent_flow/cli.py"], diffs={}),
         rules,
     )
 
     assert result.scope == "testsonly"
-    assert result.affected_stages == {DOCS_STAGE, AGENT_FLOW_STAGE}
+    assert result.affected_stages == _CPU_STAGE_NAMES | {DOCS_STAGE, AGENT_FLOW_STAGE}
     assert _combine_scopes(["docsonly", "noop"]) == "docsonly"
 
 
