@@ -1202,12 +1202,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     TLLM_CHECK_WITH_INFO(
         update_kv_cache || is_cross, "KV cache update cannot be disabled now (except for cross attention).");
     auto qkv_or_q = q;
-    if (is_fused_qkv)
+    // MLA validates its separate Q/K/V or latent-cache inputs in Runner::run.
+    if (!is_mla_enable && is_fused_qkv)
     {
         TLLM_CHECK_WITH_INFO(!k.has_value(), "The k tensor should be null if using fused QKV");
         TLLM_CHECK_WITH_INFO(!v.has_value(), "The v tensor should be null if using fused QKV");
     }
-    if (!is_fused_qkv && update_kv_cache && !is_cross)
+    if (!is_mla_enable && !is_fused_qkv && update_kv_cache && !is_cross)
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
@@ -1343,7 +1344,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
     op->mUseSpecDecoding = use_spec_decoding;
     op->mIsSpecDecTree = is_spec_dec_tree;
-    // Include static tree length in the AttentionOp cache key.
+    // Include the tree length in the AttentionOp cache key.
     if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
@@ -1463,8 +1464,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         if (workspace_.value().numel() < workspace_size)
         {
-            TLLM_LOG_WARNING("Attention workspace size is not enough, increase the size from %ld bytes to %ld bytes",
-                workspace_.value().numel(), workspace_size);
+            auto const capacity = workspace_.value().storage().nbytes();
+            if (capacity < static_cast<size_t>(workspace_size))
+            {
+                TLLM_LOG_WARNING(
+                    "Attention workspace size is not enough, increase the size from %zu bytes to %ld bytes", capacity,
+                    workspace_size);
+            }
             workspace_.value().resize_({workspace_size});
         }
         workspace = workspace_.value();

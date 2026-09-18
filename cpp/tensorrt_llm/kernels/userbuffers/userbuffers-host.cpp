@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -188,7 +188,7 @@ int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::W
         size_t gran;
         CUmulticastObjectProp mcProp = {};
         mcProp.numDevices = (*comm)->tp_size;
-        mcProp.size = (*comm)->mc_maxsize;
+        mcProp.size = mc_maxsize;
 #ifdef MNNVL
         mcProp.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 #else
@@ -257,21 +257,54 @@ int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::W
 
         CUdeviceptr mc_va;
         CUCHECK(cuMemAddressReserve(&mc_va, mc_maxsize, 0, 0U, 0));
-        CUCHECK(cuMemMap(mc_va, mc_maxsize, 0, (*comm)->mc_handle, 0));
-
-        CUmemAccessDesc accessDesc = {};
-        accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        accessDesc.location.id = (*comm)->mydev;
-        accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        CUCHECK(cuMemSetAccess(mc_va, mc_maxsize, &accessDesc, 1));
-
-        (*comm)->mc_baseptr = reinterpret_cast<void*>(mc_va);
-        ub_barrier((*comm)->comm_world);
-        if ((*comm)->tp_rank == 0)
+        CUresult const mapResult = cuMemMap(mc_va, mc_maxsize, 0, (*comm)->mc_handle, 0);
+        long mapError = static_cast<long>(mapResult);
+        long collectiveMapError = 0;
+        ub_allreduce_longmax(&mapError, &collectiveMapError, (*comm)->comm_intra);
+        if (collectiveMapError != CUDA_SUCCESS)
         {
-            TLLM_LOG_INFO(
-                "[UserBuffer] rank %d, MC initialized successfully, window size = %ld", (*comm)->nvrank, mc_maxsize);
+            if (mapResult == CUDA_SUCCESS)
+            {
+                CUCHECK(cuMemUnmap(mc_va, mc_maxsize));
+            }
+            CUCHECK(cuMemAddressFree(mc_va, mc_maxsize));
+            CUCHECK(cuMemRelease((*comm)->mc_handle));
+            (*comm)->mc_baseptr = nullptr;
+            (*comm)->mc_maxsize = 0;
+            (*comm)->mc_offset = 0;
+            (*comm)->use_mc = 0;
+
+            if ((*comm)->tp_rank == 0)
+            {
+                char const* errorString = "unknown CUDA error";
+                char const* cudaErrorString = nullptr;
+                if (cuGetErrorString(static_cast<CUresult>(collectiveMapError), &cudaErrorString) == CUDA_SUCCESS
+                    && cudaErrorString != nullptr)
+                {
+                    errorString = cudaErrorString;
+                }
+                TLLM_LOG_WARNING(
+                    "[UserBuffer] multicast mapping failed with CUDA error %ld (%s); falling back to "
+                    "unicast user buffers",
+                    collectiveMapError, errorString);
+            }
         }
+        else
+        {
+            CUmemAccessDesc accessDesc = {};
+            accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            accessDesc.location.id = (*comm)->mydev;
+            accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            CUCHECK(cuMemSetAccess(mc_va, mc_maxsize, &accessDesc, 1));
+
+            (*comm)->mc_baseptr = reinterpret_cast<void*>(mc_va);
+            if ((*comm)->tp_rank == 0)
+            {
+                TLLM_LOG_INFO("[UserBuffer] rank %d, MC initialized successfully, window size = %ld", (*comm)->nvrank,
+                    mc_maxsize);
+            }
+        }
+        ub_barrier((*comm)->comm_world);
     }
     else
     {

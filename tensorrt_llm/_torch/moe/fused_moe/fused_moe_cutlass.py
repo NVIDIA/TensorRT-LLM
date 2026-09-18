@@ -139,9 +139,9 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103, 120, 121}
+        # NVFP4: SM in {100, 103, 107, 120, 121}
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation
@@ -166,14 +166,14 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("exact", 90),
             "dtypes": {torch.float16, torch.bfloat16},
         },
-        # W4A8_MXFP4_FP8: SM in {100, 103}
+        # W4A8_MXFP4_FP8: SM in {100, 103, 107}
         QuantAlgo.W4A8_MXFP4_FP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 107}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
+        # W4A8_MXFP4_MXFP8: SM in {100, 103, 107, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
         # MXFP8 (W8A8 e4m3xe4m3 with UE8M0 1x32 block scales): SM in {100, 103}.
@@ -453,8 +453,8 @@ class CutlassFusedMoE(MoEImplBase):
         CudaGraphLoraManager does this automatically.
 
         Args:
-            max_num_tokens: Worst-case tokens in a captured forward
-                (max_batch_size * max_tokens_per_seq).
+            max_num_tokens: Larger of the captured-decode capacity
+                (max_batch_size * max_tokens_per_seq) and the engine-wide token limit.
             max_lora_rank: Largest LoRA rank across adapters.
             max_lora_size: Adapter-slot pool size for the slot-indexed device tables.
         """

@@ -19,7 +19,12 @@ try:
 except ImportError:
     _flashinfer_rope = None
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
-from ..speculative.dflash_attention import get_dflash_flash_attention, get_dflash_trtllm_gen_ops
+from ..speculative.dflash_attention import (
+    get_dflash_fa4_fwd,
+    get_dflash_flash_attention,
+    get_dflash_paged_append,
+    get_dflash_trtllm_gen_ops,
+)
 from ..speculative.interface import SpeculativeDecodingMode
 from .modeling_utils import get_model_architecture, register_draft_model
 
@@ -54,6 +59,258 @@ def dspark_layer_window_size(
     ):
         return (-1, -1)
     return (swa_window - 1, swa_window - 1)
+
+
+def _is_dflash2_architecture(config: PretrainedConfig) -> bool:
+    """Whether a draft checkpoint advertises itself as a DFlash 2 drafter.
+
+    Matches on the "dflash2" stem (released drafters use ``DFlash2DraftModel``)
+    so per-target variants of the label are picked up too.
+    """
+    return any(
+        "dflash2" in str(arch).lower().replace("_", "").replace("-", "")
+        for arch in (getattr(config, "architectures", None) or [])
+    )
+
+
+def dflash2_grouped_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base_kernel: torch.Tensor,
+    block_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Short dynamic depthwise convolution across one drafted block.
+
+    ``Conv(x)_t = sum_i k_{t,i} * x_{t-i}``, with ``k_{t,i} = base_kernel[i] +
+    delta[t, i]`` (a per-position correction shared by every ``group_size``
+    channels). Taps reaching past a block's start contribute nothing.
+
+    Args:
+        hidden_states: ``[B * block_size, hidden_size]``, request-major.
+        delta: ``[B * block_size, taps, hidden_size // group_size]``.
+        base_kernel: ``[taps, hidden_size]``.
+    Returns:
+        ``[B * block_size, hidden_size]``
+    """
+    taps, hidden_size = base_kernel.shape
+    num_groups = hidden_size // group_size
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base_kernel.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    output = coefficients[:, 0] * blocks
+    if taps > 1:
+        position = torch.arange(hidden_states.shape[0], device=hidden_states.device) % block_size
+        for tap in range(1, taps):
+            shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+            output += coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return output.flatten(-2)
+
+
+def dflash2_score_edges(
+    predecessor_codebook: torch.Tensor,
+    successor_codebook: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    gate: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Score every adjacent candidate pair in a drafted block at once.
+
+    ``S_t(a, b) = U_t(b) + <A(a) * H(h_t), B(b)>``: the drafter's logit for
+    ``b`` plus a low-rank bilinear match between predecessor ``a`` and
+    successor ``b``. Position 0's predecessor is the anchor token.
+
+    Accumulated in fp32; bf16 rounding moves candidate argmaxes often enough to
+    change the walk's path.
+
+    Args:
+        predecessor_codebook / successor_codebook: ``[vocab_size, rank]``.
+        candidate_ids: ``[B, K, top_k]`` per-position candidate token ids.
+        unary_logits: ``[B, K, top_k]`` drafter logits for those candidates.
+        gate: ``[B, K, rank]`` projected hidden state per block position.
+        anchor_token_ids: ``[B]``.
+    Returns:
+        ``[B, K, top_k, top_k]`` fp32 scores indexed
+        ``[batch, position, predecessor, candidate]``.
+    """
+    top_k = candidate_ids.shape[-1]
+    successors = successor_codebook[candidate_ids].float()
+    predecessor_ids = torch.cat(
+        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]), dim=1
+    )
+    predecessors = predecessor_codebook[predecessor_ids].float()
+    return unary_logits.float()[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * gate.float()[:, :, None], successors
+    )
+
+
+def dflash2_walk_candidate_paths(
+    candidate_ids: torch.Tensor,
+    edge_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Walk the scored lattice and return the realized score row per position.
+
+    Starting from the anchor, each step keeps the highest-scoring successor and
+    conditions the next step on it. Sequential, but only over precomputed
+    scores: ``top_k`` values per step, no vocabulary work.
+
+    Args:
+        candidate_ids: ``[B, K, top_k]``.
+        edge_scores: ``[B, K, top_k, top_k]`` from :func:`dflash2_score_edges`.
+    Returns:
+        ``[B, K, top_k]`` scores of each position's candidates under the
+        predecessor the walk settled on.
+    """
+    batch, num_steps, top_k, _ = edge_scores.shape
+    realized = edge_scores.new_empty(batch, num_steps, top_k)
+    # Step 0 replicates the anchor across the predecessor axis, so any row works.
+    predecessor = torch.zeros(batch, 1, 1, dtype=torch.long, device=edge_scores.device)
+    for step in range(num_steps):
+        scores = edge_scores[:, step].gather(1, predecessor.expand(-1, 1, top_k)).squeeze(1)
+        realized[:, step] = scores
+        predecessor = scores.argmax(-1).view(batch, 1, 1)
+    return realized
+
+
+class DFlash2BlockConv(nn.Module):
+    """Two-tap dynamic depthwise convolutions wrapped around one sublayer.
+
+    DFlash 2 (https://inco.ai/blog/dflash2/) moves the within-block mixing into
+    a short convolution. ``prepare`` convolves the sublayer's input and
+    ``finish`` its output; a single projection of the *input* drives both, so
+    ``finish`` takes the coefficients ``prepare`` hands back.
+    """
+
+    def __init__(
+        self,
+        base_kernel: torch.Tensor,
+        kernel_projection_weight: torch.Tensor,
+        taps: int,
+        group_size: int,
+        hidden_size: int,
+    ):
+        super().__init__()
+        # Side 0 wraps the sublayer input, side 1 its output.
+        if tuple(base_kernel.shape) != (2, taps, hidden_size):
+            raise ValueError(
+                f"DFlash2 conv base_kernel has shape "
+                f"{tuple(base_kernel.shape)}, expected [2, conv_kernel_size, "
+                f"hidden_size] = {(2, taps, hidden_size)}."
+            )
+        if hidden_size % group_size:
+            raise ValueError(
+                f"DFlash2 conv_group_size={group_size} must divide hidden_size={hidden_size}."
+            )
+        self.taps = taps
+        self.group_size = group_size
+        self.num_groups = hidden_size // group_size
+        expected = (2 * taps * self.num_groups, hidden_size)
+        if tuple(kernel_projection_weight.shape) != expected:
+            raise ValueError(
+                f"DFlash2 conv kernel_projection has shape "
+                f"{tuple(kernel_projection_weight.shape)}, expected "
+                f"[2 * conv_kernel_size * hidden_size / conv_group_size, "
+                f"hidden_size] = {expected}."
+            )
+        self.base_kernel = nn.Parameter(base_kernel, requires_grad=False)
+        self.kernel_projection = nn.Linear(
+            hidden_size,
+            expected[0],
+            bias=False,
+            device=kernel_projection_weight.device,
+            dtype=kernel_projection_weight.dtype,
+        )
+        self.kernel_projection.weight.data.copy_(kernel_projection_weight)
+
+    def _convolve(
+        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int, block_size: int
+    ) -> torch.Tensor:
+        return dflash2_grouped_conv(
+            hidden_states, delta, self.base_kernel[side], block_size, self.group_size
+        )
+
+    def prepare(
+        self, hidden_states: torch.Tensor, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convolve the sublayer input; also return ``finish``'s coefficients."""
+        coefficients = self.kernel_projection(hidden_states).view(
+            hidden_states.shape[0], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[:, 0], 0, block_size),
+            coefficients[:, 1],
+        )
+
+    def finish(
+        self, hidden_states: torch.Tensor, coefficients: torch.Tensor, block_size: int
+    ) -> torch.Tensor:
+        """Convolve the sublayer output with the coefficients from ``prepare``."""
+        return self._convolve(hidden_states, coefficients, 1, block_size)
+
+
+class DFlash2CandidateSelector(nn.Module):
+    """Pairwise path selector over a DFlash block's top-k candidates.
+
+    Independent per-position picks leave the right token in the candidate list
+    far more often than in first place, so DFlash 2 keeps the top
+    ``selector_top_k`` per position and scores every adjacent pair (see
+    :func:`dflash2_score_edges`) in one shot for the whole block.
+    """
+
+    def __init__(
+        self,
+        predecessor_codebook: torch.Tensor,
+        successor_codebook: torch.Tensor,
+        hidden_projection_weight: torch.Tensor,
+        top_k: int,
+        vocab_size: int,
+        rank: int,
+    ):
+        super().__init__()
+        for name, table in (
+            ("predecessor_codebook", predecessor_codebook),
+            ("successor_codebook", successor_codebook),
+        ):
+            if tuple(table.shape) != (vocab_size, rank):
+                raise ValueError(
+                    f"DFlash2 {name} has shape {tuple(table.shape)}, expected "
+                    f"[vocab_size, selector_rank] = ({vocab_size}, {rank})."
+                )
+        if tuple(hidden_projection_weight.shape)[0] != rank:
+            raise ValueError(
+                "DFlash2 candidate_selector.hidden_projection has shape "
+                f"{tuple(hidden_projection_weight.shape)}, expected "
+                f"selector_rank={rank} output features."
+            )
+        self.top_k = top_k
+        self.predecessor_codebook = nn.Parameter(predecessor_codebook, requires_grad=False)
+        self.successor_codebook = nn.Parameter(successor_codebook, requires_grad=False)
+        self.hidden_projection = nn.Linear(
+            hidden_projection_weight.shape[1],
+            rank,
+            bias=False,
+            device=hidden_projection_weight.device,
+            dtype=hidden_projection_weight.dtype,
+        )
+        self.hidden_projection.weight.data.copy_(hidden_projection_weight)
+
+    def forward(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score all adjacent candidate pairs; see :func:`dflash2_score_edges`."""
+        gate = self.hidden_projection(hidden_states.to(self.hidden_projection.weight.dtype))
+        return dflash2_score_edges(
+            self.predecessor_codebook,
+            self.successor_codebook,
+            candidate_ids,
+            unary_logits,
+            gate,
+            anchor_token_ids,
+        )
 
 
 class DFlashForCausalLM(nn.Module):
@@ -91,6 +348,9 @@ class DFlashForCausalLM(nn.Module):
 
         # Remove spec_config to prevent recursive spec-dec initialization
         draft_config_no_spec = replace(draft_config, spec_config=None, lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -114,13 +374,21 @@ class DFlashForCausalLM(nn.Module):
             "block_size", getattr(pretrained_config, "block_size", None)
         )
         self.dflash_attention_backend = dflash_attention_backend
+        # Each backend loads only its own ops; the rest stay None so the
+        # shared paged prologue can read them unconditionally.
+        self._dflash_trtllm_gen_ops = None
+        self._dflash_fa4_fwd = None
+        self._dflash_paged_append = None
         if self.dflash_attention_backend == "VANILLA":
             self._dflash_flash_attention = get_dflash_flash_attention()
         elif self.dflash_attention_backend == "TRTLLM":
             self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
+        elif self.dflash_attention_backend == "FA4":
+            self._dflash_fa4_fwd = get_dflash_fa4_fwd()
+            self._dflash_paged_append = get_dflash_paged_append()
         else:
             raise ValueError(
-                "DFlash attention backend must be VANILLA or TRTLLM, got "
+                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
                 f"{self.dflash_attention_backend!r}."
             )
         self._dflash_trtllm_gen_workspace = None
@@ -154,6 +422,33 @@ class DFlashForCausalLM(nn.Module):
             dspark_layer_window_size(self._use_swa, self._swa_window, layer_types, i)
             for i in range(num_draft_layers)
         ]
+
+        # DFlash 2 (https://inco.ai/blog/dflash2/) keeps the DFlash block decode
+        # and adds per-sublayer convolutions plus a pairwise candidate selector.
+        # Both are keyed off the draft checkpoint rather than a separate
+        # decoding_type, matching how SGLang and vLLM serve DFlash 2 drafters.
+        self._dflash2_conv_taps = int(dflash_config.get("conv_kernel_size", 0) or 0)
+        self._dflash2_conv_group_size = int(dflash_config.get("conv_group_size", 0) or 0)
+        self._dflash2_selector_rank = int(dflash_config.get("selector_rank", 0) or 0)
+        self._dflash2_selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
+        self._is_dflash2 = (
+            self._dflash2_conv_taps > 0
+            or self._dflash2_selector_rank > 0
+            or _is_dflash2_architecture(pretrained_config)
+        )
+        if self._is_dflash2:
+            self._validate_dflash2_config()
+            logger.info(
+                "DFlash 2 drafter: conv_kernel_size="
+                f"{self._dflash2_conv_taps}, conv_group_size="
+                f"{self._dflash2_conv_group_size}, selector_rank="
+                f"{self._dflash2_selector_rank}, selector_top_k="
+                f"{self._dflash2_selector_top_k}"
+            )
+        # Built in load_weights() from the checkpoint, like fc / hidden_norm.
+        self.attention_convs = None
+        self.mlp_convs = None
+        self.candidate_selector = None
 
         self.logits_processor = None  # Set by caller after construction
 
@@ -308,6 +603,70 @@ class DFlashForCausalLM(nn.Module):
         hidden_states = hidden_states.to(self.fc.weight.dtype)
         return self.hidden_norm(self.fc(hidden_states))
 
+    def _validate_dflash2_config(self) -> None:
+        """Require the full DFlash 2 recipe; a partial one would silently
+        degrade to DFlash 1 acceptance instead of failing."""
+        required = {
+            "conv_kernel_size": self._dflash2_conv_taps,
+            "conv_group_size": self._dflash2_conv_group_size,
+            "selector_rank": self._dflash2_selector_rank,
+            "selector_top_k": self._dflash2_selector_top_k,
+        }
+        missing = sorted(name for name, value in required.items() if value < 1)
+        if missing:
+            raise ValueError(
+                "DFlash 2 drafter is missing required dflash_config entries "
+                f"{missing}; got {required}."
+            )
+        if self._dflash2_selector_top_k < 2:
+            raise ValueError(
+                f"DFlash 2 selector_top_k={self._dflash2_selector_top_k} leaves "
+                "no candidates to choose between; it must be at least 2."
+            )
+
+    @property
+    def is_dflash2(self) -> bool:
+        return self._is_dflash2
+
+    @property
+    def has_block_conv(self) -> bool:
+        return self.attention_convs is not None
+
+    @property
+    def has_candidate_selector(self) -> bool:
+        return self.candidate_selector is not None
+
+    def select_candidate_path(
+        self,
+        block_logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        block_hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restrict each block position's logits to the selector's chosen path.
+
+        Writes ``-inf`` into ``block_logits`` everywhere except each position's
+        candidates, which carry the score row the walk realized. Argmax
+        therefore reproduces the walk, and sampling a row samples the
+        selector's own proposal distribution.
+
+        Args:
+            block_logits: ``[B, K, vocab_size]`` full-vocab destination.
+            candidate_ids: ``[B, K, top_k]`` full-vocab candidate token ids.
+            unary_logits: ``[B, K, top_k]`` drafter logits for those candidates.
+            block_hidden_states: ``[B, K, hidden_size]`` at the drafted
+                positions, after the drafter's final norm.
+            anchor_token_ids: ``[B]`` last accepted token per request.
+        """
+        edge_scores = self.candidate_selector(
+            candidate_ids, unary_logits, block_hidden_states, anchor_token_ids
+        )
+        realized_scores = dflash2_walk_candidate_paths(candidate_ids, edge_scores)
+        block_logits.fill_(float("-inf"))
+        block_logits.scatter_(-1, candidate_ids, realized_scores.to(block_logits.dtype))
+        return block_logits
+
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Hook applied to the block-attention output before o_proj.
 
@@ -354,6 +713,11 @@ class DFlashForCausalLM(nn.Module):
                     split[k] = v
             weights = split
 
+        # Taken before the backbone remap, which would prefix these with
+        # 'model.' and then silently drop them under allow_partial_loading.
+        if self._is_dflash2:
+            weights = self._load_dflash2_weights(weights)
+
         # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
         remapped = {}
         for key, value in weights.items():
@@ -397,6 +761,53 @@ class DFlashForCausalLM(nn.Module):
         self.draft_model_full.load_weights(
             weights=remapped, weight_mapper=weight_mapper, allow_partial_loading=True
         )
+
+    def _load_dflash2_weights(self, weights: Dict) -> Dict:
+        """Build the DFlash 2 convolutions and candidate selector.
+
+        Returns ``weights`` minus the keys consumed here.
+        """
+        consumed = set()
+
+        def take(key: str) -> torch.Tensor:
+            if key not in weights:
+                raise ValueError(
+                    f"DFlash 2 drafter is missing checkpoint weight '{key}'. "
+                    "The draft checkpoint declares DFlash 2 in its config but "
+                    "does not ship the corresponding weights."
+                )
+            consumed.add(key)
+            return weights[key].to("cuda")
+
+        hidden_size = self.config.hidden_size
+        attention_convs = nn.ModuleList()
+        mlp_convs = nn.ModuleList()
+        for layer_idx in range(len(self.model.layers)):
+            for name, convs in (("attention_conv", attention_convs), ("mlp_conv", mlp_convs)):
+                prefix = f"layers.{layer_idx}.{name}."
+                convs.append(
+                    DFlash2BlockConv(
+                        base_kernel=take(prefix + "base_kernel"),
+                        kernel_projection_weight=take(prefix + "kernel_projection.weight"),
+                        taps=self._dflash2_conv_taps,
+                        group_size=self._dflash2_conv_group_size,
+                        hidden_size=hidden_size,
+                    )
+                )
+
+        selector = DFlash2CandidateSelector(
+            predecessor_codebook=take("candidate_selector.predecessor_codebook"),
+            successor_codebook=take("candidate_selector.successor_codebook"),
+            hidden_projection_weight=take("candidate_selector.hidden_projection.weight"),
+            top_k=self._dflash2_selector_top_k,
+            vocab_size=self.config.vocab_size,
+            rank=self._dflash2_selector_rank,
+        )
+
+        self.attention_convs = attention_convs
+        self.mlp_convs = mlp_convs
+        self.candidate_selector = selector
+        return {k: v for k, v in weights.items() if k not in consumed}
 
     def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
         """Share embed_tokens and lm_head from the target model."""
@@ -677,16 +1088,62 @@ class DFlashForCausalLM(nn.Module):
 
         sliding_window = get_layer_attention_window(self.config, layer_idx)
         is_sliding_layer = is_sliding_layer or sliding_window is not None
-        if not is_sliding_layer:
-            return False, (-1, -1)
 
-        causal = self._sliding_layers_causal or sliding_window is not None
+        # A DFlash 2 checkpoint's top-level is_causal wins over the layer-type
+        # default (which would read an all-sliding drafter as causal). Only
+        # consulted for DFlash 2: is_causal is common enough elsewhere that
+        # honoring it everywhere could silently retarget an older drafter.
+        explicit_causal = getattr(self.config, "is_causal", None) if self._is_dflash2 else None
+        if explicit_causal is not None:
+            causal = bool(explicit_causal)
+        elif not is_sliding_layer:
+            return False, (-1, -1)
+        else:
+            causal = self._sliding_layers_causal or sliding_window is not None
+
         if sliding_window is None:
             # Legacy drafters without an explicit window preserve their prior
             # non-windowed behavior.
             return causal, (-1, -1)
         # FlashAttention's bounds are inclusive: W tokens are current + W-1 left.
-        return causal, (sliding_window - 1, 0)
+        # A non-causal sliding layer windows both sides, matching the HF flash
+        # path these drafters are trained under (see dspark_layer_window_size).
+        if not causal:
+            return False, (sliding_window - 1, sliding_window - 1)
+        return True, (sliding_window - 1, 0)
+
+    def _resolve_block_attention(self, layer_idx: int) -> tuple[bool, tuple[int, int]]:
+        causal, window_size = self._get_attention_mask_args(layer_idx)
+        swa_window = (
+            self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
+        )
+        if swa_window != (-1, -1):
+            window_size = swa_window
+        return causal, window_size
+
+    def validate_block_attention_windows(self) -> None:
+        """Refuse windows the TRTLLM block-decode kernel cannot apply.
+
+        TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
+        rejects ``causal=False`` with any finite ``window_left`` outright. A
+        non-causal windowed layer must therefore run on VANILLA or FA4, which
+        take a two-sided window.
+        """
+        if self.dflash_attention_backend != "TRTLLM":
+            return
+        num_layers = getattr(self.config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = len(self.model.layers)
+        for layer_idx in range(num_layers):
+            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
+            if causal or window_left < 0:
+                continue
+            raise ValueError(
+                f"DFlash draft layer {layer_idx} attends non-causally within a "
+                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
+                "attention backend does not support non-causal sliding-window "
+                "attention. Use attention_backend=VANILLA or FA4."
+            )
 
     def _prepare_dflash_trtllm_gen_buffers(
         self,
@@ -759,30 +1216,49 @@ class DFlashForCausalLM(nn.Module):
                 counter_bytes, dtype=torch.uint8, device=device
             )
 
+        self._prepare_dflash_index_buffers(device, max_batch_size, block_size)
+
+    def _prepare_dflash_index_buffers(
+        self,
+        device: torch.device,
+        max_batch_size: int,
+        block_size: int,
+        need_batch_indices: bool = True,
+    ) -> None:
+        """Allocate the static indices that place a block's K/V in the cache.
+
+        Both backends need the intra-block column offsets. Only the paged
+        backends read the batch-index rows, so VANILLA leaves them unallocated
+        """
         append_batch_indices = self._dflash_batch_indices
         block_offsets = self._dflash_block_offsets
-        static_indices_need_allocation = (
-            append_batch_indices is None
-            or block_offsets is None
-            or append_batch_indices.device != device
+        need_offsets = (
+            block_offsets is None
             or block_offsets.device != device
-            or append_batch_indices.size(0) < max_batch_size
-            or append_batch_indices.size(1) != block_size
             or block_offsets.numel() != block_size
         )
-        if static_indices_need_allocation:
-            if is_capturing:
-                raise RuntimeError(
-                    "DFlash TRTLLM-Gen index buffers must be allocated at the "
-                    "required size before CUDA graph capture."
-                )
+        need_indices = need_batch_indices and (
+            append_batch_indices is None
+            or append_batch_indices.device != device
+            or append_batch_indices.size(0) < max_batch_size
+            or append_batch_indices.size(1) != block_size
+        )
+        if not (need_offsets or need_indices):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DFlash index buffers must be allocated at the required "
+                "size before CUDA graph capture."
+            )
+        if need_offsets:
+            self._dflash_block_offsets = torch.arange(block_size, dtype=torch.int32, device=device)
+        if need_indices:
             self._dflash_batch_indices = (
                 torch.arange(max_batch_size, dtype=torch.int32, device=device)
                 .view(-1, 1)
                 .expand(-1, block_size)
                 .contiguous()
             )
-            self._dflash_block_offsets = torch.arange(block_size, dtype=torch.int32, device=device)
 
     def dflash_forward(
         self,
@@ -809,17 +1285,21 @@ class DFlashForCausalLM(nn.Module):
         Returns:
             [B * block_size, hidden_size]
         """
-        if self.dflash_attention_backend == "TRTLLM":
+        is_paged = self.dflash_attention_backend in ("TRTLLM", "FA4")
+        if is_paged:
             if ctx_kv_cache is None or ctx_page_table is None:
                 raise RuntimeError(
-                    "DFlash TRTLLM-Gen requires a paged context cache and page table."
+                    f"DFlash {self.dflash_attention_backend} requires a paged "
+                    "context cache and page table."
                 )
             trtllm_gen_ops = self._dflash_trtllm_gen_ops
+            fa4_fwd = self._dflash_fa4_fwd
+            paged_append = self._dflash_paged_append
         elif self.dflash_attention_backend == "VANILLA":
             flash_attention = self._dflash_flash_attention
         else:
             raise ValueError(
-                "DFlash attention backend must be VANILLA or TRTLLM, got "
+                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
                 f"{self.dflash_attention_backend!r}."
             )
 
@@ -855,22 +1335,25 @@ class DFlashForCausalLM(nn.Module):
             q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions, dtype=rope_dtype)
         _rope = RotaryEmbedding.apply_rotary_pos_emb
 
-        # cache_seqlens (BEFORE append). flash_attn appends block_size
-        # k/v at cache_seqlens[i]..+block_size for batch i.
+        # cache_seqlens BEFORE the block's K/V are stored.
         cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
         cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
+        seq_lens_after = cache_seqlens_i32 + block_size
 
-        if self.dflash_attention_backend == "TRTLLM":
+        if is_paged:
             max_batch_size = ctx_page_table.size(0)
-            self._prepare_dflash_trtllm_gen_buffers(
-                hidden_states.dtype,
-                hidden_states.device,
-                max_batch_size,
-                block_size,
-                num_heads_per_rank,
-                num_kv_heads_per_rank,
-                head_dim,
-            )
+            if self.dflash_attention_backend == "TRTLLM":
+                self._prepare_dflash_trtllm_gen_buffers(
+                    hidden_states.dtype,
+                    hidden_states.device,
+                    max_batch_size,
+                    block_size,
+                    num_heads_per_rank,
+                    num_kv_heads_per_rank,
+                    head_dim,
+                )
+            else:  # FA4 needs no workspace or counter buffers.
+                self._prepare_dflash_index_buffers(hidden_states.device, max_batch_size, block_size)
             block_tables = ctx_page_table.index_select(0, cache_batch_idx_i32.long())
             pages_per_slot = block_tables.size(1)
             # Index the layer first: ctx_kv_cache is an [L, ...] tensor for the
@@ -885,7 +1368,6 @@ class DFlashForCausalLM(nn.Module):
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
-            seq_lens_after = cache_seqlens_i32 + block_size
             kv_last_page_len = ((seq_lens_after - 1) % page_size) + 1
             batch_indices = self._dflash_batch_indices
             append_batch_indices = batch_indices[:B].reshape(-1)
@@ -894,11 +1376,26 @@ class DFlashForCausalLM(nn.Module):
                 .reshape(-1)
                 .contiguous()
             )
+        else:  # VANILLA
+            # Slot and column that each block K/V row occupies
+            self._prepare_dflash_index_buffers(
+                ctx_k_cache.device,
+                ctx_k_cache.size(0),
+                block_size,
+                need_batch_indices=False,
+            )
+            append_batch_indices = (
+                cache_batch_idx_i32.view(-1, 1).expand(-1, block_size).reshape(-1).long()
+            )
+            append_positions = (
+                (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets).reshape(-1).long()
+            )
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
 
         residual = None
+        has_block_conv = self.has_block_conv
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn_mod = layer.self_attn
@@ -912,6 +1409,15 @@ class DFlashForCausalLM(nn.Module):
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed_flat, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(B, block_size, -1)
+
+            # DFlash 2 wraps each sublayer in a block-local convolution; both
+            # sides share one projection of the input, hence the coefficients
+            # handed forward to finish().
+            attn_conv_coefficients = None
+            if has_block_conv:
+                hs_normed_flat, attn_conv_coefficients = self.attention_convs[layer_idx].prepare(
+                    hs_normed_flat, block_size
+                )
 
             # QKV projection on normed query tokens (2D)
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
@@ -985,12 +1491,7 @@ class DFlashForCausalLM(nn.Module):
                 v_noise_bshd = v_noise_all.reshape(B, block_size, num_kv_heads_per_rank, head_dim)
 
             # Per-layer view into the pooled ctx cache.
-            causal, window_size = self._get_attention_mask_args(layer_idx)
-            swa_window = (
-                self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
-            )
-            if swa_window != (-1, -1):
-                window_size = swa_window
+            causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
                 trtllm_gen_ops.append_paged_kv_cache(
@@ -1073,7 +1574,53 @@ class DFlashForCausalLM(nn.Module):
                         causal=False,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
                     )
+            elif self.dflash_attention_backend == "FA4":
+                layer_cache = ctx_kv_cache[layer_idx]
+                paged_append(
+                    append_key=k_noise_bshd.reshape(
+                        -1, num_kv_heads_per_rank, head_dim
+                    ).contiguous(),
+                    append_value=v_noise_bshd.reshape(
+                        -1, num_kv_heads_per_rank, head_dim
+                    ).contiguous(),
+                    batch_indices=append_batch_indices,
+                    positions=append_positions,
+                    paged_kv_cache=layer_cache,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    kv_last_page_len=kv_last_page_len,
+                    kv_layout="HND",
+                )
+                # FA4 wants NHD pages, [pages, page_size, nkv, hd]. Pool is
+                # HND so transpose: stride(-1) == 1, so no copy is materialized.
+                k_pages = layer_cache[:, 0].transpose(1, 2)
+                v_pages = layer_cache[:, 1].transpose(1, 2)
+                window_left, window_right = window_size
+                # pack_gqa=None lets FA4 enable packing itself whenever
+                # q_heads > kv_heads, including on windowed layers.
+                out, *_ = fa4_fwd(
+                    Q_bshd,
+                    k_pages,
+                    v_pages,
+                    seqused_k=seq_lens_after,
+                    page_table=block_tables,
+                    softmax_scale=head_dim**-0.5,
+                    causal=causal,
+                    window_size_left=None if window_left < 0 else window_left,
+                    window_size_right=None if window_right < 0 else window_right,
+                    num_splits=1,  # SM90 has no SplitKV kernel
+                    pack_gqa=None,
+                    return_lse=False,
+                )
             else:  # VANILLA, validated before entering the layer loop.
+                # Store this layer's block K/V, then attend read-only.
+                kv_row_shape = (-1, num_kv_heads_per_rank, head_dim)
+                ctx_k_cache[append_batch_indices, layer_idx, append_positions] = (
+                    k_noise_bshd.reshape(kv_row_shape)
+                )
+                ctx_v_cache[append_batch_indices, layer_idx, append_positions] = (
+                    v_noise_bshd.reshape(kv_row_shape)
+                )
                 layer_k_cache = ctx_k_cache[:, layer_idx]
                 layer_v_cache = ctx_v_cache[:, layer_idx]
 
@@ -1099,9 +1646,7 @@ class DFlashForCausalLM(nn.Module):
                     q=q_in,
                     k_cache=layer_k_cache,
                     v_cache=layer_v_cache,
-                    k=k_noise_bshd,
-                    v=v_noise_bshd,
-                    cache_seqlens=cache_seqlens_i32,
+                    cache_seqlens=seq_lens_after,
                     cache_batch_idx=cache_batch_idx_i32,
                     causal=causal,
                     window_size=window_size,
@@ -1123,11 +1668,23 @@ class DFlashForCausalLM(nn.Module):
 
             # o_proj (flat 2D, handles all-reduce internally)
             hidden_out = attn_mod.o_proj(attn_output)
+            if has_block_conv:
+                hidden_out = self.attention_convs[layer_idx].finish(
+                    hidden_out, attn_conv_coefficients, block_size
+                )
 
             # Post-attention layernorm + MLP (flat 2D)
             res_flat = residual.reshape(-1, residual.shape[-1])
             hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+            if has_block_conv:
+                hidden_out, mlp_conv_coefficients = self.mlp_convs[layer_idx].prepare(
+                    hidden_out, block_size
+                )
             hidden_out = layer.mlp(hidden_out)
+            if has_block_conv:
+                hidden_out = self.mlp_convs[layer_idx].finish(
+                    hidden_out, mlp_conv_coefficients, block_size
+                )
 
             hidden_states = hidden_out.reshape(B, block_size, -1)
             residual = res_flat.reshape(B, block_size, -1)

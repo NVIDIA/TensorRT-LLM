@@ -32,6 +32,8 @@ from tensorrt_llm.serve.perf_metrics import (
 )
 from tensorrt_llm.serve.scripts.time_breakdown import RequestDataParser
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _record(status="complete"):
     return {
@@ -74,6 +76,35 @@ def _record(status="complete"):
             }
         },
     }
+
+
+def _record_with_kv_transfer():
+    # _record() carries None for both KV timestamps, which every revision drops, so
+    # it cannot tell a working KV-transfer span from a zeroed one.
+    record = _record()
+    timing = record["phases"]["server"]["timing_metrics"]
+    timing["kv_cache_transfer_start"] = 1.011
+    timing["kv_cache_transfer_end"] = 1.013
+    return record
+
+
+def _disagg_record_from_headers(worker_record):
+    headers = build_metrics_headers([worker_record])
+    return headers, combine_disagg_metrics(
+        "42",
+        {
+            "ctx_server": "ctx:8000",
+            "gen_server": "gen:8000",
+            "timing_metrics": {
+                "server_arrival_time": 0.99,
+                "ctx_dispatch_time": 1.0,
+                "server_first_token_time": 1.03,
+            },
+        },
+        build_metrics_record_from_headers(headers, "ctx", request_id="42"),
+        build_metrics_record_from_headers(headers, "gen", request_id="42"),
+        disagg_request_id=42,
+    )
 
 
 def test_metrics_headers_use_metric_list_syntax():
@@ -156,6 +187,34 @@ def test_time_breakdown_parser_accepts_header_derived_disagg_record():
     assert parsed["disagg_server_arrival_time"] == pytest.approx(0.99)
     assert combined_headers[START_END_TIME_HEADER].count("ctx-start;") == 1
     assert combined_headers[SERVER_TIMING_HEADER].count("ctx_queue;") == 1
+
+
+def test_header_derived_record_keeps_kv_transfer_without_kv_cache_size():
+    # kv_cache_size is worker-local and has no Server-Timing header, so a record
+    # reconstructed from headers never carries it. Gating the KV-transfer timestamps
+    # on kv_cache_size therefore discarded them for every disaggregated request,
+    # zeroing that span; they must be gated on the timestamps themselves.
+    headers, record = _disagg_record_from_headers(_record_with_kv_transfer())
+    assert "server-kv-start;" in headers[START_END_TIME_HEADER]
+
+    gen_timing = record["phases"]["gen"]["timing_metrics"]
+    assert gen_timing["kv_cache_transfer_start"] == pytest.approx(1.011)
+    assert "kv_cache_size" not in gen_timing
+
+    timing = _jsonl_record(record)["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+    assert timing["kv_cache_transfer_start"] == pytest.approx(1.011)
+    assert timing["kv_cache_transfer_end"] == pytest.approx(1.013)
+    assert "kv_cache_size" not in timing
+
+
+def test_unpopulated_kv_transfer_timestamps_stay_absent():
+    # The other half of the same gate: an unpopulated timestamp must not be written
+    # as 0.0, or a consumer testing presence reads a zero-width transfer as real.
+    _, record = _disagg_record_from_headers(_record())
+
+    timing = _jsonl_record(record)["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+    assert "kv_cache_transfer_start" not in timing
+    assert "kv_cache_transfer_end" not in timing
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,8 @@ These examples show how to interact with the visual generation server using both
   - Multipart/form-data support for file uploads
 - **Video Management**: Retrieving and deleting generated videos
 
+For online benchmarking, see [Benchmarking VisualGen](../../../tensorrt_llm/serve/scripts/BENCHMARKING_VISUAL_GEN.md).
+
 ## Prerequisites
 
 Before running these examples, ensure you have:
@@ -311,6 +313,18 @@ You can customize these by:
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries every generated tensor, including video, audio, or action, plus scalar metadata in one payload).
 
 > **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400. One switch covers both directions: it also rejects a reference sent with `format="path"`.
+
+#### Media-storage directory
+
+Generated media is written under `TRTLLM_MEDIA_STORAGE_PATH`, whatever `response_format` the request asks for — a `file` download is served from a file written there first.
+
+| `TRTLLM_MEDIA_STORAGE_PATH` | Where media lands |
+|---|---|
+| set | the directory named, as given |
+| unset, or set to an empty string | `$CWD/trtllm_generated/<yymmdd-hhmmss>/`, a new directory per server |
+| unset, and the working directory cannot be written | a temporary directory |
+
+The stamped directory keeps one run's output separable from the next, and lets two servers on one node write side by side. The server logs the directory it settled on as it starts, which is the way to find the fallback one. Nothing removes any of it: media accumulates until you delete it.
 
 #### Tensor-format consumer contract
 

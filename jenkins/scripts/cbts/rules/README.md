@@ -56,6 +56,10 @@ For each file under `tests/` in the diff:
    `@pytest.mark.parametrize` stays at method level and a class-level
    `@skip_pre_blackwell` stays at class level instead of dropping to
    module scope.
+   Python helper modules instead query the shared `RepositoryReferenceIndex`.
+   A complete set of direct `test_*.py` importers becomes the anchors; an
+   ambiguous, dynamic, transitive, or non-test importer retains the directory
+   fallback.
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
    (bidirectional pytest-tree lineage) for each anchor; matches feed
    `block_filters`. For non-`test_*.py` paths, the lookup walks up
@@ -296,13 +300,14 @@ Outcomes:
 ## OpenEngineRule
 
 Claims non-documentation source changes under `tensorrt_llm/grpc/openengine/` and keeps only test-db
-entries under `unittest/grpc/openengine/`. The focused test is registered in `l0_cpu.yml`, so it
-resolves to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
-unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so an OpenEngine change never needs a GPU shard and the
-test still runs on every baseline and fallback pipeline. Those are also the only stages that install
-`requirements-openengine.txt`; that install is guarded on the stage name in `jenkins/L0_Test.groovy`
-and deliberately not on CBTS scope, because `scopes` is a union across fired rules and a mixed
-selection would otherwise carry the OpenEngine pins into every shard it runs. If no OpenEngine test
+entries under `unittest/grpc/openengine/`. The stub-based tests are registered in `l0_cpu.yml`, so
+they resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
+unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so they still run on every baseline and fallback
+pipeline. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
+adding `A10-PyTorch-*`: an OpenEngine change does pull one GPU shard. Any GPU serves — the model is
+TinyLlama-1.1B — so it sits with the other gateway tests rather than claiming a scarcer type.
+`requirements-openengine.txt` is installed on every stage in `jenkins/L0_Test.groovy` alongside the
+SMG file, so no stage-name guard decides which gateway a shard can import. If no OpenEngine test
 entry is registered, the rule returns `scope=None` and falls back to the baseline rather than
 silently skipping coverage.
 

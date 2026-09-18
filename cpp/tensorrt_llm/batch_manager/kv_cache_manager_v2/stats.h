@@ -21,8 +21,11 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <unordered_map>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -173,6 +176,63 @@ struct KVCacheIterationStatsDelta
 };
 
 using IterationStatsByLifeCycle = std::unordered_map<LifeCycleId, KVCacheIterationStatsDelta>;
+
+// ---------------------------------------------------------------------------
+// CountsByLevel — counters indexed by CacheLevel, so entry i always belongs to
+// the i-th configured cache tier. The length follows the configured tier list
+// instead of a hard-coded GPU/host/disk split, which is what lets a deployment
+// with a hot and a cold GPU level report them as two distinct entries.
+//
+// Kept outside KVCacheIterationStatsDelta on purpose: the level count is a
+// runtime quantity, while that struct is a fixed-field record whose field-wise
+// add/subtract helpers assume scalar members.
+// ---------------------------------------------------------------------------
+
+using CountsByLevel = TypedVec<CacheLevel, int64_t>;
+
+//! Element-wise accumulate, widening `dst` when `src` covers more levels.
+inline void addCountsByLevel(CountsByLevel& dst, CountsByLevel const& src)
+{
+    if (dst.size() < src.size())
+    {
+        dst.resize(src.size(), 0);
+    }
+    for (CacheLevel level{0}; level < src.size(); ++level)
+    {
+        dst.at(level) += src.at(level);
+    }
+}
+
+inline bool countsByLevelEmpty(CountsByLevel const& counts) noexcept
+{
+    return std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count == 0; });
+}
+
+inline int64_t countsByLevelTotal(CountsByLevel const& counts) noexcept
+{
+    return std::accumulate(counts.begin(), counts.end(), int64_t{0});
+}
+
+//! Reuse block counts split by the cache level the reused pages were resident on when the match
+//! was taken.
+struct ReusedBlocksByLevel
+{
+    CountsByLevel full;
+    CountsByLevel partial;
+
+    void add(ReusedBlocksByLevel const& other)
+    {
+        addCountsByLevel(full, other.full);
+        addCountsByLevel(partial, other.partial);
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return countsByLevelEmpty(full) && countsByLevelEmpty(partial);
+    }
+};
+
+using ReusedBlocksByLevelByLifeCycle = std::unordered_map<LifeCycleId, ReusedBlocksByLevel>;
 
 // ---------------------------------------------------------------------------
 // SsmSnapshotIterationStatsDelta — per-lifecycle counters for SSM snapshot
