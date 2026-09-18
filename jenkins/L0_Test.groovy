@@ -245,7 +245,7 @@ def isInfraDryRun() {
 }
 
 def getJenkinsInstanceName() {
-    return (env.JENKINS_URL ?: Jenkins.instance.rootUrl).replaceAll(/\/+$/, '').tokenize('/').last()
+    return trtllm_utils.getShortenedInstanceName(env.JENKINS_URL ?: Jenkins.instance.rootUrl)
 }
 
 def isCbtsStage(String stageName) {
