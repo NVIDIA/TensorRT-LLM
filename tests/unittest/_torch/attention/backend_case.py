@@ -951,6 +951,13 @@ def run_backend(
 
         def create_metadata(AttentionCls, case, mgr, *, num_contexts: int = 0):
             seq_lens_kv = torch.tensor(case.seq_lens_kv, dtype=torch.int) if case.is_cross else None
+            # Context preprocessing needs this chunk's Q length; the cached
+            # prefix is already included separately in kv_lens by prepare().
+            prompt_lens = (
+                case.seq_lens
+                if case.is_cross
+                else case.seq_lens[:num_contexts] + case.token_nums[num_contexts:]
+            )
             return AttentionCls.Metadata(
                 num_contexts=num_contexts,
                 kv_cache_params=KVCacheParams(
@@ -962,7 +969,7 @@ def run_backend(
                 max_num_tokens=case.max_num_tokens,
                 kv_cache_manager=mgr,
                 request_ids=request_ids,
-                prompt_lens=case.seq_lens if case.is_cross else case.token_nums,
+                prompt_lens=prompt_lens,
                 kv_layout=kv_layout,
             )
 
