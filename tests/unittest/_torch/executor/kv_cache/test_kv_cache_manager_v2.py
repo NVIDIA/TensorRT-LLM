@@ -1831,6 +1831,7 @@ def _make_admission_manager(
     """
     manager = object.__new__(KVCacheManagerV2)
     manager.conversation_manager = None
+    manager.kv_connector_manager = None
     manager.enable_block_reuse = True
     manager.tokens_per_block = TOKENS_PER_BLOCK
     manager.is_draft = False

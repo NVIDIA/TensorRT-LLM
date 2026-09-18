@@ -858,7 +858,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     algorithm: Literal["minimax_m3"] = "minimax_m3"
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
-        description="Number of index-attention heads (per TP rank's view).",
+        description=
+        "Global checkpoint index-attention head count. Index heads shard with "
+        "their KV-head groups in both separate and fused projections.",
     )
     sparse_index_dim: int = Field(
         default=128,
@@ -898,6 +900,17 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "by the MSA implementation.",
         status="prototype",
     )
+    fuse_qkv_index_projection: bool = Field(
+        default=False,
+        description=
+        "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q "
+        "is sharded with the KV heads and index-K is replicated. MSA batches "
+        "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
+        "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
+        "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
+        "main KV cache.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -932,6 +945,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
             raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
                              "sparse_disable_index_value=True.")
+        if self.fuse_qkv_index_projection and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "the 'msa' implementation.")
+        if self.fuse_qkv_index_projection and self.indexer_kv_dtype != "fp8":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "indexer_kv_dtype='fp8'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -946,6 +967,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
         return MiniMaxM3SparseParams(
             num_index_heads=self.sparse_num_index_heads,
+            global_num_kv_heads=(
+                self.to_sparse_metadata_params(**kwargs).global_num_kv_heads
+                or None),
             sparse_index_dim=self.sparse_index_dim,
             block_size=self.sparse_block_size,
             topk=self.sparse_topk_blocks,
@@ -955,6 +979,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
             indexer_kv_dtype=self.indexer_kv_dtype,
+            fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
