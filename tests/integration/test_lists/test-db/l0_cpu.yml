@@ -171,6 +171,7 @@ l0_cpu:
   - unittest/quantization/test_mode.py
   - unittest/scaffolding
   - unittest/scripts
+  - unittest/test_checkpoint_io_policy.py
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py

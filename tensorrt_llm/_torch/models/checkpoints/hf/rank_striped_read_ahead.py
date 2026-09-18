@@ -5,12 +5,21 @@
 
 import os
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from heapq import heappop, heappush
 from pathlib import Path
 from typing import Sequence
 
 import psutil
+
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import CheckpointCatalog
+from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
+    WeightDemand,
+    WeightLoadOrderConfidence,
+    WeightLoadPlan,
+)
 
 # Work-assignment granularity across ranks; one extent stays with one issuer.
 _CHUNK_SIZE = 256 * 1024 * 1024
@@ -64,21 +73,188 @@ def distribute_worker_budget(local_size: int) -> tuple[int, ...]:
     return tuple(workers + (rank < remainder) for rank in range(local_size))
 
 
-def build_local_plan(
+def _build_source_extents(
     files: Sequence[tuple[str, int]],
-    local_rank: int,
-    local_size: int,
-) -> ReadAheadPlan:
-    """Assign every checkpoint extent to exactly one node-local issuer."""
-    if not 0 <= local_rank < local_size:
-        raise ValueError("local rank and size must describe a valid group")
-
+) -> list[ReadAheadExtent]:
     extents = []
     for path, file_size in sorted(files):
         if file_size < 0:
             raise ValueError("checkpoint file sizes must be nonnegative")
         for offset in range(0, file_size, _CHUNK_SIZE):
-            extents.append(ReadAheadExtent(path, offset, min(_CHUNK_SIZE, file_size - offset)))
+            extents.append(
+                ReadAheadExtent(
+                    path,
+                    offset,
+                    min(_CHUNK_SIZE, file_size - offset),
+                )
+            )
+    return extents
+
+
+def _topological_demands(plan: WeightLoadPlan) -> tuple[WeightDemand, ...]:
+    """Return a stable priority-aware topological order for one rank plan."""
+    demand_by_id = {demand.group_id: demand for demand in plan.demands}
+    successors = {group_id: [] for group_id in demand_by_id}
+    remaining_predecessors = {}
+    for demand in plan.demands:
+        remaining_predecessors[demand.group_id] = len(demand.predecessors)
+        for predecessor in demand.predecessors:
+            successors[predecessor].append(demand.group_id)
+
+    ready = [
+        (
+            demand.priority,
+            demand.group_id,
+        )
+        for demand in plan.demands
+        if not demand.predecessors
+    ]
+    ready.sort()
+    ordered = []
+    while ready:
+        _, group_id = heappop(ready)
+        demand = demand_by_id[group_id]
+        ordered.append(demand)
+        for successor in successors[group_id]:
+            remaining_predecessors[successor] -= 1
+            if remaining_predecessors[successor] == 0:
+                successor_demand = demand_by_id[successor]
+                heappush(
+                    ready,
+                    (
+                        successor_demand.priority,
+                        successor,
+                    ),
+                )
+
+    if len(ordered) != len(plan.demands):
+        raise ValueError("weight demand predecessor graph must be acyclic")
+    return tuple(ordered)
+
+
+def compile_weight_plan_extent_order(
+    catalog: CheckpointCatalog,
+    plans: Sequence[WeightLoadPlan],
+    files: Sequence[tuple[str, int]],
+) -> tuple[ReadAheadExtent, ...]:
+    """Prioritize whole source chunks without changing read coverage.
+
+    The earliest ordering-qualified demand for a tensor across node-local rank
+    plans wins. Tensor ranges only reprioritize the existing fixed-size source
+    chunks; chunks are never split or omitted, and physically ordered unmatched
+    chunks form the tail. Conservative plans are consumed through
+    ``described_tensor_names`` rather than the selective-I/O-only
+    ``selected_tensor_names`` property. If every plan has opaque ordering, the
+    source's physical chunk order is preserved.
+    """
+    if not catalog.has_complete_byte_ranges:
+        raise ValueError("checkpoint catalog must expose complete byte ranges")
+    if not plans:
+        raise ValueError("at least one weight load plan is required")
+
+    paths_by_object_id = {}
+    sizes_by_object_id = {}
+    for path, size_bytes in files:
+        object_id = os.path.basename(path)
+        if object_id in paths_by_object_id:
+            raise ValueError(f"checkpoint paths have duplicate basename object ID {object_id!r}")
+        paths_by_object_id[object_id] = path
+        sizes_by_object_id[object_id] = size_bytes
+
+    catalog_sizes = {obj.object_id: obj.size_bytes for obj in catalog.objects}
+    missing_objects = catalog_sizes.keys() - paths_by_object_id.keys()
+    unexpected_objects = paths_by_object_id.keys() - catalog_sizes.keys()
+    if missing_objects or unexpected_objects:
+        raise ValueError(
+            "checkpoint catalog and source files resolve different objects: "
+            f"missing={sorted(missing_objects)}, "
+            f"unexpected={sorted(unexpected_objects)}"
+        )
+    mismatched_sizes = {
+        object_id: (catalog_sizes[object_id], sizes_by_object_id[object_id])
+        for object_id in catalog_sizes
+        if catalog_sizes[object_id] != sizes_by_object_id[object_id]
+    }
+    if mismatched_sizes:
+        raise ValueError(
+            f"checkpoint catalog object sizes do not match source files: {mismatched_sizes}"
+        )
+
+    ordered_plans = tuple(sorted(plans, key=lambda plan: plan.rank))
+    if len({plan.rank for plan in ordered_plans}) != len(ordered_plans):
+        raise ValueError("node-local weight load plans must have unique ranks")
+    world_sizes = {plan.world_size for plan in ordered_plans}
+    if len(world_sizes) != 1:
+        raise ValueError("node-local weight load plans must agree on world_size")
+    for plan in ordered_plans:
+        plan.validate_against(catalog)
+
+    # Dependencies establish an earliest read-ahead stage. Equal-priority,
+    # independent groups share a stage: their native consumers may execute
+    # concurrently, so preserve physical locality instead of inventing a
+    # tensor-name ordering.
+    tensor_priorities: dict[str, int] = {}
+    for plan in ordered_plans:
+        if plan.ordering is WeightLoadOrderConfidence.OPAQUE:
+            continue
+        group_priorities: dict[str, int] = {}
+        for demand in _topological_demands(plan):
+            priority = max(
+                demand.priority,
+                max(
+                    (group_priorities[p] + 1 for p in demand.predecessors),
+                    default=demand.priority,
+                ),
+            )
+            group_priorities[demand.group_id] = priority
+            for tensor_name in demand.source_names:
+                tensor_priorities[tensor_name] = min(
+                    priority, tensor_priorities.get(tensor_name, priority)
+                )
+
+    source_extents = _build_source_extents(files)
+    chunk_priorities: dict[ReadAheadExtent, int] = {}
+    chunks_by_object_id = {object_id: [] for object_id in paths_by_object_id}
+    for extent in source_extents:
+        chunks_by_object_id[os.path.basename(extent.path)].append(extent)
+
+    for tensor_name, priority in tensor_priorities.items():
+        for tensor_extent in catalog.get_tensor(tensor_name).extents:
+            if tensor_extent.length_bytes == 0:
+                continue
+            chunks = chunks_by_object_id[tensor_extent.object_id]
+            first_chunk = tensor_extent.offset_bytes // _CHUNK_SIZE
+            final_chunk = (tensor_extent.end_offset_bytes - 1) // _CHUNK_SIZE
+            for chunk in chunks[first_chunk : final_chunk + 1]:
+                chunk_priorities[chunk] = min(priority, chunk_priorities.get(chunk, priority))
+
+    tail_priority = max(chunk_priorities.values(), default=0) + 1
+    # Python's stable sort preserves physical order within each priority and
+    # among all unmatched chunks. Every original chunk remains present once.
+    return tuple(
+        sorted(
+            source_extents,
+            key=lambda extent: chunk_priorities.get(extent, tail_priority),
+        )
+    )
+
+
+def build_local_plan(
+    files: Sequence[tuple[str, int]],
+    local_rank: int,
+    local_size: int,
+    *,
+    ordered_extents: Sequence[ReadAheadExtent] | None = None,
+) -> ReadAheadPlan:
+    """Assign every checkpoint extent to exactly one node-local issuer."""
+    if not 0 <= local_rank < local_size:
+        raise ValueError("local rank and size must describe a valid group")
+
+    extents = _build_source_extents(files)
+    if ordered_extents is not None:
+        if Counter(ordered_extents) != Counter(extents):
+            raise ValueError("ordered_extents must be a complete permutation of checkpoint extents")
+        extents = list(ordered_extents)
 
     worker_counts = distribute_worker_budget(local_size)
     issuer_ranks = [rank for rank, workers in enumerate(worker_counts) if workers > 0]
@@ -207,19 +383,22 @@ class RankStripedReadAheadSession:
         self._node_communicator = node_communicator
         self._plan = plan
         self._cancel = threading.Event()
+        self._read_release = threading.Event()
         self._thread: threading.Thread | None = None
         self._file_descriptors: dict[str, int] = {}
         self._read_error: BaseException | None = None
         self._closed = False
 
         try:
-            for path in {extent.path for extent in plan.extents}:
+            for path in dict.fromkeys(extent.path for extent in plan.extents):
                 self._file_descriptors[path] = os.open(path, os.O_RDONLY)
         except Exception:
             self._close_file_descriptors()
             raise
 
-    def start(self) -> "RankStripedReadAheadSession":
+    def start(self, *, defer_reads: bool = False) -> "RankStripedReadAheadSession":
+        if not defer_reads:
+            self._read_release.set()
         if not self._plan.extents:
             return self
         self._thread = threading.Thread(
@@ -232,6 +411,10 @@ class RankStripedReadAheadSession:
             self._close_file_descriptors()
             raise
         return self
+
+    def release_reads(self) -> None:
+        """Release prepared workers only after activation consensus."""
+        self._read_release.set()
 
     def _read_extent(self, extent: ReadAheadExtent) -> int:
         file_descriptor = self._file_descriptors[extent.path]
@@ -251,8 +434,17 @@ class RankStripedReadAheadSession:
             completed += bytes_read
         return completed
 
+    def _request_cancel(self) -> None:
+        self._cancel.set()
+        # Wake a prepared worker that is still behind the activation gate. It
+        # observes cancellation before issuing any payload I/O.
+        self._read_release.set()
+
     def _run(self) -> None:
         try:
+            self._read_release.wait()
+            if self._cancel.is_set():
+                return
             with ThreadPoolExecutor(max_workers=self._plan.workers) as executor:
                 futures = [
                     executor.submit(self._read_extent, extent) for extent in self._plan.extents
@@ -265,7 +457,7 @@ class RankStripedReadAheadSession:
                             break
                         future.result()
                 except Exception:
-                    self._cancel.set()
+                    self._request_cancel()
                     for future in futures:
                         future.cancel()
                     raise
@@ -309,7 +501,7 @@ class RankStripedReadAheadSession:
 
     def cancel_reads(self) -> BaseException | None:
         """Stop background work while leaving the node communicator usable."""
-        self._cancel.set()
+        self._request_cancel()
         if self._thread is not None:
             self._thread.join()
         return self._close_file_descriptors()
@@ -324,7 +516,7 @@ class RankStripedReadAheadSession:
         # cannot improve first-token latency. Bound the remaining I/O volume
         # to the currently executing small pread on each worker; synchronous
         # storage latency itself is not cancellable here.
-        self._cancel.set()
+        self._request_cancel()
         if self._thread is not None:
             self._thread.join()
 

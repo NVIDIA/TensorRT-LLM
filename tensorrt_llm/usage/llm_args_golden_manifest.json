@@ -175,7 +175,8 @@
       "allowed_values": [
         "auto",
         "native",
-        "rank_striped_read_ahead"
+        "rank_striped_read_ahead",
+        "demand_ordered_rank_striped_read_ahead"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
