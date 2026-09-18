@@ -13,7 +13,9 @@ from tensorrt_llm.llmapi import LlmArgs
 from tensorrt_llm.llmapi.utils import (ApiStatusRegistry,
                                        _set_affinity_all_threads,
                                        configure_cpu_affinity,
-                                       generate_api_docs_as_docstring)
+                                       exclude_cpus_from_affinity,
+                                       generate_api_docs_as_docstring,
+                                       parse_cpu_list)
 
 _TASK_DIR = "/proc/self/task"
 
@@ -275,3 +277,26 @@ class DelayedAssert:
     def assert_all(self):
         assert all(ret[0] for ret in self.assertions), self.get_msg()
         self.clear()
+
+
+def test_exclude_cpus_from_affinity():
+    """Worker CPU affinity minus the co-located service CPUs: only the
+    overlap is dropped, and never so many that fewer than the minimum
+    number of CPUs would remain."""
+    assert parse_cpu_list("132-175,308-351") == (set(range(132, 176)) |
+                                                 set(range(308, 352)))
+    assert parse_cpu_list(" 3, 5-6 ") == {3, 5, 6}
+    assert parse_cpu_list("") == set()
+    socket1 = list(range(88, 176)) + list(range(264, 352))
+    kept, dropped = exclude_cpus_from_affinity(socket1, "132-175,308-351")
+    assert kept == list(range(88, 132)) + list(range(264, 308))
+    assert dropped == list(range(132, 176)) + list(range(308, 352))
+    socket0 = list(range(0, 88)) + list(range(176, 264))
+    assert exclude_cpus_from_affinity(socket0,
+                                      "132-175,308-351") == (socket0, [])
+    cpus = list(range(0, 12))
+    # dropping 8 of 12 would leave fewer than the minimum: untouched
+    assert exclude_cpus_from_affinity(cpus, "0-7") == (cpus, [])
+    assert exclude_cpus_from_affinity(cpus, "0-3") == (list(range(4, 12)),
+                                                       [0, 1, 2, 3])
+    assert exclude_cpus_from_affinity(cpus, "") == (cpus, [])

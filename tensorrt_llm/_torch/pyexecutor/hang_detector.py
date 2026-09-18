@@ -441,7 +441,13 @@ class HangDetector:
         on_detected: Optional[Callable[[], None]] = None,
         report_context: Optional[str] = None,
     ) -> None:
-        self.timeout = timeout if timeout is not None else 300
+        # TLLM_HANG_DETECTOR_TIMEOUT: nsys report finalization at the profile
+        # window's stop iteration pauses every rank of an engine while the
+        # trace flushes; a long window's flush exceeds 300s and the detector
+        # self-SIGKILLs a healthy engine (seen in production). Profiled runs raise it.
+        self.timeout = (
+            timeout if timeout is not None else int(os.environ.get("TLLM_HANG_DETECTOR_TIMEOUT", "300"))
+        )
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.report_context = report_context

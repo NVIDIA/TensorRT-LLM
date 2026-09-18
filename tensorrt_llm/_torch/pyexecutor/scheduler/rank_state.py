@@ -188,6 +188,11 @@ class RankState:
     num_active_requests: int = 0
     num_active_tokens: int = 0
     num_retiring_requests: int = 0
+    num_pending_new_requests: int = 0
+    """Rank 0's snapshot of not-yet-fetched requests (request queue +
+    accumulated), piggybacked on the allgather so every rank can skip the
+    request-count probe broadcast (or the whole fetch) on the busy path.
+    Always 0 on non-zero ranks and when the fetch hint is disabled."""
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
     num_context_requests: int = 0
     num_generation_requests: int = 0
@@ -205,6 +210,7 @@ class RankState:
             self.num_active_requests,
             self.num_active_tokens,
             self.num_retiring_requests,
+            self.num_pending_new_requests,
             *self.iter_stats.serialize(include_kv_cache_load),
             self.num_context_requests,
             self.num_generation_requests,
@@ -216,7 +222,7 @@ class RankState:
     def deserialize(cls, data: list[int | float]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        prefix_field_count = 4
+        prefix_field_count = 5
         rank_state_fields = fields(cls)[:prefix_field_count]
         if not values:
             raise ValueError("RankState payload is missing required field rank")
@@ -258,6 +264,7 @@ class RankState:
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
             num_retiring_requests=rank_values[3],
+            num_pending_new_requests=rank_values[4],
             iter_stats=RankIterStatsPayload.deserialize(values[prefix_field_count:stats_end]),
             num_context_requests=values[stats_end] if len(values) > stats_end else 0,
             num_generation_requests=values[stats_end + 1] if len(values) > stats_end + 1 else 0,
