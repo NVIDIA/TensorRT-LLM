@@ -145,7 +145,19 @@ class ModuleOffloadManager:
 
     @staticmethod
     def _is_non_overlapping_and_dense(tensor: torch.Tensor) -> bool:
+<<<<<<< HEAD
         return is_non_overlapping_and_dense_or_false(tensor)
+=======
+        """Return whether ``tensor`` densely covers a contiguous span from its storage offset."""
+        expected_stride = 1
+        for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
+            if size <= 1:
+                continue
+            if stride != expected_stride:
+                return False
+            expected_stride *= size
+        return True
+>>>>>>> 025ceedd0b9255508eaca47d85e9ff0137f386d2
 
     @staticmethod
     def _storage_key(tensor: torch.Tensor) -> tuple[int, int] | None:
