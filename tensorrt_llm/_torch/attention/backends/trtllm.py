@@ -228,10 +228,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _mla_ctx_cu_seqlens_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
-    _fp4_mla_fp8_context_state: Optional[Tuple[Any, Any]] = field(init=False,
-                                                                  default=None,
-                                                                  repr=False,
-                                                                  compare=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
@@ -2558,7 +2554,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.layer_idx,
             token_offset=getattr(metadata, "num_ctx_tokens", 0),
             phase="generation",
-            local_layer=self.get_local_layer_idx(metadata),
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
             v_head_dim=self.kv_lora_rank,
             rotary_cos_sin=self.rotary_cos_sin,
             q_pe=q_pe,

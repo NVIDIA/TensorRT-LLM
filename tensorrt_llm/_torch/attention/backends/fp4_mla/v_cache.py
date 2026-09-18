@@ -9,14 +9,23 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.bindings import DataType
+
 from .config import (
+    _FP4_MLA_CUTEDSL_BACKEND,
+    FP4_BLOCK_SIZE,
+    FP4_MLA_SCALE_ROW_GROUP,
     FP4_MLA_TOKENS_PER_BLOCK,
+    HP_BLOCK_SIZE,
     _ceil_div,
     _env_enabled_default,
     _env_int,
     _fp4_mla_attention_backend,
+    _fp4_mla_cutedsl_fused_v_transpose_enabled,
 )
-from .layout import _ensure_workspace_tensor
+from .fp4_mla_kernels import _fp4_mla_rebuild_v_scale_from_k_scale_kernel
+from .layout import _ensure_workspace_tensor, get_fp4_mla_v_scale_pool_size
 
 
 def _shared_v_pack_storage_enabled() -> bool:
@@ -344,7 +353,7 @@ def _update_triton_v_packed_cache(
         return None
     if page_ids.numel() == 0:
         return None
-    from .fp4_mla_triton import fp4_mla_repack_v_cache_triton
+    from .fp4_mla_triton import fp4_mla_repack_v_cache
 
     def _tma_alloc(size: int, alignment: int, stream):
         return torch.empty(size, device=kv_cache.device, dtype=torch.int8)
@@ -358,7 +367,7 @@ def _update_triton_v_packed_cache(
         dtype=torch.uint8,
         device=kv_cache.device,
     )
-    fp4_mla_repack_v_cache_triton(
+    fp4_mla_repack_v_cache(
         v_packed,
         kv_cache,
         page_ids,
@@ -407,3 +416,244 @@ def _maybe_update_triton_v_packed_cache(
         v_sf=v_sf,
         num_valid_pages=num_valid_pages,
     )
+
+
+def _rebuild_fp4_mla_v_scales_from_k_scales(
+    sf_cache: torch.Tensor,
+    v_scale_pool: torch.Tensor,
+    page_ids: torch.Tensor,
+    page_valid_tokens: torch.Tensor,
+    *,
+    local_layer: int,
+    v_head_dim: int,
+    page_size: int,
+) -> None:
+    """Bit-exactly rebuild imported MLA V scales from transferred K scales."""
+    if page_ids.numel() == 0:
+        return
+    if page_size != FP4_MLA_TOKENS_PER_BLOCK:
+        raise ValueError(
+            "FP4 MLA imported V-scale rebuild requires "
+            f"tokens_per_block={FP4_MLA_TOKENS_PER_BLOCK}, got {page_size}."
+        )
+    for name, tensor in (
+        ("sf_cache", sf_cache),
+        ("v_scale_pool", v_scale_pool),
+        ("page_ids", page_ids),
+        ("page_valid_tokens", page_valid_tokens),
+    ):
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor.")
+    if page_ids.dtype != torch.int32 or page_valid_tokens.dtype != torch.int32:
+        raise TypeError("FP4 MLA imported page IDs and valid-token counts must use int32.")
+    if page_ids.ndim != 1 or page_valid_tokens.ndim != 1:
+        raise ValueError("FP4 MLA imported page metadata must be one-dimensional.")
+    if page_ids.numel() != page_valid_tokens.numel():
+        raise ValueError("FP4 MLA imported page IDs and valid-token counts must have equal length.")
+    if not page_ids.is_contiguous() or not page_valid_tokens.is_contiguous():
+        raise ValueError("FP4 MLA imported page metadata must be contiguous.")
+    if not (sf_cache.device == v_scale_pool.device == page_ids.device == page_valid_tokens.device):
+        raise ValueError("FP4 MLA imported cache tensors must be on the same device.")
+
+    k_sf_bytes = sf_cache.view(torch.uint8)
+    v_sf_bytes = v_scale_pool.view(torch.uint8)
+    if k_sf_bytes.ndim < 2 or v_sf_bytes.ndim < 3:
+        raise ValueError(
+            "FP4 MLA imported scale pools require per-page K storage and "
+            "per-layer/per-page V storage."
+        )
+    num_layers = int(v_sf_bytes.shape[0])
+    num_pages = int(v_sf_bytes.shape[1])
+    if not 0 <= local_layer < num_layers:
+        raise IndexError(
+            f"local_layer={local_layer} is outside the V-scale pool with {num_layers} layers."
+        )
+    if int(k_sf_bytes.shape[0]) != num_pages:
+        raise ValueError(
+            "FP4 MLA K/V scale pools disagree on their physical page count: "
+            f"{int(k_sf_bytes.shape[0])} != {num_pages}."
+        )
+    sf_per_token = int(k_sf_bytes.shape[-1])
+    required_sf_per_token = _ceil_div(v_head_dim, FP4_BLOCK_SIZE)
+    if sf_per_token < required_sf_per_token:
+        raise ValueError(
+            "FP4 MLA K-scale storage is too narrow for the compressed V head: "
+            f"{sf_per_token} < {required_sf_per_token}."
+        )
+    required_v_page_elems = get_fp4_mla_v_scale_pool_size(v_head_dim, page_size)
+    if int(v_sf_bytes.shape[-1]) < required_v_page_elems:
+        raise ValueError(
+            "FP4 MLA V-scale page storage is too small for import rebuild: "
+            f"{int(v_sf_bytes.shape[-1])} < {required_v_page_elems}."
+        )
+
+    token_groups = page_size // HP_BLOCK_SIZE
+    _fp4_mla_rebuild_v_scale_from_k_scale_kernel[
+        (page_ids.numel(), triton.cdiv(v_head_dim, FP4_BLOCK_SIZE))
+    ](
+        k_sf_bytes,
+        v_sf_bytes,
+        page_ids,
+        page_valid_tokens,
+        page_ids.numel(),
+        num_pages,
+        num_layers,
+        local_layer,
+        page_size,
+        k_sf_bytes.stride(0),
+        v_sf_bytes.stride(0),
+        v_sf_bytes.stride(1),
+        V_HEAD_D=v_head_dim,
+        HP_BLOCK=HP_BLOCK_SIZE,
+        SF_PER_TOKEN=sf_per_token,
+        SF_PER_PAGE=token_groups,
+        BLOCK_TOKEN_GROUPS=triton.next_power_of_2(token_groups),
+        num_warps=4,
+    )
+
+
+def _stage_fp4_mla_import_page_metadata(
+    prompt_block_ids: list[int],
+    *,
+    prompt_len: int,
+    page_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stage imported page metadata without synchronizing the CUDA stream."""
+    if device.type != "cuda":
+        raise ValueError("FP4 MLA disaggregated import requires a CUDA device.")
+    num_prompt_pages = len(prompt_block_ids)
+    pin_memory = prefer_pinned()
+    page_ids_host = torch.tensor(
+        prompt_block_ids,
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=pin_memory,
+    )
+    page_valid_tokens_host = torch.full(
+        (num_prompt_pages,),
+        page_size,
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=pin_memory,
+    )
+    page_valid_tokens_host[-1] = prompt_len - (num_prompt_pages - 1) * page_size
+    # Constructing a CUDA tensor directly from a Python list synchronizes the
+    # current stream. During overlap scheduling that stream already waits for
+    # the previous forward, exposing the import rebuild as an inter-step gap.
+    # Explicit non-blocking copies keep the CPU free to enqueue every rebuild
+    # and the next forward while preserving their existing stream order.
+    page_ids = torch.empty_like(page_ids_host, device=device)
+    page_valid_tokens = torch.empty_like(page_valid_tokens_host, device=device)
+    page_ids.copy_(page_ids_host, non_blocking=True)
+    page_valid_tokens.copy_(page_valid_tokens_host, non_blocking=True)
+    return page_ids, page_valid_tokens
+
+
+def rebuild_fp4_mla_disagg_imported_cache(
+    kv_cache_manager: Any,
+    request_id: int,
+    prompt_len: int,
+) -> bool:
+    """Rebuild GEN-local FP4 MLA sidecars after a disaggregated KV import.
+
+    The disaggregated payload carries the native V2 K, K-scale, and BF16 HP
+    roles. V scales and CuTeDSL's V-packed layout are deterministic
+    process-local views, so rebuilding them here avoids transfer bandwidth and
+    guarantees they are ready before a first decode step that may execute
+    through a pre-captured CUDA graph.
+    """
+    if (
+        kv_cache_manager is None
+        or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4
+        or getattr(kv_cache_manager, "kv_factor", None) != 1
+        or getattr(kv_cache_manager, "mla_v_scale_head_dim", None) is None
+        or not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
+    ):
+        return False
+    if not isinstance(prompt_len, int) or prompt_len <= 0:
+        raise ValueError(
+            f"FP4 MLA disaggregated import needs a positive prompt_len, got {prompt_len}."
+        )
+
+    page_size = int(kv_cache_manager.tokens_per_block)
+    if page_size != FP4_MLA_TOKENS_PER_BLOCK:
+        raise ValueError(
+            "FP4 MLA disaggregated import requires "
+            f"tokens_per_block={FP4_MLA_TOKENS_PER_BLOCK}, got {page_size}."
+        )
+    pp_layers = list(getattr(kv_cache_manager, "pp_layers", ()))
+    num_local_layers = int(getattr(kv_cache_manager, "num_local_layers", len(pp_layers)))
+    if len(pp_layers) != num_local_layers:
+        raise RuntimeError(
+            "FP4 MLA disaggregated import cannot map local to global layers: "
+            f"{len(pp_layers)} PP layers for {num_local_layers} local layers."
+        )
+    fp4_local_layers = list(
+        getattr(kv_cache_manager, "_fp4_mla_compact_to_local", range(num_local_layers))
+    )
+    if not fp4_local_layers:
+        raise RuntimeError("FP4 MLA disaggregated import found no local MLA layers.")
+    if any(local_layer < 0 or local_layer >= num_local_layers for local_layer in fp4_local_layers):
+        raise RuntimeError(
+            "FP4 MLA disaggregated import has invalid compact-to-local layer mapping: "
+            f"{fp4_local_layers}."
+        )
+
+    num_prompt_pages = _ceil_div(prompt_len, page_size)
+    first_attention_layer = pp_layers[fp4_local_layers[0]]
+    block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(
+        [int(request_id)], layer_idx=first_attention_layer
+    )
+    if len(block_ids_per_seq) != 1 or len(block_ids_per_seq[0]) < num_prompt_pages:
+        available = len(block_ids_per_seq[0]) if block_ids_per_seq else 0
+        raise RuntimeError(
+            "FP4 MLA disaggregated import is missing prompt pages for request "
+            f"{request_id}: need {num_prompt_pages}, have {available}."
+        )
+    prompt_block_ids = [int(block_id) for block_id in block_ids_per_seq[0][:num_prompt_pages]]
+
+    v_scale_pool = kv_cache_manager.get_mla_v_scale_pool()
+    if not isinstance(v_scale_pool, torch.Tensor):
+        raise RuntimeError("FP4 MLA disaggregated import requires the manager V-scale pool.")
+    page_ids, page_valid_tokens = _stage_fp4_mla_import_page_metadata(
+        prompt_block_ids,
+        prompt_len=prompt_len,
+        page_size=page_size,
+        device=v_scale_pool.device,
+    )
+
+    v_scale_head_dim = int(kv_cache_manager.mla_v_scale_head_dim)
+    cutedsl_backend = _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
+    for compact_layer, local_layer in enumerate(fp4_local_layers):
+        layer_idx = pp_layers[local_layer]
+        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+        _rebuild_fp4_mla_v_scales_from_k_scales(
+            sf_cache,
+            v_scale_pool,
+            page_ids,
+            page_valid_tokens,
+            local_layer=compact_layer,
+            v_head_dim=v_scale_head_dim,
+            page_size=page_size,
+        )
+        if cutedsl_backend and not _fp4_mla_cutedsl_fused_v_transpose_enabled():
+            v_head_dim = getattr(kv_cache_manager, "mla_v_head_dim", None)
+            if v_head_dim is None:
+                raise RuntimeError(
+                    "CuTeDSL FP4 MLA disaggregated import requires a persistent V head dimension."
+                )
+            v_packed = kv_cache_manager.get_mla_v_packed_pool(compact_layer)
+            if not isinstance(v_packed, torch.Tensor):
+                raise RuntimeError(
+                    "CuTeDSL FP4 MLA disaggregated import requires the persistent V-packed pool."
+                )
+            _repack_cutedsl_v_packed_cache(
+                v_packed,
+                kv_cache,
+                page_ids,
+                v_head_dim=int(v_head_dim),
+                page_size=page_size,
+                block_v=FP4_MLA_SCALE_ROW_GROUP,
+            )
+    return True

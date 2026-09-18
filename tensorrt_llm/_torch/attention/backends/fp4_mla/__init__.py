@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA entry points; implementation lives in the focused sibling modules."""
 
+from .cache_gather import load_fp4_mla_chunked_kv_cache
 from .cache_update import (
     _get_fp4_mla_context_start_positions as _get_fp4_mla_context_start_positions,
 )
@@ -140,8 +141,11 @@ from .v_cache import _triton_v_packed_valid_attr as _triton_v_packed_valid_attr
 from .v_cache import _update_triton_v_packed_cache as _update_triton_v_packed_cache
 from .v_cache import _v_packed_cache_tag as _v_packed_cache_tag
 from .v_cache import _v_packed_shape as _v_packed_shape
+from .v_cache import rebuild_fp4_mla_disagg_imported_cache
 
 __all__ = [
+    "load_fp4_mla_chunked_kv_cache",
+    "rebuild_fp4_mla_disagg_imported_cache",
     "FP4_BLOCK_SIZE",
     "FP4_MLA_ATTENTION_BACKEND_ENV",
     "FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV",

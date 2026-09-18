@@ -57,6 +57,30 @@ def _fp4_mla_swizzled_sf_offset_row_block(
 
 
 @triton.jit
+def _fp4_e2m1_quantize(x):
+    abs_x = tl.abs(x)
+    magnitude = tl.where(
+        abs_x < 0.25,
+        0,
+        tl.where(
+            abs_x < 0.75,
+            1,
+            tl.where(
+                abs_x < 1.25,
+                2,
+                tl.where(
+                    abs_x < 1.75,
+                    3,
+                    tl.where(abs_x < 2.5, 4, tl.where(abs_x < 3.5, 5, tl.where(abs_x < 5.0, 6, 7))),
+                ),
+            ),
+        ),
+    )
+    sign = tl.where(x < 0.0, 8, 0)
+    return (magnitude | sign).to(tl.uint8)
+
+
+@triton.jit
 def _fp4_pack_low_nibbles(even_packed, odd_packed):
     """PTX helper: pack the low nibbles of two bytes into one byte (low + high<<4)."""
     return tl.inline_asm_elementwise(
@@ -288,7 +312,7 @@ def _fp4_mla_attention_v_repack_pages_dyn_kernel(
         out_desc.store([row_base.to(tl.int32), 0], v_vals)
 
 
-def fp4_mla_repack_v_cache_triton(
+def fp4_mla_repack_v_cache(
     v_packed: Any,
     kv_cache: Any,
     page_ids: Optional[Any] = None,
@@ -988,6 +1012,533 @@ def _fp4_mla_attention_page_stats_kernel(
     else:
         tl.store(page_max_ptr + out_offsets, page_max, mask=mask_h)
         tl.store(page_sum_ptr + out_offsets, page_sum, mask=mask_h)
+
+
+@triton.jit
+def _fp4_mla_attention_page_stats_grouped_kernel(
+    page_max_ptr,
+    page_sum_ptr,
+    p_fp4_ptr,
+    p_sf_ptr,
+    q_fp4_ptr,
+    q_sf_ptr,
+    kv_cache_ptr,
+    sf_cache_ptr,
+    global_scale_ptr,
+    q_global_scale_ptr,
+    src_page_ids_ptr,
+    paged_kv_indptr_decode_ptr,
+    kv_lens_ptr,
+    page_ids_len,
+    num_pages,
+    q_fp4_s0,
+    q_fp4_s1,
+    kv_s0,
+    kv_s2,
+    kv_s4,
+    sf_s0,
+    page_stats_s0,
+    page_stats_s1,
+    p_s0,
+    p_s1,
+    p_num_rows,
+    q_num_rows,
+    sm_scale,
+    NUM_HEADS: tl.constexpr,
+    Q_HEAD_D: tl.constexpr,
+    K_HEAD_D: tl.constexpr,
+    Q_RESIDUAL_D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    FP4_BLOCK: tl.constexpr,
+    Q_SF_PER_TOKEN: tl.constexpr,
+    K_SF_PER_TOKEN: tl.constexpr,
+    SF_PER_PAGE: tl.constexpr,
+    P_GLOBAL_SCALE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    FULL_BLOCK_END: tl.constexpr,
+    TAIL_BLOCK_K: tl.constexpr,
+    GROUP_PAGES: tl.constexpr,
+    ASSUME_FULL_PAGES: tl.constexpr,
+    ASSUME_VALID_PAGES: tl.constexpr,
+    PAGE_LOOP_STAGES: tl.constexpr,
+    occupancy: tl.constexpr = 1,
+):
+    """Grouped page-stats QK + softmax-stats + FP4 P pack.
+
+    Functionally identical to ``_fp4_mla_attention_page_stats_kernel`` for the
+    perfect decode shape (NUM_HEADS == BLOCK_H, TMA + PACK_PROBS, the standard
+    640/576/64 residual-Q layout) but each program owns one
+    ``(query, head_block, page_group)`` and walks ``GROUP_PAGES`` pages in a
+    pipelined loop. Q (and its scales) and the TMA descriptors are loaded once
+    and reused across the group, eliminating the per-page Q reload and the tiny
+    per-CTA prologue that made the one-page-per-CTA kernel work-bound at long
+    context. Per-page outputs (page_max/page_sum and packed P) are written
+    exactly as the one-page kernel writes them, so every downstream stage is
+    unchanged.
+    """
+    query_idx = tl.program_id(0)
+    head_block = tl.program_id(1)
+    page_group = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
+
+    head_start = head_block * BLOCK_H
+    offs_h = head_start + tl.arange(0, BLOCK_H)
+    offs_t = tl.arange(0, BLOCK_T)
+    q_row_base = query_idx * NUM_HEADS
+
+    if ASSUME_FULL_PAGES:
+        kv_len = 0
+    else:
+        kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+        kv_len = tl.maximum(kv_len, 0)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
+
+    q_gscale = tl.load(q_global_scale_ptr)
+
+    residual_groups = Q_RESIDUAL_D // FP4_BLOCK
+    non_residual_groups = K_HEAD_D // FP4_BLOCK - residual_groups
+
+    # ---- Hoisted, page-independent index tensors and Q tiles ----
+    # Main window (q_start == 0): the first FULL_BLOCK_END elements sit entirely
+    # in the non-residual region, so Q and K map 1:1 and load contiguously.
+    # Q rows are global rows (query_idx * NUM_HEADS + head); the swizzle's
+    # row_group term selects this query's scale/tail block, so q_row_base must
+    # be folded in (the main q_vals descriptor load already does this via its
+    # row coordinate). Keep int32 to match the one-page kernel -- int64 swizzle
+    # math is emulated and was measured ~2x slower; the max global row index
+    # (num_queries * NUM_HEADS * stride) stays well within int32.
+    q_rows = q_row_base + offs_h
+    scale_offsets = tl.arange(0, BLOCK_K // FP4_BLOCK)
+    q_sf_cols = scale_offsets
+    q_sf_offsets = _fp4_mla_swizzled_sf_offset(q_rows[:, None], q_sf_cols[None, :], Q_SF_PER_TOKEN)
+    k_sf_offsets_main = _fp4_mla_swizzled_sf_offset(
+        offs_t[:, None], q_sf_cols[None, :], K_SF_PER_TOKEN
+    )
+    q_scales = tl.load(q_sf_ptr + q_sf_offsets)
+
+    # Tail window (q_start == FULL_BLOCK_END): the residual-Q groups, each of
+    # which maps onto a duplicated K residual group.
+    tail_packed_offsets = tl.arange(0, TAIL_BLOCK_K // 2)
+    tail_scale_offsets = tl.arange(0, TAIL_BLOCK_K // FP4_BLOCK)
+    qt_elem = FULL_BLOCK_END + tail_packed_offsets * 2
+    qt_group = qt_elem // FP4_BLOCK
+    kt_group = tl.where(
+        qt_group < non_residual_groups,
+        qt_group,
+        non_residual_groups + (qt_group - non_residual_groups) // 2,
+    )
+    byte_t = (qt_elem % FP4_BLOCK) // 2
+    packed_qt_cols = FULL_BLOCK_END // 2 + tail_packed_offsets
+    packed_kt_cols = kt_group * (FP4_BLOCK // 2) + byte_t
+    qt_sf_cols = FULL_BLOCK_END // FP4_BLOCK + tail_scale_offsets
+    kt_sf_cols = tl.where(
+        qt_sf_cols < non_residual_groups,
+        qt_sf_cols,
+        non_residual_groups + (qt_sf_cols - non_residual_groups) // 2,
+    )
+    qt_sf_offsets = _fp4_mla_swizzled_sf_offset(
+        q_rows[:, None], qt_sf_cols[None, :], Q_SF_PER_TOKEN
+    )
+    kt_sf_offsets = _fp4_mla_swizzled_sf_offset(
+        offs_t[:, None], kt_sf_cols[None, :], K_SF_PER_TOKEN
+    )
+    q_tail_scales = tl.load(q_sf_ptr + qt_sf_offsets)
+    q_tail_vals = tl.load(
+        q_fp4_ptr + q_rows[:, None] * q_fp4_s0 + packed_qt_cols[None, :] * q_fp4_s1
+    )
+
+    tl.assume(q_fp4_s0 % 8 == 0)
+    tl.assume(q_fp4_s1 == 1)
+    tl.assume(kv_s0 % 8 == 0)
+    tl.assume(kv_s2 % 8 == 0)
+    tl.assume(kv_s4 == 1)
+    tl.assume(p_s0 % 8 == 0)
+    tl.assume(p_s1 == 1)
+    q_desc = tl.make_tensor_descriptor(
+        q_fp4_ptr,
+        shape=[q_num_rows, Q_HEAD_D // 2],
+        strides=[q_fp4_s0, q_fp4_s1],
+        block_shape=[BLOCK_H, BLOCK_K // 2],
+    )
+    k_desc = tl.make_tensor_descriptor(
+        kv_cache_ptr,
+        shape=[num_pages, BLOCK_T, K_HEAD_D // 2],
+        strides=[kv_s0, kv_s2, kv_s4],
+        block_shape=[1, BLOCK_T, BLOCK_K // 2],
+    )
+    p_desc = tl.make_tensor_descriptor(
+        p_fp4_ptr,
+        shape=[p_num_rows, PAGE_SIZE // 2],
+        strides=[p_s0, p_s1],
+        block_shape=[BLOCK_H, PAGE_SIZE // 2],
+    )
+    q_vals = q_desc.load([(q_row_base + head_start).to(tl.int32), 0])
+
+    scale_cols = tl.arange(0, SF_PER_PAGE)
+    byte_offsets = tl.arange(0, FP4_BLOCK // 2)
+    byte_cols = scale_cols[:, None] * (FP4_BLOCK // 2) + byte_offsets[None, :]
+
+    page_lo = page_group * GROUP_PAGES
+    page_hi = page_lo + GROUP_PAGES
+    for page_rel in tl.range(page_lo, page_hi, num_stages=PAGE_LOOP_STAGES):
+        if page_rel < MAX_PAGES:
+            page_start = page_rel * PAGE_SIZE
+            page_max = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
+            page_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+            if ASSUME_FULL_PAGES or page_start < kv_len:
+                compact_page = page_table_start + page_rel
+                if ASSUME_VALID_PAGES:
+                    physical_page = tl.load(src_page_ids_ptr + compact_page).to(tl.int64)
+                    safe_physical_page = physical_page
+                else:
+                    valid_compact_page = (compact_page >= 0) & (compact_page < page_ids_len)
+                    safe_compact_page = tl.where(valid_compact_page, compact_page, 0)
+                    physical_page = tl.load(
+                        src_page_ids_ptr + safe_compact_page, mask=valid_compact_page, other=-1
+                    ).to(tl.int64)
+                    valid_physical_page = (
+                        valid_compact_page & (physical_page >= 0) & (physical_page < num_pages)
+                    )
+                    safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
+
+                global_scale = tl.load(global_scale_ptr)
+                qk_scale = sm_scale / (q_gscale * global_scale)
+
+                k_vals = k_desc.load([safe_physical_page.to(tl.int32), 0, 0])
+                k_vals = tl.reshape(k_vals, (BLOCK_T, BLOCK_K // 2))
+                if not ASSUME_VALID_PAGES:
+                    k_vals = tl.where(valid_physical_page, k_vals, 0)
+                k_scales = tl.load(sf_cache_ptr + safe_physical_page * sf_s0 + k_sf_offsets_main)
+                scores = tl.dot_scaled(
+                    q_vals,
+                    q_scales,
+                    "e2m1",
+                    k_vals.T,
+                    k_scales,
+                    "e2m1",
+                    fast_math=True,
+                    rhs_k_pack=True,
+                )
+
+                kt_ptrs = (
+                    kv_cache_ptr
+                    + safe_physical_page * kv_s0
+                    + offs_t[:, None].to(tl.int64) * kv_s2
+                    + packed_kt_cols[None, :] * kv_s4
+                )
+                if ASSUME_VALID_PAGES:
+                    kt_vals = tl.load(kt_ptrs)
+                else:
+                    kt_vals = tl.load(kt_ptrs, mask=valid_physical_page, other=0)
+                kt_scales = tl.load(sf_cache_ptr + safe_physical_page * sf_s0 + kt_sf_offsets)
+                scores = tl.dot_scaled(
+                    q_tail_vals,
+                    q_tail_scales,
+                    "e2m1",
+                    kt_vals.T,
+                    kt_scales,
+                    "e2m1",
+                    acc=scores,
+                    fast_math=True,
+                    rhs_k_pack=True,
+                )
+
+                if ASSUME_FULL_PAGES:
+                    scores = scores * qk_scale
+                    page_max = tl.max(scores, axis=1)
+                    exp_scores = tl.math.exp2((scores - page_max[:, None]) * _LOG2_E)
+                    page_sum = tl.sum(exp_scores, axis=1)
+                else:
+                    valid_t = page_start + offs_t < kv_len
+                    scores = tl.where(valid_t[None, :], scores * qk_scale, -float("inf"))
+                    page_max = tl.max(scores, axis=1)
+                    exp_scores = tl.math.exp2((scores - page_max[:, None]) * _LOG2_E)
+                    exp_scores = tl.where(valid_t[None, :], exp_scores, 0.0)
+                    page_sum = tl.sum(exp_scores, axis=1)
+
+                grouped_probs = tl.reshape(exp_scores, (BLOCK_H, SF_PER_PAGE, FP4_BLOCK))
+                amax = tl.max(grouped_probs, axis=2)
+                inv_local_scale = tl.where(amax > 0.0, 6.0 / amax, 1.0)
+                stored_scale = tl.where(
+                    amax > 0.0,
+                    tl.minimum(amax * (P_GLOBAL_SCALE / 6.0), 448.0),
+                    1.0,
+                )
+                scaled_probs = grouped_probs * tl.reshape(
+                    inv_local_scale, (BLOCK_H, SF_PER_PAGE, 1)
+                )
+                pairs = tl.reshape(scaled_probs, (BLOCK_H, SF_PER_PAGE, FP4_BLOCK // 2, 2))
+                even_probs, odd_probs = tl.split(pairs)
+                packed = _fp4_e2m1_quantize_packed(even_probs, odd_probs)
+
+                p_page = query_idx * MAX_PAGES + page_rel
+                if ASSUME_VALID_PAGES and NUM_HEADS == 128 and BLOCK_H == 128:
+                    sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
+                        p_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
+                    )
+                else:
+                    p_rows = (p_page * NUM_HEADS + offs_h).to(tl.int64)
+                    sf_offsets = _fp4_mla_swizzled_sf_offset(
+                        p_rows[:, None], scale_cols[None, :], SF_PER_PAGE
+                    )
+                if ASSUME_VALID_PAGES:
+                    tl.store(p_sf_ptr + sf_offsets, stored_scale)
+                    p_desc.store(
+                        [(p_page * NUM_HEADS + head_start).to(tl.int32), 0],
+                        tl.reshape(packed, (BLOCK_H, PAGE_SIZE // 2)),
+                    )
+                else:
+                    tl.store(p_sf_ptr + sf_offsets, stored_scale, mask=valid_compact_page)
+                    p_rows = (p_page * NUM_HEADS + offs_h).to(tl.int64)
+                    tl.store(
+                        p_fp4_ptr + p_rows[:, None, None] * p_s0 + byte_cols[None, :, :] * p_s1,
+                        packed,
+                        mask=valid_compact_page,
+                    )
+
+            out_offsets = query_idx * page_stats_s0 + page_rel * page_stats_s1 + offs_h
+            tl.store(page_max_ptr + out_offsets, page_max)
+            tl.store(page_sum_ptr + out_offsets, page_sum)
+
+
+@triton.jit
+def _fp4_mla_attention_page_stats_mtp_kernel(
+    page_max_ptr,
+    page_sum_ptr,
+    p_fp4_ptr,
+    p_sf_ptr,
+    q_fp4_ptr,
+    q_sf_ptr,
+    kv_cache_ptr,
+    sf_cache_ptr,
+    global_scale_ptr,
+    q_global_scale_ptr,
+    src_page_ids_ptr,
+    paged_kv_indptr_decode_ptr,
+    kv_lens_ptr,
+    page_ids_len,
+    num_pages,
+    q_fp4_s0,
+    q_fp4_s1,
+    kv_s0,
+    kv_s2,
+    kv_s4,
+    sf_s0,
+    page_stats_s0,
+    page_stats_s1,
+    p_s0,
+    p_s1,
+    p_num_rows,
+    q_num_rows,
+    sm_scale,
+    NUM_HEADS: tl.constexpr,
+    Q_HEAD_D: tl.constexpr,
+    K_HEAD_D: tl.constexpr,
+    Q_RESIDUAL_D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    FP4_BLOCK: tl.constexpr,
+    Q_SF_PER_TOKEN: tl.constexpr,
+    K_SF_PER_TOKEN: tl.constexpr,
+    SF_PER_PAGE: tl.constexpr,
+    P_GLOBAL_SCALE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    FULL_BLOCK_END: tl.constexpr,
+    TAIL_BLOCK_K: tl.constexpr,
+    occupancy: tl.constexpr = 1,
+):
+    """MTP-fused page-stats: one CTA owns (seq, head_block, page) and processes
+    all QUERY_LEN_PER_SEQ linear-MTP query rows of the sequence, loading the
+    page's K (and K scales) once and reusing it across the q_len QK matmuls.
+
+    The per-query-row kernel reloads K once per query row (q_len times per
+    page); at decode the QK is load-latency bound (one K load feeds one MMA),
+    so amortizing the K load over q_len rows lifts the load:MMA ratio. Per-row
+    outputs are written identically to the one-page kernel's masked path
+    (ASSUME_FULL_PAGES/VALID_PAGES are always False for q_len>1), so all
+    downstream stages are unchanged. Restricted to the perfect decode shape.
+    """
+    seq_idx = tl.program_id(0)
+    head_block = tl.program_id(1)
+    page_rel = tl.program_id(2)
+    head_start = head_block * BLOCK_H
+    offs_h = head_start + tl.arange(0, BLOCK_H)
+    offs_t = tl.arange(0, BLOCK_T)
+    page_start = page_rel * PAGE_SIZE
+
+    kv_len_base = tl.load(kv_lens_ptr + seq_idx)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
+    q_gscale = tl.load(q_global_scale_ptr)
+
+    residual_groups = Q_RESIDUAL_D // FP4_BLOCK
+    non_residual_groups = K_HEAD_D // FP4_BLOCK - residual_groups
+
+    # ---- r-independent index tensors (main + residual-tail column maps) ----
+    scale_offsets = tl.arange(0, BLOCK_K // FP4_BLOCK)
+    q_sf_cols = scale_offsets
+    k_sf_offsets_main = _fp4_mla_swizzled_sf_offset(
+        offs_t[:, None], q_sf_cols[None, :], K_SF_PER_TOKEN
+    )
+    tail_packed_offsets = tl.arange(0, TAIL_BLOCK_K // 2)
+    tail_scale_offsets = tl.arange(0, TAIL_BLOCK_K // FP4_BLOCK)
+    qt_elem = FULL_BLOCK_END + tail_packed_offsets * 2
+    qt_group = qt_elem // FP4_BLOCK
+    kt_group = tl.where(
+        qt_group < non_residual_groups,
+        qt_group,
+        non_residual_groups + (qt_group - non_residual_groups) // 2,
+    )
+    byte_t = (qt_elem % FP4_BLOCK) // 2
+    packed_qt_cols = FULL_BLOCK_END // 2 + tail_packed_offsets
+    packed_kt_cols = kt_group * (FP4_BLOCK // 2) + byte_t
+    qt_sf_cols = FULL_BLOCK_END // FP4_BLOCK + tail_scale_offsets
+    kt_sf_cols = tl.where(
+        qt_sf_cols < non_residual_groups,
+        qt_sf_cols,
+        non_residual_groups + (qt_sf_cols - non_residual_groups) // 2,
+    )
+    kt_sf_offsets = _fp4_mla_swizzled_sf_offset(
+        offs_t[:, None], kt_sf_cols[None, :], K_SF_PER_TOKEN
+    )
+    scale_cols = tl.arange(0, SF_PER_PAGE)
+    byte_offsets = tl.arange(0, FP4_BLOCK // 2)
+    byte_cols = scale_cols[:, None] * (FP4_BLOCK // 2) + byte_offsets[None, :]
+
+    tl.assume(q_fp4_s0 % 8 == 0)
+    tl.assume(q_fp4_s1 == 1)
+    tl.assume(kv_s0 % 8 == 0)
+    tl.assume(kv_s2 % 8 == 0)
+    tl.assume(kv_s4 == 1)
+    tl.assume(p_s0 % 8 == 0)
+    tl.assume(p_s1 == 1)
+    q_desc = tl.make_tensor_descriptor(
+        q_fp4_ptr,
+        shape=[q_num_rows, Q_HEAD_D // 2],
+        strides=[q_fp4_s0, q_fp4_s1],
+        block_shape=[BLOCK_H, BLOCK_K // 2],
+    )
+    k_desc = tl.make_tensor_descriptor(
+        kv_cache_ptr,
+        shape=[num_pages, BLOCK_T, K_HEAD_D // 2],
+        strides=[kv_s0, kv_s2, kv_s4],
+        block_shape=[1, BLOCK_T, BLOCK_K // 2],
+    )
+    # p_desc = tl.make_tensor_descriptor(
+    #     p_fp4_ptr,
+    #     shape=[p_num_rows, PAGE_SIZE // 2],
+    #     strides=[p_s0, p_s1],
+    #     block_shape=[BLOCK_H, PAGE_SIZE // 2],
+    # )
+
+    # ---- Load this page's K once (shared across all query rows). ----
+    compact_page = page_table_start + page_rel
+    valid_compact_page = (compact_page >= 0) & (compact_page < page_ids_len)
+    safe_compact_page = tl.where(valid_compact_page, compact_page, 0)
+    physical_page = tl.load(
+        src_page_ids_ptr + safe_compact_page, mask=valid_compact_page, other=-1
+    ).to(tl.int64)
+    valid_physical_page = valid_compact_page & (physical_page >= 0) & (physical_page < num_pages)
+    safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
+    global_scale = tl.load(global_scale_ptr)
+    qk_scale = sm_scale / (q_gscale * global_scale)
+
+    k_vals = k_desc.load([safe_physical_page.to(tl.int32), 0, 0])
+    k_vals = tl.reshape(k_vals, (BLOCK_T, BLOCK_K // 2))
+    k_vals = tl.where(valid_physical_page, k_vals, 0)
+    k_scales = tl.load(sf_cache_ptr + safe_physical_page * sf_s0 + k_sf_offsets_main)
+    kt_vals = tl.load(
+        kv_cache_ptr
+        + safe_physical_page * kv_s0
+        + offs_t[:, None].to(tl.int64) * kv_s2
+        + packed_kt_cols[None, :] * kv_s4,
+        mask=valid_physical_page,
+        other=0,
+    )
+    kt_scales = tl.load(sf_cache_ptr + safe_physical_page * sf_s0 + kt_sf_offsets)
+
+    for r in tl.static_range(QUERY_LEN_PER_SEQ):
+        query_idx_r = seq_idx * QUERY_LEN_PER_SEQ + r
+        kv_len_r = tl.maximum(kv_len_base - (QUERY_LEN_PER_SEQ - 1 - r), 0)
+        q_row_base_r = query_idx_r * NUM_HEADS
+        q_rows_r = q_row_base_r + offs_h
+        page_max = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
+        page_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+        if page_start < kv_len_r:
+            q_vals = q_desc.load([(q_row_base_r + head_start).to(tl.int32), 0])
+            q_sf_offsets = _fp4_mla_swizzled_sf_offset(
+                q_rows_r[:, None], q_sf_cols[None, :], Q_SF_PER_TOKEN
+            )
+            q_scales = tl.load(q_sf_ptr + q_sf_offsets)
+            scores = tl.dot_scaled(
+                q_vals,
+                q_scales,
+                "e2m1",
+                k_vals.T,
+                k_scales,
+                "e2m1",
+                fast_math=True,
+                rhs_k_pack=True,
+            )
+            qt_sf_offsets = _fp4_mla_swizzled_sf_offset(
+                q_rows_r[:, None], qt_sf_cols[None, :], Q_SF_PER_TOKEN
+            )
+            q_tail_scales = tl.load(q_sf_ptr + qt_sf_offsets)
+            q_tail_vals = tl.load(
+                q_fp4_ptr + q_rows_r[:, None] * q_fp4_s0 + packed_qt_cols[None, :] * q_fp4_s1
+            )
+            scores = tl.dot_scaled(
+                q_tail_vals,
+                q_tail_scales,
+                "e2m1",
+                kt_vals.T,
+                kt_scales,
+                "e2m1",
+                acc=scores,
+                fast_math=True,
+                rhs_k_pack=True,
+            )
+
+            valid_t = page_start + offs_t < kv_len_r
+            scores = tl.where(valid_t[None, :], scores * qk_scale, -float("inf"))
+            page_max = tl.max(scores, axis=1)
+            exp_scores = tl.math.exp2((scores - page_max[:, None]) * _LOG2_E)
+            exp_scores = tl.where(valid_t[None, :], exp_scores, 0.0)
+            page_sum = tl.sum(exp_scores, axis=1)
+
+            grouped_probs = tl.reshape(exp_scores, (BLOCK_H, SF_PER_PAGE, FP4_BLOCK))
+            amax = tl.max(grouped_probs, axis=2)
+            inv_local_scale = tl.where(amax > 0.0, 6.0 / amax, 1.0)
+            stored_scale = tl.where(
+                amax > 0.0, tl.minimum(amax * (P_GLOBAL_SCALE / 6.0), 448.0), 1.0
+            )
+            scaled_probs = grouped_probs * tl.reshape(inv_local_scale, (BLOCK_H, SF_PER_PAGE, 1))
+            pairs = tl.reshape(scaled_probs, (BLOCK_H, SF_PER_PAGE, FP4_BLOCK // 2, 2))
+            even_probs, odd_probs = tl.split(pairs)
+            packed = _fp4_e2m1_quantize_packed(even_probs, odd_probs)
+
+            p_page = query_idx_r * MAX_PAGES + page_rel
+            p_rows = (p_page * NUM_HEADS + offs_h).to(tl.int64)
+            sf_offsets = _fp4_mla_swizzled_sf_offset(
+                p_rows[:, None], scale_cols[None, :], SF_PER_PAGE
+            )
+            tl.store(p_sf_ptr + sf_offsets, stored_scale, mask=valid_compact_page)
+            tl.store(
+                p_fp4_ptr + p_rows[:, None, None] * p_s0 + byte_cols[None, :, :] * p_s1,
+                packed,
+                mask=valid_compact_page,
+            )
+
+        out_offsets = query_idx_r * page_stats_s0 + page_rel * page_stats_s1 + offs_h
+        tl.store(page_max_ptr + out_offsets, page_max)
+        tl.store(page_sum_ptr + out_offsets, page_sum)
 
 
 @triton.jit

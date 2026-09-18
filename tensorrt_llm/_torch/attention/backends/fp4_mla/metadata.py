@@ -276,7 +276,7 @@ def populate_fp4_mla_generation_lengths(
 def _fp4_mla_page_table_spec(kv_cache_manager: Any) -> Any:
     get_spec = getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)
     if not callable(get_spec):
-        raise RuntimeError("FP4 MLA requires Fp4MlaKVCacheManagerV2 page metadata.")
+        raise RuntimeError("FP4 MLA requires V2 cache-layout page metadata.")
     spec = get_spec()
     for field_name in (
         "cache_pool_id",
@@ -386,7 +386,7 @@ def configure_fp4_mla_device_page_table(
 ) -> bool:
     """Configure the fixed-stride, device-materialized page table.
 
-    Context, generation, and fresh mixed batches receive the full block-offset
+    Eager context and generation batches receive the full block-offset
     table on the GPU. The materialization kernel decodes V2 page indices and
     refreshes rows from the final device KV lengths before cache update.
     """
@@ -413,18 +413,7 @@ def configure_fp4_mla_device_page_table(
     tensors = (block_offsets, page_ids, paged_kv_indptr, paged_kv_indptr_decode)
     is_cuda_graph = bool(getattr(metadata, "is_cuda_graph", False))
     generation_only = num_contexts == 0
-    fresh_mixed = (
-        not is_cuda_graph
-        and num_contexts > 0
-        and num_generation_sequences > 0
-        and int(getattr(metadata, "num_ctx_cached_tokens", 0) or 0) == 0
-    )
-    fresh_context_only = (
-        not is_cuda_graph
-        and num_contexts > 0
-        and num_generation_sequences == 0
-        and int(getattr(metadata, "num_ctx_cached_tokens", 0) or 0) == 0
-    )
+    eager_context = not is_cuda_graph and num_contexts > 0
     has_valid_generation = num_generation_sequences == 0 or (
         num_generation_tokens >= num_generation_sequences
         and num_generation_tokens % num_generation_sequences == 0
@@ -432,7 +421,7 @@ def configure_fp4_mla_device_page_table(
     # NVFP4 exposes one data pool plus its paired block-scale pool. The
     # materializer reads encoded data offsets from pool 0.
     supported = (
-        (generation_only or fresh_mixed or fresh_context_only)
+        (generation_only or eager_context)
         and kv_cache_manager is not None
         and has_valid_generation
         and int(getattr(metadata, "beam_width", 1)) == 1
@@ -470,7 +459,7 @@ def configure_fp4_mla_device_page_table(
         and kv_lens.ndim == 1
         and kv_lens.numel() >= num_sequences
     )
-    if fresh_mixed and not host_kv_lens_available:
+    if eager_context and num_generation_sequences > 0 and not host_kv_lens_available:
         return False
     if not is_cuda_graph and host_kv_lens_available:
         generation_tokens_per_sequence = (

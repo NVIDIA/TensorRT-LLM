@@ -247,6 +247,8 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     v_sf: torch.Tensor,
     global_scale: torch.Tensor,
     rotary_cos_sin: Optional[torch.Tensor],
+    q_context: Optional[torch.Tensor],
+    q_nope_head_dim: Optional[int],
     *,
     token_offset: int,
     local_layer: int,
@@ -277,6 +279,34 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         else 0
     )
     rotary_cos_sin_ptr = rotary_cos_sin if rotary_cos_sin is not None else latent_cache
+
+    apply_q_rope = q_context is not None
+    block_q_heads = 16
+    if apply_q_rope:
+        if rotary_cos_sin is None or q_nope_head_dim is None:
+            raise ValueError("FP4 MLA fused context Q-RoPE requires a rotary table and Q layout.")
+        q_head_dim = q_nope_head_dim + rope_dim
+        if (
+            q_context.dtype != torch.bfloat16
+            or q_context.device != latent_cache.device
+            or q_context.ndim != 2
+            or q_context.shape[0] != num_tokens
+            or q_context.shape[1] <= 0
+            or q_nope_head_dim <= 0
+            or q_context.shape[1] % q_head_dim != 0
+            or not q_context.is_contiguous()
+        ):
+            raise ValueError(
+                "FP4 MLA fused context Q-RoPE requires a contiguous same-device BF16 "
+                f"tensor shaped [tokens, heads * ({q_nope_head_dim} + {rope_dim})]."
+            )
+        num_q_heads = q_context.shape[1] // q_head_dim
+        q_context_view = q_context.view(num_tokens, num_q_heads, q_head_dim)
+        q_head_blocks = triton.cdiv(num_q_heads, block_q_heads)
+    else:
+        num_q_heads = 0
+        q_context_view = latent_cache
+        q_head_blocks = 0
 
     hp_pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
     if not isinstance(hp_pool, torch.Tensor):
@@ -313,7 +343,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     _fp4_mla_context_cache_update_kernel[
         (
             num_tokens,
-            num_dim_blocks,
+            num_dim_blocks + q_head_blocks,
         )
     ](
         kv_cache,
@@ -321,6 +351,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         v_sf,
         v_packed_output,
         latent_cache,
+        q_context_view,
         global_scale,
         rotary_cos_sin_ptr,
         hp_pool,
@@ -347,6 +378,9 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         sf_cache.stride(0),
         latent_cache.stride(0),
         latent_cache.stride(1),
+        q_context_view.stride(0),
+        q_context_view.stride(1) if apply_q_rope else 0,
+        q_context_view.stride(2) if apply_q_rope else 0,
         v_sf.stride(0),
         v_sf.stride(1),
         v_packed_s0,
@@ -364,6 +398,11 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         STORE_K_RESIDUAL=(_fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS),
         ROPE_DIM=rope_dim,
         APPLY_K_ROPE=apply_k_rope,
+        APPLY_Q_ROPE=apply_q_rope,
+        NUM_DIM_BLOCKS=num_dim_blocks,
+        NUM_Q_HEADS=num_q_heads,
+        Q_NOPE_DIM=q_nope_head_dim if q_nope_head_dim is not None else 0,
+        BLOCK_Q_HEADS=block_q_heads,
         POOL_HEAD_D=pool_head_dim,
         STORE_HP_TAIL=store_hp_tail,
         WRITE_V_PACKED=write_v_packed,
@@ -677,6 +716,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 v_sf,
                 v_packed_output,
                 latent_cache,
+                latent_cache,
                 global_scale,
                 rotary_table,
                 pool,
@@ -703,6 +743,9 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 sf_cache.stride(0),
                 latent_cache.stride(0),
                 latent_cache.stride(1),
+                latent_cache.stride(0),
+                0,
+                0,
                 v_sf.stride(0),
                 v_sf.stride(1),
                 v_packed_s0,
@@ -720,6 +763,11 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 STORE_K_RESIDUAL=store_k_residual,
                 ROPE_DIM=rope_dim,
                 APPLY_K_ROPE=True,
+                APPLY_Q_ROPE=False,
+                NUM_DIM_BLOCKS=num_dim_blocks,
+                NUM_Q_HEADS=0,
+                Q_NOPE_DIM=0,
+                BLOCK_Q_HEADS=16,
                 POOL_HEAD_D=hp_head_dim,
                 STORE_HP_TAIL=True,
                 WRITE_V_PACKED=write_v_packed,
@@ -780,6 +828,8 @@ def scatter_fp4_mla_kv_cache(
     q_pe: Optional[torch.Tensor] = None,
     q_rope_out: Optional[torch.Tensor] = None,
     q_quant_input: Optional[torch.Tensor] = None,
+    q_context: Optional[torch.Tensor] = None,
+    q_nope_head_dim: Optional[int] = None,
 ) -> bool:
     """Quantize MLA latent tokens and scatter them into the paged FP4 cache.
 
@@ -799,8 +849,10 @@ def scatter_fp4_mla_kv_cache(
     layouts. Tail K-only dimensions use K's per-token 1D scales. For
     exclusively owned CuTeDSL pages, context scatter also writes the
     persistent packed-V sidecar.
-    Context scatter can rotate the K tail directly from the unassembled latent
-    tensor. Generation scatter rewrites each touched 16-token tile by reading
+    Context scatter can rotate Q in place and rotate the K tail directly from
+    the unassembled latent tensor. When context Q is supplied for chunked
+    prefill, it also writes rotated K back for current-chunk attention.
+    Generation scatter rewrites each touched 16-token tile by reading
     old tokens from the HP pool and new tokens from ``latent_cache``. The
     static-scale generation
     specialization can also rotate Q and new K tails while updating the HP pool.
@@ -816,6 +868,11 @@ def scatter_fp4_mla_kv_cache(
         metadata.fp4_mla_state.q_batch_capacity = None
     if latent_cache.numel() == 0:
         raise ValueError("FP4 MLA cache scatter requires at least one latent token.")
+    if q_context is not None and not latent_cache.is_contiguous():
+        raise ValueError(
+            "FP4 MLA fused context Q/K RoPE requires contiguous latent_cache "
+            "storage for in-place current-K update."
+        )
 
     latent_cache = latent_cache.reshape(latent_cache.shape[0], -1).contiguous()
     num_tokens = latent_cache.shape[0]
@@ -883,8 +940,12 @@ def scatter_fp4_mla_kv_cache(
     if phase == "context":
         if any(arg is not None for arg in (q_pe, q_rope_out, q_quant_input)):
             raise ValueError("FP4 MLA context cache update does not accept generation Q tensors.")
+        if (q_context is None) != (q_nope_head_dim is None):
+            raise ValueError("FP4 MLA context Q and q_nope_head_dim must be provided together.")
         hp_pool_updated = False
     else:
+        if q_context is not None or q_nope_head_dim is not None:
+            raise ValueError("FP4 MLA generation cache update does not accept context Q tensors.")
         if not all(arg is not None for arg in generation_inputs):
             raise ValueError(
                 "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
@@ -985,6 +1046,8 @@ def scatter_fp4_mla_kv_cache(
             v_sf,
             global_scale,
             rotary_cos_sin,
+            q_context,
+            q_nope_head_dim,
             token_offset=token_offset,
             local_layer=local_layer,
             v_head_dim=v_head_dim,
