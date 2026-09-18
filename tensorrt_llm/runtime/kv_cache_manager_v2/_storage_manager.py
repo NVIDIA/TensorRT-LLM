@@ -350,29 +350,50 @@ class StorageManager:
         if not flexible:
             return resolved
         quota = gpu_quota // granularity * granularity
-
-        def required_quota() -> int:
-            slots = self._compute_pool_group_min_slots_from_constraints(
-                resolved, tokens_per_block, swa_scratch_reuse, max_util_for_resume
-            )
-            return self._min_quota_for_level(slot_size_lists, granularity, slots)
-
         index, request_index = flexible[0]
         batch = constraints[index]
         batch.__post_init__()
         request = batch.kv_caches[request_index]
         request.__post_init__()
-        if required_quota() <= quota:
+        original_min_slots = self._compute_pool_group_min_slots_from_constraints(
+            resolved, tokens_per_block, swa_scratch_reuse, max_util_for_resume
+        )
+        if self._min_quota_for_level(slot_size_lists, granularity, original_min_slots) <= quota:
             return resolved
+
+        fixed_min_slots = self._compute_pool_group_min_slots_from_constraints(
+            constraints[:index] + constraints[index + 1 :],
+            tokens_per_block,
+            swa_scratch_reuse,
+            max_util_for_resume,
+        )
+        fixed_peers = replace(
+            batch, kv_caches=batch.kv_caches[:request_index] + batch.kv_caches[request_index + 1 :]
+        )
+        fixed_peer_slots = self._compute_pool_group_slots_for_batch(
+            fixed_peers, tokens_per_block, swa_scratch_reuse
+        )
+        candidate = BatchDesc([request])
+
+        def required_quota() -> int:
+            slots = self._compute_pool_group_slots_for_batch(
+                candidate, tokens_per_block, swa_scratch_reuse
+            )
+            # No shared prompt: raw request demands add, including scratch and
+            # SSM. Round for resume utilization after adding the fixed peers;
+            # other workloads and structural floors remain a per-pool max.
+            for pg in typed_range(self.num_pool_groups):
+                scaled_slots = math.ceil((slots[pg] + fixed_peer_slots[pg]) / max_util_for_resume)
+                slots[pg] = max(fixed_min_slots[pg], scaled_slots)
+            return self._min_quota_for_level(slot_size_lists, granularity, slots)
+
         headroom = request.capacity - request.history_length
         minimum = max(1, headroom)
 
         def set_capacity(capacity: int) -> None:
-            requests = list(batch.kv_caches)
-            requests[request_index] = replace(
+            candidate.kv_caches[0] = replace(
                 request, capacity=capacity, history_length=capacity - headroom
             )
-            resolved[index] = replace(batch, kv_caches=requests)
 
         set_capacity(minimum)
         best = minimum if required_quota() <= quota else None
@@ -393,6 +414,15 @@ class StorageManager:
                 "GPU quota is insufficient for FIT_TO_QUOTA at or above minimum capacity"
             )
         set_capacity(best)
+        requests = list(batch.kv_caches)
+        requests[request_index] = candidate.kv_caches[0]
+        resolved[index] = replace(batch, kv_caches=requests)
+        warnings.warn(
+            f"FIT_TO_QUOTA reduced initialization constraint batch {index} request {request_index}: "
+            f"capacity {request.capacity} -> {best}, history_length {request.history_length} -> "
+            f"{best - headroom} (GPU quota {gpu_quota} bytes, usable {quota} bytes)",
+            stacklevel=2,
+        )
         return resolved
 
     def __del__(self) -> None:

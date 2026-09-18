@@ -620,6 +620,64 @@ class TestFitToQuota(TestKVCacheManagerV2):
         with self.assertRaisesRegex(ValueError, "insufficient.*FIT_TO_QUOTA"):
             KVCacheManager(cfg)
 
+    @parameterized.expand([(0.97, 24), (1.0, 24), (0.5, 48)])
+    def test_fit_matches_exhaustive_fixed_allocations(
+        self, utilization: float, quota_mib: int
+    ) -> None:
+        # Two SWA layers share a slot, so each request's scratch demand must be
+        # rounded separately. Resume utilization is rounded after summing peers.
+        cfg = self.make_config(quota_mib << 20)
+        cfg.layers = [
+            *cfg.layers,
+            *[
+                AttentionLayerConfig(
+                    layer_id=LayerId(i),
+                    buffers=[BufferConfig(role=Role.KEY, size=1 << 18)],
+                    sliding_window_size=32,
+                )
+                for i in (1, 2)
+            ],
+            SsmLayerConfig(layer_id=LayerId(3), buffers=[BufferConfig(role=Role.KEY, size=1024)]),
+        ]
+        cfg.commit_min_snapshot = True
+        cfg.swa_scratch_reuse = SwaScratchReuseConfig()
+        cfg.max_util_for_resume = utilization
+        marked = KVCacheDesc(513, 384, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA)
+        cfg.constraints = [
+            BatchDesc([KVCacheDesc(129, 0), marked, KVCacheDesc(0, 0)]),
+            # Shared prompts are allowed in other, fixed batches.
+            BatchDesc([KVCacheDesc(96, 64), KVCacheDesc(128, 64)], system_prompt_length=64),
+        ]
+        original = deepcopy(cfg.constraints)
+        headroom = marked.capacity - marked.history_length
+        candidates = {max(1, headroom), marked.capacity}
+        candidates.update(
+            range(round_up(headroom, cfg.tokens_per_block), marked.capacity, cfg.tokens_per_block)
+        )
+        feasible = []
+        for capacity in sorted(candidates):
+            peers = list(cfg.constraints[0].kv_caches)
+            peers[1] = KVCacheDesc(capacity, capacity - headroom)
+            oracle = KVCacheManager(
+                replace(cfg, constraints=[BatchDesc(peers), cfg.constraints[1]])
+            )
+            try:
+                if oracle.get_quota(GPU_LEVEL) <= cfg.cache_tiers[0].quota:
+                    feasible.append(capacity)
+            finally:
+                oracle.shutdown()
+        self.assertTrue(feasible)
+        self.manager = KVCacheManager(cfg)
+        selected = self.manager.resolved_constraints
+        self.assertEqual(selected[0].kv_caches[1].capacity, max(feasible))
+        self.assertLess(max(feasible), marked.capacity)
+        self.assertEqual(selected[0].kv_caches[1].history_length, max(feasible) - headroom)
+        self.assertEqual(selected[0].kv_caches[0], original[0].kv_caches[0])
+        self.assertEqual(selected[0].kv_caches[2], original[0].kv_caches[2])
+        self.assertEqual(selected[1], original[1])
+        self.assertEqual(cfg.constraints, original)
+        self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), cfg.cache_tiers[0].quota)
+
 
 class TestStorageStatistics(TestKVCacheManagerV2):
     def test_statistics_are_detached_snapshots(self) -> None:

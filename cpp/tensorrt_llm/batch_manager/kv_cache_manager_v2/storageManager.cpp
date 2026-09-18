@@ -1765,18 +1765,38 @@ std::vector<BatchDesc> StorageManager::resolveConstraints(std::vector<BatchDesc>
         return resolved;
     }
     size_t const quota = gpuQuota / granularity * granularity;
-    auto requiredQuota = [&]()
-    {
-        auto const slots
-            = computePoolGroupMinSlotsFromConstraints(resolved, tokensPerBlock, swaScratchReuse, maxUtilForResume);
-        return minQuotaForLevel(slotSizeLists, granularity, slots);
-    };
-    if (requiredQuota() <= quota)
+    auto const originalMinSlots
+        = computePoolGroupMinSlotsFromConstraints(resolved, tokensPerBlock, swaScratchReuse, maxUtilForResume);
+    if (minQuotaForLevel(slotSizeLists, granularity, originalMinSlots) <= quota)
     {
         return resolved;
     }
     auto const [batchIndex, requestIndex] = *flexibleIndex;
-    auto& request = resolved[batchIndex].kvCaches[requestIndex];
+    auto const originalRequest = resolved[batchIndex].kvCaches[requestIndex];
+    auto fixedConstraints = resolved;
+    fixedConstraints.erase(fixedConstraints.begin() + batchIndex);
+    auto const fixedMinSlots
+        = computePoolGroupMinSlotsFromConstraints(fixedConstraints, tokensPerBlock, swaScratchReuse, maxUtilForResume);
+    auto fixedPeers = resolved[batchIndex];
+    fixedPeers.kvCaches.erase(fixedPeers.kvCaches.begin() + requestIndex);
+    auto const fixedPeerSlots = computePoolGroupSlotsForBatch(fixedPeers, tokensPerBlock, swaScratchReuse);
+    BatchDesc candidate{{originalRequest}};
+    auto& request = candidate.kvCaches.front();
+    auto requiredQuota = [&]()
+    {
+        auto slots = computePoolGroupSlotsForBatch(candidate, tokensPerBlock, swaScratchReuse);
+        // The adjustable batch has no shared prompt, so raw request demands are
+        // additive, including per-request scratch rounding and SSM slots. Apply
+        // resume headroom only after adding the fixed peers, then take the max
+        // with other workloads and structural floors before rounding to bytes.
+        for (PoolGroupIndex pg{0}; pg < slots.size(); ++pg)
+        {
+            auto const scaledSlots = static_cast<SlotCount>(
+                std::ceil(static_cast<double>(slots[pg] + fixedPeerSlots[pg]) / static_cast<double>(maxUtilForResume)));
+            slots[pg] = std::max(fixedMinSlots[pg], scaledSlots);
+        }
+        return minQuotaForLevel(slotSizeLists, granularity, slots);
+    };
     int const headroom = request.capacity - request.historyLength;
     int const maximum = request.capacity;
     int const minimum = std::max(1, headroom);
@@ -1810,6 +1830,12 @@ std::vector<BatchDesc> StorageManager::resolveConstraints(std::vector<BatchDesc>
         throw std::invalid_argument("GPU quota is insufficient for FIT_TO_QUOTA at or above minimum capacity");
     }
     setCapacity(*best);
+    resolved[batchIndex].kvCaches[requestIndex] = request;
+    TLLM_LOG_WARNING(
+        "FIT_TO_QUOTA reduced initialization constraint batch %zu request %zu: capacity %d -> %d, "
+        "history_length %d -> %d (GPU quota %zu bytes, usable %zu bytes)",
+        batchIndex, requestIndex, originalRequest.capacity, request.capacity, originalRequest.historyLength,
+        request.historyLength, gpuQuota, quota);
     return resolved;
 }
 
