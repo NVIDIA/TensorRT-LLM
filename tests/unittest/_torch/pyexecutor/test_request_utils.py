@@ -915,6 +915,41 @@ def _make_broadcast_item(req_id):
     )
 
 
+def test_request_broadcaster_known_nonempty_skips_count_probe():
+    """With known_nonempty (all ranks agree via the ADP allgather hint that
+    rank 0 holds requests), the count probe is skipped and the result is
+    identical to the probing path."""
+    dist = Mock()
+    dist.rank = 0
+    dist.world_size = 1
+    hang_detector = MagicMock()
+    broadcaster = RequestBroadcaster(dist, hang_detector)
+    probe = Mock(wraps=broadcaster._broadcast_request_count)
+    broadcaster._broadcast_request_count = probe
+    items = [_make_broadcast_item(1), _make_broadcast_item(2)]
+
+    probed_requests, probed_py_objects = broadcaster.broadcast(items)
+    assert probe.call_count == 1
+    assert probed_requests == items
+
+    hinted_requests, hinted_py_objects = broadcaster.broadcast(items, known_nonempty=True)
+    assert probe.call_count == 1  # probe skipped
+    assert hinted_requests == probed_requests
+    assert hinted_py_objects == probed_py_objects
+
+
+def test_request_broadcaster_empty_probing_path_unchanged():
+    dist = Mock()
+    dist.rank = 0
+    dist.world_size = 1
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+
+    new_requests, py_request_objects = broadcaster.broadcast([])
+
+    assert new_requests == []
+    assert py_request_objects is None
+
+
 class _SingleRoundDist:
     """Fake transport recording the collectives RequestBroadcaster issues.
 
@@ -1039,6 +1074,18 @@ def test_single_round_idle_path_keeps_cpu_probe():
 
     assert (new_requests, py_request_objects) == ([], None)
     assert dist.calls == [("broadcast_int64", [0], True)]
+
+
+def test_single_round_known_nonempty_still_skips_straight_to_payload():
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+    items = [_make_broadcast_item(1)]
+
+    new_requests, py_request_objects = broadcaster.broadcast(items, known_nonempty=True)
+
+    assert new_requests == items
+    assert [kind for kind, *_ in dist.calls] == ["broadcast"]
+    assert dist.calls[0][1] == (items, py_request_objects)
 
 
 def test_merge_helix_requests_with_padding():

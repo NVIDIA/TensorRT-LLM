@@ -1482,6 +1482,32 @@ class ModelEngine:
             is_dummy=self._warmup_depth > 0,
         )
 
+    def make_graph_batch(
+        self, scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager
+    ) -> Tuple[ScheduledRequests, frozenset[int]]:
+        """The batch ``forward`` would hand to the CUDA-graph runner.
+
+        For the executor's packed attention-DP post-schedule exchange
+        (TLLM_ADP_PACKED_SYNC): evaluated right after scheduling with the
+        same execution-batch transform, spec-decode state and KV cache manager
+        the forward uses, so the padding hint it yields equals what the runner
+        would gather. Runners without graph-batch promotion return the batch
+        unchanged.
+        """
+        runner = self._runner
+        make = getattr(runner, "make_graph_batch", None)
+        if make is None:
+            return scheduled_requests, frozenset()
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        execution_batch = runner._graphs.attention_dp_execution_batch(
+            scheduled_requests)
+        return make(execution_batch,
+                    kv_cache_manager,
+                    enable_spec_decode=self.enable_spec_decode,
+                    runtime_draft_len=self.runtime_draft_len)
+
     def _forward_scheduled(
         self,
         inputs: ScheduledInputs,

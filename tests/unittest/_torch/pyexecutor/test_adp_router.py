@@ -30,6 +30,7 @@ from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -85,6 +86,17 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False, has_pp=False):
     dist.has_cp_helix = has_cp_helix
     dist.mapping.has_pp.return_value = has_pp
     return dist
+
+
+def _as_state_payload(values):
+    """Mirror the int64 tensor transport used by gather_all_rank_states."""
+    return torch.tensor(values, dtype=torch.int64)
+
+
+def _assert_allgathered_state(dist, expected_values):
+    dist.tp_allgather.assert_called_once()
+    (payload,) = dist.tp_allgather.call_args.args
+    assert torch.equal(payload, _as_state_payload(expected_values))
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
@@ -236,13 +248,27 @@ class TestRankState:
 
     def test_serialize(self) -> None:
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100, 0, *RankIterStatsPayload().serialize(), 0, 0, 0, 0]
+        # rank, active, tokens, retiring, pending_new, the iter-stats payload, then the
+        # forward work (context, generation) and the connector counters
+        assert state.serialize() == [
+            0,
+            5,
+            100,
+            0,
+            0,
+            *RankIterStatsPayload().serialize(),
+            0,
+            0,
+            0,
+            0,
+        ]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
         assert state.rank == 2
         assert state.num_active_requests == 3
         assert state.num_active_tokens == 50
+        assert state.num_pending_new_requests == 0
 
     def test_roundtrip(self):
         original = RankState(rank=1, num_active_requests=10, num_active_tokens=200)
@@ -260,11 +286,20 @@ class TestRankState:
         assert original == restored
         assert restored.num_retiring_requests == 3
 
+    def test_roundtrip_with_pending_new_requests(self):
+        original = RankState(
+            rank=0, num_active_requests=10, num_active_tokens=200, num_pending_new_requests=7
+        )
+        restored = RankState.deserialize(data=original.serialize())
+        assert original == restored
+        assert restored.num_pending_new_requests == 7
+
     def test_defaults(self):
         state = RankState(rank=0)
         assert state.num_active_requests == 0
         assert state.num_active_tokens == 0
         assert state.num_retiring_requests == 0
+        assert state.num_pending_new_requests == 0
         assert state.iter_stats.has_iter_stats == 0
         assert state.iter_stats.iter_stats_iter == -1
 
@@ -671,15 +706,19 @@ class TestDefaultADPRouter:
 
     def test_gather_all_rank_states(self):
         dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
-        dist.tp_allgather.return_value = [[0, 1, 10], [1, 2, 20]]
+        # Short (older-format) payloads exercise deserialize's trailing-default fill.
+        dist.tp_allgather.return_value = [
+            _as_state_payload([0, 1, 10]),
+            _as_state_payload([1, 2, 20]),
+        ]
         router = DefaultADPRouter(dist=dist)
         req = Mock(py_orig_prompt_len=10)
         states = router.gather_all_rank_states([req])
         assert len(states) == 2
         assert states[0] == RankState(rank=0, num_active_requests=1, num_active_tokens=10)
         assert states[1] == RankState(rank=1, num_active_requests=2, num_active_tokens=20)
-        dist.tp_allgather.assert_called_once_with(
-            RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
+        _assert_allgathered_state(
+            dist, RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
         )
 
     @pytest.mark.parametrize("include_kv_cache_load", [False, True])
@@ -713,8 +752,8 @@ class TestDefaultADPRouter:
         )
         rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
         dist.tp_allgather.return_value = [
-            expected_local.serialize(include_kv_cache_load),
-            rank1.serialize(include_kv_cache_load),
+            _as_state_payload(expected_local.serialize(include_kv_cache_load)),
+            _as_state_payload(rank1.serialize(include_kv_cache_load)),
         ]
 
         router = DefaultADPRouter(dist=dist)
@@ -730,7 +769,31 @@ class TestDefaultADPRouter:
 
         assert states[0] == expected_local
         assert states[1] == rank1
-        dist.tp_allgather.assert_called_once_with(expected_local.serialize(include_kv_cache_load))
+        _assert_allgathered_state(dist, expected_local.serialize(include_kv_cache_load))
+
+    def test_gather_all_rank_states_piggybacks_pending_new_requests(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
+        expected_local = RankState(
+            rank=0,
+            num_active_requests=1,
+            num_active_tokens=10,
+            num_pending_new_requests=5,
+        )
+        rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
+        dist.tp_allgather.return_value = [
+            _as_state_payload(expected_local.serialize()),
+            _as_state_payload(rank1.serialize()),
+        ]
+
+        router = DefaultADPRouter(dist=dist)
+        req = Mock(py_orig_prompt_len=10)
+        states = router.gather_all_rank_states([req], num_pending_new_requests=5)
+
+        assert states[0] == expected_local
+        assert states[0].num_pending_new_requests == 5
+        assert states[1] == rank1
+        assert states[1].num_pending_new_requests == 0
+        _assert_allgathered_state(dist, expected_local.serialize())
 
     @pytest.mark.parametrize(
         "num_connector_transfers,connector_poll_failed", [(0, False), (3, True)]
@@ -834,7 +897,9 @@ class TestDefaultADPRouter:
         )
 
         disabled = state.serialize()
-        assert len(disabled) == 17
+        # rank, active requests, active tokens, retiring requests, pending-request
+        # hint, the 9 iteration stats, the 2 forward-work counters and the 2 connector counters.
+        assert len(disabled) == 18
         restored = RankState.deserialize(disabled)
         assert restored.num_context_requests == 2
         assert restored.num_generation_requests == 3
@@ -842,7 +907,7 @@ class TestDefaultADPRouter:
         assert restored.connector_poll_failed
         assert restored.iter_stats.kv_used_blocks == -1
         enabled = state.serialize(include_kv_cache_load=True)
-        assert len(enabled) == 20
+        assert len(enabled) == 21
         restored = RankState.deserialize(enabled)
         assert restored.iter_stats.kv_used_blocks == 4
         assert restored.num_context_requests == 2
@@ -1496,7 +1561,11 @@ class TestKVCacheAwareADPRouterRouting:
         prefix_matches=None,
     ):
         dist = _mock_dist(tp_rank=tp_rank, tp_size=tp_size)
-        dist.tp_allgather = lambda data: [list(data) for _ in range(tp_size)]
+        # Echo the payload back for every rank: rank-state gathers ship int64
+        # tensors, prefix-match gathers ship lists.
+        dist.tp_allgather = lambda data: [
+            data.clone() if isinstance(data, torch.Tensor) else list(data) for _ in range(tp_size)
+        ]
         kv_cache_manager = MagicMock()
         kv_cache_manager.enable_block_reuse = True
         router = KVCacheAwareADPRouter(

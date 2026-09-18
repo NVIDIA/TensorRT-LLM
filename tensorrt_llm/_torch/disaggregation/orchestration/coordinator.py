@@ -715,6 +715,9 @@ class DisaggTransferCoordinator:
             response = request.create_response()
             if response:
                 response.result.cached_tokens = request.cached_tokens
+                response.result.ctx_computed_tokens = getattr(request, 'py_ctx_computed_tokens', 0)
+                response.result.ctx_first_begin = getattr(request, 'py_ctx_first_begin', -1)
+                response.result.ctx_num_chunks = getattr(request, 'py_ctx_num_chunks', 0)
                 attach_ctx_usage(request, response)
             released = self._transfers.end_transfer(request)
             if released:
