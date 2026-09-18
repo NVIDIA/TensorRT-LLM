@@ -4557,6 +4557,19 @@ def test_mxfp8_fused_fc12_moe_rubin(
     # bf16 rounding noise between the two launches.
     torch.testing.assert_close(output_dirty.float(), output.float(), rtol=2e-2, atol=2e-2)
 
+    # Raw BF16 input quantizes in the workspace reset. A poisoned scale
+    # placeholder must stay unread and unmodified by the custom op.
+    raw_kwargs = dict(common_kwargs, input=a, input_scale=torch.full_like(a_sf, 255))
+    raw_output = torch.empty_like(output)
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            output=raw_output, zero_output=True, **raw_kwargs
+        )
+    torch.cuda.synchronize()
+    check(raw_output, "raw BF16 input, quantize/reset fusion")
+    assert (raw_kwargs["input_scale"] == 255).all()
+    torch.testing.assert_close(raw_output.float(), output.float(), rtol=2e-2, atol=2e-2)
+
     # 2. Every tactic the runner enumerates (small shapes only: each distinct
     #    geometry is a DSL compile).
     if num_experts > 64:
@@ -4698,7 +4711,7 @@ def test_mxfp8_moe_locality_domain_admission_rule():
     the strict 100+100 SM split: wins from 2 to 1024 rows, neutral at 2048,
     losses from 3072 rows up.
     """
-    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
 
     def admits(num_tokens, num_local_experts):
         return CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
@@ -4723,7 +4736,6 @@ def test_mxfp8_moe_locality_domain_admission_rule():
     # rows (4096 routes); a full expert sweep of 2048 rows is not profiled.
     assert admits(409, 512)
     assert not admits(410, 512)
-
 
 
 @pytest.mark.skipif(
@@ -5094,7 +5106,7 @@ def test_mxfp8_moe_tuning_buckets_cover_decode_shapes():
     (a few tokens per DP rank) are profiled regardless of that warmup shape.
     Profile generation only reads tensor shapes, so this runs on CPU tensors.
     """
-    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
 
     num_experts, top_k, hidden = 128, 10, 4096
     warmup_tokens = 3  # an odd shape: last_positive_power_of_2(3) == 2
@@ -5125,3 +5137,98 @@ def test_mxfp8_moe_tuning_buckets_cover_decode_shapes():
     # documentation of the failure mode the anchor prevents.
     unanchored = profiled_token_counts(tune_max_num_tokens=None)
     assert 4 not in unanchored and 8 not in unanchored, unanchored
+
+
+@pytest.mark.parametrize("hidden", [2048, 4096, 7168])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
+    """Only local computation may defer quantization; communication needs bytes.
+
+    The cutoff is an element count, so the largest deferred row count follows
+    from the hidden size rather than being tied to one model.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
+
+    backend = SimpleNamespace(
+        has_nvfp4=False,
+        has_mxfp8=True,
+        hidden_size=hidden,
+        scaling_vector_size=32,
+        quant_method=SimpleNamespace(BLOCK_SIZE=32, weight_alignment=512),
+        _locality_domain_runtime=None,
+        MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS=CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS,
+    )
+    backend._fuses_mxfp8_input_quant = CuteDslFusedMoE._fuses_mxfp8_input_quant.__get__(backend)
+    backend._mxfp8_full_gpu_path_selected = CuteDslFusedMoE._mxfp8_full_gpu_path_selected.__get__(
+        backend
+    )
+    max_rows = CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS // hidden
+    scale_cols = hidden // 32
+    calls = []
+
+    def native_quantize(tensor, swizzled, alignment):
+        calls.append((tensor, swizzled, alignment))
+        return (
+            torch.empty_like(tensor, dtype=torch.float8_e4m3fn),
+            torch.empty((tensor.size(0), scale_cols), dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "mxfp8_quantize", native_quantize)
+    for rows in (0, 1, max_rows):
+        x = torch.empty((rows, hidden), dtype=dtype)
+        raw, sf = CuteDslFusedMoE.quantize_input(backend, x, post_quant_comm=False)
+        assert raw is x and sf.shape == (rows, scale_cols) and sf.dtype == torch.uint8
+    assert not calls
+    x = torch.empty((max_rows, hidden), dtype=dtype)
+    quantized, sf = CuteDslFusedMoE.quantize_input(backend, x, post_quant_comm=True)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 1
+    assert calls[0][0] is x and calls[0][1:] == (False, 512)
+    assert sf.shape == (max_rows, scale_cols)
+    # Locality domains: the fusion stacks on the full-GPU path only. No
+    # recorded decision -> separate launch (the split may still be profiled);
+    # decision "split" -> separate launch; decision "full GPU" -> fused;
+    # outside the static admission rule -> fused (the split never runs).
+    backend._locality_domain_runtime = object()
+    backend.routing_method = SimpleNamespace(experts_per_token=10)
+    backend.expert_size_per_partition = 64
+    backend.num_slots = 512
+    backend._mxfp8_locality_domain_decisions = {}
+    small = torch.empty((8, hidden), dtype=dtype)
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 2
+    backend._mxfp8_locality_domain_decisions[8] = True
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
+    backend._mxfp8_locality_domain_decisions[8] = False
+    raw, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    assert raw is small and len(calls) == 3
+    assert not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
+        CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, 10, 64, 512
+    )
+    if (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1) * hidden <= (
+        CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS
+    ):
+        outside = torch.empty(
+            (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, hidden), dtype=dtype
+        )
+        raw, _ = CuteDslFusedMoE.quantize_input(backend, outside, post_quant_comm=False)
+        assert raw is outside and len(calls) == 3
+    backend._locality_domain_runtime = None
+    larger = torch.empty((max_rows + 1, hidden), dtype=dtype)
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, larger, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 4
+    # Non-contiguous rows cannot be vector-loaded by the reset kernel.
+    strided = torch.empty((2, hidden * 2), dtype=dtype)[:, :hidden]
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, strided, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 5
+
+def test_mxfp8_input_quantization_tuning_cache_isolation():
+    """Changing activation dtype must not reuse prequantized timing decisions."""
+    for locality in (False, True):
+        keys = {
+            CuteDslFusedMoE._mxfp8_tuner_key(dtype, locality)
+            for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
+        }
+        assert len(keys) == 3
+    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.float8_e4m3fn) == 8
+    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.bfloat16) != 8

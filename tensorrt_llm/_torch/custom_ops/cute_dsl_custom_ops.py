@@ -16289,8 +16289,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # the per-launch zeroed synchronization workspace, allocated
                 # once per padded route count and cleared by one reset launch.
                 workspace_cache = dict()
-                # use_pdl -> compiled reset_fc12_sync_workspace
+                # (use_pdl, zero_output, input dtype) -> compiled reset
                 reset_kernel_cache = dict()
+                # (device, rows, K) -> (E4M3 activations, linear UE8M0 scales):
+                # scratch written by the fused input quantization in the reset
+                # launch and read by the GEMM; one allocation per row bucket
+                # instead of one per call. Never handed back to the caller.
+                input_quant_scratch_cache = dict()
                 sf_vec_size = MXFP8_FUSED_FC12_SF_VEC_SIZE
                 # FP8 UMMA_K is 64; the CTA K tile may be one or two 128-byte atoms.
                 mma_inst_k = 64
@@ -16549,8 +16554,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      fc1_norm_const, fc2_b, fc2_sfb, fc2_alpha, output,
                      token_final_scales) = inputs
 
-                    assert fc1_a.dtype == torch.float8_e4m3fn and fc1_a.dim(
-                    ) == 2
+                    assert fc1_a.dtype in (torch.float8_e4m3fn, torch.bfloat16,
+                                           torch.float16) and fc1_a.dim() == 2
+                    input_unquantized = (fc1_a if fc1_a.dtype
+                                         != torch.float8_e4m3fn else None)
+                    if input_unquantized is not None:
+                        assert fc1_a.is_contiguous(
+                        ) and fc1_a.data_ptr() % 16 == 0
                     assert fc1_b.dtype == torch.float8_e4m3fn and fc1_b.dim(
                     ) == 3
                     assert fc2_b.dtype == torch.float8_e4m3fn and fc2_b.dim(
@@ -16622,6 +16632,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     assert mma_tiler[0] == self.tile_size, (
                         f"Tactic ({tactic}) is incompatible with tile size "
                         f"({self.tile_size})")
+
+                    # Raw input is quantized by the existing workspace-reset
+                    # launch. Own both outputs here: custom-op inputs remain
+                    # read-only, including the scale-shape placeholder. The
+                    # scratch is cached per row bucket like the workspace;
+                    # the GEMM of one call finishes reading it before the
+                    # reset of the next call rewrites it (stream order, or
+                    # the reset's griddepcontrol_wait under PDL).
+                    if input_unquantized is not None:
+                        scratch_key = (input_unquantized.device,
+                                       input_unquantized.shape[0], k)
+                        scratch = self.__class__.input_quant_scratch_cache.get(
+                            scratch_key)
+                        if scratch is None:
+                            scratch = (
+                                torch.empty(input_unquantized.shape,
+                                            dtype=torch.float8_e4m3fn,
+                                            device=input_unquantized.device),
+                                torch.empty(fc1_sfa.shape,
+                                            dtype=fc1_sfa.dtype,
+                                            device=input_unquantized.device),
+                            )
+                            self.__class__.input_quant_scratch_cache[
+                                scratch_key] = scratch
+                        fc1_a, fc1_sfa = scratch
 
                     # FC1 intermediate (FC2 A operand) and its swizzled block
                     # scales: written and re-read by the kernel, so plain scratch.
@@ -16930,7 +16965,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # ordering.
                     use_reset_pdl = TRTLLM_ENABLE_PDL and (
                         cluster_shape_mn[0] * cluster_shape_mn[1] == 1)
-                    reset_key = (use_reset_pdl, self.zero_output)
+                    quant_args = {}
+                    input_dtype = None
+                    if input_unquantized is not None:
+                        input_dtype = input_unquantized.dtype
+                        raw_dtype = (cutlass.BFloat16 if input_dtype
+                                     == torch.bfloat16 else cutlass.Float16)
+                        quant_args = dict(input_raw_ptr=make_ptr(
+                            raw_dtype,
+                            input_unquantized.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16),
+                                          input_quant_ptr=fc1_a_ptr,
+                                          input_scale_ptr=fc1_sfa_ptr,
+                                          input_numel=cutlass.Int32(
+                                              input_unquantized.numel()))
+                    reset_key = (use_reset_pdl, self.zero_output, input_dtype)
                     compiled_reset = self.__class__.reset_kernel_cache.get(
                         reset_key)
                     if compiled_reset is None:
@@ -16945,6 +16995,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             stream,
                             use_reset_pdl,
                             self.zero_output,
+                            **quant_args,
                         )
                         self.__class__.reset_kernel_cache[
                             reset_key] = compiled_reset
@@ -16956,6 +17007,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         output_ptr,
                         cutlass.Int32(output.numel()),
                         stream,
+                        **quant_args,
                     )
 
                     compiled_gemm(
@@ -17035,6 +17087,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     fc1_norm_const, fc2_weight, fc2_weight_scale, fc2_alpha,
                     output, token_final_scales
                 ]
+                if input.dtype != torch.float8_e4m3fn:
+                    tuner_key += f"::input_quant::{input.dtype}"
                 if precomputed_tactic is None:
                     _, best_tactic = tuner.choose_one(
                         tuner_key,
@@ -17092,7 +17146,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 accumulates ``token_final_scales * fc2`` into it. With
                 ``zero_output`` the op clears the whole ``output`` itself, inside
                 its workspace reset launch, so the caller can skip the dense
-                memset. A negative ``swiglu_limit`` disables the SwiGLU clamp.
+                memset. BF16/FP16 input fuses MXFP8 input quantization into
+                that reset launch; ``input_scale`` then supplies only the
+                expected [orig_m, K/32] shape and is never read or modified.
+                E4M3 input requires populated linear UE8M0 scales as before.
+                A negative ``swiglu_limit`` disables the SwiGLU clamp.
                 """
                 _run_mxfp8_fused_fc12_moe_rubin(
                     input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,
@@ -17219,6 +17277,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuner_key = (
                 "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin::locality_domain"
             )
+            if input.dtype != torch.float8_e4m3fn:
+                tuner_key += f"::input_quant::{input.dtype}"
             op_runner = Sm107Mxfp8FusedFc12MoeRunner(
                 num_experts,
                 top_k,

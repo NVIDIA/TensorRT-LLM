@@ -3277,8 +3277,11 @@ def _mxfp8_fp32_oracle(
     [
         (60, 4, 2048, 1408, 128),  # Qwen1.5-MoE-A2.7B
         (128, 10, 4096, 1024, 128),  # Qwen3.5-397B experts as seen by one EP4 rank
+        # Decode-sized batch: quantize_input defers the MXFP8 quantization to
+        # the fused FC12 workspace reset (raw BF16 reaches the op).
+        (128, 10, 4096, 1024, 16),
     ],
-    ids=["e60_k4_h2048_i1408", "e128_k10_h4096_i1024"],
+    ids=["e60_k4_h2048_i1408", "e128_k10_h4096_i1024", "e128_k10_h4096_i1024_decode"],
 )
 def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
     num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, seq_len: int
@@ -3349,6 +3352,16 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
 
         token_selected_experts, token_final_scales = routing_method.apply(router_logits)
         x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+        # Small batches come back as raw BF16 (quantized inside the fused op);
+        # the references always consume explicitly quantized activations,
+        # which are byte-identical to what the op produces.
+        if x_quantized.dtype == torch.float8_e4m3fn:
+            x_q_ref, x_sf_ref = x_quantized, x_sf
+        else:
+            x_q_ref, x_sf_ref = torch.ops.trtllm.mxfp8_quantize(
+                x, False, alignment=backend.quant_method.weight_alignment
+            )
+            x_sf_ref = x_sf_ref.view(seq_len, -1)
 
         def run_fused():
             return run_backend_moe(
@@ -3369,8 +3382,8 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
             fused = run_fused().float()
             ref = ref_fused_moe.forward(x, router_logits).float()
             oracle = _mxfp8_fp32_oracle(
-                x_quantized,
-                x_sf,
+                x_q_ref,
+                x_sf_ref,
                 weights,
                 token_selected_experts,
                 token_final_scales,
