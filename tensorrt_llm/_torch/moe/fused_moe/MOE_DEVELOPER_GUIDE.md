@@ -65,7 +65,7 @@ Each backend declares one of two scheduler kinds via the `scheduler_kind` class 
 | Kind | Scheduler class | Used by | Cross-rank EP exchange |
 |------|-----------------|---------|------------------------|
 | `EXTERNAL_COMM` | `ExternalCommMoEScheduler` | Cutlass, DeepGemm, CuteDSL, DenseGEMM, TRTLLMGen | Host issues `Communication.dispatch` / `.combine` outside the MoE kernel; supports per-chunk EPLB hooks and multi-stream chunk overlap |
-| `FUSED_COMM` | `FusedCommMoEScheduler` | DeepgemmCudaW4a8Mxfp4Mxfp8Impl, MegaMoECuteDsl | Comm is fused into the backend kernel via SymmBuffer / NVSHMEM-equivalent peer-pointer mapping; no host comm; lockstep chunk launches; EPLB stats AllReduced internally |
+| `FUSED_COMM` | `FusedCommMoEScheduler` | DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl | Comm is fused into the backend kernel via SymmBuffer / NVSHMEM-equivalent peer-pointer mapping; no host comm; lockstep chunk launches; EPLB stats AllReduced internally |
 
 The two paths have *deliberately opposite* invariants (`use_dp_padding` honored vs ignored, ADP padding kept vs stripped, empty-chunk substituted vs zero-token kernel launch, multi-stream overlap allowed vs forbidden). See `moe_scheduler.py` class docstrings and `MOE_SCHEDULER_DESIGN.md` for the full contract.
 
@@ -164,7 +164,8 @@ ConfigurableMoE currently supports these backends (`create_moe.py`):
 - `CutlassFusedMoE`, the `TrtllmGenFusedMoEBase` leaves,
   `DeepgemmCudaFp8BlockScalesImpl`, `CuteDslFusedMoE`, `CuteDslB12xFusedMoE`,
   `TrtllmCutedslFusedFc12Nvfp4Impl`, `DenseGEMMFusedMoE`,
-  `DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `MegaMoECuteDsl`, `MarlinFusedMoE`
+  `DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`,
+  `MarlinFusedMoE`
 
 Still on old path (standalone, with embedded communication):
 - `TritonFusedMoE`, `VanillaMoE`
@@ -205,7 +206,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4 hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode — best perf on RTX PRO 6000 (SM120) and DGX Spark (SM121); select via the `CUTEDSL` backend path (it heads that family's candidate list, so it wins on SM120/121 when flashinfer is present and yields to `CuteDslFusedMoE` otherwise); single-GPU-shaped topology only — it rejects both `ep_size > 1` and attention-DP, because it has no dispatch/combine kernel and has never been exercised behind a DP allgather | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_fc12.py` | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2: a `MoEImplBase` leaf sharing `CuteDslFusedMoE`'s NVFP4 weight layout and outer autotune runner, driving the single persistent `cute_dsl_nvfp4_fc12_fused_rubin` kernel (keeps the FC1->FC2 intermediate on-chip, removing the global round-trip and one launch); reachable through the `CUTEDSL_FC12` backend family or a pinned `impl_id`; requires CuTe DSL Rubin support (`MoEDep.CUTEDSL_RUBIN` in the collected environment); routing tile 128 (1-CTA) or 256 (2-CTA, cluster (2,1)), chosen by the autotuner per shape; non-uGPU | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
-| `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects Blackwell, Rubin generic or Rubin genphase kernels. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models. | `FUSED_COMM` |
+| `mega_moe/mega_moe_cute_dsl.py` | `TrtllmCutedslMegaMoeNvfp4Impl` (aliased as `MegaMoECuteDsl`) | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects one of its per-architecture kernel variants. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models. | `FUSED_COMM` |
 | `fused_moe_marlin.py` | `MarlinFusedMoE` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, fused single-launch `marlin_nvfp4_moe_gemm` kernel); supports attention-DP + EP via external comm (scheduler precomputes routing; dispatch payload is plain BF16, no activation scales); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass in `resolve_moe_impl`, recorded in the layer's `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
 | `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) | (legacy path) |
 | `fused_moe_vanilla.py` | `VanillaMoE` | All devices | Reference / debugging only | (legacy path) |
@@ -292,12 +293,12 @@ not `==`.
 | File | Role |
 |------|------|
 | `mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` backend (DeepGEMM `fp8_fp4_mega_moe` wrapper), aliased as `MegaMoEDeepGemm` |
-| `mega_moe_cute_dsl.py` | `MegaMoECuteDsl` backend (architecture-specific CuteDSL MegaMoE wrapper, NVFP4) |
+| `mega_moe_cute_dsl.py` | `TrtllmCutedslMegaMoeNvfp4Impl` backend (architecture-specific CuteDSL MegaMoE wrapper, NVFP4), aliased as `MegaMoECuteDsl` |
 | `CHUNKING_DESIGN.md` | Chunking design for MegaMoE (sequential multi-chunk, in-kernel barrier semantics) |
 | `COMMUNICATION_COMPARISON.md` | Comparison of fused-comm SymmBuffer vs external comm strategies |
 | `KERNEL_INTERNALS.html` | Reference for the underlying DeepGEMM kernel layout |
 
-The exported CuteDSL kernel sources for `MegaMoECuteDsl` live under
+The exported CuteDSL kernel sources for `TrtllmCutedslMegaMoeNvfp4Impl` live under
 `tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/`, preserving the upstream
 package structure and `KernelClass` entry points. The runner constructs
 `ProblemDesc` and `ImplDesc` and dispatches internally; the public backend
@@ -411,10 +412,11 @@ artifact a tuning result is replayed from — records a class name rather than a
 id, alongside `problem.quant` and `deployment.env.env_flags`. A class that
 still spans several quantization formats deliberately does not synthesize a
 `MoEImplId`; a canonical one is attached only where a class owns a fixed
-`MoEImplDescriptor.identity`. The TRTLLM-Gen leaves and the DeepGEMM
-implementations do today, each admitting exactly one format. Until
-the rest follow and those fields switch to `descriptor.impl_id`, a class name
-is not an identity: read `descriptor.identity`.
+`MoEImplDescriptor.identity`. The TRTLLM-Gen leaves, the DeepGEMM
+implementations, `TrtllmCutedslFusedFc12Nvfp4Impl` and
+`TrtllmCutedslMegaMoeNvfp4Impl` do today, each admitting exactly one format.
+Until the rest follow and those fields switch to `descriptor.impl_id`, a class
+name is not an identity: read `descriptor.identity`.
 
 ### Cross-rank agreement
 
@@ -628,13 +630,13 @@ expert bias, and the NVFP4 TMA-WS runner already applies `SwigluBiasAdaptor`.
 
 ### Scheduler / EPLB Constraints
 
-- `FUSED_COMM` backends (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `MegaMoECuteDsl`) **must not** layer host-side `Communication.dispatch` / `.combine` on top of the fused kernel — `ConfigurableMoE._create_comm_strategy_auto` returns `None` for them.
+- `FUSED_COMM` backends (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`) **must not** layer host-side `Communication.dispatch` / `.combine` on top of the fused kernel — `ConfigurableMoE._create_comm_strategy_auto` returns `None` for them.
 - `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support. Backends gate
   wrapper-level constraints via `validate_configurable_moe`; `MegaMoEDeepGemm`
   supports dynamic EPLB by routing to slot IDs and migrating transformed DG
   weight tensors registered by its quantization method, with the constraint
-  `num_slots % ep_size == 0`. `MegaMoECuteDsl` declares `eplb_support_status = SUPPORTED`: its quantization method registers the four MegaMoE-format derived params (`mega_fc{1,2}_weight{,_sf}`) and the per-expert `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
+  `num_slots % ep_size == 0`. `TrtllmCutedslMegaMoeNvfp4Impl` publishes `capabilities.supports_eplb=True` on its descriptor, and its quantization method declares `eplb_support_status = SUPPORTED` and registers the four MegaMoE-format derived params (`mega_fc{1,2}_weight{,_sf}`) and the per-expert `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
 
 ## Canonical Examples
@@ -644,7 +646,7 @@ When adding new components, use these reference implementations:
 | Task | Reference | Key methods to implement |
 |------|-----------|--------------------------|
 | New `EXTERNAL_COMM` Backend | `fused_moe_cutlass.py` (`CutlassFusedMoE`) | Declare `MoEImplBase`; implement `capabilities`, `activation_support`, `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`; call `apply_moe_impl_construction_state()` in `__init__` (`create_weights` / `load_weights` come from `MoEWeightOwnerMixin` — override only if allocation needs more); then add the class to `moe_resolution.IMPL_PRIORITY` and `BACKEND_FAMILY`, and add a branch in `create_moe_backend`. Declare the `descriptor` and `@register_moe_impl` on the same class that implements those four methods. Split an abstract parent out of it only when several quantization formats are planned — see the one-class-per-identity note below |
-| New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`), `mega_moe/mega_moe_cute_dsl.py` (`MegaMoECuteDsl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `MegaMoECuteDsl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel imports from `cute_dsl_kernels/cutedsl_megamoe/`, and `quantize_input` that short-circuits zero-token input. |
+| New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`), `mega_moe/mega_moe_cute_dsl.py` (`TrtllmCutedslMegaMoeNvfp4Impl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `TrtllmCutedslMegaMoeNvfp4Impl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel imports from `cute_dsl_kernels/cutedsl_megamoe/`, and `quantize_input` that short-circuits zero-token input. |
 | New Quantization Method | `quantization.py` → `FP8QDQFusedMoEMethod` | Subclass `FusedMoEMethod`, implement quant/dequant ops |
 | New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine`; also implement `CheckpointableCommunication` when native workspace mappings must follow executor sleep/wakeup |
 | New Scheduler | `moe_scheduler.py` (`ExternalCommMoEScheduler` / `FusedCommMoEScheduler`) | Subclass `MoEScheduler`, implement `forward`; add new `MoESchedulerKind` value and wire into `create_moe_scheduler` factory |
@@ -656,17 +658,21 @@ When adding new components, use these reference implementations:
 
 `CutlassFusedMoE` is itself an execution unit now: it is no longer a `MoE` and has **no `forward`**, so it can only run as `ConfigurableMoE.backend`. Anything that needs a callable layer must wrap it (see `Llama4MinLatencyFusedMoE`, which extends `ConfigurableMoE` and pins `moe_cls=CutlassFusedMoE`).
 
-These backends declare `MoEImplBase` directly — `CutlassFusedMoE`, `TrtllmGenFusedMoEBase`, `DenseGEMMFusedMoE`, `MegaMoECuteDsl`, `CuteDslFusedMoE`, `MarlinFusedMoE`, and the two DeepGEMM implementations. `TrtllmGenFusedMoEBase` declares it as an abstract family root and its leaves inherit through it, which is the shape the next note describes. Only `CuteDslB12xFusedMoE` still reaches it through another implementation, `CutlassFusedMoE`, as a historical shortcut; that concrete inheritance is broken in its own follow-up item, not here.
+These backends declare `MoEImplBase` directly — `CutlassFusedMoE`, `TrtllmGenFusedMoEBase`, `DenseGEMMFusedMoE`, `TrtllmCutedslMegaMoeNvfp4Impl`, `CuteDslFusedMoE`, `MarlinFusedMoE`, and the two DeepGEMM implementations. `TrtllmGenFusedMoEBase` declares it as an abstract family root and its leaves inherit through it, which is the shape the next note describes. Only `CuteDslB12xFusedMoE` still reaches it through another implementation, `CutlassFusedMoE`, as a historical shortcut; that concrete inheritance is broken in its own follow-up item, not here.
 
-**Note on one class per identity:** an identity and the code it names belong on the same class. That class declares the `descriptor`, takes its three contract attributes off it, carries `@register_moe_impl`, and implements the four abstract methods of `MoEImplBase`: `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`. Both DeepGEMM implementations are shaped that way — `DeepgemmCudaFp8BlockScalesImpl` and `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` each hold their identity, their construction, and their whole contract in one place.
+**Note on one class per identity:** an identity and the code it names belong on the same class. That class declares the `descriptor`, takes its three contract attributes off it, carries `@register_moe_impl`, and implements the four abstract methods of `MoEImplBase`: `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`. Both DeepGEMM implementations and `TrtllmCutedslMegaMoeNvfp4Impl` are shaped that way — each holds its identity, its construction, and its whole contract in one place.
+
+One identity may still fan out to several kernels underneath, as long as the four id segments stay the same for all of them. `TrtllmCutedslMegaMoeNvfp4Impl` dispatches its per-architecture kernel variants from one registered class, because the architecture it runs on is not an id segment — `can_implement` gates the SM, and the runner picks the kernel.
 
 Splitting an abstract parent out below `MoEImplBase` is worth it only once several quantization formats actually share an implementation. The parent then holds what they share — construction, buffers, workspace sizing, the weight lifecycle — implements none of the four, stays abstract, and carries no `descriptor`, because a descriptor is exactly one identity and an abstract class has nothing to publish it for; each format is a registered leaf that narrows `can_implement` to itself. `TrtllmGenFusedMoEBase` is that shape and so far the only one. Below one format the parent would carry no identity, implement nothing, and have exactly one subclass, which is why the other backends do not have one.
 
 What such a parent must also not do is branch on the axis its subclasses divide. Every `if self.<quant or provider flag>:` in it is a subclass difference expressed as data, so it belongs in an override — which is why `TrtllmGenFusedMoEBase` keeps `supports_gptoss_style` and `supports_situ` (read off the *class* at resolution, where there is no instance to ask) but has no flag whose only reader is one of its own methods. Those became hooks: `_create_quant_method_weights`, `_configure_shared_expert_fusion`, `_requires_separated_routing`, `_situ_tp_weight_alignment`, `resolve_activation_support`. `needs_zero_expert_bias` is the one declarative flag left, because its four setters sit on two different inheritance levels and an override would repeat the same body four times.
 
-**Note on implementation class names:** the name is derived from the identity as `<Provider><Technique><Quant>Impl`, with the kernel segment entering only when two ids differ in that segment alone. `DeepgemmCudaFp8BlockScalesImpl` and `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` share a provider and a technique but differ in `quant` as well as `kernel_name`, so neither needs its kernel segment to stay unambiguous.
+**Note on implementation class names:** the name is derived from the identity as `<Provider><Technique><Quant>Impl`, with the kernel segment entering only when two ids differ in that segment alone — and when it does, it sits where the id puts it, between technique and quant, so the name reads in id order. `DeepgemmCudaFp8BlockScalesImpl` and `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` share a provider and a technique but differ in `quant` as well as `kernel_name`, so neither needs its kernel segment to stay unambiguous.
 
-The `XXFusedMoE` names remain supported as module-level aliases — `DeepGemmFusedMoE`, `MegaMoEDeepGemm`, and `TRTLLMGenFusedMoE` are assignments onto the classes above, not base classes — so call sites, `issubclass` checks, and comments across the MoE tree keep resolving. An alias is deliberately not a parent: a parent under the old name would give one kernel a name that resolves and a name that does not, and for the family root it would leave a second class to keep in step with the first. `TRTLLMGenFusedMoE` is the one alias that stands for a family rather than a single leaf, which is why no descriptor can publish it: a descriptor is exactly one identity. It also means every gate against it must be `issubclass` / `isinstance` and never an equality check — resolution hands over a leaf, so `type(x) is TRTLLMGenFusedMoE` matches nothing.
+`TrtllmCutedslMegaMoeNvfp4Impl` carries its kernel segment for the reason `TrtllmCutedslFusedFc12Nvfp4Impl` already does, and it carries it ahead of the collision: `trtllm.cutedsl.mega_moe.nvfp4`, `trtllm.cutedsl.fused_fc12.nvfp4` and the `trtllm.cutedsl.grouped_gemm.nvfp4` that `CuteDslFusedMoE` will claim differ in `kernel_name` alone, so the shorter `TrtllmCutedslNvfp4Impl` can only ever belong to one of them. Spelling the segment out now keeps that last migration a pure rename of the other class. Note that `cutedsl` as a bare token already names more than one leaf — a pin on it matches both this kernel and the fused FC1+FC2 one, and `IMPL_PRIORITY` plus the SM gates decide which answers; name the kernel segment to pin either.
+
+The `XXFusedMoE` names remain supported as module-level aliases — `DeepGemmFusedMoE`, `MegaMoEDeepGemm`, `MegaMoECuteDsl`, and `TRTLLMGenFusedMoE` are assignments onto the classes above, not base classes — so call sites, `issubclass` checks, and comments across the MoE tree keep resolving. An alias is deliberately not a parent: a parent under the old name would give one kernel a name that resolves and a name that does not, and for the family root it would leave a second class to keep in step with the first. `TRTLLMGenFusedMoE` is the one alias that stands for a family rather than a single leaf, which is why no descriptor can publish it: a descriptor is exactly one identity. It also means every gate against it must be `issubclass` / `isinstance` and never an equality check — resolution hands over a leaf, so `type(x) is TRTLLMGenFusedMoE` matches nothing.
 
 **Known debt:** backends that have not migrated still carry the `XXFusedMoE` form as their real name, and that rename is deliberately not paid one backend at a time. It belongs with the change that switches the report's `winner` / `eligible` / `rejected[].backend` fields to `descriptor.impl_id` — see [Degradation is allowed, silence is not](#degradation-is-allowed-silence-is-not).
 
