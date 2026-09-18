@@ -24,18 +24,29 @@ Pass the Hub ID or local path via `--model`:
 ### Static FP8 checkpoints
 
 Statically quantized (ModelOpt) FP8 builds of Nano and Super run on this path.
-Quantization is detected from the checkpoint's own metadata — pass the directory
-to `--model` exactly as you would a BF16 one, with no extra flag:
+Quantization is detected from the checkpoint's own metadata, so nothing has to
+be declared on the command line. The weights live on the `fp8` branch of the
+same repos as the BF16 builds rather than under a separate model ID, so select
+them with `--revision`:
 
 ```bash
-python cosmos3.py --model /path/to/Cosmos3-Nano-FP8 \
+python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
     --prompt_file prompts/t2v.json \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 ```
 
-There are no FP8 Hub IDs yet, so use a local path. T2V, T2I, I2V and V2V are
-validated on a **single GPU**; every multi-GPU configuration is refused with an
-explicit error, so use BF16 there.
+`nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
+equally fine; pass its directory to `--model` and omit `--revision`.
+
+Serving takes the same option:
+
+```bash
+trtllm-serve nvidia/Cosmos3-Nano --revision fp8 \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+```
+
+T2V, T2I, I2V and V2V are validated on a **single GPU**; every multi-GPU
+configuration is refused with an explicit error, so use BF16 there.
 
 These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
 rather than being refused — audio is quantized and generated like any other
