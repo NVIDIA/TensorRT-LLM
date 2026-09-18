@@ -20,8 +20,7 @@ from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
 from queue import Empty, Queue
-from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
-                    Tuple, Type, get_type_hints)
+from typing import (Any, Callable, ContextManager, Iterable, List, Optional, Set, Tuple, Type, get_type_hints)
 
 import filelock
 import huggingface_hub
@@ -636,6 +635,44 @@ def get_numa_aware_cpu_affinity(device_id):
     return cpu_affinity
 
 
+def parse_cpu_list(spec: str) -> Set[int]:
+    """``"132-175,308-351"`` -> the set of CPU ids it names (empty for an empty spec)."""
+    cpus: Set[int] = set()
+    for part in (spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cpus.update(range(int(lo), int(hi) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+WORKER_AFFINITY_EXCLUDE_ENV = "TLLM_WORKER_AFFINITY_EXCLUDE_CPUS"
+WORKER_AFFINITY_MIN_CPUS = 8
+
+
+def exclude_cpus_from_affinity(cpus: List[int],
+                               spec: str,
+                               *,
+                               min_cpus: int = WORKER_AFFINITY_MIN_CPUS
+                               ) -> Tuple[List[int], List[int]]:
+    """Drop the CPUs named by ``spec`` from ``cpus`` unless too few would remain.
+
+    Returns ``(kept, dropped)``; ``dropped`` is empty when nothing was removed
+    (empty spec, no overlap, or fewer than ``min_cpus`` would be left).
+    """
+    excluded = parse_cpu_list(spec)
+    if not excluded:
+        return list(cpus), []
+    kept = [c for c in cpus if c not in excluded]
+    dropped = [c for c in cpus if c in excluded]
+    if not dropped or len(kept) < min_cpus:
+        return list(cpus), []
+    return kept, dropped
+
+
 def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
     """Best-effort bind of this process's threads to `cpus`.
 
@@ -761,8 +798,18 @@ def configure_cpu_affinity(device_id: int) -> None:
     # optimal affinity based upon the NUMA topology
     if ((numa_aware_affinity is None and not constrained_affinity)
             or (numa_aware_affinity == "1")):
-        bound, attempted = _set_affinity_all_threads(
-            get_numa_aware_cpu_affinity(device_id))
+        numa_cpus = get_numa_aware_cpu_affinity(device_id)
+        # Keep the worker off the CPUs reserved for co-located services. The
+        # request-serving and agent-runner processes of an RL rollout are
+        # pinned to a slice of one socket (NRL_RAY_SERVICE_CPUS); without this
+        # exclusion the TP ranks whose GPUs sit on that socket share those
+        # cores with them and their host path runs 2-3x slower than the other
+        # ranks', so every all-reduce of the iteration waits for them.
+        exclude_spec = os.environ.get(WORKER_AFFINITY_EXCLUDE_ENV)
+        if exclude_spec is None:
+            exclude_spec = os.environ.get("NRL_RAY_SERVICE_CPUS", "")
+        numa_cpus, dropped = exclude_cpus_from_affinity(numa_cpus, exclude_spec)
+        bound, attempted = _set_affinity_all_threads(numa_cpus)
         if bound == 0:
             logger.warning(
                 f"Worker process {pid} could not set the NUMA-aware CPU "
@@ -772,7 +819,9 @@ def configure_cpu_affinity(device_id: int) -> None:
             logger.info(
                 f"Worker process {pid} CPU affinity set to "
                 f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
-                f"({bound}/{attempted} threads).")
+                f"({bound}/{attempted} threads"
+                + (f"; {len(dropped)} service CPUs excluded: {dropped[0]}-{dropped[-1]}"
+                   if dropped else "") + ").")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],
