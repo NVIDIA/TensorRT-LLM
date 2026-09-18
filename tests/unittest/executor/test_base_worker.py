@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -11,6 +27,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
+import tensorrt_llm.executor.base_worker as base_worker_module
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.utils import RequestError
@@ -54,6 +71,49 @@ def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
     request = LoRARequest("missing", 1, missing_path)
 
     assert request.path == missing_path
+
+
+@pytest.mark.cpu_only
+def test_setup_engine_failure_releases_cpu_affinity(monkeypatch):
+    release = Mock()
+    worker = object.__new__(BaseWorker)
+    worker._engine = "unused"
+    worker.rank = 0
+    worker.llm_args = SimpleNamespace(backend="unsupported")
+    worker._backend = "unsupported"
+    worker._cpu_affinity_lease = None
+    worker.doing_shutdown = True
+
+    def acquire_then_fail():
+        worker._cpu_affinity_lease = 7
+        return [], []
+
+    worker._get_comm_ranks_device_id = acquire_then_fail
+    monkeypatch.setattr(base_worker_module, "release_cpu_affinity", release)
+
+    with pytest.raises(ValueError, match="Unsupported backend config"):
+        worker.setup_engine()
+
+    release.assert_called_once_with(7)
+    assert worker._cpu_affinity_lease is None
+
+
+@pytest.mark.cpu_only
+def test_shutdown_failure_releases_cpu_affinity(monkeypatch):
+    release = Mock()
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = False
+    worker._cpu_affinity_lease = 11
+    worker.engine = Mock()
+    worker.engine.can_shutdown.return_value = True
+    worker.engine.shutdown.side_effect = RuntimeError("shutdown failed")
+    monkeypatch.setattr(base_worker_module, "release_cpu_affinity", release)
+
+    with pytest.raises(RuntimeError, match="shutdown failed"):
+        worker.shutdown()
+
+    release.assert_called_once_with(11)
+    assert worker._cpu_affinity_lease is None
 
 
 def create_fake_llm_args(engine_path, tp_size: int = 1):
@@ -109,6 +169,7 @@ class FakeWorker(BaseWorker):
         if self.engine is not None:
             self.engine.shutdown()
             self.engine = None
+        self._release_cpu_affinity()
 
 
 class TestWorkerBase:
