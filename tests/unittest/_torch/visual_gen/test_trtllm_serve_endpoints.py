@@ -2054,18 +2054,28 @@ class TestVideoGenerationAsync:
         """
         import threading
 
+        entered = threading.Event()
         release = threading.Event()
         wrote = threading.Event()
         original_save = VisualGenOutput.save
 
         def _blocking_save(self, *args, **kwargs):
+            entered.set()
             release.wait(timeout=5)
             try:
                 return original_save(self, *args, **kwargs)
             finally:
                 wrote.set()
 
+        seen = []
+        original_upsert = VIDEO_STORE.upsert
+
+        async def _spy_upsert(video_id, job):
+            seen.append(job.status)
+            return await original_upsert(video_id, job)
+
         monkeypatch.setattr(VisualGenOutput, "save", _blocking_save)
+        monkeypatch.setattr(VIDEO_STORE, "upsert", _spy_upsert)
 
         resp = await async_video_client.post(
             "/v1/videos",
@@ -2081,22 +2091,18 @@ class TestVideoGenerationAsync:
         assert resp.status_code == 202
         video_id = resp.json()["id"]
 
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            poll = await async_video_client.get(f"/v1/videos/{video_id}")
-            if poll.json().get("status") == "postprocessing":
-                break
-            await asyncio.sleep(0.02)
-        else:
-            release.set()
-            pytest.fail("the encode never reached 'postprocessing'")
+        # The thread has to be inside the save already: a cancel that lands
+        # before the executor picks the callable up writes nothing at all, and
+        # the closing assertion would then hold without the cleanup running.
+        assert await asyncio.to_thread(entered.wait, 5)
 
         deleting = asyncio.ensure_future(async_video_client.delete(f"/v1/videos/{video_id}"))
         await asyncio.sleep(0.05)  # let DELETE reach the cancel while the save is held
         release.set()
         assert (await deleting).status_code == 200
 
-        await asyncio.to_thread(wrote.wait, 5)
+        assert await asyncio.to_thread(wrote.wait, 5)
+        assert "completed" not in seen  # the delete cancelled the encode
         assert list(tmp_path.glob(f"{video_id}*")) == []
 
     def test_async_video_multipart(self, video_client, tmp_path):
