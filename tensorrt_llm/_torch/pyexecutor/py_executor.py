@@ -2737,7 +2737,6 @@ class PyExecutor:
             rank = getattr(self.dist, "rank", 0)
             world = getattr(self.dist, "world_size", 1)
             if rank in (0, world - 1):
-                n = self._stage_n
                 parts = " ".join(f"{k}={v * 1e3 / 500:.2f}"
                                  for k, v in self._stage_acc.items())
                 logger.info(
