@@ -1077,6 +1077,7 @@ def forward_sparse_attn(
         and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
         and self.q_b_proj.bias is None
         and self.q_b_proj.weight.dtype == torch.bfloat16
+        and getattr(self.q_b_proj, "_locality_domain_weight_shards", None) is None
         and not _is_fused_q_fp8_quant_enabled(
             self, num_generations=num_generations, num_contexts=num_contexts
         )

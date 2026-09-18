@@ -21,18 +21,217 @@ the global one. These tests exercise that resolution on CPU without weights.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
+from tensorrt_llm._torch.locality_domain import policy
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_deepseekv3, modeling_utils
 from tensorrt_llm._torch.models.modeling_deepseekv3 import Deepseekv3MoE
+from tensorrt_llm._torch.modules import linear
 from tensorrt_llm._torch.moe.fused_moe import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
 EXPERTS_KEY = "model.layers.{}.mlp.experts"
+
+
+@pytest.mark.parametrize("enable_locality_domains", [False, True])
+def test_linear_reassigned_quant_config_guard(enable_locality_domains: bool) -> None:
+    module = linear.Linear(
+        16,
+        16,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(),
+        locality_domain_policy=policy.LocalityDomainPolicy(enabled=enable_locality_domains),
+    )
+    weight = module.weight
+    module.quant_config = QuantConfig()
+    if enable_locality_domains:
+        with pytest.raises(RuntimeError, match="quant_config changed"):
+            module.create_weights()
+    else:
+        module.create_weights()
+        assert module.weight is weight
+
+
+def test_layerwise_quant_config_preserves_unquantized_router() -> None:
+    gate = modeling_deepseekv3.DeepseekV3Gate(
+        hidden_size=16,
+        num_experts=4,
+        top_k=2,
+        n_group=2,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        dtype=torch.bfloat16,
+    )
+    projection = linear.Linear(16, 16, bias=False, skip_create_weights_in_init=True)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    model = torch.nn.Module()
+    model.add_module("gate", gate)
+    model.add_module("projection", projection)
+    model.model_config = SimpleNamespace(
+        quant_config_dict={"gate": quant_config, "projection": quant_config}
+    )
+
+    modeling_utils.DecoderModelForCausalLM.apply_layerwise_quant_config(model)
+    gate.create_weights()
+
+    assert gate.quant_config is None
+    assert gate.weight.dtype == torch.bfloat16
+    assert projection.quant_config is quant_config
+
+
+@pytest.mark.parametrize("use_cute_dsl_bf16_gemm", [False, True])
+@pytest.mark.parametrize("attach_lora", [False, True])
+def test_deepseek_small_m_preserves_fused_kernel_without_locality_domains(
+    use_cute_dsl_bf16_gemm: bool,
+    attach_lora: bool,
+) -> None:
+    module = modeling_deepseekv3.DeepseekV3Linear(
+        16,
+        16,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+        lora=LoraLayer([LoraModuleType.ATTENTION_Q], [16]) if attach_lora else None,
+    )
+    inputs = torch.ones(1, 16, dtype=torch.bfloat16)
+    expected = torch.ones_like(inputs)
+    with (
+        patch.object(modeling_deepseekv3, "get_sm_version", return_value=107),
+        patch.object(modeling_deepseekv3, "is_sm_100f", return_value=True),
+        patch.object(torch.ops.trtllm, "dsv3_fused_a_gemm_op", return_value=expected) as fused,
+        patch.object(linear.Linear, "apply_linear") as fallback,
+    ):
+        assert module.apply_linear(inputs, None) is expected
+    fused.assert_called_once()
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@pytest.mark.parametrize("use_cute_dsl_bf16_gemm", [False, True])
+def test_deepseek_small_m_preserves_lora(num_tokens: int, use_cute_dsl_bf16_gemm: bool) -> None:
+    lora_layer = LoraLayer([LoraModuleType.ATTENTION_Q], [16])
+    module = modeling_deepseekv3.DeepseekV3Linear(
+        16,
+        16,
+        dtype=torch.bfloat16,
+        lora=lora_layer,
+        use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+    )
+    module.weight.data.copy_(2 * torch.eye(16, dtype=torch.bfloat16))
+    module.bias.data.fill_(1)
+    inputs = torch.ones(num_tokens, 16, dtype=torch.bfloat16)
+    adapter_output = torch.full_like(inputs, 3)
+    ranks = torch.tensor([1], dtype=torch.int32)
+    weight_pointers = torch.zeros((1, 2), dtype=torch.int64)
+    lora_params = {
+        "num_seqs": 1,
+        "host_request_types": torch.zeros(1, dtype=torch.int32),
+        "prompt_lens_cpu": torch.tensor([num_tokens], dtype=torch.int32),
+        3: {
+            int(LoraModuleType.ATTENTION_Q): {
+                "adapter_size": ranks,
+                "weight_pointers": weight_pointers,
+            }
+        },
+    }
+
+    # Keep Linear.apply_linear and the LoRA merge real. Use CPU implementations
+    # for the fused base GEMM and the native adapter GEMM.
+    with (
+        patch.object(modeling_deepseekv3, "get_sm_version", return_value=107),
+        patch.object(linear, "is_sm_100f", return_value=False),
+        patch.object(
+            torch.ops.trtllm,
+            "dsv3_fused_a_gemm_op",
+            side_effect=lambda x, weight, bias, _: x @ weight + bias,
+        ) as fused,
+        patch.object(
+            torch.ops.trtllm, "lora_grouped_gemm", return_value=adapter_output
+        ) as adapter_gemm,
+    ):
+        output = module.apply_linear(inputs, module.bias, lora_params, layer_idx=3)
+
+    torch.testing.assert_close(output, torch.full_like(inputs, 6))
+    fused.assert_not_called()
+    adapter_gemm.assert_called_once()
+    assert adapter_gemm.call_args.args[2][0] is ranks
+    assert adapter_gemm.call_args.args[3][0] is weight_pointers
+
+
+@pytest.mark.parametrize("quant_algo", [None, QuantAlgo.NVFP4], ids=["bf16", "nvfp4"])
+@pytest.mark.parametrize("per_module_quant", [False, True])
+@pytest.mark.parametrize("frozen_config", [False, True])
+def test_shared_experts_do_not_partition_locality_domains(
+    quant_algo, per_module_quant: bool, frozen_config: bool
+) -> None:
+    shared_quant_config = QuantConfig(quant_algo=quant_algo, group_size=16)
+    global_quant_config = (
+        QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+        if per_module_quant
+        else shared_quant_config
+    )
+    model_policy = policy.LocalityDomainPolicy(enabled=True)
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(n_group=1, topk_group=1, routed_scaling_factor=1.0),
+        quant_config=global_quant_config,
+        quant_config_dict=(
+            {"model.layers.0.mlp.shared_experts": shared_quant_config} if per_module_quant else None
+        ),
+        skip_create_weights_in_init=True,
+        use_cute_dsl_bf16_gemm=True,
+        locality_domain_policy=model_policy,
+    )
+    model_config._frozen = frozen_config
+
+    # Exercise the real GatedMLP/Linear construction and planner on CPU, while
+    # presenting hardware on which both BF16 and NVFP4 can be partitioned.
+    with (
+        patch(
+            "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled",
+            return_value=True,
+        ),
+        patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True),
+        patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True),
+        patch.object(
+            modeling_deepseekv3, "create_moe", return_value=torch.nn.Module()
+        ) as create_moe,
+        patch.object(torch.cuda, "is_available", return_value=False),
+        patch.object(torch.cuda, "Event"),
+    ):
+        module = Deepseekv3MoE(
+            num_experts=4,
+            top_k=2,
+            hidden_size=256,
+            intermediate_size=256,
+            shared_expert_intermediate_size=256,
+            aux_stream_dict={modeling_deepseekv3.AuxStreamType.MoeShared: None},
+            dtype=torch.bfloat16,
+            model_config=model_config,
+            layer_idx=0,
+        )
+        for projection in (module.shared_experts.gate_up_proj, module.shared_experts.down_proj):
+            projection.create_weights()
+            assert projection.quant_config is shared_quant_config
+            assert not projection.partition_plan.enabled
+            assert projection._locality_domain_runtime is None
+
+    assert module.shared_experts_use_fp4 == (quant_algo == QuantAlgo.NVFP4)
+    assert create_moe.call_args.kwargs["model_config"] is model_config
+    assert model_config.quant_config is global_quant_config
+    assert model_config.locality_domain_policy is model_policy
+    assert model_config.extra_attrs["locality_domain_policy"] is model_policy
+    assert model_config.locality_domain_policy.enabled
+    assert model_config._frozen == frozen_config
 
 
 @pytest.fixture

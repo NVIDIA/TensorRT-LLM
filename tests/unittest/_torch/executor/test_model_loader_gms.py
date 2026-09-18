@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch import memory as memory_mod
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
@@ -619,4 +620,24 @@ def test_gms_unexpected_lock_state_raises(monkeypatch):
     backend.mem_pool_scope.assert_not_called()
     backend.finalize_write.assert_not_called()
     backend.materialize_module.assert_not_called()
+    checkpoint_loader.load_weights.assert_not_called()
+
+
+def test_gms_rejects_localized_weights_before_model_init(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    loader._load_and_validate_config.return_value = SimpleNamespace(
+        mapping=SimpleNamespace(),
+        locality_domain_policy=LocalityDomainPolicy(enabled=True),
+    )
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    with pytest.raises(
+        ValueError,
+        match="LoadFormat.GMS is incompatible with locality domain localized weights",
+    ):
+        loader.load("/ckpt", checkpoint_loader)
+
+    model_loader_mod.AutoModelForCausalLM.from_config.assert_not_called()
     checkpoint_loader.load_weights.assert_not_called()

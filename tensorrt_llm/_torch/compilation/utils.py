@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -239,6 +242,12 @@ def inplace_info():
             1: "output"
         },
         "cute_dsl_bf16_gemm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_locality_domain_inplace_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_bmm_locality_domain_inplace_rubin": {
             1: "output"
         },
         "cute_dsl_fp8_bmm_rubin": {

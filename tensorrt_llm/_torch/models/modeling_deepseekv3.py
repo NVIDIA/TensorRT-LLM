@@ -58,6 +58,7 @@ from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
+from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -406,8 +407,7 @@ class DeepseekV3WeightLoader:
                     attn_module = all_named_modules[parent_module_name]
                     _, v_b_proj = split_kv_b_proj(module.weight.data,
                                                   is_scale=False)
-                    attn_module.v_b_proj = nn.Parameter(v_b_proj,
-                                                        requires_grad=False)
+                    attn_module._bind_v_b_proj_weight(v_b_proj)
 
                     attn_module.k_b_proj_trans.data.copy_(
                         k_b_proj_trans.reshape(
@@ -715,21 +715,26 @@ class DeepseekV3Linear(Linear):
         use_custom_cublas_mm: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
+        use_cute_dsl_bf16_gemm: bool = False,
+        locality_domain_policy: Optional[LocalityDomainPolicy] = None,
     ):
         super().__init__(
             in_features,
             out_features,
             bias,
-            dtype,
-            mapping,
-            tensor_parallel_mode,
-            gather_output,
-            quant_config,
-            weights_loading_config,
-            reduce_output,
-            skip_create_weights_in_init,
-            use_custom_cublas_mm,
-            lora,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
+            quant_config=quant_config,
+            weights_loading_config=weights_loading_config,
+            reduce_output=reduce_output,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=True,
+            locality_domain_policy=locality_domain_policy,
+            lora=lora,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
         )
 
@@ -738,8 +743,13 @@ class DeepseekV3Linear(Linear):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
+        if self._locality_domain_weight_shards is not None:
+            return super().apply_linear(input, bias, lora_params, layer_idx)
         num_tokens = input.shape[0]
-        if (not self.has_any_quant and 1 <= num_tokens <= 16
+        has_any_quant = self.has_any_quant
+        # The fused op has no LoRA inputs; let Linear merge active adapters.
+        if (not has_any_quant and (self.lora is None or not lora_params)
+                and 1 <= num_tokens <= 16
                 and get_sm_version() not in [120, 121]):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
@@ -782,7 +792,8 @@ class DeepseekV3Attention(MLA):
                          config=model_config,
                          aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
-                         reduce_output=reduce_output)
+                         reduce_output=reduce_output,
+                         enable_locality_domain_bf16_linear=True)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
@@ -793,8 +804,10 @@ class DeepseekV3Attention(MLA):
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
             use_cute_dsl_blockscaling_mm=model_config.
             use_cute_dsl_blockscaling_mm,
+            locality_domain_policy=model_config.locality_domain_policy,
         )
 
 
@@ -833,7 +846,8 @@ class DeepseekV32Attention(MLA):
                          config=model_config,
                          aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
-                         reduce_output=reduce_output)
+                         reduce_output=reduce_output,
+                         enable_locality_domain_bf16_linear=True)
 
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
@@ -843,10 +857,12 @@ class DeepseekV32Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
+            locality_domain_policy=model_config.locality_domain_policy)
 
 
-class DeepseekV3Gate(nn.Module):
+class DeepseekV3Gate(Linear):
 
     def __init__(
         self,
@@ -861,12 +877,19 @@ class DeepseekV3Gate(nn.Module):
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
         use_cute_dsl_bf16_gemm: bool = False,
+        locality_domain_policy: Optional[LocalityDomainPolicy] = None,
     ):
-        super().__init__()
-        self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
-        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
-                                               dtype=dtype),
-                                   requires_grad=False)
+        super().__init__(
+            hidden_size,
+            num_experts,
+            bias=False,
+            dtype=dtype,
+            reduce_output=False,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=True,
+            locality_domain_policy=locality_domain_policy,
+        )
+        self._skip_layerwise_quant_config = True
         self.moe_backend = moe_backend
         if moe_backend == 'TRTLLM':
             bias_dtype = torch.bfloat16
@@ -887,8 +910,11 @@ class DeepseekV3Gate(nn.Module):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (self.use_cute_dsl_bf16_gemm and is_sm_100f()
-                and self.weight.dtype == torch.bfloat16):
+        if self._locality_domain_weight_shards is not None:
+            logits = self._run_bf16_linear_locality_domain(
+                hidden_states, None, output_dtype=torch.float32)
+        elif (self.use_cute_dsl_bf16_gemm and is_sm_100f()
+              and self.weight.dtype == torch.bfloat16):
             input_2d = hidden_states.view(-1, hidden_states.shape[-1])
             m, k = input_2d.shape
             n = self.weight.shape[0]
@@ -920,6 +946,7 @@ class DeepseekV3Gate(nn.Module):
                 "DeepseekV3Gate expects 'weight' and 'e_score_correction_bias' "
                 "when partial loading is disabled")
         if w is not None:
+            self._weights_transformed = False
             self.weight.copy_(w[:])
         if bias is not None:
             self.e_score_correction_bias.copy_(bias[:].to(
@@ -981,7 +1008,8 @@ class Deepseekv3MoE(nn.Module):
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=model_config.moe_backend,
-            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
+            locality_domain_policy=model_config.locality_domain_policy)
         # For MIXED_PRECISION, resolve the per-expert quant config (e.g. W4A8_AWQ)
         # instead of using the ambiguous global MIXED_PRECISION config.
         # For other cases (e.g. nvfp4, unquantized MTP layers), use
@@ -1014,10 +1042,15 @@ class Deepseekv3MoE(nn.Module):
 
         shared_quant_config = self._get_shared_experts_quant_config(
             model_config, layer_idx)
-        shared_model_config = model_config
-        if shared_quant_config is not model_config.quant_config:
-            shared_model_config = copy.copy(model_config)
-            shared_model_config.quant_config = shared_quant_config
+        # Shared experts overlap routed MoE on another stream. Disable locality
+        # domains for every precision so both paths do not contend for the same
+        # global partition streams. Only thaw the private copy of ModelConfig.
+        shared_model_config = copy.copy(model_config)
+        shared_model_config._frozen = False
+        shared_model_config.quant_config = shared_quant_config
+        shared_model_config.locality_domain_policy = LocalityDomainPolicy(
+            enabled=False)
+        shared_model_config._frozen = model_config._frozen
 
         # For shared experts, use the block size implied by their quant config.
         block_size = 1
@@ -1379,6 +1412,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=has_mlp_tp,
                 use_cute_dsl_blockscaling_mm=model_config.
                 use_cute_dsl_blockscaling_mm,
+                enable_locality_domain_bf16_linear=True,
             )
 
         # On NVFP4 models, construct the boundary/prologue norms as NVFP4 norms.
