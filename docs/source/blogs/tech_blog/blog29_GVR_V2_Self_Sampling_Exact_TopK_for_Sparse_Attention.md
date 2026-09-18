@@ -163,9 +163,9 @@ $$
 
 Here $E$ counts excess entries tied at the boundary, and $D$ counts scores in the shell $q\le x_i\lt\tau$. Dense scores near the boundary can turn a small threshold error into large **candidate amplification**. Temporal overlap alone therefore cannot predict refinement work.
 
-![Threshold admission and candidate amplification for one schematic score row. A staircase tail count marks feasible admission and boundary ties; a proportional bar splits 2.3K candidates into K output, 0.3K excess ties, and a K-sized shell.](../media/gvr_v2/candidate_work.svg)
+![Threshold admission and candidate amplification for one schematic score row. A simplified tail-count curve labels the K required winners, E excess boundary ties, and D additional shell candidates that make up the admitted population Cp. The right panel explains the same three components without numerical ratios.](../media/gvr_v2/candidate_work.svg)
 
-*Figure 5.* A: exact tail counts identify thresholds satisfying $K\le C(q)\le B_r$, where $B_r$ is candidate capacity; failed admission requires continued verification or exact recovery. B: the same schematic row yields 2.3× candidate amplification, split into required output, excess ties, and the boundary shell. Exact handling of ties preserves the Top-K value multiset.
+*Figure 5.* A: exact tail counts identify thresholds satisfying $K\le C(q)\le B_r$, where $B_r$ is candidate capacity. The labeled segments split the admitted population into required winners, excess boundary ties, and the boundary shell. B: candidate amplification arises from the latter two components; their proportions are schematic. Exact handling of ties preserves the Top-K value multiset.
 
 Self-sampling aims to place admission near the current tail; multi-thresholding separates certain winners, the crossing bin, and lower bins. V2 balances full-row reads against candidate handling over $C(q)$ entries and exact refinement over $m$ crossing-bin candidates.
 

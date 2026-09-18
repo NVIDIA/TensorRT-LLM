@@ -52,11 +52,11 @@ In variable-length `main`, warp 0 derives sampling geometry and publishes it thr
 
 ## Candidate-Work Illustration
 
-`candidate_work.svg` is a schematic, independent of the timing observations. For a finite-score row with K-th-largest boundary $\tau$ and $q\le\tau$, the admitted population obeys $C_p=C(q)=K+E+D(q,\tau)$. Here $E=C(\tau)-K$ counts excess boundary ties and $D$ counts entries with $q\le x_i\lt\tau$. The illustrated curve and bar use consistent relative populations: $C(q)=2.3K$, $E=0.3K$, and $D=K$; these are explanatory values, not benchmark measurements.
+`candidate_work.svg` is a schematic, independent of the timing observations. For a finite-score row with K-th-largest boundary $\tau$ and $q\le\tau$, the admitted population obeys $C_p=C(q)=K+E+D(q,\tau)$. Here $E=C(\tau)-K$ counts excess boundary ties and $D$ counts entries with $q\le x_i\lt\tau$. The simplified curve labels the three population segments directly, and the matching bar explains their roles without numerical ratios. Their proportions are illustrative, not benchmark measurements.
 
 Both panels are computed from the same finite synthetic row in `plot_results.py`. The tail-count axis is linear, and the stacked bar is proportional to population size. At the exact boundary, the filled marker includes ties and the open marker excludes them; their difference is the entire tied population, of which only the excess contributes to E.
 
-The admission band requires $K\le C(q)\le B_r$. A large tie plateau can leave no threshold in this band; the exact recovery path still applies. In V2, the admitted count describes candidate handling, while only the crossing bin requires the remaining exact selection. The illustration does not imply that every execution family materializes the same buffer or that candidate count alone predicts latency. Its multi-threshold markers denote counts shared through classification, not a scalar fitted search.
+The admission band requires $K\le C(q)\le B_r$. A large tie plateau can leave no threshold in this band; the exact recovery path still applies. In V2, the admitted count describes candidate handling, while only the crossing bin requires the remaining exact selection. The illustration does not imply that every execution family materializes the same buffer or that candidate count alone predicts latency. The tail-count curve explains threshold admission; it does not prescribe a scalar search or a particular number of verification thresholds.
 
 ## Temporal-Overlap Illustration
 
