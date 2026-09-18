@@ -336,6 +336,7 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
     sched = SimpleNamespace(
         has_cp_helix=True,
         kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
+        kv_cache_manager_pair=SimpleNamespace(try_allocate_generation=lambda req: False),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
     )

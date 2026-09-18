@@ -931,6 +931,15 @@ class TestDisaggTransferAdmissionController:
         assert result.admitted_requests == [request]
         assert result.admitted_transfer_blocks == 3
 
+    def test_revert_ctx_alloc_reverts_target_and_draft(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_manager_pair = Mock()
+        request = _make_disagg_transfer_request(1, 32)
+
+        PyExecutor._revert_ctx_alloc(executor, [request])
+
+        executor.kv_cache_manager_pair.revert_allocate_context.assert_called_once_with(request)
+
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferIdleProgress:
@@ -1672,6 +1681,7 @@ class _StubADPExecutor:
 
         kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
         self.kv_cache_manager = kv_cache_manager
+        self.kv_cache_manager_pair = Mock()
 
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
@@ -2524,29 +2534,26 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
     scheduled_batch.generation_requests.append(real_gen_request)
 
     stub._is_kv_manager_v2 = True
-    stub.enable_joint_kv_cache_reuse = False
     PyExecutor._revert_gen_alloc(stub, scheduled_batch)
 
-    reverted = [c.args[0] for c in stub.kv_cache_manager.revert_allocate_generation.call_args_list]
+    reverted = [
+        c.args[0] for c in stub.kv_cache_manager_pair.revert_allocate_generation.call_args_list
+    ]
     assert reverted == [real_gen_request]
 
 
-def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
-    # The V2 scheduler grows both pools together, so a skipped batch hands both
-    # back. Attention DP keeps one unified pool and never reaches this pairing.
+def test_revert_gen_alloc_uses_kv_cache_manager_pair():
+    # The pair owns target/draft rollback, regardless of the reuse mode.
     stub = object.__new__(PyExecutor)
     stub._is_kv_manager_v2 = True
-    stub.kv_cache_manager = Mock()
-    stub.draft_kv_cache_manager = Mock()
-    stub.enable_joint_kv_cache_reuse = True
+    stub.kv_cache_manager_pair = Mock()
     gen_request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=9)
     scheduled_batch = ScheduledRequests()
     scheduled_batch.generation_requests.append(gen_request)
 
     PyExecutor._revert_gen_alloc(stub, scheduled_batch)
 
-    stub.kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
-    stub.draft_kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
+    stub.kv_cache_manager_pair.revert_allocate_generation.assert_called_once_with(gen_request)
 
 
 def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
