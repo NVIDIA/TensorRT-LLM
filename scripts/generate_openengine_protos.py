@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate private OpenEngine Python bindings from the vendored schema."""
+"""Generate or verify private OpenEngine Python bindings from the vendored schema."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ _COPYRIGHT_HEADER = (
     "# SPDX-License-Identifier: Apache-2.0\n\n"
 )
 _GENERATED_INIT_CONTENT = (
-    _COPYRIGHT_HEADER + '"""Private OpenEngine bindings generated during the build."""\n'
+    _COPYRIGHT_HEADER + '"""Private OpenEngine bindings generated from the vendored schema."""\n'
 )
 # Stable ownership contract for generated directories; do not rename.
 _OWNERSHIP_MARKER_NAME = ".openengine-generated"
@@ -289,6 +289,47 @@ def _publish_generated_output(staged_output: Path, output_dir: Path) -> None:
     staged_output.rename(output_dir)
 
 
+def _check_generated_output(expected_dir: Path, output_dir: Path) -> None:
+    """Raise when generated bindings differ from the tracked package."""
+    if not output_dir.is_dir():
+        raise RuntimeError(_stale_bindings_message(output_dir, ["missing output directory"]))
+
+    expected_files = _generated_files(expected_dir)
+    actual_files = _generated_files(output_dir)
+    differences = [
+        *(f"missing {path}" for path in sorted(expected_files - actual_files)),
+        *(f"unexpected {path}" for path in sorted(actual_files - expected_files)),
+        *(
+            f"changed {path}"
+            for path in sorted(expected_files & actual_files)
+            if expected_dir.joinpath(path).read_bytes() != output_dir.joinpath(path).read_bytes()
+        ),
+    ]
+    if differences:
+        raise RuntimeError(_stale_bindings_message(output_dir, differences))
+
+
+def _generated_files(directory: Path) -> set[Path]:
+    """Return source artifacts while ignoring interpreter bytecode caches."""
+    return {
+        relative_path
+        for path in directory.rglob("*")
+        if path.is_file()
+        if "__pycache__" not in (relative_path := path.relative_to(directory)).parts
+        and path.suffix != ".pyc"
+    }
+
+
+def _stale_bindings_message(output_dir: Path, differences: list[str]) -> str:
+    details = "\n  ".join(differences)
+    return (
+        f"Tracked OpenEngine bindings at {output_dir} are stale:\n  {details}\n"
+        "Regenerate them with:\n"
+        "  python scripts/generate_openengine_protos.py "
+        "--tool-env-root build/openengine-proto-tools"
+    )
+
+
 def _generate(project_root: Path, output_dir: Path) -> None:
     from grpc_tools import _proto as grpc_tools_proto
     from grpc_tools import protoc
@@ -353,14 +394,25 @@ def _generate(project_root: Path, output_dir: Path) -> None:
     print(f"Generated OpenEngine bindings in {output_dir}")
 
 
+def _check(project_root: Path, output_dir: Path) -> None:
+    """Generate to temporary storage and compare it with tracked bindings."""
+    with tempfile.TemporaryDirectory(
+        prefix="openengine-protos-check-", dir=output_dir.parent
+    ) as temp:
+        expected_dir = Path(temp) / "generated"
+        _generate(project_root, expected_dir)
+        _check_generated_output(expected_dir, output_dir)
+    print(f"OpenEngine bindings are up to date in {output_dir}")
+
+
 def _venv_python(venv_dir: Path) -> Path:
     if os.name == "nt":
         return venv_dir / "Scripts/python.exe"
     return venv_dir / "bin/python"
 
 
-def _generate_in_isolated_environment(
-    project_root: Path, output_dir: Path, tool_env_root: Path
+def _run_in_isolated_environment(
+    project_root: Path, output_dir: Path, tool_env_root: Path, check: bool
 ) -> None:
     requirements_path = project_root / "requirements-build-openengine.txt"
     requirements_digest = _sha256(requirements_path)
@@ -386,17 +438,17 @@ def _generate_in_isolated_environment(
             check=True,
         )
         stamp.write_text(requirements_digest + "\n", encoding="utf-8")
-    subprocess.run(
-        [
-            str(python),
-            str(Path(__file__).resolve()),
-            "--project-root",
-            str(project_root),
-            "--output",
-            str(output_dir),
-        ],
-        check=True,
-    )
+    command = [
+        str(python),
+        str(Path(__file__).resolve()),
+        "--project-root",
+        str(project_root),
+        "--output",
+        str(output_dir),
+    ]
+    if check:
+        command.append("--check")
+    subprocess.run(command, check=True)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -413,6 +465,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Create or reuse an isolated, requirements-keyed grpcio-tools environment here",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Fail if generated bindings differ from the requested output directory",
+    )
     return parser.parse_args(argv)
 
 
@@ -425,7 +482,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         else project_root / "tensorrt_llm/grpc/openengine/_generated"
     )
     if args.tool_env_root is not None:
-        _generate_in_isolated_environment(project_root, output_dir, args.tool_env_root.resolve())
+        _run_in_isolated_environment(
+            project_root, output_dir, args.tool_env_root.resolve(), args.check
+        )
+    elif args.check:
+        _check(project_root, output_dir)
     else:
         _generate(project_root, output_dir)
 

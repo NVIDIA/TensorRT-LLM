@@ -1525,7 +1525,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1601,9 +1601,10 @@ repos:
     rev: v0.9.4
     hooks:
     -   id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
+        args: [--fix, --exit-non-zero-on-fix, --exclude=tensorrt_llm/grpc/openengine/_generated]
         exclude: *legacy_files
     -   id: ruff-format
+        args: [--exclude=tensorrt_llm/grpc/openengine/_generated]
         exclude: *legacy_files
 -   repo: https://github.com/executablebooks/mdformat
     rev: 0.7.17
@@ -1643,6 +1644,12 @@ repos:
         additional_dependencies: [PyYAML]
         always_run: true
         pass_filenames: false
+    -   id: openengine-bindings-check
+        name: verify generated OpenEngine bindings are in sync
+        entry: python scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
+        language: system
+        pass_filenames: false
+        files: ^(constraints\.txt|requirements-(build-)?openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py

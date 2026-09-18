@@ -68,9 +68,7 @@ def sanity_check():
     if not (tensorrt_llm_path / "grpc" / "openengine" / "_generated" /
             "openengine_pb2.py").is_file():
         raise ImportError(
-            'The private OpenEngine bindings are missing. Please execute '
-            '`scripts/build_wheel.py` first, or run '
-            '`scripts/generate_openengine_protos.py --tool-env-root build/openengine-proto-tools`.'
+            'The checked-in private OpenEngine bindings are missing. Please check the package integrity.'
         )
 
 
@@ -252,7 +250,7 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
 
     Precompiled wheels own native bits. Source owns telemetry schemas and the
     OpenEngine contract. Skip those wheel files so Python-only edits layer over
-    old wheels and bindings are regenerated from the current checkout.
+    old wheels and tracked bindings from the current checkout remain authoritative.
     """
     filename = filename.replace("\\", "/")
     if filename.startswith("tensorrt_llm/usage/schemas/"):
@@ -571,12 +569,6 @@ if use_precompiled:
             version = precompiled if precompiled != "1" else get_version()
             precompiled_location = download_precompiled(tempdir, version)
         extract_from_precompiled(precompiled_location, package_data, tempdir)
-    subprocess.check_call([
-        sys.executable,
-        "scripts/generate_openengine_protos.py",
-        "--tool-env-root",
-        str(Path("build") / "openengine-proto-tools"),
-    ])
 
 sanity_check()
 

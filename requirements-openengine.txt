@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# The OpenEngine bindings are generated into the TensorRT-LLM wheel at build time.
+# The OpenEngine bindings are checked into the TensorRT-LLM wheel source.
 # protobuf is supplied by TensorRT-LLM's base requirements and constraints.
 grpcio>=1.67.1,<2

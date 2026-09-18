@@ -64,9 +64,21 @@ non-loopback address.
 
 The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
 
-TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. The adjacent `manifest.json` records the source mapping, generator versions, runtime floors, and per-file checksums. During a wheel or supported editable build, `scripts/generate_openengine_protos.py` uses the fully pinned compiler environment in `requirements-build-openengine.txt` to generate private bindings under `tensorrt_llm.grpc.openengine._generated`.
+TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. The adjacent `manifest.json` records the source mapping, generator versions, runtime floors, and per-file checksums. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
-The generated modules are build outputs and are not checked in. They are shipped only in TensorRT-LLM's private namespace; the wheel does not provide or depend on a top-level `openengine` Python package. The runtime dependencies remain TensorRT-LLM's base protobuf constraint plus `grpcio>=1.67.1,<2` from the OpenEngine extra.
+When changing the schema, generator, or `requirements-build-openengine.txt`, regenerate and commit the bindings:
+
+```bash
+python scripts/generate_openengine_protos.py --tool-env-root build/openengine-proto-tools
+```
+
+Verify that a checkout is current without modifying it:
+
+```bash
+python scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
+```
+
+The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. The runtime dependencies remain TensorRT-LLM's base protobuf constraint plus `grpcio>=1.67.1,<2` from the OpenEngine extra.
 
 ## Maintenance boundary
 

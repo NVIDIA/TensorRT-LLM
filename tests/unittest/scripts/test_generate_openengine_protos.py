@@ -66,3 +66,41 @@ def test_main_replaces_an_output_symlink_without_touching_its_target(tmp_path, m
     assert not output_dir.is_symlink()
     assert (output_dir / "generated.py").is_file()
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_check_detects_stale_tracked_bindings(tmp_path, monkeypatch):
+    generator = _load_generator()
+    output_dir = tmp_path / "tracked"
+    output_dir.mkdir()
+    (output_dir / "generated.py").write_text("stale\n", encoding="utf-8")
+
+    def generate(_project_root, expected_dir):
+        expected_dir.mkdir()
+        (expected_dir / "generated.py").write_text("current\n", encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_generate", generate)
+
+    with pytest.raises(
+        RuntimeError, match=r"(?s)Tracked OpenEngine bindings.*changed generated\.py"
+    ):
+        generator._check(PROJECT_ROOT, output_dir)
+
+    assert (output_dir / "generated.py").read_text(encoding="utf-8") == "stale\n"
+
+
+def test_check_ignores_interpreter_bytecode(tmp_path, monkeypatch):
+    generator = _load_generator()
+    output_dir = tmp_path / "tracked"
+    output_dir.mkdir()
+    (output_dir / "generated.py").write_text("current\n", encoding="utf-8")
+    bytecode_dir = output_dir / "__pycache__"
+    bytecode_dir.mkdir()
+    (bytecode_dir / "generated.cpython-312.pyc").write_bytes(b"bytecode")
+
+    def generate(_project_root, expected_dir):
+        expected_dir.mkdir()
+        (expected_dir / "generated.py").write_text("current\n", encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_generate", generate)
+
+    generator._check(PROJECT_ROOT, output_dir)

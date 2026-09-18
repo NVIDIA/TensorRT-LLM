@@ -33,10 +33,6 @@ def test_stage_python_package(
         (package / "__init__.py").write_text(f"# {tree}\n")
         (package / "__pycache__" / "cached.pyc").write_bytes(b"cache")
         (package / "cached.pyc").write_bytes(b"cache")
-    generator = project / "scripts" / "generate_openengine_protos.py"
-    generator.parent.mkdir()
-    generator.write_text("# generator\n")
-
     assets = (
         "setup.py",
         "pyproject.toml",
@@ -72,12 +68,9 @@ def test_stage_python_package(
 
     build_wheel.stage_python_package(project, staging)
 
-    assert {path.name for path in staging.iterdir()} == set(
-        trees + assets + requirements + ("scripts",)
-    )
+    assert {path.name for path in staging.iterdir()} == set(trees + assets + requirements)
     for name in assets + requirements:
         assert (staging / name).read_bytes() == (project / name).read_bytes()
-    assert (staging / "scripts" / generator.name).read_bytes() == generator.read_bytes()
     for tree in trees:
         assert {path.name for path in (staging / tree).iterdir()} == {"__init__.py"}
         assert (staging / tree / "__init__.py").read_bytes() == (

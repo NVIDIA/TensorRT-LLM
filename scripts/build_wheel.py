@@ -755,11 +755,6 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
         sync_tree(project_dir / tree,
                   staging_dir / tree,
                   exclude=("__pycache__", "*.pyc"))
-    generator = project_dir / "scripts" / "generate_openengine_protos.py"
-    if generator.is_file():
-        generator_dst = staging_dir / "scripts" / generator.name
-        generator_dst.parent.mkdir(parents=True, exist_ok=True)
-        copy(generator, generator_dst)
     top_level_files = [
         "setup.py", "pyproject.toml", "constraints.txt", "LICENSE", "README.md"
     ]
@@ -785,23 +780,6 @@ def install_editable_package(venv_python: Path) -> None:
     already uses `venv_python` for the same reason.
     """
     build_run(f"\"{venv_python}\" -m pip install -e .[devel]")
-
-
-def generate_openengine_bindings(project_dir: Path, package_dir: Path,
-                                 tool_env_root: Path) -> None:
-    """Generate private OpenEngine bindings with an isolated compiler toolchain."""
-    output_dir = package_dir / "grpc" / "openengine" / "_generated"
-    command = [
-        sys.executable,
-        str(project_dir / "scripts/generate_openengine_protos.py"),
-        "--project-root",
-        str(project_dir),
-        "--output",
-        str(output_dir),
-        "--tool-env-root",
-        str(tool_env_root),
-    ]
-    run(command, check=True)
 
 
 def main(*,
@@ -968,8 +946,8 @@ def main(*,
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    # Validate and generate the Python protocol package before the expensive
-    # native build. Configure-only and C++-only builds do not package Python.
+    # Stage package sources before the native build. Configure-only and C++-only
+    # builds do not package Python.
     if not configure_only and not cpp_only:
         if out_of_tree:
             wheel_project_dir = build_root / "package"
@@ -979,10 +957,6 @@ def main(*,
 
         pkg_dir = wheel_project_dir / "tensorrt_llm"
         assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
-        proto_tool_env_root = ((build_root / "openengine-proto-tools")
-                               if build_root is not None else
-                               (build_dir / "openengine-proto-tools"))
-        generate_openengine_bindings(project_dir, pkg_dir, proto_tool_env_root)
 
     if use_ccache:
         if build_root is not None and "CCACHE_DIR" not in os.environ:
