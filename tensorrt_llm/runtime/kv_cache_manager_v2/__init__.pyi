@@ -35,12 +35,20 @@ from typing import (
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
+BAD_PAGE_INDEX: Final[int]
+GPU_LEVEL: Final[CacheLevel]
+CACHE_LEVEL1: Final[CacheLevel]
 
 class CorruptedError(Exception):
-    """Raised by every public entry point once a broken invariant has been recorded.
+    """Raised by every public entry point once a broken invariant has been recorded."""
 
-    Only the C++ backend has the latch that raises this; the pure-Python backend never does.
-    """
+class CuError(Exception):
+    """A CUDA driver call failed; carries the driver's own status code."""
+
+    error_code: Any
+
+class OutOfMemoryError(Exception): ...
+class OutOfPagesError(OutOfMemoryError): ...
 
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
@@ -56,12 +64,31 @@ class CacheTier(enum.IntEnum):
     HOST_MEM = 1
     DISK = 2
 
+class PageStatus(enum.Enum):
+    LOCKED = enum.auto()
+    HELD = enum.auto()
+    DROPPABLE = enum.auto()
+
 class PageIndexMode(enum.IntEnum):
     SHARED = 0
     PER_LAYER = 1
 
 LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
+
+class AttnLifeCycle:
+    """The attention life cycle, keyed by its sliding-window and sink-token shape."""
+
+    @staticmethod
+    def make(
+        window_size: int | None, num_sink_tokens: int | None, tokens_per_block: int
+    ) -> "AttnLifeCycle": ...
+    @property
+    def window_size(self) -> int | None: ...
+    @property
+    def num_sink_blocks(self) -> int: ...
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
+
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
@@ -73,6 +100,7 @@ class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
 
+SlidingWindowSize: TypeAlias = int | None
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
@@ -151,6 +179,21 @@ class PoolGroupPeakBlockStats:
     unavailable: int
     evictable: int
 
+class DeviceArray(Protocol):
+    """A dense array in GPU memory, borrowed for the duration of a call.
+
+    Structural, not nominal: anything exporting the DLPack protocol over a CUDA buffer
+    satisfies it, so a ``torch.Tensor`` is accepted without this package depending on
+    torch. Callers may equally pass a CuPy, JAX or numba device array.
+
+    Shape and dtype are stated per parameter rather than in the type, and are checked at
+    the boundary. Contents are read or written on the caller's stream; the array must
+    stay alive and unmodified until that work completes.
+    """
+
+    def __dlpack__(self, *, stream: int | None = ...) -> Any: ...
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+
 # From _config.py
 DataRole = NewType("DataRole", str)
 
@@ -184,9 +227,46 @@ class DiskCacheTierConfig:
 
 @dataclass(slots=True)
 class BufferConfig:
+    """One buffer of a layer's KV cache.
+
+    ``is_sparse`` marks a buffer whose history is held on the host and disk tiers and
+    read by sparse-attention block selection (see :meth:`KVCacheManager.is_sparse`).
+
+    It changes where a page locks, and that is what distinguishes it. An ordinary buffer
+    locks every page to ``GPU_LEVEL``. A sparse buffer locks a block holding input tokens
+    to ``GPU_LEVEL``, but a pure-history block to ``CACHE_LEVEL1`` -- which must be
+    configured with tier ``HOST_MEM``. Configuring level 1 with another tier, or declaring
+    fewer than two cache tiers, raises from the ``KVCacheManager`` constructor.
+
+    Because lock location is a per-buffer rule and a page is one slot shared by every
+    buffer of its lifecycle, a sparse buffer requires a lifecycle of its own; sharing one
+    with a non-sparse buffer raises from the ``KVCacheManager`` constructor.
+
+    The buffer still has a GPU-tier pool, but for a sparse buffer it also carries scratch,
+    in the manner of SWA scratch reuse: the per-layer pure-history pages a step actually
+    selects are copied up by :meth:`KVCacheManager.fetch_sparse_pages`. That region is
+    sized by the selection width, not by sequence length.
+
+    A block leaves ``GPU_LEVEL`` for ``CACHE_LEVEL1`` once it becomes pure history -- once
+    its ordinal falls below the watermark set by :meth:`_KVCache.set_history_length` --
+    and is re-locked there rather than unlocked. Advancing ``history_length`` is therefore
+    what pays the device-to-host copy; it is issued on the owning :class:`_KVCache`'s
+    stream. Rewinding ``history_length`` below a block already demoted raises; a demoted
+    block is not promoted back.
+
+    A sparse buffer's page-index table is consequently mixed: entries below the history
+    watermark are ``CACHE_LEVEL1`` slot indices, entries above it are ``GPU_LEVEL`` ones.
+    Only the former may be resolved against the host pool, which is what makes
+    "selections name only pure-history ordinals" a precondition of
+    :meth:`KVCacheManager.fetch_sparse_pages` rather than a property it can check.
+
+    Fixed at construction: the storage layout derived from it is built once.
+    """
+
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
+    is_sparse: bool = False
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -333,7 +413,7 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# Backend-neutral key builders (native C++ under the C++ backend, pure-Python otherwise).
+# Native key builders, shared with the radix tree so routing hashes match the engine's.
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
@@ -351,6 +431,8 @@ class _Status(enum.Enum):
     ACTIVE = enum.auto()
     SUSPENDED = enum.auto()
     CLOSED = enum.auto()
+
+KvCacheStatus: TypeAlias = _Status
 
 IndexSeq = array.array[int] | memoryview[int]
 
@@ -547,7 +629,6 @@ class KVCacheManager:
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
-        # C++ backend only; the pure-Python backend does not accept this parameter.
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
@@ -556,8 +637,99 @@ class KVCacheManager:
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress: ...
+    def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
+        """Whether this buffer was declared ``BufferConfig.is_sparse``.
+
+        A sparse buffer's pages do not all lock in one place. A block still holding input
+        tokens locks to ``GPU_LEVEL``; once it falls below the history watermark it is
+        re-locked to ``CACHE_LEVEL1``. Its pages are therefore split across two levels at
+        any moment, and :meth:`_KVCache.get_base_page_indices` reports each in its own
+        level's numbering -- so the answer is a property of the block, not of the buffer,
+        and this reports only which rule applies. An ordinary buffer locks every page to
+        ``GPU_LEVEL``.
+
+        Neither level is what a caller addresses to read a page staged by
+        :meth:`fetch_sparse_pages`. Those live in the ``GPU_LEVEL`` pool's scratch region,
+        reached through the unchanged :meth:`get_mem_pool_base_address`.
+        """
+
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def copy_base_page_indices_to_device(
+        self,
+        kv_caches: Sequence[_KVCache],
+        layer_group_id: LayerGroupId,
+        out: DeviceArray,  # int32[batch, max_blocks_per_seq]
+        stream: CudaStream,
+        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
+    ) -> None:
+        """Gather a batch's base page indices for one layer group into a device array.
+
+        Row b of ``out`` is the table :meth:`_KVCache.get_base_page_indices` reports for
+        ``kv_caches[b]``, padded to the array's width with ``BAD_PAGE_INDEX``. Rows are
+        positional, so the caller fixes the batch order here and every later call --
+        :meth:`fetch_sparse_pages` above all -- inherits it.
+
+        Indices are reported as stored: level-relative, unscaled, and with
+        ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot. For a sparse
+        buffer that is what makes the table usable, since a pure-history entry and an
+        input-token entry are numbered in different levels' pools and only the sentinel
+        distinguishes an absent block from slot zero.
+
+        The source is host memory, so this enqueues a transfer on ``stream`` and returns.
+        The table is only valid until the batch's locks next change -- a committed block,
+        a beam fork, an SWA recycle, a ``history_length`` advance -- so it belongs in the
+        same per-step preparation as the dense path's block offsets.
+        """
+
+    def fetch_sparse_pages(
+        self,
+        buffers: Sequence[BufferId],
+        page_table: DeviceArray,  # int32[batch, max_blocks_per_seq]
+        selected: DeviceArray,  # int32[batch, topk]
+        num_blocks: DeviceArray,  # int32[batch]
+        out: DeviceArray,  # int32[batch, max_blocks_per_seq]
+        stream: CudaStream,
+    ) -> None:
+        """Stage a batch's selected pure-history pages into each buffer's GPU scratch pool.
+
+        Device-driven and stream-ordered throughout: the selection is read from device
+        memory, so the host neither inspects it nor decides anything, and the call
+        enqueues onto ``stream`` and returns. Order it against the selection kernel by
+        sharing a stream, or across streams with an event. Every shape is static across
+        steps, so the call is capturable in a CUDA graph.
+
+        ``buffers`` must share one layer group, so that a single ``page_table`` addresses
+        them all; each must be ``BufferConfig.is_sparse``.
+
+        ``page_table`` is that group's base page indices as filled by
+        :meth:`copy_base_page_indices_to_device`, whose batch order it inherits.
+        ``selected`` holds block ordinals, ``topk`` uniform across requests and ``-1``
+        past a request's valid count. ``num_blocks`` is how many blocks of each request
+        are eligible to be selected, and bounds the walk; it counts blocks rather than
+        tokens because selection, staging and ``out`` are all in block units, so no
+        request here needs token granularity.
+
+        Eligible means below the history watermark: a block at or above it holds input
+        tokens and is locked to ``GPU_LEVEL``, so resolving it against the host pool
+        would address unrelated memory. The call cannot detect an out-of-range ordinal,
+        so honouring ``num_blocks`` is the selector's responsibility.
+
+        Pages are copied into the scratch region of each buffer's ``GPU_LEVEL`` pool,
+        which this manager owns and sizes from the configured selection width. The
+        scratch slot for the j-th selection of request b is positional, so no allocation
+        happens per call and the mapping is stable under graph replay.
+
+        ``out`` is shaped like ``page_table`` rather than compacted, and is written in
+        full: entry ``[b][ord]`` is the ``GPU_LEVEL`` scratch index holding block ``ord``
+        when ``ord`` was selected for request b, and ``BAD_PAGE_INDEX`` otherwise. A
+        kernel that indexes a page table by block ordinal therefore consumes ``out`` in
+        place of ``page_table``, against :meth:`get_mem_pool_base_address` as usual, with
+        its selection array unchanged.
+
+        The staged pages are a snapshot. That is sound only because a block below the
+        watermark is committed history and immutable.
+        """
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_converter(
         self, layer_id: LayerId, data_role: DataRole
@@ -639,3 +811,6 @@ class KVCacheManager:
     def need_adjustment(self) -> bool: ...
     @property
     def commit_min_snapshot(self) -> bool: ...
+
+def exact_div(x: int, y: int) -> int: ...
+def typed_range(*args: int) -> range: ...
