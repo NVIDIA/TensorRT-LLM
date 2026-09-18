@@ -17,7 +17,7 @@ full.
 Off by default; enable with the ``enable_tokenization_cache`` LLM argument.
 Each ``DefaultInputProcessor`` owns its own cache, so cached ids are never
 shared across tokenizers. Sizing knobs, eligibility rules, and measured effect
-are documented in ``docs/source/deployment-guide/prefix-tokenization-cache.md``.
+are documented in ``docs/source/features/prefix-tokenization-cache.md``.
 """
 
 from __future__ import annotations

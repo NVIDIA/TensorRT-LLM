@@ -31,7 +31,6 @@ Welcome to TensorRT LLM's Documentation!
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
    deployment-guide/configuring-cpu-affinity.md
-   deployment-guide/prefix-tokenization-cache.md
 
 .. toctree::
    :maxdepth: 2
@@ -95,6 +94,7 @@ Welcome to TensorRT LLM's Documentation!
    features/kv-cache-connector.md
    features/sparse-attention.md
    features/visual-generation.md
+   features/prefix-tokenization-cache.md
 
 
 .. toctree::
