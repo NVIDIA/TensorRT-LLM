@@ -102,7 +102,6 @@ full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:A100/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/6581064)
 full:A100/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
-full:A100/disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6758573)
 full:A100/llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging SKIP (https://nvbugs/6727262)
 full:A100/llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default SKIP (https://nvbugs/6727262)
 full:A30/unittest/_torch/sampler/test_beam_search_speculative_d2h.py::test_speculative_d2h_predictor_always_hit SKIP (https://nvbugs/6792615)
