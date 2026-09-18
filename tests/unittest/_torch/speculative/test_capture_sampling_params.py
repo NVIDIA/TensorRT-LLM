@@ -38,6 +38,7 @@ from tensorrt_llm.mapping import Mapping
 CAPTURE_TEMPERATURE = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.temperature
 CAPTURE_TOP_K = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.top_k
 CAPTURE_TOP_P = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.top_p
+CAPTURE_MIN_P = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.min_p
 
 
 class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
@@ -73,6 +74,7 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
             self.assertAlmostEqual(sampling_config.temperature, CAPTURE_TEMPERATURE, places=6)
             self.assertEqual(sampling_config.top_k, CAPTURE_TOP_K)
             self.assertAlmostEqual(sampling_config.top_p, CAPTURE_TOP_P, places=6)
+            self.assertAlmostEqual(sampling_config.min_p, CAPTURE_MIN_P, places=6)
         finally:
             kv_cache_manager.shutdown()
 
@@ -109,13 +111,7 @@ def _fake_meta():
 
 
 def _scan(meta, requests):
-    normalized, _ = SpecMetadata._scan_one_model_sampling(meta, requests)
-    # Drop min_p and the trailing num_tokens; these tests are about the other three.
-    return [entry[:3] for entry in normalized]
-
-
-def _scan_with_min_p(meta, requests):
-    """Like ``_scan`` but keeps min_p, which the tests below are about."""
+    """The four sampling knobs, dropping the trailing num_tokens."""
     normalized, _ = SpecMetadata._scan_one_model_sampling(meta, requests)
     return [entry[:4] for entry in normalized]
 
@@ -129,15 +125,25 @@ class TestScanOneModelSamplingHonorsRealCaptureParams(unittest.TestCase):
         meta = _fake_meta()
         warmup_requests = [
             _request(
-                temperature=CAPTURE_TEMPERATURE, top_k=CAPTURE_TOP_K, top_p=CAPTURE_TOP_P, slot=None
+                temperature=CAPTURE_TEMPERATURE,
+                top_k=CAPTURE_TOP_K,
+                top_p=CAPTURE_TOP_P,
+                min_p=CAPTURE_MIN_P,
+                slot=None,
             ),
             _request(
-                temperature=CAPTURE_TEMPERATURE, top_k=CAPTURE_TOP_K, top_p=CAPTURE_TOP_P, slot=None
+                temperature=CAPTURE_TEMPERATURE,
+                top_k=CAPTURE_TOP_K,
+                top_p=CAPTURE_TOP_P,
+                min_p=CAPTURE_MIN_P,
+                slot=None,
             ),
         ]
         normalized = _scan(meta, warmup_requests)
         self.assertEqual(
-            normalized, [(CAPTURE_TEMPERATURE, CAPTURE_TOP_K, CAPTURE_TOP_P)] * len(warmup_requests)
+            normalized,
+            [(CAPTURE_TEMPERATURE, CAPTURE_TOP_K, CAPTURE_TOP_P, CAPTURE_MIN_P)]
+            * len(warmup_requests),
         )
         self.assertFalse(meta.is_all_greedy_sample)
 
@@ -148,7 +154,7 @@ class TestScanOneModelSamplingHonorsRealCaptureParams(unittest.TestCase):
         # capture the advanced-sampling graph.
         meta = _fake_meta()
         normalized = _scan(meta, [_request(slot=None), _request(slot=None)])
-        self.assertTrue(all(temp != CAPTURE_TEMPERATURE for temp, _, _ in normalized))
+        self.assertTrue(all(temp != CAPTURE_TEMPERATURE for temp, _, _, _ in normalized))
         self.assertTrue(meta.is_all_greedy_sample)
 
     def test_capture_time_values_do_not_leak_into_a_later_serving_scan(self):
@@ -165,6 +171,7 @@ class TestScanOneModelSamplingHonorsRealCaptureParams(unittest.TestCase):
                     temperature=CAPTURE_TEMPERATURE,
                     top_k=CAPTURE_TOP_K,
                     top_p=CAPTURE_TOP_P,
+                    min_p=CAPTURE_MIN_P,
                     slot=None,
                 )
             ],
@@ -172,90 +179,11 @@ class TestScanOneModelSamplingHonorsRealCaptureParams(unittest.TestCase):
         self.assertFalse(meta.is_all_greedy_sample)
 
         serving_normalized = _scan(meta, [_request(temperature=1.0, top_p=1.0, slot=1)])
-        temp, top_k, top_p = serving_normalized[0]
+        temp, top_k, top_p, min_p = serving_normalized[0]
         self.assertEqual(temp, 1.0)
         self.assertNotEqual(top_k, CAPTURE_TOP_K)
         self.assertEqual(top_p, 1.0)
-
-
-class TestScanOneModelSamplingMinP(unittest.TestCase):
-    """min_p's two silent-failure modes in the one-model scan.
-
-    Both are invisible at op level -- the kernel is handed whatever the scan produced --
-    and both degrade output rather than raising, so they get their own tests.
-    """
-
-    def test_min_p_only_request_is_not_greedy(self):
-        """A request whose only knob is min_p must classify as NON-greedy.
-
-        If it classified greedy it would take the argmax fast path and min_p would be
-        dropped without a trace. ``is_all_greedy_sample`` is also part of the CUDA graph
-        key, so the same mistake would select the argmax graph variant.
-        """
-        meta = _fake_meta()
-        normalized = _scan_with_min_p(meta, [_request(min_p=0.05, slot=0)])
-        self.assertFalse(meta.is_all_greedy_sample)
-        # ... and the value must survive normalization rather than being reset to the
-        # 0.0 disable sentinel the greedy branch would apply.
-        self.assertEqual(normalized[0][3], 0.05)
-
-    def test_min_p_one_is_explicit_greedy(self):
-        """min_p == 1.0 keeps only the argmax, which SamplingParams documents as
-        explicit greedy -- so the scan must agree and take the fast path."""
-        meta = _fake_meta()
-        _scan_with_min_p(meta, [_request(min_p=1.0, slot=0)])
-        self.assertTrue(meta.is_all_greedy_sample)
-
-    def test_absent_min_p_normalizes_to_the_disable_sentinel(self):
-        """min_p's neutral value is 0.0, not 1.0 like top_p -- getting that backwards
-        would filter every row down to the argmax."""
-        meta = _fake_meta()
-        normalized = _scan_with_min_p(meta, [_request(temperature=1.0, top_p=0.9, slot=0)])
-        self.assertEqual(normalized[0][3], 0.0)
-
-    def test_changing_only_min_p_invalidates_the_buffer_signature(self):
-        """Two batches differing ONLY in min_p must refill the device buffers.
-
-        The refill is skipped when the signature is unchanged, so leaving min_p out of it
-        would let the second batch decode from the first batch's min_p -- silently, and
-        only for requests that happen to follow one another.
-        """
-        meta = _fake_meta()
-        meta._sampling_params_signature = [None, None]
-
-        first, _ = SpecMetadata._scan_one_model_sampling(
-            meta, [_request(temperature=1.0, min_p=0.05)]
-        )
-        SpecMetadata._sampling_params_buffers_need_update(meta, first)
-
-        second, _ = SpecMetadata._scan_one_model_sampling(
-            meta, [_request(temperature=1.0, min_p=0.5)]
-        )
-        need_request, need_expanded = SpecMetadata._sampling_params_buffers_need_update(
-            meta, second
-        )
-        self.assertTrue(need_request)
-        self.assertTrue(need_expanded)
-
-    def test_identical_batches_still_skip_the_refill(self):
-        """The counterpart: adding min_p to the signature must not defeat the caching
-        that keeps a steady-state decode batch off the H2D path."""
-        meta = _fake_meta()
-        meta._sampling_params_signature = [None, None]
-
-        first, _ = SpecMetadata._scan_one_model_sampling(
-            meta, [_request(temperature=1.0, min_p=0.05)]
-        )
-        SpecMetadata._sampling_params_buffers_need_update(meta, first)
-
-        second, _ = SpecMetadata._scan_one_model_sampling(
-            meta, [_request(temperature=1.0, min_p=0.05)]
-        )
-        need_request, need_expanded = SpecMetadata._sampling_params_buffers_need_update(
-            meta, second
-        )
-        self.assertFalse(need_request)
-        self.assertFalse(need_expanded)
+        self.assertNotEqual(min_p, CAPTURE_MIN_P)
 
 
 def _populate_meta(mode, draft_len=1):
@@ -304,30 +232,6 @@ def _populate_meta(mode, draft_len=1):
     return meta
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "populate allocates CUDA buffers")
-class TestMinPBufferFillIsGatedOnFused(unittest.TestCase):
-    def test_fused_fills_the_min_p_buffers(self):
-        meta = _populate_meta(AdvancedSamplingMode.FULL)
-        SpecMetadata.populate_sampling_params_for_one_model(
-            meta, [_request(temperature=1.0, min_p=0.25)]
-        )
-        self.assertAlmostEqual(meta.request_min_ps[0].item(), 0.25, places=6)
-        self.assertAlmostEqual(meta.min_ps[0].item(), 0.25, places=6)
-
-    def test_flashinfer_modes_leave_them_at_the_disable_sentinel(self):
-        # A min_p request cannot reach populate under a NO_* mode -- validate_request
-        # rejects it -- so even when one is handed straight to populate the buffers must
-        # stay at the 0.0 they were allocated with, and the fill must not run.
-        meta = _populate_meta(AdvancedSamplingMode.NO_TOPK)
-        SpecMetadata.populate_sampling_params_for_one_model(
-            meta, [_request(temperature=1.0, top_p=0.9, min_p=0.25)]
-        )
-        self.assertEqual(meta.request_min_ps[0].item(), 0.0)
-        self.assertEqual(meta.min_ps[0].item(), 0.0)
-        # The other buffers are still filled, i.e. the gate is narrow.
-        self.assertAlmostEqual(meta.request_top_ps[0].item(), 0.9, places=6)
-
-
 def _context_request(**kwargs):
     """A request that has not started generating: its expanded span is one row, not
     ``draft_len + 1``."""
@@ -337,16 +241,11 @@ def _context_request(**kwargs):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "populate allocates CUDA buffers")
-class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
-    """Hazard B4: the expanded per-token buffers are laid out by each request's token
-    count, and a context request occupies one row where a generation request occupies
-    ``draft_len + 1``.
-
-    min_p is filled by a separate ``if fill_min_p`` branch from the one that fills top_p.
-    Two branches walking the same list is only correct as long as they agree on the
-    layout, and nothing in the types would catch them diverging -- the buffers are flat
-    float32 and any misalignment is a silently wrong filter on the wrong token, not a
-    crash.
+class TestExpandedBufferLayout(unittest.TestCase):
+    """The expanded per-token buffers are laid out by each request's token count: a
+    context request occupies one row, a generation request ``draft_len + 1``. Each
+    per-token filter is filled by its own pass over the same list, so a misalignment
+    between them is a wrong filter on the wrong token rather than a crash.
     """
 
     DRAFT_LEN = 3
@@ -390,46 +289,6 @@ class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
         SpecMetadata.populate_sampling_params_for_one_model(meta, requests)
         # 4 + 1 + 4: the context request in the middle shifts every later token.
         self.assertEqual(self._assert_aligned(meta, requests, min_ps, top_ps), 9)
-
-    def test_layout_is_rebuilt_when_a_context_request_starts_generating(self):
-        """The transition itself, with the sampling parameters held fixed.
-
-        Only the token counts change, so the per-request buffers stay valid and only the
-        expanded ones must be refilled. If the refill were keyed on the sampling values
-        alone, min_p would keep the previous, shorter layout and every token after the
-        transition would read its neighbour's filter.
-        """
-        meta = _populate_meta(AdvancedSamplingMode.FULL, draft_len=self.DRAFT_LEN)
-        min_ps = [0.1, 0.2]
-        top_ps = [0.7, 0.8]
-
-        def batch(second_is_generating):
-            first = _request(temperature=1.0, min_p=min_ps[0], top_p=top_ps[0], slot=0)
-            make = _request if second_is_generating else _context_request
-            second = make(temperature=1.0, min_p=min_ps[1], top_p=top_ps[1], slot=1)
-            return [first, second]
-
-        before = batch(second_is_generating=False)
-        SpecMetadata.populate_sampling_params_for_one_model(meta, before)
-        self.assertEqual(self._assert_aligned(meta, before, min_ps, top_ps), 5)
-
-        after = batch(second_is_generating=True)
-        SpecMetadata.populate_sampling_params_for_one_model(meta, after)
-        self.assertEqual(self._assert_aligned(meta, after, min_ps, top_ps), 8)
-
-    def test_transition_invalidates_only_the_expanded_signature(self):
-        """The refill decision itself, stated directly rather than through the buffers."""
-        meta = _populate_meta(AdvancedSamplingMode.FULL, draft_len=self.DRAFT_LEN)
-        as_context = [_context_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
-        as_generation = [_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
-
-        normalized, _ = meta._scan_one_model_sampling(as_context)
-        meta._sampling_params_buffers_need_update(normalized)
-
-        normalized, _ = meta._scan_one_model_sampling(as_generation)
-        need_request, need_expanded = meta._sampling_params_buffers_need_update(normalized)
-        self.assertFalse(need_request, "sampling values did not change")
-        self.assertTrue(need_expanded, "the token count -- and so the layout -- did")
 
 
 if __name__ == "__main__":

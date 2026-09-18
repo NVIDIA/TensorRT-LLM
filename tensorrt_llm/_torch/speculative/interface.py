@@ -529,7 +529,7 @@ class SpecMetadata:
     runtime_tokens_per_gen_step: int = 1
 
     # Auto-detected per step from populated sampling params:
-    # True if every request is greedy (no temp/top_k/top_p) and we can take
+    # True if every request is greedy (no temp/top_k/top_p/min_p) and we can take
     # the argmax fast-path. False if any request needs sampling.
     # Used as part of the CUDA graph key so we capture two variants
     # (greedy fast-path vs advanced sampling) and dispatch at replay.
@@ -644,7 +644,7 @@ class SpecMetadata:
     # request reproduces bit-exactly only for a given slot history.
     _rng_window_counter: dict = field(default_factory=dict)
     # The same state expanded to one entry per logits row, mirroring the
-    # temperatures / top_ks / top_ps layout, for the sampling calls that
+    # temperatures / top_ks / top_ps / min_ps layout, for the sampling calls that
     # consume rows rather than requests.
     seeds: Optional[torch.Tensor] = None
     offsets: Optional[torch.Tensor] = None
@@ -738,7 +738,7 @@ class SpecMetadata:
 
         Both layouts are produced: ``request_*`` with one entry per request,
         and ``seeds`` / ``offsets`` expanded to one entry per logits row (the
-        temperatures / top_ks / top_ps layout), because the sampling calls
+        temperatures / top_ks / top_ps / min_ps layout), because the sampling calls
         take one or the other.
 
         A request that specified no seed gets ``DEFAULT_SAMPLING_SEED``. Its
@@ -2342,7 +2342,7 @@ class SpecWorkerBase(nn.Module, ABC):
           - generation rows (`[num_contexts:batch_size]`) run the rejection
             sampling kernel on slot-gathered draft probs.
 
-        Per-token sampling-parameter tensors (`temperatures / top_ks / top_ps`)
+        Per-token sampling-parameter tensors (`temperatures / top_ks / top_ps / min_ps`)
         are laid out as `[ctx (1 each), gen (draft_len+1 each)]`, matching the
         logits layout, so slicing is symmetric for both subsets.
         """
@@ -2506,7 +2506,7 @@ class SpecWorkerBase(nn.Module, ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Philox (seed, offset) laid out one entry per logits row.
 
-        Mirrors how ``temperatures`` / ``top_ks`` / ``top_ps`` are sliced at
+        Mirrors how ``temperatures`` / ``top_ks`` / ``top_ps`` / ``min_ps`` are sliced at
         the same call sites.
         """
         return spec_metadata.seeds[:

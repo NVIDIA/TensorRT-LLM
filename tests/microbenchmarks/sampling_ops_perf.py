@@ -50,7 +50,7 @@ import statistics
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -90,15 +90,15 @@ class FilterCase:
     """
 
     name: str
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
-    min_p: Optional[float] = None
+    top_k: int | None = None
+    top_p: float | None = None
+    min_p: float | None = None
     #: Apply the filters to half the rows only, leaving the rest neutral. This
     #: is the case the per-row skip exists for and that a per-deploy mode
     #: cannot express.
     mixed: bool = False
-    baseline_mode: Optional[AdvancedSamplingMode] = None
-    gate: Optional[float] = None
+    baseline_mode: AdvancedSamplingMode | None = None
+    gate: float | None = None
     gate_note: str = ""
 
 
@@ -286,7 +286,7 @@ def time_eager(fn: Callable[[], Any], warmup: int, iters: int) -> float:
     return statistics.median(s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends))
 
 
-def time_graph(fn: Callable[[], Any], warmup: int, iters: int) -> tuple[Optional[float], str]:
+def time_graph(fn: Callable[[], Any], warmup: int, iters: int) -> tuple[float | None, str]:
     """Median replay latency in microseconds, or ``(None, reason)``.
 
     Capture is done on a side stream after a warmup, per the documented recipe:
@@ -338,14 +338,14 @@ class Result:
     rows: int
     vocab: int
     dtype: str
-    eager_us: Optional[float]
-    graph_us: Optional[float]
+    eager_us: float | None
+    graph_us: float | None
     note: str = ""
     #: False when the backend cannot apply every filter the case asks for, so
     #: its number describes less work than the case specifies.
     equivalent: bool = True
 
-    def key(self, *, impl: Optional[str] = None) -> str:
+    def key(self, *, impl: str | None = None) -> str:
         impl = self.impl if impl is None else impl
         return f"{impl}|{self.case}|{self.shape}|{self.rows}|{self.vocab}|{self.dtype}"
 
@@ -419,7 +419,7 @@ def run_sweep(
 # ---------------------------------------------------------------------------
 
 
-def _fmt(value: Optional[float]) -> str:
+def _fmt(value: float | None) -> str:
     return "     n/a" if value is None else f"{value:8.1f}"
 
 

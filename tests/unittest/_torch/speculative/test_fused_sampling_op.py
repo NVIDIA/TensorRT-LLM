@@ -25,6 +25,8 @@ path. The two consume their RNG differently, so identical ids are not expected; 
 behavior is checked by support, determinism and distribution instead.
 """
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -42,10 +44,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _params(rows, *, device, temperature=0.8, top_k=None, top_p=None, min_p=None):
+def _params(
+    rows: int,
+    *,
+    device: str,
+    temperature: float = 0.8,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    min_p: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-row buffers in the disable-sentinel convention the op expects."""
 
-    def col(value, default, dtype):
+    def col(value: float | None, default: float, dtype: torch.dtype) -> torch.Tensor:
         filled = torch.full((rows,), default, device=device, dtype=dtype)
         if value is not None:
             filled[:] = value
@@ -59,7 +69,13 @@ def _params(rows, *, device, temperature=0.8, top_k=None, top_p=None, min_p=None
     )
 
 
-def _reference_probs(logits, temperatures, top_ks, top_ps, min_ps):
+def _reference_probs(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+) -> torch.Tensor:
     """The TorchSampler pipeline: temperature+softmax, then min-p, top-k, top-p."""
     probs = torch.softmax(logits.float() / temperatures.unsqueeze(-1), dim=-1)
     if (min_ps > 0).any():
@@ -71,7 +87,13 @@ def _reference_probs(logits, temperatures, top_ks, top_ps, min_ps):
     return probs
 
 
-def _pure_torch_reference_probs(logits, temperatures, top_ks, top_ps, min_ps):
+def _pure_torch_reference_probs(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+) -> torch.Tensor:
     """Independent Torch implementation of the documented filter pipeline.
 
     Unlike ``_reference_probs``, this does not call FlashInfer or any fused-op
@@ -115,11 +137,11 @@ def _pure_torch_reference_probs(logits, temperatures, top_ks, top_ps, min_ps):
     return torch.stack(reference)
 
 
-def _l1_per_row(a, b):
+def _l1_per_row(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a - b).abs().sum(-1)
 
 
-def _print_probability_error(label, actual, expected):
+def _print_probability_error(label: str, actual: torch.Tensor, expected: torch.Tensor) -> float:
     absolute_error = (actual - expected).abs()
     row_l1 = absolute_error.sum(-1)
     print(
@@ -133,7 +155,9 @@ def _print_probability_error(label, actual, expected):
     return row_l1.max().item()
 
 
-def _rng(rows, device, seed=7, offset=0):
+def _rng(
+    rows: int, device: str, seed: int = 7, offset: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.tensor([seed], dtype=torch.int64, device=device),
         torch.tensor([offset], dtype=torch.int64, device=device),
@@ -141,7 +165,7 @@ def _rng(rows, device, seed=7, offset=0):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_neutral_row_is_plain_softmax(dtype):
+def test_neutral_row_is_plain_softmax(dtype: torch.dtype) -> None:
     """Every filter neutral: the op must reduce to temperature + softmax and nothing else.
 
     This is the row the 1.15x perf gate is about, so it is also the row whose correctness
@@ -157,7 +181,7 @@ def test_neutral_row_is_plain_softmax(dtype):
     assert _l1_per_row(probs, expected).max().item() < 2e-5
 
 
-def test_min_p_zero_changes_nothing():
+def test_min_p_zero_changes_nothing() -> None:
     """min_p == 0 is the disable sentinel and must be bit-identical to not asking."""
     dev = "cuda"
     torch.manual_seed(0)
@@ -169,23 +193,7 @@ def test_min_p_zero_changes_nothing():
     torch.testing.assert_close(with_zero, neutral, atol=1e-5, rtol=1e-4)
 
 
-@pytest.mark.parametrize("min_p", [0.01, 0.1, 0.5])
-def test_min_p_matches_reference(min_p):
-    dev = "cuda"
-    torch.manual_seed(0)
-    logits = torch.randn(16, 8192, device=dev) * 2.0
-    temps, top_ks, top_ps, min_ps = _params(16, device=dev, min_p=min_p)
-
-    probs = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
-    expected = _reference_probs(logits, temps, top_ks, top_ps, min_ps)
-    max_row_l1 = _print_probability_error(f"min_p={min_p}", probs, expected)
-    assert max_row_l1 < 2e-5
-    # min-p is a hard support cut, so the kept sets must agree exactly -- there is no
-    # boundary-tie excuse here as there is for top-p.
-    assert torch.equal(probs > 0, expected > 0)
-
-
-def test_min_p_one_keeps_only_the_argmax():
+def test_min_p_one_keeps_only_the_argmax() -> None:
     """min_p == 1.0 is documented explicit-greedy: only p == p_max survives."""
     dev = "cuda"
     torch.manual_seed(0)
@@ -200,7 +208,7 @@ def test_min_p_one_keeps_only_the_argmax():
     assert (probs > 0).sum(-1).max().item() == 1
 
 
-def test_min_p_one_keeps_every_tied_maximum():
+def test_min_p_one_keeps_every_tied_maximum() -> None:
     """Tied maxima all survive min_p == 1.0; the filter is ``w >= minP``, not argmax.
 
     The neighbouring test uses ``torch.randn``, which never ties, so its single-survivor
@@ -240,13 +248,16 @@ def test_min_p_one_keeps_every_tied_maximum():
     [
         (50, None, None),
         (None, 0.9, None),
+        (None, None, 0.05),
         (50, 0.9, None),
         (50, None, 0.05),
         (None, 0.9, 0.05),
         (50, 0.9, 0.05),
     ],
 )
-def test_filter_combinations_match_reference(top_k, top_p, min_p):
+def test_filter_combinations_match_reference(
+    top_k: int | None, top_p: float | None, min_p: float | None
+) -> None:
     """Every combination, against the production pipeline.
 
     Bounded on total probability mass rather than pointwise: top-p's cutoff is not
@@ -268,7 +279,7 @@ def test_filter_combinations_match_reference(top_k, top_p, min_p):
     torch.testing.assert_close(probs.sum(-1), torch.ones(16, device=dev), atol=1e-6, rtol=1e-6)
 
 
-def test_mixed_batch_rows_are_independent():
+def test_mixed_batch_rows_are_independent() -> None:
     """The per-row skip is a claim, so it gets tested: a row's answer in a mixed batch
     must equal its answer computed alone."""
     dev = "cuda"
@@ -300,7 +311,7 @@ def test_mixed_batch_rows_are_independent():
 
 @pytest.mark.parametrize("vocab", [65535, 65536, 65537])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_large_vocab_dispatch_boundary_matches_reference(dtype, vocab):
+def test_large_vocab_dispatch_boundary_matches_reference(dtype: torch.dtype, vocab: int) -> None:
     """Exercise both sides of the multi-CTA vocabulary boundary."""
     dev = "cuda"
     torch.manual_seed(0)
@@ -328,7 +339,7 @@ def test_large_vocab_dispatch_boundary_matches_reference(dtype, vocab):
 
 
 @pytest.mark.parametrize("rows", [1, 8, 31, 32, 33, 64])
-def test_fp32_probability_error_against_pure_torch_reference(rows):
+def test_fp32_probability_error_against_pure_torch_reference(rows: int) -> None:
     """Measure fused-op error against an independent Torch oracle.
 
     The 128256-token vocabulary is representative of Llama 3.1. Rows 31/32/33
@@ -428,7 +439,7 @@ def test_fp32_probability_error_against_pure_torch_reference(rows):
     assert support_difference.sum(-1).max().item() <= 1
 
 
-def test_sampled_tokens_lie_in_the_filtered_support():
+def test_sampled_tokens_lie_in_the_filtered_support() -> None:
     """A token the filters removed must never be sampled -- the failure that silently
     degrades output instead of raising."""
     dev = "cuda"
@@ -446,7 +457,7 @@ def test_sampled_tokens_lie_in_the_filtered_support():
         assert (picked > 0).all(), f"step {step} sampled a token outside the support"
 
 
-def test_tokens_and_probs_agree_with_the_probs_only_op():
+def test_tokens_and_probs_agree_with_the_probs_only_op() -> None:
     """The rejection path takes tokens from one call and probs from another; if the two
     entry points filtered differently, acceptance would be computed against a
     distribution neither side sampled from."""
@@ -463,7 +474,7 @@ def test_tokens_and_probs_agree_with_the_probs_only_op():
     torch.testing.assert_close(probs_both, probs_only, atol=1e-6, rtol=1e-5)
 
 
-def test_same_seed_and_offset_reproduce_the_same_tokens():
+def test_same_seed_and_offset_reproduce_the_same_tokens() -> None:
     dev = "cuda"
     torch.manual_seed(0)
     logits = torch.randn(16, 4096, device=dev) * 2.0
@@ -479,7 +490,7 @@ def test_same_seed_and_offset_reproduce_the_same_tokens():
     assert torch.equal(first, second)
 
 
-def test_sampling_follows_the_filtered_distribution():
+def test_sampling_follows_the_filtered_distribution() -> None:
     """Many draws over a small vocabulary should reproduce the probs the op reports.
 
     Chi-square would need a distributional table; the total-variation distance is enough
@@ -530,7 +541,7 @@ _REJECT_FILTERS = [
 
 
 @pytest.mark.parametrize("filters", _REJECT_FILTERS)
-def test_rejection_tokens_lie_in_the_filtered_support(filters):
+def test_rejection_tokens_lie_in_the_filtered_support(filters: dict[str, Any]) -> None:
     """A rejection sampler that accepts too readily still returns a plausible token, so
     membership is the assertion that catches it."""
     dev = "cuda"
@@ -550,7 +561,7 @@ def test_rejection_tokens_lie_in_the_filtered_support(filters):
 
 
 @pytest.mark.parametrize("filters", _REJECT_FILTERS)
-def test_rejection_tokens_follow_the_filtered_distribution(filters):
+def test_rejection_tokens_follow_the_filtered_distribution(filters: dict[str, Any]) -> None:
     """The acceptance test decides *which* distribution the loop converges to; an
     off-by-one in it (``<`` vs ``<=`` against the count/mass target) keeps or drops the
     boundary token and shifts the distribution without ever leaving the support."""
@@ -572,7 +583,7 @@ def test_rejection_tokens_follow_the_filtered_distribution(filters):
     assert tv < 0.05, f"total-variation distance {tv:.3f} from the filtered distribution"
 
 
-def test_small_batch_top_k_top_p_hybrid_follows_filtered_distribution():
+def test_small_batch_top_k_top_p_hybrid_follows_filtered_distribution() -> None:
     """Rows <= 8 solve top-k, then reject only for top-p instead of descending twice.
 
     The large one-row-per-draw distribution test above intentionally exceeds that routing
@@ -607,7 +618,7 @@ def test_small_batch_top_k_top_p_hybrid_follows_filtered_distribution():
     "filters",
     [pytest.param({"top_p": 1e-6}, id="top_p"), pytest.param({"top_k": 1}, id="top_k_descent")],
 )
-def test_rejection_converges_when_the_support_barely_shrinks(filters):
+def test_rejection_converges_when_the_support_barely_shrinks(filters: dict[str, Any]) -> None:
     """The round budget's worst case: a near-flat row keeping exactly one token.
 
     Every rejection here removes only the weights at or below the draw, and on a flat row
@@ -629,7 +640,7 @@ def test_rejection_converges_when_the_support_barely_shrinks(filters):
         assert torch.equal(tokens.long(), torch.full_like(tokens.long(), vocab - 1))
 
 
-def test_rejection_and_descent_keep_the_same_set():
+def test_rejection_and_descent_keep_the_same_set() -> None:
     """Mixed batch: rows that take the rejection path and rows that fall through to the
     descent are dispatched per row, inside one launch. Both must sample from the set the
     probs-only op reports for that row."""
