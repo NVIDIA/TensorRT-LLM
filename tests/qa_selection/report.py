@@ -14,12 +14,12 @@
 # limitations under the License.
 """Everything selection writes once collection is over.
 
-    SelectionReport.of(selection) -> Artifacts.write(report, out_dir)
-                                  -> TerminalSummary.render(...)
+    SelectionOutput.of(selection, rootdir) -> Artifacts.write(report, out_dir)
+                                           -> TerminalSummary.render(...)
 
-Two consumers, two formats. The pipeline reads `.ids` files with `awk` and
-needs no parser; a human reads the JSON record or the terminal block. Both are
-built from the same `SelectionReport`, so they cannot disagree.
+Two formats from one record: `.ids` files the pipeline filters with `awk`, and
+a JSON record holding the counts and the per-test outcome. `plugin.py` holds
+the hooks.
 """
 
 import json
@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import pytest
+
 from .collection import Selection
 from .core.allocation import Assignment, GpuDemand, Ladder
 from .core.machines import MachineProfile
@@ -35,34 +37,29 @@ from .core.selector import CollectedTest
 
 
 class NodeIds:
-    """The identifier form this package emits, and the contract behind it.
+    """The identifier form this package emits.
 
-    Test lists on disk are unprefixed; `parse_test_list` prefixes the entries at
-    load time to match already-prefixed items. So emitting unprefixed ids is the
-    on-disk contract, and a consumer joining against prefixed Jenkins artifacts
-    must add the prefix itself. The form is named in the record rather than left
-    to be inferred.
+    Node ids are unprefixed, matching the test lists on disk; a consumer
+    joining against prefixed artifacts adds the prefix itself.
     """
 
     FORM = "unprefixed"
 
     @staticmethod
-    def of(assignments: Tuple[Assignment, ...]) -> List[str]:
-        """Bare node ids, in collection order, with no list decorations.
+    def of(outcomes: Tuple["Outcome", ...]) -> List[str]:
+        """Bare node ids, in collection order.
 
         No `TIMEOUT (N)`/`SKIP`/`XFAIL` suffix is added: a consumer filters its
-        own list by first field, so every suffix it already carries survives.
+        own list by first field, so the suffixes it carries survive.
         """
-        return [assignment.nodeid for assignment in assignments]
+        return [outcome.nodeid for outcome in outcomes]
 
 
 class SourceRevision:
     """The checkout the marks were read from.
 
-    Stamped into the record so a stale artifact is visible in a consumer's log
-    rather than inferred from a test count. Nothing else is stamped -- notably
-    no timestamp, which would make every regeneration differ and destroy the
-    property that the artifact changes only when a `skip_*` decorator does.
+    The commit alone: no timestamp, so regenerating produces no diff unless a
+    `skip_*` decorator changed.
     """
 
     COMMAND = ("git", "rev-parse", "HEAD")
@@ -70,10 +67,7 @@ class SourceRevision:
 
     @classmethod
     def of(cls, rootdir: Path) -> Optional[str]:
-        """The checkout's commit, or None when it cannot be read.
-
-        Absent is a usable answer: the record says so, and the run continues.
-        """
+        """The checkout's commit, or None when it cannot be read."""
         try:
             done = subprocess.run(
                 cls.COMMAND,
@@ -91,9 +85,8 @@ class SourceRevision:
 class Outcome:
     """One collected test, as the record states it.
 
-    `required_gpus` is an inference -- `skip_less_device(4)` declares a lower
-    bound for running, not a demand -- so it never appears without the marks it
-    was read from.
+    `required_gpus` is read from a lower bound, never declared, so it always
+    travels with the markers it was read from.
     """
 
     nodeid: str
@@ -108,7 +101,7 @@ class Outcome:
 
     @classmethod
     def of(cls, assignment: Assignment, view: CollectedTest) -> "Outcome":
-        """One assignment plus the one fact only the collected view carries."""
+        """One assignment, plus the one fact only the collected view carries."""
         return cls(
             nodeid=assignment.nodeid,
             selected=assignment.decision.selected,
@@ -125,9 +118,8 @@ class Outcome:
     def unkeyable_skipif_of(view: CollectedTest) -> int:
         """How many of this test's `skipif` marks carry no `reason=`.
 
-        A keyless mark can never be given a rule, so it is not an unknown
-        reason; counting it here is what keeps D22's two skipif populations
-        apart. It never blocks: an unkeyable mark leaves the test selected.
+        A keyless mark can be given no rule, so it is not an unknown reason. It
+        never blocks: the test stays selected.
         """
         return sum(1 for mark in view.iter_markers("skipif") if mark.skipif_reason is None)
 
@@ -148,11 +140,7 @@ class Outcome:
 
 @dataclass(frozen=True)
 class SelectionReport:
-    """What one invocation decided, in the shape both outputs are built from.
-
-    Counting happens here once so the `.ids` files, the JSON record and the
-    terminal block cannot disagree about a number.
-    """
+    """What one invocation decided, counted once for every output."""
 
     machine: str
     profile: MachineProfile
@@ -184,10 +172,9 @@ class SelectionReport:
 
     @property
     def live(self) -> Tuple[Outcome, ...]:
-        """The tests this invocation actually kept.
+        """The tests this invocation kept, by the rule `Selection.is_live` uses.
 
-        Equals `feasible` unless `--gpus` named a rung, matching
-        `Selection.is_live` -- the same rule, applied to the same decisions.
+        Equals `feasible` unless `--gpus` named a rung.
         """
         if self.target_rung is None:
             return self.feasible
@@ -197,8 +184,8 @@ class SelectionReport:
     def rungs(self) -> Dict[int, Tuple[Outcome, ...]]:
         """The feasible tests partitioned by allocation, empty rungs included.
 
-        One collection serves every rung: the partition is complete here, not
-        only for the rung a caller happens to be running (design D14).
+        Every rung, not only the one a caller is running: one collection
+        carries what all of them need.
         """
         if self.ladder is None:
             return {}
@@ -211,18 +198,16 @@ class SelectionReport:
     def unassignable(self) -> Tuple[Outcome, ...]:
         """Tests this machine can run that no rung fits.
 
-        Feasible on purpose: an infeasible test is not waiting for an
-        allocation. These are folded into no rung, ever (task 4.7).
+        Feasible only: an infeasible test is not waiting for an allocation.
+        Never folded into the largest rung.
         """
         return tuple(outcome for outcome in self.feasible if outcome.unassignable)
 
     @property
     def unknown_reasons(self) -> Dict[str, List[str]]:
-        """Skipif reasons with no rule, each with the tests that carry it.
+        """Skipif reasons with no rule, each with the tests carrying it.
 
-        Kept, not deselected: an undecidable reason fails open. Expect three
-        states under this key -- not yet curated, deliberately undecidable, and
-        deliberately deferred -- which `core/`'s README tells apart.
+        Kept, not deselected: an undecidable reason fails open.
         """
         found: Dict[str, List[str]] = {}
         for outcome in self.outcomes:
@@ -234,8 +219,7 @@ class SelectionReport:
     def unkeyable_skipif(self) -> List[str]:
         """Tests carrying a `skipif` with no `reason=` at all.
 
-        Never merged into `unknown_reasons`: no rule could ever name these, so
-        advising one would advise an impossible fix (design D22).
+        Reported apart from `unknown_reasons`: no rule can name these.
         """
         return [outcome.nodeid for outcome in self.outcomes if outcome.unkeyable_skipif]
 
@@ -243,16 +227,14 @@ class SelectionReport:
     def unclassified_rung(self) -> int:
         """Where a consumer routes an identifier this run never collected.
 
-        Empty in this record by construction -- a collect run cannot see what it
-        did not collect. The key and the routing policy are stated anyway so a
-        consumer holding a stale list has somewhere defined to put them, and a
-        wrong guess costs the cheapest allocation (design D16).
+        The smallest rung, or one GPU without a ladder. Always empty here: a
+        collect run cannot see what it did not collect.
         """
         return self.ladder.smallest if self.ladder is not None else GpuDemand.ASSUMED_GPUS
 
     @property
     def counts(self) -> Dict[str, int]:
-        """Every population's size, for a caller that logs numbers only."""
+        """Every population's size."""
         return {
             "candidates": len(self.outcomes),
             "feasible": len(self.feasible),
@@ -286,8 +268,7 @@ class SelectionReport:
 class Artifacts:
     """The files `--selection-out-dir` receives.
 
-    Both formats, side by side: the JSON is the auditable contract, the `.ids`
-    files make the pipeline's common path a one-liner with no parser --
+    The JSON is the record; the `.ids` files need no parser:
 
         awk 'NR==FNR{keep[$0];next} ($1 in keep)' B200-4gpu.ids list.txt
     """
@@ -298,11 +279,7 @@ class Artifacts:
 
     @classmethod
     def write(cls, report: SelectionReport, out_dir: Path) -> List[Path]:
-        """Write the record and the identifier lists; return what was written.
-
-        The record is written on every run. Which `.ids` files join it is
-        decided by `--ladder` alone, and there is no third mode.
-        """
+        """Write the record and the identifier lists; return what was written."""
         out_dir.mkdir(parents=True, exist_ok=True)
         written = [cls.write_record(report, out_dir)]
         written += [
@@ -312,7 +289,7 @@ class Artifacts:
 
     @classmethod
     def write_record(cls, report: SelectionReport, out_dir: Path) -> Path:
-        """Write `<machine>.json`, the auditable record of the whole run."""
+        """Write `<machine>.json`."""
         path = out_dir / f"{report.machine}{cls.RECORD_SUFFIX}"
         path.write_text(json.dumps(report.to_mapping(), indent=cls.INDENT) + "\n")
         return path
@@ -327,9 +304,8 @@ class Artifacts:
     def id_lists(cls, report: SelectionReport) -> Dict[str, List[str]]:
         """Filename -> node ids, for every list this run emits.
 
-        Without a ladder: one `<machine>.ids` of everything feasible. With one:
-        `<machine>-<rung>gpu.ids` per rung, every rung written even when empty,
-        so a missing file means a failed run rather than an empty allocation.
+        Without a ladder, one `<machine>.ids` of everything feasible; with one,
+        `<machine>-<rung>gpu.ids` per rung, written even when empty.
         """
         if report.ladder is None:
             return {
@@ -341,28 +317,46 @@ class Artifacts:
         }
 
 
-class TerminalSummary:
-    """The human-readable block, rendered in pytest's terminal summary.
+@dataclass(frozen=True)
+class SelectionOutput:
+    """The record one run produced, and the files it went to."""
 
-    Here rather than in the collection hook so it prints once, after pytest's
-    own counts, where a reader is already looking for totals.
-    """
+    # Resolved once collection is over and kept on `config.stash`.
+    STASH_KEY = pytest.StashKey()
+
+    report: SelectionReport
+    written: Tuple[Path, ...]
+
+    @classmethod
+    def of(cls, selection: Selection, rootdir: Path) -> "SelectionOutput":
+        """Build the record, and write it when an output directory was named."""
+        report = SelectionReport.of(selection, rootdir)
+        out_dir = selection.request.out_dir
+        return cls(
+            report=report,
+            written=tuple(Artifacts.write(report, out_dir)) if out_dir is not None else (),
+        )
+
+
+class TerminalSummary:
+    """The human-readable block, rendered in pytest's terminal summary."""
 
     TITLE = "qa selection"
 
-    # Every line is `label` then value, so the block reads as one column pair.
+    # Every line is a label then a value, in one column pair.
     LABEL_WIDTH = 14
 
     @classmethod
-    def render(cls, writer, report: SelectionReport, written: List[Path]) -> None:
+    def render(cls, writer, output: SelectionOutput) -> None:
         """Write the summary block through pytest's terminal reporter."""
         writer.section(cls.TITLE, sep="-")
-        for line in cls.lines(report, written):
+        for line in cls.lines(output):
             writer.line(line)
 
     @classmethod
-    def lines(cls, report: SelectionReport, written: List[Path]) -> List[str]:
+    def lines(cls, output: SelectionOutput) -> List[str]:
         """The block's lines, so they can be asserted without a terminal."""
+        report = output.report
         counts = report.counts
         lines = [
             cls.line("target", cls.target(report)),
@@ -373,7 +367,7 @@ class TerminalSummary:
         if report.ladder is not None:
             lines.append(cls.line("rungs", cls.rung_counts(report)))
         lines += cls.population_lines(report)
-        lines += [cls.line("written", path) for path in written]
+        lines += [cls.line("written", path) for path in output.written]
         return lines
 
     @classmethod
@@ -383,7 +377,7 @@ class TerminalSummary:
 
     @staticmethod
     def target(report: SelectionReport) -> str:
-        """The machine and the allocation shape decisions were made against."""
+        """The machine and the allocation decisions were made against."""
         target = f"{report.machine}, {report.profile.gpu_count} GPUs"
         return target if report.ladder is None else f"{target}, ladder {report.ladder}"
 
@@ -399,10 +393,9 @@ class TerminalSummary:
 
     @classmethod
     def population_lines(cls, report: SelectionReport) -> List[str]:
-        """The three unresolved populations, each with the fix it calls for.
+        """The unresolved populations, each with the fix it calls for.
 
-        Printed only when non-empty, and never merged: each has a different
-        owner, so a combined count would be one nobody can act on (design D22).
+        Printed only when non-empty, and never merged: each has its own fix.
         """
         counts = report.counts
         populations = [
