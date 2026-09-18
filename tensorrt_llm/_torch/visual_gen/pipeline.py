@@ -974,6 +974,15 @@ class BasePipeline(nn.Module):
         noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
         return guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
 
+    @staticmethod
+    def _conditional_half(tensor):
+        """The conditional rows of a tensor ``_setup_cfg_config`` doubled.
+
+        It builds them as ``cat([negative, positive])``, so the conditional rows are
+        the second half. Only call this for tensors it reported as doubled.
+        """
+        return tensor.chunk(2)[1]
+
     def _combine_cfg_branches(self, noise_uncond, noise_cond, guidance_scale, guidance_rescale):
         """Combine the two CFG branches of one stream into a single prediction.
 
@@ -1039,6 +1048,8 @@ class BasePipeline(nn.Module):
         do_cfg_parallel = cfg_size >= 2 and guidance_scale > 1.0
 
         local_extras = {}
+        doubled_embeds = False
+        doubled_extras: set[str] = set()
 
         if do_cfg_parallel:
             if self.rank == 0:
@@ -1068,12 +1079,14 @@ class BasePipeline(nn.Module):
             local_embeds = None
             if is_split_embeds and guidance_scale > 1.0:
                 prompt_embeds = torch.cat([neg_prompt_embeds, prompt_embeds])
+                doubled_embeds = True
 
             # For standard CFG, concatenate extra tensors
             if extra_cfg_tensors:
                 for name, (pos_tensor, neg_tensor) in extra_cfg_tensors.items():
                     if pos_tensor is not None and neg_tensor is not None and guidance_scale > 1.0:
                         local_extras[name] = torch.cat([neg_tensor, pos_tensor], dim=0)
+                        doubled_extras.add(name)
                     elif pos_tensor is not None:
                         local_extras[name] = pos_tensor
 
@@ -1083,6 +1096,11 @@ class BasePipeline(nn.Module):
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
+            # Which tensors above are [negative, positive] concatenations. A step that
+            # drops the unconditional branch has to slice exactly these and nothing
+            # else, so the fact is recorded here rather than guessed from shapes.
+            "doubled_embeds": doubled_embeds,
+            "doubled_extras": doubled_extras,
         }
 
     def _denoise_step_cfg_parallel(
@@ -1268,6 +1286,7 @@ class BasePipeline(nn.Module):
         post_step_fn: Optional[Callable] = None,
         scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
         extra_stream_timesteps: dict[str, torch.Tensor] | None = None,
+        skip_uncond_at_scale_one: bool = False,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -1311,6 +1330,12 @@ class BasePipeline(nn.Module):
             extra_stream_timesteps: Optional native timestep schedules keyed by extra
                          stream name. Each must match the primary schedule length.
                          Omitted streams use the primary timestep, as before.
+            skip_uncond_at_scale_one: when the effective scale for a step is exactly
+                         1.0 the unconditional prediction is discarded anyway, so this
+                         drops that branch instead of computing it. Off by default: it
+                         halves the batch entering the transformer on those steps, which
+                         changes GEMM shapes and therefore kernel selection and rounding.
+                         Opt in only where that has been evaluated.
 
         Returns:
             Single latents if no extra_streams
@@ -1391,6 +1416,25 @@ class BasePipeline(nn.Module):
                         local_extras,
                     )
                 else:
+                    # At an effective scale of exactly 1.0 the unconditional branch
+                    # contributes nothing, so it can be dropped entirely. Doing so
+                    # also halves the batch, so the conditional halves of the
+                    # embeddings and extras have to be selected to match.
+                    step_do_cfg = do_cfg and not (
+                        skip_uncond_at_scale_one and current_guidance_scale == 1.0
+                    )
+                    step_embeds, step_extras = prompt_embeds, local_extras
+                    if do_cfg and not step_do_cfg:
+                        if cfg_config["doubled_embeds"]:
+                            step_embeds = self._conditional_half(prompt_embeds)
+                        step_extras = {
+                            name: (
+                                self._conditional_half(value)
+                                if name in cfg_config["doubled_extras"]
+                                else value
+                            )
+                            for name, value in local_extras.items()
+                        }
                     (
                         noise_pred,
                         extra_noise_preds,
@@ -1401,12 +1445,12 @@ class BasePipeline(nn.Module):
                         extra_stream_latents,
                         i,
                         t,
-                        prompt_embeds,
+                        step_embeds,
                         forward_fn,
                         current_guidance_scale,
                         guidance_rescale,
-                        local_extras,
-                        do_cfg=do_cfg,
+                        step_extras,
+                        do_cfg=step_do_cfg,
                     )
 
             # Scheduler step for all streams

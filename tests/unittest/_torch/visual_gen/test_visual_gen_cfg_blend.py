@@ -149,3 +149,74 @@ class TestCombineCfgBranches:
             atol=0,
             rtol=0,
         )
+
+
+class TestSkipUncondAtScaleOne:
+    """``skip_uncond_at_scale_one`` drops the discarded branch instead of computing it.
+
+    Opt-in, because halving the batch changes GEMM shapes and therefore kernel
+    selection. The velocity it produces must still be the conditional one.
+    """
+
+    def _run(self, skip: bool):
+        pipeline = _pipeline()
+        video_uncond, video_cond = _branches((1, 4, 3, 2, 2), seed=31)
+        action_uncond, action_cond = _branches((1, 33, 64), seed=37)
+        video_scheduler = _RecordingScheduler(TIMESTEPS)
+        action_scheduler = _RecordingScheduler(TIMESTEPS)
+        seen = []
+
+        def forward_fn(latent_input, extra_streams, step_index, timestep, embeds, extras):
+            batch = latent_input.shape[0]
+            seen.append(
+                {
+                    "batch": batch,
+                    "embeds": embeds.shape[0],
+                    "text_ids": extras["text_ids"].shape[0],
+                }
+            )
+            # Mirror the CFG layout: first half unconditional, second half conditional.
+            video = torch.cat([video_uncond, video_cond]) if batch == 2 else video_cond
+            action = torch.cat([action_uncond, action_cond]) if batch == 2 else action_cond
+            return video, {"action": action}
+
+        pipeline.denoise(
+            latents=torch.zeros(1, 4, 3, 2, 2, dtype=torch.bfloat16),
+            scheduler=video_scheduler,
+            prompt_embeds=torch.arange(8).unsqueeze(0),
+            neg_prompt_embeds=torch.arange(8).unsqueeze(0) + 100,
+            guidance_scale=GUIDANCE_SCALE,
+            forward_fn=forward_fn,
+            extra_cfg_tensors={
+                "text_ids": (torch.arange(8).unsqueeze(0), torch.arange(8).unsqueeze(0) + 100)
+            },
+            extra_streams={
+                "action": (torch.zeros(1, 33, 64, dtype=torch.bfloat16), action_scheduler)
+            },
+            guidance_interval=GUIDANCE_INTERVAL,
+            skip_uncond_at_scale_one=skip,
+        )
+        return seen, video_scheduler.seen, action_scheduler.seen, video_cond, action_cond
+
+    def test_batch_halves_only_outside_the_interval(self):
+        seen, _, _, _, _ = self._run(skip=True)
+        # t=999 is inside [960, 1001] and keeps both branches; the rest drop one.
+        assert [s["batch"] for s in seen] == [2, 1, 1, 1]
+        # The embeddings and extras must be sliced to match, or the model sees
+        # the negative prompt while being asked for the conditional prediction.
+        assert [s["embeds"] for s in seen] == [2, 1, 1, 1]
+        assert [s["text_ids"] for s in seen] == [2, 1, 1, 1]
+
+    def test_off_by_default_keeps_both_branches(self):
+        seen, _, _, _, _ = self._run(skip=False)
+        assert [s["batch"] for s in seen] == [2] * len(TIMESTEPS)
+
+    def test_velocity_is_the_conditional_one_either_way(self):
+        """Skipping must not change which velocity reaches the scheduler."""
+        _, vid_skip, act_skip, video_cond, action_cond = self._run(skip=True)
+        _, vid_keep, act_keep, _, _ = self._run(skip=False)
+        for step in range(1, len(TIMESTEPS)):
+            assert torch.equal(vid_skip[step], video_cond)
+            assert torch.equal(act_skip[step], action_cond)
+            assert torch.equal(vid_skip[step], vid_keep[step])
+            assert torch.equal(act_skip[step], act_keep[step])

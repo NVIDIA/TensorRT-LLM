@@ -2396,6 +2396,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             extra_cfg_tensors=extra_cfg_tensors,
             extra_streams=extra_streams,
             guidance_interval=request.guidance_interval,
+            skip_uncond_at_scale_one=policy_solver_fp32,
             post_step_fn=(
                 post_step_fn
                 if (request.do_action or should_pin_condition)

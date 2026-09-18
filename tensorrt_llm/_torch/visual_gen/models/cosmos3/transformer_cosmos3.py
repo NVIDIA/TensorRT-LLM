@@ -1494,6 +1494,18 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             "action_start_frame_offset", _int_key("action_start_frame_offset")
         )
 
+    @staticmethod
+    def _conditional_rows(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Trim a cached [2*B, ...] CFG tensor down to its conditional rows.
+
+        Returns ``tensor`` untouched unless its batch is exactly twice the requested
+        one, which only happens when a denoising step dropped the unconditional
+        branch after the cache was populated at the doubled batch.
+        """
+        if tensor.shape[0] != 2 * batch_size:
+            return tensor
+        return tensor[batch_size:]
+
     def reset_cache(self):
         self.cached_kv = None
         self.cached_freqs_gen = None
@@ -1763,6 +1775,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         S_gen = hidden_gen.shape[1]
         hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
         cos, sin = freqs_gen_combined
+        # The understanding K/V and the generation RoPE frequencies are both cached on
+        # the first denoising step, at whatever batch that step used. A later step may
+        # drop the unconditional branch once guidance reaches 1.0 (see
+        # ``BasePipeline.denoise``'s ``skip_uncond_at_scale_one``), which halves the
+        # generation batch. The cached rows are laid out as [unconditional,
+        # conditional], so the conditional half is the tail. A no-op when the batch is
+        # unchanged, which is every other configuration.
+        gen_batch = hidden_gen.shape[0]
+        cos = self._conditional_rows(cos, gen_batch)
+        sin = self._conditional_rows(sin, gen_batch)
         cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         freqs_gen = (cos, sin)
@@ -1770,6 +1792,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         with offload_context("generator"):
             for i, layer in enumerate(self.gen_layers):
                 k_und, v_und = self.cached_kv[i]
+                k_und = self._conditional_rows(k_und, gen_batch)
+                v_und = self._conditional_rows(v_und, gen_batch)
                 if not self.sharder.is_active:
                     k_und = k_und[:, :max_real_len]
                     v_und = v_und[:, :max_real_len]
