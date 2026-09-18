@@ -214,10 +214,26 @@ struct KVCacheDesc
 // BatchDesc — a batch of requests that the KVCacheManager must support.
 // Mirrors _config.py::BatchDesc.
 // ---------------------------------------------------------------------------
+enum class ConstraintPolicy
+{
+    //! Preserve legacy behavior, including growing GPU quota to fit fixed workloads.
+    kFixed,
+    //! Fit the full initialization envelope within the original hot GPU quota.
+    //! Reduce the first request's capacity and history together; preserve all peers
+    //! and other constraints. Search the original, minimum and block-aligned
+    //! capacities. Reject infeasible envelopes without allocating oversized pools.
+    //! At most one batch may opt in; shared system prompts are unsupported.
+    kFitToQuota,
+};
+
 struct BatchDesc
 {
     std::vector<KVCacheDesc> kvCaches;
     int systemPromptLength = 0; // tokens shared by all requests (0 if no reuse)
+    // Only initialization constraints use this policy. FIT_TO_QUOTA adjusts the
+    // first request, preserving capacity minus history and every other request.
+    ConstraintPolicy constraintPolicy = ConstraintPolicy::kFixed;
+    std::optional<int> minCapacity;
 
     void validate() const
     {
@@ -226,13 +242,17 @@ struct BatchDesc
         {
             desc.validate();
         }
+        validateConstraintPolicy();
     }
+
+    void validateConstraintPolicy() const;
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
     // bindings replace. Uses KVCacheDesc::operator== elementwise.
     bool operator==(BatchDesc const& other) const noexcept
     {
-        return systemPromptLength == other.systemPromptLength && kvCaches == other.kvCaches;
+        return systemPromptLength == other.systemPromptLength && kvCaches == other.kvCaches
+            && constraintPolicy == other.constraintPolicy && minCapacity == other.minCapacity;
     }
 
     bool operator!=(BatchDesc const& other) const noexcept

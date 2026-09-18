@@ -17,7 +17,7 @@ import math
 import os
 import warnings
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence, cast
 
@@ -36,6 +36,7 @@ from ._common import (
 from ._config import (
     BatchDesc,
     CacheTierConfig,
+    ConstraintPolicy,
     DataRole,
     DiskCacheTierConfig,
     KVCacheDesc,
@@ -197,6 +198,8 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_fit_to_quota",
+        "resolved_constraints",
         "_event_manager",
         "__rawref__",
     )
@@ -210,6 +213,8 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
+    _fit_to_quota: bool
+    resolved_constraints: list[BatchDesc]
     _event_manager: "KVCacheEventManager | None"
     __rawref__: rawref.ref["StorageManager"]
 
@@ -247,11 +252,23 @@ class StorageManager:
 
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
+        self._fit_to_quota = any(
+            c.constraint_policy == ConstraintPolicy.FIT_TO_QUOTA for c in constraints or []
+        )
+        self.resolved_constraints = self._resolve_constraints(
+            constraints or [],
+            slot_size_lists,
+            gpu_quota,
+            gpu_granularity,
+            tokens_per_block,
+            swa_scratch_reuse,
+            max_util_for_resume,
+        )
 
         # Constraints are hot-level feasibility floors. Other levels need only one
         # structural slot per pool group.
         self._min_slots = self._compute_pool_group_min_slots_from_constraints(
-            constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
+            self.resolved_constraints, tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
 
         # Derive one lifecycle ratio, then project it onto each level's pool grouping.
@@ -271,9 +288,9 @@ class StorageManager:
             life_cycle_ratio = self.ratio_from_batch(
                 typical_batch, tokens_per_block, swa_scratch_reuse, gpu_granularity
             )
-        elif constraints:
+        elif self.resolved_constraints:
             life_cycle_slots = self._compute_slots_from_constraints(
-                constraints, tokens_per_block, swa_scratch_reuse, max_util_for_resume
+                self.resolved_constraints, tokens_per_block, swa_scratch_reuse, max_util_for_resume
             )
             life_cycle_bytes = self._slots_to_bytes(life_cycle_slots, gpu_granularity)
             total = sum(life_cycle_bytes)
@@ -306,6 +323,70 @@ class StorageManager:
         assert self.num_pool_groups == get_uniform_attribute(
             self._levels, lambda level: level.storage.num_pool_groups
         )
+
+    def _resolve_constraints(
+        self,
+        constraints: list[BatchDesc],
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        gpu_quota: int,
+        granularity: int,
+        tokens_per_block: int,
+        swa_scratch_reuse: SwaScratchReuseConfig | None,
+        max_util_for_resume: float,
+    ) -> list[BatchDesc]:
+        resolved = list(constraints)
+        flexible = [
+            (index, c)
+            for index, c in enumerate(constraints)
+            if c.constraint_policy == ConstraintPolicy.FIT_TO_QUOTA
+        ]
+        if len(flexible) > 1:
+            raise ValueError("Only one FIT_TO_QUOTA constraint is supported")
+        if not flexible:
+            return resolved
+        quota = gpu_quota // granularity * granularity
+
+        def required_quota() -> int:
+            slots = self._compute_pool_group_min_slots_from_constraints(
+                resolved, tokens_per_block, swa_scratch_reuse, max_util_for_resume
+            )
+            return self._min_quota_for_level(slot_size_lists, granularity, slots)
+
+        index, constraint = flexible[0]
+        constraint.__post_init__()
+        if required_quota() <= quota:
+            return resolved
+        batch = constraint
+        request = batch.kv_caches[0]
+        headroom = request.capacity - request.history_length
+        minimum = constraint.min_capacity
+        assert minimum is not None
+
+        def set_capacity(capacity: int) -> None:
+            requests = list(batch.kv_caches)
+            requests[0] = KVCacheDesc(capacity, capacity - headroom)
+            resolved[index] = replace(batch, kv_caches=requests)
+
+        set_capacity(minimum)
+        best = minimum if required_quota() <= quota else None
+        low = (minimum + tokens_per_block - 1) // tokens_per_block
+        high = request.capacity // tokens_per_block
+        # A fixed block phase preserves SWA retention alignment. Searching
+        # arbitrary token lengths would not give a monotone page requirement.
+        while low <= high:
+            middle = (low + high) // 2
+            set_capacity(middle * tokens_per_block)
+            if required_quota() <= quota:
+                best = middle * tokens_per_block
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best is None:
+            raise ValueError(
+                "GPU quota is insufficient for FIT_TO_QUOTA at or above minimum capacity"
+            )
+        set_capacity(best)
+        return resolved
 
     def __del__(self) -> None:
         self.destroy()
@@ -1099,10 +1180,15 @@ class StorageManager:
         """
         granularity = CacheLevelManager.cache_tier_granularity(tier_config.tier, tier_config.quota)
         min_slots = self._min_slots_for_level(level)
-        quota = max(
-            self._min_quota_for_level(slot_size_lists, granularity, min_slots),
-            round_up(tier_config.quota, granularity),
-        )
+        min_quota = self._min_quota_for_level(slot_size_lists, granularity, min_slots)
+        if level == GPU_LEVEL and self._fit_to_quota:
+            quota = tier_config.quota // granularity * granularity
+            if min_quota > quota:
+                raise ValueError(
+                    "GPU quota is insufficient for resolved initialization constraints"
+                )
+        else:
+            quota = max(min_quota, round_up(tier_config.quota, granularity))
         return CacheLevelStorage.ratio_to_slot_count_list(
             quota, slot_size_lists, ratio, granularity, min_slots
         )

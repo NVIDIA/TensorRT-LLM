@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <set>
 #include <stdexcept>
@@ -37,6 +38,32 @@ void DiskCacheTierConfig::assertValid() const
     }
 }
 
+void BatchDesc::validateConstraintPolicy() const
+{
+    if (constraintPolicy == ConstraintPolicy::kFixed)
+    {
+        if (minCapacity.has_value())
+        {
+            throw std::invalid_argument("FIXED constraints do not accept min_capacity");
+        }
+        return;
+    }
+    if (constraintPolicy != ConstraintPolicy::kFitToQuota)
+    {
+        throw std::invalid_argument("Unknown constraint policy");
+    }
+    if (kvCaches.empty() || systemPromptLength != 0)
+    {
+        throw std::invalid_argument("FIT_TO_QUOTA requires a first request and no shared system prompt");
+    }
+    auto const& request = kvCaches.front();
+    int const headroom = request.capacity - request.historyLength;
+    if (!minCapacity.has_value() || *minCapacity < std::max(1, headroom) || *minCapacity > request.capacity)
+    {
+        throw std::invalid_argument("min_capacity must preserve generation headroom and not exceed capacity");
+    }
+}
+
 void KVCacheManagerConfig::validate() const
 {
     if (swaScratchReuse.has_value())
@@ -46,6 +73,12 @@ void KVCacheManagerConfig::validate() const
     for (auto const& batch : constraints)
     {
         batch.validate();
+    }
+    if (std::count_if(constraints.begin(), constraints.end(),
+            [](BatchDesc const& batch) { return batch.constraintPolicy == ConstraintPolicy::kFitToQuota; })
+        > 1)
+    {
+        throw std::invalid_argument("Only one FIT_TO_QUOTA constraint is supported");
     }
     if (typicalStep.has_value())
     {

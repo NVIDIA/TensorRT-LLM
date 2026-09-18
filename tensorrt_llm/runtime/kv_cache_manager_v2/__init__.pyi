@@ -209,10 +209,16 @@ class KVCacheDesc:
     capacity: int
     history_length: int
 
+class ConstraintPolicy(enum.IntEnum):
+    FIXED = 0
+    FIT_TO_QUOTA = 1
+
 @dataclass(slots=True)
 class BatchDesc:
     kv_caches: list[KVCacheDesc]
     system_prompt_length: int = 0
+    constraint_policy: ConstraintPolicy = ConstraintPolicy.FIXED
+    min_capacity: int | None = None
 
 @dataclass(slots=True)
 class SwaScratchReuseConfig:
@@ -616,6 +622,8 @@ class KVCacheManager:
     def event_manager(self) -> Any | None: ...
     @property
     def init_config(self) -> KVCacheManagerConfig: ...
+    @property
+    def resolved_constraints(self) -> list[BatchDesc]: ...
     @property
     def allow_seq_rebasing(self) -> bool: ...
     @property

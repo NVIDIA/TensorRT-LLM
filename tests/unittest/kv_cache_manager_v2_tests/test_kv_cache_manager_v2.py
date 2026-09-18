@@ -23,7 +23,7 @@ import random
 import time
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
@@ -39,6 +39,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         BufferConfig,
         BufferId,
         CacheLevel,
+        ConstraintPolicy,
         CorruptedError,
         CudaStream,
         DataRole,
@@ -97,6 +98,7 @@ else:
         BufferConfig,
         BufferId,
         CacheLevel,
+        ConstraintPolicy,
         CorruptedError,
         CudaStream,
         DataRole,
@@ -417,6 +419,149 @@ class TestKVCacheManagerV2(unittest.TestCase):
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
+
+
+class TestFitToQuota(TestKVCacheManagerV2):
+    def make_config(self, quota: int = 17 << 20) -> KVCacheManagerConfig:
+        return KVCacheManagerConfig(
+            tokens_per_block=32,
+            cache_tiers=[GpuCacheTierConfig(quota=quota)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=1 << 20)],
+                )
+            ],
+            constraints=[
+                BatchDesc(
+                    [KVCacheDesc(4096, 4095), KVCacheDesc(1, 0)],
+                    constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
+                    min_capacity=1,
+                )
+            ],
+        )
+
+    def test_fits_actual_pool_bytes_and_preserves_peers(self) -> None:
+        cfg = self.make_config()
+        original = deepcopy(cfg.constraints)
+        self.manager = KVCacheManager(cfg)
+        resolved = self.manager.resolved_constraints[0]
+        self.assertEqual(cfg.constraints, original)
+        self.assertEqual(resolved.kv_caches[1:], original[0].kv_caches[1:])
+        self.assertEqual(resolved.kv_caches[0].capacity, 14 * 32)
+        self.assertEqual(resolved.kv_caches[0].capacity - resolved.kv_caches[0].history_length, 1)
+        self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), cfg.cache_tiers[0].quota)
+        # A caller can inspect and modify its copy without changing the manager.
+        resolved.kv_caches.clear()
+        self.assertEqual(len(self.manager.resolved_constraints[0].kv_caches), 2)
+
+    def test_side_buffers_count_toward_quota(self) -> None:
+        cfg = self.make_config()
+        cfg.layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=1 << 20),
+                    BufferConfig(role=Role.VALUE, size=1 << 20),
+                ],
+            )
+        ]
+        self.manager = KVCacheManager(cfg)
+        self.assertEqual(self.manager.resolved_constraints[0].kv_caches[0].capacity, 6 * 32)
+        self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), 17 << 20)
+
+    def test_unaligned_minimum_does_not_reject_aligned_fit(self) -> None:
+        cfg = self.make_config(4 << 20)
+        cfg.layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=2 << 20)],
+                sliding_window_size=32,
+            )
+        ]
+        cfg.constraints = [
+            BatchDesc(
+                [KVCacheDesc(97, 96)],
+                constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
+                min_capacity=33,
+            )
+        ]
+        self.manager = KVCacheManager(cfg)
+        self.assertEqual(self.manager.resolved_constraints[0].kv_caches[0], KVCacheDesc(96, 95))
+        self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), 4 << 20)
+
+    def test_fixed_envelope_is_not_relaxed(self) -> None:
+        cfg = self.make_config()
+        cfg.constraints = [*cfg.constraints, BatchDesc([KVCacheDesc(1024, 0)])]
+        with self.assertRaisesRegex(ValueError, "insufficient.*FIT_TO_QUOTA"):
+            KVCacheManager(cfg)
+
+    def test_scratch_and_distinct_pool_rounding(self) -> None:
+        cfg = self.make_config(32 << 20)
+        cfg.layers = [
+            *cfg.layers,
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=Role.KEY, size=(1 << 19) + 1)],
+                sliding_window_size=64,
+            ),
+        ]
+        cfg.swa_scratch_reuse = SwaScratchReuseConfig()
+        cfg.constraints = [*cfg.constraints, BatchDesc([KVCacheDesc(128, 0)])]
+        self.manager = KVCacheManager(cfg)
+        resolved = self.manager.resolved_constraints
+        self.assertLess(resolved[0].kv_caches[0].capacity, 4096)
+        self.assertEqual(resolved[1], cfg.constraints[1])
+        self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), cfg.cache_tiers[0].quota)
+        # Rebuild the selected workloads as fixed constraints. The ordinary
+        # allocator is an independent check that their full envelope fits.
+        fixed = [
+            replace(c, constraint_policy=ConstraintPolicy.FIXED, min_capacity=None)
+            for c in resolved
+        ]
+        oracle = KVCacheManager(replace(cfg, constraints=fixed))
+        try:
+            self.assertLessEqual(oracle.get_quota(GPU_LEVEL), cfg.cache_tiers[0].quota)
+        finally:
+            oracle.shutdown()
+
+    def test_legacy_fixed_constraints_still_grow(self) -> None:
+        cfg = self.make_config()
+        cfg.constraints = [BatchDesc([KVCacheDesc(1024, 0)])]
+        self.manager = KVCacheManager(cfg)
+        self.assertEqual(self.manager.resolved_constraints, cfg.constraints)
+        self.assertGreater(self.manager.get_quota(GPU_LEVEL), cfg.cache_tiers[0].quota)
+
+    def test_sufficient_quota_preserves_requested_shape(self) -> None:
+        cfg = self.make_config(256 << 20)
+        self.manager = KVCacheManager(cfg)
+        self.assertEqual(self.manager.resolved_constraints, cfg.constraints)
+
+    def test_reserved_ssm_requests_and_replace(self) -> None:
+        cfg = self.make_config()
+        cfg.layers = [
+            *cfg.layers,
+            SsmLayerConfig(layer_id=LayerId(1), buffers=[BufferConfig(role=Role.KEY, size=1024)]),
+        ]
+        cfg.commit_min_snapshot = True
+        cfg.constraints = [
+            replace(
+                cfg.constraints[0], kv_caches=[*cfg.constraints[0].kv_caches, KVCacheDesc(0, 0)]
+            )
+        ]
+        self.manager = KVCacheManager(cfg)
+        resolved = self.manager.resolved_constraints[0]
+        self.assertEqual(resolved.kv_caches[1:], cfg.constraints[0].kv_caches[1:])
+        self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), cfg.cache_tiers[0].quota)
+
+    def test_invalid_policy_configuration(self) -> None:
+        with self.assertRaisesRegex(ValueError, "min_capacity"):
+            BatchDesc(
+                [KVCacheDesc(8, 4)], constraint_policy=ConstraintPolicy.FIT_TO_QUOTA, min_capacity=3
+            )
+        cfg = self.make_config()
+        with self.assertRaisesRegex(ValueError, "Only one"):
+            replace(cfg, constraints=cfg.constraints * 2)
 
 
 class TestStorageStatistics(TestKVCacheManagerV2):

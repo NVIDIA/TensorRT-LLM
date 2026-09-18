@@ -283,12 +283,16 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mGpuPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(
         CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota));
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
+    bool const fitToQuota = std::any_of(constraints.begin(), constraints.end(),
+        [](BatchDesc const& batch) { return batch.constraintPolicy == ConstraintPolicy::kFitToQuota; });
+    mResolvedConstraints = resolveConstraints(
+        constraints, slotSizeLists, gpuQuota, gpuGranularity, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
     // Constraints are hot-level feasibility floors. They are scaled by
     // 1/maxUtilForResume because KvCache::resume rejects a pool group above that
     // utilization. Other levels need only the structural one-slot floor.
-    mMinSlots
-        = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
+    mMinSlots = computePoolGroupMinSlotsFromConstraints(
+        mResolvedConstraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
     // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
     // those weights while accounting for the cold representation's page sizes.
@@ -317,10 +321,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         lifeCycleRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
     }
-    else if (!constraints.empty())
+    else if (!mResolvedConstraints.empty())
     {
         auto lifeCycleSlots
-            = computeSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
+            = computeSlotsFromConstraints(mResolvedConstraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
         lifeCycleRatio = normalizeToRatio(slotsToBytes(lifeCycleSlots, gpuGranularity));
     }
     else
@@ -335,7 +339,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mLevels.reserve(config.cacheTiers.size());
 
-    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
+    auto gpuSlotCounts
+        = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots, fitToQuota);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get());
 
@@ -1727,6 +1732,80 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
 // computeSlotsFromConstraints
 // ---------------------------------------------------------------------------
 
+std::vector<BatchDesc> StorageManager::resolveConstraints(std::vector<BatchDesc> const& constraints,
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t gpuQuota, size_t granularity,
+    int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
+{
+    std::vector<BatchDesc> resolved;
+    std::optional<size_t> flexibleIndex;
+    BatchDesc const* flexible = nullptr;
+    for (auto const& constraint : constraints)
+    {
+        constraint.validate();
+        if (constraint.constraintPolicy == ConstraintPolicy::kFitToQuota)
+        {
+            if (flexible != nullptr)
+            {
+                throw std::invalid_argument("Only one FIT_TO_QUOTA constraint is supported");
+            }
+            flexibleIndex = resolved.size();
+            flexible = &constraint;
+        }
+        resolved.push_back(constraint);
+    }
+    if (flexible == nullptr)
+    {
+        return resolved;
+    }
+    size_t const quota = gpuQuota / granularity * granularity;
+    auto requiredQuota = [&]()
+    {
+        auto const slots
+            = computePoolGroupMinSlotsFromConstraints(resolved, tokensPerBlock, swaScratchReuse, maxUtilForResume);
+        return minQuotaForLevel(slotSizeLists, granularity, slots);
+    };
+    if (requiredQuota() <= quota)
+    {
+        return resolved;
+    }
+    auto& batch = resolved[*flexibleIndex];
+    auto& request = batch.kvCaches.front();
+    int const headroom = request.capacity - request.historyLength;
+    int const maximum = request.capacity;
+    int const minimum = *flexible->minCapacity;
+    auto setCapacity = [&](int capacity)
+    {
+        request.capacity = capacity;
+        request.historyLength = capacity - headroom;
+    };
+    setCapacity(minimum);
+    std::optional<int> best = requiredQuota() <= quota ? std::optional<int>{minimum} : std::nullopt;
+    int low = divUp(minimum, tokensPerBlock);
+    int high = maximum / tokensPerBlock;
+    // Keep the block phase fixed so SWA retention does not oscillate across
+    // candidates. Arbitrary token lengths do not have monotone page costs.
+    while (low <= high)
+    {
+        int const middle = low + (high - low) / 2;
+        setCapacity(middle * tokensPerBlock);
+        if (requiredQuota() <= quota)
+        {
+            best = middle * tokensPerBlock;
+            low = middle + 1;
+        }
+        else
+        {
+            high = middle - 1;
+        }
+    }
+    if (!best.has_value())
+    {
+        throw std::invalid_argument("GPU quota is insufficient for FIT_TO_QUOTA at or above minimum capacity");
+    }
+    setCapacity(*best);
+    return resolved;
+}
+
 TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
     int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
@@ -1913,13 +1992,26 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    bool fitToQuota) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
     size_t quota = cacheTierQuota(tierConfig);
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
+    size_t const minQuota = minQuotaForLevel(slotSizeLists, granularity, minSlots);
+    if (fitToQuota)
+    {
+        quota = quota / granularity * granularity;
+        if (minQuota > quota)
+        {
+            throw std::invalid_argument("GPU quota is insufficient for resolved initialization constraints");
+        }
+    }
+    else
+    {
+        quota = std::max(minQuota, roundUp(quota, granularity));
+    }
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
 }
 

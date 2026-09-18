@@ -150,15 +150,56 @@ class KVCacheDesc:
         assert 0 <= self.history_length <= self.capacity
 
 
+class ConstraintPolicy(IntEnum):
+    """Initialization workload policy; FIXED preserves legacy quota growth.
+
+    FIT_TO_QUOTA keeps GPU pool allocation within the configured byte quota.
+    KVCM reduces the first request's capacity and history by the same amount,
+    keeps all other requests and constraints fixed, and includes physical buffer
+    sizes, allocation granularity and resume headroom in the fit. It raises
+    ValueError if no supported capacity at or above min_capacity fits.
+
+    Only one FIT_TO_QUOTA batch is supported. Shared system prompts are not
+    supported. Planning searches block-aligned capacities plus the requested
+    capacity and minimum; it does not promise a token-exact maximum. The
+    original descriptors are unchanged; inspect manager.resolved_constraints
+    for the selected workloads. This policy governs initialization only.
+    """
+
+    FIXED = 0
+    FIT_TO_QUOTA = 1
+
+
 # A batch of requests, working as a use case the KVCacheManager must always support.
 @dataclass(slots=True, frozen=True)
 class BatchDesc:
     kv_caches: list[KVCacheDesc]
     # Tokens shared by all requests. Set to 0 if no kv cache reuse.
     system_prompt_length: int = 0
+    # FIT_TO_QUOTA may reduce the first request's capacity and history together.
+    # Remaining requests stay fixed. Only used for initialization constraints.
+    constraint_policy: ConstraintPolicy = ConstraintPolicy.FIXED
+    min_capacity: int | None = None
 
     def __post_init__(self) -> None:
         assert self.system_prompt_length >= 0
+        if self.constraint_policy == ConstraintPolicy.FIXED:
+            if self.min_capacity is not None:
+                raise ValueError("FIXED constraints do not accept min_capacity")
+            return
+        if self.constraint_policy != ConstraintPolicy.FIT_TO_QUOTA:
+            raise ValueError("Unknown constraint policy")
+        if not self.kv_caches or self.system_prompt_length != 0:
+            raise ValueError("FIT_TO_QUOTA requires a first request and no shared system prompt")
+        request = self.kv_caches[0]
+        headroom = request.capacity - request.history_length
+        if (
+            self.min_capacity is None
+            or not max(1, headroom) <= self.min_capacity <= request.capacity
+        ):
+            raise ValueError(
+                "min_capacity must preserve generation headroom and not exceed capacity"
+            )
 
 
 @dataclass(slots=True)
@@ -276,6 +317,8 @@ class KVCacheManagerConfig:
 
     def __post_init__(self) -> None:
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
+        if sum(c.constraint_policy == ConstraintPolicy.FIT_TO_QUOTA for c in self.constraints) > 1:
+            raise ValueError("Only one FIT_TO_QUOTA constraint is supported")
         assert len(set(layer.layer_id for layer in self.layers)) == len(self.layers), (
             "duplicate layer id"
         )
