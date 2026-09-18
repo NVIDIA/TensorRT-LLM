@@ -1283,6 +1283,11 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"

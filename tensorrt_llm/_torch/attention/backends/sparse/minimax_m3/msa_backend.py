@@ -368,14 +368,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # num_index_heads * query tokens into one Q block, which bounds the
         # draft length it can verify.
         decode_query_len = self._msa_max_decode_query_len()
+        num_index_heads = params.sharded_index_head_count(self.mapping)
         if not self._cutedsl_indexer_supported(
-            num_index_heads=params.num_index_heads,
+            num_index_heads=num_index_heads,
             page_size=page_size,
             decode_query_len=decode_query_len,
         ):
             raise RuntimeError(
                 "The MiniMax-M3 CuTe DSL indexer scorer does not support this "
-                f"configuration: {params.num_index_heads} index heads, page size "
+                f"configuration: {num_index_heads} index heads, page size "
                 f"{page_size}, index dtype {self._msa_index_kv_dtype()}, up to "
                 f"{decode_query_len} query tokens per generation request."
             )
@@ -475,13 +476,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             fmha_sm100 = require_msa_module()
             max_k_tiles = _worst_case_proxy_max_k_tiles(
                 fmha_sm100,
-                num_index_heads=params.num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 kv_cache_manager=kv_cache_manager,
                 max_batch=max_num_sequences,
             )
             self._msa_worst_case_max_k_tiles = int(max_k_tiles)
             self._alloc_msa_proxy_scratch(
-                num_index_heads=params.num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
@@ -863,7 +864,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         params = self._msa_params
         if params is None:
             return
-        num_index_heads = params.num_index_heads
+        num_index_heads = params.sharded_index_head_count(self.mapping)
         qo_lens_cpu = self.msa_qo_lens_cpu
         kv_lens_cpu = self.msa_kv_lens_cpu
         qo_offset_cpu = self.msa_qo_offset_cpu
