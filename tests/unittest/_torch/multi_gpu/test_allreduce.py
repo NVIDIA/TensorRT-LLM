@@ -62,7 +62,7 @@ def _run_nccl_nvfp4_auxiliary_device_case(auxiliary: str, other_device: str,
     bias = inputs["bias"] if auxiliary == "bias" else None
     with pytest.raises(RuntimeError,
                        match=f"{auxiliary} must be on the input device"):
-        torch.ops.tensorrt_llm.allreduce(x, inputs["residual"],
+        torch.ops.trtllm.allreduce(x, inputs["residual"],
                                          inputs["norm_weight"], inputs["scale"],
                                          bias, None, [tensorrt_llm.mpi_rank()],
                                          AllReduceStrategy.NCCL, fusion_op,
