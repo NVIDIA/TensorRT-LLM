@@ -111,9 +111,12 @@ def llm_test_harness(model_dir: str,
         tokenizer = model_dir
 
     with assert_resource_freed(LLM, model_dir, tokenizer, **llm_kwargs) as llm:
-        outputs = llm.generate(inputs, sampling_params=sampling_params)
-        print(outputs)
-        check_output(outputs, references, similar_threshold=similar_threshold)
+        with llm:
+            outputs = llm.generate(inputs, sampling_params=sampling_params)
+            print(outputs)
+            check_output(outputs,
+                         references,
+                         similar_threshold=similar_threshold)
 
 
 def llm_check_output(llm: LLM,
