@@ -46,6 +46,7 @@ CUDA-graph capture.
 
 import math
 import operator
+import os
 import threading
 from collections.abc import Sequence
 
@@ -945,6 +946,9 @@ def _varlen_launcher(
 BLOCK_SKIP_MIN_N = 131072  # compressed positions (512k raw @ cr=4)
 BLOCK_SKIP_CLUS_MIN_N = 262144  # 2-CTA cluster family: 1M raw @ cr=4
 BLOCK_SKIP_MAX_N = 262144  # skip table covers SKIP_BLOCKS * 32 compressed positions
+# The scorer writes the logits right before the top-k reads them; below this
+# footprint the rows are still L2-resident and the dense scan beats the skip.
+BLOCK_SKIP_MIN_LOGITS_MB = int(os.environ.get("TRTLLM_GVR_BLOCK_SKIP_MIN_MB", "96"))
 
 
 def block_skip_useful(
@@ -957,15 +961,17 @@ def block_skip_useful(
 ) -> bool:
     """True when the varlen dispatch for this geometry lands on the single-CTA
     streaming main (R == 1) at an envelope of >= BLOCK_SKIP_MIN_N compressed
-    positions (cold B200, real DSv4 rows: 512k B128 +8/+14 %, 1M B128
-    +26/+32 % Pro/Flash; 128k-256k single-CTA rows -2..-6 %), or on the 2-CTA
-    cluster family at >= BLOCK_SKIP_CLUS_MIN_N (1M B64 +15/+14 %; its 512k
-    band is flat and the 4-CTA cluster stays within noise). The register
-    families (row loaded before a line exists) and the multi-CTA SPLIT main
-    (~1 us of row per launch) do not pay for the table build and the per-tile
-    gating. Pure host function (mirrors _varlen_launcher's tiers)."""
+    positions or on the 2-CTA cluster family at >= BLOCK_SKIP_CLUS_MIN_N, and
+    the launch's logits (rows x positions x 4 B) exceed BLOCK_SKIP_MIN_LOGITS_MB
+    (scorer -> top-k chain, real DSv4 rows, B200: 64 MB launches lose 5-10 % of
+    the top-k, >= 128 MB gain 15-42 %). The register families (row loaded
+    before a line exists) and the multi-CTA SPLIT main (~1 us of row per
+    launch) do not pay for the table build and the per-tile gating. Pure host
+    function (mirrors _varlen_launcher's tiers)."""
     n_kernel = min(int(n_env), int(npad))
     if n_kernel < BLOCK_SKIP_MIN_N or n_kernel > BLOCK_SKIP_MAX_N:
+        return False
+    if int(num_rows) * n_kernel * 4 < (BLOCK_SKIP_MIN_LOGITS_MB << 20):
         return False
     n_route = max(n_kernel, int(k) + 1)
     plan_free = route(int(num_rows), n_route, int(npad), int(k), num_sms, sm_version)

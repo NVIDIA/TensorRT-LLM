@@ -4866,10 +4866,10 @@ def test_indexer_gvr_block_skip_dispatch(use_self_sampling, k_dtype, use_dsl_sco
         indexer = create_indexer(sparse_config)
     assert indexer.use_gvr_block_skip is expected
     if expected:
-        # 128 rows at a 1M-token envelope: single-CTA streaming main
+        # 128 rows at a 1M-token envelope: single-CTA streaming main, 128 MB
         assert indexer._block_skip_useful(128, 262144)
-        # 64 rows at 1M: 2-CTA cluster family, measured as a gain
-        assert indexer._block_skip_useful(64, 262144)
+        # 64 rows at 1M: 2-CTA cluster family, 64 MB of L2-resident logits
+        assert not indexer._block_skip_useful(64, 262144)
         # 32 rows at 1M: 4-CTA cluster family, measured as a loss
         assert not indexer._block_skip_useful(32, 262144)
         # 64 rows past the skip table (270336 compressed positions): dense

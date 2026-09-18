@@ -2127,14 +2127,17 @@ def test_selfsampling_block_skip_guards():
 
 def test_selfsampling_block_skip_useful_families():
     """The glue arms the skip only where it measured a win: the single-CTA
-    streaming main at envelopes of >= 512k raw tokens and the 2-CTA cluster
-    family at >= 1M; shorter envelopes, the 4-CTA cluster, the register
-    families and the multi-CTA SPLIT main are excluded."""
+    streaming main at envelopes of >= 512k raw tokens (and the 2-CTA cluster
+    family at >= 1M) when the launch writes more than 96 MB of logits; smaller
+    launches (L2-resident rows), shorter envelopes, the 4-CTA cluster, the
+    register families and the multi-CTA SPLIT main are excluded."""
     k = 1024
-    assert ss_host.block_skip_useful(128, 131072, k, 131072)  # main R=1, 512k
-    assert ss_host.block_skip_useful(128, 262144, k, 262144)  # main R=1, 1M
+    assert ss_host.block_skip_useful(256, 131072, k, 131072)  # main R=1, 512k, 128 MB
+    assert not ss_host.block_skip_useful(128, 131072, k, 131072)  # main R=1, 512k, 64 MB
+    assert ss_host.block_skip_useful(128, 262144, k, 262144)  # main R=1, 1M, 128 MB
     assert not ss_host.block_skip_useful(128, 65536, k, 65536)  # main R=1 but 256k
-    assert ss_host.block_skip_useful(64, 262144, k, 262144)  # clus cs=2, 1M
+    # clus cs=2 at 1M (B 33..74) tops out at 77 MB: below the footprint floor
+    assert not ss_host.block_skip_useful(64, 262144, k, 262144)  # clus cs=2, 1M, 64 MB
     assert not ss_host.block_skip_useful(64, 131072, k, 131072)  # clus cs=2, 512k
     assert not ss_host.block_skip_useful(32, 262144, k, 262144)  # clus cs=4
     assert not ss_host.block_skip_useful(1, 262144, k, 262144)  # SPLIT main R=64
