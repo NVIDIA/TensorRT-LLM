@@ -191,6 +191,8 @@ def _kpool_score_kernel(
     REQ,
     OUT,
     num_rows,
+    w_row_stride,
+    w_head_stride,
     slot_stride,
     row_stride,
     bt_stride,
@@ -268,7 +270,9 @@ def _kpool_score_kernel(
                 ).to(tl.float32)
                 scores = tl.dot(q, tl.trans(keys), input_precision=PRECISION)  # [HP, BP]
                 scores = tl.maximum(scores * q_scale, 0.0)
-                w = tl.load(W + r * H + h, mask=hmask & in_range, other=0.0).to(tl.float32)
+                w = tl.load(
+                    W + r * w_row_stride + h * w_head_stride, mask=hmask & in_range, other=0.0
+                ).to(tl.float32)
                 mixed = tl.sum(scores * (w * w_scale)[:, None], axis=0)
                 mixed = tl.where(valid, mixed, min_value)
                 tl.store(OUT + r * num_pools_max + j, mixed, mask=(j < num_pools_max) & in_range)
@@ -291,7 +295,9 @@ def _kpool_score_kernel(
             ).to(tl.float32)
             scores = tl.dot(q, tl.trans(keys), input_precision=PRECISION)  # [HP, BP]
             scores = tl.maximum(scores * q_scale, 0.0)
-            w = tl.load(W + r * H + h, mask=hmask & in_range, other=0.0).to(tl.float32)
+            w = tl.load(
+                W + r * w_row_stride + h * w_head_stride, mask=hmask & in_range, other=0.0
+            ).to(tl.float32)
             mixed = tl.sum(scores * (w * w_scale)[:, None], axis=0)
             mixed = tl.where(valid, mixed, min_value)
             tl.store(OUT + r * num_pools_max + j, mixed, mask=(j < num_pools_max) & in_range)
@@ -317,7 +323,7 @@ def kpool_score(
     """Pool scores ``[N, num_pools_max]`` fp32.
 
     ``q`` is ``[N, H, head_dim]`` (bf16 or fp32, contiguous), ``weights``
-    ``[N, H]``, ``kv_lens[i]`` row ``i``'s visible length. Only the
+    ``[N, H]`` (possibly strided), ``kv_lens[i]`` row ``i``'s visible length. Only the
     ``kv_len // kpool`` complete pools of each row are scored; the rest hold
     the fp32 minimum. ``rows_per_program > 1`` requires rows that share a
     block table to be consecutive with non-decreasing ``kv_lens``: either all
@@ -348,6 +354,8 @@ def kpool_score(
         kv_lens if request_ids is None else request_ids,
         out,
         n,
+        weights.stride(0),
+        weights.stride(1),
         index_pool.stride(0),
         index_pool.stride(1),
         block_tables.stride(0),

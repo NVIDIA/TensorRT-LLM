@@ -152,6 +152,62 @@ def test_pool_scores_generation_rows(precision):
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
 
 
+@pytest.mark.parametrize("layout", ["generation", "prefill_shared", "prefill_boundary"])
+@pytest.mark.parametrize("weight_head_stride", [1, 2])
+def test_pool_scores_strided_head_weights(layout, weight_head_stride):
+    gen = torch.Generator(device="cuda").manual_seed(23)
+    n, heads, num_pools_max = 4, 32, 520
+    pages = num_pools_max * KPOOL // TPB
+    num_tables = n if layout == "generation" else 2 if layout == "prefill_boundary" else 1
+    slots = num_tables * pages + 8
+    pool = _strided_index_pool(slots, gen)
+    tables = _paged_tables(num_tables, pages, slots, gen)
+    request_ids = None
+    if layout != "generation":
+        request_ids = torch.tensor(
+            [0, 0, 1, 1] if layout == "prefill_boundary" else [0, 0, 0, 0],
+            device="cuda",
+            dtype=torch.int32,
+        )
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    # Match project_state's [key | gate | head weights] slice: [T, 32]
+    # with row stride 288. Also exercise a non-unit head stride.
+    projection = torch.rand(
+        n, 2 * HD + heads * weight_head_stride, generator=gen, device="cuda"
+    ).to(torch.bfloat16)
+    weights = projection[:, 2 * HD :: weight_head_stride]
+    assert weights.stride() == (2 * HD + heads * weight_head_stride, weight_head_stride)
+    assert not weights.is_contiguous()
+    # More than 512 complete pools forces top-k to discard candidates.
+    kv_lens = torch.tensor([2052, 2053, 2056, 2057], device="cuda", dtype=torch.int64)
+    kwargs = dict(num_pools_max=num_pools_max, q_scale=HD**-0.5, w_scale=heads**-0.5)
+    got = kpool_score(
+        q,
+        weights,
+        pool,
+        tables,
+        kv_lens,
+        TPB,
+        head_dim=HD,
+        kpool=KPOOL,
+        rows_per_program=1 if request_ids is None else 16,
+        request_ids=request_ids,
+        precision="tf32",
+        **kwargs,
+    )
+    reference_tables = tables if request_ids is None else tables[request_ids.long()]
+    want = _reference_scores(q, weights, pool, reference_tables, kv_lens, **kwargs)
+    visible = want > FP32_MIN
+    assert torch.equal(got <= FP32_MIN, ~visible)
+    torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        got.topk(512, dim=-1).indices.sort(dim=-1).values,
+        want.topk(512, dim=-1).indices.sort(dim=-1).values,
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_pool_scores_packed_context_rows_share_tables():
     """rows_per_program=16 with request_ids: the packed query tokens
     of several requests, in position order, including a group straddling two
