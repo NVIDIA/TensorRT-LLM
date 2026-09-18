@@ -1738,13 +1738,13 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
     torch.testing.assert_close(idx_pool, ref_idx_pool)
 
 
-@pytest.mark.parametrize("sparse", [True, False])
-def test_msa_attention_core_owns_the_cache_write(sparse):
+@pytest.mark.parametrize("sparse,indexer_dtype", [(True, "fp8"), (True, "bf16"), (False, "fp8")])
+def test_msa_attention_core_owns_the_cache_write(sparse: bool, indexer_dtype: str) -> None:
     """The model layer's MSA core must write the caches exactly once and in
     the right place: write_layer_caches runs before run_indexer (whose proxy
     pass reads the index-K cache), run_indexer is told index-K is already
-    resident, and forward() receives k=v=None so no FMHA phase writes K/V
-    again."""
+    resident (with no live index-K for FP8), and forward() receives k=v=None
+    so no FMHA phase writes K/V again."""
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
 
     num_tokens, width = 3, 128
@@ -1753,6 +1753,7 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
 
     class FakeBackend:
         layer_idx = 7
+        indexer_kv_dtype = indexer_dtype
 
         def write_layer_caches(self, k, v, idx_k, metadata):
             events.append(("write", k, v, idx_k, metadata))
@@ -1778,7 +1779,11 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
     if sparse:
         assert names == ["write", "indexer", "forward"]
         _, indexer_q, indexer_k, indexer_metadata, prewritten = events[1]
-        assert indexer_q is idx_q and indexer_k is idx_k and indexer_metadata is metadata
+        assert indexer_q is idx_q and indexer_metadata is metadata
+        if indexer_dtype == "fp8":
+            assert indexer_k is None
+        else:
+            assert indexer_k is idx_k
         assert prewritten is True
     else:
         assert names == ["write", "forward"]
