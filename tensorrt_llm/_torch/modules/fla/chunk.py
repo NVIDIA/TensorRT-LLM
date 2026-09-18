@@ -122,20 +122,23 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
 @torch.compiler.disable
 def chunk_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
-    initial_state_indices: Optional[torch.Tensor] = None,
-    inplace_indexed_state_update: bool = False,
-    output_final_state: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-    output: Optional[torch.Tensor] = None,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float = None,
+        initial_state: torch.Tensor = None,
+        initial_state_indices: Optional[torch.Tensor] = None,
+        inplace_indexed_state_update: bool = False,
+        output_final_state: bool = False,
+        cu_seqlens: Optional[torch.LongTensor] = None,
+        head_first: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        output: Optional[torch.Tensor] = None,
+        use_cp="auto",  # accepted for call-site parity with the FlashInfer adapter; the Triton path has no CP variant
+        g_is_linear:
+    bool = False,  # call-site parity: the Triton kernels want log space, so convert back
 ):
     r"""
     Args:
@@ -208,6 +211,8 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
+    if g_is_linear:
+        g = torch.log(g)
     assert q.dtype == k.dtype == v.dtype
     assert (
         q.dtype != torch.float32
