@@ -4463,14 +4463,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 token_num = max(token_num, 2)
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
-            # ``materialize_history`` keeps the history marker at 0 so the declared
-            # history holds real blocks, and leaves SWA scratch reuse on. Scratch
-            # reuse in turn forbids a *second* capacity change: ``KvCache::resize``
-            # requires ``old_capacity - max_rewind_len <= history_length``, and
-            # max_rewind_len is num_extra_kv_tokens, so growing away from
-            # ``dummy_capacity`` would demand ``history_length >= token_num`` and
-            # always throws. Reserve the generation room in the one resize off zero
-            # capacity instead; the final capacity is unchanged either way.
+            # Materializing history keeps SWA scratch reuse on, which rejects a
+            # second resize, so reserve the generation slot in the first one.
             preallocate_gen = is_gen and materialize_history
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
             encoder_input_tokens = (

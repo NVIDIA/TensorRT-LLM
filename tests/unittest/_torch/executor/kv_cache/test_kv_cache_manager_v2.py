@@ -1162,8 +1162,7 @@ class _ScratchPreconditionKVCache:
 
 @pytest.mark.parametrize("materialize_history", [False, True])
 # A positive draft width keeps the ``_kv_draft`` term of the reservation
-# load-bearing: with 0 draft tokens the assertion below would still hold if the
-# single resize only reserved the generated token.
+# load-bearing.
 @pytest.mark.parametrize("max_num_draft_tokens", [0, 4])
 def test_generation_dummy_reserves_capacity_within_scratch_precondition(
     materialize_history: bool,
@@ -1171,11 +1170,9 @@ def test_generation_dummy_reserves_capacity_within_scratch_precondition(
 ) -> None:
     """A generation dummy must not trip the SWA-scratch resize precondition.
 
-    ``materialize_history`` holds the history marker at 0 -- the caller writes
-    the history itself -- and leaves scratch reuse enabled, so the capacity has
-    to be reserved in a single resize off zero capacity. Growing a second time
-    demanded ``history_length >= token_num`` and threw, which took the
-    layer-wise benchmark down on every sliding-window model.
+    With scratch reuse on, the capacity has to be reserved in a single resize
+    off zero capacity; a second one threw and took the layer-wise benchmark
+    down on every sliding-window model.
     """
     token_num = 1150
     num_extra_kv_tokens = 1
