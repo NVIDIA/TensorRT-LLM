@@ -17,6 +17,7 @@ import torch
 from strenum import StrEnum
 
 import tensorrt_llm
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -327,6 +328,7 @@ def log_memory_usage(stage: str):
 
 def _create_py_executor_impl(
     llm_args: TorchLlmArgs,
+    _startup_timer: _StartupTimer,
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
@@ -562,11 +564,21 @@ def _create_py_executor_impl(
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
+    _startup_timer.mark_initialization("configuration_and_distributed_init")
     mem_monitor = _ExecutorMemoryMonitor()
 
     @contextmanager
     def allocation_scope(current_stage: ExecutorMemoryType):
-        with mem_monitor.observe_creation_stage(current_stage):
+        timing_name = {
+            ExecutorMemoryType.INIT_KV_CACHE: "profiling_kv_cache_allocation",
+            ExecutorMemoryType.INIT_EXTRA_RESOURCES:
+            "profiling_executor_creation",
+            ExecutorMemoryType.MODEL_EXTRA: "memory_profiling_and_capacity",
+            ExecutorMemoryType.KV_CACHE: "final_kv_cache_allocation",
+            ExecutorMemoryType.EXTRA_RESOURCES: "final_executor_creation",
+        }.get(current_stage, current_stage.value)
+        with _startup_timer.phase(
+                timing_name), mem_monitor.observe_creation_stage(current_stage):
             stage = current_stage.value
             if not enable_sleep or stage.startswith("_no_capture"):
                 yield
@@ -953,6 +965,10 @@ def _create_py_executor_impl(
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
 
+    for engine in (model_engine, draft_model_engine):
+        if engine is not None:
+            engine._warmup_purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
+
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
@@ -995,27 +1011,30 @@ def _create_py_executor_impl(
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
 
-        # Shut down the transceiver before tearing down KV cache managers so
-        # that NIXL-registered (pinned) GPU memory is deregistered first;
-        # otherwise the old KV cache memory stays pinned and the subsequent
-        # KV cache allocation will OOM.
-        try:
-            if hasattr(py_executor, 'kv_cache_transceiver'
-                       ) and py_executor.kv_cache_transceiver is not None:
-                py_executor.kv_cache_transceiver.shutdown()
-        finally:
-            kv_cache_creator.teardown_managers(resources)
+        with _startup_timer.phase("profiling_resource_teardown"):
+            # Shut down the transceiver before tearing down KV cache managers so
+            # that NIXL-registered (pinned) GPU memory is deregistered first;
+            # otherwise the old KV cache memory stays pinned and the subsequent
+            # KV cache allocation will OOM.
+            try:
+                if hasattr(py_executor, 'kv_cache_transceiver'
+                           ) and py_executor.kv_cache_transceiver is not None:
+                    with _startup_timer.phase("profiling_transceiver_shutdown"):
+                        py_executor.kv_cache_transceiver.shutdown()
+            finally:
+                with _startup_timer.phase("profiling_kv_cache_teardown"):
+                    kv_cache_creator.teardown_managers(resources)
 
-        # configure_kv_cache_capacity shuts down the Phase-1 executor, which
-        # releases its CUDA graphs before its resource managers. Only the
-        # profiling attention metadata remains to be discarded here.
-        for eng in [model_engine, draft_model_engine]:
-            if eng is not None:
-                eng.attn_metadata = None
+            # configure_kv_cache_capacity shuts down the Phase-1 executor, which
+            # releases its CUDA graphs before its resource managers. Only the
+            # profiling attention metadata remains to be discarded here.
+            for eng in [model_engine, draft_model_engine]:
+                if eng is not None:
+                    eng.attn_metadata = None
 
-        del py_executor  # free before constructing new
-        gc.collect()
-        torch.cuda.empty_cache()
+            del py_executor  # free before constructing new
+            gc.collect()
+            torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
@@ -1023,6 +1042,10 @@ def _create_py_executor_impl(
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
+
+        for engine in (model_engine, draft_model_engine):
+            if engine is not None:
+                engine._warmup_purpose = "final_executor"
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
@@ -1062,7 +1085,8 @@ def _create_py_executor_impl(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    py_executor.start_worker()
+    with _startup_timer.phase("executor_start_worker"):
+        py_executor.start_worker()
 
     return py_executor
 
@@ -1078,13 +1102,15 @@ def create_py_executor(
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
-        return _create_py_executor_impl(
-            llm_args=llm_args,
-            checkpoint_dir=checkpoint_dir,
-            tokenizer=tokenizer,
-            profiling_stage_data=profiling_stage_data,
-            resource_governor_queue=resource_governor_queue,
-        )
+        with _StartupTimer("executor_creation") as startup_timer:
+            return _create_py_executor_impl(
+                _startup_timer=startup_timer,
+                llm_args=llm_args,
+                checkpoint_dir=checkpoint_dir,
+                tokenizer=tokenizer,
+                profiling_stage_data=profiling_stage_data,
+                resource_governor_queue=resource_governor_queue,
+            )
     except BaseException:
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None

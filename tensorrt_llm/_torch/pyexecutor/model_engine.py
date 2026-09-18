@@ -818,6 +818,8 @@ class PyTorchModelEngine(ModelEngine):
         # Wall-clock seconds per warmup phase, filled by ``_warmup_phase`` and
         # reported by ``_log_warmup_summary``.
         self._warmup_timings: Dict[str, float] = {}
+        self._warmup_purpose = "unspecified"
+        self._warmup_pass = 0
 
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
         self._force_lora_graph_for_capture: Optional[bool] = None
@@ -1422,6 +1424,7 @@ class PyTorchModelEngine(ModelEngine):
         # ``_warmup_phase``; the summary is emitted even when a phase raises,
         # so Python exceptions retain the partial breakdown (not forced kills).
         self._warmup_timings = {}
+        self._warmup_pass += 1
         warmup_start = time.perf_counter()
         try:
             self._warmup_scheduled(resource_manager, kv_cache_manager)
@@ -1436,7 +1439,7 @@ class PyTorchModelEngine(ModelEngine):
         (``warmup/after_<name>``) so timing and memory logs line up.
         """
         logger.info(
-            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] {name}: start"
+            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] {name}: start"
         )
         start = time.perf_counter()
         completed = False
@@ -1449,11 +1452,11 @@ class PyTorchModelEngine(ModelEngine):
                                                                   0.0) + elapsed
             if completed:
                 logger.info(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] {name}: done in {elapsed:.1f}s"
+                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] {name}: done in {elapsed:.1f}s"
                 )
             else:
                 logger.warning(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] {name}: failed after {elapsed:.1f}s"
+                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] {name}: failed after {elapsed:.1f}s"
                 )
 
     # A single phase taking longer than this is reported at WARNING level in
@@ -1464,7 +1467,7 @@ class PyTorchModelEngine(ModelEngine):
         """Report local timings subject to the configured logger rank filtering."""
         if not self._warmup_timings:
             logger.info(
-                f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] summary: total={total_sec:.1f}s (no phases ran)"
+                f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] summary: total={total_sec:.1f}s (no phases ran)"
             )
             return
         parts = []
@@ -1472,7 +1475,7 @@ class PyTorchModelEngine(ModelEngine):
             pct = 100.0 * sec / total_sec if total_sec > 0 else 0.0
             parts.append(f"{name}={sec:.1f}s ({pct:.0f}%)")
         logger.info(
-            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] summary: total={total_sec:.1f}s | "
+            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] summary: total={total_sec:.1f}s | "
             + ", ".join(parts))
         slow = {
             name: sec
@@ -1481,7 +1484,7 @@ class PyTorchModelEngine(ModelEngine):
         }
         if slow:
             logger.warning(
-                f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] slow phases (>"
+                f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] slow phases (>"
                 + f"{self._WARMUP_SLOW_PHASE_SEC:.0f}s): " +
                 ", ".join(f"{name}={sec:.1f}s" for name, sec in slow.items()))
 
@@ -2071,7 +2074,7 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
                     logger.info(
-                        f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] general shape num_tokens={num_tokens}, "
+                        f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] general shape num_tokens={num_tokens}, "
                         f"num_gen_tokens={num_gen_tokens}: done in "
                         f"{time.perf_counter() - shape_start:.1f}s")
             except torch.OutOfMemoryError:
@@ -2182,7 +2185,7 @@ class PyTorchModelEngine(ModelEngine):
                 # NVRTC grid, ...). Time it per shape so a slow startup can be
                 # attributed without a debugger.
                 logger.info(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] attention shape num_tokens={num_tokens}, "
+                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] attention shape num_tokens={num_tokens}, "
                     f"num_gen_requests={num_gen_requests}: start")
                 shape_start = time.perf_counter()
                 with trtllm_gen_fmha_jit_warmup():
@@ -2191,7 +2194,7 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                 torch.cuda.synchronize()
                 logger.info(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] attention shape num_tokens={num_tokens}, "
+                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] attention shape num_tokens={num_tokens}, "
                     f"num_gen_requests={num_gen_requests}: done in "
                     f"{time.perf_counter() - shape_start:.1f}s")
 
@@ -2326,7 +2329,7 @@ class PyTorchModelEngine(ModelEngine):
                             spec_resource_manager.is_first_draft = True
 
                         logger.info(
-                            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] autotuner shape num_tokens={num_tokens}, "
+                            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] autotuner shape num_tokens={num_tokens}, "
                             f"num_gen_requests={num_gen_requests}: start")
                         shape_start = time.perf_counter()
                         self.forward(batch,
@@ -2335,7 +2338,7 @@ class PyTorchModelEngine(ModelEngine):
                         ran_forward = True
                         torch.cuda.synchronize()
                         logger.info(
-                            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}] autotuner shape num_tokens={num_tokens}, "
+                            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] autotuner shape num_tokens={num_tokens}, "
                             f"num_gen_requests={num_gen_requests}: done in "
                             f"{time.perf_counter() - shape_start:.1f}s")
 
