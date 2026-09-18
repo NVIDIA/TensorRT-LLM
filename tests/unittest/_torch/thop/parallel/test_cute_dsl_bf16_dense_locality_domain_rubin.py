@@ -5,6 +5,7 @@ import pytest
 import torch
 from _torch.thop.parallel._cute_dsl_bf16_rubin_test_utils import (
     RUBIN_CUTE_DSL_MARKS,
+    bf16_matmul_atol,
     make_bf16_bmm_runner,
     make_bf16_gemm_runner,
     reset_bf16_gemm_state,
@@ -40,7 +41,7 @@ def test_cute_dsl_bf16_gemm_locality_domain_rubin(kernel_variant, mnk):
     expected_1 = act.float() @ weight_1.t().float()
     runner([act, weight_0, output], tactic=tactic)
     torch.cuda.synchronize()
-    torch.testing.assert_close(output.float(), expected_0, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(output.float(), expected_0, rtol=1e-2, atol=bf16_matmul_atol(k))
 
     wide_output = torch.empty(m, n * 2, dtype=torch.bfloat16, device="cuda")
     run_locality_domain_composite(
@@ -100,6 +101,7 @@ def test_deepseek_gate_bf16_locality_domain_end_to_end_rubin():
     weight = torch.randn(256, 7168, dtype=torch.bfloat16, device="cuda")
     correction_bias = torch.randn(256, dtype=torch.float32, device="cuda")
     expected = hidden_states.float() @ weight.t().float()
+    atol = bf16_matmul_atol(hidden_states.shape[-1])
 
     gate = DeepseekV3Gate(
         hidden_size=7168,
@@ -144,7 +146,7 @@ def test_deepseek_gate_bf16_locality_domain_end_to_end_rubin():
 
     assert output.dtype == torch.float32
     assert output.shape == (1, 1, 256)
-    torch.testing.assert_close(output, expected, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=atol)
 
     first_generation_shards = gate._locality_domain_weight_shards
     gate.pre_reload_weights()
@@ -164,7 +166,7 @@ def test_deepseek_gate_bf16_locality_domain_end_to_end_rubin():
     with tuner.replay(((concurrent_runner, tactic),)), torch.inference_mode():
         reloaded_output = gate(hidden_states)
     torch.cuda.synchronize()
-    torch.testing.assert_close(reloaded_output, reloaded_expected, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(reloaded_output, reloaded_expected, rtol=1e-2, atol=atol)
 
 
 def test_gated_mlp_bf16_locality_domain_end_to_end_rubin():
@@ -247,8 +249,9 @@ def test_cute_dsl_bf16_gemm_locality_domain_uses_input_device_rubin():
     torch.cuda.synchronize(input_device)
 
     assert torch.cuda.current_device() == original_device
-    torch.testing.assert_close(output[:, :128].float(), expected_0, rtol=1e-2, atol=1.0)
-    torch.testing.assert_close(output[:, 128:].float(), expected_1, rtol=1e-2, atol=1.0)
+    atol = bf16_matmul_atol(act.shape[-1])
+    torch.testing.assert_close(output[:, :128].float(), expected_0, rtol=1e-2, atol=atol)
+    torch.testing.assert_close(output[:, 128:].float(), expected_1, rtol=1e-2, atol=atol)
 
 
 @pytest.mark.parametrize(
@@ -272,7 +275,7 @@ def test_cute_dsl_bf16_bmm_locality_domain_rubin(kernel_variant, bm_nk):
     expected_1 = torch.bmm(act.float(), weight_1.transpose(1, 2).float())
     runner([act, weight_0, output], tactic=tactic)
     torch.cuda.synchronize()
-    torch.testing.assert_close(output.float(), expected_0, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(output.float(), expected_0, rtol=1e-2, atol=bf16_matmul_atol(k))
 
     wide_output = torch.empty(batch_size, m, n * 2, dtype=torch.bfloat16, device="cuda")
     run_locality_domain_composite(
@@ -360,6 +363,7 @@ def test_bf16_linear_locality_domain_end_to_end_rubin():
     weight = torch.randn(out_features, in_features, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
     expected = F.linear(input, weight, bias)
+    atol = bf16_matmul_atol(in_features)
 
     linear = Linear(
         in_features=in_features,
@@ -392,7 +396,7 @@ def test_bf16_linear_locality_domain_end_to_end_rubin():
     with torch.inference_mode():
         output = linear(input)
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, expected, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=atol)
 
     first_generation_shards = linear._locality_domain_weight_shards
     linear.pre_reload_weights()
@@ -417,7 +421,7 @@ def test_bf16_linear_locality_domain_end_to_end_rubin():
     with torch.inference_mode():
         reloaded_output = linear(input)
     torch.cuda.synchronize()
-    torch.testing.assert_close(reloaded_output, reloaded_expected, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(reloaded_output, reloaded_expected, rtol=1e-2, atol=atol)
 
 
 def test_cute_dsl_bf16_bmm_autotune_all_tactics_rubin():
@@ -428,12 +432,13 @@ def test_cute_dsl_bf16_bmm_autotune_all_tactics_rubin():
     act = torch.randn(batch_size, m, k, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(batch_size, n, k, dtype=torch.bfloat16, device="cuda")
     expected = torch.bmm(act.float(), weight.transpose(1, 2).float())
+    atol = bf16_matmul_atol(k)
 
     output = torch.empty(batch_size, m, n, dtype=torch.bfloat16, device="cuda")
     with autotune(skip_dynamic_tuning_buckets=True):
         torch.ops.trtllm.cute_dsl_bf16_bmm_rubin(act, weight, output)
     torch.cuda.synchronize()
-    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=atol)
 
     expected_tactics = runner.get_valid_tactics([act, weight, output], None)
     assert any(t[0] == "base" and t[1] is True for t in expected_tactics)
@@ -444,7 +449,7 @@ def test_cute_dsl_bf16_bmm_autotune_all_tactics_rubin():
         captured_output = torch.empty_like(output)
         torch.ops.trtllm.cute_dsl_bf16_bmm_rubin(act, weight, captured_output)
     torch.cuda.synchronize()
-    torch.testing.assert_close(captured_output.float(), expected, rtol=1e-2, atol=1.0)
+    torch.testing.assert_close(captured_output.float(), expected, rtol=1e-2, atol=atol)
 
     tested_tactics = []
     for ((captured_runner, tactic),) in all_tactics:
@@ -453,7 +458,7 @@ def test_cute_dsl_bf16_bmm_autotune_all_tactics_rubin():
         with tuner.replay(((captured_runner, tactic),)):
             torch.ops.trtllm.cute_dsl_bf16_bmm_rubin(act, weight, replay_output)
         torch.cuda.synchronize()
-        torch.testing.assert_close(replay_output.float(), expected, rtol=1e-2, atol=1.0)
+        torch.testing.assert_close(replay_output.float(), expected, rtol=1e-2, atol=atol)
 
     assert tested_tactics == expected_tactics
 
@@ -526,4 +531,7 @@ def test_cute_dsl_bf16_split_k_locality_domain_rubin():
         kernel_variant="base",
         split_k_slices=split_k_slices,
         capture_graph=True,
+        # TMA reduce-add rounds each partial sum and accumulation to BF16,
+        # so account for all slices as well as the reduction length.
+        atol=bf16_matmul_atol(k) * split_k_slices,
     )

@@ -76,7 +76,9 @@ def _make_bare_absorption_mla(
     mla._locality_domain_k_b_proj_trans_shards = None
     mla._locality_domain_v_b_proj_shards = None
     mla._weights_transformed = False
-    mla.kv_b_proj = SimpleNamespace(quant_config=None)
+    mla.kv_b_proj = SimpleNamespace(
+        quant_config=None, partition_plan=SimpleNamespace(enabled=False)
+    )
     mla.num_heads_tp = 2
     mla.num_heads_tp_cp = 2
     mla.qk_nope_head_dim = qk_nope_head_dim
@@ -259,8 +261,10 @@ def test_transform_builds_fresh_localized_absorption_shards(
     with torch.no_grad():
         original_k.fill_(3)
         original_v.fill_(5)
-    mla._weights_transformed = False
-    mla.transform_weights()
+    # The checkpoint loader binds the new V weight after loading kv_b_proj.
+    # It must invalidate the derived shards without a manual flag reset.
+    mla._bind_v_b_proj_weight(original_v)
+    mla.post_load_weights()
 
     rebuilt_k_shards = mla._locality_domain_k_b_proj_trans_shards
     rebuilt_v_shards = mla._locality_domain_v_b_proj_shards
