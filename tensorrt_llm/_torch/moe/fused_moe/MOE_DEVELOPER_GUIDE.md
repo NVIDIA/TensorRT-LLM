@@ -446,7 +446,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
 | NVFP4 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
 | W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121 via `CuteDslB12xFusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
-| W4A8 NVFP4 FP8 | N | Y (SM100/103/107) | N | N | N | N | N | N | N | N |
+| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 FP8 | Y (SM100/103/107) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 MXFP8 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | N | N | Y (SM100/103/107, requires `hidden_size % 512 == 0`) | N | N | N | N |
