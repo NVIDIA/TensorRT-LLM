@@ -221,12 +221,12 @@ untouched.
 
 `keep_rope_precision` controls this:
 
-- Off (default): the whole K vector and the whole V vector become NVFP4. Best
-  ratio.
+- Off (default): the whole K vector and the whole V vector become NVFP4. This
+  gives the highest compression ratio.
 - On: only the NoPE part of the K vector becomes NVFP4. The RoPE part is copied
   into the cold page unchanged, so it keeps the hot cache's precision (FP8 or
   BF16). The V vector still becomes NVFP4 in full. Accuracy improves a little and
-  the ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
+  the compression ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
 
 The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
 series. Any other model ignores it with a warning and quantizes whole vectors; to

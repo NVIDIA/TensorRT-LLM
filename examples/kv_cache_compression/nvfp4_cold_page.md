@@ -381,8 +381,8 @@ the last 64 of the 512 numbers of a DeepSeek-V4 compressed entry. By default the
 turns the whole K vector and the whole V vector into NVFP4. With
 `keep_rope_precision: true`, only the NoPE part of the K vector becomes NVFP4 and
 the RoPE part is copied unchanged, keeping the hot cache's precision; the V
-vector still becomes NVFP4 in full. Accuracy improves a little and the ratio
-drops. For FP8 hot caches: MLA 1.78x to 1.64x, DeepSeek-V4 compressed entry 1.78x
+vector still becomes NVFP4 in full. Accuracy improves a little and the
+compression ratio drops. For FP8 hot caches: MLA 1.78x to 1.64x, DeepSeek-V4 compressed entry 1.78x
 to 1.62x, Qwen3.5 K+V 1.78x to 1.62x; for BF16 hot caches Qwen3.5 goes from 3.56x
 to 2.69x. The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the
 Qwen3.5 series only; other models log a warning and keep quantizing whole
