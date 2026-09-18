@@ -177,9 +177,17 @@ def get_kv_cache_manager_cls(
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
 
-        # Kimi K3's V1 compatibility route uses the unified C++ pool for
-        # block reuse and separate KV / recurrent-state pools otherwise.
-        # V2 and disaggregated serving use the shared hybrid routing below.
+        # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
+        # (CppMambaHybridCacheManager) like the other hybrid linear models —
+        # per-block KDA state snapshots every mamba_state_cache_interval
+        # tokens with FORCE_CHUNK context chunking. Without block reuse the
+        # Mixed manager (separate KV / recurrent-state pools) stays the
+        # default. SA speculative decoding is validated on the Mixed
+        # manager's SpeculativeState scratch path only; reuse + SA is
+        # unvalidated. Disaggregated serving (TRTLLM-14815) routes through
+        # the shared hybrid transceiver validation below: the Python NIXL
+        # transceiver selects the Mixed manager, whose KDA recurrent/conv
+        # states transfer through the bounce buffer.
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
