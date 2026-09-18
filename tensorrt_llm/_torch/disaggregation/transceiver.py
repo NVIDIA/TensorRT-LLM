@@ -127,6 +127,19 @@ def _validate_fp4_mla_bridge_profile(
     return True
 
 
+def _wait_reuse_copies(req: LlmRequest) -> None:
+    """Block until the copies that resuming this request's reused prefix made into its fresh
+    pages are complete (KV cache manager v2, ``py_kv_reuse_copy_event``). The context engine's
+    transfer writes those same pages as soon as the receive is published, so publishing before
+    the copies ran would let them overwrite the transferred partial block and recurrent state
+    with the stale prefix. The copies run on their own stream, so the wait is short."""
+    event = getattr(req, "py_kv_reuse_copy_event", None)
+    if event is None:
+        return
+    event.synchronize()
+    req.py_kv_reuse_copy_event = None
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     @property
     def consumes_transfer_buffer(self) -> bool:
@@ -1036,6 +1049,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             fetches = self._open_peer_source(req)
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
+            _wait_reuse_copies(req)
             fetches.fetch(extent)
             session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
@@ -1119,6 +1133,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
+            _wait_reuse_copies(req)
             fetches.fetch(extent)
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request

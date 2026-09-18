@@ -1170,6 +1170,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0
         self.py_ctx_pre_resize_cap = None
+        # KV cache manager v2: the event after which the copies that resuming a reused prefix
+        # made into this request's fresh pages are complete (see prepare_context_cache).
+        self.py_kv_reuse_copy_event = None
         self._cached_tokens = 0
         self._cached_tokens_set = False
 

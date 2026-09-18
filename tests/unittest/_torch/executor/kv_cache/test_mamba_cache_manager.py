@@ -99,6 +99,7 @@ def _two_chunk_save_last_schedule(monkeypatch):
     # (the default) has its own tests (test_fold_save_last_*).
     monkeypatch.setenv("TLLM_MAMBA_FOLD_SAVE_LAST", "0")
 
+
 def test_advance_replay_state_uses_checkpoint_predicate_and_skips_dummies():
     metadata = ReplayStateUpdateMetadata(
         prev_num_accepted_tokens=torch.tensor([11, 12, 13], dtype=torch.int32),
@@ -2019,6 +2020,60 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
     kv_cache.stop_committing.assert_called_once_with()
 
 
+@skip_no_cuda
+def test_v2_disagg_gen_init_resume_copies_run_on_a_dedicated_stream_and_leave_an_event():
+    """Resuming a generation-init request's reused cache must not put the deferred
+    partial-block / recurrent-state copies on the execution stream: the context
+    engine's transfer writes the same pages as soon as the receive is published,
+    and a copy that ran later would overwrite it. The request carries an event
+    the transceiver waits on before publishing."""
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr._stream = torch.cuda.current_stream()
+    mgr._disagg_gen_init_copy_stream = None
+    mgr._restore_page_index_bufs = MagicMock()
+    execution_stream_handle = object()
+    kv_cache = SimpleNamespace(
+        is_active=False,
+        cuda_stream=execution_stream_handle,
+        resume=MagicMock(return_value=True),
+    )
+    request = SimpleNamespace(py_request_id=7, py_kv_reuse_copy_event=None)
+
+    assert mgr._resume_disagg_gen_init(request, kv_cache) is True
+
+    copy_stream = mgr._disagg_gen_init_copy_stream
+    assert copy_stream is not None and copy_stream != mgr._stream
+    kv_cache.resume.assert_called_once_with(copy_stream.cuda_stream)
+    # the cache goes back to the execution stream so later operations keep their ordering
+    assert kv_cache.cuda_stream == mgr._stream.cuda_stream
+    mgr._restore_page_index_bufs.assert_called_once_with(7, kv_cache)
+    assert isinstance(request.py_kv_reuse_copy_event, torch.cuda.Event)
+    request.py_kv_reuse_copy_event.synchronize()  # recorded on an idle stream: completes at once
+
+    # a second request reuses the stream; a failed resume leaves no event
+    kv_cache2 = SimpleNamespace(
+        is_active=False, cuda_stream=execution_stream_handle, resume=MagicMock(return_value=False)
+    )
+    request2 = SimpleNamespace(py_request_id=8, py_kv_reuse_copy_event=None)
+    assert mgr._resume_disagg_gen_init(request2, kv_cache2) is False
+    assert mgr._disagg_gen_init_copy_stream is copy_stream
+    assert request2.py_kv_reuse_copy_event is None
+    assert kv_cache2.cuda_stream is execution_stream_handle
+
+
+def test_v2_disagg_receive_waits_for_the_reuse_copies_once():
+    from tensorrt_llm._torch.disaggregation.transceiver import _wait_reuse_copies
+
+    event = MagicMock()
+    request = SimpleNamespace(py_kv_reuse_copy_event=event)
+    _wait_reuse_copies(request)
+    event.synchronize.assert_called_once_with()
+    assert request.py_kv_reuse_copy_event is None
+    _wait_reuse_copies(request)  # nothing left to wait for
+    event.synchronize.assert_called_once_with()
+    _wait_reuse_copies(SimpleNamespace())  # a request without the attribute is fine too
+
+
 def test_v2_hybrid_add_dummy_requests_forwards_encoder_output_lens(mocker):
     mgr = object.__new__(MambaHybridCacheManagerV2)
     base_add_dummy_requests = mocker.patch.object(
@@ -3601,8 +3656,7 @@ def test_v2_kda_replay_resets_context_slots():
 
     # The base reset needs a fully built manager (host state indices, batch
     # size, ...); this test only covers the V2 override on top of it.
-    with patch.object(MambaHybridCacheManager,
-                      "_reset_context_mamba_slots") as base_reset:
+    with patch.object(MambaHybridCacheManager, "_reset_context_mamba_slots") as base_reset:
         mgr._reset_context_mamba_slots(num_contexts=1)
 
     base_reset.assert_called_once_with(1)
@@ -4684,20 +4738,17 @@ def _fake_hybrid_for_final_state(raw_ids, slots, primary=7):
 
 def test_final_state_index_resolves_end_of_prompt_block_after_fold_table_reset():
     """prompt_len 90 -> tokens 0..89 -> last token in block 2 -> its slot."""
-    fake, calls = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12],
-                                               slots={12: 300},
-                                               primary=200)  # S1 = stale
-    assert CppMambaHybridCacheManager.get_final_state_index(
-        fake, 42, prompt_len=90) == 300
-    assert calls == [("indices", (42, )), ("slots", (12, ))]
+    fake, calls = _fake_hybrid_for_final_state(
+        raw_ids=[10, 11, 12], slots={12: 300}, primary=200
+    )  # S1 = stale
+    assert CppMambaHybridCacheManager.get_final_state_index(fake, 42, prompt_len=90) == 300
+    assert calls == [("indices", (42,)), ("slots", (12,))]
 
 
 def test_final_state_index_block_aligned_prompt_uses_last_full_block():
     """prompt_len 96 -> last token 95 -> block 2 (not block 3)."""
-    fake, _ = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12],
-                                           slots={12: 301})
-    assert CppMambaHybridCacheManager.get_final_state_index(
-        fake, 42, prompt_len=96) == 301
+    fake, _ = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12], slots={12: 301})
+    assert CppMambaHybridCacheManager.get_final_state_index(fake, 42, prompt_len=96) == 301
 
 
 def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_requests():
@@ -4711,11 +4762,17 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_req
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
     )
-    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=64, save_last_snapshot=True)
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=64, save_last_snapshot=True
+    )
     mgr.tokens_per_block = 32
     mgr.enable_block_reuse = True
-    ctx = SimpleNamespace(prompt_len=150, expect_snapshot_points=[], state=LlmRequestState.CONTEXT_INIT)
-    gen_new = SimpleNamespace(prompt_len=128, expect_snapshot_points=[], state=LlmRequestState.GENERATION_IN_PROGRESS)
+    ctx = SimpleNamespace(
+        prompt_len=150, expect_snapshot_points=[], state=LlmRequestState.CONTEXT_INIT
+    )
+    gen_new = SimpleNamespace(
+        prompt_len=128, expect_snapshot_points=[], state=LlmRequestState.GENERATION_IN_PROGRESS
+    )
     gen_done = SimpleNamespace(
         prompt_len=128,
         expect_snapshot_points=[1, 2, 3],
@@ -4725,7 +4782,9 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_req
     mgr.prepare_expect_snapshot_points([ctx, gen_new, gen_done])
     assert ctx.expect_snapshot_points == [64, 128] and ctx.py_snapshot_points_ready
     assert gen_new.expect_snapshot_points == [64, 96, 128] and gen_new.py_snapshot_points_ready
-    assert gen_done.expect_snapshot_points == [1, 2, 3], "prepared generation-phase request untouched"
+    assert gen_done.expect_snapshot_points == [1, 2, 3], (
+        "prepared generation-phase request untouched"
+    )
     # a context-phase request is recomputed every pass, marker or not
     ctx.expect_snapshot_points = [999]
     mgr.prepare_expect_snapshot_points([ctx])

@@ -1280,6 +1280,14 @@ class KVCacheManagerV2(BaseResourceManager):
             execution_stream if execution_stream is not None else torch.cuda.current_stream()
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
+        # Resuming a cache created from a reuse match copies the matched partial block and
+        # recurrent-state page into the request's fresh pages (deferred copies, kvCache.cpp). For
+        # a disaggregated generation-init request those pages are also the destination of the
+        # context engine's transfer, which may land within milliseconds; on the execution stream
+        # the copies would run only after the queued decode work and overwrite the transferred
+        # data with the stale prefix. They run on this otherwise idle stream instead, and the
+        # transceiver waits for them before it publishes the receive (py_kv_reuse_copy_event).
+        self._disagg_gen_init_copy_stream: Optional[torch.cuda.Stream] = None
 
         # Materialize an exact per-local-layer vector for cache and attention consumers.
         self.max_attention_window_vec = _resolve_v2_max_attention_window_vec(
@@ -3422,16 +3430,46 @@ class KVCacheManagerV2(BaseResourceManager):
                 ]
                 kv_cache.set_base_page_index_buf(i, pool_idx, memoryview(buffer.numpy()))
 
-    def _resume_and_restore(self, req_id: int, kv_cache) -> bool:
+    def _resume_and_restore(
+        self, req_id: int, kv_cache, stream: Optional[torch.cuda.Stream] = None
+    ) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
-        Returns True if the cache is (or becomes) active, False on failure.
+        Returns True if the cache is (or becomes) active, False on failure. ``stream`` carries
+        the copies the resume issues; None means the execution stream.
         """
         if kv_cache.is_active:
             return True
-        if not kv_cache.resume(self._stream.cuda_stream):
+        cuda_stream = self._stream if stream is None else stream
+        if not kv_cache.resume(cuda_stream.cuda_stream):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
+        return True
+
+    def _resume_disagg_gen_init(self, req: LlmRequest, kv_cache) -> bool:
+        """Resume a generation-init request's cache with its reuse copies on the dedicated stream
+        and leave the request an event that marks them complete; the transceiver waits on it
+        before the context engine may write the same pages. See __init__."""
+        # getattr: test doubles build the manager without __init__.
+        execution_stream = getattr(self, "_stream", None)
+        if execution_stream is None or not torch.cuda.is_available():
+            return self._resume_and_restore(req.py_request_id, kv_cache)
+        if kv_cache.is_active:
+            return True
+        copy_stream = getattr(self, "_disagg_gen_init_copy_stream", None)
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=execution_stream.device)
+            self._disagg_gen_init_copy_stream = copy_stream
+        # resume() adopts the stream it is given for the deferred copies.
+        if not kv_cache.resume(copy_stream.cuda_stream):
+            return False
+        # Hand the cache back to the execution stream; the core orders the switch after the
+        # copies, so everything it does on the cache later stays behind them as well.
+        kv_cache.cuda_stream = execution_stream.cuda_stream
+        self._restore_page_index_bufs(req.py_request_id, kv_cache)
+        event = torch.cuda.Event()
+        event.record(copy_stream)
+        req.py_kv_reuse_copy_event = event
         return True
 
     def _context_reuse_tokens(
@@ -3544,7 +3582,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 # `resize_context` can take scratch slots, so it is cleared for
                 # every servable request rather than only the served ones.
                 kv_cache.enable_swa_scratch_reuse = False
-            if not self._resume_and_restore(req.py_request_id, kv_cache):
+            if req.is_disagg_generation_init_state:
+                resumed = self._resume_disagg_gen_init(req, kv_cache)
+            else:
+                resumed = self._resume_and_restore(req.py_request_id, kv_cache)
+            if not resumed:
                 return None
             return kv_cache.num_committed_tokens
 
