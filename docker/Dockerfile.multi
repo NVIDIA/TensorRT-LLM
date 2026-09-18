@@ -28,6 +28,12 @@ LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-so
 # https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html
 ARG SH_ENV="/etc/shinit_v2"
 ENV ENV=${SH_ENV}
+ENV TRTLLM_ORIGINAL_SH_ENV="/etc/tensorrt_llm/original_sh_env.sh"
+RUN mkdir -p /etc/tensorrt_llm && \
+    if [ -f "${ENV}" ] && [ ! -f "${TRTLLM_ORIGINAL_SH_ENV}" ]; then \
+        mv "${ENV}" "${TRTLLM_ORIGINAL_SH_ENV}"; \
+    fi
+COPY docker/common/sh_env_wrapper.sh ${SH_ENV}
 ARG BASH_ENV="/etc/bash.bashrc"
 ENV BASH_ENV=${BASH_ENV}
 
@@ -50,15 +56,6 @@ ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
-
-# Avoid verbose PCI probing logs when Jenkins enables shell xtrace. Run the
-# PyTorch base image's GCP host detection in a subshell so xtrace is restored
-# automatically without changing the detection result.
-RUN --mount=type=bind,source=docker/patches/pytorch_26_08_shinit_v2.patch,target=/tmp/shinit_v2.patch,readonly \
-    if grep -q '^# GCP detection:' "${ENV}"; then \
-        patch --batch --forward --fuzz=0 "${ENV}" /tmp/shinit_v2.patch; \
-    fi
-
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
