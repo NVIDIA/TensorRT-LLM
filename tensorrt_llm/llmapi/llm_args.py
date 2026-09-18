@@ -2690,7 +2690,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch" or backend == "_autodeploy"
+        return backend == "pytorch"
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -2822,7 +2822,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        return backend in ("pytorch", "_autodeploy")
+        return backend == "pytorch"
 
     @property
     def num_capture_layers(self) -> int:
@@ -4584,9 +4584,8 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "each server and is only logged, not surfaced, so keep context and "
         "generation server configurations consistent. 'CPP' selects the C++ "
         "transceiver, 'PYTHON' the Python transceiver. None is equivalent "
-        "to 'CPP'. 'auto' is only resolved on the PyTorch backend's "
-        "standard model-loading path; other paths (e.g. AutoDeploy) fall "
-        "back to the C++ transceiver.")
+        "to 'CPP'. 'auto' is resolved on the PyTorch backend's standard "
+        "model-loading path.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -5089,7 +5088,7 @@ class BaseLlmArgs(StrictBaseModel):
         exclude_json_schema=True,  # hide from API references
         validate_default=True,
         status="deprecated",
-        telemetry=TelemetryField.categorical('pytorch', '_autodeploy'))
+        telemetry=TelemetryField.categorical('pytorch'))
 
     return_perf_metrics: bool = Field(
         default=False,
@@ -5288,9 +5287,8 @@ class BaseLlmArgs(StrictBaseModel):
                     "lora_dir is empty, so custom embedding or lm head will not be applied."
                 )
 
-        if self.enable_lora and self.lora_config is not None and self.backend in [
-                'pytorch', '_autodeploy'
-        ]:
+        if (self.enable_lora and self.lora_config is not None
+                and self.backend == 'pytorch'):
             logger.warning(
                 f"enable_lora is ignored when lora_config is provided for {self.backend} backend."
             )
@@ -6571,20 +6569,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
-        return self
-
-    @model_validator(mode="after")
-    def warn_non_pytorch_checkpoint_io_policy_fallback(self) -> 'TorchLlmArgs':
-        # AutoDeploy does not construct a checkpoint loader. Preserve the
-        # requested policy for telemetry while reporting its native selection.
-        # PyTorch requests are resolved at loader construction, where the actual
-        # format and registered loader implementations are known.
-        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
-                and self.backend != "pytorch"):
-            logger.warning(
-                "Checkpoint I/O policy resolved before loading: "
-                "requested=rank_striped_read_ahead, selected=native, "
-                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")
