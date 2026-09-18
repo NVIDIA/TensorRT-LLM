@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Iterator, Mapping, Sequence
 
 import torch
 import torch.nn as nn
+from torch._prims_common import is_non_overlapping_and_dense_or_false
 
 from tensorrt_llm.logger import logger
 
@@ -144,15 +145,7 @@ class ModuleOffloadManager:
 
     @staticmethod
     def _is_non_overlapping_and_dense(tensor: torch.Tensor) -> bool:
-        """Return whether ``tensor`` densely covers its storage in any dimension order."""
-        expected_stride = 1
-        for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
-            if size <= 1:
-                continue
-            if stride != expected_stride:
-                return False
-            expected_stride *= size
-        return True
+        return is_non_overlapping_and_dense_or_false(tensor)
 
     @staticmethod
     def _storage_key(tensor: torch.Tensor) -> tuple[int, int] | None:
