@@ -666,12 +666,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             for layer_idx in self._shared_draft_layer_ids
             if layer_idx in self.layer_offsets
         ]
-        if self.is_draft or not draft_layers or self.dtype == DataType.NVFP4:
+        if self.is_draft or not draft_layers:
             return
         if self.enable_swa_scratch_reuse:
             raise NotImplementedError(
                 "MiniMax-M3 shared Eagle3 draft layers do not support SWA scratch reuse."
             )
+        if self.dtype == DataType.NVFP4:
+            # Hybrid draft layers use MiniMaxM3DraftSubpageView.
+            return
         # Draft layers run at the target's 128-token pages. trtllm-gen has P128
         # kernels for their dense-GQA shapes but not for every shape, so opt in
         # here rather than in the global allowlist.

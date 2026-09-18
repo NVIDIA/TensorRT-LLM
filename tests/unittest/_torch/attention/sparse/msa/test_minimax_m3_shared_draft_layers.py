@@ -109,7 +109,9 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     assert calls == [("base", [7], 1, None)]
 
 
-def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch):
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("swa_scratch_reuse", [False, True])
+def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch, dtype, swa_scratch_reuse):
     """With per-layer page tables every layer already has its own pool."""
     pointers = torch.tensor([[0x6000_0000 + i, 0] for i in range(61)])
     mapping = torch.tensor([[i, 0] for i in range(61)], dtype=torch.int32)
@@ -122,12 +124,17 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch):
 
     monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", fake_base_prepare)
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
-    manager.dtype = DataType.FP8
+    manager.dtype = dtype
     manager._shared_draft_layer_ids = [DRAFT_LOCAL_LAYER]
     manager.layer_offsets = {i: i for i in range(61)}
     manager.is_draft = False
-    manager.enable_swa_scratch_reuse = False
+    manager.enable_swa_scratch_reuse = swa_scratch_reuse
     manager.tokens_per_block = 128
+
+    if swa_scratch_reuse:
+        with pytest.raises(NotImplementedError, match="SWA scratch reuse"):
+            manager._prepare_page_table_tensor(8)
+        return
 
     manager._prepare_page_table_tensor(8)
 
@@ -135,7 +142,8 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch):
     assert torch.equal(manager.kv_cache_pool_mapping, mapping)
     assert manager.num_attention_op_pools == 61
     assert manager._draft_op_pools == ()
-    assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
+    expected_extra_pages = {128} if dtype == DataType.FP8 else set()
+    assert manager.trtllm_gen_extra_tokens_per_block == frozenset(expected_extra_pages)
 
 
 def test_update_resources_refuses_tree_relocation(monkeypatch):

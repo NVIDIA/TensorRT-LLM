@@ -805,14 +805,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         to msa_kv_lens_staged enforces that. Device-only, capture-safe and
         idempotent; skipped without speculative decoding.
 
-        Three buffers carry the correction to the kernels: msa_seq_lens_cuda,
+        The correction updates msa_seq_lens_cuda,
         which the CuTe DSL scorer, the Triton sparse decode and the trtllm-gen
         dense decode all read their lengths from; msa_out_cache_loc, the K/V
         and index-K write slots; and the per-token valid-block count the top-k
-        selection is bounded by, on whichever buffer this step staged it. The
-        fmha_sm100 plans need no patch: they cover context rows only, whose
-        lengths the correction never touches. msa_max_kv_len is a host upper
-        bound and stays valid as lengths shrink.
+        selection is bounded by, on whichever buffer this step staged it.
+        NVFP4 CSR attention also needs corrected cumulative KV lengths when
+        extend_ctx promotes speculative generation rows into the context prefix.
+        Staged host bounds remain valid upper bounds as lengths shrink.
         """
         super().on_update_kv_lens()
         if not self._msa_fields_ready or not self._msa_kv_lens_dynamic:
@@ -825,6 +825,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # domain as the staged bound and msa_seq_lens_cuda.
         kv_true = torch.minimum(self.kv_lens_cuda[:batch], self.msa_kv_lens_staged[:batch])
         self.msa_seq_lens_cuda[:batch].copy_(kv_true)
+        if self.msa_cu_kv_lens is not None:
+            self.msa_cu_kv_lens[0].zero_()
+            torch.cumsum(kv_true, 0, out=self.msa_cu_kv_lens[1 : batch + 1])
 
         qbr = self.msa_q_batch_row[:total_q].to(torch.long)
         qo_dev = self.seq_lens_cuda[:batch]

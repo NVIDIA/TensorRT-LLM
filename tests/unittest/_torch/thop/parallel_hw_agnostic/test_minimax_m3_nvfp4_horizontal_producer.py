@@ -114,20 +114,26 @@ def _assert_nvfp4_cache_equal(
     expected_k_scale,
     expected_v_scale,
 ):
-    valid_rows = torch.nonzero(slots >= 0, as_tuple=False).flatten()
+    expected_data_pool = torch.zeros_like(data_cache)
+    expected_scale_pool = torch.zeros_like(scale_cache)
+    valid_rows = torch.nonzero(
+        (slots >= 0) & (slots < data_cache.shape[0] * 128), as_tuple=False
+    ).flatten()
     for row in valid_rows.tolist():
         page, within = divmod(int(slots[row].item()), 128)
-        assert torch.equal(data_cache[page, 0, :, within], expected_k_data[row])
-        assert torch.equal(data_cache[page, 1, :, within], expected_v_data[row])
-        assert torch.equal(scale_cache[page, 0, :, within], expected_k_scale[row])
+        expected_data_pool[page, 0, :, within] = expected_k_data[row]
+        expected_data_pool[page, 1, :, within] = expected_v_data[row]
+        expected_scale_pool[page, 0, :, within] = expected_k_scale[row]
         for head in range(data_cache.shape[2]):
-            v_region = scale_cache[page, 1, head].view(-1)
+            v_region = expected_scale_pool[page, 1, head].view(-1)
             offsets = (
                 (within // 4) * 32
                 + torch.arange(8, device="cuda", dtype=torch.long) * 4
                 + within % 4
             )
-            assert torch.equal(v_region[offsets], expected_v_scale[row, head])
+            v_region[offsets] = expected_v_scale[row, head]
+    assert torch.equal(data_cache, expected_data_pool)
+    assert torch.equal(scale_cache, expected_scale_pool)
 
 
 @pytest.mark.parametrize(
@@ -171,6 +177,8 @@ def test_minimax_m3_nvfp4_horizontal_producer_matches_production_quantize(
     )
     if num_tokens > 1:
         slots[-1] = -1
+    if num_tokens > 2:
+        slots[-2] = num_pages * 128
     rope_cache = _rope_cache(512)
 
     main_width = (num_heads_q + 2 * num_kv_heads) * 128
@@ -236,7 +244,14 @@ def test_minimax_m3_nvfp4_horizontal_producer_matches_production_quantize(
             position_ids,
         )
     )
-    data_cache, scale_cache, index_cache = _nvfp4_caches(num_pages, num_kv_heads)
+    # Keep guard pages around the exposed pools so rejected slots cannot
+    # silently corrupt an adjacent allocation.
+    data_pool, scale_pool, index_pool = _nvfp4_caches(num_pages + 2, num_kv_heads)
+    data_cache, scale_cache, index_cache = (
+        pool[1:-1] for pool in (data_pool, scale_pool, index_pool)
+    )
+    # Singleton-head strides do not participate in index-K addressing.
+    index_cache = index_cache.as_strided(index_cache.shape, (index_cache.stride(0), 1, 128, 1))
     q, index_q = _run_nvfp4(
         packed,
         data_cache,
@@ -256,13 +271,17 @@ def test_minimax_m3_nvfp4_horizontal_producer_matches_production_quantize(
 
     assert torch.equal(q.view(torch.uint8), q_reference.view(torch.uint8))
     assert torch.equal(index_q.view(torch.uint8), index_q_reference.view(torch.uint8))
-    valid = slots >= 0
+    valid = (slots >= 0) & (slots < num_pages * 128)
     pages = slots[valid].long() // 128
     within = slots[valid].long() % 128
     assert torch.equal(
         index_cache[pages, :, within].view(torch.uint8),
         fp8_index_cache[pages, :, within].view(torch.uint8),
     )
+    assert torch.equal(index_cache.view(torch.uint8), fp8_index_cache.view(torch.uint8))
+    for pool in (data_pool, scale_pool, index_pool.view(torch.uint8)):
+        assert torch.count_nonzero(pool[0]).item() == 0
+        assert torch.count_nonzero(pool[-1]).item() == 0
     _assert_nvfp4_cache_equal(
         data_cache,
         scale_cache,
@@ -274,8 +293,22 @@ def test_minimax_m3_nvfp4_horizontal_producer_matches_production_quantize(
     )
 
 
-def test_minimax_m3_nvfp4_horizontal_producer_rejects_mismatched_page_counts() -> None:
-    num_tokens, num_heads_q, num_kv_heads, num_pages = 1, 16, 1, 4
+@pytest.mark.parametrize(
+    "invalid_input,error",
+    [
+        ("page_count", "same number of pages"),
+        ("index_page_overlap", "pages must not overlap"),
+        ("index_page_alignment", "32-bit FP8 store alignment"),
+        ("packed_alignment", "8-byte-aligned"),
+        ("data_alignment", "aligned addresses"),
+        ("index_alignment", "aligned addresses"),
+        ("launch_geometry", "launch geometry exceeds int32"),
+    ],
+)
+def test_minimax_m3_nvfp4_horizontal_producer_rejects_invalid_inputs(
+    invalid_input: str, error: str
+) -> None:
+    num_tokens, num_heads_q, num_kv_heads, num_pages = 2, 16, 1, 4
     total_heads = num_heads_q + 3 * num_kv_heads + 1
     packed = torch.randn(
         num_tokens,
@@ -290,12 +323,33 @@ def test_minimax_m3_nvfp4_horizontal_producer_rejects_mismatched_page_counts() -
     rope_cache = _rope_cache(8)
     position_ids = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
 
-    with pytest.raises(RuntimeError, match="same number of pages"):
+    if invalid_input == "page_count":
+        index_cache = index_cache[:-1]
+    elif invalid_input.startswith("index_page_"):
+        page_stride = 128 * 128 + (1 if invalid_input.endswith("alignment") else -4)
+        index_cache = index_cache.as_strided(index_cache.shape, (page_stride, 1, 128, 1))
+    elif invalid_input == "packed_alignment":
+        packed = torch.empty(packed.numel() + 1, dtype=packed.dtype, device="cuda")[1:].view_as(
+            packed
+        )
+    elif invalid_input == "data_alignment":
+        data_cache = torch.empty(data_cache.numel() + 1, dtype=data_cache.dtype, device="cuda")[
+            1:
+        ].view_as(data_cache)
+    elif invalid_input == "index_alignment":
+        index_cache = torch.empty(index_cache.numel() + 1, dtype=index_cache.dtype, device="cuda")[
+            1:
+        ].view_as(index_cache)
+    elif invalid_input == "launch_geometry":
+        # Rejected before checking the packed width or allocating outputs.
+        num_heads_q = 1 << 30
+
+    with pytest.raises(RuntimeError, match=error):
         _run_nvfp4(
             packed,
             data_cache,
             scale_cache,
-            index_cache[:-1],
+            index_cache,
             slots,
             inv_scales,
             num_heads_q,

@@ -446,11 +446,15 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
         "Index-K and main NVFP4 caches must contain the same number of pages");
     TORCH_CHECK(indexKCache.stride(3) == 1 && indexKCache.stride(2) == kHeadDim,
         "Index-K cache must have contiguous token rows");
+    TORCH_CHECK(
+        indexKCache.stride(0) >= indexKCache.size(2) * indexKCache.stride(2), "Index-K cache pages must not overlap");
+    TORCH_CHECK(indexKCache.stride(0) % 4 == 0, "Index-K cache page stride must preserve 32-bit FP8 store alignment");
     TORCH_CHECK(rotaryCosSin.dim() == 3 && rotaryCosSin.size(1) == 2 && rotaryCosSin.size(2) == kRotaryDim / 2,
         "rotary_cos_sin must be [max_positions, 2, rotary_dim/2]");
 
     int64_t const numTokens = packed.size(0);
     int64_t const totalHeads = numHeadsQ + 2 * numHeadsKV + numHeadsIndex + 1;
+    checkMinimaxM3Int32LaunchGeometry(numTokens, totalHeads);
     TORCH_CHECK(
         packed.size(1) == totalHeads * headDim, "Packed tensor width must equal (Q + 2*KV + index-Q + 1) * head_dim");
     TORCH_CHECK(outCacheLoc.numel() >= numTokens, "out_cache_loc is shorter than num_tokens");
@@ -458,6 +462,11 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     TORCH_CHECK(qWeight.numel() == headDim && kWeight.numel() == headDim && indexQWeight.numel() == headDim
             && indexKWeight.numel() == headDim,
         "All norm weights must contain head_dim elements");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(packed.data_ptr()) % 8 == 0,
+        "Packed input must start at an 8-byte-aligned address for vectorized BF16 loads");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(kvDataCache.data_ptr()) % 2 == 0
+            && reinterpret_cast<uintptr_t>(indexKCache.data_ptr()) % 4 == 0,
+        "Paged caches must start at aligned addresses for packed stores");
     TORCH_CHECK(packed.get_device() == kvDataCache.get_device() && packed.get_device() == kvScaleCache.get_device()
             && packed.get_device() == indexKCache.get_device() && packed.get_device() == outCacheLoc.get_device()
             && packed.get_device() == kvQuantScale.get_device() && packed.get_device() == positionIds.get_device()
@@ -479,11 +488,12 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
         indexQOut.data_ptr(), kvDataCache.data_ptr(), kvScaleCache.data_ptr(), indexKCache.data_ptr(),
         outCacheLoc.data_ptr<int>(), kvQuantScale.data_ptr<float>(), kvDataCache.stride(0), kvDataCache.stride(1),
         kvDataCache.stride(2), kvDataCache.stride(3), kvScaleCache.stride(0), kvScaleCache.stride(1),
-        kvScaleCache.stride(2), indexKCache.stride(0), indexKCache.stride(2), static_cast<int>(kvDataCache.size(3)),
-        static_cast<int>(numTokens), static_cast<int>(numHeadsQ), static_cast<int>(numHeadsKV),
-        static_cast<int>(numHeadsIndex), static_cast<int>(headDim), static_cast<int>(rotaryDim),
-        static_cast<float>(eps), qWeight.data_ptr(), kWeight.data_ptr(), indexQWeight.data_ptr(),
-        indexKWeight.data_ptr(), rotaryCosSin.data_ptr<float>(), positionIds.data_ptr<int>(), stream);
+        kvScaleCache.stride(2), indexKCache.stride(0), indexKCache.stride(2), kvDataCache.size(0),
+        static_cast<int>(kvDataCache.size(3)), static_cast<int>(numTokens), static_cast<int>(numHeadsQ),
+        static_cast<int>(numHeadsKV), static_cast<int>(numHeadsIndex), static_cast<int>(headDim),
+        static_cast<int>(rotaryDim), static_cast<float>(eps), qWeight.data_ptr(), kWeight.data_ptr(),
+        indexQWeight.data_ptr(), indexKWeight.data_ptr(), rotaryCosSin.data_ptr<float>(), positionIds.data_ptr<int>(),
+        stream);
     return {qOut, indexQOut};
 }
 

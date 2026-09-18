@@ -702,7 +702,7 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
     the two by a wide margin; reading the wrong scale bytes fails it well
     before the loose envelope notices.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.msa_sparse_gqa import run_msa_nvfp4_sparse_gqa
+    from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_nvfp4_sparse_gqa
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         require_msa_module,
     )
@@ -728,8 +728,14 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
         _msa_total_k_rows=sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens),
         msa_block_table=case.block_table,
         msa_seq_lens_cuda=case.seq_lens,
-        num_contexts=0,
-        num_generations=batch,
+        num_contexts=2,
+        _msa_context_prefix_bounds=(
+            1,
+            max(seq_lens[:2]),
+            sum(seq_lens[:2]),
+            sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens[:2]),
+        ),
+        num_generations=batch - 2,
     )
 
     triton_out = _run_nvfp4(case)
@@ -746,6 +752,25 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
         v_global_scale=case.scales["v_global_scale"],
         out=msa_out,
     )
+
+    # A mixed step sends only its context prefix to CSR prefill. The longer
+    # generation suffix must not affect the prefix worklist or output.
+    prefix_rows = metadata.num_contexts
+    prefix_out = torch.empty_like(msa_out[:prefix_rows])
+    run_msa_nvfp4_sparse_gqa(
+        case.q[:prefix_rows],
+        case.k_paged,
+        case.v_paged,
+        case.scale_pool,
+        case.topk_idx[:, :prefix_rows].permute(1, 0, 2).contiguous(),
+        metadata,
+        sm_scale=HEAD_DIM**-0.5,
+        k_global_scale=case.scales["k_global_scale"],
+        v_global_scale=case.scales["v_global_scale"],
+        num_rows=prefix_rows,
+        out=prefix_out,
+    )
+    torch.testing.assert_close(prefix_out, msa_out[:prefix_rows], rtol=1e-2, atol=1e-2)
 
     # A layout error makes K/V effectively random, so the two would disagree by
     # O(1) rather than by MSA's FP8 rounding.

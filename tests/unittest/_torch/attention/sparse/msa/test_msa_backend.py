@@ -1501,7 +1501,8 @@ def _kv_lens_update_metadata(
     return metadata
 
 
-def test_on_update_kv_lens_rederives_lengths_slots_and_counts(monkeypatch):
+@pytest.mark.parametrize("nvfp4", [False, True])
+def test_on_update_kv_lens_rederives_lengths_slots_and_counts(monkeypatch, nvfp4):
     """Request 0 loses one rejected draft token (staged 9 -> corrected 8), request 1
     is unchanged. The per-request length the decode kernels read, the write
     slots and the per-token valid-block counts must all follow.
@@ -1510,7 +1511,17 @@ def test_on_update_kv_lens_rederives_lengths_slots_and_counts(monkeypatch):
         monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
     )
 
+    if nvfp4:
+        # Both rows are in the context prefix when extend_ctx is active.
+        metadata.num_contexts = 2
+        metadata.msa_cu_kv_lens = torch.tensor([0, 9, 21, -1], dtype=torch.int32)
+        metadata.msa_cu_q_lens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
     metadata.on_update_kv_lens()
+    metadata.on_update_kv_lens()  # Corrections must be idempotent.
+    if nvfp4:
+        assert metadata.msa_cu_kv_lens.tolist() == [0, 8, 20, -1]
+        assert metadata.msa_cu_q_lens.tolist() == [0, 2, 5]
 
     # One length per request, in the buffer every decode kernel reads.
     assert metadata.msa_seq_lens_cuda.tolist() == [8, 12]
@@ -1751,10 +1762,14 @@ def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
     packed_dim, scale_cols = head_dim // 2, head_dim // 16
     shape = (num_slots, pages_per_role, num_heads, physical_page, packed_dim)
     scale_shape = (num_slots, pages_per_role, num_heads, physical_page, scale_cols)
-    k_cache = torch.zeros(shape, dtype=torch.uint8, device="cuda")
-    v_cache = torch.zeros_like(k_cache)
-    k_scale_cache = torch.zeros(scale_shape, dtype=torch.uint8, device="cuda")
-    v_scale_cache = torch.zeros_like(k_scale_cache)
+    # Guard slots on either side make an invalid-row write observable without
+    # touching another allocation, even if the kernel's write mask regresses.
+    k_backing = torch.zeros((num_slots + 2, *shape[1:]), dtype=torch.uint8, device="cuda")
+    v_backing = torch.zeros_like(k_backing)
+    ksf_backing = torch.zeros((num_slots + 2, *scale_shape[1:]), dtype=torch.uint8, device="cuda")
+    vsf_backing = torch.zeros_like(ksf_backing)
+    k_cache, v_cache = k_backing[1:-1], v_backing[1:-1]
+    k_scale_cache, v_scale_cache = ksf_backing[1:-1], vsf_backing[1:-1]
     slots = torch.tensor([0, 31, 32, 127, 128, -1], dtype=torch.int32, device="cuda")
     k = torch.randn(slots.numel(), head_dim, dtype=torch.bfloat16, device="cuda")
     v = torch.randn_like(k)
@@ -1820,13 +1835,27 @@ def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
     expected_ksf = expected_ksf.view(slots.numel(), 1, scale_cols)
     expected_vsf = expected_vsf.view(slots.numel(), 1, scale_cols)
 
-    for row, slot in enumerate(slots[:-1].tolist()):
+    expected_k_pool = torch.zeros_like(k_cache)
+    expected_v_pool = torch.zeros_like(v_cache)
+    expected_ksf_pool = torch.zeros_like(k_scale_cache)
+    expected_vsf_pool = torch.zeros_like(v_scale_cache)
+    for row, slot in enumerate(slots.tolist()):
+        if slot < 0:
+            continue
         logical_page, logical_within = divmod(slot, 128)
         subpage, within = divmod(logical_within, physical_page)
-        assert torch.equal(k_cache[logical_page, subpage, 0, within], expected_k[row, 0])
-        assert torch.equal(v_cache[logical_page, subpage, 0, within], expected_v[row, 0])
-        assert torch.equal(k_scale_cache[logical_page, subpage, 0, within], expected_ksf[row, 0])
-        v_region = v_scale_cache[logical_page, subpage, 0].view(-1)
+        expected_k_pool[logical_page, subpage, 0, within] = expected_k[row, 0]
+        expected_v_pool[logical_page, subpage, 0, within] = expected_v[row, 0]
+        expected_ksf_pool[logical_page, subpage, 0, within] = expected_ksf[row, 0]
+        v_region = expected_vsf_pool[logical_page, subpage, 0].view(-1)
         offsets = torch.arange(scale_cols, device="cuda") * 4
         offsets += (within // 4) * (4 * scale_cols) + within % 4
-        assert torch.equal(v_region[offsets], expected_vsf[row, 0])
+        v_region[offsets] = expected_vsf[row, 0]
+
+    assert torch.equal(k_cache, expected_k_pool)
+    assert torch.equal(v_cache, expected_v_pool)
+    assert torch.equal(k_scale_cache, expected_ksf_pool)
+    assert torch.equal(v_scale_cache, expected_vsf_pool)
+    for backing in (k_backing, v_backing, ksf_backing, vsf_backing):
+        assert torch.count_nonzero(backing[0]).item() == 0
+        assert torch.count_nonzero(backing[-1]).item() == 0

@@ -1631,8 +1631,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         model_config.spec_config.speculative_model,
                         **external_drafter_config_kwargs(
                             model_config, spec_config))
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
