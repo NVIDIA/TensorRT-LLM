@@ -17,14 +17,21 @@
     pytest --collect-only -p qa_selection.plugin --machine=B200 --gpus=4 --ladder=1,4,8
 
 Load with `-p` on the command line. No hardware is touched: every decision
-is read from marks. The logic lives in `collection.py`; this file is hooks only.
+is read from marks. The logic lives in `collection.py` and `report.py`; this file is hooks only.
 """
 
+from pathlib import Path
 from typing import List
 
 import pytest
 
 from .collection import ResourceMarkers, Selection, SelectionOptions, SelectionRequest
+from .report import Artifacts, SelectionReport, TerminalSummary
+
+# Kept on the config stash rather than at module level: a plugin module is
+# imported once per process, but a config is per session.
+REPORT_KEY = pytest.StashKey()
+WRITTEN_KEY = pytest.StashKey()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -58,3 +65,29 @@ def pytest_collection_modifyitems(config: pytest.Config, items: List[pytest.Item
     if dropped:
         config.hook.pytest_deselected(items=dropped)
     items[:] = kept
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Build the record and write the artifacts, once collection is settled.
+
+    Here rather than in `modifyitems` so every other plugin's deselection has
+    already happened, and so the files exist before `--collect-only` prints.
+    """
+    config = session.config
+    selection = config.stash.get(Selection.STASH_KEY, None)
+    if selection is None:
+        return
+
+    report = SelectionReport.of(selection, Path(str(config.rootpath)))
+    config.stash[REPORT_KEY] = report
+    out_dir = selection.request.out_dir
+    config.stash[WRITTEN_KEY] = Artifacts.write(report, out_dir) if out_dir else []
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """Render the human-readable block after pytest's own counts."""
+    report = terminalreporter.config.stash.get(REPORT_KEY, None)
+    if report is None:
+        return
+    written = terminalreporter.config.stash.get(WRITTEN_KEY, [])
+    TerminalSummary.render(terminalreporter, report, written)
