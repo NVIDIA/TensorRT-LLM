@@ -1,0 +1,72 @@
+version: 0.0.1
+llm_func_core_ada:
+
+# ==========================================================================
+# T1  compute_capability >= 8.9  (Ada and above)
+# ==========================================================================
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+      compute_capability:
+        gte: 8.9
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- Qwen3/Qwen3-30B-A3B
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
+  # ---- nvidia/NVIDIA-Nemotron-Nano-9B-v2
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
+  # ---- nvidia/Nemotron-3-Nano
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=1]
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- llmapi/test_llm_api_pytorch_moe_lora.py
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[eager] TIMEOUT (90)
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+      compute_capability:
+        gte: 8.9
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=True-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=True-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]

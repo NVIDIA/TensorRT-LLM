@@ -1,0 +1,243 @@
+version: 0.0.1
+llm_func_core_base:
+
+# ==========================================================================
+# T0  no compute_capability floor
+# ==========================================================================
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- Qwen/Qwen3-VL-8B-Instruct
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL::test_auto_dtype[forced_chunked_prefill]
+  # ---- Qwen3/Qwen3-30B-A3B
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-CUTLASS]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
+  # ---- Qwen3/Qwen3-8B
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=False]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
+  # ---- TestNanoV3Omni
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
+  # ---- meta-llama/Llama-3.1-8B
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton-False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-True-1]
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=FLASHINFER]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=FLASHINFER]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_format
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[llguidance]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
+  # ---- mistralai/Mistral-Small-3.1-24B-Instruct-2503
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralSmall24B::test_auto_dtype[forced_chunked_prefill]
+  # ---- nvidia/NVIDIA-Nemotron-Nano-9B-v2
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
+  # ---- nvidia/Nemotron-3-Nano
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-attn_dp_off-trtllm]
+  # ---- poolside/Laguna-XS-2.1
+  - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- TestDecoderEncode
+  - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[tinyllama-1.1b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[gemma-3-1b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen2-7b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen3-0.6b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[tinyllama-1.1b]
+  # ---- TestEncoderEncode
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-eager]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_per_token_reward[qwen2.5-prm-7b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-0.6b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-8b]
+  # ---- TestServePrefixAwareScheduling
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
+  # ---- disaggregated/test_disaggregated.py
+  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_sa[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
+  # ---- disaggregated/test_disaggregated_single_gpu.py
+  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[True-False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct]
+  # ---- disaggregated/test_workers.py
+  - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
+  # ---- llmapi/test_llm_api_pytorch_moe_lora.py
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (90)
+  # ---- llmapi/test_llm_examples.py
+  - llmapi/test_llm_examples.py::test_llmapi_server_example
+  # ---- test_e2e.py
+  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
+  - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  # ---- unittest/disaggregated/test_cache_transceiver_single_process.py
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
+  # ---- unittest/llmapi/apps/_test_openai_embeddings.py
+  - unittest/llmapi/apps/_test_openai_embeddings.py
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- Qwen/Qwen2-7B-Instruct
+  - accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_tp2
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
+  - accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_auto_scaling.py
+  - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-kv_cache_aware]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-kv_cache_aware]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- meta-llama/Llama-3.1-8B
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[4]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=2]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=2-ctx_pp=2]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=2]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp1pp2]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp2pp1]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp1]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[pp4-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[pp4-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=FLASHINFER-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=FLASHINFER-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[llguidance]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar]
+  # ---- nvidia/Nemotron-3-Nano
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-attn_dp_off-trtllm]
+  # ---- nvidia/Nemotron-Super-V3
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[bf16-4-attn_dp_off-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[bf16-4-attn_dp_on-trtllm]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=CUTLASS]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
+  # ---- nvidia/Nemotron-Ultra-V3
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_online_eplb[moe_backend=CUTLASS]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- TestModelRegistryAccuracy
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[Qwen_QwQ-32B-False]
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.3-70B-Instruct-False]
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Codestral-22B-v0.1-False]
+  # ---- disaggregated/test_ad_disagg.py
+  - disaggregated/test_ad_disagg.py::test_async_sharded_generation_handoff
+  # ---- disaggregated/test_disaggregated.py
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct]
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- Qwen3/Qwen3-8B
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[multi_gpus_no_cache]
+
+# 8 GPUs on ONE node. Excluded from multi-node allocations (GB200/GB300 satisfy 8 as 2 nodes x 4).
+- condition:
+    terms:
+      placement: single_node
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+  tests:
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_disaggregated.py
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0]
