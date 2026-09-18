@@ -101,6 +101,9 @@ class PostprocWorker:
         decoding_iter: int = 0
         avg_decoded_tokens_per_iter: Optional[float] = None
         cached_tokens: int = 0
+        ctx_computed_tokens: int = 0
+        ctx_first_begin: int = -1
+        ctx_num_chunks: int = 0
 
     def __init__(
         self,
@@ -285,6 +288,10 @@ class PostprocWorker:
                             None),
                         cached_tokens=getattr(response_result, "cached_tokens",
                                               0),
+                        ctx_computed_tokens=getattr(response_result,
+                                                    "ctx_computed_tokens", 0),
+                        ctx_first_begin=getattr(response_result, "ctx_first_begin", -1),
+                        ctx_num_chunks=getattr(response_result, "ctx_num_chunks", 0),
                     ))
                 if is_final:
                     self._records.pop(client_id, None)

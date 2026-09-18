@@ -84,10 +84,12 @@ class RpcExecutorMixin:
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
+        # Register the result BEFORE the fire-and-forget send. The response
+        # loop runs on another thread and drops responses whose client_id is
+        # not in _results, so a request that completes before this thread
+        # reaches the registration (a short generation, or the submitter
+        # stalled between the two statements) would otherwise lose its final
+        # response and the caller would wait for it forever.
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -96,6 +98,16 @@ class RpcExecutorMixin:
             logprob_params=logprob_params,
         )
         self._results[request.id] = result
+
+        # submit is a fire-and-forget operation, don't need to wait for response
+        try:
+            with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                self.rpc_client.submit(request).remote(need_response=False)
+        except Exception:
+            # The request never reached the worker: drop the registration so
+            # the id does not linger in _results.
+            self._results.pop(request.id, None)
+            raise
 
         return result
 
