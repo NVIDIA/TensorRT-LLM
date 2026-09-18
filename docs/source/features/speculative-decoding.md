@@ -56,7 +56,7 @@ Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where th
 
 To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingConfig` and provide the following parameters:
 
-* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation. Mutually exclusive with `eagle_choices` (static tree).
+* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation.
 * `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
 * `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
 
@@ -165,6 +165,8 @@ speculative_config = DFlashDecodingConfig(
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
+
+[DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes

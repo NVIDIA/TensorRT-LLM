@@ -85,14 +85,28 @@ Models that select the V2 manager by default:
 
 | Model | Reason |
 | --- | --- |
-| Hybrid Mamba (NemotronH, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
+| Hybrid Mamba (NemotronH and its multimodal models, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
 | DeepSeek-V4 | Sparse attention attaches auxiliary per-layer buffers |
 | GPT-OSS | Sliding window on every other layer (VSWA), so the sliding-window and full-attention pools are sized independently |
 | Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing |
+| Llama / Llama4 | Uniform KV pool layout; chunked attention does not partition the pools |
 
 Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
 unified pool, so `use_kv_cache_manager_v2` does not apply to them.
+
+For a model whose `layer_types` mixes sliding-window and full-attention layers
+and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager
+derives one attention window per layer from `layer_types` when
+`max_attention_window` is not set: sliding layers get `sliding_window`, full
+layers get `max_seq_len`, and the two window sizes form two layer groups whose
+pools are sized independently. The derived list is logged at startup. Set
+`max_attention_window` explicitly to override the derivation; a single entry
+restores one full-context pool for every layer. With derived windows,
+`pool_ratio` must carry one entry per layer group (two for such a model). If a
+configured `pool_ratio` does not match the derived group count, the manager
+logs a warning and keeps the single-window default, so existing configurations
+continue to run.
 
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
@@ -138,7 +152,7 @@ layer group in layer-group ID order.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
-`MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
+`MambaHybridCacheManagerV2` and `max_beam_width=1`. Hybrid
 Mamba models select V2 by default (see
 [Selecting the KV Cache Manager](#selecting-the-kv-cache-manager)); set
 `use_kv_cache_manager_v2` to `false` to select the V1 C++

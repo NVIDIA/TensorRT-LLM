@@ -27,9 +27,9 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
                                        check_output, print_info, print_warning)
 
 from .common import get_mmlu_accuracy, venv_check_call
-from .conftest import (get_device_count, get_sm_version, llm_models_root,
-                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                       skip_pre_hopper, unittest_path)
+from .conftest import (get_sm_version, llm_models_root, skip_post_blackwell,
+                       skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
+                       unittest_path)
 
 _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8
@@ -1069,65 +1069,6 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
     ])
 
 
-@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
-    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
-     "EAGLE3-LLaMA3.1-Instruct-8B"),
-])
-def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
-                                                     model_name, model_path,
-                                                     eagle_model_path):
-    print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--prompt",
-        "You are a good assistant. Please tell me the capital of France is",
-        "--spec_decode_max_draft_len",
-        "3",
-        "--spec_decode_algo",
-        "eagle3",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--draft_model_dir",
-        f"{llm_models_root()}/{eagle_model_path}",
-        "--disable_kv_cache_reuse",
-        "--disable_overlap_scheduler",
-        "--eagle_choices",
-        "[[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [2, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]]",
-        "--kv_cache_fraction",
-        "0.4",
-    ])
-
-
-@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
-    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
-     "EAGLE3-LLaMA3.1-Instruct-8B"),
-])
-def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
-        llm_root, llm_venv, model_name, model_path, eagle_model_path):
-    print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--prompt",
-        "You are a good assistant. Please tell me the capital of France is",
-        "--spec_decode_max_draft_len",
-        "3",
-        "--spec_decode_algo",
-        "eagle3",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--draft_model_dir",
-        f"{llm_models_root()}/{eagle_model_path}",
-        "--disable_kv_cache_reuse",
-        "--disable_overlap_scheduler",
-        "--eagle_choices",
-        "[[0], [1], [2]]",
-        "--kv_cache_fraction",
-        "0.4",
-    ])
-
-
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
 ])
@@ -1359,32 +1300,6 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
     finally:
         if os.path.exists(extra_config_path):
             os.remove(extra_config_path)
-
-
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    pytest.param('DeepSeek-V3-671B-FP8',
-                 'DeepSeek-V3-0324',
-                 8,
-                 marks=(skip_post_blackwell,
-                        pytest.mark.skip_less_device_memory(140000))),
-])
-def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
-                                            model_path, gpu_count):
-    print(f"Testing {model_name}.")
-    if gpu_count > get_device_count():
-        pytest.skip(f"Not enough GPUs for {model_name}")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    mapping = {"DeepSeek-V3-671B-FP8": 83.8}
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--enable_chunked_prefill",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        f"--tp_size={gpu_count}",
-        "--max_batch_size=32",
-        "--max_num_tokens=256",
-    ])
 
 
 @skip_pre_hopper

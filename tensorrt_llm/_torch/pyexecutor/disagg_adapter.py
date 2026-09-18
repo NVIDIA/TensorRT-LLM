@@ -32,6 +32,20 @@ class PyExecutorEffects(ExecutorEffects):
             error_msg=error_msg, requests=requests, charge_budget=charge_budget
         )
 
+    def fail_fatal(self, error_msg: str) -> None:
+        executor = self._executor
+        executor._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
+        executor.is_shutdown = True
+        executor._handle_errors(
+            error_msg, requests=None, charge_budget=False, fatal_is_collective_aligned=True
+        )
+
+    def prepare_gen_resources(self, requests: List[LlmRequest]) -> None:
+        self._executor._prepare_disagg_gen_resources(requests)
+
+    def revert_ctx_alloc(self, requests: List[LlmRequest]) -> None:
+        self._executor._revert_ctx_alloc(requests)
+
 
 class PyExecutorRequestRegistry(ActiveRequestRegistry):
     def __init__(self, executor: "PyExecutor") -> None:

@@ -62,6 +62,7 @@ class _StatsRequest:
     draft_tokens: list[int] = field(default_factory=list)
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
+    py_connector_served_position: int = 0
     context_chunk_size: int = 0
     expect_snapshot_points: list[int] = field(default_factory=list)
     prepopulated_prompt: tuple[int, int] | None = None

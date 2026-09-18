@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    MAMBA_CONV_ROLE,
+    AttentionLayerGroup,
+    MambaLayerGroup,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -766,6 +770,7 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
 
 def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import NemotronHMultimodalModel
     from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 
@@ -777,7 +782,12 @@ def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     ):
         monkeypatch.delenv(env_var, raising=False)
 
-    for model_cls in (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel):
+    for model_cls in (
+        NemotronHForCausalLM,
+        Qwen3NextForCausalLM,
+        Qwen3_5VLModel,
+        NemotronHMultimodalModel,
+    ):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
@@ -933,10 +943,23 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
         py_request_id=123,
     )
 
-    kv_slice = transceiver._create_kv_slice(request)
+    chunk = transceiver._create_chunk(request)
 
     # No mamba layer group → no STATE entries in block_ids
-    assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
+    assert all(ids.size == 0 for ids in chunk.block_ids_per_layer_groups)
+
+
+def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_tokens():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 1
+    # The incoming recurrent state replaces the whole local slot, so nothing survives as a hit.
+    assert manager._disagg_transfer_overwrites_whole_cached_prefix()
+
+
+def test_v2_disagg_gen_init_without_local_mamba_layers_keeps_complete_blocks():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 0
+    assert not manager._disagg_transfer_overwrites_whole_cached_prefix()
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
@@ -948,7 +971,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
-    # Provide a mamba layer group so _create_kv_slice places the slot ID
+    # Provide a mamba layer group so _create_chunk places the slot ID
     mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
@@ -960,10 +983,10 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         py_request_id=123,
     )
 
-    kv_slice = transceiver._create_kv_slice(request)
+    chunk = transceiver._create_chunk(request)
 
     # Slot index 7 should be in the STATE group's block_ids
-    assert kv_slice.block_ids_per_layer_groups[0][0] == 7
+    assert chunk.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
 
@@ -971,8 +994,13 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     "max_beam_width, has_connector, expected",
     [
         (2, False, "max_beam_width > 1"),
-        (1, True, "kv_connector_manager"),
-        (2, True, "kv_connector_manager, max_beam_width > 1"),
+        # A KV connector alone no longer forces a fallback: it is supported
+        # through the pool-layout registration path, so the manager is returned
+        # unchanged and nothing is raised.
+        (1, True, None),
+        # With beam search still incompatible, the connector must not appear in
+        # the reason list -- it is not what makes this configuration unsupported.
+        (2, True, "max_beam_width > 1"),
     ],
 )
 def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
@@ -990,6 +1018,15 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+
+    if expected is None:
+        assert (
+            creator._validate_or_fallback_kv_cache_manager_v2(
+                MambaHybridCacheManagerV2, model_config, KvCacheConfig()
+            )
+            is MambaHybridCacheManagerV2
+        )
+        return
 
     with pytest.raises(NotImplementedError, match=expected):
         creator._validate_or_fallback_kv_cache_manager_v2(
@@ -1797,6 +1834,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -1827,6 +1865,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -2054,6 +2093,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr._generation_kv_capacity_headroom = 1
         mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
         mgr.head_dim_per_layer = [64, 64]
@@ -2091,7 +2131,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         config = mgr._build_cache_config(base_config)
         runtime_manager = RuntimeKVCacheManager(config)
         try:
-            statistics = _introspection.storage_statistics(runtime_manager)
+            statistics = runtime_manager.get_storage_statistics()
 
             def _slot_sizes(stat):
                 # cpp binding exposes `slot_sizes`; the Python backend `slot_size`.
@@ -2195,6 +2235,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_attention_dp=False,
     enable_swa_scratch_reuse=False,
     dtype=DataType.HALF,
+    kv_cache_dtype="auto",
     conv_state_layout="x_b_c",
     mamba_d_conv=4,
     mamba_n_groups=1,
@@ -2226,7 +2267,7 @@ def _build_v2_hybrid_with_mamba_layer(
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
             enable_branch_snapshot=enable_branch_snapshot,
         ),
-        dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
+        dtype=kv_cache_dtype,
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -2357,8 +2398,10 @@ def test_v2_hybrid_allocates_mamba_state_and_dummy_indices():
 
 
 @skip_no_cuda
-def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales():
-    mgr = _build_v2_hybrid_with_mamba_layer(dtype=DataType.NVFP4)
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "nvfp4"])
+def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales(kv_cache_dtype: str) -> None:
+    # "auto" keeps the user config unchanged when the checkpoint selects NVFP4.
+    mgr = _build_v2_hybrid_with_mamba_layer(dtype=DataType.NVFP4, kv_cache_dtype=kv_cache_dtype)
     try:
         ssm_pool_id = mgr.impl.get_layer_group_id(LayerId(0))
         attention_pool_id = mgr.impl.get_layer_group_id(LayerId(1))
@@ -2490,7 +2533,10 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         request_ids = [101, 102, 103, 104]
 
         assert mgr._num_reserved_dummy_slots == 5
-        assert mgr.index_mapper.num_free_slots() == len(request_ids) + 5
+        # The reserved dummy slots sit on top of the admission pool, whose width
+        # depends on the overlap/disagg lease coefficient.
+        initial_free_slots = mgr.index_mapper.num_free_slots()
+        assert initial_free_slots >= len(request_ids) + 5
 
         assert (
             mgr.add_dummy_requests(request_ids, token_nums=[1] * len(request_ids), is_gen=False)
@@ -2513,7 +2559,7 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         all_request_ids = request_ids + cuda_graph_dummy_ids + [ATTENTION_DP_DUMMY_REQUEST_ID]
         state_indices = mgr.get_state_indices(all_request_ids, [False] * len(all_request_ids))
         assert len(set(state_indices)) == len(all_request_ids)
-        assert mgr.index_mapper.num_free_slots() == 0
+        assert mgr.index_mapper.num_free_slots() == initial_free_slots - len(all_request_ids)
     finally:
         mgr.shutdown()
 
@@ -3397,7 +3443,8 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         assert isinstance(mamba_group, MambaLayerGroup)
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        assert mamba_group.conv_section_bytes == [
+        conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
+        assert conv_view.section_bytes == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]

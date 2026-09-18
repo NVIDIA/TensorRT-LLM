@@ -47,6 +47,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
+from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -101,6 +102,7 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
+    workspace_reclaimable: bool = field(default=True, init=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -1199,7 +1201,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Args:
             batch_size: int, the number of requests in the batch.
             is_spec_decoding_enabled: bool, whether the attention need to be spec_decoding mode, which is determined by attention_need_spec_dec_mode() function.
-            is_spec_dec_tree: bool, whether the spec-dec mode is a tree, i.e., static tree or dynamic tree. For linear-tree, it is always False.
+            is_spec_dec_tree: bool, whether the spec-dec mode is a tree, i.e., dynamic tree. For linear-tree, it is always False.
             is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
             max_draft_len: int, the number of the draft layers.
             max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
@@ -1225,7 +1227,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # on the C++ ``layer_idx == 0`` fallback to rebuild the target mask:
         # the dynamic draft loop clears that mask before the next target step.
         self.force_prepare_spec_dec_tree_mask = is_spec_dec_dynamic_tree
-        # Forward static tree length to FMHA kernel selection.
+        # Forward the tree length to FMHA kernel selection.
         self.max_total_draft_tokens = max_total_draft_tokens
 
         # Parameters can be fixed and not changed during runtime if the
@@ -1237,28 +1239,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
             if is_spec_dec_tree and self.spec_decoding_position_offsets is None:
-                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
-                    # Dynamic tree: use _internal_buf_dim which may be larger
-                    # than max_total_draft_tokens+1 to accommodate K*max_draft_len
-                    buf_dim = spec_tree_manager._internal_buf_dim
-                    # Dynamic tree: 1D layout for flexible view() in drafting loop
-                    self.spec_decoding_position_offsets = torch.empty(
-                        (self.max_num_requests * buf_dim, ),
-                        dtype=torch.int,
-                        device='cuda',
-                    )
-                else:
-                    # Static tree: keep 2D layout
-                    self.spec_decoding_position_offsets = torch.empty(
-                        [self.max_num_requests, max_total_draft_tokens + 1],
-                        dtype=torch.int,
-                        device='cuda',
-                    )
+                # Dynamic tree: use _internal_buf_dim which may be larger
+                # than max_total_draft_tokens+1 to accommodate K*max_draft_len.
+                # 1D layout for flexible view() in the drafting loop.
+                buf_dim = spec_tree_manager._internal_buf_dim
+                self.spec_decoding_position_offsets = torch.empty(
+                    (self.max_num_requests * buf_dim, ),
+                    dtype=torch.int,
+                    device='cuda',
+                )
             if is_spec_dec_tree and self.spec_decoding_packed_mask is None:
-                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
-                    buf_dim = spec_tree_manager._internal_buf_dim
-                else:
-                    buf_dim = max_total_draft_tokens + 1
+                buf_dim = spec_tree_manager._internal_buf_dim
                 # Zero-init: dynamic-tree dst has inner dim
                 # ceil(buf_dim/32) but only ceil((max_total_draft_tokens+1)/32)
                 # is written each step. Unwritten cols would otherwise feed the
@@ -1330,25 +1321,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
                 cpp_query_len = n_dt
 
-            # Case 2: static tree (target model only)
-            elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert spec_metadata.spec_dec_mode.is_eagle3_one_model(
-                ), "Tree decoding is only supported for Eagle3 now"
-                assert not getattr(spec_metadata, 'is_draft_model', False), (
-                    "Static tree spec-dec params are only prepared for the target model"
-                )
-
-                # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
-                self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                    spec_tree_manager.spec_dec_position_offsets[0, :],
-                    non_blocking=True)
-                self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                    spec_tree_manager.spec_dec_packed_mask[0, :, :],
-                    non_blocking=True)
-                self.spec_decoding_generation_lengths[:batch_size].fill_(
-                    spec_tree_manager.max_total_draft_tokens + 1)
-
-            # Case 3: linear tree
+            # Case 2: linear tree
             else:
                 # Currently dynamic draft length is only supported for linear tree
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
@@ -1518,9 +1491,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                           mapping: "Mapping") -> int:
         """Context-MLA workspace sized by summed attended KV length.
 
-        Dense fp8 context-MLA stages expanded K/V. NVFP4 DSA stages selected
-        latent rows in fp8 plus selection/scan workspace. Cached tokens can
-        grow both beyond the fresh-prefill profiling floor.
+        Dense fp8 context-MLA stages expanded K/V. NVFP4 sparse MLA stages
+        selected latent rows in fp8 plus selection/scan workspace. Cached
+        tokens can grow both beyond the fresh-prefill profiling floor.
         """
         config = model_config.pretrained_config
         if not is_mla(config):
@@ -1541,6 +1514,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             nvfp4_gather_aux_bytes_per_token = 64
             return int(config.kv_lora_rank + config.qk_rope_head_dim +
                        nvfp4_gather_aux_bytes_per_token)
+
+        nvfp4_dsv4_context = (quant_mode is not None and getattr(
+            quant_mode, "has_fp4_kv_cache", lambda: False)()
+                              and sparse_algorithm == "deepseek_v4"
+                              and get_sm_version() >= 100)
+        if nvfp4_dsv4_context:
+            compress_ratios = [
+                ratio for ratio in getattr(model_config.sparse_attention_config,
+                                           "compress_ratios", []) if ratio > 1
+            ]
+            if not compress_ratios:
+                return 0
+            # Context compaction allocates one fp8 latent row and its
+            # selection/scan workspace per active compressed token. Express
+            # that in raw-KV-token units for the estimator and use the least
+            # compressed layer as the whole-model upper bound.
+            min_compress_ratio = min(compress_ratios)
+            latent_dim = config.kv_lora_rank + config.qk_rope_head_dim
+            nvfp4_gather_aux_bytes_per_compressed_token = 64
+            return math.ceil(
+                (latent_dim + nvfp4_gather_aux_bytes_per_compressed_token) /
+                min_compress_ratio)
 
         fp8_context_mla = (quant_config is not None
                            and quant_config.quant_mode.has_fp8_kv_cache()
@@ -1580,7 +1575,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def runtime_workspace_is_chunked_prefill_bounded(
             cls, model_config: "ModelConfig") -> bool:
-        """NVFP4 DSA gathers from the complete attended prefix."""
+        """NVFP4 sparse MLA gathers from the complete attended prefix."""
         config = model_config.pretrained_config
         if not is_mla(config):
             return True
@@ -1590,7 +1585,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    "algorithm", None)
         return not (quant_mode is not None
                     and getattr(quant_mode, "has_fp4_kv_cache", lambda: False)()
-                    and sparse_algorithm == "dsa" and get_sm_version() >= 100)
+                    and sparse_algorithm in ("dsa", "deepseek_v4")
+                    and get_sm_version() >= 100)
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
@@ -2069,7 +2065,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
-        fmha.forward(q, k, v, metadata, forward_args)
+        if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
+            # Conservatively disable reclamation for metadata used by graphs
+            # or backends that can retain staged workspace state.
+            metadata.workspace_reclaimable = False
+        try:
+            fmha.forward(q, k, v, metadata, forward_args)
+        except RuntimeError as exc:
+            log_attention_failure_context(
+                type(self).__name__, self.layer_idx, metadata,
+                forward_args.attention_window_size, exc)
+            raise
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat

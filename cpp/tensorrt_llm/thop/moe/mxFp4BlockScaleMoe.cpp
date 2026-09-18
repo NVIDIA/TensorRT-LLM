@@ -530,7 +530,7 @@ public:
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_DEBUG("No %s Bf16MxE2m1 runner for tileN=%d: %s",
+                TLLM_LOG_WARNING("No %s Bf16MxE2m1 runner for tileN=%d: %s",
                     useFineGrained ? "FineGrained" : "non-FineGrained", tileN, e.what());
             }
             it = mRunners.emplace(std::move(key), std::move(runner)).first;
@@ -677,7 +677,7 @@ public:
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_DEBUG("No %s MxE4m3MxE2m1 runner for tileN=%d: %s",
+                TLLM_LOG_WARNING("No %s MxE4m3MxE2m1 runner for tileN=%d: %s",
                     useFineGrained ? "FineGrained" : "non-FineGrained", tileN, e.what());
             }
             it = mRunners.emplace(std::move(key), std::move(runner)).first;
