@@ -109,7 +109,9 @@ reviews:
           repository code.
 
           Put the evidence first, using immutable GitHub blob links with full SHAs and
-          line numbers from head and target. End with one record: SEMANTIC_RESULT
+          line numbers from head and target. Include this required record in
+          Explanation; for FAIL also repeat it verbatim in Resolution so it survives
+          result rendering: SEMANTIC_RESULT
           head=<SHA> target=<SHA> merge_base=<SHA> verdict=<PASS|FAIL|INCONCLUSIVE>
           Use verified full lowercase SHAs; omit the record if unavailable. A record
           alone is insufficient.
