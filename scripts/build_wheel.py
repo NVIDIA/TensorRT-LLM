@@ -946,18 +946,6 @@ def main(*,
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stage package sources before the native build. Configure-only and C++-only
-    # builds do not package Python.
-    if not configure_only and not cpp_only:
-        if out_of_tree:
-            wheel_project_dir = build_root / "package"
-            stage_python_package(project_dir, wheel_project_dir)
-        else:
-            wheel_project_dir = project_dir
-
-        pkg_dir = wheel_project_dir / "tensorrt_llm"
-        assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
-
     if use_ccache:
         if build_root is not None and "CCACHE_DIR" not in os.environ:
             # Default the cache next to the rest of the out-of-tree build
@@ -1090,6 +1078,16 @@ def main(*,
         assert not install, "Installing is not supported for cpp_only builds"
         return
 
+    if out_of_tree:
+        # Assemble the wheel in an out-of-tree staging project; the checkout
+        # is only read from this point on.
+        wheel_project_dir = build_root / "package"
+        stage_python_package(project_dir, wheel_project_dir)
+    else:
+        wheel_project_dir = project_dir
+
+    pkg_dir = wheel_project_dir / "tensorrt_llm"
+    assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     include_dir = pkg_dir / "include"
     if lib_dir.exists():

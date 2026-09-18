@@ -104,3 +104,39 @@ def test_check_ignores_interpreter_bytecode(tmp_path, monkeypatch):
     monkeypatch.setattr(generator, "_generate", generate)
 
     generator._check(PROJECT_ROOT, output_dir)
+
+
+def test_isolated_check_forwards_check_mode(tmp_path, monkeypatch):
+    generator = _load_generator()
+    requirements_path = PROJECT_ROOT / "requirements-build-openengine.txt"
+    requirements_digest = generator._sha256(requirements_path)
+    environment_key = (
+        f"py{generator.sys.version_info.major}{generator.sys.version_info.minor}-"
+        f"{requirements_digest[:16]}"
+    )
+    venv_dir = tmp_path / "tools" / environment_key
+    python = generator._venv_python(venv_dir)
+    python.parent.mkdir(parents=True)
+    python.touch()
+    (venv_dir / ".requirements.sha256").write_text(requirements_digest + "\n", encoding="utf-8")
+    commands = []
+    monkeypatch.setattr(
+        generator.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    generator.main(
+        [
+            "--project-root",
+            str(PROJECT_ROOT),
+            "--output",
+            str(tmp_path / "output"),
+            "--tool-env-root",
+            str(tmp_path / "tools"),
+            "--check",
+        ]
+    )
+
+    assert len(commands) == 1
+    assert "--check" in commands[0]
