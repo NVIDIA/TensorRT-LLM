@@ -2246,9 +2246,19 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    // Threshold to switch between one-shot and two-shot allreduce kernel.
-    // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    // Threshold to switch between one-shot and two-shot allreduce kernel, in bytes of the
+    // full message (tokens * hidden * ranks * element size). Default: empirical value from the
+    // MNNVL sweep, matching FlashInfer's byte threshold. TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES
+    // overrides it (the Python workspace sizing in distributed/ops.py reads the same variable).
+    static size_t const kOneShotSizeThreshold = []() -> size_t
+    {
+        char const* env = std::getenv("TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES");
+        if (env != nullptr && *env != '\0')
+        {
+            return static_cast<size_t>(std::strtoull(env, nullptr, 10));
+        }
+        return 64 * 1024 * 8 * 2;
+    }();
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {
@@ -2371,8 +2381,13 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
+        // comm_buffer (like buffer_flags and allreduce's workspace) is opaque
+        // communication scratch: it is mutated by the kernel but deliberately
+        // not alias-annotated, since AOT functionalization rejects non-ATen
+        // ops with alias annotations (needed for torch.compile / piecewise
+        // CUDA graphs). Ordering comes from the input/output data deps.
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
-        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
+        "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
         "Tensor? scale=None, int fusion_op=0) -> "
         "Tensor[]");
     m.def(
