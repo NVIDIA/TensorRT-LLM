@@ -780,7 +780,10 @@ class KVCacheManager(BaseResourceManager):
             return None
         return req.prompt_len
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
         # dedicated path so the self-attention flow below stays unconditional.
         if self.kv_cache_type == CacheTypeCpp.CROSS:
@@ -838,7 +841,7 @@ class KVCacheManager(BaseResourceManager):
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
 
-        if self.kv_connector_manager is not None:
+        if publish_connector_output and self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
 
@@ -2334,7 +2337,21 @@ class SlotManager:
             # CUDA graph dummy request could be added for different batches,
             # but we only need to reserve slot for it once.
             from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-            assert request_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+            if request_id != CUDA_GRAPH_DUMMY_REQUEST_ID:
+                from .llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+                raise RuntimeError(
+                    f"Sequence slot {self.slot_mapping[request_id]} is already "
+                    f"held by request {request_id}, so a second request object "
+                    f"is presenting the same id. Only a reused id can reach "
+                    f"here: real ids are never reused and a request's slot is "
+                    f"never reset. Known reusable ids are "
+                    f"ATTENTION_DP_DUMMY_REQUEST_ID "
+                    f"({ATTENTION_DP_DUMMY_REQUEST_ID}) and the CUDA-graph "
+                    f"padding sentinels at or just below "
+                    f"{CUDA_GRAPH_DUMMY_REQUEST_ID}; for those, the previous "
+                    f"incarnation was dropped without freeing its slot. "
+                    f"{len(self.slot_mapping)} of {self.max_num_requests} "
+                    f"slots are mapped, {len(self.free_slots)} free.")
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
@@ -2599,9 +2616,29 @@ class ResourceManager:
         return self.resource_managers.get(type)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        for _, resource_manager in self.resource_managers.items():
-            if hasattr(resource_manager, "prepare_resources"):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True) -> None:
+        """Prepare every manager's resources for the scheduled batch.
+
+        Args:
+            scheduled_batch: The batch about to run.
+            publish_connector_output: Whether the KV cache manager should hand
+                this batch to the connector. False for a second preparation
+                pass in the same iteration -- the ADP empty-batch padding --
+                which must not overwrite the scheduler output already built.
+        """
+        kv_cache_manager_types = (ResourceManagerType.KV_CACHE_MANAGER,
+                                  ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        for resource_type, resource_manager in self.resource_managers.items():
+            if not hasattr(resource_manager, "prepare_resources"):
+                continue
+            if (not publish_connector_output
+                    and resource_type in kv_cache_manager_types):
+                resource_manager.prepare_resources(
+                    scheduled_batch, publish_connector_output=False)
+            else:
                 resource_manager.prepare_resources(scheduled_batch)
 
     @nvtx_range("update_resources")

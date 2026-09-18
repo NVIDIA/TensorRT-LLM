@@ -16,9 +16,9 @@
 
 One worker per rank owns a `MooncakeDistributedStore` handle and moves pages
 between that pool and its own GPU KV cache. It is also the only place that knows
-how a page is addressed and how a key is spelled, which is why the leader,
-colocated with rank 0's worker in the same process, asks it to run prefix
-lookups instead of rebuilding that knowledge.
+how a page is addressed and how a key is spelled. Each scheduler adapter asks
+its process-local worker to run prefix lookups instead of rebuilding that
+knowledge: every owner has an adapter under ADP, while TP has one on rank 0.
 
 Loads are synchronous: the runtime has already told the scheduler those tokens
 are computed, so the bytes must be in place before the forward pass reads them,
@@ -61,9 +61,9 @@ from .validation import validate_layout, validate_llm_args
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
-#: Set by the worker's constructor so the leader, which the executor builds in
-#: the same process on rank 0, can reach the store handle without a second
-#: connection or an out-of-band channel. See `py_executor_creator`, which
+#: Set by the worker's constructor so the scheduler adapter, built in the same
+#: process on every ADP owner (rank 0 for TP), can reach the store handle without
+#: a second connection or an out-of-band channel. See `py_executor_creator`, which
 #: constructs scheduler and worker concurrently for exactly this kind of
 #: mutual dependency.
 _LOCAL_WORKER: Optional["MooncakeStoreConnectorWorker"] = None
@@ -83,8 +83,8 @@ def resolve_local_worker(timeout: float = 60.0) -> "MooncakeStoreConnectorWorker
     if not _LOCAL_WORKER_READY.wait(timeout):
         raise RuntimeError(
             "The mooncake-store leader could not find a worker in its process. "
-            "The leader only runs on rank 0, where the executor also builds a "
-            "worker, so this means worker construction failed."
+            "The executor builds a worker alongside each scheduler adapter, "
+            "so this means worker construction failed."
         )
     assert _LOCAL_WORKER is not None
     return _LOCAL_WORKER
@@ -152,20 +152,27 @@ def _stream_handle(stream) -> int:
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
-    def __init__(self, llm_args: TorchLlmArgs):
+    supports_attention_dp = True
+
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.from_env()
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
+        # Each ADP owner holds a complete attention cache. Reusable content is
+        # keyed by attention sharding, while rank and client lifetime stay local.
+        enable_attention_dp = getattr(llm_args, "enable_attention_dp", False)
+        self._attention_rank = 0 if enable_attention_dp else self._rank
+        self._attention_world_size = 1 if enable_attention_dp else self._world_size
         self._model_key = self._config.resolve_model_key(llm_args.model)
 
         self._addressing: Optional[PageAddressing] = None
-        # Namespaces for this rank, used for both directions of transfer.
+        # Namespaces for this attention shard, shared by compatible ADP owners.
         self._namespaces: Dict[int, KeyNamespace] = {}
-        # The same namespaces for every rank. A prefix is only reusable when all
-        # shards of it are present, so a lookup has to ask about all of them.
+        # A TP hit requires every attention shard. ADP has one complete shard,
+        # so neither content identity nor lookup depends on unrelated owners.
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
 
         self._store = _open_store(self._config)
@@ -249,11 +256,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for layer_group_id in addressing.layer_group_ids:
             bytes_per_page = addressing.bytes_per_page(layer_group_id)
             self._namespaces[layer_group_id] = self._namespace(
-                self._rank, layer_group_id, bytes_per_page
+                self._attention_rank, layer_group_id, bytes_per_page
             )
             self._peer_namespaces[layer_group_id] = tuple(
                 self._namespace(rank, layer_group_id, bytes_per_page)
-                for rank in range(self._world_size)
+                for rank in range(self._attention_world_size)
             )
 
         if self._config.role.saves:
@@ -313,7 +320,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             cache_prefix=self._config.cache_prefix,
             model_key=self._model_key,
             rank=rank,
-            world_size=self._world_size,
+            world_size=self._attention_world_size,
             layer_group_id=layer_group_id,
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,
@@ -334,8 +341,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def count_prefix_hit(self, block_hashes: Sequence[bytes]) -> int:
         """How many leading blocks of `block_hashes` are fully present.
 
-        A block counts only when every layer group and every rank has its page,
-        because a prefix is replayed as a whole. The scan stops at the first
+        A block counts only when every layer group and attention shard has its
+        page. ADP owners share the one unsharded representation; TP requires
+        all shards because a prefix is replayed as a whole. The scan stops at the first
         incomplete block: the runtime consumes a prefix, so a later hit is not
         usable on its own.
 

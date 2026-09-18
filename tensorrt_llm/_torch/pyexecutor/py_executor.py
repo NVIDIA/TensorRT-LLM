@@ -1003,7 +1003,7 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
-    def _maybe_init_kv_connector_manager(self):
+    def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
             if self.kv_cache_transceiver is not None:
                 logger.warning(
@@ -1024,13 +1024,9 @@ class PyExecutor:
                     "list has no notion of beams, so non-leading beams would "
                     "save and restore the wrong KV state.")
 
-            if self.enable_attention_dp:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with attention data "
-                    "parallelism (enable_attention_dp). Dummy requests "
-                    "inserted for cross-DP balancing flow through the "
-                    "connector scheduler / worker hooks and are not "
-                    "distinguished from real requests.")
+            if self.enable_attention_dp != self.kv_connector_manager.enable_attention_dp:
+                raise ValueError(
+                    "KV connector and executor attention-DP modes must agree.")
 
             if self.kv_cache_manager is None:
                 raise ValueError(
@@ -3351,6 +3347,10 @@ class PyExecutor:
         """
         if self._is_kv_manager_v2:
             for req in scheduled_batch.generation_requests:
+                # The empty-batch padding dummy joins after scheduling, so its
+                # capacity was never grown; reverting would shrink it.
+                if getattr(req, "py_skip_gen_alloc_revert", False):
+                    continue
                 self.kv_cache_manager.revert_allocate_generation(req)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
@@ -3360,10 +3360,11 @@ class PyExecutor:
         decision. If one rank cannot allocate its dummy, peers that succeeded
         must release theirs before retrying or the fixed dummy request ID leaks
         cache resources on every skipped iteration.
-        """
-        if not self._enable_dsv4_adp_dummy_fixes:
-            return
 
+        Keyed off ``_pending_adp_dummy_request`` rather than a feature flag, so
+        it also covers the dummy that ``_pad_empty_attention_dp_batch`` adds
+        after scheduling.
+        """
         dummy_request = self._pending_adp_dummy_request
         self._pending_adp_dummy_request = None
         if dummy_request is None or can_queue:
@@ -3738,10 +3739,19 @@ class PyExecutor:
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
-    def _kv_connector_start_batch(self, scheduled_batch):
+    def _kv_connector_start_batch(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
+            if self.enable_attention_dp and scheduled_batch.batch_size == 0:
+                # Async restores can empty a batch after the usual ADP padding
+                # and resource preparation. Keep ready owners computing while
+                # this owner's worker makes progress on the restore.
+                self._pad_empty_attention_dp_batch(scheduled_batch)
+                if scheduled_batch.batch_size:
+                    self.resource_manager.prepare_resources(
+                        scheduled_batch, publish_connector_output=False)
             self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
@@ -5877,6 +5887,102 @@ class PyExecutor:
         self.active_requests.append(dummy_request)
         self._pending_adp_dummy_request = dummy_request
 
+    @nvtx_range("_pad_empty_attention_dp_batch")
+    def _pad_empty_attention_dp_batch(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Pad an empty scheduled batch so attention DP can make progress.
+
+        `_can_queue` vetoes the forward pass on every rank when any rank's
+        *scheduled* batch is empty. `_pad_attention_dp_dummy_request` cannot
+        prevent that: it guarantees every rank has an *active* request, and runs
+        before `_schedule()`, so a rank whose only active request was taken out
+        of the batch by an asynchronous connector restore is left unpadded.
+        Peers then never advance their context chunks (`_update_request_states`
+        runs under `if can_queue:`), so no KV cache is freed and the rank stays
+        starved -- silently, since nothing on that path raises or times out.
+
+        Padding is rank-local because `_schedule()` allgathers inside
+        `_balance_adp_requests`. A generation dummy is used rather than the
+        context dummy the pre-schedule path would pick, since this rank is empty
+        precisely because it is short of KV cache. Not reached under pipeline
+        parallelism, which the attention-DP connector rejects at startup.
+        """
+        if not self.enable_attention_dp:
+            return
+        if scheduled_batch is None or scheduled_batch.batch_size != 0:
+            return
+        if not self.active_requests or self.expected_num_active_requests <= 0:
+            return
+        # Unlike the pre-schedule path, this one pads a rank that already holds
+        # active requests, so it must respect the cap that
+        # `_pad_attention_dp_dummy_request` asserts against. A rank at the cap
+        # is not starved anyway.
+        if len(self.active_requests) >= self.max_num_active_requests:
+            return
+        # The fill gate suppresses forwards on purpose; dummies added then are
+        # never terminated (termination follows a forward pass).
+        if self._should_skip_dummy_for_benchmark_disagg(
+                self._count_schedulable_active_requests()):
+            return
+        # ATTENTION_DP_DUMMY_REQUEST_ID is a singleton resource.
+        if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
+               for request in self.active_requests):
+            return
+        if not self._has_adp_dummy_kv_capacity(None):
+            logger.warning_once(
+                "attention-DP rank scheduled an empty batch and cannot afford "
+                "even a padding dummy; the forward pass is vetoed fleet-wide "
+                "this iteration",
+                key="attention_dp_empty_batch_no_pad_capacity")
+            return
+
+        dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        try:
+            # Degrade to an empty batch rather than propagate: the ranks have
+            # yet to agree on can_queue, so a rank-local raise would strand the
+            # peers in the collectives that follow.
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                request_ids=dummy_request_ids,
+                token_nums=None,
+                is_gen=True,
+                prepare_resource=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+            )
+        except (OutOfPagesError, NoFreeSlotsError):
+            dummy_requests = None
+        if not dummy_requests:
+            logger.warning_once(
+                "Could not allocate the attention-DP empty-batch padding "
+                "dummy; retrying next iteration",
+                key="attention_dp_empty_batch_pad_alloc_failed")
+            return
+
+        dummy_request = dummy_requests[0]
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            try:
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+            except NoFreeSlotsError:
+                self.kv_cache_manager.free_resources(dummy_request)
+                return
+
+        dummy_request.is_attention_dp_dummy = True
+        # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
+        dummy_request.py_skip_gen_alloc_revert = True
+        self.active_requests.append(dummy_request)
+        scheduled_batch.generation_requests.append(dummy_request)
+        logger.warning(
+            f"[rank {self.dist.rank}] attention-DP empty-batch padding: an "
+            f"asynchronous connector restore emptied this rank's scheduled "
+            f"batch at iteration {self.iter_counter}; added the padding dummy "
+            f"so the fleet can still run a forward pass "
+            f"({len(self.active_requests)} active requests)")
+        # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
+        # cannot queue: no forward runs then, so the usual dummy teardown in
+        # `_handle_responses` is not reached this iteration.
+        self._pending_adp_dummy_request = dummy_request
+
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
@@ -6652,12 +6758,18 @@ class PyExecutor:
                 or request.state
                 == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
 
-    def _try_cancel_request(self, request) -> bool:
+    def _try_cancel_request(self, request: LlmRequest) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is not None and connector.has_pending_transfers(
+                request.request_id):
+            # The generic worker API cannot cancel DMA. Defer cancellation
+            # until get_finished confirms that the blocks are no longer used.
+            return False
         if self.kv_cache_transceiver is None:
             return True
 

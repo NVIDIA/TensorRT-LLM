@@ -2736,7 +2736,9 @@ class KVCacheManagerV2(BaseResourceManager):
             return []
         return next(iter(indices_by_group.values()))
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(
+        self, scheduled_batch: ScheduledRequests, *, publish_connector_output: bool = True
+    ):
         if self.is_draft:
             # Draft V2 manager: mirror the main manager by creating/resizing
             # KV caches for scheduled requests (the main V2 scheduler does not
@@ -2749,7 +2751,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # its pages. This is the same point in the iteration at which the V1
         # manager drives the connector's scheduler-side hooks, and page indices
         # are available, so the connector is driven from here.
-        if self.kv_connector_manager is not None:
+        if publish_connector_output and self.kv_connector_manager is not None:
             self._run_kv_connector_hooks(scheduled_batch)
 
     def _run_kv_connector_hooks(self, scheduled_batch: ScheduledRequests) -> None:
