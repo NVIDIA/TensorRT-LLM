@@ -420,6 +420,10 @@ The FMHA package is split by role:
   selection caching.
 - `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
   context/generation and MHA/MLA entry points.
+  Each phase's `FmhaParams` carries packed QKV in `qkv_input` or separate Q
+  in `query_input`, with the other field set to `None`. Separate K/V remain
+  in `key_input`/`value_input`, and `output` holds the phase's output view.
+  MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
