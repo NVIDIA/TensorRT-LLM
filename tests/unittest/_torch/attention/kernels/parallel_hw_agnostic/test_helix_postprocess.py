@@ -412,6 +412,70 @@ class TestHelixPostProcess(unittest.TestCase):
 
     @parameterized.expand(
         [
+            ("cpu",),
+            ("non_contiguous",),
+            ("wrong_dtype",),
+            ("empty",),
+            ("not_a_divisor",),
+        ]
+    )
+    def test_alltoall_helix_native_rejects_bad_zero_kv_mask(self, case):
+        """Every zero_kv_mask validation rule must reject before the kernel launches.
+
+        Single GPU on purpose. Everything alltoall_helix_native does ahead of the
+        mask check is host-side shape validation and pointer setup -- nothing
+        dereferences the workspace or needs an initialized MNNVL region -- so an
+        invalid mask raises without a collective. Only invalid masks belong here:
+        a valid one would go on to launch the kernel against this uninitialized
+        workspace.
+        """
+        device = torch.device("cuda")
+        num_tokens, cp_size, value_dim = 8, 2, 64
+        partial_o = torch.randn(num_tokens, cp_size, value_dim, dtype=torch.float16, device=device)
+        softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device=device)
+        workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device=device)
+
+        if case == "cpu":
+            mask = torch.zeros(num_tokens, dtype=torch.bool)
+        elif case == "non_contiguous":
+            mask = torch.zeros(num_tokens, 2, dtype=torch.bool, device=device)[:, 0]
+        elif case == "wrong_dtype":
+            mask = torch.zeros(num_tokens, dtype=torch.uint8, device=device)
+        elif case == "empty":
+            mask = torch.zeros(0, dtype=torch.bool, device=device)
+        elif case == "not_a_divisor":
+            # 3 does not divide entry_count == 8.
+            mask = torch.zeros(3, dtype=torch.bool, device=device)
+        else:
+            raise AssertionError(f"unhandled case: {case}")
+
+        with pytest.raises(RuntimeError):
+            torch.ops.trtllm.alltoall_helix_native(
+                partial_o, softmax_stats, workspace, 0, cp_size, mask
+            )
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "needs 2 GPUs")
+    def test_alltoall_helix_native_rejects_cross_device_zero_kv_mask(self):
+        """A mask on another CUDA device must be an error, not an invalid access.
+
+        Separate from the parameterized cases above because it is the one rule
+        that cannot be checked with a single GPU.
+        """
+        num_tokens, cp_size, value_dim = 8, 2, 64
+        partial_o = torch.randn(
+            num_tokens, cp_size, value_dim, dtype=torch.float16, device="cuda:0"
+        )
+        softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device="cuda:0")
+        workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device="cuda:0")
+        mask = torch.zeros(num_tokens, dtype=torch.bool, device="cuda:1")
+
+        with pytest.raises(RuntimeError):
+            torch.ops.trtllm.alltoall_helix_native(
+                partial_o, softmax_stats, workspace, 0, cp_size, mask
+            )
+
+    @parameterized.expand(
+        [
             # (layout,) — "nccl", "fifo_v1", "fifo_v2".
             ("nccl",),
             ("fifo_v1",),
