@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from ...speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
-from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
@@ -223,9 +222,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
-
-    # True during warmup forward passes (dummy requests, no real data).
-    is_warmup: bool = False
 
     # Batch-shared FP4 state; other attention paths allocate none of it.
     fp4_mla_state: Optional[Fp4MlaState] = field(init=False,
@@ -583,9 +579,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=prefer_pinned(),
                 )
 
-        if (self.kv_cache_manager is not None
-                and self.kv_cache_manager.kv_factor == 1
-                and self.kv_cache_manager.dtype == DataType.NVFP4):
+        if callable(
+                getattr(self.kv_cache_manager, "get_fp4_mla_page_table_spec",
+                        None)):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
 
         # Allocate static buffers for helix parallelism support.
@@ -1695,6 +1691,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
+    @property
+    def uses_fp4_mla_attention(self) -> bool:
+        """Whether this layer executes dense FP4 MLA, not sparse NVFP4 storage."""
+        return (self.is_mla_enable and self.has_fp4_kv_cache
+                and self.sparse_params is None)
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = int(self.quant_config.layer_quant_mode)
@@ -2622,7 +2624,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # kernel reads it.
         self._ensure_rope_table_size(metadata.max_seq_len)
 
-        if self.has_fp4_kv_cache:
+        if self.uses_fp4_mla_attention:
             self._fp4_mla_rope_generation(
                 fused_q,
                 q_pe,
@@ -2744,6 +2746,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q_pe=q_pe,
             q_rope_out=fused_q[..., self.kv_lora_rank:],
             q_quant_input=fused_q,
+            helix_position_offsets=metadata.helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
         if not hp_pool_updated:
             raise RuntimeError(
@@ -2757,5 +2761,5 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
         return bool(
-            self.has_fp4_kv_cache
+            self.uses_fp4_mla_attention
             and can_fuse_fp4_mla_q_quant(metadata, fused_q, q_pe, latent_cache))

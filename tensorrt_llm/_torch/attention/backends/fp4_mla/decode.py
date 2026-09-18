@@ -777,6 +777,7 @@ def run_fp4_mla_attention_decode(
     prequantized_q: torch.Tensor,
     prequantized_q_sf: torch.Tensor,
     q_batch_capacity: int,
+    softmax_stats_tensor: torch.Tensor | None = None,
 ) -> None:
     """Run MLA decode with FP4 QK and FP4 PV tensor-core matmuls.
 
@@ -824,6 +825,43 @@ def run_fp4_mla_attention_decode(
         raise ValueError("FP4 MLA attention output batch dimensions do not match.")
 
     backend = _fp4_mla_attention_backend()
+    helix_spec_tokens_valid = bool(getattr(metadata, "_helix_spec_tokens_valid", False))
+    helix_kv_bounds = None
+    if softmax_stats_tensor is not None:
+        if backend != _FP4_MLA_CUTEDSL_BACKEND:
+            raise NotImplementedError(
+                "FP4 MLA Helix softmax stats require the cutedsl attention backend."
+            )
+        if query_len_per_seq != 1 and not helix_spec_tokens_valid:
+            raise NotImplementedError(
+                "FP4 MLA multi-token Helix requires speculative per-token metadata."
+            )
+        expected_stats_shape = (num_queries, num_heads, 2)
+        if (
+            softmax_stats_tensor.shape != expected_stats_shape
+            or softmax_stats_tensor.dtype != torch.float32
+            or softmax_stats_tensor.device != q.device
+            or not softmax_stats_tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "FP4 MLA Helix requires contiguous same-device float32 softmax "
+                f"stats with shape {expected_stats_shape}."
+            )
+        if helix_spec_tokens_valid:
+            helix_kv_bounds = getattr(metadata, "helix_kv_bounds", None)
+            if (
+                not isinstance(helix_kv_bounds, torch.Tensor)
+                or helix_kv_bounds.dtype != torch.int32
+                or helix_kv_bounds.device != q.device
+                or helix_kv_bounds.ndim != 1
+                or helix_kv_bounds.numel() < num_queries
+                or not helix_kv_bounds.is_contiguous()
+            ):
+                raise ValueError(
+                    "FP4 MLA speculative Helix KV bounds must be a contiguous "
+                    "same-device int32 tensor covering every query token."
+                )
+            helix_kv_bounds = helix_kv_bounds[:num_queries]
     if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
@@ -1026,6 +1064,15 @@ def run_fp4_mla_attention_decode(
                 )
 
         kernel_output = output
+        kernel_softmax_stats = None
+        if softmax_stats_tensor is not None:
+            kernel_softmax_stats = _ensure_workspace_tensor(
+                metadata,
+                "_fp4_mla_cutedsl_softmax_stats_buf",
+                (2, num_queries, physical_heads),
+                dtype=torch.float32,
+                device=output.device,
+            )
         if num_heads < physical_heads:
             kernel_output = _ensure_workspace_tensor(
                 metadata,
@@ -1056,9 +1103,15 @@ def run_fp4_mla_attention_decode(
             v_page_offset=v_page_offset,
             q_batch_capacity=q_batch_capacity,
             partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
+            softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
+            softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
+            helix_kv_bounds=helix_kv_bounds,
         )
         if kernel_output is not output:
             output.copy_(kernel_output[:, :num_heads])
+        if kernel_softmax_stats is not None:
+            softmax_stats_tensor[..., 0].copy_(kernel_softmax_stats[0, :, :num_heads])
+            softmax_stats_tensor[..., 1].copy_(kernel_softmax_stats[1, :, :num_heads])
         return
 
     total_p_rows = num_queries * max_pages * num_heads

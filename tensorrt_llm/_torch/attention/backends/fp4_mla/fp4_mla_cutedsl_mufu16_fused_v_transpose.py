@@ -976,6 +976,7 @@ def fused_fp4_mla_decode_ctm(
     sfb_ptr: cute.Pointer,
     page_table_ptr: cute.Pointer,
     valid_k_ptr: cute.Pointer,
+    helix_kv_bounds_ptr: cute.Pointer,
     c_ptr: cute.Pointer,
     accum_ptr: cute.Pointer,
     row_max_ptr: cute.Pointer,
@@ -999,9 +1000,11 @@ def fused_fp4_mla_decode_ctm(
     page_size: ctm.Constexpr = KV_TILE,
     use_mixed_imlp: ctm.Constexpr = False,
     query_len_per_seq: ctm.Constexpr = 1,
+    use_helix_kv_bounds: ctm.Constexpr = False,
     use_smem_page_plan: ctm.Constexpr = True,
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
+    write_softmax_stats: ctm.Constexpr = False,
 ) -> None:
     n, k = problem_size
     m = runtime_m
@@ -1047,6 +1050,10 @@ def fused_fp4_mla_decode_ctm(
     valid_k_tensor = cute.make_tensor(
         cute.recast_ptr(valid_k_ptr, dtype=cutlass.Int32),
         cute.make_layout((l // query_len_per_seq,), stride=(1,)),
+    )
+    helix_kv_bounds_tensor = cute.make_tensor(
+        cute.recast_ptr(helix_kv_bounds_ptr, dtype=cutlass.Int32),
+        cute.make_layout((l,), stride=(1,)),
     )
     v_tma_tensor = cute.make_tensor(
         b_ptr,
@@ -1310,6 +1317,7 @@ def fused_fp4_mla_decode_ctm(
         page_table_tensor,
         page_indptr_tensor,
         valid_k_tensor,
+        helix_kv_bounds_tensor,
         q_global_scale_tensor,
         kv_global_scale_tensor,
         tma_q_desc,
@@ -1338,10 +1346,12 @@ def fused_fp4_mla_decode_ctm(
         pv_output_scale,
         page_size,
         query_len_per_seq,
+        use_helix_kv_bounds,
         use_smem_page_plan,
         use_mixed_imlp,
         use_consecutive_page_pair,
         use_ksf_gather4,
+        write_softmax_stats,
     ).launch(
         grid=(
             cute.ceil_div(c_tensor.shape[0], SMEM_P4_CTA_GROUP_M) * CLUSTER_SHAPE_MNK[0],
@@ -4978,6 +4988,7 @@ def _store_final_o_from_tmem(
     final_row_sum: ctm.Float32,
     final_stat_scale: ctm.Float32,
     output_normalizer: ctm.Float32,
+    write_softmax_stats: ctm.Constexpr = False,
     producer_warp_base: ctm.Constexpr = 0,
 ) -> None:
     gC_arr = ctm.make_array_view(mC_mnl)
@@ -4999,6 +5010,10 @@ def _store_final_o_from_tmem(
         + local_row
     )
     batch_offset = bidz * m * n
+    if cutlass.const_expr(write_softmax_stats):
+        if col_band == ctm.Int32(0) and bidy == ctm.Int32(0):
+            mRowMax_ml[row, bidz] = final_row_max * final_stat_scale
+            mRowSum_ml[row, bidz] = final_row_sum
     n_tile_total = n // ctm.Int32(OUT_DIM)
     subtile_cols: ctm.Constexpr = 32
     subtiles_per_n_tile: ctm.Constexpr = SMEM_P4_BMM2_N // SMEM_P4_TMEM_WARP_N // subtile_cols
@@ -6282,6 +6297,7 @@ def _run_mla_decode_body(
     mPageTable_pl: cute.Tensor,
     mPageIndptr_s: cute.Tensor,
     mValidK_l: cute.Tensor,
+    mHelixKvBounds_l: cute.Tensor,
     mQGlobalScale: cute.Tensor,
     mKvGlobalScale: cute.Tensor,
     tma_q_ptr,
@@ -6310,10 +6326,12 @@ def _run_mla_decode_body(
     pv_output_scale: ctm.Float32,
     page_size: ctm.Constexpr,
     query_len_per_seq: ctm.Constexpr,
+    use_helix_kv_bounds: ctm.Constexpr,
     use_smem_page_plan: ctm.Constexpr,
     use_mixed_imlp: ctm.Constexpr = False,
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
+    write_softmax_stats: ctm.Constexpr = False,
 ) -> None:
     pv_psf_rescale = ctm.Float32(FP4_MLA_P_GLOBAL_SCALE) * pv_output_scale
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -6324,11 +6342,14 @@ def _run_mla_decode_body(
     page_batch = ctm.Int32(0)
     valid_k_for_l = ctm.Int32(0)
     page_batch = cute.arch.make_warp_uniform(bidz // ctm.Int32(query_len_per_seq))
-    query_offset = bidz - page_batch * ctm.Int32(query_len_per_seq)
-    valid_k_for_l = ctm.max(
-        mValidK_l[page_batch] - (ctm.Int32(query_len_per_seq - 1) - query_offset),
-        ctm.Int32(0),
-    )
+    if cutlass.const_expr(use_helix_kv_bounds):
+        valid_k_for_l = mHelixKvBounds_l[bidz]
+    else:
+        query_offset = bidz - page_batch * ctm.Int32(query_len_per_seq)
+        valid_k_for_l = ctm.max(
+            mValidK_l[page_batch] - (ctm.Int32(query_len_per_seq - 1) - query_offset),
+            ctm.Int32(0),
+        )
     valid_k_for_l = cute.arch.make_warp_uniform(valid_k_for_l)
     csr_page_begin = ctm.Int32(0)
     csr_page_count = ctm.Int32(0)
@@ -7317,8 +7338,19 @@ def _run_mla_decode_body(
             final_anchor_row_sum = sFinalAnchorRowSum[final_row_state_local_row]
             final_stat_scale = ctm.Float32(1.0)
             final_row_sum = final_anchor_row_sum
+            final_row_max = running_row_max
+            if cutlass.const_expr(write_softmax_stats):
+                final_stat_scale = softmax_scale_log2 / ctm.Float32(LOG2_E)
+                final_row_sum = final_anchor_row_sum * cute.exp2(
+                    (running_row_anchor - running_row_max) * softmax_scale_log2,
+                    fastmath=True,
+                )
+                if valid_k_for_l == ctm.Int32(0):
+                    final_stat_scale = ctm.Float32(1.0)
+                    final_row_max = ctm.Float32(-ctm.Float32.inf)
+                    final_row_sum = ctm.Float32(0.0)
             output_normalizer = ctm.Float32(0.0)
-            if final_anchor_row_sum != ctm.Float32(0.0):
+            if valid_k_for_l != ctm.Int32(0) and final_anchor_row_sum != ctm.Float32(0.0):
                 output_normalizer = cute.arch.rcp_approx(final_anchor_row_sum) * pv_output_scale
             last_pv_li_idx = stream_li_total - ctm.Int32(1)
             last_pv_slot = last_pv_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
@@ -7344,10 +7376,11 @@ def _run_mla_decode_body(
                 bidz,
                 m,
                 n,
-                final_row_max=running_row_max,
+                final_row_max=final_row_max,
                 final_row_sum=final_row_sum,
                 final_stat_scale=final_stat_scale,
                 output_normalizer=output_normalizer,
+                write_softmax_stats=write_softmax_stats,
                 producer_warp_base=SMEM_P4_CORRECTION_WARP_ID_BEGIN,
             )
             prims.barrier(barrier_id=O_STORE_BAR_ID, number_of_threads=O_STORE_BAR_THREADS)
@@ -7366,6 +7399,7 @@ def kernel(
     mPageTable_pl: cute.Tensor,
     mPageIndptr_s: cute.Tensor,
     mValidK_l: cute.Tensor,
+    mHelixKvBounds_l: cute.Tensor,
     mQGlobalScale: cute.Tensor,
     mKvGlobalScale: cute.Tensor,
     tma_q_desc: ctm.GridConstant[cuda_tma.TensorMap],
@@ -7394,15 +7428,18 @@ def kernel(
     pv_output_scale: ctm.Float32,
     page_size: ctm.Constexpr,
     query_len_per_seq: ctm.Constexpr,
+    use_helix_kv_bounds: ctm.Constexpr,
     use_smem_page_plan: ctm.Constexpr,
     use_mixed_imlp: ctm.Constexpr,
     use_consecutive_page_pair: ctm.Constexpr,
     use_ksf_gather4: ctm.Constexpr,
+    write_softmax_stats: ctm.Constexpr,
 ) -> None:
     _run_mla_decode_body(
         mPageTable_pl,
         mPageIndptr_s,
         mValidK_l,
+        mHelixKvBounds_l,
         mQGlobalScale,
         mKvGlobalScale,
         tma_q_desc.get_ptr(),
@@ -7431,10 +7468,12 @@ def kernel(
         pv_output_scale,
         page_size,
         query_len_per_seq,
+        use_helix_kv_bounds,
         use_smem_page_plan,
         use_mixed_imlp,
         use_consecutive_page_pair,
         use_ksf_gather4,
+        write_softmax_stats,
     )
 
 
@@ -7455,6 +7494,7 @@ def _make_fused_ptrs(
     sfb_data_ptr: int,
     page_table_data_ptr: int,
     valid_k_data_ptr: int,
+    helix_kv_bounds_data_ptr: int,
     c_data_ptr: int,
     accum_data_ptr: int,
     row_max_data_ptr: int,
@@ -7474,6 +7514,7 @@ def _make_fused_ptrs(
         make_ptr(cutlass.Uint8, sfb_data_ptr, cute.AddressSpace.gmem, assumed_align=32),
         make_ptr(cutlass.Int32, page_table_data_ptr, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, valid_k_data_ptr, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, helix_kv_bounds_data_ptr, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(
             _cutlass_output_dtype(output_dtype),
             c_data_ptr,
@@ -7609,6 +7650,7 @@ def _compile_fused(
     sfb_data_ptr: int,
     page_table_data_ptr: int,
     valid_k_data_ptr: int,
+    helix_kv_bounds_data_ptr: int,
     c_data_ptr: int,
     accum_data_ptr: int,
     row_max_data_ptr: int,
@@ -7630,6 +7672,8 @@ def _compile_fused(
     ksf_page_stride_bytes: int = 0,
     vsf_page_stride_bytes: int = 0,
     use_consecutive_page_pair: bool = False,
+    write_softmax_stats: bool = False,
+    use_helix_kv_bounds: bool = False,
 ) -> Callable:
     if type(kv) is not int:
         raise TypeError(f"runtime-KV compile K must be an int, got {type(kv).__name__}")
@@ -7654,6 +7698,8 @@ def _compile_fused(
         query_len_per_seq,
         use_consecutive_page_pair,
         use_ksf_gather4,
+        write_softmax_stats,
+        use_helix_kv_bounds,
     )
     cached = _FUSED_COMPILE_CACHE.get(cache_key)
     if cached is not None:
@@ -7668,6 +7714,7 @@ def _compile_fused(
         sfb_data_ptr,
         page_table_data_ptr,
         valid_k_data_ptr,
+        helix_kv_bounds_data_ptr,
         c_data_ptr,
         accum_data_ptr,
         row_max_data_ptr,
@@ -7696,9 +7743,11 @@ def _compile_fused(
         page_size=page_size,
         use_mixed_imlp=use_mixed_imlp,
         query_len_per_seq=query_len_per_seq,
+        use_helix_kv_bounds=use_helix_kv_bounds,
         use_smem_page_plan=kv == SMEM_P4_PAGE_PLAN_PROFILE_KV,
         use_consecutive_page_pair=use_consecutive_page_pair,
         use_ksf_gather4=use_ksf_gather4,
+        write_softmax_stats=write_softmax_stats,
         options="--opt-level 2 --ptxas-options '--uumn'",
     )
     _FUSED_COMPILE_CACHE[cache_key] = compiled
@@ -7730,6 +7779,9 @@ def run_trtllm_fp4_mla_decode_page_native(
     assume_consecutive_page_prefix_tiles: int = 0,
     partition_runtime_valid_k: bool = False,
     enable_mxi_imlp: bool = True,
+    softmax_row_max: torch.Tensor | None = None,
+    softmax_row_sum: torch.Tensor | None = None,
+    helix_kv_bounds: torch.Tensor | None = None,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -7775,6 +7827,24 @@ def run_trtllm_fp4_mla_decode_page_native(
             f"q_internal must be a uint8 [M, Q640/2, L] tensor, got dtype={q_internal.dtype} shape={tuple(q_internal.shape)}"
         )
     physical_m, q_bytes, l_batch = q_internal.shape
+    if (softmax_row_max is None) != (softmax_row_sum is None):
+        raise ValueError("softmax_row_max and softmax_row_sum must be provided together")
+    write_softmax_stats = softmax_row_max is not None
+    if write_softmax_stats:
+        expected_stats_shape = (l_batch, physical_m)
+        for name, tensor in (
+            ("softmax_row_max", softmax_row_max),
+            ("softmax_row_sum", softmax_row_sum),
+        ):
+            if (
+                tensor.dtype != torch.float32
+                or tensor.shape != expected_stats_shape
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous float32 with shape {expected_stats_shape}"
+                )
+            _validate_tensor_pointer_alignment(name, tensor, alignment_bytes=32)
     if l_batch <= 0 or l_batch > CUDA_GRID_Z_MAX:
         raise ValueError(f"queries must be in [1, {CUDA_GRID_Z_MAX}], got {l_batch}")
     if q_batch_capacity is None:
@@ -7846,6 +7916,16 @@ def run_trtllm_fp4_mla_decode_page_native(
     if valid_k.dtype != torch.int32 or valid_k.shape != (num_sequences,) or valid_k.stride(0) != 1:
         raise ValueError(
             f"valid_k must be contiguous int32 [{num_sequences}], got dtype={valid_k.dtype} shape={tuple(valid_k.shape)} stride={valid_k.stride()}"
+        )
+    if helix_kv_bounds is not None and (
+        helix_kv_bounds.dtype != torch.int32
+        or helix_kv_bounds.shape != (l_batch,)
+        or helix_kv_bounds.stride(0) != 1
+    ):
+        raise ValueError(
+            "helix_kv_bounds must be contiguous int32 with shape "
+            f"[{l_batch}], got dtype={helix_kv_bounds.dtype} "
+            f"shape={tuple(helix_kv_bounds.shape)} stride={helix_kv_bounds.stride()}"
         )
     cache_layout = _kv_cache_3d_layout(kv_cache, page_size)
     _validate_tensor_pointer_alignment("kv_cache", kv_cache, alignment_bytes=16)
@@ -7938,6 +8018,10 @@ def run_trtllm_fp4_mla_decode_page_native(
         q_global_scale,
         kv_global_scale,
     )
+    if write_softmax_stats:
+        tensors += (softmax_row_max, softmax_row_sum)
+    if helix_kv_bounds is not None:
+        tensors += (helix_kv_bounds,)
     if device.type != "cuda" or any((tensor.device != device for tensor in tensors)):
         raise ValueError("all page-native decode tensors must share one CUDA device")
     if q_global_scale.dtype != torch.float32 or q_global_scale.numel() != 1:
@@ -7959,9 +8043,14 @@ def run_trtllm_fp4_mla_decode_page_native(
     # canonical KV pointer so the compiled call carries no sidecar allocation.
     b_data_ptr = kv_cache.data_ptr()
     scratch_ptr = output.data_ptr()
+    row_max_data_ptr = softmax_row_max.data_ptr() if write_softmax_stats else scratch_ptr
+    row_sum_data_ptr = softmax_row_sum.data_ptr() if write_softmax_stats else scratch_ptr
     sfb_data_ptr = v_sf.data_ptr()
     page_table_data_ptr = src_page_ids.data_ptr()
     valid_k_data_ptr = valid_k.data_ptr()
+    helix_kv_bounds_data_ptr = (
+        helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else valid_k_data_ptr
+    )
     c_data_ptr = output.data_ptr()
     page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
     q_global_scale_data_ptr = q_global_scale.data_ptr()
@@ -7980,10 +8069,11 @@ def run_trtllm_fp4_mla_decode_page_native(
         sfb_data_ptr,
         page_table_data_ptr,
         valid_k_data_ptr,
+        helix_kv_bounds_data_ptr,
         c_data_ptr,
         scratch_ptr,
-        scratch_ptr,
-        scratch_ptr,
+        row_max_data_ptr,
+        row_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -8001,6 +8091,8 @@ def run_trtllm_fp4_mla_decode_page_native(
         ksf_page_stride_bytes=ksf_page_stride_bytes,
         vsf_page_stride_bytes=vsf_page_stride_bytes,
         use_consecutive_page_pair=use_consecutive_page_pair,
+        write_softmax_stats=write_softmax_stats,
+        use_helix_kv_bounds=helix_kv_bounds is not None,
     )
     supports_prepared = _class_defines_callables(
         fused, "to", "generate_execution_args", "run_compiled_program"
@@ -8018,7 +8110,10 @@ def run_trtllm_fp4_mla_decode_page_native(
         sfb_data_ptr,
         page_table_data_ptr,
         valid_k_data_ptr,
+        helix_kv_bounds_data_ptr,
         c_data_ptr,
+        row_max_data_ptr,
+        row_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -8051,10 +8146,11 @@ def run_trtllm_fp4_mla_decode_page_native(
         sfb_data_ptr,
         page_table_data_ptr,
         valid_k_data_ptr,
+        helix_kv_bounds_data_ptr,
         c_data_ptr,
         scratch_ptr,
-        scratch_ptr,
-        scratch_ptr,
+        row_max_data_ptr,
+        row_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -8084,7 +8180,8 @@ def run_trtllm_fp4_mla_decode_page_native(
     if executor is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "FP4 MLA CUDA Graph capture requires an eager warmup for the compiled kernel, device, and CUDA context."
+                "FP4 MLA CUDA Graph capture requires an eager warmup for the "
+                "compiled kernel, device, and CUDA context."
             )
         candidate = fused.to(device_index)
         if not _class_defines_callables(
@@ -8132,6 +8229,9 @@ def run_trtllm_fp4_mla_decode_page_native_from_raw(
     assume_consecutive_page_prefix_tiles: int = 0,
     partition_runtime_valid_k: bool = False,
     enable_mxi_imlp: bool = True,
+    softmax_row_max: torch.Tensor | None = None,
+    softmax_row_sum: torch.Tensor | None = None,
+    helix_kv_bounds: torch.Tensor | None = None,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -8183,4 +8283,7 @@ def run_trtllm_fp4_mla_decode_page_native_from_raw(
         assume_consecutive_page_prefix_tiles=assume_consecutive_page_prefix_tiles,
         partition_runtime_valid_k=partition_runtime_valid_k,
         enable_mxi_imlp=enable_mxi_imlp,
+        softmax_row_max=softmax_row_max,
+        softmax_row_sum=softmax_row_sum,
+        helix_kv_bounds=helix_kv_bounds,
     )

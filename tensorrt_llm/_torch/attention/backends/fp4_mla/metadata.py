@@ -427,7 +427,6 @@ def configure_fp4_mla_device_page_table(
         and int(getattr(metadata, "beam_width", 1)) == 1
         and not bool(getattr(metadata, "is_spec_dec_tree", False))
         and not bool(getattr(metadata, "locality_domain_enabled", False))
-        and not bool(getattr(metadata, "enable_helix", False))
         and int(getattr(kv_cache_manager, "tokens_per_block", 0) or 0) == FP4_MLA_TOKENS_PER_BLOCK
         and max_page_capacity > 0
         and page_index_scale > 0

@@ -571,10 +571,14 @@ def rebuild_fp4_mla_disagg_imported_cache(
         or not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
     ):
         return False
-    if not isinstance(prompt_len, int) or prompt_len <= 0:
+    if not isinstance(prompt_len, int) or prompt_len < 0:
         raise ValueError(
-            f"FP4 MLA disaggregated import needs a positive prompt_len, got {prompt_len}."
+            f"FP4 MLA disaggregated import needs a nonnegative prompt_len, got {prompt_len}."
         )
+    # Helix assigns whole pages round-robin, so a rank may own no prompt pages.
+    # There are no process-local V sidecars to rebuild on that rank.
+    if prompt_len == 0:
+        return True
 
     page_size = int(kv_cache_manager.tokens_per_block)
     if page_size != FP4_MLA_TOKENS_PER_BLOCK:

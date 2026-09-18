@@ -204,7 +204,6 @@ def _build_multi_seq_metadata(
         request_ids=request_ids,
         runtime_features=SimpleNamespace(has_speculative_draft_tokens=False),
         is_cuda_graph=False,
-        is_warmup=False,
         fp4_mla_state=Fp4MlaState(
             batch_indices=batch_indices,
             positions=positions,

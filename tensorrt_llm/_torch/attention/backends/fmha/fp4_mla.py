@@ -59,7 +59,7 @@ class Fp4MlaFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        return attn.is_mla_enable and attn.has_fp4_kv_cache
+        return bool(getattr(attn, "uses_fp4_mla_attention", False))
 
     def _is_supported(
         self,

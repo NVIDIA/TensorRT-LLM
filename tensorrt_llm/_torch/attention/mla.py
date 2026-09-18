@@ -698,7 +698,8 @@ class MLA(nn.Module):
         )
         mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
         if (
-            self.mqa.support_fp4_kv_cache()
+            self.sparse_params is None
+            and self.mqa.support_fp4_kv_cache()
             and self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_fp4_kv_cache()
         ):
@@ -1598,7 +1599,8 @@ class MLA(nn.Module):
             )
 
             fp4_mla = (
-                self.mqa.support_fp4_kv_cache()
+                self.sparse_params is None
+                and self.mqa.support_fp4_kv_cache()
                 and self.quant_config is not None
                 and self.quant_config.layer_quant_mode.has_fp4_kv_cache()
             )
