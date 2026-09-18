@@ -428,30 +428,9 @@ The FMHA package is split by role:
   MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
-- `fmha/fp4_mla.py` implements FP4 MLA context and no-dequant decode.
-  The shared FMHA availability check admits FP4 MLA only to libraries that
-  declare `supports_fp4_mla`; it does not restrict the existing FP4 GQA path.
-  Selection caches validation in `_is_supported()`. Its cache key distinguishes
-  K/V input presence, sparse/sinks inputs, and prepared FP4 state, so changing
-  those conditions triggers validation again instead of reusing a valid entry.
-  The core implementation requires dense TRTLLM MLA, BF16 absorption weights,
-  fused RoPE with duplicated rotary tables, and KV Cache Manager V2. It uses
-  FP8 context attention with an FP4 cache update and FP4 generation attention.
-  Chunked prefill and context parallelism are rejected before KV allocation.
-  Cached-context attention is not implemented, so executor block reuse remains
-  disabled even though the manager supports full-block reuse of its pools.
-  Disaggregated serving is reserved for the follow-up integration. On SM107,
-  this dense TRTLLM path keeps NVFP4 KV quantization; unsupported profiles retain
-  the existing FP8 fallback.
-  `fp4_mla/state.py` owns batch-shared page tables, HP/V-scale views, append
-  metadata, and scratch caches. `TrtllmAttentionMetadata` keeps one optional
-  state reference and forwards prepare/MTP lifecycle updates to it. These
-  buffers continue to use the metadata allocator for CUDA-graph address
-  stability; the layer-local FP8 attention view is allocated lazily by FMHA.
-  The `fp4_mla` package exports entry points from focused `config`, `layout`,
-  `metadata`, `cache_update`, `v_cache`, and `decode` modules. The FP8 context
-  view has its own FMHA manager and uses normal capability-based selection;
-  its manager-owned scratch is allocated once and reused across layers.
+- `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
+  cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
+  batch state, cache storage, and kernels live in `fp4_mla/`.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
