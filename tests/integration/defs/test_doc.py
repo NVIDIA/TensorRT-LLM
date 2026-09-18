@@ -38,10 +38,10 @@ SKIP_FILENAMES = {
     "ATTRIBUTIONS-CPP-aarch64.md",
 }
 
-# Sphinx pages that docs/source/helper.py generates at build time via its
-# write_index() calls. They are gitignored (see .gitignore "docs/source/**/*.rst"),
-# so a link to one is correct even though it resolves to nothing in a source
-# checkout. Paths are repository-relative.
+# Repository-relative Sphinx pages that docs/source/helper.py generates at build
+# time via its write_index() calls. They are gitignored (see .gitignore
+# "docs/source/**/*.rst"), so a link to one is correct even though it resolves to
+# nothing in a source checkout.
 SPHINX_GENERATED_DOC_PAGES = {
     "docs/source/examples/llm_api_examples.rst",
     "docs/source/examples/trtllm_serve_examples.rst",
@@ -156,14 +156,21 @@ def _clean_markdown_destination(destination):
     return destination.strip()
 
 
+def _is_python_environment(dirnames, filenames):
+    """Return whether a directory is the root of an installed Python environment.
+
+    Environments vendor third-party markdown whose relative links describe the
+    upstream source tree, not this repository, so they must not be validated.
+    Name-based pruning alone misses environments created under an arbitrary name
+    (e.g. CI scratch dirs), hence these layout markers.
+    """
+    return "pyvenv.cfg" in filenames or "site-packages" in dirnames
+
+
 def _find_markdown_files(root_dir):
     markdown_files = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
-        # Installed Python environments vendor third-party markdown whose relative
-        # links describe the upstream source tree, not this repository. Detect them
-        # by layout rather than by name, since SKIP_DIR_PREFIXES misses an
-        # environment created under an arbitrary name (e.g. a CI scratch dir).
-        if "pyvenv.cfg" in filenames or "site-packages" in dirnames:
+        if _is_python_environment(dirnames, filenames):
             dirnames[:] = []
             continue
         # Prune in-place so os.walk doesn't descend into skipped dirs.
@@ -241,12 +248,13 @@ def _check_relative_repository_link(url_info, source_file, root_dir):
     if not os.path.splitext(local_path)[1]:
         candidate_paths.extend((f"{local_path}.md", f"{local_path}.rst"))
 
-    for candidate_path in candidate_paths:
-        relative_path = os.path.relpath(candidate_path, root_dir)
-        if relative_path in SPHINX_GENERATED_DOC_PAGES:
-            return True, url, line_num, f"Sphinx-generated page: {relative_path}"
-
-    is_valid = any(os.path.exists(candidate_path) for candidate_path in candidate_paths)
+    is_valid = any(
+        os.path.exists(candidate_path)
+        # Generated pages are absent from a source checkout, so treat a link to
+        # one as resolved rather than dangling.
+        or os.path.relpath(candidate_path, root_dir) in SPHINX_GENERATED_DOC_PAGES
+        for candidate_path in candidate_paths
+    )
     reason = f"Repository path {'exists' if is_valid else 'not found'}: {local_path}"
     return is_valid, url, line_num, reason
 
