@@ -1740,11 +1740,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             2 if self.rope_params.duplicate_data else 1)
         table_max_positions = (self.rotary_cos_sin.numel() //
                                floats_per_position
-                               if self.rotary_cos_sin is not None
-                               and floats_per_position > 0 else 0)
+                               if self.rotary_cos_sin is not None else 0)
+        self.rope_params.max_positions = max(self.rope_params.max_positions,
+                                             table_max_positions,
+                                             required_max_positions)
         if required_max_positions > table_max_positions:
-            self.rope_params.max_positions = max(required_max_positions,
-                                                 self.rope_params.max_positions)
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
 

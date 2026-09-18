@@ -739,7 +739,6 @@ def test_fmha_cache_sanity_check_logs_mismatched_inputs() -> None:
         relative_attention_max_distance=7,
     )
 
-    # Keep K/V presence unchanged so both inputs hit the same cache key.
     with (
         patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True),
         patch.object(fmha_manager.logger, "error") as log_error,
@@ -749,7 +748,7 @@ def test_fmha_cache_sanity_check_logs_mismatched_inputs() -> None:
                 attn,
                 torch.empty((1, 4)),
                 torch.empty((1, 2)),
-                torch.empty((1, 2)),
+                None,
                 cached_metadata,
                 cached_args,
             )
@@ -770,7 +769,7 @@ def test_fmha_cache_sanity_check_logs_mismatched_inputs() -> None:
     assert "cached=FakeFmha, uncached=FakeFmha" in message
     assert "q: cached=shape=(1, 4), uncached=shape=(1, 8)" in message
     assert "k: cached=shape=(1, 2), uncached=shape=(1, 3)" in message
-    assert "v: cached=shape=(1, 2), uncached=shape=(1, 3)" in message
+    assert "v: cached=None, uncached=shape=(1, 3)" in message
     assert "metadata.beam_width: cached=1, uncached=2" in message
     assert "forward_args.relative_attention_max_distance: cached=0, uncached=7" in message
 

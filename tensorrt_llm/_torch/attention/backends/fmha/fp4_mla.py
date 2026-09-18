@@ -70,8 +70,8 @@ class Fp4MlaFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        # Input presence/readiness and mask/output formats are in the selection
-        # cache key; cache geometry and sparse compression are model invariants.
+        # Mask/output formats and the attention phase are represented in the cache key.
+        # K/V presence is fixed per phase; optional features and pools are instance invariants.
         del q, phase
         if forward_args.output_sf is not None:
             raise NotImplementedError("FP4 MLA does not support quantized attention output.")
