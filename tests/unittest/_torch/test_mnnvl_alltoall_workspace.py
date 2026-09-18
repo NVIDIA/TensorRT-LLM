@@ -873,6 +873,9 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
             num_slots=2,
             top_k=1,
             max_num_tokens_per_rank=1,
+            # Exercise the fence-based workspace path: CFT defaults on and would pick
+            # the (unpatched) CftMnnvlMemory on a supported driver.
+            can_use_cft_counted_writes=False,
         )
 
     assert NVLinkOneSided._WORKSPACES == {}
