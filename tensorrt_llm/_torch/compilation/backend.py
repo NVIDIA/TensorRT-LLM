@@ -81,7 +81,11 @@ class Backend:
 
     @classmethod
     def build_custom_passes(cls, enable_userbuffers, mapping: Mapping):
-        world_size = tensorrt_llm.mpi_world_size()
+        # mpi_world_size() reports 1 under non-MPI orchestrators (Ray sets
+        # TLLM_DISABLE_MPI); the mapping carries the real world size on every
+        # orchestrator.
+        world_size = (mapping.world_size
+                      if mapping is not None else tensorrt_llm.mpi_world_size())
         # Really naive pass manager here
         custom_passes = [PatternMatcherPass("add_norm", MATCHER_SUBSYSTEM)]
         if world_size > 1:
