@@ -76,7 +76,11 @@ def autodeploy_worker_config(disagg_cluster, disable_overlap_scheduler=False):
         "backend": AUTODEPLOY_BACKEND,
         "max_batch_size": 1,
         "cuda_graph_config": {"batch_sizes": [1]},
-        "cache_transceiver_config": {"backend": "DEFAULT"},
+        "cache_transceiver_config": {
+            "backend": "DEFAULT",
+            "transceiver_runtime": "CPP",
+        },
+        "kv_cache_config": {"use_kv_cache_manager_v2": False},
         "disagg_cluster": disagg_cluster,
     }
     if disable_overlap_scheduler:
