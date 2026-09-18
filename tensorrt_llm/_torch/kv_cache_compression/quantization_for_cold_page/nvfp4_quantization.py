@@ -47,8 +47,8 @@ _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
 
-# Models whose RoPE layout and keep_rope_precision accuracy have been validated.
-# Add a model_type here after checking both; other models ignore the switch.
+# Models whose K vectors have a known position-free (NoPE) part and whose accuracy
+# with keep_rope_precision has been checked. Other models ignore the switch.
 _KEEP_ROPE_PRECISION_MODEL_TYPES = frozenset(
     {"deepseek_v4", "glm_moe_dsa", "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
 )
@@ -85,7 +85,7 @@ class _Nvfp4Scales:
 
 @dataclass(frozen=True)
 class _Nvfp4BufferLayout:
-    """One hot buffer; a compressed one (``scales`` set) turns ``quantized_range_*`` of each row into NVFP4."""
+    """One hot buffer; ``quantized_range_*`` picks which numbers of each K/V vector become NVFP4."""
 
     role: str
     scales: _Nvfp4Scales | None = None
@@ -202,7 +202,7 @@ def _get_text_config(pretrained_config: object) -> object:
 
 
 def _get_rope_elements(text_config: object, head_dim: int) -> int:
-    """Number of leading K elements that carry RoPE (``head_dim * partial_rotary_factor``)."""
+    """Number of leading K numbers that carry position information (``head_dim * partial_rotary_factor``)."""
 
     factor = getattr(text_config, "partial_rotary_factor", None)
     rope_parameters = getattr(text_config, "rope_parameters", None)
@@ -228,7 +228,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             logger.warning(
                 "keep_rope_precision is validated for model types "
                 f"{sorted(_KEEP_ROPE_PRECISION_MODEL_TYPES)} only; ignoring it for "
-                f"{model_type!r} and quantizing whole KV rows."
+                f"{model_type!r} and turning whole K and V vectors into NVFP4."
             )
             self._keep_rope_precision = False
 
@@ -241,7 +241,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         key_only: bool = False,
         buffer_name: str,
     ) -> tuple[int, int]:
-        """Return (start, elements) of the part of each row that becomes NVFP4; the rest is copied as is."""
+        """Return (start, count) of the numbers of each K or V vector that become NVFP4."""
 
         if not keep_rope:
             return 0, row_elements
@@ -450,10 +450,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             )
 
         # The codec holds only the target model's config, so it cannot locate RoPE
-        # in a draft model's rows: draft KVCMs always quantize whole rows.
+        # in a draft model's K vectors: draft KVCMs always quantize whole vectors.
         keep_rope = self._keep_rope_precision
         if keep_rope and is_draft:
-            logger.warning("keep_rope_precision: draft-model KV rows are quantized whole.")
+            logger.warning("keep_rope_precision: draft-model K and V vectors become NVFP4 in full.")
             keep_rope = False
 
         deepseek_v4_layouts = {}

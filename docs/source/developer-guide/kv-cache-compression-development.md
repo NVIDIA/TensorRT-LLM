@@ -292,26 +292,35 @@ The framework connects storage-bound compression to KVCM V2 through the
 existing interfaces. A new compression format implements its provider APIs and
 algorithm launcher.
 
-#### Which elements of a row the NVFP4 codec quantizes
+#### Which numbers of a K or V vector become NVFP4
 
-Each hot row has one contiguous range that the kernel turns into NVFP4; the bytes
-before and after that range are copied unchanged. A compressed buffer stores the
-range as `quantized_range_start` and `quantized_range_elements`, and its layer
-stores `raw_row_stride_elements`.
+The hot KV cache stores, for every token and KV head, one K vector and one V
+vector of `head_dim` numbers; the kernel calls each vector a row and places rows
+`raw_row_stride_elements` numbers apart. For each row the kernel turns one
+contiguous piece into NVFP4 (4-bit values plus one scale per 16 numbers) and
+copies everything before and after that piece unchanged. A compressed buffer
+records the piece as `quantized_range_start` and `quantized_range_elements`.
 
-- `keep_rope_precision` off: the range is the whole row.
-- `keep_rope_precision` on: the RoPE elements are left out of the range, so they
-  land in the cold page byte-for-byte after that buffer's scales. The codec finds
-  them from the model config: the `qk_rope_head_dim` tail of an MLA latent row,
-  the first `head_dim * partial_rotary_factor` elements of a partial-rotary GQA
-  head, or the 64-element tail of a DeepSeek-V4 compressed row.
+- `keep_rope_precision` off: the piece is the whole vector, so every K and V
+  number becomes NVFP4.
+- `keep_rope_precision` on: the piece is the NoPE part of the K vector, so the
+  RoPE numbers are copied unchanged into the cold page, right after that buffer's
+  scales. The codec finds the RoPE part in the model config: the last
+  `qk_rope_head_dim` numbers of the single 576-number vector an MLA layer stores
+  per token (its only buffer is the key), the first
+  `head_dim * partial_rotary_factor` numbers of a GQA head that rotates only its
+  leading numbers (Qwen3.5), or the last 64 of the 512 numbers of a DeepSeek-V4
+  compressed entry. V vectors carry
+  no position and always become NVFP4 in full.
 
-Rows that are entirely RoPE, rows with RoPE in the middle, and ranges that do not
-start and end on a 16-element scale group are rejected. The switch only takes
-effect for the model types in `_KEEP_ROPE_PRECISION_MODEL_TYPES`, whose RoPE
-layout and accuracy have been checked; other models log a warning and quantize
-whole rows. Draft KVCMs always quantize whole rows because the codec holds only
-the target model's config.
+The codec refuses what the kernel cannot express: a K vector that is entirely
+RoPE (nothing left to quantize), RoPE in the middle of the vector (two pieces),
+or a piece whose start or length is not a multiple of 16 numbers (the scale
+group). The switch only takes effect for the model types in
+`_KEEP_ROPE_PRECISION_MODEL_TYPES`, whose RoPE layout and accuracy have been
+checked; other models log a warning and quantize whole vectors. Draft-model KV
+caches always quantize whole vectors because the codec holds only the target
+model's config.
 
 ### 4. Add method-specific kernels
 

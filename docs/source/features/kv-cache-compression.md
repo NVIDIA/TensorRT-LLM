@@ -206,21 +206,30 @@ NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
 
 #### Keeping RoPE Precision
 
-Some models apply rotary position embedding (RoPE) to only part of each K row: the
-64-element tail of an MLA latent row, the first `head_dim * partial_rotary_factor`
-elements of a partial-rotary GQA head (Qwen3.5), or the 64-element
-tail of a DeepSeek-V4 compressed row. Those elements carry the token position, so
-their rounding error acts differently from the rest of the row, and some
-deployments prefer to leave them alone.
+For every token and KV head, the KV cache stores one K vector and one V vector
+of `head_dim` numbers. In some models only part of the K vector carries the
+token's position (the RoPE part); the rest does not (the NoPE part). GLM-5 and
+other MLA models store one 576-number vector per token instead of separate K and
+V, and its last 64 numbers are RoPE; Qwen3.5 rotates the first 64 of its 256
+numbers; a DeepSeek-V4 compressed entry has 512 numbers of which the last 64 are
+RoPE. Position information reacts to
+4-bit rounding differently from the rest, so some deployments prefer to leave it
+untouched.
 
-`keep_rope_precision` makes that a choice. It is off by default: the whole row is
-quantized for the best ratio. Turning it on copies the RoPE part byte-for-byte
-from the active cache, which improves accuracy a little and lowers the ratio; an
-FP8 MLA row goes from 1.78x to 1.64x. The option is validated for DeepSeek-V4,
-GLM-5 (`glm_moe_dsa`), and the Qwen3.5 series. Any other model ignores it with a
-warning and quantizes whole rows; supporting a new model means checking its
-accuracy and adding its `model_type` to the list in `nvfp4_quantization.py`.
-Draft-model KV caches used by speculative decoding always quantize whole rows.
+`keep_rope_precision` controls this:
+
+- Off (default): the whole K vector and the whole V vector become NVFP4. Best
+  ratio.
+- On: only the NoPE part of the K vector becomes NVFP4. The RoPE part is copied
+  into the cold page unchanged, so it keeps the hot cache's precision (FP8 or
+  BF16). The V vector still becomes NVFP4 in full. Accuracy improves a little and
+  the ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
+
+The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
+series. Any other model ignores it with a warning and quantizes whole vectors; to
+support a new model, check its accuracy and add its `model_type` to
+`_KEEP_ROPE_PRECISION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of a
+draft model (speculative decoding) always quantizes whole vectors.
 
 ```yaml
 kv_cache_compression_config:

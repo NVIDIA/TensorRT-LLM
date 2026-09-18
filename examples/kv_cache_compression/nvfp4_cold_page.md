@@ -374,17 +374,21 @@ Pages currently use identity global scales.
 
 ## Keeping RoPE Precision
 
-RoPE rotates part of each K row by the token position: the last 64 elements of an
-MLA latent row, the first 64 of a Qwen3.5 head, the last 64 of a DeepSeek-V4
-compressed row. By default the cold page quantizes them together with the rest of
-the row. Set `keep_rope_precision: true` to copy them byte-for-byte instead; this
-raises accuracy a little and lowers the ratio. For FP8 hot rows: MLA 1.78x to
-1.64x, DeepSeek-V4 compressed row 1.78x to 1.62x, Qwen3.5 K+V 1.78x to 1.62x; for
-BF16 hot rows Qwen3.5 goes from 3.56x to 2.69x. The option is validated for
-DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5 series only; other models log
-a warning and keep quantizing whole rows, and draft-model KV caches always
-quantize whole rows. To add a model, check its accuracy and add its `model_type`
-to `_KEEP_ROPE_PRECISION_MODEL_TYPES` in `nvfp4_quantization.py`.
+Every token's K vector has a part that carries the token's position (RoPE) and,
+in some models, a part that does not (NoPE): the last 64 of the 576 numbers an
+MLA model stores per token, the first 64 of the 256 numbers of a Qwen3.5 head,
+the last 64 of the 512 numbers of a DeepSeek-V4 compressed entry. By default the cold page
+turns the whole K vector and the whole V vector into NVFP4. With
+`keep_rope_precision: true`, only the NoPE part of the K vector becomes NVFP4 and
+the RoPE part is copied unchanged, keeping the hot cache's precision; the V
+vector still becomes NVFP4 in full. Accuracy improves a little and the ratio
+drops. For FP8 hot caches: MLA 1.78x to 1.64x, DeepSeek-V4 compressed entry 1.78x
+to 1.62x, Qwen3.5 K+V 1.78x to 1.62x; for BF16 hot caches Qwen3.5 goes from 3.56x
+to 2.69x. The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the
+Qwen3.5 series only; other models log a warning and keep quantizing whole
+vectors, and the KV cache of a draft model always quantizes whole vectors. To add
+a model, check its accuracy and add its `model_type` to
+`_KEEP_ROPE_PRECISION_MODEL_TYPES` in `nvfp4_quantization.py`.
 
 ```yaml
 kv_cache_compression_config:

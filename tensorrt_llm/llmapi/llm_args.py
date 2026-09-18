@@ -3860,12 +3860,12 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     keep_rope_precision: bool = Field(
         default=False,
         description=
-        "Keep the RoPE (position-encoded) part of each K row at its active-"
-        "cache precision in the compressed tier instead of quantizing it with "
-        "the rest of the row. Off (default) quantizes the whole row for the "
-        "best ratio; on trades some ratio for accuracy. Validated for "
-        "DeepSeek-V4, GLM-5, and Qwen3.5; other models ignore it with a warning."
-    )
+        "Off (default): whole K and V vectors become NVFP4 in the compressed "
+        "cache tier. On: only the part of each K vector without position "
+        "information (NoPE) becomes NVFP4; the position-encoded (RoPE) part is "
+        "copied unchanged, which gains a little accuracy for a lower ratio. "
+        "Validated for DeepSeek-V4, GLM-5, and Qwen3.5; other models ignore it "
+        "with a warning.")
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,

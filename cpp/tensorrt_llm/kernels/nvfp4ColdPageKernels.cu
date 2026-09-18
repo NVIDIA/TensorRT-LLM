@@ -76,10 +76,11 @@ enum IntegerField : std::uint32_t
     kNumKvHeads,       // Number of KV-head row groups represented by this buffer.
     kTokensPerPage,    // Number of token or compressed-entry rows per KV head in one
                        // Page.
-    // Each hot row has one range that becomes NVFP4; every element before or
-    // after it is preserved byte-for-byte. The range is [start, start + elements)
-    // within a row of kRawRowStrideElements elements: the lossless prefix is
-    // [0, start) and the lossless suffix is [start + elements, stride).
+    // A row is one K or V vector of one token and KV head, kRawRowStrideElements
+    // elements apart from the next. One contiguous range of each row,
+    // [start, start + elements), becomes NVFP4; the elements before it
+    // ([0, start), the lossless prefix) and after it ([start + elements, stride),
+    // the lossless suffix) are copied byte-for-byte.
     kQuantizedRangeElements, // Number of elements in the NVFP4 range of each row.
     kRawRowStrideElements,   // Element stride between rows in the hot Page.
     kQuantizedRangeStart,    // First element of the NVFP4 range; zero when it starts the row.
