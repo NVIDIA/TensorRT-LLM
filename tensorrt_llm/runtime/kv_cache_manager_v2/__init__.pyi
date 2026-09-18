@@ -388,7 +388,15 @@ class _KVCache:
     @property
     def beam_width(self) -> BeamIndex: ...
     @beam_width.setter
-    def beam_width(self, beam_width: BeamIndex) -> None: ...
+    def beam_width(self, beam_width: BeamIndex) -> None:
+        """Expand before the first generation step, never during generation (C++ only).
+
+        First resume the cache and materialize prompt storage (or prepare synthetic
+        warmup state). Full prompt blocks are shared; the writable tail, including
+        preallocated blocks, is copied using the boundary set by
+        ``expected_prompt_length`` at cache creation.
+        """
+        ...
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
@@ -574,7 +582,17 @@ class KVCacheManager:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
-    ) -> _KVCache: ...
+    ) -> _KVCache:
+        """Create a suspended cache with a prefill-to-generation boundary.
+
+        On the C++ backend, ``expected_prompt_length`` also determines which full
+        prompt blocks are shared by beams. Pass the actual full prompt length for
+        beam search if ``input_tokens`` is absent or shortened for reuse matching.
+        It defaults to the non-empty input length; without either value, the beam
+        sharing boundary is zero and the statistics boundary is unset. When set,
+        it also marks generation-phase allocation stats.
+        """
+        ...
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,

@@ -369,10 +369,14 @@ public:
         return mBeamWidth;
     }
 
-    // Beam widths greater than one are generation-only. Increasing the width
-    // copies the prompt tail and live generation state from beam 0; full prompt
-    // blocks remain unmapped for the new beams and are shared through cache
-    // indirection. Decreasing the width discards the removed alternatives.
+    // Beam widths greater than one are generation-only. Before increasing the
+    // width, the caller must resume the cache and materialize prompt storage
+    // (or prepare synthetic warmup state). Expansion must happen before the first
+    // generation step, never during generation. Full prompt blocks remain unmapped
+    // for new beams and are shared through cache indirection; the writable tail,
+    // including preallocated blocks, is copied from beam 0. The boundary is
+    // expectedPromptLength from createKvCache(). Decreasing the width discards
+    // the removed alternatives.
     void setBeamWidth(BeamIndex beamWidth);
 
     CUstream cudaStream() const;
