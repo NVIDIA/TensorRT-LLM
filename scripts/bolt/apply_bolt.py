@@ -30,6 +30,15 @@ regenerated for any modified members so `pip install` stays consistent.
                 --output bolt-TensorRT-LLM-GH200.tar.gz \
                 [--manifest manifest.json] [--strip] [--dry-run]
 
+`--wheel` is the same operation on a standalone .whl. The released SBSA
+manylinux wheel is built and uploaded on its own rather than packed into a
+tarball, so it needs an entry point that does not go through the release
+layout:
+
+  apply_bolt.py --wheel tensorrt_llm-<ver>-cp312-cp312-manylinux_2_39_aarch64.whl \
+                --profiles /path/to/_merged \
+                --output bolted.whl [--strip] [--dry-run]
+
 llvm-bolt must be on PATH (same version used to instrument/merge). The optimize
 flags mirror scripts/bolt/bolt_lib.sh::optimize_libraries -- keep them in sync.
 """
@@ -233,6 +242,33 @@ def process_wheel(
         return bolted
 
 
+def bolt_standalone_wheel(
+    wheel: Path, output: Path, profiles_dir: Path, strip: bool, dry_run: bool
+) -> int:
+    """BOLT a .whl that is not packed inside a release tarball.
+
+    process_wheel() rewrites in place, so the copy happens first and the input
+    is never touched: a failed apply leaves the original wheel uploadable.
+    """
+    log(f"Standalone wheel: {wheel.name}")
+    if dry_run:
+        bolted = process_wheel(wheel, profiles_dir, DEFAULT_BOLT_FLAGS, strip, True)
+        log(f"dry-run: {bolted} member(s) would be bolted; skipping repack.")
+        return 0
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.resolve() != wheel.resolve():
+        shutil.copy2(wheel, output)
+    bolted = process_wheel(output, profiles_dir, DEFAULT_BOLT_FLAGS, strip, False)
+    if bolted == 0:
+        err("no ELF in the wheel matched a profile -- nothing bolted. Check --profiles names.")
+        if output.resolve() != wheel.resolve():
+            output.unlink(missing_ok=True)
+        return 2
+    log(f"Done. Bolted wheel: {output} ({bolted} lib(s) bolted, RECORD updated)")
+    return 0
+
+
 def _rewrite_record(record_path: Path, wheel_root: Path, changed: list[Path]) -> None:
     changed_rel = {p.relative_to(wheel_root).as_posix() for p in changed}
     rows_out: list[list[str]] = []
@@ -311,11 +347,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument(
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument(
         "--tarball",
-        required=True,
         type=Path,
         help="BOLT-compatible release tarball (TensorRT-LLM*.tar.gz)",
+    )
+    src.add_argument(
+        "--wheel",
+        type=Path,
+        help="BOLT-compatible standalone wheel (the released manylinux .whl)",
     )
     ap.add_argument(
         "--profiles",
@@ -347,8 +388,9 @@ def main() -> int:
     if not args.dry_run and shutil.which("llvm-bolt") is None:
         err("llvm-bolt not on PATH")
         return 2
-    if not args.tarball.is_file():
-        err(f"tarball not found: {args.tarball}")
+    source = args.tarball or args.wheel
+    if not source.is_file():
+        err(f"input not found: {source}")
         return 2
 
     owns_workdir = args.workdir is None
@@ -361,6 +403,11 @@ def main() -> int:
             f"({len(list(profiles_dir.glob('*.yaml')))} yaml, "
             f"{len(list(profiles_dir.glob('*.fdata')))} fdata)"
         )
+
+        if args.wheel:
+            return bolt_standalone_wheel(
+                args.wheel, args.output, profiles_dir, args.strip, args.dry_run
+            )
 
         # Extract the tarball.
         extract = workdir / "extract"

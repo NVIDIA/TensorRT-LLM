@@ -5718,6 +5718,77 @@ def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 }
 
 
+// Apply the branch's latest promoted BOLT profile bundle to a freshly built
+// wheel, in place. Mirrors Build.groovy's premerge applyLatestBolt (same
+// llvm-bolt staging, same apply_latest.sh, same exit-code contract), but for a
+// standalone .whl rather than a packed tarball.
+//
+// Strict on a real apply failure: a half-BOLTed or unverifiable wheel must never
+// reach the upload. A MISSING bundle is different -- that is the cold-start case
+// (a branch nothing has ever promoted for), and it is fatal only when the caller
+// says this wheel is a release artifact. Otherwise it is a loud skip, so an
+// ordinary sanity-check build does not start failing the day a new branch is cut.
+def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, boolean boltRequired)
+{
+    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
+    def llvmArch = (cpu_arch == AARCH64_TRIPLE) ? "ARM64" : "X64"
+    // apply_latest.sh resolves exactly one branch, so try the build's own branch
+    // and fall back to main. Profiles are function-name-keyed and applied with
+    // -infer-stale-profile, so a nearby branch's bundle is valid -- the same
+    // candidate-branch fallback BuildDockerImage.groovy's overlay uses.
+    def branches = [env.gitlabTargetBranch, env.branch_name, "main"]
+        .collect { it?.toString()?.trim() }
+        .findAll { it }
+        .unique()
+
+    stage("BOLT release wheel") {
+        sh """
+            set -e
+            export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+            if ! command -v llvm-bolt >/dev/null 2>&1; then
+                echo '[bolt-wheel] staging llvm-bolt ${llvmVer}'
+                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                mkdir -p .bolt-llvm
+                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
+                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
+                rm -f /tmp/\$tb
+            fi
+        """
+        // Exit codes (apply_latest.sh): 3 = no promoted bundle for branch/triple,
+        // 2 = apply error, 0 = applied. Only 3 is worth trying the next branch for;
+        // an apply error means the bundle IS there and did not take, which retrying
+        // against a different branch would only paper over.
+        def rc = 3
+        def appliedFrom = null
+        for (b in branches) {
+            rc = sh(returnStatus: true, script: """
+                export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+                bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
+                     ${b} ${cpu_arch} ${wheel} ${wheel}.bolted
+            """)
+            if (rc != 3) {
+                appliedFrom = b
+                break
+            }
+            echo "[bolt-wheel] no promoted bundle for ${b}/${cpu_arch}; trying next candidate branch"
+        }
+        if (rc == 3) {
+            if (boltRequired) {
+                error("[bolt-wheel] no promoted BOLT bundle for any of ${branches.join(', ')} (${cpu_arch}); " +
+                      "refusing to upload an unoptimized release wheel (promote a bundle via BoltProfileGen)")
+            }
+            echo "[bolt-wheel] no promoted bundle for any of ${branches.join(', ')} (${cpu_arch}); wheel stays un-BOLTed"
+            return
+        }
+        if (rc != 0) {
+            error("[bolt-wheel] apply_latest.sh failed (rc=${rc}) for ${appliedFrom}/${cpu_arch}")
+        }
+        sh "mv -f ${wheel}.bolted ${wheel}"
+        echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch})"
+    }
+}
+
 def runLLMBuild(
     pipeline,
     cpu_arch,
@@ -5726,7 +5797,8 @@ def runLLMBuild(
     version_override="",
     cpver="cp312",
     plat_name="",
-    is_dlfw=false)
+    is_dlfw=false,
+    isReleaseWheel=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -5771,6 +5843,22 @@ def runLLMBuild(
     }
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
+
+    // ENABLE_BOLT_COMPATIBLE=ON above only makes the binaries BOLT-able; it does
+    // not optimize them. The tarball gets the actual optimization elsewhere
+    // (Build.groovy premerge, BoltProfileGen postmerge), but this wheel is built
+    // and uploaded on its own, so without this step the released SBSA wheel ships
+    // unoptimized. Must run BEFORE the upload below, and before the local
+    // pip install / DLFW repack, so every consumer sees the same bytes.
+    //
+    // Scoped to the wheel published at the root of <arch>/, which is the one the
+    // release job picks up. An imageTest/ build is a throwaway wheel compiled
+    // inside an already-released image to prove that image can still build from
+    // source; optimizing it would prove nothing and only add a failure mode.
+    if (cpu_arch == AARCH64_TRIPLE && !wheel_path) {
+        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch, isReleaseWheel)
+    }
+
     def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
     // DLFW publishes the built public-version wheel under its subdirectory. Other
     // builds continue to publish the built wheel at the original path.
@@ -6894,10 +6982,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                 pyver = "3.10"
             }
 
+            // A nightly_release run is the one whose wheels the release job
+            // publishes, so a missing BOLT bundle has to fail it rather than
+            // quietly ship an unoptimized wheel to PyPI.
+            def isReleaseWheel = globalVars[RUN_MODE] == "nightly_release"
+
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw)
+                    values[7], isDlfw, isReleaseWheel)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
