@@ -9,7 +9,6 @@ from .sol_methodology import resolve_sol_methodology
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
-    container_setup,
     has_slurm_environment,
     load_and_validate_task_yaml,
     sol_enabled,
@@ -80,7 +79,6 @@ def main(argv: list[str] | None = None) -> None:
         sol_methodology=methodology.name,
         remote_execution=task_data,
         campaign_name=args.workspace.resolve().name,
-        container_setup=container_setup(task_data),
     )
     with PerfAnalyzeWorkflow(
         workspace=args.workspace,

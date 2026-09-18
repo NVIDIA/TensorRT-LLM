@@ -364,11 +364,9 @@ def test_git_and_workspace_slug_rules_stay_equal():
     point a node's worktree name away from its sub-workspace name; this guards
     the equality without coupling the two modules.
 
-    ``node_workspace`` is part of the agent-team concurrent integration, which
-    this repo has not adopted yet — the DAG engine is currently driven by
-    ``perf_optimize``, which owns its own per-item directories. Skip rather than
-    fail while that module is absent, so the guard arms itself automatically if
-    the agent-team integration is ported later.
+    ``node_workspace`` is part of the agent-team concurrent integration. Skip
+    rather than fail while that module is absent, so the guard arms itself
+    automatically in a checkout that has not ported that integration.
     """
     node_workspace = pytest.importorskip(
         "agent_flow.workflows.agent_team.node_workspace",

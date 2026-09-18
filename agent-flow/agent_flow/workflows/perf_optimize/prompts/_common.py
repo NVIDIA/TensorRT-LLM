@@ -39,7 +39,6 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     SOL_METHODOLOGY_FALLBACK,
     SOL_PROJECTOR_INTERNAL_KNOWLEDGE,
     SOL_PROJECTOR_METHODOLOGY,
-    build_container_setup_block,
 )
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 
@@ -52,7 +51,6 @@ __all__ = [
     "DORMANT_CAPABILITY_SWEEP",
     "EVIDENCE_DISCIPLINE",
     "EXECUTION_SLURM_BOOTSTRAP",
-    "build_container_setup_block",
     "EXPECTATION_GATE",
     "GIT_DISCIPLINE",
     "KERNEL_COVERAGE_REPORTER_GUIDANCE",
