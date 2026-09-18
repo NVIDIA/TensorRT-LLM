@@ -1661,9 +1661,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         kv_cache_manager.get_num_free_blocks = Mock(return_value=8)
         kv_cache_manager.max_seq_len = 2048
         kv_cache_manager.get_num_available_tokens = Mock(return_value=100)
+
+        # update_draft_len() runs over the returned requests: it measures
+        # py_draft_tokens and or-assigns py_needs_onehot_draft_probs, so the
+        # stand-ins need real values rather than auto-created Mock attributes.
+        def _dummy_request():
+            return Mock(py_draft_tokens=[], py_needs_onehot_draft_probs=False)
+
         kv_cache_manager.add_dummy_requests = Mock(side_effect=[
-            [Mock(), Mock(), Mock()],
-            [Mock()],
+            [_dummy_request() for _ in range(3)],
+            [_dummy_request()],
         ])
         model_engine._get_draft_kv_cache_manager = Mock(return_value=None)
 
