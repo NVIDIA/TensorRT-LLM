@@ -38,16 +38,8 @@ python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
-`trtllm-serve` is configured entirely through its YAML rather than top-level
-flags, so the revision goes there instead. `cosmos3-fp8-1gpu.yaml` is the
-1-GPU config above with `revision: fp8` added:
-
-```bash
-trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-fp8-1gpu.yaml
-```
-
-That config works for the offline example too, in which case `--revision` is
-redundant.
+`../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
+that would rather set it in the config than on the command line.
 
 T2V, T2I, I2V and V2V are validated on a **single GPU**; every multi-GPU
 configuration is refused with an explicit error, so use BF16 there.
