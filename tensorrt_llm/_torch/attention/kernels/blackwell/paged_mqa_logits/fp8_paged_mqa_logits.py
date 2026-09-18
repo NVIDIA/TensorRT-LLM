@@ -202,6 +202,7 @@ class FP8MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        use_relu_trick: bool = True,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -222,6 +223,9 @@ class FP8MQALogitsKernel:
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
+        # (FMNMX). fp32 epilogue only -- f16x2 has no abs modifier.
+        self.use_relu_trick = use_relu_trick
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
         # Without padding, e.g. fp16 + N=32 gives 64B per stage, so stage 1
@@ -1411,10 +1415,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -1451,10 +1470,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -1477,7 +1511,11 @@ class FP8MQALogitsKernel:
                                 result_t * Float16(scale_val)
                             )
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
+                            # relu trick's / 2 folds into the store scale.
+                            scale_eff = scale_val
+                            if cutlass.const_expr(self.use_relu_trick):
+                                scale_eff = scale_val * cutlass.Float32(0.5)
+                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_eff)
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1627,10 +1665,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -1667,10 +1720,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -1693,7 +1761,11 @@ class FP8MQALogitsKernel:
                                 result_t * Float16(scale_val)
                             )
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
+                            # relu trick's / 2 folds into the store scale.
+                            scale_eff = scale_val
+                            if cutlass.const_expr(self.use_relu_trick):
+                                scale_eff = scale_val * cutlass.Float32(0.5)
+                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_eff)
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG

@@ -469,6 +469,7 @@ class FP4MQALogitsKernel:
         cand_cap: int = 5120,
         emit_cand_bucketed: bool = False,
         accept_cap: int = 8192,
+        use_relu_trick: bool = True,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -487,6 +488,9 @@ class FP4MQALogitsKernel:
             cutlass.Float16,
         ), f"FP4 output_dtype must be fp32/bf16/fp16; got {output_dtype}"
         assert block_kv == 128, "FP4 compute tile (block_kv) hardcoded to 128"
+        # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
+        # (FMNMX). fp32 epilogue only -- f16x2 has no abs modifier.
+        self.use_relu_trick = use_relu_trick
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
@@ -2430,10 +2434,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -2491,10 +2510,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -2516,6 +2550,11 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
+                            if cutlass.const_expr(self.use_relu_trick):
+                                # FP4 has no store-time scale (the SF is
+                                # baked into the accumulator by UMMA), so
+                                # the relu trick's / 2 lands here.
+                                result_t = result_t * cutlass.Float32(0.5)
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
@@ -3197,10 +3236,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -3258,10 +3312,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -3283,6 +3352,11 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
+                            if cutlass.const_expr(self.use_relu_trick):
+                                # FP4 has no store-time scale (the SF is
+                                # baked into the accumulator by UMMA), so
+                                # the relu trick's / 2 lands here.
+                                result_t = result_t * cutlass.Float32(0.5)
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
