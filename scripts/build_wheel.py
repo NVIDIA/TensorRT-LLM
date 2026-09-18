@@ -804,7 +804,6 @@ def main(*,
          out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
-         cpp_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
@@ -991,22 +990,14 @@ def main(*,
                 "-- BOLT: Forcing NVRTC_DYNAMIC_LINKING=ON (static NVIDIA libs lack relocations)"
             )
 
-    targets = ["tensorrt_llm"]
-
-    if cpp_only:
-        build_pyt = "OFF"
-        build_deep_ep = "OFF"
-        build_deep_gemm = "OFF"
-        build_flash_mla = "OFF"
-    else:
-        targets.extend([
-            "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
-            "flash_mla"
-        ])
-        build_pyt = "ON"
-        build_deep_ep = "ON"
-        build_deep_gemm = "ON"
-        build_flash_mla = "ON"
+    targets = [
+        "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
+        "pg_utils", "flash_mla"
+    ]
+    build_pyt = "ON"
+    build_deep_ep = "ON"
+    build_deep_gemm = "ON"
+    build_flash_mla = "ON"
 
     if micro_benchmarks:
         targets.append("micro_benchmarks")
@@ -1073,10 +1064,6 @@ def main(*,
         print("CMake Build command: ")
         print(cmake_build_command)
         build_run(cmake_build_command)
-
-    if cpp_only:
-        assert not install, "Installing is not supported for cpp_only builds"
-        return
 
     if out_of_tree:
         # Assemble the wheel in an out-of-tree staging project; the checkout
@@ -1354,106 +1341,101 @@ def main(*,
     if scripts_dir.exists():
         clear_folder(scripts_dir)
 
-    if not cpp_only:
+    def get_binding_lib(subdirectory, name):
+        binding_build_dir = (build_dir / "tensorrt_llm" / subdirectory)
+        if on_windows:
+            binding_lib = list(binding_build_dir.glob(f"{name}.*.pyd"))
+        else:
+            binding_lib = list(binding_build_dir.glob(f"{name}.*.so"))
 
-        def get_binding_lib(subdirectory, name):
-            binding_build_dir = (build_dir / "tensorrt_llm" / subdirectory)
-            if on_windows:
-                binding_lib = list(binding_build_dir.glob(f"{name}.*.pyd"))
-            else:
-                binding_lib = list(binding_build_dir.glob(f"{name}.*.so"))
+        assert len(
+            binding_lib
+        ) == 1, f"Exactly one binding library should be present: {binding_lib}"
+        return binding_lib[0]
 
-            assert len(
-                binding_lib
-            ) == 1, f"Exactly one binding library should be present: {binding_lib}"
-            return binding_lib[0]
+    binding_lib_dir = get_binding_lib("nanobind", "bindings")
+    binding_lib_file_name = binding_lib_dir.name
+    install_file(binding_lib_dir, pkg_dir)
 
-        binding_lib_dir = get_binding_lib("nanobind", "bindings")
-        binding_lib_file_name = binding_lib_dir.name
-        install_file(binding_lib_dir, pkg_dir)
+    with (build_dir / "tensorrt_llm" / "deep_ep" /
+          "cuda_architectures.txt").open() as f:
+        deep_ep_cuda_architectures = f.read().strip().strip(";")
+    if not deep_ep_cuda_architectures and deep_ep_dir.exists():
+        if deep_ep_dir.is_symlink():
+            deep_ep_dir.unlink()
+        else:
+            rmtree(deep_ep_dir)
+    if deep_ep_cuda_architectures:
+        install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"), pkg_dir)
+        install_tree(
+            build_dir / "tensorrt_llm" / "deep_ep" / "python" / "deep_ep",
+            deep_ep_dir)
+        (lib_dir / "nvshmem").mkdir(exist_ok=True)
+        install_file(
+            build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
+            lib_dir / "nvshmem")
+        install_file(
+            build_dir /
+            "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
+            lib_dir / "nvshmem")
+        install_file(
+            build_dir /
+            "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
+            lib_dir / "nvshmem")
 
-        with (build_dir / "tensorrt_llm" / "deep_ep" /
-              "cuda_architectures.txt").open() as f:
-            deep_ep_cuda_architectures = f.read().strip().strip(";")
-        if not deep_ep_cuda_architectures and deep_ep_dir.exists():
-            if deep_ep_dir.is_symlink():
-                deep_ep_dir.unlink()
-            else:
-                rmtree(deep_ep_dir)
-        if deep_ep_cuda_architectures:
-            install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
-                         pkg_dir)
-            install_tree(
-                build_dir / "tensorrt_llm" / "deep_ep" / "python" / "deep_ep",
-                deep_ep_dir)
-            (lib_dir / "nvshmem").mkdir(exist_ok=True)
-            install_file(
-                build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
-                lib_dir / "nvshmem")
-            install_file(
-                build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
-                lib_dir / "nvshmem")
-            install_file(
-                build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
-                lib_dir / "nvshmem")
+    install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"), pkg_dir)
+    install_tree(
+        build_dir / "tensorrt_llm" / "deep_gemm" / "python" / "deep_gemm",
+        deep_gemm_dir)
 
-        install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
+    with (build_dir / "tensorrt_llm" / "flash_mla" /
+          "cuda_architectures.txt").open() as f:
+        flash_mla_cuda_architectures = f.read().strip().strip(";")
+    if flash_mla_cuda_architectures:
+        install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
                      pkg_dir)
         install_tree(
-            build_dir / "tensorrt_llm" / "deep_gemm" / "python" / "deep_gemm",
-            deep_gemm_dir)
+            build_dir / "tensorrt_llm" / "flash_mla" / "python" / "flash_mla",
+            pkg_dir / "flash_mla")
 
-        with (build_dir / "tensorrt_llm" / "flash_mla" /
-              "cuda_architectures.txt").open() as f:
-            flash_mla_cuda_architectures = f.read().strip().strip(";")
-        if flash_mla_cuda_architectures:
-            install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
-                         pkg_dir)
-            install_tree(
-                build_dir / "tensorrt_llm" / "flash_mla" / "python" /
-                "flash_mla", pkg_dir / "flash_mla")
+    # Stage the FetchContent-patched MSA package for setup.py packaging.
+    msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+    cutlass_src = build_dir / "_deps" / "cutlass-src"
+    msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
+    if not (msa_src / "cute" / "interface.py").is_file():
+        raise FileNotFoundError(
+            f"MSA package missing at {msa_src}; CMake FetchContent for msa "
+            "did not populate the expected sources.")
+    if msa_dst.is_symlink():
+        msa_dst.unlink()
+    elif msa_dst.exists():
+        rmtree(msa_dst)
+    msa_dst.mkdir(parents=True)
+    for python_source in msa_src.glob("*.py"):
+        install_file(python_source, msa_dst)
+    for source_dir, relative_dir in (
+        (msa_src / "csrc", Path("csrc")),
+        (msa_src / "cute", Path("cute")),
+        (cutlass_src / "include", Path("cutlass/include")),
+        (cutlass_src / "tools/util/include",
+         Path("cutlass/tools/util/include")),
+    ):
+        (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
+        install_tree(
+            source_dir,
+            msa_dst / relative_dir,
+        )
+    install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
 
-        # Stage the FetchContent-patched MSA package for setup.py packaging.
-        msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
-        cutlass_src = build_dir / "_deps" / "cutlass-src"
-        msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
-        if not (msa_src / "cute" / "interface.py").is_file():
-            raise FileNotFoundError(
-                f"MSA package missing at {msa_src}; CMake FetchContent for msa "
-                "did not populate the expected sources.")
-        if msa_dst.is_symlink():
-            msa_dst.unlink()
-        elif msa_dst.exists():
-            rmtree(msa_dst)
-        msa_dst.mkdir(parents=True)
-        for python_source in msa_src.glob("*.py"):
-            install_file(python_source, msa_dst)
-        for source_dir, relative_dir in (
-            (msa_src / "csrc", Path("csrc")),
-            (msa_src / "cute", Path("cute")),
-            (cutlass_src / "include", Path("cutlass/include")),
-            (cutlass_src / "tools/util/include",
-             Path("cutlass/tools/util/include")),
-        ):
-            (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
-            install_tree(
-                source_dir,
-                msa_dst / relative_dir,
-            )
-        install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
-
-        if not skip_stubs:
-            with working_directory(pkg_dir):
-                if on_windows:
-                    generate_python_stubs_windows(venv_python, pkg_dir, lib_dir)
-                else:  # on linux
-                    generate_python_stubs_linux(
-                        venv_python, bool(deep_ep_cuda_architectures),
-                        bool(flash_mla_cuda_architectures),
-                        nixl_root is not None or mooncake_root is not None,
-                        binding_lib_file_name)
+    if not skip_stubs:
+        with working_directory(pkg_dir):
+            if on_windows:
+                generate_python_stubs_windows(venv_python, pkg_dir, lib_dir)
+            else:  # on linux
+                generate_python_stubs_linux(
+                    venv_python, bool(deep_ep_cuda_architectures),
+                    bool(flash_mla_cuda_architectures), nixl_root is not None
+                    or mooncake_root is not None, binding_lib_file_name)
 
     build_kv_cache_manager_v2(wheel_project_dir,
                               venv_python,
@@ -1606,11 +1588,6 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Number of parallel jobs for compilation (default: number of CPUs available to this process, respecting affinity)"
     )
-    parser.add_argument(
-        "--cpp_only",
-        "-l",
-        action="store_true",
-        help="Only build the C++ library without Python dependencies")
     parser.add_argument(
         "--extra-cmake-vars",
         "-D",
