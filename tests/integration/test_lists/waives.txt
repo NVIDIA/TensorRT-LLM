@@ -251,8 +251,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::Tes
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-one_model] SKIP (https://nvbugs/6672360)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-fp8] SKIP (https://nvbugs/6626640)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
-llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-tp2-bart-large-cnn] SKIP (https://nvbugs/6463812)
-llmapi/test_llm_api_pytorch_bart.py::test_mbart_pytorch_generate_encoder_decoder_end_to_end SKIP (https://nvbugs/6758881)
 llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_eagle3 SKIP (https://nvbugs/6075431)
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] SKIP (https://nvbugs/6759009)
 test_doc.py::test_relative_path_validity SKIP (https://nvbugs/6784181)
