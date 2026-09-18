@@ -31,6 +31,7 @@ from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from click.testing import CliRunner
 
 
 def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
@@ -171,3 +172,59 @@ def test_openengine_server_missing_grpc_raises_import_error(
         importlib.import_module("tensorrt_llm.grpc.openengine.server")
 
     assert exc_info.value.name == "grpc"
+
+
+def test_serve_openengine_missing_grpc_shows_install_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OpenEngine CLI path provides the optional-runtime installation hint."""
+    real_import = builtins.__import__
+
+    def import_without_grpc(
+        name: str,
+        globals_: Optional[dict] = None,
+        locals_: Optional[dict] = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> types.ModuleType:
+        if name == "grpc" or name.startswith("grpc."):
+            raise ModuleNotFoundError("No module named 'grpc'", name="grpc")
+        return real_import(name, globals_, locals_, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "grpc", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine.server", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_grpc)
+
+    import tensorrt_llm.commands.serve as serve_module
+
+    monkeypatch.setattr(serve_module, "get_llm_args", lambda **_: ({}, None))
+    monkeypatch.setattr(serve_module, "collect_explicit_cli_keys", lambda **_: set())
+    monkeypatch.setattr(
+        serve_module,
+        "update_llm_args_with_extra_dict",
+        lambda llm_args, _extra, **_: llm_args,
+    )
+    monkeypatch.setattr(
+        serve_module._command_telemetry,
+        "apply_raw_config_telemetry_opt_out",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "_apply_effective_telemetry_config",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "parse_metadata_server_config_file",
+        lambda _path: None,
+    )
+
+    result = CliRunner().invoke(
+        serve_module.serve,
+        ["test-model", "--grpc", "--grpc-protocol", "openengine"],
+    )
+
+    assert result.exit_code == 1
+    assert 'python -m pip install "tensorrt_llm[openengine]"' in result.output

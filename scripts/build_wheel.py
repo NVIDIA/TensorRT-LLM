@@ -755,6 +755,11 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
         sync_tree(project_dir / tree,
                   staging_dir / tree,
                   exclude=("__pycache__", "*.pyc"))
+    generator = project_dir / "scripts" / "generate_openengine_protos.py"
+    if generator.is_file():
+        generator_dst = staging_dir / "scripts" / generator.name
+        generator_dst.parent.mkdir(parents=True, exist_ok=True)
+        copy(generator, generator_dst)
     top_level_files = [
         "setup.py", "pyproject.toml", "constraints.txt", "LICENSE", "README.md"
     ]
