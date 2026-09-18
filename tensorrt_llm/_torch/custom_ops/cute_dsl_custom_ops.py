@@ -8476,13 +8476,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ``forward`` (shares ``_pick_tuning`` with the single-CTA path).
 
     # ------------------------------------------------------------------ #
-    #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
+    #  CuTE DSL FP8 Paged MQA Logits (SM100 family)                      #
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.paged_mqa_logits import (
         FP4MQALogitsKernel, FP8MQALogitsKernel)
 
     class CuteDSLPagedMQALogitsRunner:
-        """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
+        """Runner for CuTe DSL FP8 Paged MQA Logits kernel (SM100 family).
 
         Caches compiled kernels keyed by static params
         (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n, num_sms).
@@ -8736,7 +8736,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            device=q.device)
 
     # ------------------------------------------------------------------ #
-    #  CuTe DSL MiniMax-M3 index decode scoring (Blackwell SM100)         #
+    #  CuTe DSL MiniMax-M3 index decode scoring (SM100 family)            #
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.cute_ptx_utils import \
         TORCH_TO_CUTE_DTYPE as _M3_TORCH_TO_CUTE_DTYPE
@@ -10321,11 +10321,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, n), "CuTe DSL bf16 gemm output shape is incorrect"
 
     # ------------------------------------------------------------------ #
-    #  CuTE DSL FP4 Paged MQA Logits (Blackwell SM100)                   #
+    #  CuTE DSL FP4 Paged MQA Logits (SM100 family)                      #
     # ------------------------------------------------------------------ #
 
     class CuteDSLFP4PagedMQALogitsRunner:
-        """Runner for CuTe DSL FP4 Paged MQA Logits kernel (Blackwell SM100).
+        """Runner for CuTe DSL FP4 Paged MQA Logits kernel (SM100 family).
 
         Caches compiled kernels keyed by static params
         (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
