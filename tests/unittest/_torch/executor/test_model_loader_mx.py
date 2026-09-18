@@ -37,6 +37,8 @@ from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
+    WEIGHT_MANIFEST_DIR_ENV,
+    WEIGHT_MANIFEST_ROLE_ENV,
     ArtifactIdentity,
     PostTransformFeature,
     PostTransformProfile,
@@ -45,6 +47,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
+    load_weight_manifest,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
@@ -138,6 +141,15 @@ class _TinyModel(nn.Module):
         self._events.append("post_load_weights")
 
 
+class _ManifestTinyModel(_TinyModel):
+    """`_TinyModel` plus real CPU tensors so a weight manifest has something to hash."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(2, 4))
+        self.register_buffer("scale", torch.tensor([0.5, 0.25]))
+
+
 @contextmanager
 def _moe_context(config, mapping):
     yield None
@@ -216,6 +228,30 @@ def _llama_alias_state(model):
         "layer1_next_norm": layers[1].next_layer_layernorm is model.model.norm,
         "layer1_next_attn": layers[1].next_attn is None,
     }
+
+
+def _mx_canonical_parameter_catalog(model: nn.Module):
+    """Mirror MX's canonical TRT-LLM parameter view without importing MX."""
+    catalog = {}
+    seen_storages = set()
+    runtime_alias_components = {"next_attn", "next_layer_layernorm"}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        storage = (
+            parameter.device.type,
+            parameter.device.index,
+            parameter.data_ptr(),
+        )
+        if runtime_alias_components.intersection(name.split(".")):
+            continue
+        if storage in seen_storages:
+            continue
+        seen_storages.add(storage)
+        catalog[name] = (
+            parameter.data_ptr(),
+            tuple(parameter.shape),
+            parameter.dtype,
+        )
+    return catalog
 
 
 def _llama_input_embeddings(model: nn.Module) -> torch.Tensor:
@@ -583,13 +619,10 @@ def test_construct_checkpoint_loader_passes_mx_config():
         None,
         "MX",
         mx_config=mx_config,
-        mx_model_name="Qwen/Qwen3-8B",
     )
 
     assert isinstance(checkpoint_loader, MXCheckpointLoader)
     assert checkpoint_loader.mx_server_url == "http://mx:8001"
-    assert checkpoint_loader.query_timeout_s == 17
-    assert checkpoint_loader.model_name == "Qwen/Qwen3-8B"
 
 
 def _format_documented_values(
@@ -698,6 +731,15 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert kwargs["mapping"] is loader.mapping
     assert kwargs["model"] is model
     assert kwargs["source_identity"] is loader._source_identity
+    assert (
+        kwargs["model_config"]
+        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+    )
+    assert kwargs["load_config"] is loader.llm_args
+    assert (
+        kwargs["post_transform_protocol_version"]
+        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+    )
     assert kwargs["allow_post_transform_weights"] is True
     assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
     assert loader._call_load_weights.call_count == 0
@@ -719,6 +761,73 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert model._weights_transformed is False
     assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
+
+
+def test_cleanup_releases_active_checkpoint_loader(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+
+    loader.load("/ckpt", checkpoint_loader)
+    loader.cleanup()
+
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._checkpoint_loader is None
+
+
+def test_cleanup_swallows_checkpoint_loader_failure(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    cleanup_error = RuntimeError("cleanup failed")
+    checkpoint_loader.cleanup.side_effect = cleanup_error
+    loader._checkpoint_loader = checkpoint_loader
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
+
+    loader.cleanup()
+
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._checkpoint_loader is None
+    warning.assert_called_once_with(
+        f"Failed to clean up checkpoint loader {checkpoint_loader!r}: {cleanup_error!r}"
+    )
+
+
+def test_cleanup_continues_after_gms_failure(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    gms_backend = MagicMock(name="gms_backend")
+    cleanup_error = RuntimeError("gms cleanup failed")
+    gms_backend.cleanup.side_effect = cleanup_error
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    loader._gms_backend = gms_backend
+    loader._checkpoint_loader = checkpoint_loader
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
+
+    loader.cleanup()
+
+    gms_backend.cleanup.assert_called_once_with()
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._gms_backend is None
+    assert loader._checkpoint_loader is None
+    warning.assert_called_once_with(
+        f"Failed to clean up GMS backend {gms_backend!r}: {cleanup_error!r}"
+    )
+
+
+def test_config_failure_retains_checkpoint_loader_for_cleanup(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    loader._load_and_validate_config.side_effect = RuntimeError("config failed")
+
+    with pytest.raises(RuntimeError, match="config failed"):
+        loader.load("/ckpt", checkpoint_loader)
+
+    assert loader._checkpoint_loader is checkpoint_loader
+    loader.cleanup()
+    checkpoint_loader.cleanup.assert_called_once_with()
 
 
 @pytest.mark.cpu_only
@@ -823,6 +932,15 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     loader._call_load_weights.assert_not_called()
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
+    assert (
+        kwargs["model_config"]
+        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+    )
+    assert kwargs["load_config"] is loader.llm_args
+    assert (
+        kwargs["post_transform_protocol_version"]
+        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+    )
     assert callable(kwargs["prepare_post_transform_receiver"])
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
@@ -1537,6 +1655,25 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     assert decision.qualified
 
 
+def test_staged_llama_finalization_preserves_mx_tensor_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny_llama_model(monkeypatch)
+
+    # MX discovers and registers tensors after receiver alias preparation.
+    ModelLoader._setup_aliases(model)
+    registered_catalog = _mx_canonical_parameter_catalog(model)
+
+    # This is the receiver-side finalization sequence after RDMA completes.
+    ModelLoader._setup_aliases(model)
+    ModelLoader._mark_weights_transformed(model)
+    ModelLoader._walk_cache_state(model)
+    published_catalog = _mx_canonical_parameter_catalog(model)
+
+    assert registered_catalog
+    assert published_catalog == registered_catalog
+
+
 @pytest.mark.cpu_only
 def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     monkeypatch: pytest.MonkeyPatch,
@@ -1556,6 +1693,45 @@ def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
     assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
+
+
+@pytest.mark.cpu_only
+def test_separate_draft_load_preserves_mx_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = MagicMock()
+    spec_config = SimpleNamespace(speculative_model="draft-checkpoint")
+    loader = ModelLoader(
+        llm_args=MagicMock(),
+        mapping=mapping,
+        spec_config=spec_config,
+        sparse_attention_config=None,
+        max_num_tokens=1,
+        max_seq_len=1,
+    )
+    checkpoint_loader = MagicMock()
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.load_weights.return_value = {"draft": object()}
+    draft_mapper = MagicMock()
+    monkeypatch.setattr(
+        model_loader_mod.AutoCheckpointMapper,
+        "get",
+        MagicMock(return_value=draft_mapper),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = SimpleNamespace(
+        draft_config=_make_draft_model_config(),
+        draft_model=MagicMock(),
+        load_draft_weights=lambda _weights: None,
+    )
+
+    loader._load_separate_draft_weights(model, checkpoint_loader)
+
+    checkpoint_loader.load_weights.assert_called_once_with(
+        "draft-checkpoint",
+        mapping=mapping,
+        _preserve_mx_session=True,
+    )
 
 
 @pytest.mark.cpu_only
@@ -1921,3 +2097,125 @@ def test_mla_transform_weights_is_idempotent(monkeypatch):
     mla._weights_transformed = False
     MLA.cache_derived_state(mla)
     assert mla._weights_transformed is True
+
+
+def _make_manifest_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    events: list[str],
+    role: str | None,
+    mapping: mapping_mod.Mapping | None = None,
+) -> ModelLoader:
+    loader = _make_loader(monkeypatch, events=events)
+    loader.mapping = mapping or mapping_mod.Mapping(world_size=1, rank=0, tp_size=1)
+    monkeypatch.setattr(
+        model_loader_mod.AutoModelForCausalLM,
+        "from_config",
+        MagicMock(return_value=_ManifestTinyModel(events)),
+    )
+    if role is None:
+        monkeypatch.delenv(WEIGHT_MANIFEST_DIR_ENV, raising=False)
+        monkeypatch.delenv(WEIGHT_MANIFEST_ROLE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(tmp_path))
+        monkeypatch.setenv(WEIGHT_MANIFEST_ROLE_ENV, role)
+    real_write = model_loader_mod.maybe_write_weight_manifest
+
+    def _recording_write(*args, **kwargs):
+        events.append("manifest")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(model_loader_mod, "maybe_write_weight_manifest", _recording_write)
+    return loader
+
+
+def _hf_checkpoint_loader() -> MagicMock:
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+    return checkpoint_loader
+
+
+@pytest.mark.cpu_only
+def test_load_writes_final_manifest_at_end_of_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = []
+    loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="baseline")
+
+    model, _ = loader.load("/ckpt", _hf_checkpoint_loader())
+
+    assert events == ["load_weights", "post_load_weights", "manifest"]
+    files = sorted(path.name for path in tmp_path.iterdir())
+    assert files == ["manifest.final.baseline.rank0.json"]
+    manifest = load_weight_manifest(tmp_path / files[0])
+    assert [entry.fqn for entry in manifest.entries] == ["scale", "weight"]
+    assert manifest.context["boundary"] == "model_loader_load_end"
+    assert manifest.context["checkpoint_format"] == "HF"
+    assert manifest.context["weights_preloaded"] is False
+    assert manifest.context["load_format"] == str(LoadFormat.AUTO)
+    assert manifest.context["model_class"] == type(model).__name__
+    assert manifest.context["tp_rank"] == 0 and manifest.context["world_size"] == 1
+    assert model_loader_mod.ModelLoaderMetricNames.WEIGHT_MANIFEST_SECONDS.value in loader._metrics
+
+
+@pytest.mark.cpu_only
+def test_load_final_manifest_records_mx_receiver_facts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = []
+    loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role="receiver")
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.is_weights_preloaded.return_value = True
+    # `_ManifestTinyModel` is not a registered root, so the post-transform
+    # staged path must stay off; the full post-load path still ends in a manifest.
+    checkpoint_loader.is_post_transform_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {}
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert events[-1] == "manifest"
+    manifest = load_weight_manifest(tmp_path / "manifest.final.receiver.rank0.json")
+    assert manifest.context["checkpoint_format"] == "MX"
+    assert manifest.context["weights_preloaded"] is True
+    assert manifest.context["role"] == "receiver"
+
+
+@pytest.mark.cpu_only
+def test_load_writes_no_manifest_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = []
+    loader = _make_manifest_loader(monkeypatch, tmp_path, events=events, role=None)
+
+    loader.load("/ckpt", _hf_checkpoint_loader())
+
+    assert events == ["load_weights", "post_load_weights", "manifest"]
+    assert list(tmp_path.iterdir()) == []
+    assert (
+        model_loader_mod.ModelLoaderMetricNames.WEIGHT_MANIFEST_SECONDS.value not in loader._metrics
+    )
+
+
+@pytest.mark.cpu_only
+def test_load_final_manifest_uses_mapping_rank(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = []
+    loader = _make_manifest_loader(
+        monkeypatch,
+        tmp_path,
+        events=events,
+        role="donor",
+        mapping=mapping_mod.Mapping(world_size=2, rank=1, tp_size=2),
+    )
+
+    loader.load("/ckpt", _hf_checkpoint_loader())
+
+    manifest = load_weight_manifest(tmp_path / "manifest.final.donor.rank1.json")
+    assert manifest.context["rank"] == 1
+    assert manifest.context["tp_rank"] == 1
+    assert manifest.context["world_size"] == 2

@@ -8,12 +8,13 @@ llm_perf_core:
 # 3: H100, test cases
 # 4: H100, GB200, B200, B300, GB300, RTX6000-Server test cases
 # 5: GB200, B200, B300, GB300, RTX6000-Server test cases
-# 6: B200, GB200, B300, GB300 test cases
+# 6: B200, GB200, B300, GB300, VR200 test cases
 # 7: B200, B300 test cases
 # 8: B300 test cases
 # 9: H100, B200, B300, RTX6000-Server test cases
 # 10: B200, B300, RTX6000-Server test cases
 # 11: RTX-6000 Server test cases
+# 12: VR200 single-node test cases
 # ===============================================================================
 
 
@@ -80,13 +81,19 @@ llm_perf_core:
 
 # 4: H100, GB200, B200, B300, GB300, RTX6000-Server test cases
 - condition:
+    terms:
+      compute_capability:
+      - 9.0
+      - 10.0
+      - 10.3
+      - 12.0
     ranges:
       system_gpu_count:
         gte: 2
-      compute_capability:
-        gte: 9.0
-        lte: 12.0
   tests:
+  # compute_capability is a list, not a range: a range from Hopper to
+  # RTX-6000-Server (12.0) also spans Rubin (10.7), and these cases have not been
+  # run there. A new architecture opts in by being added to the list.
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-input_output_len:512,512]
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8]
   #nemotron_nano_12b_v2
@@ -117,25 +124,32 @@ llm_perf_core:
 
 # 5: GB200, B200, B300, GB300, RTX6000-Server test cases
 - condition:
+    terms:
+      compute_capability:
+      - 10.0
+      - 10.3
+      - 12.0
     ranges:
       system_gpu_count:
         gte: 4
-      compute_capability:
-        gte: 10.0
-        lte: 12.0
   tests:
+  # compute_capability is a list, not a range: a range from Hopper to
+  # RTX-6000-Server (12.0) also spans Rubin (10.7), and these cases have not been
+  # run there. A new architecture opts in by being added to the list.
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:4-gpus:4]
 
 
-# 6: B200, GB200, B300, GB300 test cases
+# 6: B200, GB200, B300, GB300, VR200 test cases
 - condition:
     ranges:
       system_gpu_count:
         gte: 4
       compute_capability:
         gte: 10.0
-        lte: 10.3
+        lte: 10.7
   tests:
+  # Upper bound is 10.7 so Rubin shares this set: a VR200 NVL72 node exposes 4 GPUs,
+  # the same shape these cases are sized for, so it runs them rather than a copy.
   #qwen3.5_27b (dense BF16 52G, 1-GPU): maxbs 512 mamba states need >95G
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:500,2000]
@@ -200,6 +214,13 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] #min_latency
   - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4] #max_throughput
+  # Qwen3.8 Flash-Next single-GPU FP8/TRTLLM and NVFP4/CUTEDSL with MTP3.
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:5-con:1-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:5-con:1-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1] TIMEOUT(180)
 
 
 # 7: B200, B300 test cases
@@ -271,6 +292,26 @@ llm_perf_core:
   tests:
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  # NVFP4 DSpark: experimental single-node adaptation of the GB300 disagg recipe.
+  # Hold workload/parallelism fixed; only override MoE (including the draft).
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:AUTO] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:TRTLLM] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:CUTEDSL] TIMEOUT(120)
+  #deepseek_v4_pro_base_fp8 (1.6T MoE, FP8 block-scale, B300 DEP8 throughput and TEP8 latency)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:8192,1024-reqs:1024-con:512-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:1000,2000-reqs:512-con:256-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448-kv_frac:0.9-input_output_len:8192,1024-reqs:10-con:1-ep:8-tp:8-gpus:8] TIMEOUT(120) #min_latency
+  #kimi_k3 (TEP8 interactive serving, 8-GPU)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT (120)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
+  # kimi_k3 short-context (1k/2k) scenario, same TEP8 8-GPU deployment
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
+  # Qwen3.8 MAX NVFP4 TP8 with MTP3 on 8-GPU B300 systems.
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:1-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:1-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:1-tp:8-gpus:8] TIMEOUT(180)
 
 
 # 9: H100, B200, B300, RTX6000-Server test cases
@@ -328,3 +369,20 @@ llm_perf_core:
   # 2000-token decode of each request; does not fit the 60min default here.
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:8-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:8-tp:8-gpus:8]
+
+
+# 12: VR200 single-node test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+      compute_capability:
+        gte: 10.7
+        lte: 10.7
+  tests:
+  #deepseek_v4_pro_fp4 (1.6T MoE, sparse MLA + mHC, FP4+FP8 mixed). The
+  #rough 0.8-0.9TB weight footprint fits in 4x288GB Rubin HBM, but not 4xB200.
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:8192,1024-reqs:1024-con:512-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:1000,2000-reqs:512-con:256-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-float4-maxbs:128-maxnt:8448-input_output_len:8192,1024-reqs:10-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120) #min_latency

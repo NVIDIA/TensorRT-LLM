@@ -302,6 +302,11 @@ class KvCacheTransceiver(ABC):
         """Whether the send session closed before its final slice."""
         return False
 
+    @property
+    def consumes_transfer_buffer(self) -> bool:
+        """Return whether this runtime consumes the C++ CacheTransBuffer budget."""
+        return True
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Start sending ``req``'s KV cache to the requesting instance.
@@ -527,6 +532,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                 logger.info(
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
+
+        if (cache_transceiver_config.kv_cache_bounce_size_mb > 0
+                or cache_transceiver_config.agent_bounce_buffer_enable):
+            logger.warning(
+                "bounce is only supported by the Python (v2) transceiver; "
+                "ignored on the C++ transceiver path")
 
         self.impl = CacheTransceiverCpp(
             kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,

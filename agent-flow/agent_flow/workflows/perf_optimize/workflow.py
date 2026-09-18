@@ -471,25 +471,30 @@ class PerfOptimizeWorkflow:
                         self.roadmap_path,
                         analysis_dir / "profile_findings.md",
                     ]
+                    # A reused round never ran ncu, so any ledger sitting
+                    # in its analysis/ is the copy --reuse-analysis seeded
+                    # from the source campaign, not one this round authored.
+                    imported_ledger = (
+                        state.reuse_pending
+                        and (analysis_dir / kernel_ledger.LEDGER_FILENAME).is_file()
+                    )
                     enforce_ledger = (
                         self._kernel_coverage() is not None
                         # A replan-only round runs no ncu at all: the
                         # standing ledger still describes this build.
                         and not replan_only
-                        # A reused round never ran ncu either, so it can only
-                        # carry the ledger the source campaign wrote — hold it
-                        # to the contract exactly when the source had one.
-                        and (
-                            not state.reuse_pending
-                            or (analysis_dir / kernel_ledger.LEDGER_FILENAME).is_file()
-                        )
+                        # Hold a reused round to the contract exactly when the
+                        # source had a ledger to hold it to.
+                        and (not state.reuse_pending or imported_ledger)
                     )
                     if enforce_ledger:
                         analyzer_outputs.append(analysis_dir / kernel_ledger.LEDGER_FILENAME)
                     self._require_stage_outputs(STAGE_ANALYZER, analyzer_outputs)
                     roadmap = self._validate_roadmap()
                     if enforce_ledger:
-                        self._validate_kernel_ledger(roadmap, analysis_dir)
+                        self._validate_kernel_ledger(
+                            roadmap, analysis_dir, log=log, imported=imported_ledger
+                        )
                     self._validate_nsys_items(roadmap, analysis_dir)
                     self._record_nsys_capture(state, analysis_dir)
                     if not replan_only and not state.reuse_pending:
@@ -1669,16 +1674,43 @@ class PerfOptimizeWorkflow:
                 )
         return roadmap
 
-    def _validate_kernel_ledger(self, roadmap: dict[str, Any], analysis_dir: Path) -> None:
+    def _waive_imported_ledger(self, why: str, log) -> None:
+        """Warn that a reused round's imported ledger is being waived."""
+        print_message(
+            f"[yellow]the {kernel_ledger.LEDGER_FILENAME} imported by "
+            f"--reuse-analysis does not satisfy this campaign's coverage "
+            f"contract, so it is waived for the reused round (round 2+ "
+            f"re-profiles under it as usual):\n{why}[/yellow]",
+            log,
+        )
+
+    def _validate_kernel_ledger(
+        self,
+        roadmap: dict[str, Any],
+        analysis_dir: Path,
+        log=None,
+        imported: bool = False,
+    ) -> None:
         """Validate the round's kernel ledger as part of the analyzer gate.
 
         No-op unless the task declares ``profile.kernel_coverage``. With
         the contract active, the ledger must be shape-valid, every
         ``disposition: item`` ref must name a real roadmap item, and the
         enumerated rows must reach the declared coverage target — the
-        deterministic teeth behind "every kernel's optimization and
-        fusion possibility was considered". Raising leaves the checkpoint
-        parked at the analyzer, so re-running retries the stage.
+        deterministic teeth behind "every kernel's elimination,
+        optimization, fusion, or overlap possibility was considered".
+        Raising leaves the checkpoint parked at the analyzer, so
+        re-running retries the stage.
+
+        ``imported`` marks the one ledger the round did not author: the
+        copy ``--reuse-analysis`` seeded from a source campaign. A retry
+        cannot repair that file — the reused round runs plan-only and
+        never writes a ledger — so a source ledger this campaign cannot
+        satisfy (an older schema, or ``item`` refs naming the *source*
+        campaign's roadmap ids) would wedge the run on a failure no
+        operator action clears. It degrades to the same warn-and-waive
+        the source-had-no-ledger case already takes; rounds 2+ profile
+        and are enforced normally.
         """
         coverage = self._kernel_coverage()
         if coverage is None:
@@ -1690,14 +1722,22 @@ class PerfOptimizeWorkflow:
                 ledger, roadmap, float(coverage["coverage_target_pct"])
             )
         except kernel_ledger.LedgerError as exc:
+            if imported:
+                self._waive_imported_ledger(str(exc), log)
+                return
             raise RuntimeError(
                 f"analyzer stage finished but {kernel_ledger.LEDGER_FILENAME} failed "
                 f"validation:\n{exc}\nEvery kernel above the coverage bar must "
-                f"carry both dispositions (faster / fusion). Re-run the workflow "
-                f"to retry the analyzer stage, or pass --clean to start over."
+                f"carry all four dispositions "
+                f"({' / '.join(kernel_ledger.QUESTIONS)}), and the coverage block "
+                f"its `gpu_busy_pct`. Re-run the workflow to retry the analyzer "
+                f"stage, or pass --clean to start over."
             ) from exc
         if problems:
             bullet = "\n  - "
+            if imported:
+                self._waive_imported_ledger(bullet.lstrip("\n") + bullet.join(problems), log)
+                return
             raise RuntimeError(
                 f"analyzer stage finished but {ledger_path} failed the coverage "
                 f"contract:{bullet}{bullet.join(problems)}\n"
@@ -2351,14 +2391,18 @@ class PerfOptimizeWorkflow:
                 f"{coverage['coverage_target_pct']}% is covered; group "
                 f"honestly-shared rows), capture them over bounded ncu "
                 f"passes (re-filtering each pass on the still-missing "
-                f"stems), and answer both questions per kernel — faster? "
-                f"fusible? — each with a roadmap item or an evidence-backed "
-                f"dismissal. `Write` the ledger to `{ledger_path}` per the "
-                f"contract; the orchestrator validates it (both dispositions "
-                f"per row, item refs resolving into `{self.roadmap_path}`, "
-                f"coverage ≥ target) and an incomplete ledger aborts the "
-                f"stage. Mirror the rows as the `## Kernel disposition "
-                f"ledger` section of your findings"
+                f"stems), record the window's GPU busy share in "
+                f"`coverage.gpu_busy_pct` (it converts every share of GPU "
+                f"time into the share of wall clock the noise floor judges), "
+                f"and answer all four questions per kernel — eliminable? "
+                f"faster? fusible? overlappable? — each with a roadmap item "
+                f"or an evidence-backed dismissal. `Write` the ledger to "
+                f"`{ledger_path}` per the contract; the orchestrator "
+                f"validates it (all four dispositions per row, item refs "
+                f"resolving into `{self.roadmap_path}`, coverage ≥ target) "
+                f"and an incomplete ledger aborts the stage. Mirror the rows "
+                f"as the `## Kernel disposition ledger` section of your "
+                f"findings"
             )
             ncu_artifacts = "the per-pass `server_ncu_pass<k>.ncu-rep` reports + their summaries"
         else:
@@ -3056,9 +3100,10 @@ class PerfOptimizeWorkflow:
             coverage_read = (
                 f" {ledger_name} (the final round's per-kernel disposition "
                 f"ledger — the Kernel Coverage section per your system "
-                f"prompt: every kernel's faster/fusion disposition resolved "
-                f"to its campaign outcome, the still-pending refs itemized "
-                f"as the untried tail),"
+                f"prompt: every kernel's elimination/faster/fusion/overlap "
+                f"disposition "
+                f"resolved to its campaign outcome, the still-pending refs "
+                f"itemized as the untried tail),"
             )
             coverage_section = "Kernel Coverage / "
         reuse_read = ""

@@ -13,7 +13,12 @@ import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
-from agent_flow.workflows.perf_optimize import nsys_items, roadmap_schema, task_schema
+from agent_flow.workflows.perf_optimize import (
+    kernel_ledger,
+    nsys_items,
+    roadmap_schema,
+    task_schema,
+)
 from agent_flow.workflows.perf_optimize import progress as progress_module
 from agent_flow.workflows.perf_optimize import state as state_module
 from agent_flow.workflows.perf_optimize import workflow as workflow_module
@@ -3327,12 +3332,13 @@ _KC_EXTRA = {"profile": {"kernel_coverage": {}}}
 def _ledger_yaml(faster_ref: str = "opt-001") -> str:
     return yaml.safe_dump(
         {
-            "version": 1,
+            "version": kernel_ledger.LEDGER_VERSION,
             "source": "rounds/round_1/analysis/nsys_stats.txt",
             "coverage": {
                 "enumerated_share_pct": 96.0,
                 "other_share_pct": 4.0,
                 "min_share_pct": 0.5,
+                "gpu_busy_pct": 82.4,
             },
             "kernels": [
                 {
@@ -3346,11 +3352,21 @@ def _ledger_yaml(faster_ref: str = "opt-001") -> str:
                         "occupancy_pct": 62.0,
                         "bound": "memory",
                     },
+                    "elimination": {
+                        "disposition": "dismissed",
+                        "why_it_runs": "read by the next layer (NVTX + source)",
+                        "ref": "mandatory-math: per-step recurrence",
+                    },
                     "faster": {"disposition": "item", "ref": faster_ref},
                     "fusion": {
                         "disposition": "dismissed",
                         "neighbors": "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace)",
                         "ref": "already-fused: neighbors are inside this kernel",
+                    },
+                    "overlap": {
+                        "disposition": "dismissed",
+                        "concurrent_with": "moe_gemm (cuda_gpu_trace, stream 7)",
+                        "ref": "graph-disabled: cuda_graph_config unset in the live tuning config",
                     },
                 }
             ],
@@ -3485,6 +3501,65 @@ def test_kernel_coverage_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
     assert state.stage == state_module.STAGE_ANALYZER
 
 
+@pytest.mark.parametrize("dropped", ["elimination", "faster", "fusion", "overlap"])
+def test_kernel_coverage_unanswered_question_blocks_advance(tmp_path, fake_git, dropped):
+    """A row that skips any question aborts the stage.
+
+    The exhaustiveness guarantee is only worth the weakest question it
+    enforces — a ledger silently dropping one would let a campaign
+    conclude with a kernel nobody asked whether it had to exist, run
+    alone, or run at all.
+    """
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_incomplete_ledger(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["kernels"][0][dropped]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_with_incomplete_ledger
+    try:
+        with pytest.raises(RuntimeError, match="answers all four questions"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_kernel_coverage_missing_gpu_busy_blocks_advance(tmp_path, fake_git):
+    """Materiality is denominated in wall clock, so the busy share is owed."""
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_without_busy_share(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["coverage"]["gpu_busy_pct"]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_without_busy_share
+    try:
+        with pytest.raises(RuntimeError, match="gpu_busy_pct"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
 def test_kernel_coverage_below_target_blocks_advance(tmp_path, fake_git):
     task = _write_task(tmp_path, _KC_EXTRA)
     ws = tmp_path / "ws"
@@ -3531,7 +3606,10 @@ def test_kernel_coverage_driving_prompts_name_ledger_and_section(tmp_path):
     assert "kernel_ledger.yaml" in analyzer
     assert "per-kernel coverage contract" in analyzer
     assert "0.5%" in analyzer and "95.0%" in analyzer
-    assert "faster? fusible?" in analyzer
+    assert "eliminable? faster? fusible? overlappable?" in analyzer
+    # The busy share is asked for by name — it is what converts a share of
+    # GPU time into the share of wall clock the noise floor judges.
+    assert "coverage.gpu_busy_pct" in analyzer
     # The default bounded top-kernel wording is superseded, not repeated.
     assert "on the top nsys kernels: keep the canonical ncu flags" not in analyzer
     reporter = captured["reporter"]
@@ -3942,19 +4020,76 @@ def test_reused_round_without_a_ledger_does_not_enforce_the_coverage_gate(tmp_pa
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
 
 
-def test_reused_source_ledger_is_still_validated(tmp_path, fake_git):
-    """An imported ledger that fails the contract blocks the stage."""
+def _run_reuse_campaign_with_source_ledger(tmp_path, ledger_yaml: str):
+    """Run a one-round reuse campaign whose source carries ``ledger_yaml``."""
     source = _analyze_workspace(tmp_path / "prior")
-    (source / "kernel_ledger.yaml").write_text(_ledger_yaml("opt-does-not-exist"), encoding="utf-8")
-    task = _write_task(tmp_path, _KC_EXTRA)
+    (source / "kernel_ledger.yaml").write_text(ledger_yaml, encoding="utf-8")
+    extra = dict(_KC_EXTRA)
+    extra["optimize"] = {"max_rounds": 1}
+    task = _write_task(tmp_path, extra)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws, reuse_analysis=source)
-    _stub_agents(workflow)
+    trace = _stub_agents(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    return ws, trace
+
+
+def test_reused_source_ledger_that_fails_the_contract_is_waived(tmp_path, fake_git):
+    """An unsatisfiable imported ledger degrades; it never wedges the run.
+
+    The reused round is plan-only and never writes a ledger, so nothing a
+    retry does can repair the copy ``--reuse-analysis`` seeded — here one
+    whose ``item`` refs name the *source* campaign's roadmap ids. Aborting
+    on it would leave the campaign stuck on a failure no operator action
+    clears, so it takes the same warn-and-waive as a source with no ledger.
+    """
+    ws, trace = _run_reuse_campaign_with_source_ledger(tmp_path, _ledger_yaml("opt-does-not-exist"))
+
+    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+
+
+def test_reused_source_ledger_predating_the_contract_is_waived(tmp_path, fake_git):
+    """The real trap: a source ledger written before the questions grew.
+
+    Every workspace produced before ``elimination`` / ``overlap`` /
+    ``gpu_busy_pct`` became required carries a ledger that can never
+    satisfy today's schema, and ``--reuse-analysis`` documents an earlier
+    campaign as a supported source.
+    """
+    stale = yaml.safe_load(_ledger_yaml())
+    stale["coverage"].pop("gpu_busy_pct")
+    for row in stale["kernels"]:
+        row.pop("elimination")
+        row.pop("overlap")
+    ws, trace = _run_reuse_campaign_with_source_ledger(
+        tmp_path, yaml.safe_dump(stale, sort_keys=False)
+    )
+
+    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+
+
+def test_a_self_authored_ledger_is_never_waived(tmp_path, fake_git):
+    """The waive is scoped to the imported copy, not to every failure.
+
+    A round that profiled authored its own ledger, so a failing one is a
+    retryable defect and must still park the checkpoint.
+    """
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_ledger(workflow, faster_ref="opt-does-not-exist")
     try:
         with pytest.raises(RuntimeError, match="coverage contract"):
             workflow.run(str(task))
     finally:
         workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
 
 
 def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path):

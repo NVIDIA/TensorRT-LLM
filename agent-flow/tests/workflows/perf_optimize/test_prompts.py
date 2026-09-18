@@ -1114,16 +1114,121 @@ def test_kernel_coverage_note_interpolates_the_task_bars():
     assert "supersedes Run B's target selection" in block
 
 
-def test_kernel_coverage_note_poses_both_questions_per_kernel():
+def test_kernel_coverage_note_poses_all_four_questions_per_kernel():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "can it be eliminated?" in block
     assert "can it be made faster?" in block
     assert "can it be fused with its neighbors?" in block
+    assert "can it be overlapped with independent work on another stream?" in block
     # Each answer is an item or an evidence-backed dismissal — recorded
     # in the schema-validated ledger, with the abort consequence named.
     assert "kernel_ledger.yaml" in block
     assert "aborts the stage" in block
     assert "disposition: item" in block
     assert "disposition: dismissed" in block
+
+
+def test_kernel_coverage_note_orders_questions_by_what_they_presuppose():
+    """Each question assumes less than the last, elimination least of all."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "ordered by how much they presuppose, each asking less than the last" in block
+    # The order is load-bearing: elimination leads because a yes moots
+    # the rest, overlap trails because it drops the alone assumption.
+    for earlier, later in (
+        (
+            "### Question 1 per kernel — can it be eliminated?",
+            "### Question 2 per kernel — can it be made faster?",
+        ),
+        (
+            "### Question 2 per kernel — can it be made faster?",
+            "### Question 3 per kernel — can it be fused with its neighbors?",
+        ),
+        (
+            "### Question 3 per kernel — can it be fused with its neighbors?",
+            "### Question 4 per kernel — can it be overlapped with independent work?",
+        ),
+    ):
+        assert block.index(earlier) < block.index(later), later
+
+
+def test_kernel_coverage_note_grounds_elimination_in_why_the_kernel_runs():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "Ask this **first**" in block
+    # It recovers the WHOLE share, unlike every other question.
+    assert "recovers the row's **whole** wall-clock share" in block
+    assert "elimination.why_it_runs" in block or "why_it_runs" in block
+    # The four shapes it hunts for.
+    for shape in ("Redundant", "Wasted", "Hoistable", "Accidental slow path"):
+        assert shape in block, shape
+    # It is the per-kernel teeth on round 1's one-shot global sweep.
+    assert "dormant-capability sweep" in block
+    # Carved cleanly against question 2 so the two do not duplicate.
+    assert '"this work does not need to happen" is *elimination*' in block
+    for tag in (
+        "mandatory-math",
+        "padding-minimal",
+        "already-hoisted",
+        "fast-path-active",
+        "fast-path-blocked",
+    ):
+        assert tag in block, tag
+    # An elimination item outranks the row's other answers; gains are not
+    # summed across a kernel this item intends to delete.
+    assert "An elimination item outranks the row's other answers" in block
+
+
+def test_kernel_coverage_note_justifies_the_overlap_question():
+    """Q4 is not redundant with Q2/Q3 — both presuppose running alone."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "Questions 2 and 3 both presuppose the kernel must run **alone**" in block
+    # A latency-bound kernel is routed to Q3, not left at "use CUDA graphs":
+    # graphs collapse the gaps BETWEEN launches, not a kernel that fails to
+    # fill the device from inside a replayed graph.
+    assert "gaps *between* launches" in block
+    assert "answered by question 4" in block
+
+
+def test_kernel_coverage_note_grounds_overlap_in_an_independent_partner():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # The partner and the evidence of today's serialization are recorded,
+    # the same discipline `fusion.neighbors` imposes for adjacency.
+    assert "overlap.concurrent_with" in block
+    assert "data-independent" in block
+    assert "disjoint output slices, disjoint step state" in block
+    # Overlap only pays when the machine is idle — two saturated kernels
+    # serialize on the shared resource whatever stream issued them.
+    assert "do not overlap into anything" in block
+    assert "binding* resource" in block
+    # Realized through the shipped idiom, not a hand-rolled stream pair.
+    assert "maybe_execute_in_parallel" in block
+    assert "AuxStreamType" in block
+    # The CUDA-graph gate is a hard precondition, not a nicety.
+    assert "with_multi_stream(True)" in block
+    assert "graph-disabled" in block
+    for tag in (
+        "no-independent-partner",
+        "resource-saturated",
+        "already-concurrent",
+        "below-materiality",
+        "phase-boundary",
+    ):
+        assert tag in block, tag
+    # Fusion and overlap are alternative spends of one adjacency.
+    assert "Never book the same saving twice" in block
+
+
+def test_kernel_coverage_note_fixes_the_materiality_unit():
+    """`share_pct` is GPU time; every gate downstream is wall clock."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "The materiality unit — wall clock, not GPU time" in block
+    assert "coverage.gpu_busy_pct" in block
+    assert "wall_clock_share = share_pct x gpu_busy_pct / 100" in block
+    # The failure mode the conversion prevents is named with its factor.
+    assert "overstates every candidate by `1 / busy`" in block
+    # And dismissals must quote the converted number, not the raw share.
+    assert "dismissal quoting a raw `share_pct` is not evidence" in block
+    # A low busy share is itself a roadmap item, not per-kernel noise.
+    assert "*is* the host-overhead opportunity" in block
 
 
 def test_kernel_coverage_note_grounds_fusion_in_observed_adjacency():
@@ -1225,6 +1330,14 @@ def test_kernel_coverage_reporter_section_slots_after_kernel_comparison():
     # itemized, never buried.
     assert "pending at campaign end" in block
     assert "untried tail" in block
+    # All four questions get a column, and the busy share that makes the
+    # shares readable as wall clock is stated.
+    assert "| eliminate → | faster → | fusion → | overlap → |" in block
+    assert "coverage.gpu_busy_pct" in block
+    assert "all four questions" in block
+    # One item can span two cells (alternative realizations) or two rows
+    # (a pair) — resolved consistently, counted once.
+    assert "never count its gain twice" in block
     # Honest degrade when the final ledger is missing.
     assert "Kernel coverage ledger unavailable" in block
 

@@ -24,7 +24,6 @@ Run with:
 import gc
 import json
 import os
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 
@@ -34,28 +33,23 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from utils.llm_data import get_checkpoint
 
-try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import (
-        VSAMetadataBuilder,
-        _cute_dsl_import_error,
-        set_vsa_forward_context,
-    )
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._utils import get_free_port
-    from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import (
+    VSAMetadataBuilder,
+    _cute_dsl_import_error,
+    set_vsa_forward_context,
+)
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._utils import get_free_port
+from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
-    MODULES_AVAILABLE = True
-    _cute_dsl_available = _cute_dsl_import_error is None
-except ImportError:
-    MODULES_AVAILABLE = False
-    _cute_dsl_available = False
-    _cute_dsl_import_error = None
+_cute_dsl_available = _cute_dsl_import_error is None
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -95,8 +89,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     port = get_free_port()
@@ -205,26 +197,7 @@ def _log(rank: int, msg: str) -> None:
 # =============================================================================
 
 
-def _llm_models_root() -> str | None:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    return str(root) if root.exists() else None
-
-
-def _checkpoint(env_var: str, default_name: str) -> str | None:
-    if env_var in os.environ:
-        return os.environ[env_var]
-    models_root = _llm_models_root()
-    return os.path.join(models_root, default_name) if models_root is not None else None
-
-
-WAN21_VSA_14B_PATH = _checkpoint(
-    "DIFFUSION_MODEL_PATH_WAN21_VSA_T2V_14B_720P",
-    "Wan2.1-VSA-T2V-14B-720P-Diffusers",
-)
+WAN21_VSA_14B_SUBDIR = "Wan2.1-VSA-T2V-14B-720P-Diffusers"
 
 
 # =============================================================================
@@ -238,9 +211,11 @@ def _logic_vsa_ulysses_real_model(
     *,
     ulysses_size: int,
     cfg_size: int = 1,
-    checkpoint_path: str,
+    checkpoint_subdir: str,
     label: str,
 ) -> None:
+    checkpoint_path = get_checkpoint(checkpoint_subdir)
+
     from tensorrt_llm._torch.visual_gen.checkpoints.weight_loader import WeightLoader
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
@@ -254,20 +229,14 @@ def _logic_vsa_ulysses_real_model(
 
     _log(rank, f"[{label}] building ref_model (world_size=1)")
     ref_config = _make_vsa_model_config(pretrained_dict)
-    try:
-        ref_model = WanTransformer3DModel(ref_config).to(device).to(dtype)
-    except (ImportError, ValueError, NotImplementedError) as e:
-        pytest.skip(f"[{label}] VSA ref model unavailable: {e}")
+    ref_model = WanTransformer3DModel(ref_config).to(device).to(dtype)
     _log(rank, f"[{label}] ref_model created")
 
     _log(rank, f"[{label}] building dist_model (ul={ulysses_size} cfg={cfg_size})")
     dist_config = _make_vsa_model_config(
         pretrained_dict, ulysses_size=ulysses_size, cfg_size=cfg_size
     )
-    try:
-        dist_model = WanTransformer3DModel(dist_config).to(device).to(dtype)
-    except (ImportError, ValueError, NotImplementedError) as e:
-        pytest.skip(f"[{label}] VSA parallel model unavailable: {e}")
+    dist_model = WanTransformer3DModel(dist_config).to(device).to(dtype)
     _log(rank, f"[{label}] dist_model created")
 
     _log(rank, f"[{label}] loading checkpoint weights")
@@ -338,15 +307,8 @@ class TestWanVsaUlyssesRealModel:
     """
 
     def _skip_if_unavailable(self):
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
         if not _cute_dsl_available:
             pytest.skip(f"CUTEDSL not available (requires Blackwell GPU): {_cute_dsl_import_error}")
-        if WAN21_VSA_14B_PATH is None or not os.path.isdir(WAN21_VSA_14B_PATH):
-            pytest.skip(
-                "Wan2.1-VSA-T2V-14B-720P checkpoint not found; "
-                "set DIFFUSION_MODEL_PATH_WAN21_VSA_T2V_14B_720P or LLM_MODELS_ROOT"
-            )
 
     def test_real_model_vsa_cfg2_ulysses4_vs_single_gpu(self):
         """world=8, cfg=2, ulysses=4, real VSA 14B weights, VSA sparsity=0.9."""
@@ -356,7 +318,7 @@ class TestWanVsaUlyssesRealModel:
             test_fn=_logic_vsa_ulysses_real_model,
             ulysses_size=4,
             cfg_size=2,
-            checkpoint_path=WAN21_VSA_14B_PATH,
+            checkpoint_subdir=WAN21_VSA_14B_SUBDIR,
             label="real,cfg=2,ul=4",
         )
 

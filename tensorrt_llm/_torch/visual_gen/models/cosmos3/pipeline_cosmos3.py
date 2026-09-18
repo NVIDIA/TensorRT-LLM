@@ -43,6 +43,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, R
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import (
     classify_worker_error,
+    make_noise_generator,
     postprocess_video_tensor,
     synchronize_media_prepare_status,
 )
@@ -1108,6 +1109,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         come here, matching the reference, so a JSON negative prompt keeps its
         serialized form and gains the sentences after it.
         """
+        if duration_template is None and resolution_template is None:
+            return prompt
+
         parts: List[str] = []
         head = prompt.rstrip(".").strip()
         if head:
@@ -1136,7 +1140,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         resolution_template: Optional[str],
         force_duration_template: bool = False,
     ) -> str:
-        """Apply cosmos-framework-style metadata to plain text or JSON prompts."""
+        """Fill missing JSON metadata or append it to a plain-text prompt."""
         stripped = prompt.strip()
         if stripped.startswith("{"):
             try:
@@ -1145,22 +1149,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 data = None
             else:
                 if isinstance(data, dict):
+                    metadata_defaults = {}
                     if duration_template is not None and (
                         num_frames > 1 or force_duration_template
                     ):
                         # Truncated, not rounded, and integer-valued even though the
-                        # text template above stays fractional: both mirror the
-                        # reference (cosmos-framework _format_json_prompt_with_template).
-                        data["duration"] = f"{int(num_frames / frame_rate)}s"
-                        data["fps"] = float(frame_rate)
-                    else:
-                        # A still carries no duration: drop whatever the caller's
-                        # JSON declared rather than leaving it stale.
-                        data.pop("duration", None)
-                        data.pop("fps", None)
+                        # text template above stays fractional.
+                        metadata_defaults["duration"] = f"{int(num_frames / frame_rate)}s"
+                        metadata_defaults["fps"] = float(frame_rate)
                     if resolution_template is not None:
-                        data["resolution"] = {"H": int(height), "W": int(width)}
-                        data["aspect_ratio"] = _aspect_ratio_bucket(height, width)
+                        metadata_defaults["resolution"] = {"H": int(height), "W": int(width)}
+                        metadata_defaults["aspect_ratio"] = _aspect_ratio_bucket(height, width)
+                    missing_defaults = {
+                        key: value for key, value in metadata_defaults.items() if key not in data
+                    }
+                    if not missing_defaults:
+                        return prompt
+                    data.update(missing_defaults)
                     return json.dumps(data)
 
         return self._apply_metadata_templates(
@@ -1951,7 +1956,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
         if not request.do_action:
-            use_duration_template = use_duration_template and not request.is_t2i
             duration_template = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
             if use_resolution_template:
                 resolution_template = (
@@ -2580,7 +2584,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video=video,
             )
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
         logger.info("Tokenizing prompts...")
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._tokenize_request_prompts(
             request,
@@ -2976,7 +2980,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # scheduler from carrying over on a reused worker.
         self.scheduler = self._scheduler_for(flow_shift_target, use_karras_sigmas=False)
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         if negative_prompt is None:
             negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT

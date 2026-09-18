@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-
 import pytest
 
 from tensorrt_llm import LLM
@@ -22,6 +20,7 @@ from tensorrt_llm._torch.configs import KimiK3Config, KimiLinearConfig
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
+    DSparkDecodingConfig,
     KvCacheConfig,
     MambaStateConfig,
     MoeConfig,
@@ -29,15 +28,17 @@ from tensorrt_llm.llmapi import (
     SamplingParams,
     SchedulingParams,
 )
-from tensorrt_llm.sampling_params import GuidedDecodingParams
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import (
     GSM8K,
     ForceTokenLogitsProcessor,
+    GPQADiamond,
     LlmapiAccuracyTestHarness,
-    assert_acceptance_length,
-    compute_acceptance_length,
+    assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
+    assert_kv_cache_reuse_for_llm,
 )
 
 
@@ -45,6 +46,7 @@ from .accuracy_core import (
 class TestKimiK3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K3"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+    DSPARK_MODEL_PATH = f"{llm_models_root()}/Kimi-K3-DSpark"
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(16)
@@ -54,9 +56,10 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # so gate on GB300-class device memory. B300 clears this memory gate but
     # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) -- do not
     # schedule these tests on B300; that exclusion is enforced by QA's
-    # platform selection, not by this marker.
+    # platform selection and by the CI stage's gb300-only gpu wildcard,
+    # not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
-    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
+    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa", "dspark"])
     def test_w4a16_mxfp4(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
         """Verify Kimi K3 accuracy and its key model-feature matrix entries.
 
@@ -64,8 +67,13 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         mode also exercises attention DP, the overlap scheduler, CUDA graphs,
         chunked prefill, Torch sampling, a logits processor, and guided
         decoding. The reuse mode requires an observed hybrid-cache hit. The SA
-        mode remains an acceptance-length guard; SA is supported but is not a
-        column in the model-feature matrix.
+        and DSpark modes also guard acceptance length for the two speculative
+        decoding techniques advertised in the model-feature matrix.
+
+        The baseline and sa modes run post-merge in the GB300 16-GPU 4-node CI
+        stage (test-db list l0_gb300_multi_nodes_node4_gpu16.yml); all four
+        modes also run in QA's weekly multinode pipeline
+        (qa/llm_function_multinode.txt).
         """
         if mode == "baseline":
             monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
@@ -110,10 +118,25 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 max_batch_size=8,
                 disable_overlap_scheduler=True,
                 enable_chunked_prefill=False,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-                speculative_config=SADecodingConfig(max_draft_len=2),
                 max_stats_len=-1,
             )
+            if mode == "sa":
+                llm_kwargs.update(
+                    cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+                    speculative_config=SADecodingConfig(max_draft_len=2),
+                )
+            else:
+                # Kimi K3 DSpark verification has only been qualified in eager
+                # mode. The external drafter and its captured target states
+                # also need more headroom than suffix automaton.
+                kv_cache_kwargs["free_gpu_memory_fraction"] = 0.20
+                llm_kwargs.update(
+                    cuda_graph_config=None,
+                    speculative_config=DSparkDecodingConfig(
+                        max_draft_len=7,
+                        speculative_model=self.DSPARK_MODEL_PATH,
+                    ),
+                )
             # Log corpus-aggregate acceptance length and rate at evaluation
             # end. QA records these values from the test log.
             monkeypatch.setenv("TLLM_EVAL_SPEC_STATS", "1")
@@ -127,22 +150,68 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             if mode == "baseline":
                 self._assert_attention_dp(llm)
                 self._assert_logits_processor(llm)
-                self._assert_guided_decoding(llm)
+                assert_guided_decoding_regex(llm)
             elif mode == "reuse":
-                self._assert_kv_cache_reuse(llm)
+                # Sequential requests on the idle default router are assigned
+                # to the same ADP rank, so explicit rank pinning is unnecessary.
+                assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 510 + [43])
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            if mode == "sa":
-                acceptance_length = compute_acceptance_length(llm)
-                print(
-                    "[AL] TestKimiK3::test_w4a16_mxfp4[sa] "
-                    f"acceptance_length = {acceptance_length:.3f}"
+            if mode in ("sa", "dspark"):
+                assert_acceptance_length_for_llm(
+                    f"TestKimiK3::test_w4a16_mxfp4[{mode}]",
+                    llm,
                 )
-                assert_acceptance_length(
-                    "TestKimiK3::test_w4a16_mxfp4",
-                    acceptance_length,
-                )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_less_device_memory(200000)
+    def test_gpqa_diamond_w4a16_mxfp4(self) -> None:
+        """Run GPQA Diamond on the K3 checkpoint with DEP16."""
+        max_seq_len = GPQADiamond.MAX_INPUT_LEN + GPQADiamond.MAX_OUTPUT_LEN
+        sampling_params = SamplingParams(
+            max_tokens=GPQADiamond.MAX_OUTPUT_LEN,
+            truncate_prompt_tokens=GPQADiamond.MAX_INPUT_LEN,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=16,
+            moe_expert_parallel_size=16,
+            enable_attention_dp=True,
+            max_batch_size=32,
+            max_num_tokens=8192,
+            max_seq_len=max_seq_len,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
+            moe_config=MoeConfig(
+                max_num_tokens=33024,
+                use_low_precision_moe_combine=True,
+            ),
+            # The qualified K3 GPQA configuration used KV cache manager V1.
+            # Like K3 MMMU, GPQA leaves very long generations after shorter
+            # requests finish. V2 has stalled or deadlocked at this shape even
+            # with a host tier and additional cache capacity. Pin V1 until the
+            # V2 x KDA-hybrid long-generation path is qualified.
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.25,
+                tokens_per_block=64,
+                use_kv_cache_manager_v2=False,
+            ),
+        ) as llm:
+            # K3 stores its compressed-tensors quantization configuration in
+            # text_config, so the LLM-args reference matcher sees no quant algo.
+            assert llm.args.quant_config.quant_algo is None
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=sampling_params,
+                # The provider reference and the 90.404% qualification run use
+                # the model's chat template.
+                extra_evaluator_kwargs=dict(apply_chat_template=True),
+            )
 
     def _assert_checkpoint_routing(self) -> None:
         config = load_pretrained_config(self.MODEL_PATH, trust_remote_code=True)
@@ -160,9 +229,16 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         # K3's routed-expert quantization is nested in the composite checkpoint
         # and is not represented by the modelopt-style args quant_algo field.
         assert llm.args.quant_config.quant_algo is None
-        if mode == "sa":
+        if mode in ("sa", "dspark"):
             assert llm.args.disable_overlap_scheduler is True
             assert llm.args.enable_chunked_prefill is False
+            if mode == "dspark":
+                assert llm.args.cuda_graph_config is None
+                assert llm.args.speculative_config.decoding_type == "DSpark"
+                assert (
+                    str(llm.args.speculative_config.speculative_model)
+                    == TestKimiK3.DSPARK_MODEL_PATH
+                )
         else:
             assert llm.args.disable_overlap_scheduler is False
             assert llm.args.enable_chunked_prefill is True
@@ -221,39 +297,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             )
 
     @staticmethod
-    def _assert_kv_cache_reuse(llm: LLM) -> None:
-        prompt_token_ids = [1] + [42] * 510 + [43]
-        output_length = 8
-        sampling_params = SamplingParams(
-            max_tokens=output_length,
-            temperature=0,
-            end_id=-1,
-            return_perf_metrics=True,
-        )
-        # Sequential requests on an otherwise idle default router are assigned
-        # to the same ADP rank, so explicit rank pinning is unnecessary here.
-
-        cold_output = llm.generate(
-            [prompt_token_ids],
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )[0].outputs[0]
-        warm_output = llm.generate(
-            [prompt_token_ids],
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )[0].outputs[0]
-
-        cold_metrics = cold_output.request_perf_metrics
-        warm_metrics = warm_output.request_perf_metrics
-        assert cold_metrics is not None
-        assert warm_metrics is not None
-        assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
-        assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
-        assert len(cold_output.token_ids) == output_length
-        assert warm_output.token_ids == cold_output.token_ids
-
-    @staticmethod
     def _assert_logits_processor(llm: LLM) -> None:
         forced_token_id = 22
         output_length = 4
@@ -272,18 +315,76 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         assert len(outputs) == 1
         assert outputs[0].outputs[0].token_ids == [forced_token_id] * output_length
 
-    @staticmethod
-    def _assert_guided_decoding(llm: LLM) -> None:
-        prompt_token_ids = llm.tokenizer.encode("Return exactly two decimal digits:")
-        outputs = llm.generate(
-            [prompt_token_ids],
-            sampling_params=SamplingParams(
-                max_tokens=8,
-                guided_decoding=GuidedDecodingParams(regex=r"[0-9]{2}"),
-            ),
-            use_tqdm=False,
-        )
 
-        assert isinstance(outputs, list)
-        assert len(outputs) == 1
-        assert re.fullmatch(r"[0-9]{2}", outputs[0].outputs[0].text)
+@pytest.mark.timeout(3600)
+# TP8 leaves ~182 GiB of weights per GPU before any KV cache, past what a
+# 184 GiB B200/GB200 part holds. Scheduled on 2x4 GB300
+# (l0_gb300_multi_nodes_node2_gpu8).
+@pytest.mark.skip_less_device_memory(250000)
+@skip_pre_blackwell
+class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
+    """Kimi K3 driven by a standalone DSpark drafter.
+
+    Split from TestKimiK3 because both the drafter and the target precision
+    are checkpoint axes here: the RadixArk artifact below is a qwen3-shaped
+    DSparkDraftModel while Inferact ships a K3DSparkModel, and the target is
+    the NVFP4 requant rather than TestKimiK3's MXFP4 weights.
+    """
+
+    MODEL_NAME = "moonshotai/Kimi-K3"
+    # The NVFP4 requant, not the MXFP4 weights TestKimiK3 runs: it is the
+    # Blackwell deployment precision and nothing else covers it end to end.
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K3-NVFP4"
+    DSPARK_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3-DSpark"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_tep8(self):
+        """GSM8K plus an acceptance-length gate on the TEP8 DSpark recipe.
+
+        TEP, not TestKimiK3's DEP16 recipe: with attention DP off the drafter gets
+        its own KV cache pool, which is the path this covers. Accuracy alone
+        cannot detect a broken drafter -- speculative decoding is lossless, so
+        a drafter producing garbage scores the same and only runs slower --
+        hence the acceptance-length assertion.
+        """
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False, free_gpu_memory_fraction=0.20, tokens_per_block=64
+        )
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7, speculative_model=self.DSPARK_MODEL_PATH, attention_backend="TRTLLM"
+        )
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=False,
+            max_batch_size=8,
+            max_num_tokens=4096,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            # The drafter runs between target steps, and its hidden-state
+            # capture needs a whole-sequence prefill.
+            disable_overlap_scheduler=True,
+            enable_chunked_prefill=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+            # Not the TRTLLM backend TestKimiK3 uses: trtllm-gen ships
+            # SiTu cubins only for W4A8_MXFP4_MXFP8, so K3's NVFP4 routed
+            # experts leave MEGAMOE_CUTEDSL and CUTLASS as the choices.
+            moe_config=MoeConfig(
+                backend="MEGAMOE_CUTEDSL", max_num_tokens=33024, use_low_precision_moe_combine=True
+            ),
+            kv_cache_config=kv_cache_config,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+            speculative_config=spec_config,
+        ) as llm:
+            # Unlike TestKimiK3's MXFP4 weights, the requant ships
+            # hf_quant_config.json, so the matcher sees MIXED_PRECISION --
+            # only the experts are 4-bit.
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                "TestKimiK3DSpark::test_gsm8k_tep8",
+                llm,
+            )

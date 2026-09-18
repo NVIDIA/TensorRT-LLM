@@ -33,10 +33,10 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _lpips_deterministic_algorithms,
     _lpips_model_path,
     _preserve_lpips_candidate_on_failure,
+    _require_exists,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
     _run_single_device_feature_generator,
-    _skip_if_missing,
     _validate_single_feature_config,
 )
 
@@ -117,7 +117,7 @@ def _generate_glm_image_lpips_image(model_path, output_path):
     from tensorrt_llm.media.encoding import save_image
     from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-    _skip_if_missing(model_path, "GLM-Image checkpoint", is_dir=True)
+    _require_exists(model_path, "GLM-Image checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     with _lpips_deterministic_algorithms():
         args = VisualGenArgs(
@@ -147,7 +147,7 @@ def _generate_glm_image_feature_image(case, output_path):
     from tensorrt_llm.media.encoding import save_image
 
     model_path = _lpips_model_path(case.checkpoint_subdir)
-    _skip_if_missing(model_path, f"{case.checkpoint_subdir} checkpoint", is_dir=True)
+    _require_exists(model_path, f"{case.checkpoint_subdir} checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     pipeline = None
     with _lpips_deterministic_algorithms(), _fixed_nvfp4_quantization_backend(case.features):

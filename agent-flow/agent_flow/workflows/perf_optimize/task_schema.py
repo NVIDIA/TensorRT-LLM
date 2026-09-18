@@ -39,11 +39,12 @@ block (the base validator preserves unknown ``profile`` keys):
   contract**: the analyzer's ncu deep dive must cover every kernel
   at/above ``min_share_pct`` of in-window GPU time (extending down the
   nsys timeline decomposition until ``coverage_target_pct`` is reached),
-  and every covered kernel gets both of its questions — faster?
-  fusible? — answered in a schema-validated ``kernel_ledger.yaml`` each
-  round (a roadmap item or an evidence-backed dismissal per question).
-  Requires ``nsys`` (the enumeration source) and ``ncu`` (the per-kernel
-  metrics) in ``profile.methods``.
+  and every covered kernel gets all four of its questions — eliminable?
+  faster? fusible? overlappable? — answered in a schema-validated
+  ``kernel_ledger.yaml`` each round (a roadmap item or an
+  evidence-backed dismissal per question). Requires ``nsys`` (the
+  enumeration source) and ``ncu`` (the per-kernel metrics) in
+  ``profile.methods``.
 
 Base validation is delegated to
 :func:`agent_flow.workflows.perf_analyze.task_schema.load_and_validate_task_yaml`

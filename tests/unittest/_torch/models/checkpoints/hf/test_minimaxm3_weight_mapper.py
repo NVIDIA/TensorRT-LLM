@@ -184,6 +184,8 @@ def test_load_weights_accepts_base_mapper_without_params_map() -> None:
     model = object.__new__(MiniMaxM3ForCausalLM)
     torch.nn.Module.__init__(model)
     model.model_config = model_config
+    # Set by SpecDecOneEngineForCausalLM.__init__, which this test bypasses.
+    model.spec_config = None
     mapper = HfWeightMapper()
     source_name = "model.layers.3.block_sparse_moe.e_score_correction_bias"
     target_name = "model.layers.3.block_sparse_moe.gate.e_score_correction_bias"

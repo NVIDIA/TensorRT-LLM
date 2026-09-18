@@ -53,8 +53,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "An optional `profile.kernel_coverage` block "
         "activates the per-kernel coverage contract: the analyzer's ncu "
         "dive covers every kernel above the share bar and answers "
-        "faster?/fusible? per kernel in a schema-validated "
-        "kernel_ledger.yaml each round. "
+        "eliminable?/faster?/fusible?/overlappable? per kernel in a "
+        "schema-validated kernel_ledger.yaml each round. "
         "See task.example.yaml.",
     )
     parser.add_argument(

@@ -271,7 +271,7 @@ def test_fill_gate_wiring():
         stub = Stub()
         stub.is_warmup = warmup
         stub._gpu_keepalive = Mock()
-        stub._disagg_gen_transfer_made_progress = False
+        stub._benchmark_gen_transfer_made_progress = lambda: False
         stub._benchmark_transfer_progress_global = progress
         stub._is_benchmark_disagg_fill_complete = lambda batch, made_progress: complete
         stub._fail_if_fill_gate_stalled = Mock()

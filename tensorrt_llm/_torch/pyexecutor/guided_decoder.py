@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from dataclasses import dataclass
 from queue import Queue
@@ -16,6 +19,25 @@ from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
                               XGrammarMatcherFactory)
 from .llm_request import LlmRequest
 from .scheduler import ScheduledRequests
+
+
+def row_has_valid_token(row: torch.Tensor, vocab_size_padded: int) -> bool:
+    """Whether a filled next-token bitmask row allows at least one token.
+
+    A grammar state with no valid continuation produces an all-zero row, which
+    would mask the whole logits row to -inf and make softmax return NaN for it.
+
+    Only the bits below `vocab_size_padded` are counted: the trailing bits of a
+    partial last word are never read by the apply kernel and are not guaranteed
+    to be cleared by the backends, so counting them could report a dead-end row
+    as valid.
+    """
+    num_words, num_tail_bits = divmod(vocab_size_padded, 32)
+    if torch.any(row[:num_words]):
+        return True
+    if num_tail_bits == 0:
+        return False
+    return bool(row[num_words].item() & ((1 << num_tail_bits) - 1))
 
 
 @dataclass(slots=True)
@@ -206,6 +228,11 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
+    def _has_valid_token(self, index: int) -> bool:
+        """Whether the bitmask row just filled at `index` allows any token."""
+        return row_has_valid_token(self.bitmask_host[index],
+                                   self.vocab_size_padded)
+
     def _build(self, requests: GuidedRequests) -> List[Tuple[int, str]]:
         """Build the bitmask for requests with guided decoding enabled.
 
@@ -257,6 +284,25 @@ class GuidedDecoder:
                 self.num_advanced_tokens[slot] += 1
                 if not matcher.is_terminated():
                     matcher.fill_next_token_bitmask(self.bitmask_host, offset)
+                    if not self._has_valid_token(offset):
+                        if req.is_draft:
+                            self.is_draft_terminated[slot] = True
+                            logger.debug(
+                                f"Draft request {req.request_id} at slot {slot} reached a grammar state with no valid token."
+                            )
+                            # Unlike the unacceptable-token path above, the
+                            # matcher did advance past new_token here, so the
+                            # drafting loop must still roll that advance back.
+                            self.num_advanced_draft_tokens[
+                                slot] += self.num_advanced_tokens[slot]
+                            continue
+                        # The request is about to be terminated, so exclude it
+                        # from the rollback pass: the matcher advance made
+                        # above is never verified against accepted tokens.
+                        self.num_advanced_tokens[slot] = 0
+                        raise ValueError(
+                            f"Request {req.request_id} at slot {slot} reached a grammar state with no valid token."
+                        )
                     self.token_mask_host[offset] = 1
                     self.num_guided_tokens[slot] += 1
                     # Process draft tokens. Bound by the layout's draft length:
@@ -273,6 +319,11 @@ class GuidedDecoder:
                             break
                         matcher.fill_next_token_bitmask(self.bitmask_host,
                                                         offset + i)
+                        if not self._has_valid_token(offset + i):
+                            # Stop guiding here rather than failing the
+                            # request: the remaining draft positions are left
+                            # unconstrained and get verified as usual.
+                            break
                         self.token_mask_host[offset + i] = 1
                         self.num_guided_tokens[slot] += 1
 
@@ -579,6 +630,58 @@ class CapturableGuidedDecoder(GuidedDecoder):
                 req.cast_to_draft()
             else:
                 assert req.is_draft
+
+    @nvtx_range("GuidedDecoder.add_accepted_batch")
+    def add_accepted_batch(self, num_accepted_tokens: torch.Tensor) -> None:
+        """Copy verification counts, including the bonus token, to the host.
+
+        Args:
+            num_accepted_tokens: Int32 tensor of shape [batch_size].
+        """
+        batch_size = len(self.requests)
+        assert num_accepted_tokens.size(0) == batch_size
+        self.num_accepted_tokens[:batch_size].copy_(num_accepted_tokens,
+                                                    non_blocking=True)
+        self.token_event.record()
+
+    @hostfunc
+    def fetch_accepted_batch(self) -> None:
+        batch_size = len(self.requests_hostfunc)
+        num_accepted_tokens_list = self.num_accepted_tokens[:batch_size].tolist(
+        )
+        for i, req in enumerate(self.requests_hostfunc.requests):
+            if req.guided_decoding_params is None or (slot :=
+                                                      req.seq_slot) is None:
+                continue
+            # Verification can accept tokens beyond a terminal draft token,
+            # where the matcher stopped advancing (see fetch_draft_batch).
+            req.num_accepted_draft_tokens = min(
+                num_accepted_tokens_list[i], self.num_advanced_tokens[slot]) - 1
+
+    def rollback_rejected_batch(self,
+                                num_accepted_tokens: torch.Tensor) -> None:
+        """Restore the accepted grammar prefix for drafters without a logits loop.
+
+        Target masking advances matchers through the golden token and draft
+        tokens. SA, DFlash and PARD do not call execute_draft_batch, which
+        normally rolls back the rejected suffix before the next draft loop.
+
+        Call after drafting kernels have been enqueued: these host callbacks
+        need the GIL and must not precede native calls that synchronize the
+        stream while holding it.
+
+        Args:
+            num_accepted_tokens: Int32 tensor of shape [batch_size], including
+                the bonus token in each verification count.
+        """
+        self.add_accepted_batch(num_accepted_tokens)
+        with torch.cuda.stream(self.stream):
+            torch.cuda.current_stream().wait_event(self.token_event)
+            self.fetch_accepted_batch()
+            self.rollback_rejected_tokens()
+            # CUDA graph capture requires every forked stream to be joined.
+            self.bitmask_event.record()
+        torch.cuda.current_stream().wait_event(self.bitmask_event)
 
     def execute_draft_batch(self,
                             logits: torch.Tensor,

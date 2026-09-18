@@ -42,7 +42,8 @@ class MTPHiddenStatesManager(BaseResourceManager):
                  dtype: torch.dtype,
                  hidden_size: int,
                  max_num_requests: int,
-                 sa_manager=None):
+                 sa_manager=None,
+                 num_seq_slots: Optional[int] = None):
         self.dtype = dtype
         self.num_draft_slots = config.max_draft_len
         self.hidden_size = hidden_size
@@ -50,7 +51,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
         # Reserve one extra slot for the CUDA graph padding dummy request,
         # which is kept alive permanently and must not consume a real slot.
-        slot_pool_size = max_num_requests + 1
+        slot_pool_size = (num_seq_slots or max_num_requests) + 1
         self.slot_manager = SlotManager(slot_pool_size)
         # Optional SA manager for MTP+SA mode
         self.sa_manager = sa_manager
@@ -180,6 +181,14 @@ class MTPSpecMetadata(SpecMetadata):
         if self.spec_dec_mode.is_mtp_eagle_one_model():
             self.subseq_all_rank_num_tokens = value
 
+    def dp_num_tokens(self) -> int:
+        # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
+        # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
+        # forward and only one input token in the following draft forward.
+        if self.spec_dec_mode.is_mtp_eagle_one_model():
+            return self.num_tokens
+        return self.num_tokens - self.num_generations
+
     def prepare(self):
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
@@ -190,12 +199,8 @@ class MTPSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
-        # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
-        # forward and only one input token in the following draft forward.
         # This num_tokens is used to set the all_rank_num_tokens for attention dp.
-        if not self.spec_dec_mode.is_mtp_eagle_one_model():
-            self.num_tokens -= self.num_generations
+        self.num_tokens = self.dp_num_tokens()
 
         if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
             mtp_slot_ids = []
