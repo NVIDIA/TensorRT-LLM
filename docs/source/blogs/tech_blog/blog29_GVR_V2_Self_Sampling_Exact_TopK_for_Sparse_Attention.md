@@ -67,14 +67,18 @@ The V3.2 +1 shift is a temporal prediction rule. Its overlap measures how well t
 
 Near-64K measurements also expose dependence on the input and layer:
 
+<div align="center">
+
 | Indexer | Input | Layers | Mean | P10–P90 | Min–max |
-| :--- | :--- | ---: | ---: | ---: | ---: |
+| :---: | :---: | :---: | :---: | :---: | :---: |
 | V4 Pro | SWE-bench | 30 | 71.5% | 60.3–82.6% | 57.1–85.0% |
 | V4 Pro | Random tokens | 30 | 57.9% | 33.6–80.4% | 28.4–86.7% |
 | V4 Flash | SWE-bench | 21 | 62.8% | 53.4–73.3% | 53.2–83.7% |
 | V4 Flash | Random tokens | 21 | 52.8% | 30.7–74.7% | 25.9–81.3% |
 | V3.2 | SWE-bench | 61 | 47.4% | 37.9–59.7% | 5.7–70.7% |
 | V3.2 | Random tokens | 61 | 46.0% | 33.1–62.2% | 6.0–67.9% |
+
+</div>
 
 *Distribution of per-layer mean hit rates, with layer IDs matched between inputs within each model. Each layer is averaged over its decode steps and then weighted equally; P10–P90 and min–max describe those layer means, not individual transitions. V3.2 uses +1 alignment.*
 
@@ -88,8 +92,10 @@ V2 calibrates from the **current row**, removing dependence on temporal overlap 
 
 V1's prior also has a lifecycle outside the kernel. GVR V1 has no prefill engine: TensorRT-LLM uses radix for prefill and can seed the decode prior from each request's last prefill selection. That phase-dependent history complicates a common selection architecture. V2's current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The [integration section](#decode-and-prefill-in-tensorrt-llm) traces the consequences for CUDA Graph preparation and disaggregated serving.
 
+<div align="center">
+
 | Algorithm question | GVR V1 (temporal hint) | Streaming GVR V2 |
-| :--- | :--- | :--- |
+| :---: | :---: | :---: |
 | Where does the guess come from? | Current scores gathered through previous-step indices | Packed sample windows spread across the current row |
 | What makes the guess useful? | High, stable overlap with previous winners | Coverage of the current row's score distribution |
 | What guides admission? | A hint-derived pivot and rescue rung | Sample-derived primary threshold, lower safety floor, and upper anchor |
@@ -99,19 +105,29 @@ V1's prior also has a lifecycle outside the kernel. GVR V1 has no prefill engine
 | How do prefill and decode relate? | Radix prefill; its last selection can seed temporal decode | Shared streaming selection with phase-specific row adapters |
 | How does a bad guess affect the result? | More admission/refinement work or recovery; membership remains exact | Lower admission or exact recovery; membership remains exact |
 
+</div>
+
 ![GVR V1 and streaming V2 both use multi-thresholding. V1 calibrates through previous winners; V2 samples the current row without a temporal prior. Measured bars compare GVR V1 and V2.](../media/gvr_v2/evolution.svg)
 
 *Figure 3. Multi-thresholding is shared by GVR V1 and V2. The flows emphasize their calibration and refinement choices on streaming paths; the bars compare complete GVR V1 and V2 implementations over radix CUDA. V2 removes the temporal-overlap dependency and prior-state lifecycle.*
 
 GVR V1 achieves **3.47×** speedup over radix CUDA; V2 reaches **5.05×**. V2 is **1.46× faster than GVR V1**. These gains compare complete implementations, including their calibration, verification, refinement, and execution paths.
 
-The improvement also extends to the lower end of the measured speedup distribution:
+The fifth percentile remains above parity, while the minimum exposes workloads where V1 retains an advantage:
+
+<div align="center">
 
 | Baseline | Geomean speedup | P5 speedup | Minimum speedup | V2 faster |
-| :--- | ---: | ---: | ---: | ---: |
+| :---: | :---: | :---: | :---: | :---: |
 | GVR V1 | **1.46×** | **1.10×** | 0.689× | 99.57% |
 
-P5 is the fifth percentile across workload-level speedups, each computed from mean kernel times. These results support broad improvement across tested workloads while retaining local regressions. Runtime P95/P99 latency and a fixed worst-case bound require different evidence; the stronger performance floor remains a design objective.
+</div>
+
+P5 is the fifth percentile across workload-level speedups, each computed as V1 time divided by V2 time. The **0.689× minimum means V2 takes about 45% longer than V1** in the worst measured case. The 99.57% win rate supports broad improvement, while this minimum makes the remaining regressions explicit.
+
+**V1's calibration with temporal hints can still produce a better admission threshold.** An informative prior, validated against current-row samples, can let V1 admit a tighter candidate set than self-sampling. Diagnostics of the pronounced large-batch regressions show V1 accepting enough candidates on its first pass, while V2 initially admits fewer than $K$ scores and rescans at a lower threshold. This identifies extra admission work; differences in dispatch and refinement also contribute to total kernel cost.
+
+These local wins fit the motivation for moving beyond temporal hints. Their usefulness varies across inputs, layers, and decode steps, and their true overlap is unavailable before selection. V2 removes that unstable dependency to improve robustness and average latency with a shared current-row selection core. Self-sampling can still misestimate a tail, so its admission margin and recovery cost remain optimization targets. **A stronger practical performance floor is a design objective, not a guarantee that V2 beats V1 on every input.** This workload distribution also does not establish runtime P95/P99 latency or a fixed worst-case bound.
 
 ### From Floyd–Rivest SELECT to GPU Top-K
 
@@ -127,12 +143,16 @@ This belongs to a comparison model with random-sampling assumptions; the origina
 
 GVR V2 carries that principle into a different cost model:
 
+<div align="center">
+
 | Design choice | Floyd–Rivest theoretical SELECT | GVR V2 streaming |
-| :--- | :--- | :--- |
+| :---: | :---: | :---: |
 | Primary objective | Expected element comparisons | Kernel latency: input passes, memory traffic, and parallel work |
 | Calibration | Random sample and sample order statistics | Regularly spaced, packed sample windows and histogram quantiles |
 | Remaining selection | Exact partitioning and recursive selection | Exact bin counts, crossing-bin refinement, and recovery |
 | Result | An element at the requested rank | An exact set of $K$ indices, without requiring sorted output |
+
+</div>
 
 On a GPU, doing more work on chip can be worthwhile if it avoids another full-row read. V2 couples sampling to candidate capacity, vectorized loads, and multi-threshold counts. **The inherited idea is sample-guided exact selection; the optimization target is GPU execution cost.** Its deterministic sampling policy does not inherit SELECT's randomized comparison bound. Exactness follows from full-row accounting and exact refinement or recovery.
 
@@ -177,10 +197,14 @@ V2 calibrates inside the selection kernel, using the current row's layout to gen
 
 A **sample window** is a contiguous group of scores. A CUDA thread block processes many such windows. The streaming families use these layouts:
 
+<div align="center">
+
 | Family | Scores per window | Loads and logical ownership |
-| :--- | :--- | :--- |
+| :---: | :---: | :---: |
 | `main` | 8 FP32 scores = 32 bytes | One work item loads two adjacent `float4` vectors |
 | `clus` | 16 FP32 scores = 64 bytes | Two work items each load two vectors, covering the lower and upper halves |
+
+</div>
 
 Regular spacing spreads the windows across the valid row. The sampling budget sets their count and spacing, while bounds and alignment handling keep loads valid for each phase. A thread block processes more windows in iterations when the sample exceeds its parallel capacity.
 
@@ -263,12 +287,16 @@ The output contract is an exact selected **value multiset** with valid unique in
 
 A single scheduling policy cannot serve both one short row and thousands of long rows efficiently. GVR V2 uses four kernel families, implemented in CuTe DSL:
 
+<div align="center">
+
 | Family | Where the scores or candidates live | Why it helps |
-| :--- | :--- | :--- |
+| :---: | :---: | :---: |
 | `reg` | A row resides in one thread block's registers | Avoids repeated global loads when the row fits |
 | `reg_clus` | Register slices across cooperating blocks | Exposes more parallelism for medium rows at small batch sizes |
 | `clus` | Streaming shards; histograms and candidates shared within a hardware cluster | Merges through distributed shared memory |
 | `main` | Streaming scan with bounded candidate staging | Covers the remaining shapes, including long rows and large batches |
+
+</div>
 
 A thread block is also called a cooperative thread array, or CTA. Blackwell thread-block clusters let cooperating CTAs exchange data through distributed shared memory. This reduces the need to materialize intermediate results in global memory for eligible shapes.
 
@@ -286,22 +314,30 @@ This explains the two sources of performance improvement: a better starting thre
 
 The benchmarks use FP32 indexer scores from the three models below on NVIDIA B200. Batch size $B$ counts score rows: each case repeats one captured row across 1 to 1,024 batch rows to measure kernel scaling. It does not represent heterogeneous serving concurrency. GVR V2 uses the merged [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076) implementation. Results report cold-L2 GPU kernel time, excluding compilation, input preparation, and Python overhead. Speedups are geometric means over matched workloads from separate benchmark runs. The grid uses single-token decode and case-matched launch envelopes; ragged batches, MTP, and prefill require separate evaluation. Historical serving results appear in the [integration section](#serving-gains-from-the-shared-engine).
 
+<div align="center">
+
 | Model | $K$ | Indexer compression | Valid row lengths $N$ |
-| :--- | ---: | ---: | :--- |
+| :---: | :---: | :---: | :---: |
 | DeepSeek-V4 Flash | 512 | 4 | 1,027–262,127 |
 | DeepSeek-V4 Pro | 1,024 | 4 | 1,027–262,127 |
 | DeepSeek-V3.2 | 2,048 | 1 | 4,111–163,775 |
+
+</div>
 
 **$N$ is the indexer row width, not the original prompt length.** A roughly 512K-token V4 context yields a roughly 128K-wide indexer row because of 4× compression.
 
 #### Overall Results
 
+<div align="center">
+
 | Baseline | Geomean speedup | Minimum speedup | GVR V2 faster |
-| :--- | ---: | ---: | ---: |
+| :---: | :---: | :---: | :---: |
 | GVR V1 | **1.46×** | 0.689× | 99.57% |
 | TensorRT-LLM radix CUDA dispatch | **5.05×** | 1.34× | 100.00% |
 
-Both comparisons use the same 9,746 cases. The minimum column retains individual regressions, including the GVR V1 cases where V2 is slower. Figure 1 shows the model-level comparison over this same workload grid.
+</div>
+
+Both comparisons use the same 9,746 cases. The minimum column retains individual regressions, including the GVR V1 cases where V2 is slower; the [V1-to-V2 discussion](#from-gvr-v1-to-v2-why-move-beyond-temporal-hints) explains how informative temporal hints can retain an admission advantage. Figure 1 shows the model-level comparison over this same workload grid.
 
 #### The Gains Extend Beyond an Average
 
@@ -370,11 +406,15 @@ $$
 
 It measures efficiency relative to the ideal traffic bound. The table compares **average / peak reachable rate** along each Pareto curve: the average weights the plotted intensity points equally, and the peak is their maximum. Both use the same layer-averaged timings as Figure 9B.
 
+<div align="center">
+
 | Operator | V4 Flash | V4 Pro | V3.2 |
-| :--- | ---: | ---: | ---: |
+| :---: | :---: | :---: | :---: |
 | **GVR V2** | **41.6% / 77.8%** | **39.0% / 68.4%** | **41.5% / 66.5%** |
 | GVR V1 | 26.1% / 63.3% | 25.4% / 58.9% | 27.8% / 51.1% |
 | TensorRT-LLM radix CUDA | 7.7% / 16.9% | 7.8% / 16.4% | 8.3% / 17.8% |
+
+</div>
 
 *Each cell shows average / peak.*
 
