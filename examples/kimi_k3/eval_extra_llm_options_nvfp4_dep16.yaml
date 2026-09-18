@@ -20,8 +20,13 @@
 # sizing pass. Lowering the batch lowers the minimum instead of the headroom.
 # It costs eval wall time, not accuracy.
 #
-# backend: CUTLASS is required, not a preference -- AUTO resolves Kimi K3 to
-# TRTLLM, and trtllm-gen ships SiTu cubins for W4A8_MXFP4_MXFP8 only.
+# backend: CUTLASS is a choice here, not a requirement. AUTO resolves Kimi K3
+# to TRTLLM, which serves NVFP4 SiTu since #17940 (group-16
+# Bmm_E2m1_E2m1E2m1_..._siTuGlu_* cubins) -- the model-layer guard that used to
+# refuse it was removed in #18709. CUTEDSL and MEGAMOE_CUTEDSL also serve NVFP4
+# SiTu. This file pins CUTLASS so the recipe below (max_num_tokens, KV sizing)
+# stays the one it was measured with; switching backends means re-checking
+# those, not just this line.
 #
 # moe_config.max_num_tokens stays at the inherited value: for CUTLASS it is a
 # per-call chunking bound. Do NOT carry it over to MEGAMOE_* backends, where
