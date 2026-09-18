@@ -6563,6 +6563,24 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         20,
         5
     )
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
+        3,
+        8,
+        2
+    )
+    // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_gen1_node4_gpu16",
+        1,
+        16,
+        4
+    )
     // GB300 PerfSanity post-merge aggregated
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
@@ -6647,14 +6665,32 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         56,
         14
     )
-    // DeepSeek-V4-Pro 8k1k con4301 gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        1,
+        5,
         8,
         2
+    )
+    // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16",
+        2,
+        16,
+        4
+    )
+    // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32",
+        2,
+        32,
+        8
     )
     // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
