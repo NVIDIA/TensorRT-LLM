@@ -749,6 +749,11 @@ class TestTritonPrefillWithPrefix:
 
 def test_paged_cache_tile_cast() -> None:
     """FP8 prefix attention must not allocate a BF16 copy of the KV pool."""
+    if not torch.cuda.is_available():
+        pytest.skip("This test requires CUDA")
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("Triton FP8 E4M3 cache loads require SM89 or newer")
+
     torch.manual_seed(42)
     device = "cuda"
     page_size, num_pages, num_heads, num_kv_heads = 16, 128, 4, 2
