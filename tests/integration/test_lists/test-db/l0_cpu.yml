@@ -64,7 +64,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_rejects_unavailable_fusion
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_declares_cache_mutations
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_unfused_indexer_keeps_cache_write_eager
-  - unittest/_torch/models/test_minimax_m3.py::test_msa_attention_core_routes_compact_q_to_attention_dispatcher
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
   - unittest/_torch/models/checkpoints

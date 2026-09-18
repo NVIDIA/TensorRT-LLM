@@ -790,43 +790,100 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
 
 
 @pytest.mark.cpu_only
-def test_msa_attention_core_routes_compact_q_to_attention_dispatcher() -> None:
+@pytest.mark.parametrize(
+    ("indexer_dtype", "caches_prewritten"),
+    [("fp8", False), ("fp8", True), ("bf16", False)],
+    ids=["unfused-fp8", "fused-fp8", "bf16"],
+)
+def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
+    monkeypatch: pytest.MonkeyPatch, indexer_dtype: str, caches_prewritten: bool
+) -> None:
+    """Exercise the real MSA indexer after live-row slicing and cache insertion."""
+    from unittest.mock import Mock
+
+    dtype = torch.float8_e4m3fn if indexer_dtype == "fp8" else torch.bfloat16
+    q, k, v, idx_q, idx_k = [torch.full((4, 128), value).to(dtype) for value in range(1, 6)]
+    index_cache = torch.zeros((4, 1, 1, 128), dtype=dtype)
+    expected_cache = torch.zeros_like(index_cache)
+    expected_cache[:2, 0, 0].copy_(idx_k[:2])
+    if caches_prewritten:
+        index_cache.copy_(expected_cache)
     selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        num_tokens=2,
+        msa_decode_span=None,
+        msa_idx_k_cache=Mock(return_value=index_cache),
+        msa_write_idx_k=Mock(),
+        msa_prefill_proxy_plan=None,
+        msa_prefill_n_valid_blocks=None,
+        msa_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
+        msa_qo_lens_cpu=torch.tensor([2], dtype=torch.int32),
+        msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
+        msa_qo_offset_cpu=torch.tensor([0], dtype=torch.int32),
+    )
 
-    class FakeMsaBackend:
-        def __init__(self) -> None:
-            self.prepopulated_call = None
+    def write_caches(
+        live_k: torch.Tensor,
+        live_v: torch.Tensor,
+        live_idx_k: torch.Tensor,
+        metadata: SimpleNamespace,
+    ) -> None:
+        """Replace only CUDA scatter math, retaining the live cache-write inputs."""
+        assert metadata is attn_metadata
+        torch.testing.assert_close(live_k.float(), k[:2].float())
+        torch.testing.assert_close(live_v.float(), v[:2].float())
+        torch.testing.assert_close(live_idx_k.float(), idx_k[:2].float())
+        index_cache[:2, 0, 0].copy_(live_idx_k)
 
-        def write_layer_caches(self, k, v, idx_k, metadata) -> None:
-            pytest.fail("The horizontal producer has already written both caches")
+    def select_blocks(
+        live_idx_q: torch.Tensor, cache: torch.Tensor, **kwargs: object
+    ) -> torch.Tensor:
+        """Require the cache write to precede selection, without running CUDA scoring."""
+        assert cache is index_cache
+        torch.testing.assert_close(cache.float(), expected_cache.float())
+        torch.testing.assert_close(live_idx_q.flatten(1).float(), idx_q[:2].float())
+        return selected_blocks
 
-        def run_indexer(self, idx_q, idx_k, metadata, *, idx_k_prewritten):
-            assert idx_k is None
-            assert idx_k_prewritten
-            assert metadata is attn_metadata
-            return selected_blocks
-
-        def forward(self, q, k, v, metadata, forward_args) -> None:
-            assert k is None and v is None
-            self.prepopulated_call = (q, metadata, forward_args)
-
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.layer_idx = 3
+    backend.indexer_kv_dtype = indexer_dtype
+    backend.m3_config = SimpleNamespace(num_index_heads=1, sparse_index_dim=128)
+    backend.write_layer_caches = Mock(side_effect=write_caches)
+    backend.indexer = SimpleNamespace(select_blocks=Mock(side_effect=select_blocks))
+    backend.forward = Mock()
     layer = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
-    backend = FakeMsaBackend()
     layer.attn = backend
     layer.is_sparse_attention_layer = True
-    q = torch.randn(2, 8)
-    idx_q = torch.randn(2, 4)
-    attn_metadata = SimpleNamespace()
-    output = torch.empty_like(q)
+    output = torch.empty((4, 128), dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (attn_metadata, layer),
+    )
+    modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
+        q,
+        None if caches_prewritten else k,
+        None if caches_prewritten else v,
+        idx_q,
+        None if caches_prewritten else idx_k,
+        None,
+        None,
+        "3",
+        output,
+    )
 
-    result = layer._msa_attention_core(q, None, None, idx_q, None, attn_metadata, output)
-
-    assert result is output
-    assert backend.prepopulated_call is not None
-    called_q, called_metadata, forward_args = backend.prepopulated_call
-    assert called_q is q
+    assert backend.write_layer_caches.call_count == (0 if caches_prewritten else 1)
+    attn_metadata.msa_write_idx_k.assert_not_called()
+    attn_metadata.msa_idx_k_cache.assert_called_once_with(3)
+    backend.indexer.select_blocks.assert_called_once()
+    backend.forward.assert_called_once()
+    called_q, called_k, called_v, called_metadata = backend.forward.call_args.args
+    assert called_k is None and called_v is None
+    torch.testing.assert_close(called_q.float(), q[:2].float())
     assert called_metadata is attn_metadata
-    assert forward_args.output is output
+    forward_args = backend.forward.call_args.kwargs["forward_args"]
+    assert forward_args.output.shape == (2, 128)
+    assert forward_args.output.data_ptr() == output.data_ptr()
     assert forward_args.sparse_backend_args.topk_indices is selected_blocks
 
 

@@ -321,8 +321,8 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) ->
     main_cache = torch.zeros(2, 2, 1, 128, 128)
     index_cache = torch.zeros(2, 1, 128, 128)
     manager = metadata.kv_cache_manager
-    manager.get_buffers = lambda layer_idx, kv_layout: main_cache
-    manager.get_index_k_buffer = lambda layer_idx, kv_layout: index_cache
+    manager.get_buffers = Mock(return_value=main_cache)
+    manager.get_index_k_buffer = Mock(return_value=index_cache)
     monkeypatch.setattr(
         metadata,
         "get_empty",
@@ -331,6 +331,8 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) ->
     # No native pool in this CPU test; only zero-copy cache-view staging is under test.
     monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
     metadata._create_msa_buffers()
+    manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    manager.get_index_k_buffer.assert_called_once_with(3, kv_layout="HND")
     assert set(metadata.msa_layer_cache_tensors) == {3}
     main, index = metadata.msa_layer_cache_tensors[3]
     assert main is main_cache and index is index_cache

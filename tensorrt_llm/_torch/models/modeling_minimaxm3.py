@@ -897,11 +897,10 @@ def minimax_m3_attn_custom_op_inplace(
 ) -> None:
     """Run MiniMax-M3 cache and attention work behind a compile boundary.
 
-    The horizontal producer needs live paged-cache tensors and cache-slot
-    metadata, which are intentionally resolved inside this opaque attention
-    boundary rather than traced through Dynamo.  Projection remains in the
-    captured segment; only the cache-writing producer and MSA attention stay
-    on the eager side of the existing piecewise boundary.
+    The captured horizontal producer can populate both caches before this
+    boundary. The packed-projection fallback runs that producer here instead,
+    while separate projections leave their cache writes here. Slice padded
+    inputs to live tokens before request-dependent cache and MSA work.
     """
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = attn_metadata.num_tokens
@@ -1889,25 +1888,28 @@ class MiniMaxM3Attention(Attention):
         FMHA forward; this layer selects the top-k blocks (sparse only) and
         builds the forward_args the FMHA reads.
 
-        This layer owns the cache write: write_layer_caches stores the
-        new-token K/V (and, on the bf16 indexer path, index-K) in one launch
-        before the indexer's proxy pass reads the index-K cache. forward()
-        then receives k=v=None, which is the backend's contract for "K/V are
-        already resident", so neither FMHA phase writes them again.
+        Unless a producer has already populated the caches, write_layer_caches
+        stores new-token K/V and any live index-K before the indexer's proxy
+        pass reads the cache. FP8 index-K is then omitted from run_indexer;
+        BF16 retains its live tensor with idx_k_prewritten=True. forward()
+        receives k=v=None so neither FMHA phase writes them again.
         """
         assert (k is None) == (v is None)
         if self.is_sparse_attention_layer:
             assert idx_q is not None
-            # On the FP8 indexer path idx_k is None: the fused producer already
-            # inserted E4M3 index-K into the side cache, so only K/V are written.
+            # Unfused PCG supplies live FP8 index-K; eager FP8 producers may
+            # already have inserted it and supply None instead.
             if k is not None:
                 self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
+                if self.attn.indexer_kv_dtype == "fp8":
+                    # The FP8 indexer accepts only an already-populated cache.
+                    idx_k = None
             else:
                 # The horizontal producer has already written both caches.
                 assert idx_k is None
             # Publish the selected blocks so the FMHA runs the sparse path.
-            # idx_k_prewritten: index-K is already in the cache (written above
-            # on bf16, or by the FP8 producer), so run_indexer must not write it.
+            # idx_k_prewritten: index-K is already in the cache (written here
+            # or by an FP8 producer), so run_indexer must not write it.
             kv_block_indexes = self.attn.run_indexer(
                 idx_q, idx_k, attn_metadata, idx_k_prewritten=True
             )
