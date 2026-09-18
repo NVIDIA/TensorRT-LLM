@@ -838,6 +838,38 @@ def _minimax_m3_qkv_index_proj_fake(
     return hidden_states.new_empty((hidden_states.shape[0], sum(qkv_proj.local_output_sizes)))
 
 
+@torch.library.custom_op("trtllm::minimax_m3_fused_sparse_qkv_producer", mutates_args=())
+def minimax_m3_fused_sparse_qkv_producer(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+) -> List[torch.Tensor]:
+    """Capture projection, norm, RoPE and FP8 cache insertion together."""
+    attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    packed = attn_layer.qkv_proj(hidden_states)
+    result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed, position_ids, attn_metadata
+    )
+    if result is None:
+        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
+    return list(result)
+
+
+@minimax_m3_fused_sparse_qkv_producer.register_fake
+def _minimax_m3_fused_sparse_qkv_producer_fake(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+) -> List[torch.Tensor]:
+    del position_ids
+    _, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    num_tokens = hidden_states.shape[0]
+    return [
+        hidden_states.new_empty((num_tokens, attn_layer.q_size), dtype=torch.float8_e4m3fn),
+        hidden_states.new_empty((num_tokens, attn_layer.index_q_size), dtype=torch.float8_e4m3fn),
+    ]
+
+
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
     q: Optional[torch.Tensor],
@@ -1929,6 +1961,18 @@ class MiniMaxM3Attention(Attention):
         packed_qkv = None
         packed_idx_qk = None
         if self.enable_fused_qkv_index_projection:
+            if (
+                self.register_to_config
+                and is_torch_compiling()
+                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+                and self._emit_fp8_main_qkv()
+                and self.attn.indexer_kv_dtype == "fp8"
+            ):
+                q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+                    hidden_states, position_ids, self.layer_idx_str
+                )
+                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
+                return self.o_proj(o, all_reduce_params=all_reduce_params)
             if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
                 # Keep the projection in the captured segment while hiding
                 # its shape-specializing MXFP8 internals behind a symbolic
@@ -2003,10 +2047,19 @@ class MiniMaxM3Attention(Attention):
             idx_qk = (
                 packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
             )
-            fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
-            if fp8_idx_q is not None:
-                # Index-K was inserted directly into the paged side cache.
-                return fp8_idx_q, None
+            graph_fp8_indexer = (
+                self.register_to_config
+                and is_torch_compiling()
+                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+                and self.attn.indexer_kv_dtype == "fp8"
+            )
+            if not graph_fp8_indexer:
+                fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
+                if fp8_idx_q is not None:
+                    # Index-K was inserted directly into the paged side cache.
+                    return fp8_idx_q, None
+            # During compilation keep norm/RoPE/FP8 conversion captured, but
+            # leave dynamic index-K cache insertion in the attention boundary.
             fused_idx = self._fused_qk_norm_rope(
                 idx_qk,
                 position_ids,
@@ -2016,6 +2069,7 @@ class MiniMaxM3Attention(Attention):
                 head_dim=self.sparse_index_dim,
                 q_norm=self.index_q_norm,
                 k_norm=self.index_k_norm,
+                out_fp8=graph_fp8_indexer,
             )
             if fused_idx is not None:
                 return self._split_index_qk(fused_idx)

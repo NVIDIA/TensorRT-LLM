@@ -39,6 +39,46 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
+@pytest.mark.cpu_only
+def test_msa_metadata_clears_padded_cache_slot_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A smaller replay must not reuse the previous step's live cache slots."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_buffers_ready = True
+    metadata.request_ids = [0]
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=4,
+        get_buffers=lambda layer_idx: torch.empty(1),
+        get_block_ids_per_seq=lambda request_ids: torch.tensor([[3]], dtype=torch.int32),
+    )
+    metadata.msa_out_cache_loc = torch.full((4,), 99, dtype=torch.int32)
+    metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    metadata.msa_subpage_block_table = None
+    metadata._msa_runs_no_fmha = lambda: True
+    metadata._msa_kv_lens_may_change = lambda: False
+    original_ptr = metadata.msa_out_cache_loc.data_ptr()
+
+    for count in (4, 2, 1):
+        metadata._msa_qo_lens_cpu = torch.tensor([count], dtype=torch.int32)
+        metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
+        metadata._msa_qo_offset_cpu = torch.zeros(1, dtype=torch.int32)
+        metadata._build_msa_fields()
+        assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
+            4 - count
+        )
+        assert metadata.msa_out_cache_loc.data_ptr() == original_ptr
+        assert metadata._msa_fields_ready
+
+    metadata.request_ids = []
+    metadata._msa_qo_lens_cpu = torch.empty(0, dtype=torch.int32)
+    metadata._build_msa_fields()
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 4
+
+
 def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         msa_package_available,

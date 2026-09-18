@@ -483,6 +483,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
         qkv_proj=lambda hidden_states: packed,
+        attn=object(),  # Compatibility path, without the captured FP8 producer.
         register_to_config=True,
         num_heads=1,
         head_dim=3,
@@ -515,6 +516,121 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     assert captured["position_ids"] is position_ids
     assert captured["output_shape"] == (position_ids.shape[-1], 3)
     assert result.shape == (position_ids.shape[-1], 3)
+
+
+@pytest.mark.cpu_only
+def test_piecewise_captured_producer_preserves_symbolic_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    layer = SimpleNamespace(q_size=1024, index_q_size=128)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (None, layer),
+    )
+    with FakeTensorMode(shape_env=ShapeEnv()) as mode:
+        num_tokens = mode.shape_env.create_unbacked_symint()
+        hidden = torch.empty((num_tokens, 512), dtype=torch.bfloat16)
+        positions = torch.empty((1, num_tokens), dtype=torch.int32)
+        q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(hidden, positions, "3")
+    for output, width in ((q, 1024), (idx_q, 128)):
+        assert output.shape[0].node.expr == num_tokens.node.expr
+        assert output.shape[1] == width
+        assert output.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.cpu_only
+def test_piecewise_captures_horizontal_producer_before_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    packed = torch.empty((4, 7), dtype=torch.bfloat16)
+    q = torch.empty((4, 3), dtype=torch.float8_e4m3fn)
+    idx_q = torch.empty((4, 1), dtype=torch.float8_e4m3fn)
+    output = torch.empty((4, 3), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(num_tokens=2)
+    layer = SimpleNamespace(
+        enable_fused_qkv_index_projection=True,
+        register_to_config=True,
+        attn=backend,
+        _emit_fp8_main_qkv=lambda: True,
+        layer_idx_str="3",
+        qkv_proj=Mock(return_value=packed),
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=(q, idx_q)),
+        _forward_attention_core=Mock(return_value=output),
+        o_proj=lambda output, all_reduce_params: output,
+    )
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (metadata, layer),
+    )
+    hidden = torch.empty((4, 5), dtype=torch.bfloat16)
+    positions = torch.arange(4).reshape(1, 4)
+    result = MiniMaxM3Attention._sparse_forward(layer, positions, hidden, metadata)
+    assert result is output
+    layer.qkv_proj.assert_called_once_with(hidden)
+    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once_with(
+        packed, positions, metadata
+    )
+    layer._forward_attention_core.assert_called_once_with(q, None, None, idx_q, None, metadata)
+
+
+@pytest.mark.cpu_only
+def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    q, k, v, idx_q, idx_k = [torch.empty((4, 128), dtype=torch.float8_e4m3fn) for _ in range(5)]
+    metadata = SimpleNamespace(num_tokens=2)
+    layer = SimpleNamespace(
+        enable_fused_qkv_index_projection=False,
+        register_to_config=True,
+        attn=backend,
+        _emit_fp8_main_qkv=lambda: True,
+        qkv_proj=Mock(return_value=torch.empty((4, 384), dtype=torch.bfloat16)),
+        index_qk_proj=Mock(return_value=torch.empty((4, 256), dtype=torch.bfloat16)),
+        _fused_qk_norm_rope=Mock(
+            side_effect=[torch.cat((q, k, v), dim=-1), torch.cat((idx_q, idx_k), dim=-1)]
+        ),
+        _fused_fp8_index_qk_norm_rope=Mock(),
+        _split_main_qkv=lambda tensor: (q, k, v),
+        _split_index_qk=lambda tensor: (idx_q, idx_k),
+        num_heads=1,
+        num_key_value_heads=1,
+        head_dim=128,
+        sparse_num_index_heads=1,
+        sparse_index_dim=128,
+        q_norm=object(),
+        k_norm=object(),
+        index_q_norm=object(),
+        index_k_norm=object(),
+        ln_events=(None, None),
+        aux_stream=None,
+        _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
+        o_proj=lambda output, all_reduce_params: output,
+    )
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "maybe_execute_in_parallel",
+        lambda first, second, *args, **kwargs: (first(), second()),
+    )
+    MiniMaxM3Attention._sparse_forward(
+        layer, torch.arange(4).reshape(1, 4), torch.empty((4, 128), dtype=torch.bfloat16), metadata
+    )
+    layer._fused_fp8_index_qk_norm_rope.assert_not_called()
+    assert layer._fused_qk_norm_rope.call_count == 2
+    assert all(call.kwargs["out_fp8"] for call in layer._fused_qk_norm_rope.call_args_list)
+    layer._forward_attention_core.assert_called_once_with(q, k, v, idx_q, idx_k, metadata)
 
 
 @pytest.mark.cpu_only

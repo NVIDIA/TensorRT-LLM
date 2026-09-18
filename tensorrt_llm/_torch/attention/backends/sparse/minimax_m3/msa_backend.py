@@ -965,6 +965,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_fields_ready = False
         if not self._msa_buffers_ready:
             return
+        # Captured producers execute the whole padded bucket, including on
+        # attention-DP ranks without local requests. Invalidate the tail before
+        # any early return so replay cannot write padding into stale KV slots.
+        self.msa_out_cache_loc.fill_(-1)
         request_ids = self.request_ids
         qo_lens_cpu = self.msa_qo_lens_cpu
         kv_lens_cpu = self.msa_kv_lens_cpu

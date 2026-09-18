@@ -58,6 +58,9 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_projection_fake_preserves_padded_hidden_rows
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_fused_projection_preserves_input_token_dimension
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_preserves_symbolic_shapes
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captures_horizontal_producer_before_attention
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_unfused_indexer_keeps_cache_write_eager
   - unittest/_torch/models/test_minimax_m3.py::test_msa_attention_core_routes_compact_q_to_attention_dispatcher
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip

@@ -7295,6 +7295,22 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
         # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
         # Triton path keeps the KV cache in BF16.
+        self._run_nvfp4(use_msa)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
+    def test_nvfp4_piecewise_cuda_graph(
+            self, fuse_qkv_index_projection: bool) -> None:
+        self._run_nvfp4(True,
+                        piecewise=True,
+                        fuse_qkv_index_projection=fuse_qkv_index_projection)
+
+    def _run_nvfp4(self,
+                   use_msa: bool,
+                   *,
+                   piecewise: bool = False,
+                   fuse_qkv_index_projection: bool = False) -> None:
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
@@ -7303,7 +7319,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                         dtype="fp8" if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton",
-            indexer_kv_dtype="fp8" if use_msa else "bf16")
+            indexer_kv_dtype="fp8" if use_msa else "bf16",
+            fuse_qkv_index_projection=fuse_qkv_index_projection)
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
@@ -7311,6 +7328,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
+                 prefill_cuda_graph_backend=(PrefillCudaGraphBackend.PIECEWISE
+                                             if piecewise else
+                                             PrefillCudaGraphBackend.DISABLED),
+                 prefill_capture_num_tokens=[128, 512, 2048]
+                 if piecewise else None,
+                 torch_compile_config=TorchCompileConfig()
+                 if piecewise else None,
                  max_seq_len=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
