@@ -1590,15 +1590,6 @@ def serve(
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
                                   if visual_gen_args is not None else None)
 
-        # --revision/--hf_revision is a top-level option, so it has to be
-        # applied here as well: without this the VisualGen path silently
-        # ignored it and always served the default branch. An explicit flag
-        # wins over the YAML; the YAML still works on its own.
-        if revision is not None:
-            if parsed_visual_gen_args is None:
-                parsed_visual_gen_args = VisualGenArgs()
-            parsed_visual_gen_args.revision = revision
-
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 

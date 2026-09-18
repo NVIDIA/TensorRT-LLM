@@ -38,11 +38,16 @@ python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
-Serving takes the same option:
+`trtllm-serve` is configured entirely through its YAML rather than top-level
+flags, so set the revision there:
+
+```yaml
+# cosmos3-nano-fp8.yaml
+revision: fp8
+```
 
 ```bash
-trtllm-serve nvidia/Cosmos3-Nano --revision fp8 \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args cosmos3-nano-fp8.yaml
 ```
 
 T2V, T2I, I2V and V2V are validated on a **single GPU**; every multi-GPU
