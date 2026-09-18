@@ -14,7 +14,7 @@
 # limitations under the License.
 """Pytest entry point: deselect the tests a target machine cannot run.
 
-    pytest --collect-only -p qa_selection.plugin --machine=B200
+    pytest --collect-only -p qa_selection.plugin --machine=B200 --gpus=4 --ladder=1,4,8
 
 Load with `-p` on the command line. No hardware is touched: every decision
 is read from marks. The logic lives in `collection.py`; this file is hooks only.
