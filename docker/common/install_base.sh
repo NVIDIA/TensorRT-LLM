@@ -197,7 +197,7 @@ install_gcctoolset_rockylinux() {
     rdma-core-devel \
     zeromq-devel \
     -y
-  echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
+  echo ". scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
 
