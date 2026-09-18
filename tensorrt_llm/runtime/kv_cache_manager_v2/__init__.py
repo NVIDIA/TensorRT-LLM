@@ -179,11 +179,16 @@ else:
     class _BatchDescFieldSpec:
         kv_caches: object = None
         system_prompt_length: int = 0
+
+    @_dataclasses_bd.dataclass
+    class _KVCacheDescFieldSpec:
+        capacity: int = 0
+        history_length: int = 0
         constraint_policy: object = None
-        min_capacity: object = None
 
     BatchDesc.__dataclass_fields__ = _BatchDescFieldSpec.__dataclass_fields__
-    del _BatchDescFieldSpec, _dataclasses_bd
+    _cpp.KVCacheDesc.__dataclass_fields__ = _KVCacheDescFieldSpec.__dataclass_fields__
+    del _BatchDescFieldSpec, _KVCacheDescFieldSpec, _dataclasses_bd
     BufferConfig = _cpp.BufferConfig
     BufferId = _cpp.BufferId
     CoalescedBuffer = _cpp.CoalescedBuffer

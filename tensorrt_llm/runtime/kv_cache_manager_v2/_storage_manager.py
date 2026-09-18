@@ -253,7 +253,9 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
         self._fit_to_quota = any(
-            c.constraint_policy == ConstraintPolicy.FIT_TO_QUOTA for c in constraints or []
+            request.constraint_policy == ConstraintPolicy.FIT_TO_QUOTA
+            for batch in constraints or []
+            for request in batch.kv_caches
         )
         self.resolved_constraints = self._resolve_constraints(
             constraints or [],
@@ -336,12 +338,15 @@ class StorageManager:
     ) -> list[BatchDesc]:
         resolved = list(constraints)
         flexible = [
-            (index, c)
-            for index, c in enumerate(constraints)
-            if c.constraint_policy == ConstraintPolicy.FIT_TO_QUOTA
+            (batch_index, request_index)
+            for batch_index, batch in enumerate(constraints)
+            for request_index, request in enumerate(batch.kv_caches)
+            if request.constraint_policy == ConstraintPolicy.FIT_TO_QUOTA
         ]
         if len(flexible) > 1:
-            raise ValueError("Only one FIT_TO_QUOTA constraint is supported")
+            raise ValueError(
+                "Only one FIT_TO_QUOTA request is supported across initialization constraints"
+            )
         if not flexible:
             return resolved
         quota = gpu_quota // granularity * granularity
@@ -352,19 +357,21 @@ class StorageManager:
             )
             return self._min_quota_for_level(slot_size_lists, granularity, slots)
 
-        index, constraint = flexible[0]
-        constraint.__post_init__()
+        index, request_index = flexible[0]
+        batch = constraints[index]
+        batch.__post_init__()
+        request = batch.kv_caches[request_index]
+        request.__post_init__()
         if required_quota() <= quota:
             return resolved
-        batch = constraint
-        request = batch.kv_caches[0]
         headroom = request.capacity - request.history_length
-        minimum = constraint.min_capacity
-        assert minimum is not None
+        minimum = max(1, headroom)
 
         def set_capacity(capacity: int) -> None:
             requests = list(batch.kv_caches)
-            requests[0] = KVCacheDesc(capacity, capacity - headroom)
+            requests[request_index] = replace(
+                request, capacity=capacity, history_length=capacity - headroom
+            )
             resolved[index] = replace(batch, kv_caches=requests)
 
         set_capacity(minimum)

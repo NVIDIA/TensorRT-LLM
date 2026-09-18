@@ -38,29 +38,19 @@ void DiskCacheTierConfig::assertValid() const
     }
 }
 
-void BatchDesc::validateConstraintPolicy() const
+void KVCacheDesc::validateConstraintPolicy() const
 {
     if (constraintPolicy == ConstraintPolicy::kFixed)
     {
-        if (minCapacity.has_value())
-        {
-            throw std::invalid_argument("FIXED constraints do not accept min_capacity");
-        }
         return;
     }
     if (constraintPolicy != ConstraintPolicy::kFitToQuota)
     {
         throw std::invalid_argument("Unknown constraint policy");
     }
-    if (kvCaches.empty() || systemPromptLength != 0)
+    if (capacity <= 0)
     {
-        throw std::invalid_argument("FIT_TO_QUOTA requires a first request and no shared system prompt");
-    }
-    auto const& request = kvCaches.front();
-    int const headroom = request.capacity - request.historyLength;
-    if (!minCapacity.has_value() || *minCapacity < std::max(1, headroom) || *minCapacity > request.capacity)
-    {
-        throw std::invalid_argument("min_capacity must preserve generation headroom and not exceed capacity");
+        throw std::invalid_argument("FIT_TO_QUOTA requires positive capacity");
     }
 }
 
@@ -70,15 +60,16 @@ void KVCacheManagerConfig::validate() const
     {
         swaScratchReuse->validate();
     }
+    int flexibleCount = 0;
     for (auto const& batch : constraints)
     {
         batch.validate();
+        flexibleCount += std::count_if(batch.kvCaches.begin(), batch.kvCaches.end(),
+            [](KVCacheDesc const& request) { return request.constraintPolicy == ConstraintPolicy::kFitToQuota; });
     }
-    if (std::count_if(constraints.begin(), constraints.end(),
-            [](BatchDesc const& batch) { return batch.constraintPolicy == ConstraintPolicy::kFitToQuota; })
-        > 1)
+    if (flexibleCount > 1)
     {
-        throw std::invalid_argument("Only one FIT_TO_QUOTA constraint is supported");
+        throw std::invalid_argument("Only one FIT_TO_QUOTA request is supported across initialization constraints");
     }
     if (typicalStep.has_value())
     {

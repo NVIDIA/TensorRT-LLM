@@ -434,9 +434,10 @@ class TestFitToQuota(TestKVCacheManagerV2):
             ],
             constraints=[
                 BatchDesc(
-                    [KVCacheDesc(4096, 4095), KVCacheDesc(1, 0)],
-                    constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
-                    min_capacity=1,
+                    [
+                        KVCacheDesc(4096, 4095, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA),
+                        KVCacheDesc(1, 0),
+                    ],
                 )
             ],
         )
@@ -470,7 +471,7 @@ class TestFitToQuota(TestKVCacheManagerV2):
         self.assertEqual(self.manager.resolved_constraints[0].kv_caches[0].capacity, 6 * 32)
         self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), 17 << 20)
 
-    def test_unaligned_minimum_does_not_reject_aligned_fit(self) -> None:
+    def test_swa_block_phase_search(self) -> None:
         cfg = self.make_config(4 << 20)
         cfg.layers = [
             AttentionLayerConfig(
@@ -481,13 +482,14 @@ class TestFitToQuota(TestKVCacheManagerV2):
         ]
         cfg.constraints = [
             BatchDesc(
-                [KVCacheDesc(97, 96)],
-                constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
-                min_capacity=33,
+                [KVCacheDesc(97, 96, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA)],
             )
         ]
         self.manager = KVCacheManager(cfg)
-        self.assertEqual(self.manager.resolved_constraints[0].kv_caches[0], KVCacheDesc(96, 95))
+        self.assertEqual(
+            self.manager.resolved_constraints[0].kv_caches[0],
+            KVCacheDesc(96, 95, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA),
+        )
         self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), 4 << 20)
 
     def test_fixed_envelope_is_not_relaxed(self) -> None:
@@ -516,7 +518,13 @@ class TestFitToQuota(TestKVCacheManagerV2):
         # Rebuild the selected workloads as fixed constraints. The ordinary
         # allocator is an independent check that their full envelope fits.
         fixed = [
-            replace(c, constraint_policy=ConstraintPolicy.FIXED, min_capacity=None)
+            replace(
+                c,
+                kv_caches=[
+                    replace(request, constraint_policy=ConstraintPolicy.FIXED)
+                    for request in c.kv_caches
+                ],
+            )
             for c in resolved
         ]
         oracle = KVCacheManager(replace(cfg, constraints=fixed))
@@ -555,13 +563,62 @@ class TestFitToQuota(TestKVCacheManagerV2):
         self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), cfg.cache_tiers[0].quota)
 
     def test_invalid_policy_configuration(self) -> None:
-        with self.assertRaisesRegex(ValueError, "min_capacity"):
+        with self.assertRaisesRegex(ValueError, "positive capacity"):
+            KVCacheDesc(0, 0, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA)
+        with self.assertRaisesRegex(ValueError, "shared system prompt"):
             BatchDesc(
-                [KVCacheDesc(8, 4)], constraint_policy=ConstraintPolicy.FIT_TO_QUOTA, min_capacity=3
+                [KVCacheDesc(8, 4, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA)],
+                system_prompt_length=1,
             )
         cfg = self.make_config()
         with self.assertRaisesRegex(ValueError, "Only one"):
             replace(cfg, constraints=cfg.constraints * 2)
+        with self.assertRaisesRegex(ValueError, "Only one"):
+            replace(cfg, constraints=[BatchDesc([cfg.constraints[0].kv_caches[0]] * 2)])
+
+    def test_marked_request_need_not_be_first(self) -> None:
+        cfg = self.make_config()
+        marked, fixed = cfg.constraints[0].kv_caches
+        cfg.constraints = [BatchDesc([KVCacheDesc(32, 0)]), BatchDesc([fixed, marked])]
+        self.manager = KVCacheManager(cfg)
+        resolved = self.manager.resolved_constraints
+        self.assertEqual(resolved[0], cfg.constraints[0])
+        self.assertEqual(resolved[1].kv_caches[0], fixed)
+        self.assertEqual(resolved[1].kv_caches[1].capacity, 14 * 32)
+        self.assertEqual(resolved[1].kv_caches[1].history_length, 14 * 32 - 1)
+
+    @parameterized.expand([(0,), (1,), (65,)])
+    def test_lower_bound_preserves_headroom(self, headroom: int) -> None:
+        cfg = self.make_config(6 << 20)
+        cfg.constraints = [
+            BatchDesc(
+                [
+                    KVCacheDesc(
+                        4096, 4096 - headroom, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA
+                    ),
+                    KVCacheDesc(1, 0),
+                ]
+            )
+        ]
+        self.manager = KVCacheManager(cfg)
+        resolved = self.manager.resolved_constraints[0].kv_caches[0]
+        self.assertLess(resolved.capacity, 4096)
+        self.assertGreaterEqual(resolved.capacity, max(1, headroom))
+        self.assertEqual(resolved.capacity - resolved.history_length, headroom)
+        self.assertLessEqual(self.manager.get_quota(GPU_LEVEL), 6 << 20)
+
+    def test_headroom_that_cannot_fit_is_rejected(self) -> None:
+        cfg = self.make_config(4 << 20)
+        cfg.constraints = [
+            BatchDesc(
+                [
+                    KVCacheDesc(4096, 4096 - 65, constraint_policy=ConstraintPolicy.FIT_TO_QUOTA),
+                    KVCacheDesc(1, 0),
+                ]
+            )
+        ]
+        with self.assertRaisesRegex(ValueError, "insufficient.*FIT_TO_QUOTA"):
+            KVCacheManager(cfg)
 
 
 class TestStorageStatistics(TestKVCacheManagerV2):

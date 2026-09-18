@@ -1560,10 +1560,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("layer_id", &kv::SsmLayerConfig::layerId)
         .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
 
+    nb::enum_<kv::ConstraintPolicy>(m, "ConstraintPolicy")
+        .value("FIXED", kv::ConstraintPolicy::kFixed)
+        .value("FIT_TO_QUOTA", kv::ConstraintPolicy::kFitToQuota);
+
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
-        .def(nb::init<int, int>(), nb::arg("capacity"), nb::arg("history_length"))
+        .def(
+            "__init__",
+            [](kv::KVCacheDesc* desc, int capacity, int historyLength, kv::ConstraintPolicy constraintPolicy)
+            {
+                new (desc) kv::KVCacheDesc{capacity, historyLength, constraintPolicy};
+                desc->validate();
+            },
+            nb::arg("capacity"), nb::arg("history_length"), nb::arg("constraint_policy") = kv::ConstraintPolicy::kFixed)
         .def_rw("capacity", &kv::KVCacheDesc::capacity)
         .def_rw("history_length", &kv::KVCacheDesc::historyLength)
+        .def_rw("constraint_policy", &kv::KVCacheDesc::constraintPolicy)
         .def("__eq__",
             [](kv::KVCacheDesc const& self, nb::handle other)
             {
@@ -1577,32 +1589,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KVCacheDesc const& self)
             {
                 return "KVCacheDesc(capacity=" + std::to_string(self.capacity)
-                    + ", history_length=" + std::to_string(self.historyLength) + ")";
+                    + ", history_length=" + std::to_string(self.historyLength)
+                    + ", constraint_policy=" + pythonRepr(self.constraintPolicy) + ")";
             }) DEF_COPY(kv::KVCacheDesc);
-
-    nb::enum_<kv::ConstraintPolicy>(m, "ConstraintPolicy")
-        .value("FIXED", kv::ConstraintPolicy::kFixed)
-        .value("FIT_TO_QUOTA", kv::ConstraintPolicy::kFitToQuota);
 
     nb::class_<kv::BatchDesc>(m, "BatchDesc")
         .def(
             "__init__",
-            [](kv::BatchDesc* bd, std::vector<kv::KVCacheDesc> kvCaches, int systemPromptLength,
-                kv::ConstraintPolicy constraintPolicy, std::optional<int> minCapacity)
+            [](kv::BatchDesc* bd, std::vector<kv::KVCacheDesc> kvCaches, int systemPromptLength)
             {
                 new (bd) kv::BatchDesc();
                 bd->kvCaches = std::move(kvCaches);
                 bd->systemPromptLength = systemPromptLength;
-                bd->constraintPolicy = constraintPolicy;
-                bd->minCapacity = minCapacity;
-                bd->validateConstraintPolicy();
+                bd->validate();
             },
-            nb::arg("kv_caches"), nb::arg("system_prompt_length") = 0,
-            nb::arg("constraint_policy") = kv::ConstraintPolicy::kFixed, nb::arg("min_capacity") = std::nullopt)
+            nb::arg("kv_caches"), nb::arg("system_prompt_length") = 0)
         .def_rw("kv_caches", &kv::BatchDesc::kvCaches)
         .def_rw("system_prompt_length", &kv::BatchDesc::systemPromptLength)
-        .def_rw("constraint_policy", &kv::BatchDesc::constraintPolicy)
-        .def_rw("min_capacity", &kv::BatchDesc::minCapacity)
         .def("__eq__",
             [](kv::BatchDesc const& self, nb::handle other)
             {
@@ -1622,11 +1625,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     {
                         repr += ", ";
                     }
-                    repr += "KVCacheDesc(capacity=" + std::to_string(self.kvCaches[i].capacity)
-                        + ", history_length=" + std::to_string(self.kvCaches[i].historyLength) + ")";
+                    repr += pythonRepr(self.kvCaches[i]);
                 }
-                repr += "], system_prompt_length=" + std::to_string(self.systemPromptLength) + ", constraint_policy="
-                    + pythonRepr(self.constraintPolicy) + ", min_capacity=" + pythonRepr(self.minCapacity) + ")";
+                repr += "], system_prompt_length=" + std::to_string(self.systemPromptLength) + ")";
                 return repr;
             }) DEF_COPY(kv::BatchDesc);
 

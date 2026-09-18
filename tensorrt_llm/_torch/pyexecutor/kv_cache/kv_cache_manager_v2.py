@@ -2747,13 +2747,12 @@ class KVCacheManagerV2(BaseResourceManager):
                         [
                             KVCacheDesc(
                                 capacity=self.max_seq_len,
-                                history_length=self.max_seq_len - 1,
+                                history_length=max(0, self.max_seq_len - min_decode_capacity),
+                                constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
                             )
                         ]
                         + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (self.max_batch_size - 1),
-                        constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
-                        min_capacity=min(min_decode_capacity, self.max_seq_len),
+                        * (self.max_batch_size - 1)
                     )
                 )
 

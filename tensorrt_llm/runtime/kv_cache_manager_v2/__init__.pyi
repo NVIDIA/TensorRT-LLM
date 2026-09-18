@@ -204,21 +204,20 @@ class SsmLayerConfig:
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
-@dataclass(slots=True)
-class KVCacheDesc:
-    capacity: int
-    history_length: int
-
 class ConstraintPolicy(enum.IntEnum):
     FIXED = 0
     FIT_TO_QUOTA = 1
 
 @dataclass(slots=True)
+class KVCacheDesc:
+    capacity: int
+    history_length: int
+    constraint_policy: ConstraintPolicy = ConstraintPolicy.FIXED
+
+@dataclass(slots=True)
 class BatchDesc:
     kv_caches: list[KVCacheDesc]
     system_prompt_length: int = 0
-    constraint_policy: ConstraintPolicy = ConstraintPolicy.FIXED
-    min_capacity: int | None = None
 
 @dataclass(slots=True)
 class SwaScratchReuseConfig:

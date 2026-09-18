@@ -284,7 +284,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota));
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
     bool const fitToQuota = std::any_of(constraints.begin(), constraints.end(),
-        [](BatchDesc const& batch) { return batch.constraintPolicy == ConstraintPolicy::kFitToQuota; });
+        [](BatchDesc const& batch)
+        {
+            return std::any_of(batch.kvCaches.begin(), batch.kvCaches.end(),
+                [](KVCacheDesc const& request) { return request.constraintPolicy == ConstraintPolicy::kFitToQuota; });
+        });
     mResolvedConstraints = resolveConstraints(
         constraints, slotSizeLists, gpuQuota, gpuGranularity, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
@@ -1737,23 +1741,26 @@ std::vector<BatchDesc> StorageManager::resolveConstraints(std::vector<BatchDesc>
     int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
     std::vector<BatchDesc> resolved;
-    std::optional<size_t> flexibleIndex;
-    BatchDesc const* flexible = nullptr;
+    std::optional<std::pair<size_t, size_t>> flexibleIndex;
     for (auto const& constraint : constraints)
     {
         constraint.validate();
-        if (constraint.constraintPolicy == ConstraintPolicy::kFitToQuota)
+        for (size_t requestIndex = 0; requestIndex < constraint.kvCaches.size(); ++requestIndex)
         {
-            if (flexible != nullptr)
+            if (constraint.kvCaches[requestIndex].constraintPolicy != ConstraintPolicy::kFitToQuota)
             {
-                throw std::invalid_argument("Only one FIT_TO_QUOTA constraint is supported");
+                continue;
             }
-            flexibleIndex = resolved.size();
-            flexible = &constraint;
+            if (flexibleIndex.has_value())
+            {
+                throw std::invalid_argument(
+                    "Only one FIT_TO_QUOTA request is supported across initialization constraints");
+            }
+            flexibleIndex = std::pair{resolved.size(), requestIndex};
         }
         resolved.push_back(constraint);
     }
-    if (flexible == nullptr)
+    if (!flexibleIndex.has_value())
     {
         return resolved;
     }
@@ -1768,11 +1775,11 @@ std::vector<BatchDesc> StorageManager::resolveConstraints(std::vector<BatchDesc>
     {
         return resolved;
     }
-    auto& batch = resolved[*flexibleIndex];
-    auto& request = batch.kvCaches.front();
+    auto const [batchIndex, requestIndex] = *flexibleIndex;
+    auto& request = resolved[batchIndex].kvCaches[requestIndex];
     int const headroom = request.capacity - request.historyLength;
     int const maximum = request.capacity;
-    int const minimum = *flexible->minCapacity;
+    int const minimum = std::max(1, headroom);
     auto setCapacity = [&](int capacity)
     {
         request.capacity = capacity;

@@ -794,12 +794,14 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
     assert config.constraints == [
         BatchDesc(
             [
-                KVCacheDesc(capacity=1024, history_length=1023),
+                KVCacheDesc(
+                    capacity=1024,
+                    history_length=1021,
+                    constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
+                ),
                 KVCacheDesc(capacity=3, history_length=0),
                 KVCacheDesc(capacity=3, history_length=0),
-            ],
-            constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
-            min_capacity=3,
+            ]
         ),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
     ]
