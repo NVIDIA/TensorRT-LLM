@@ -562,7 +562,6 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        self.post_load_weights()
         out_shape = (*x.shape[:-1], self.out_features)
         out = torch.ops.trtllm.fp8_swap_ab_gemm(
             x.reshape(-1, x.shape[-1]),

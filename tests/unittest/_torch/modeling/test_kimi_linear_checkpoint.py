@@ -392,6 +392,9 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
         indices[axis] = slice(start // 128, (end + 127) // 128)
         scales = scales[tuple(indices)]
         torch.testing.assert_close(module.weight_scale, scales, rtol=0, atol=0)
+    for module in model.modules():
+        if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
+            module.post_load_weights()
     hidden = torch.randn(7, 256, dtype=torch.bfloat16, device="cuda")
     expected = torch.cat(
         [getattr(attention, name)(hidden) for name in _KDA_PROJECTIONS[:4]], dim=-1
@@ -554,6 +557,9 @@ def test_mla_a_fusion_follows_checkpoint_datatypes(quantized):
             torch.testing.assert_close(module.weight_scale[scale_rows], scales, rtol=0, atol=0)
             weight *= scales.repeat_interleave(128, 0).repeat_interleave(128, 1)[: weight.shape[0]]
         references.append((module, rows, torch.nn.functional.linear(hidden.float(), weight)))
+    for module in model.modules():
+        if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
+            module.post_load_weights()
     for module, rows, expected in references:
         actual = module(hidden)[:, rows].float()
         assert (actual - expected).norm() / expected.norm() < 0.05
