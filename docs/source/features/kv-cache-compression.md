@@ -277,10 +277,17 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 specialized sparse cache | Compressed rows quantized; SWA, compressor, and indexer state preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `keep_rope_precision` is on) and the indexer cache is preserved losslessly | Not supported |
+| DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,
     KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.
+[^deepseek-v4]: DeepSeek-V4 requires `tokens_per_block` of 128 or 256 (the
+    DeepSeek-V4 cache manager's constraint) and cold-page compression does not
+    cover the FP8 `fp8_ds_mla` footer-scale KV layout; use the ordinary FP8 or
+    BF16 runtime KV layout. If `scale_checkpoint_path` supplies ModelOpt KV
+    scales, only the per-layer K scale is applied to the CSA cache; the V scale
+    is not used.
 [^cold-page-requirements]: NVFP4 cold-page quantization additionally requires
     the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
     [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md)

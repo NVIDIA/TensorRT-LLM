@@ -15,6 +15,13 @@ run, based on what the PR changed. New rules are added in Python only.
 The touch DB is produced by the post-merge collection under `coverage_utils/`;
 see `coverage_utils/COLLECTION.md` for what it does and does not record.
 
+Tier 2 is evaluated for every eligible CBTS run (`/bot run` and
+`/bot run --post-merge`). Coverage decisions for authors outside
+`CBTS_COVERAGE_PILOT_USERS` are shadow-only: their candidate scope, stages,
+case counts, and skip rate are reported, but the narrowed test DB is not
+uploaded and the baseline filter chain remains active. Tier 1 decisions
+continue to apply to all users.
+
 ## Consumption layers
 
 CBTS narrows test cases only; Build always runs.
@@ -92,10 +99,11 @@ jenkins/scripts/cbts/
 │   ├── openengine_rule.py
 │   └── out_of_scope_rule.py
 ├── coverage_tier.py       Tier 2 entry: applies the selector to the test-db YAMLs, classifies every candidate entry
+├── python_change_analysis.py  shared AST scopes, bindings, and local dependencies
+├── repository_reference.py   shared repository import and binding-reference index
 ├── coverage_selection/
 │   ├── SELECTION.md       how a decision is made: qualname concepts, decline gates, narrowing
 │   ├── selector.py        CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
-│   ├── qualname_map.py    changed lines → co_qualname, plus the import-time and closure classifications
 │   ├── touch_db.py        read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
 │   └── artifact.py        resolve and merge the x86/SBSA post-merge touch DBs
 ├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
@@ -230,7 +238,7 @@ Decision JSON:
 `cbts_test_db/` is written on the L0_MergeRequest agent and is not
 available to downstream `L0_Test-*` pods. To deliver it per stage:
 
-1. `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
+1. For an applied decision, `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
    recording the path in `result.cbts_test_db_artifact_path` (rides along
    inside `testFilter`).
 2. `renderTestDB` on the stage agent downloads and extracts that tarball
@@ -241,6 +249,12 @@ If the upload or the download/extraction fails, the override directory is
 absent and `renderTestDB` falls back to the source test-db. Layer 2 still
 applies. The tarball carries only the narrowed YAMLs, so no PR diff text
 travels between jobs.
+
+Shadow coverage decisions return to the baseline before this upload step, so
+neither Layer 2 stage filtering nor Layer 3 test-db narrowing can affect the
+run. OpenSearch records `b_cbts_applied` and
+`b_coverage_pilot_eligible`; `s_scope=coverage` with
+`b_cbts_applied=false` identifies a successful shadow candidate.
 
 ## Split-resize heuristic (Layer 2.5)
 

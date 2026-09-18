@@ -31,6 +31,7 @@ from _torch.moe.moe_test_utils import (
     IS_CI_MODE,
     MoeBackendType,
     MoeModelConfig,
+    build_test_activation,
     create_test_param,
     get_backend_class,
     iter_base_test_configs,
@@ -56,7 +57,6 @@ from tensorrt_llm._torch.moe.fused_moe import (
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
     MoEActivation,
-    SimpleActivation,
     SiTuActivation,
     SwigluActivation,
     SwigluBiasActivation,
@@ -71,7 +71,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
+    TRTLLMGenFusedMoE,
+    trtllm_gen_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -82,6 +85,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEResolutionReport,
     MoERunContext,
     MoEStaticCapability,
+    canonical_activation,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     MoEDep,
@@ -105,6 +109,10 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
+)
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
+    TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
 from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
@@ -514,11 +522,16 @@ def should_skip_gptoss(
 def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
     """An upstream fused down projection owns quantization on this path."""
     monkeypatch.delenv("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", raising=False)
+    # Patched in the module that owns the override, so the assertion fires if
+    # the pre-quantized short-circuit stops running before the SM probe.
     monkeypatch.setattr(
-        "tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen.get_sm_version",
+        "tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_w4a8_mxfp4_mxfp8.is_sm_100f",
         MagicMock(side_effect=AssertionError("SM probe must be short-circuited")),
     )
-    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    # The MXFP8-activation leaf: it is the one that overrides
+    # ``try_fused_route_quant`` at all, so declining has to be shown on it and
+    # not on a leaf that inherits the base's unconditional ``None``.
+    backend = TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.__new__(TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl)
     hidden_states = MxFp8QuantizedTensor(
         fp8_tensor=torch.empty(1, 3584, dtype=torch.float8_e4m3fn),
         scaling_factor=torch.empty(1, 112, dtype=torch.uint8),
@@ -535,47 +548,16 @@ def test_kimi_mxfp8_quantized_tensor_handoff() -> None:
     fp8_tensor = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
     scaling_factor = torch.empty(2, 2, dtype=torch.uint8)
     hidden_states = MxFp8QuantizedTensor(fp8_tensor, scaling_factor)
-    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    # The NVFP4 leaf owns this path by identity now, so there is no quant-mode
+    # mock to set up: which branch runs is which class was constructed.
+    backend = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
     backend._weights_created = True
-    quant_mode = MagicMock()
-    quant_mode.has_any_quant.return_value = True
-    quant_mode.has_w4a8_mxfp4_fp8.return_value = False
-    quant_mode.has_nvfp4.return_value = True
-    backend.quant_config = SimpleNamespace(layer_quant_mode=quant_mode)
 
     quantized, scales = backend.quantize_input(hidden_states)
 
     assert quantized is fp8_tensor
     assert scales.data_ptr() == scaling_factor.data_ptr()
     assert torch.equal(scales, scaling_factor)
-
-
-def build_test_activation(
-    activation_type: ActivationType,
-    swiglu_alpha: Optional[torch.Tensor] = None,
-    swiglu_beta: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[torch.Tensor] = None,
-) -> "SimpleActivation | SwigluActivation | SwigluBiasActivation | SiTuActivation":
-    """Package the flat parameters these tests parametrize over as one activation.
-
-    The tests still sweep alpha / beta / limit independently because that is
-    what ``quantize_util.get_swiglu_tensors`` produces for the reference
-    implementation. Presence of alpha or beta means the gpt-oss package, which
-    is the same rule the C++ op applied when it upgraded a bare ``Swiglu`` with
-    constants to ``SwigluBias``.
-    """
-    kind = ActivationType(activation_type)
-    if kind is ActivationType.SiTu:
-        return SiTuActivation(gate_softcap=swiglu_alpha, linear_softcap=swiglu_beta)
-    if swiglu_alpha is not None or swiglu_beta is not None:
-        return SwigluBiasActivation(
-            gate_sigmoid_scale=swiglu_alpha,
-            linear_offset=swiglu_beta,
-            clamp=swiglu_limit,
-        )
-    if kind in (ActivationType.Swiglu, ActivationType.SwigluBias):
-        return SwigluActivation(clamp=swiglu_limit)
-    return SimpleActivation(kind=kind)
 
 
 def create_test_backend(
@@ -597,7 +579,9 @@ def create_test_backend(
     n_shared_experts: int = 0,
 ) -> MoE:
     """Create a MoE backend for testing."""
-    backend_cls = get_backend_class(backend_type)
+    backend_cls = get_backend_class(
+        backend_type, None if quant_config is None else quant_config.quant_algo
+    )
     if locality_domain_policy is None:
         locality_domain_policy = LocalityDomainPolicy(enabled=False)
 
@@ -885,7 +869,11 @@ def _make_trtllm_gen_moe(
         mapping=Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank),
         moe_backend="TRTLLM",
     )
-    return TRTLLMGenFusedMoE(
+    # The leaf for this checkpoint's format. ``TRTLLMGenFusedMoE`` itself is
+    # abstract now, so the class has to come from the quantization the caller
+    # asked for.
+    leaf_cls = trtllm_gen_leaf(None if quant_config is None else quant_config.quant_algo)
+    return leaf_cls(
         routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -994,27 +982,6 @@ def test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale() -> None:
     # The two conventions must actually differ, otherwise this test would pass
     # vacuously on a build where dequantScaleAb happens to be 1.
     assert not torch.allclose(situ.fc31_scale_c.data.float(), swiglu.fc31_scale_c.data.float())
-
-
-@_situ_supported
-@pytest.mark.parametrize(
-    "quant_algo",
-    [
-        pytest.param(None, id="unquantized"),
-        pytest.param(QuantAlgo.FP8, id="fp8"),
-        pytest.param(QuantAlgo.W4A16_MXFP4, id="w4a16_mxfp4"),
-    ],
-)
-def test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins(quant_algo) -> None:
-    """There is no standalone SiTu activation kernel.
-
-    SiTu exists only as a fused FC1 epilogue, in the NVFP4 (group-16) and
-    W4A8_MXFP4_MXFP8 (group-32) cubin families. Anything else has to be
-    rejected at construction rather than silently resolving to SwiGLU, which
-    is structurally wrong output that no shape check would catch.
-    """
-    with pytest.raises(ValueError, match="requires one of .* quantization"):
-        _make_trtllm_gen_moe(quant_config=QuantConfig(quant_algo=quant_algo), situ=True)
 
 
 @_situ_supported
@@ -1545,27 +1512,53 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
 def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Standard serving must not pay for the 36-tactic sweep by default.
+    # Standard serving must not pay for the tactic sweep by default.
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.tactic_autotune is False
 
 
-def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
+@pytest.mark.parametrize(
+    "sm_version,decode_count,prefill_count", [(100, 36, 40), (103, 36, 40), (107, 11, 13)]
+)
+def test_enumerate_megamoe_candidate_tactics_curated_space(
+    sm_version: int, decode_count: int, prefill_count: int
+) -> None:
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
-    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
-    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
-    assert len(decode) == len(prefill) == 36
+    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
+    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
+    assert (len(decode), len(prefill)) == (decode_count, prefill_count)
+    assert all(len(t) == 10 for t in decode + prefill)
     assert {t[-1] for t in decode} == {(1, 1)}
     assert {t[-1] for t in prefill} == {(2, 4)}
-    # The deterministic fallback stays inside the curated axes.
+    for tactic in decode + prefill:
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     for num_tokens in (64, 4096, 16384):
-        megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
+        megamoe_op.validate_megamoe_tactic(
+            megamoe_op.default_megamoe_tactic(num_tokens), sm_version=sm_version
+        )
+    if sm_version == 107:
+        for bucket, tactic in megamoe_op._SM107_GENPHASE_TACTICS.items():
+            megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
+            assert (
+                megamoe_op._default_megamoe_tactic_for_problem(
+                    sm_version=sm_version,
+                    max_tokens_per_rank=bucket,
+                    num_tokens=bucket,
+                    apply_topk_in_fc1=False,
+                    in_kernel_fc2_reduce=False,
+                    combine_format="bf16",
+                )
+                == tactic
+            )
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
-    invalid_tactic[2] = 511
-    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+    invalid_tactic[3] = ("grouped", 0)
+    with pytest.raises(ValueError, match=r"schedule_policy hint must be a positive int or None"):
+        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic), sm_version=sm_version)
+    legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
+    megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
+    assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.gpu
@@ -2507,7 +2500,10 @@ def test_trtllm_bf16_unquantized_moe(
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
 
-    # This test constructs the backend directly, so query it directly.
+    # This test constructs the backend directly, so query it directly. The
+    # parametrized activation has to go into the problem: this leaf declares
+    # which kinds it reaches, so leaving it out would ask the Relu2 cases for
+    # the SwiGLU verdict.
     verdict = get_backend_class(backend_type).can_implement(
         MoEProblem(
             quant=None,
@@ -2516,6 +2512,7 @@ def test_trtllm_bf16_unquantized_moe(
             intermediate_size=intermediate_size,
             num_experts=num_experts,
             top_k=top_k,
+            activation=canonical_activation(activation_type),
         ),
         MoEDeployment(
             ep_size=1,
@@ -2647,6 +2644,29 @@ FUSED_SHARED_EXPERT_INFOS = [
 ]
 
 
+@pytest.fixture
+def shared_expert_fusion_enabled(monkeypatch: pytest.MonkeyPatch):
+    """Turn the flag on somewhere the backend will actually read it.
+
+    ``setenv`` alone is not enough. The flag reaches the backend through the
+    selection environment, which is collected once per process and cached, so
+    any earlier test that resolved a MoE has already frozen it -- leaving the
+    write visible to ``os.environ`` and to nothing else. Dropping the cache on
+    the way out rather than re-collecting there lets the next reader collect
+    after ``monkeypatch`` has restored the variable.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+        MoEEnvFlag,
+        collect_moe_environment,
+        reset_moe_environment_cache,
+    )
+
+    monkeypatch.setenv(MoEEnvFlag.SHARED_EXPERT_FUSION.value, "1")
+    collect_moe_environment(force=True)
+    yield
+    reset_moe_environment_cache()
+
+
 class _AppendSharedExpertsRouting:
     """Reference-side routing wrapper: appends the fused shared experts as
     always-selected entries (ids [num_experts, num_experts+n_fused), weight
@@ -2703,10 +2723,10 @@ def _write_fused_shared_expert_slots(
     FUSED_SHARED_EXPERT_INFOS,
     ids=lambda info: f"e{info[0]}g{info[1]}tg{info[2]}k{info[3]}fused{info[4]}",
 )
+@pytest.mark.usefixtures("shared_expert_fusion_enabled")
 def test_trtllm_fp8_block_scales_fused_shared_experts(
     expert_info,
     seq_len: int,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     """Fused-shared-expert accuracy for the TRTLLM backend (FP8 block scales).
 
@@ -2721,8 +2741,6 @@ def test_trtllm_fp8_block_scales_fused_shared_experts(
     intermediate_size = 512
     dtype = torch.bfloat16
     backend_type = MoeBackendType.TRTLLM
-
-    monkeypatch.setenv("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", "1")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -2849,7 +2867,8 @@ def test_trtllm_fp8_block_scales_fused_shared_experts(
     get_sm_version() not in (100, 103),
     reason="TRTLLM-Gen FP8 block scales requires SM100/103",
 )
-def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.usefixtures("shared_expert_fusion_enabled")
+def test_trtllm_fp8_block_scales_fuse_shared_expert_layout():
     """Layout-only check of fuse_shared_expert (no kernel launch).
 
     Builds a shared GatedMLP of intermediate n_fused*I, fuses it, and asserts
@@ -2867,8 +2886,6 @@ def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.M
     n_fused = 2
     dtype = torch.bfloat16
     scale_block = 128
-
-    monkeypatch.setenv("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", "1")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()

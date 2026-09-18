@@ -15,7 +15,7 @@
 """
 Differential tests for the fused DSA decode-metadata Triton kernel.
 
-The kernel in fused_metadata.py collapses the eager metadata chain in
+The kernel in kernels.py collapses the eager metadata chain in
 DSAtrtllmAttentionMetadata.on_update_kv_lens() into one launch. Its whole
 contract is that the integer metadata it produces is BIT-IDENTICAL to that eager
 chain -- a wrong index silently corrupts sparse attention. These tests assert
@@ -40,7 +40,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import (  # noqa: E402
     _compute_slot_mappings,
     build_req_idx_per_token,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.fused_metadata import (  # noqa: E402
+from tensorrt_llm._torch.attention.backends.sparse.dsa.kernels import (  # noqa: E402
     fused_dsa_decode_metadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (  # noqa: E402
@@ -331,11 +331,11 @@ def test_fused_negative_gpos_matches_eager():
 
 @pytest.mark.parametrize(
     "value,expected",
-    [("0", False), ("1", True), ("garbage", False)],
+    [("0", True), ("1", False), ("2", False), ("-1", False), ("garbage", False), ("", False)],
 )
 def test_meta_gate_values(monkeypatch, value, expected):
-    """The env gate is on only for exactly "1"; anything else keeps eager."""
-    monkeypatch.setenv("TRTLLM_FUSED_DSA_METADATA", value)
+    """Only "0" enables fusion; any other explicit value disables it."""
+    monkeypatch.setenv("TRTLLM_DISABLE_FUSED_DSA_METADATA", value)
     _fused_dsa_meta_enabled.cache_clear()
     try:
         assert _fused_dsa_meta_enabled() is expected
@@ -344,22 +344,23 @@ def test_meta_gate_values(monkeypatch, value, expected):
 
 
 def test_meta_gate_unset(monkeypatch):
-    """With the env var unset, the gate is off (eager path)."""
-    monkeypatch.delenv("TRTLLM_FUSED_DSA_METADATA", raising=False)
+    """With the disable env var unset, fusion is enabled by default."""
+    monkeypatch.delenv("TRTLLM_DISABLE_FUSED_DSA_METADATA", raising=False)
     _fused_dsa_meta_enabled.cache_clear()
     try:
-        assert _fused_dsa_meta_enabled() is False
+        assert _fused_dsa_meta_enabled() is True
     finally:
         _fused_dsa_meta_enabled.cache_clear()
 
 
-def test_meta_gate_cached(monkeypatch):
+@pytest.mark.parametrize("initial,updated,expected", [("0", "1", True), ("1", "0", False)])
+def test_meta_gate_cached(monkeypatch, initial, updated, expected):
     """The gate is read once and pinned; a mid-run env flip must not change it."""
-    monkeypatch.setenv("TRTLLM_FUSED_DSA_METADATA", "1")
+    monkeypatch.setenv("TRTLLM_DISABLE_FUSED_DSA_METADATA", initial)
     _fused_dsa_meta_enabled.cache_clear()
     try:
-        assert _fused_dsa_meta_enabled() is True
-        monkeypatch.setenv("TRTLLM_FUSED_DSA_METADATA", "0")
-        assert _fused_dsa_meta_enabled() is True  # cached, not re-read
+        assert _fused_dsa_meta_enabled() is expected
+        monkeypatch.setenv("TRTLLM_DISABLE_FUSED_DSA_METADATA", updated)
+        assert _fused_dsa_meta_enabled() is expected  # cached, not re-read
     finally:
         _fused_dsa_meta_enabled.cache_clear()
