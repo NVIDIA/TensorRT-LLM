@@ -392,6 +392,16 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+
+def _request_flag(request, name: str) -> bool:
+    """Read a request state predicate that is a nanobind read-only property on
+    the C++ ``LlmRequest`` (``is_generation_only_request`` etc.) but a plain
+    method on the Python wrapper; a missing attribute reads as False."""
+    value = getattr(request, name, False)
+    if callable(value):
+        value = value()
+    return bool(value)
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -9080,9 +9090,9 @@ class PyExecutor:
             return True
         if getattr(self, "kv_cache_transceiver", None) is None:
             return False
-        if getattr(request, "is_context_only_request", False):
+        if _request_flag(request, "is_context_only_request"):
             return True
-        if request.is_generation_only_request():
+        if _request_flag(request, "is_generation_only_request"):
             return True
         return request.state in self._DISAGG_TRANSFER_BOUND_STATES
 
