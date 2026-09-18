@@ -466,6 +466,17 @@ def test_cuda_actual_graph_parameter_rebinding(shape, wshape):
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() != (10, 0) or "B200" not in torch.cuda.get_device_name():
         pytest.skip("Qualified B200 geometry")
+    if (
+        torch.version.cuda != "13.4"
+        or torch.backends.cudnn.version() != 92501
+        or not torch.__version__.startswith("2.14.0a0+")
+        or not torch.__version__.endswith(".nv26.08")
+    ):
+        pytest.skip("Graph execution requires the qualified CUDA/cuDNN/PyTorch runtime")
+    # On the qualified runtime, missing or broken cuDNN bindings must fail.
+    cudnn = importlib.import_module("cudnn")
+    if cudnn.__version__ != "1.27.0" or cudnn.backend_version() != 92501:
+        pytest.skip("Graph execution requires cuDNN frontend 1.27 and backend 9.25.1")
     rank = len(shape) - 2
     fmt = torch.channels_last if rank == 2 else torch.channels_last_3d
     padding = (1, 1) if rank == 2 else (0, 1, 1)
