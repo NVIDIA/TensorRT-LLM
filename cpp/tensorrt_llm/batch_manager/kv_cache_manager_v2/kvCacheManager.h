@@ -127,13 +127,17 @@ public:
 
     // ---- KvCache creation -------------------------------------------------
 
-    // Create a new KvCache. Returned cache is SUSPENDED; call activate() with a stream.
+    // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.
     // input_tokens:         optional sequence to match against existing cached blocks.
     // priorityCb:           optional priority override per block.
-    // expectedPromptLength: token count marking the prefill->generation boundary; once
-    //                       historyLength reaches it, later capacity growth is recorded as
-    //                       generation-phase allocation stats (defaults to inputTokens.size()).
-    //                       Stats-only: no effect on allocation, reuse, or correctness.
+    // expectedPromptLength: full prompt token count marking the prefill->generation boundary.
+    //                       Beam expansion shares blocks entirely before this boundary and
+    //                       copies the writable tail into each additional beam. For beam search,
+    //                       pass the actual prompt length if inputTokens is absent or shortened
+    //                       for reuse matching. Defaults to non-empty inputTokens.size(); without
+    //                       either value, beam expansion uses a zero shared-prefix boundary.
+    //                       Once historyLength reaches it, later capacity growth is also recorded
+    //                       as generation-phase allocation stats.
     // textOnly:             per-sequence override of the text-only (digest-free) guarantee;
     //                       nullopt inherits the manager config default.
     // enableRequestStats:   collect request-local allocation and reuse statistics even when
