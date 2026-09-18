@@ -27,13 +27,12 @@ _MIB = 1024 * 1024
 # generation side, so set them there; unset uses the defaults.
 # - min_bytes gates payloads that carry recurrent (mamba/KDA) state: the fallback cost scales
 #   with bytes, not block count, so the gate is byte-denominated.
-# - min_blocks is the legacy plain-KV gate, kept so existing bounce deployments see no behavior
-#   change.
+# - min_blocks gates plain-KV transfer fragments (one per block for whole-slot copies).
 # For Kimi K3 the byte gate never rejects: the fixed ~433 MiB per-request KDA payload always
 # clears the 2 MiB default, so arena capacity plus reservation backpressure is the effective
 # admission control.
 _MIN_BYTES_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES"  # byte gate for recurrent-state payloads
-_MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"  # block-count gate for plain-KV payloads
+_MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"  # fragment-count gate for plain-KV payloads
 
 
 def _env_int_gate(name: str, default: int) -> int:
@@ -126,11 +125,10 @@ class Config:
     sizing: Sizing = field(default_factory=FixedSizing)  # how much memory to reserve (pluggable)
     chunk_mb: int = 32  # physical chunk size; a large chunk keeps the write to a single descriptor
     # Which gate applies depends on the payload (see VmmBounceTransport.reserve): transfers that
-    # carry recurrent state use min_bytes; plain-KV transfers keep the original min_blocks gate so
-    # pre-existing bounce deployments see no behavior change.
+    # carry recurrent state use min_bytes; plain-KV transfers use the min_blocks fragment-count gate.
     # byte gate for recurrent-state payloads (see DEFAULT_MIN_BYTES for the rationale)
     min_bytes: int = DEFAULT_MIN_BYTES
-    # block-count gate for plain-KV payloads (roughly 12k tokens at 128 per block); heuristic,
+    # fragment-count gate for plain-KV payloads (one fragment per whole-slot block); heuristic,
     # tunable via TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS
     min_blocks: int = 96
 
