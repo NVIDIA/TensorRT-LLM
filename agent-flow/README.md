@@ -70,9 +70,12 @@ python examples/quick_start.py
 
 Define custom tools with `from agent_flow import tool`. Both backends accept
 these definitions and existing Claude SDK tool objects. Python shorthand and
-`TypedDict` inputs are normalized to JSON Schema. Resource links and embedded
-text resources become readable tool output; image results retain their MIME
-type. Unsupported result types return explicit tool errors.
+`TypedDict` inputs are normalized to JSON Schema. Explicit JSON Schemas are
+normalized to the root object shape MCP tools require (a string `type`, a
+`properties` key, and a root `$ref` moved into `allOf`) so both backends
+advertise the same schema. Resource links and embedded text resources become
+readable tool output; image results retain their MIME type. Unsupported result
+types return explicit tool errors.
 
 Declare required calls on the layer, independently of its backend:
 

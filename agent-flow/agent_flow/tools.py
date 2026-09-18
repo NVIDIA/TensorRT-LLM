@@ -114,8 +114,29 @@ def _field_qualifier(hint: Any) -> Any:
     return get_origin(hint)
 
 
+def _mcp_object_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Give an explicit JSON Schema the root shape MCP tool schemas require.
+
+    Both backends advertise an object schema with a ``properties`` key. The Claude SDK
+    also relies on that shape to recognise a JSON Schema: a dict without a string ``type``
+    and a ``properties`` key is re-read as Python shorthand, so keywords such as ``$ref``
+    become required parameters. Root constraints that do not fit the shape move into
+    ``allOf``, which keeps their meaning across JSON Schema drafts.
+    """
+    constraints = []
+    if "$ref" in schema:
+        constraints.append({"$ref": schema.pop("$ref")})
+    if "type" in schema and not isinstance(schema["type"], str):
+        constraints.append({"type": schema.pop("type")})
+    if constraints:
+        schema["allOf"] = constraints + list(schema.get("allOf", []))
+    schema.setdefault("type", "object")
+    schema.setdefault("properties", {})
+    return schema
+
+
 def normalize_input_schema(schema: Any) -> dict[str, Any]:
-    """Copy JSON Schema or convert a shorthand dictionary/TypedDict to JSON Schema."""
+    """Copy JSON Schema into the MCP object shape, or convert shorthand/TypedDict input."""
     if isinstance(schema, Mapping):
         # A field named "type" can also occur in shorthand, e.g. {"type": str}.
         schema_type = schema.get("type")
@@ -134,7 +155,7 @@ def normalize_input_schema(schema: Any) -> dict[str, Any]:
             )
         )
         if is_json_schema:
-            normalized = copy.deepcopy(dict(schema))
+            normalized = _mcp_object_schema(copy.deepcopy(dict(schema)))
         else:
             properties = {key: _json_schema(hint, set()) for key, hint in schema.items()}
             normalized = {
