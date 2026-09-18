@@ -268,35 +268,6 @@ def generate_dummy_loras(
     return lora_output_paths
 
 
-def get_test_prompts(use_code_prompts: bool = False) -> list[str]:
-    """Get test prompts for LoRA testing.
-
-    Args:
-        use_code_prompts: If True, return code-related prompts. If False, return general prompts.
-
-    Returns:
-        List of test prompts.
-    """
-    if use_code_prompts:
-        return [
-            "Write a function that outputs the fibonacci sequence.",
-            "Convert the following C++ code to Python:  x = 0;x++;",
-            "Find the largest prime factor of 42.",
-            "write a unit test for this function: $(cat fib.py)",
-            "# A simple python function to remove whitespace from a string:",
-            "How to load CodeLlama from HuggingFace?",
-        ]
-    else:
-        return [
-            "Hey how are you doing today?",
-            "How is the weather in Seattle, WA?",
-            "Is it ok to fill diesel in a petrol car?",
-            "Can you check the top 5 trending songs on spotify?",
-            "What is the capital of France?",
-            "How to load CodeLlama from HuggingFace?",
-        ]
-
-
 def get_test_prompts_for_torch() -> list[str]:
     """Get test prompts for LoRA Torch testing.
 
@@ -310,95 +281,6 @@ def get_test_prompts_for_torch() -> list[str]:
         "Can you check the top 5 trending songs on spotify?",
         "What is the capital of France?",
     ]
-
-
-def test_multi_lora_support(
-    hf_model_dir,
-    tllm_ckpt_dir,
-    engine_dir,
-    llm_venv,
-    example_root,
-    num_loras=2,
-    lora_rank=8,
-    target_hf_modules=["q_proj", "k_proj", "v_proj"],
-    target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
-    zero_lora_weights=True,
-    use_code_prompts=False,
-):
-    start_time = time.time()
-    print("Creating dummy LoRAs...")
-    lora_start = time.time()
-    lora_paths = generate_dummy_loras(
-        hf_model_dir=hf_model_dir,
-        lora_output_dir=llm_venv.get_working_directory(),
-        num_loras=num_loras,
-        lora_rank=lora_rank,
-        target_modules=target_hf_modules,
-        zero_weights=zero_lora_weights)
-    lora_end = time.time()
-    print(
-        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
-    )
-
-    print("Build engines...")
-    build_start = time.time()
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={tllm_ckpt_dir}",
-        f"--output_dir={engine_dir}",
-        "--remove_input_padding=enable",
-        "--context_fmha=enable",
-        "--gemm_plugin=auto",
-        "--lora_plugin=auto",
-        "--max_batch_size=8",
-        "--max_input_len=512",
-        "--max_seq_len=562",
-        "--lora_dir",
-        f"{lora_paths[0]}",
-        f"{lora_paths[1]}",
-        "--max_lora_rank=8",
-        "--lora_target_modules",
-        *target_trtllm_modules,
-        "--max_beam_width=1",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-    build_end = time.time()
-    print(
-        f"Build engines completed in {(build_end - build_start):.2f} seconds.")
-
-    input_prompts = get_test_prompts(use_code_prompts)
-
-    print("Run inference with C++ runtime with pybind...")
-    inference_start = time.time()
-    run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
-    run_cmd = [
-        run_script,
-        f"--tokenizer_dir={hf_model_dir}",
-        f"--engine_dir={engine_dir}",
-        "--input_text",
-        *input_prompts,
-        "--lora_task_uids",
-        "-1",
-        "0",
-        "1",
-        "-1",
-        "0",
-        "1",
-        "--top_p=0.5",
-        "--top_k=0",
-        "--random_seed=0",
-        "--max_output_len=30",
-    ]
-    venv_check_call(llm_venv, run_cmd)
-    inference_end = time.time()
-    print(
-        f"Inference completed in {(inference_end - inference_start):.2f} seconds."
-    )
-
-    total_time = time.time() - start_time
-    print(
-        f"Total test_multi_lora_support execution time: {total_time:.2f} seconds"
-    )
 
 
 def test_llm_torch_multi_lora_support(
