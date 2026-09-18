@@ -2833,13 +2833,8 @@ class KVCacheCompressionManager(BaseResourceManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-        pretrained_config: Optional["PretrainedConfig"] = None,
     ) -> Optional[object]:
-        """Create a native cold-page codec when the algorithm provides one.
-
-        ``pretrained_config`` describes the model whose KV the requesting KVCM
-        holds; a one-model draft KVCM passes its draft config.
-        """
+        """Create a native cold-page codec when the algorithm provides one."""
         return None
 
     def encode_cold_pages(

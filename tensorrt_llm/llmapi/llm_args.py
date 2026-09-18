@@ -3908,16 +3908,14 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
-    rope_precision: Literal["auto", "quantized", "lossless"] = Field(
-        default="auto",
+    keep_rope_precision: bool = Field(
+        default=False,
         description=
-        "Precision of the RoPE (position-encoded) part of each K row in the "
-        "compressed tier. 'quantized' stores it in the `quant` format for the "
-        "best ratio; 'lossless' copies it byte-for-byte from the active cache "
-        "for the best accuracy; 'auto' keeps the per-model default (lossless "
-        "for DeepSeek-V4 compressed rows, quantized elsewhere). Models whose "
-        "K rows are fully rotated, or that declare per-layer-type RoPE (for "
-        "example Gemma4), cannot use 'lossless'.")
+        "Keep the RoPE (position-encoded) part of each K row at its active-"
+        "cache precision in the compressed tier instead of quantizing it with "
+        "the rest of the row. Off (default) quantizes the whole row for the "
+        "best ratio; on trades some ratio for accuracy. Models whose K rows "
+        "are fully rotated cannot turn it on.")
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,

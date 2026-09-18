@@ -292,32 +292,18 @@ The framework connects storage-bound compression to KVCM V2 through the
 existing interfaces. A new compression format implements its provider APIs and
 algorithm launcher.
 
-#### Row schemas in the NVFP4 cold-page codec
+#### Row contract of the NVFP4 cold-page codec
 
-The NVFP4 codec separates three concerns so that no model-specific code touches
-the byte layout:
-
-- **Schema** (`row_schema.py`): what each hot row means. A `LayerSchema` lists
-  every buffer of a KVCM layer; a buffer is either opaque (copied byte-for-byte)
-  or a row of `nope` and `rope` spans. Schemas come from an ordered table of
-  resolvers; each resolver sees the layers no earlier resolver claimed.
-  `deepseek_v4` claims layers by their `deepseek_v4_*` roles; `mla` claims every
-  key-only layer and requires the `kv_lora_rank + qk_rope_head_dim` geometry,
-  failing closed on anything else (for example the packed `fp8_ds_mla` rows);
-  `gqa` claims the rest. A resolver may return `EXCLUDE` to leave a layer to
-  KVCM's default lossless codec.
-- **Policy** (`ColdPagePolicy`): which precision each span kind gets. NoPE is
-  always quantized; RoPE follows `rope_precision`. After precision resolution,
-  adjacent spans of the same precision merge into the kernel's row contract: one
-  quantized run per row, described as (start, length, stride), with every
-  element before or after the run preserved.
-- **Layout** (`nvfp4_quantization.py`): one function turns a schema into the
-  kernel-facing `_Nvfp4LayerLayout`, with per-buffer row geometry, and the
-  lifecycle metadata packs the three tables the CUDA kernels read; the Python
-  column enums mirror the kernel's `WideField` / `IntegerField` / `ScaleField`.
-
-To support a new attention family, write a resolver that names the spans of its
-rows; do not add a layout builder or a `model_type` check.
+The kernels quantize one contiguous run per hot row and copy the bytes around it
+unchanged. Each compressed buffer carries `quantized_run_start_elements` and
+`quantized_run_elements`; its layer carries `raw_row_stride_elements`. With
+`keep_rope_precision` off the run is the whole row. With it on, the codec locates
+the RoPE elements from the model config (the `qk_rope_head_dim` tail of an MLA
+latent row, the first `rotary_dim` elements of a partial-rotary GQA head, the
+64-element tail of a DeepSeek-V4 compressed row) and leaves them out of the run,
+so they land in the cold page byte-for-byte after that buffer's scales. Rows
+whose RoPE elements sit in the middle, or whose run would not start and end on a
+16-element scale group, are rejected.
 
 ### 4. Add method-specific kernels
 

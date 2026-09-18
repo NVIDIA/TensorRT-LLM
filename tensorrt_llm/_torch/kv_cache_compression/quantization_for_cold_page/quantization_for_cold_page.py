@@ -22,14 +22,8 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-        pretrained_config: object | None = None,
     ) -> object:
-        """Create one native codec with state isolated to this KVCM.
-
-        ``pretrained_config`` describes the model whose KV this KVCM holds; a
-        one-model draft KVCM passes its draft config. It defaults to the
-        target config the manager was constructed with.
-        """
+        """Create one native codec with state isolated to this KVCM."""
 
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
 
@@ -40,7 +34,6 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             num_kv_heads_per_layer=num_kv_heads_per_layer,
             head_dim_per_layer=head_dim_per_layer,
             is_draft=is_draft,
-            pretrained_config=pretrained_config,
         )
         return native.create_python_cold_page_codec(self, codec_state)
 
@@ -69,7 +62,6 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-        pretrained_config: object | None = None,
     ) -> object:
         """Build the format-specific state owned by one native codec."""
         raise NotImplementedError
