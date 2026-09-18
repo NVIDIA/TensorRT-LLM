@@ -446,7 +446,7 @@ __device__ void copyLosslessRowBytesToCold(
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
     std::size_t const prefixBytes = losslessPrefixBytesPerRow<T>(params);
-    std::size_t const runBytes = static_cast<std::size_t>(params.quantizedRangeElements) * sizeof(T);
+    std::size_t const rangeBytes = static_cast<std::size_t>(params.quantizedRangeElements) * sizeof(T);
     std::size_t const suffixBytes = losslessSuffixBytesPerRow<T>(params);
     std::size_t const coldRowBytes = prefixBytes + suffixBytes;
     if (prefixBytes != 0U)
@@ -456,7 +456,7 @@ __device__ void copyLosslessRowBytesToCold(
     if (suffixBytes != 0U)
     {
         copyStridedRows(
-            raw, rawRowBytes, prefixBytes + runBytes, coldLossless, coldRowBytes, prefixBytes, rows, suffixBytes);
+            raw, rawRowBytes, prefixBytes + rangeBytes, coldLossless, coldRowBytes, prefixBytes, rows, suffixBytes);
     }
 }
 
@@ -472,7 +472,7 @@ __device__ void restoreLosslessRowBytesFromCold(
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
     std::size_t const prefixBytes = losslessPrefixBytesPerRow<T>(params);
-    std::size_t const runBytes = static_cast<std::size_t>(params.quantizedRangeElements) * sizeof(T);
+    std::size_t const rangeBytes = static_cast<std::size_t>(params.quantizedRangeElements) * sizeof(T);
     std::size_t const suffixBytes = losslessSuffixBytesPerRow<T>(params);
     std::size_t const coldRowBytes = prefixBytes + suffixBytes;
     if (prefixBytes != 0U)
@@ -482,7 +482,7 @@ __device__ void restoreLosslessRowBytesFromCold(
     if (suffixBytes != 0U)
     {
         copyStridedRows(
-            coldLossless, coldRowBytes, prefixBytes, raw, rawRowBytes, prefixBytes + runBytes, rows, suffixBytes);
+            coldLossless, coldRowBytes, prefixBytes, raw, rawRowBytes, prefixBytes + rangeBytes, rows, suffixBytes);
     }
 }
 

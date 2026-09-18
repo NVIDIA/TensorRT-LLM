@@ -204,6 +204,9 @@ NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets `KvCacheConfig(dtype="nvfp4")` and keeps active GPU KV in
 NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
 
+For complete single-GPU and disaggregated-serving configurations, see the
+[NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
+
 #### Keeping RoPE Precision
 
 For every token and KV head, the KV cache stores one K vector and one V vector
@@ -237,9 +240,6 @@ kv_cache_compression_config:
   quant: nvfp4
   keep_rope_precision: true
 ```
-
-For complete single-GPU and disaggregated-serving configurations, see the
-[NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
 
 ### TriAttention
 

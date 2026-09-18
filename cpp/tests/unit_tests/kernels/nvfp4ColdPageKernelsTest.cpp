@@ -1414,7 +1414,7 @@ TEST_P(Nvfp4ColdPageRopePrecisionTest, PartialRotaryKeyRowKeepsLosslessPrefix)
     runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{2, 16, 192}, 256, 64);
 }
 
-// MLA latent rows with rope_precision=lossless: 512 NoPE elements quantized, 64 RoPE elements preserved.
+// MLA latent rows with keep_rope_precision on: 512 NoPE elements quantized, 64 RoPE elements preserved.
 TEST_P(Nvfp4ColdPageRopePrecisionTest, MlaLatentRowKeepsLosslessSuffix)
 {
     runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 64, 512}, 576, 0, 2.0F, 0.5F);

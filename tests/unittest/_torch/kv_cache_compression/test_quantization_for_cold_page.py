@@ -1394,9 +1394,9 @@ def _kv_layer(head_dim, *, tokens=64, element_bytes=2):
     )
 
 
-def _create(manager, cache_config, native, *, runtime_dtype=DataType.FP8, **geometry):
+def _create(manager, cache_config, native, *, runtime_dtype=DataType.FP8, **layer_args):
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        manager.create_cold_page_codec(cache_config, runtime_dtype=runtime_dtype, **geometry)
+        manager.create_cold_page_codec(cache_config, runtime_dtype=runtime_dtype, **layer_args)
     return _layouts(native)
 
 
@@ -1464,7 +1464,7 @@ def test_keep_rope_precision_leaves_the_mla_rope_tail() -> None:
 
 
 @pytest.mark.parametrize(
-    ("keep_rope_precision", "run", "cold_page_bytes"),
+    ("keep_rope_precision", "quantized_range", "cold_page_bytes"),
     [
         # 8192 B NVFP4 data + 1024 B scales + 2176 B indexer copied whole.
         (False, (0, 512), 11392),
@@ -1473,7 +1473,7 @@ def test_keep_rope_precision_leaves_the_mla_rope_tail() -> None:
     ],
 )
 def test_deepseek_v4_compressed_rows_follow_keep_rope_precision(
-    keep_rope_precision, run, cold_page_bytes
+    keep_rope_precision, quantized_range, cold_page_bytes
 ) -> None:
     native, _ = _native()
     (layout,) = _create(
@@ -1484,7 +1484,7 @@ def test_deepseek_v4_compressed_rows_follow_keep_rope_precision(
         num_kv_heads_per_layer=(),
         head_dim_per_layer=(),
     )
-    assert _quantized_range(layout.buffers[0]) == run
+    assert _quantized_range(layout.buffers[0]) == quantized_range
     metadata = _configure_lifecycle(
         native,
         {1: {"deepseek_v4_compress": 32 * 512, "deepseek_v4_indexer_compress": 32 * 68}},
@@ -1586,7 +1586,7 @@ def test_keep_rope_precision_requires_mla_latent_geometry_for_key_only_layers() 
             AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=64 * 656)]),
         ),
     )
-    with pytest.raises(NotImplementedError, match="MLA latent geometry"):
+    with pytest.raises(NotImplementedError, match="MLA latent vector"):
         _create(
             _manager(pretrained_config=_mla_config(), keep_rope_precision=True),
             cache_config,
@@ -1598,11 +1598,7 @@ def test_keep_rope_precision_requires_mla_latent_geometry_for_key_only_layers() 
 
 
 def test_measured_glm52_and_deepseek_v4_pages_are_reproduced() -> None:
-    """Whole-page byte pins for the two production layouts measured on GB300.
-
-    GLM-5.2 was measured with RoPE quantized (the default); DeepSeek-V4-Pro was
-    measured with its RoPE tail preserved, which is now ``keep_rope_precision=True``.
-    """
+    """Reproduce the GB300-measured cold page sizes of GLM-5.2 (default) and DeepSeek-V4-Pro (RoPE kept)."""
 
     # GLM-5.2: 79 MLA latent rows (78 layers + MTP) x 64 tokens at FP8, 22 indexer-K layers.
     native, _ = _native()

@@ -256,9 +256,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     or kv_lora_rank + rope_dim != row_elements
                 ):
                     raise NotImplementedError(
-                        f"{buffer_name}: head_dim {row_elements} is not the MLA latent geometry "
-                        f"kv_lora_rank + qk_rope_head_dim ({kv_lora_rank} + {rope_dim}), so its "
-                        "RoPE elements cannot be located; keep_rope_precision is unsupported here"
+                        f"{buffer_name}: head_dim {row_elements} is not kv_lora_rank + "
+                        f"qk_rope_head_dim ({kv_lora_rank} + {rope_dim}) of an MLA latent vector, "
+                        "so its RoPE part cannot be located; keep_rope_precision is unsupported here"
                     )
                 rope = (kv_lora_rank, rope_dim)
             else:
