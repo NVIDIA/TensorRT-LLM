@@ -131,9 +131,13 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         output: torch.Tensor,
         n: int,
         max_seq_len: int,
-        extra: dict[str, torch.Tensor | None],
+        extra: dict[str, torch.Tensor | None] | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
-        prior = extra["gvr_prior_indices"]
+        # Without a prior the indexer hands TopK no GVR kwargs at all, so the
+        # dict itself is absent rather than carrying a ``None`` entry.
+        prior = extra["gvr_prior_indices"] if extra is not None else None
         if top_k.needs_gvr_prior:
             assert prior.shape == (num_generations, topk)
             assert prior.data_ptr() == metadata.gvr_prior_indices[1].data_ptr()
@@ -186,7 +190,10 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
             is_generation=is_generation,
         )
     assert decode_call.call_count == int(has_decode)
-    assert seed_call.call_count == int(top_k.needs_gvr_prior and has_prefill)
+    # The indexer seeds unconditionally after prefill; TopK itself is the one
+    # that drops the update when the implementation keeps no prior, so the call
+    # count tracks prefill alone and the prior contents assert the ownership.
+    assert seed_call.call_count == int(has_prefill)
     if seed_call.called:
         assert seed_call.call_args.args[1].data_ptr() == metadata.seq_lens_cuda.data_ptr()
     token_offset = num_ctx_tokens if is_generation is None else 0
