@@ -556,8 +556,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             stride = layout.raw_row_stride_elements
             expected_raw_bytes = rows * stride * element_bytes
 
-            # Cold layer: [packed NVFP4 per buffer][scales then lossless bytes per
-            # buffer][opaque buffers][16-byte padding].
+            # Cold layer: [NVFP4 data per compressed buffer][scales then copied bytes
+            # per compressed buffer][buffers copied whole][16-byte padding].
             compressed = [buffer for buffer in layout.buffers if buffer.scales is not None]
             packed_bytes = {
                 buffer.role: rows * buffer.quantized_range_elements // _ELEMENTS_PER_BYTE
