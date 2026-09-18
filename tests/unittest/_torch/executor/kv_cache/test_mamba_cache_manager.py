@@ -238,6 +238,43 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     assert params.mamba_ssm_cache_dtype is torch.float32
 
 
+def _kimi_kda_hf_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=4,
+        linear_attn_config={
+            "head_dim": 8,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 3],
+            "full_attn_layers": [2, 4],
+        },
+        dtype=torch.bfloat16,
+    )
+
+
+def test_kimi_kda_state_dtype_bf16_is_opt_in() -> None:
+    """kv_cache_config.mamba_ssm_cache_dtype=bfloat16 reaches the state pool.
+
+    The bf16 staging paths in the KDA mixer and the fused decode kernel are
+    only reachable when the explicit request survives cache-param extraction.
+    """
+    params = extract_mamba_kv_cache_params(
+        _kimi_kda_hf_config(),
+        quant_config=SimpleNamespace(mamba_ssm_cache_dtype=torch.bfloat16),
+    )
+
+    assert params.mamba_ssm_cache_dtype is torch.bfloat16
+
+
+def test_kimi_kda_state_dtype_rejects_unsupported_request() -> None:
+    with pytest.raises(ValueError, match="float32 .default. or"):
+        extract_mamba_kv_cache_params(
+            _kimi_kda_hf_config(),
+            quant_config=SimpleNamespace(mamba_ssm_cache_dtype=torch.float16),
+        )
+
+
 def _kimi_model_config() -> SimpleNamespace:
     config = SimpleNamespace(
         architectures=["KimiLinearForCausalLM"],

@@ -258,6 +258,56 @@ def resolve_ssm_cache_dtype(config):
     return None
 
 
+KIMI_KDA_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+def resolve_auto_ssm_cache_dtype(config, fallback):
+    """Resolve mamba_ssm_cache_dtype="auto" for ``config``.
+
+    Kimi K3 defaults to fp32: the HF reference (fla chunk/fused_recurrent
+    KDA kernels) carries the delta-rule recurrent state in fp32. A bf16
+    state pool is an explicit opt-in through
+    kv_cache_config.mamba_ssm_cache_dtype; the fused verify kernel then
+    rounds the committed state to bf16. A checkpoint-declared
+    mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
+    checkpoints do not carry the field); it is logged when it would have
+    changed the dtype.
+    """
+    if is_kimi_linear(config):
+        declared = resolve_ssm_cache_dtype(config)
+        if declared is not None and declared != torch.float32:
+            logger.info(
+                "Kimi K3: the checkpoint declares "
+                f"mamba_ssm_cache_dtype={declared}; keeping the fp32 "
+                "recurrent-state pool (kv_cache_config.mamba_ssm_cache_dtype "
+                "opts in to bfloat16).")
+        return torch.float32
+    return (resolve_ssm_cache_dtype(config) or resolve_hf_torch_dtype(config)
+            or fallback)
+
+
+def validate_kimi_kda_state_dtype(config,
+                                  mamba_ssm_cache_dtype,
+                                  mamba_ssm_stochastic_rounding=False):
+    """Reject state-cache settings the Kimi K3 KDA kernels cannot honor.
+
+    The kernels read fp32 or bf16 state and round the committed state to
+    nearest; stochastic rounding is a Mamba2 fp16-cache feature that would
+    otherwise be accepted and silently ignored here.
+    """
+    if not is_kimi_linear(config):
+        return
+    if mamba_ssm_cache_dtype not in KIMI_KDA_STATE_DTYPES:
+        raise ValueError(
+            "Kimi K3 KDA recurrent-state cache supports float32 (default) or "
+            f"bfloat16; got mamba_ssm_cache_dtype={mamba_ssm_cache_dtype}.")
+    if mamba_ssm_stochastic_rounding and mamba_ssm_cache_dtype != torch.float32:
+        raise ValueError(
+            "Kimi K3 KDA kernels round the committed recurrent state to "
+            "nearest; mamba_ssm_stochastic_rounding is not supported with a "
+            f"{mamba_ssm_cache_dtype} state cache.")
+
+
 def resolve_vocab_size(config) -> Optional[int]:
     """Return the language model's vocabulary size, or None if absent.
 
@@ -599,18 +649,9 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = _coerce_torch_dtype(
             quant_config.mamba_ssm_cache_dtype)
     if mamba_ssm_cache_dtype is None:
-        mamba_ssm_cache_dtype = (resolve_ssm_cache_dtype(config)
-                                 or resolve_hf_torch_dtype(config)
-                                 or torch.bfloat16)
-    if is_kimi_linear(config) and mamba_ssm_cache_dtype != torch.float32:
-        # The KDA delta-rule recurrent state must be kept in fp32 for
-        # numerical parity with the HF reference (fla chunk/fused_recurrent
-        # KDA kernels carry the state in fp32).
-        logger.info(
-            f"Kimi K3: overriding mamba_ssm_cache_dtype "
-            f"{mamba_ssm_cache_dtype} -> torch.float32 (KDA recurrent state "
-            "must be fp32)")
-        mamba_ssm_cache_dtype = torch.float32
+        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
+            config, torch.bfloat16)
+    validate_kimi_kda_state_dtype(config, mamba_ssm_cache_dtype)
 
     return MambaKVCacheParams(
         state_size=state_size,
