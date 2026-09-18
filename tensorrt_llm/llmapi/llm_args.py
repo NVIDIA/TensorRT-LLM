@@ -5802,6 +5802,12 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Enable iteration performance statistics.",
         status="prototype")
 
+    enable_tokenization_cache: bool = Field(
+        default=False,
+        description=
+        "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
+        status="prototype")
+
     enable_iter_req_stats: bool = Field(
         default=False,
         description=

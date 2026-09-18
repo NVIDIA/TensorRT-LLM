@@ -2030,6 +2030,7 @@ class _TorchLLM(BaseLLM):
             self.tokenizer,
             checkpoint_format,
             trust_remote_code=self.args.trust_remote_code,
+            enable_tokenization_cache=self.args.enable_tokenization_cache,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 

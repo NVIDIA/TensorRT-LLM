@@ -389,6 +389,13 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_tokenization_cache"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "encode_only"
     },
     {

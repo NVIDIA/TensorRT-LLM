@@ -14,10 +14,10 @@ from there, and accepts the splice only if the first ``resync`` re-tokenized ids
 equal the cached ids over the same span. Otherwise the prompt is tokenized in
 full.
 
-Off by default; enable with ``TLLM_PREFIX_TOKEN_CACHE=1``. Each
-``DefaultInputProcessor`` owns its own cache, so cached ids are never shared
-across tokenizers. Environment variables, eligibility rules, and measured
-effect are documented in ``docs/source/deployment-guide/prefix-tokenization-cache.md``.
+Off by default; enable with the ``enable_tokenization_cache`` LLM argument.
+Each ``DefaultInputProcessor`` owns its own cache, so cached ids are never
+shared across tokenizers. Sizing knobs, eligibility rules, and measured effect
+are documented in ``docs/source/deployment-guide/prefix-tokenization-cache.md``.
 """
 
 from __future__ import annotations
@@ -35,10 +35,8 @@ __all__ = [
     "PrefixTokenCache",
     "PrefixTokenCacheConfig",
     "create_prefix_token_cache",
-    "prefix_cache_enabled",
 ]
 
-ENABLE_ENV_VAR = "TLLM_PREFIX_TOKEN_CACHE"
 # Log the hit rate every this many cache-eligible requests, so an operator can
 # see whether the cache is doing anything without reading its counters.
 LOG_EVERY_REQUESTS = 1000
@@ -50,10 +48,6 @@ LOG_EVERY_REQUESTS = 1000
 # text has that probe at the same position. The probe must be longer than any
 # suffix the chat template appends after the last message.
 PROBE_CHARS = 256
-
-
-def prefix_cache_enabled() -> bool:
-    return os.environ.get(ENABLE_ENV_VAR, "0") == "1"
 
 
 class OffsetTokenizer(Protocol):
@@ -278,17 +272,18 @@ class PrefixTokenCache:
 
 
 def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
-    """Return a cache for ``tokenizer`` if the feature is enabled and usable.
+    """Return a cache for ``tokenizer`` if the tokenizer can support one.
 
-    Returns None when the feature is off or the tokenizer cannot report
-    offsets. Raises ``ValueError`` for a malformed env override.
+    Returns None when there is no tokenizer or it cannot report offsets.
+    Raises ``ValueError`` for a malformed env override.
     """
-    if not prefix_cache_enabled() or tokenizer is None:
+    if tokenizer is None:
         return None
     if not getattr(tokenizer, "is_fast", False):
         logger.warning(
-            f"{ENABLE_ENV_VAR} is set but the tokenizer is not a fast tokenizer, "
-            "which the prefix token cache needs for offset mappings; disabling it."
+            "enable_tokenization_cache is set but the tokenizer is not a fast "
+            "tokenizer, which the prefix token cache needs for offset mappings; "
+            "disabling it."
         )
         return None
     config = PrefixTokenCacheConfig.from_env()

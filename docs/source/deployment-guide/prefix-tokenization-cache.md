@@ -21,15 +21,25 @@ The output is always identical to tokenizing the whole prompt.
 
 ## Enabling the cache
 
-The cache is **off by default**. Enable it with:
+The cache is **off by default**. Enable it with the `enable_tokenization_cache`
+LLM argument, either in the `trtllm-serve` configuration file:
 
-```bash
-export TLLM_PREFIX_TOKEN_CACHE=1
+```yaml
+enable_tokenization_cache: true
 ```
+
+or from Python:
+
+```python
+from tensorrt_llm import LLM
+
+llm = LLM(model="zai-org/GLM-5.2", enable_tokenization_cache=True)
+```
+
+The cache size can be tuned with environment variables:
 
 | Environment variable | Default | Behavior |
 |---|---:|---|
-| `TLLM_PREFIX_TOKEN_CACHE` | unset | Set to exactly `1` to enable the cache. Any other value leaves it disabled. |
 | `TLLM_PREFIX_TOKEN_CACHE_ENTRIES` | 512 | Maximum number of cached prompts. Eviction is least-recently-used. |
 | `TLLM_PREFIX_TOKEN_CACHE_MAX_CHARS` | 67108864 | Maximum total characters of cached prompt text. Cached ids are stored as int32, about one byte per character of English text, so this bounds host memory to roughly twice this many bytes. |
 | `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` | 4096 | Prompts shorter than this are tokenized normally and never cached. |
@@ -65,8 +75,7 @@ feature you turned on.
 ## Measured effect
 
 An A/B on GLM-5.2 (GB300, disaggregated, matched pair, 3600 s, ~29.6k requests
-per arm, 0.34% error rate in both, identical configuration except the
-environment variable):
+per arm, identical configuration except `enable_tokenization_cache`):
 
 | Metric | OFF | ON | Delta |
 |---|---:|---:|---:|

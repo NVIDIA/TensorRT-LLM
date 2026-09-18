@@ -161,13 +161,15 @@ class DefaultInputProcessor(InputProcessor):
                  model_path,
                  config,
                  tokenizer,
-                 trust_remote_code: bool = True) -> None:
+                 trust_remote_code: bool = True,
+                 enable_tokenization_cache: bool = False) -> None:
         self.tokenizer = tokenizer
         self.config = config
         self.model_path = model_path
         self.multimodal_hashing_supported = None
-        # Opt-in via TLLM_PREFIX_TOKEN_CACHE=1; None when disabled.
-        self._prefix_token_cache = create_prefix_token_cache(tokenizer)
+        # None when disabled or the tokenizer cannot support the cache.
+        self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
+                                    if enable_tokenization_cache else None)
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -1113,6 +1115,7 @@ def create_input_processor(
     tokenizer,
     checkpoint_format: Optional[str] = "HF",
     trust_remote_code: bool = True,
+    enable_tokenization_cache: bool = False,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -1124,6 +1127,9 @@ def create_input_processor(
             config loading; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
+        enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
+            the tokenization of recent prompts. Ignored for model-specific
+            (multimodal) input processors.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -1184,7 +1190,11 @@ def create_input_processor(
                                            trust_remote_code=trust_remote_code,
                                            **kwargs)
 
-    return DefaultInputProcessor(None, None, tokenizer)
+    return DefaultInputProcessor(
+        None,
+        None,
+        tokenizer,
+        enable_tokenization_cache=enable_tokenization_cache)
 
 
 def _mm_data_to_counts(mm_data: Dict[str, Any]) -> Dict[str, int]:

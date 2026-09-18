@@ -207,6 +207,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      enable_tokenization_cache:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_req_stats:
         annotation: bool
         default: False
