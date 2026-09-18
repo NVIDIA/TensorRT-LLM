@@ -23,6 +23,7 @@ from utils.util import check_accuracy
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, TunableRunner
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+    SITU_BETA_DISABLED,
     GroupedGemmInputsHelper,
     _get_sm107_nvfp4_default_mma_config,
 )
@@ -2875,12 +2876,16 @@ def _assert_rubin_moe_op_schema(
                 "scaling_vector_size",
                 "partition_id",
                 "activation_type",
+                "situ_beta",
+                "situ_linear_beta",
                 "precomputed_tactic",
             ),
             {
                 "scaling_vector_size": 16,
                 "partition_id": -1,
                 "activation_type": int(ActivationType.Swiglu),
+                "situ_beta": SITU_BETA_DISABLED,
+                "situ_linear_beta": SITU_BETA_DISABLED,
                 "precomputed_tactic": None,
             },
             {"output_tensor", "output_sf_tensor"},
@@ -3147,10 +3152,14 @@ def test_rubin_bf16_moe_precomputed_tactic_fake_signatures():
                 "output_sf_tensor",
                 "scaling_vector_size",
                 "activation_type",
+                "situ_beta",
+                "situ_linear_beta",
             ),
             {
                 "scaling_vector_size": 16,
                 "activation_type": int(ActivationType.Swiglu),
+                "situ_beta": SITU_BETA_DISABLED,
+                "situ_linear_beta": SITU_BETA_DISABLED,
             },
             {"output_tensor", "output_sf_tensor"},
             id="nvfp4_fc1",
@@ -3604,7 +3613,12 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
     runner_args, runner_kwargs = runner_instances[0].init_call
     if quantized and is_fc1:
         assert runner_args == (1, 1, 1, 0, 128, 16)
-        assert runner_kwargs == {"activation_type": ActivationType.Swiglu}
+        # The disabled sentinel canonicalizes to None before the runner sees it.
+        assert runner_kwargs == {
+            "activation_type": ActivationType.Swiglu,
+            "situ_beta": None,
+            "situ_linear_beta": None,
+        }
     elif quantized:
         assert runner_args == (1, 1, 1, 0, 128, torch.bfloat16, 16)
         assert not runner_kwargs
