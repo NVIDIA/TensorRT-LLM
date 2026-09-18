@@ -15,11 +15,10 @@
 """DFlash hidden-state capture when the tap dtype is wider than the buffer.
 
 The capture buffer is allocated in the target's ``torch_dtype``, but a model
-may tap a stream that is wider (an FP32 residual, say), and folding
-``residual`` inside the capture call can promote the result as well. The write
-used ``Tensor.copy_``, which converts silently; #18553 replaced it with
-``inplace_slice_copy``, which requires dest and src to share a dtype and raises
-otherwise, so a wider tap started aborting in the first forward.
+may tap a wider stream (an FP32 residual, say), and folding ``residual`` inside
+the capture call can promote the result as well. The capture converts the tap
+to the buffer dtype so the write is well-defined and the drafter keeps seeing
+buffer-dtype-rounded values.
 
 These tests require CUDA: ``DFlashSpecMetadata`` allocates the capture buffer
 on ``cuda`` and ``inplace_slice_copy`` is a CUDA-only custom op.
@@ -68,9 +67,8 @@ def test_capture_converts_wider_tap_to_buffer_dtype():
     captured = md.get_hidden_states(MAX_TOKENS)
     assert captured.dtype == torch.bfloat16
     assert captured.shape == (MAX_TOKENS, 2 * HIDDEN_SIZE)
-    # Bitwise, not approximate: the conversion must match what Tensor.copy_
-    # into the bf16 buffer produced before #18553, because the drafter has
-    # always consumed values rounded to the buffer dtype.
+    # Bitwise, not approximate: the drafter consumes buffer-dtype-rounded
+    # values, so the capture must store exactly the bf16-rounded tap.
     assert torch.equal(captured[:, :HIDDEN_SIZE], h1.to(torch.bfloat16))
     assert torch.equal(captured[:, HIDDEN_SIZE:], h3.to(torch.bfloat16))
 

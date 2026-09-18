@@ -99,10 +99,8 @@ class DFlashSpecMetadata(SpecMetadata):
 
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
-        # Keeps the capture-dtype notice to one line per metadata object rather
-        # than one per layer per forward. create_cuda_graph_metadata() re-runs
-        # __post_init__ on its shallow copy, so expect one line per graph
-        # bucket as well.
+        # Log the capture-dtype notice once per metadata object, not once per
+        # layer per forward.
         self._warned_capture_dtype = False
 
         # Set up hidden state capture buffer
@@ -189,16 +187,11 @@ class DFlashSpecMetadata(SpecMetadata):
         already-mixed aggregated stream value and passes ``residual=None``
         (see the DSpark tap in ``modeling_kimi_linear.py``).
 
-        The tapped dtype is model-specific too. The buffer is allocated in the
-        target's ``torch_dtype``, but a model may tap a stream that is wider --
-        an FP32 residual folded into a bf16 buffer, for instance -- and folding
-        ``residual`` here can promote the result for other callers too.
-        ``Tensor.copy_`` converted silently, so this was invisible until #18553
-        replaced it with ``inplace_slice_copy``, which requires matching dtypes
-        and raises during the first forward. Converting to the buffer's dtype
-        restores the previous behaviour exactly, which matters beyond the crash:
-        the drafter has always consumed values rounded to the buffer dtype, so
-        capturing anything wider would silently move acceptance length.
+        The buffer is allocated in the target's ``torch_dtype``; a model may
+        tap a wider stream (e.g. an FP32 residual folded into a bf16 buffer),
+        so convert to the buffer dtype on capture. The drafter consumes
+        buffer-dtype-rounded values, so capturing anything wider would shift
+        acceptance length.
         """
         if self.captured_hidden_states is None:
             return
