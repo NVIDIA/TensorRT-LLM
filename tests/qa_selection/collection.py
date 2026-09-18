@@ -17,9 +17,9 @@
     SelectionOptions.add_to(parser) -> SelectionRequest.of(config)
                                     -> Selection.of(request, items)
 
-The options, the markers, the adapter from a pytest item to `selector.py`'s
+The options, the markers, the adapter from a pytest item to `core.selector`'s
 `CollectedTest`, and the decisions one run produced. `plugin.py` holds the
-hooks; the modules below this one import no pytest.
+hooks; `core/` holds the decisions and imports no pytest.
 """
 
 from dataclasses import dataclass
@@ -27,9 +27,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
-from .allocation import Assignment, Ladder
-from .machines import MachineProfile, ProfileConfigError, default_catalog
-from .selector import CollectedTest, Mark, Selector
+from .core.allocation import Assignment, Ladder
+from .core.machines import MachineProfile, ProfileConfigError, default_catalog
+from .core.selector import CollectedTest, Mark, Selector
 
 
 class ResourceMarkers:

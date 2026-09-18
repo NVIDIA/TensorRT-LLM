@@ -1662,7 +1662,7 @@ repos:
         name: Check QA selection rules cover the integration skip decorators
         entry: python scripts/check_qa_selection_rules.py
         language: python
-        files: ^(tests/integration/defs/.*\.py|tests/qa_selection/rules\.(py|json)|scripts/check_qa_selection_rules\.py)$
+        files: ^(tests/integration/defs/.*\.py|tests/qa_selection/core/rules\.(py|json)|scripts/check_qa_selection_rules\.py)$
         pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
