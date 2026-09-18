@@ -101,16 +101,6 @@ reviews:
           Example: the target changes a function's return units while this PR
           adds a caller expecting the old units in another file.
 
-          Inspect unit tests, fixtures, mocks, and test doubles added or changed
-          on either branch against the combined production code. Trace their
-          exercised callers and callees; verify accepted positional/keyword
-          arguments, required object attributes, and return-value contracts.
-          Check both directions: target changes can invalidate PR tests, and
-          PR changes can invalidate target tests. Report each independently
-          supported incompatibility; do not stop after the first finding.
-          A newly broken test is a semantic conflict even if production
-          workloads remain usable; do not dismiss test-double mismatches.
-
           Fail only for a concrete incompatibility between the PR changes and
           the target code. Cite both relevant code locations, the violated
           contract, a triggering scenario, confidence, and a minimal regression
@@ -118,10 +108,6 @@ reviews:
           Do not execute repository code or claim tests were run.
           Pass only if the required context was inspected and no supported
           conflict was found; this is not proof of semantic compatibility.
-          For every verdict, describe both production and test-contract
-          findings with inspected file/line evidence. For PASS, explain why
-          the affected contracts remain compatible, or why a category does
-          not apply. Missing evidence must be Inconclusive, never a bare PASS.
           Analyze the requested historical pair even if live refs advance.
           State that the result applies only to the reported SHA pair and must
           be rerun after either branch changes.
