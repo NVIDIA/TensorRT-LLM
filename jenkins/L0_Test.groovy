@@ -5784,11 +5784,17 @@ def runLLMBuild(
     def uploadedWheelPath = "${builtWheelUploadPath}${wheelName}"
     def wheelPath = uploadedWheelPath
     if (is_dlfw) {
-        // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
-        def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
+        // NVIDIA_PYTORCH_VERSION ships with the NGC PyTorch image itself, which
+        // makes it the ground truth for the NGC release version. Example value: 26.08
+        def ngcReleaseVersion = sh(
+            returnStdout: true,
+            script: 'echo $NVIDIA_PYTORCH_VERSION'
+        ).trim()
+        def matcher = ngcReleaseVersion =~ /^(\d+)\.(\d+)$/
         if (!matcher.find()) {
-            error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
+            error "Failed to extract NGC Release version from NVIDIA_PYTORCH_VERSION: '${ngcReleaseVersion}'"
         }
+        echo "NGC Release version: ${ngcReleaseVersion}"
         def dlfwLocalVersion =
             "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
         def localWheelPath = sh(
