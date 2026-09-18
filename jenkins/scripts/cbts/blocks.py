@@ -55,10 +55,13 @@ class Block:
     tests: list[str]
 
 
-# Strip trailing ` SKIP ...` / ` TIMEOUT ...` annotations from a test id.
-# YAML entries can carry `TIMEOUT (n)`, waives.txt entries can carry both;
-# the lookup must hit either form so we normalize on both sides.
-_TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT)\b.*$")
+# Strip trailing ` SKIP ...` / ` TIMEOUT ...` / ` ISOLATION` annotations from a
+# test id. YAML entries can carry `TIMEOUT (n)` and/or `ISOLATION` (see
+# jenkins/scripts/cbts/README.md), waives.txt entries can carry SKIP/TIMEOUT;
+# the lookup must hit either form so we normalize on both sides. `ISOLATION`
+# has no trailing argument of its own, but `\b.*$` still swallows anything
+# after it (e.g. a later `-k "..."`), matching how SKIP/TIMEOUT are handled.
+_TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT|ISOLATION)\b.*$")
 
 # Strip leading `full:<gpu>/` platform prefix used in waives.txt.
 _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
@@ -67,9 +70,10 @@ _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
 def normalize_test_id(test_id: str) -> str:
     """Canonical form for cross-referencing test-db YAML and waives.txt.
 
-    Strips trailing `SKIP`/`TIMEOUT` annotations, trailing `# comment`, and
-    leading `full:<gpu>/` prefix. `YAMLIndex` indexes both the raw and the
-    normalized form; `rules.waives_rule` looks up by this normalization.
+    Strips trailing `SKIP`/`TIMEOUT`/`ISOLATION` annotations, trailing
+    `# comment`, and leading `full:<gpu>/` prefix. `YAMLIndex` indexes both
+    the raw and the normalized form; `rules.waives_rule` looks up by this
+    normalization.
     """
     s = test_id.strip()
     s = _TEST_ID_SUFFIX_RE.sub("", s).strip()
@@ -177,7 +181,8 @@ def _normalize_target_path(target: str) -> str:
 def _entry_target(entry: str) -> str:
     """Canonical "target" key for indexing/lookup.
 
-    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m), and `[params]` suffix.
+    Strips SKIP/TIMEOUT/ISOLATION/full:gpu, pytest options (-k/-m), and
+    `[params]` suffix.
 
     `file.py::TestC::test_m[a-b] TIMEOUT (90)` → `file.py::TestC::test_m`
     `file.py -k "kw"`                          → `file.py`
