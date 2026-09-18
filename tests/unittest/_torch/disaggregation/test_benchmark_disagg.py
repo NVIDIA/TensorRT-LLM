@@ -1380,8 +1380,8 @@ class TestFailFastDuringBenchmarkFill:
         ex.dist.tp_size = tp_size
         ex.dist.cp_size = cp_size
         ex.dist.world_size = tp_size * cp_size
-        all_rank_status = [(True, False)] * (tp_size * cp_size)
-        all_rank_status[-1] = (True, True)
+        all_rank_status = [(True, True, False)] * (tp_size * cp_size)
+        all_rank_status[-1] = (True, True, True)
         gather = getattr(ex.dist, gather_name)
         gather.return_value = all_rank_status
         ex.disagg.admit = Mock(return_value=([], True))
@@ -1389,7 +1389,7 @@ class TestFailFastDuringBenchmarkFill:
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is None
-        gather.assert_called_once_with((True, False))
+        gather.assert_called_once_with((True, True, False))
         if gather_name == "tp_cp_allgather":
             ex.dist.tp_allgather.assert_not_called()
         ex._handle_errors.assert_called_once()
@@ -1403,15 +1403,15 @@ class TestFailFastDuringBenchmarkFill:
         ex.dist.tp_size = 2
         ex.dist.world_size = 2
         ex.dist.tp_allgather.return_value = [
-            (True, False),
-            (True, False),
+            (True, True, False),
+            (True, True, False),
         ]
         ex.disagg.admit = Mock(return_value=([], True))
 
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        ex.dist.tp_allgather.assert_called_once_with((True, False))
+        ex.dist.tp_allgather.assert_called_once_with((True, True, False))
         ex._handle_errors.assert_not_called()
 
     def test_model_parallel_waits_until_all_ranks_have_fetched(self):
@@ -1420,14 +1420,14 @@ class TestFailFastDuringBenchmarkFill:
         ex.dist.tp_size = 2
         ex.dist.world_size = 2
         ex.dist.tp_allgather.return_value = [
-            (True, True),
-            (False, False),
+            (True, True, True),
+            (True, False, False),
         ]
 
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        ex.dist.tp_allgather.assert_called_once_with((True, True))
+        ex.dist.tp_allgather.assert_called_once_with((True, True, True))
         ex._handle_errors.assert_not_called()
 
     def test_mid_fetch_does_not_kill(self):
@@ -1441,18 +1441,38 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
-    def test_post_fill_skips_fail_fast_vote(self):
-        """Decode iterations must not pay for the fill-only collective."""
+    def test_post_fill_rank_still_votes(self):
+        """A post-fill rank must not skip the gather its peers may enter.
+
+        ``_benchmark_fill_phase_active`` is rank-local. Returning early on it
+        leaves a still-filling peer inside the collective, which desynchronises
+        the shared host communicator (nvbug 17095).
+        """
         ex = self._make_executor(fill_phase_active=False)
         ex.enable_attention_dp = True
         ex.dist.tp_size = 2
         ex.dist.world_size = 2
+        ex.dist.tp_allgather.return_value = [(False, True, True)] * 2
 
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        ex.dist.tp_allgather.assert_not_called()
+        ex.dist.tp_allgather.assert_called_once_with((False, True, True))
         ex._handle_errors.assert_not_called()
+
+    def test_filling_rank_votes_with_a_post_fill_peer(self):
+        """A peer that cleared its flag must not suppress this rank's vote."""
+        ex = self._make_executor(fill_phase_active=True)
+        ex.enable_attention_dp = True
+        ex.dist.tp_size = 2
+        ex.dist.world_size = 2
+        ex.dist.tp_allgather.return_value = [(False, True, True), (True, True, True)]
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is None
+        ex.dist.tp_allgather.assert_called_once_with((True, True, True))
+        ex._handle_errors.assert_called_once()
 
     @pytest.mark.parametrize(
         "fill_active, is_warmup, expected_alive",
@@ -1588,7 +1608,8 @@ class TestFillPhaseEndToEnd:
         # Phase 2b: Healthy fill keeps making progress, so fail-fast must not
         # fire even though some active requests remain in INIT.
         ex._schedule = Mock(return_value=(ScheduledRequests(), [init_reqs[0]], 0))
-        ex.dist.tp_allgather = Mock(return_value=[(True, False), (True, False)])
+        ex.dist.tp_allgather = Mock(
+            return_value=[(True, True, False), (True, True, False)])
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None, (
             "Fail-fast must not kill requests while the scheduler can still fit INIT requests"
@@ -1607,12 +1628,14 @@ class TestFillPhaseEndToEnd:
         # Phase 4: Gate opens, fill phase clears
         ex._benchmark_fill_phase_active = False
 
-        # Phase 5: Decode iterations do not re-enter the fill-only vote.
+        # Phase 5: Post-fill iterations still vote; the voted flag suppresses
+        # the fail-fast instead of a rank-local early return.
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
         ex.active_requests = ready_reqs
-        ex.dist.tp_allgather = Mock()
+        ex.dist.tp_allgather = Mock(
+            return_value=[(False, True, False)] * self.TP_SIZE)
 
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None
-        ex.dist.tp_allgather.assert_not_called()
+        ex.dist.tp_allgather.assert_called_once_with((False, True, False))
         ex._handle_errors.assert_not_called()
