@@ -2203,7 +2203,8 @@ class SpecWorkerBase(nn.Module, ABC):
         routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
         extra host-side state. Shapes are static: CUDA-graph safe. No-op while
         ``dummy_slot_row`` is still 0, which is a live request's row rather than
-        a padding marker.
+        a padding marker; ``prepare_rejection_sampling_buffers`` and
+        ``prepare_penalty_buffers`` are the two places that publish it.
 
         Args:
             logits: ``[(batch_size - num_contexts) * rows_per_request, vocab]``;
