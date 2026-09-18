@@ -28,6 +28,7 @@ import torch
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
@@ -112,6 +113,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
     ) -> None:
+        proxy_start = time.perf_counter()
+        logger.info(f"[startup][pid={os.getpid()}] executor_proxy: start")
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
         super().__init__(
@@ -128,20 +131,22 @@ class GenerationExecutorProxy(GenerationExecutor):
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         self._owns_mpi_session = mpi_session is None
 
-        if mpi_session is None:
-            if mpi_process_pre_spawned:
-                logger_debug('create comm session ...\n', "yellow")
-                self.mpi_session = create_mpi_comm_session(model_world_size)
+        with _StartupTimer("mpi_session_setup"):
+            if mpi_session is None:
+                if mpi_process_pre_spawned:
+                    logger_debug('create comm session ...\n', "yellow")
+                    self.mpi_session = create_mpi_comm_session(model_world_size)
+                else:
+                    logger_debug('create pool session ...\n', "yellow")
+                    self.mpi_session = MpiPoolSession(
+                        n_workers=model_world_size)
             else:
-                logger_debug('create pool session ...\n', "yellow")
-                self.mpi_session = MpiPoolSession(n_workers=model_world_size)
-        else:
-            # submit() launches one worker task per pool worker, so an
-            # external session must match the model's world size exactly;
-            # fail loudly instead of starting the wrong number of executors.
-            validate_session_world_size(mpi_session, model_world_size)
-            logger_debug('using external mpi session ...\n', "yellow")
-            self.mpi_session = mpi_session
+                # submit() launches one worker task per pool worker, so an
+                # external session must match the model's world size exactly;
+                # fail loudly instead of starting the wrong number of executors.
+                validate_session_world_size(mpi_session, model_world_size)
+                logger_debug('using external mpi session ...\n', "yellow")
+                self.mpi_session = mpi_session
 
         if isinstance(self.mpi_session,
                       (MpiCommSession, RemoteMpiCommSessionClient)):
@@ -203,7 +208,14 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.rpc_client: Optional[RPCClient] = None
         self._worker_process_monitor = WorkerProcessMonitor()
+        logger.info(
+            f"[startup][pid={os.getpid()}] executor_proxy/pre_worker_setup: "
+            f"done in {time.perf_counter() - proxy_start:.3f}s (includes mpi_session_setup)"
+        )
         self._start_executor_workers(worker_kwargs)
+        logger.info(
+            f"[startup][pid={os.getpid()}] executor_proxy/workers_ready: "
+            f"elapsed={time.perf_counter() - proxy_start:.3f}s")
 
         # Create RPC client after workers are started (worker starts RPC server)
         self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
@@ -899,25 +911,32 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.WORKER_PROCESS_IDENTITIES_SIGNAL
             if self._can_monitor_worker_processes() else None)
 
-        self.mpi_futures = self.mpi_session.submit(
-            worker_main,
-            **mpi_worker_kwargs,
-            worker_cls=self.worker_cls,
-            tracer_init_kwargs=tracer_init_kwargs,
-            _torch_external_model_modules=export_external_model_modules(),
-            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
-            worker_process_identities_signal=worker_process_identities_signal,
-        )
+        with _StartupTimer("worker_submit_to_ready") as startup_timer:
+            with startup_timer.phase("worker_submit"):
+                self.mpi_futures = self.mpi_session.submit(
+                    worker_main,
+                    **mpi_worker_kwargs,
+                    worker_cls=self.worker_cls,
+                    tracer_init_kwargs=tracer_init_kwargs,
+                    _torch_external_model_modules=export_external_model_modules(
+                    ),
+                    ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+                    worker_process_identities_signal=
+                    worker_process_identities_signal,
+                )
 
-        self.workers_started = True
+            self.workers_started = True
 
-        status = self._wait_for_executor_workers_ready()
+            with startup_timer.phase("worker_initialization_wait"):
+                status = self._wait_for_executor_workers_ready()
 
-        ready_signal, error_trace = status[:2]
-        if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
-            logger.error(f"Executor worker initialization error: {error_trace}")
-            self._fail_initialization(
-                RuntimeError("Executor worker returned error"), ready_signal)
+            ready_signal, error_trace = status[:2]
+            if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
+                logger.error(
+                    f"Executor worker initialization error: {error_trace}")
+                self._fail_initialization(
+                    RuntimeError("Executor worker returned error"),
+                    ready_signal)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
