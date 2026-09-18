@@ -25,6 +25,9 @@ l0_cpu:
   - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
+  # Real (no-GPU) apt install of ffmpeg via the VisualGen helper, verifying the
+  # bounded/retried command actually makes the ffmpeg CLI available.
+  - examples/visual_gen/test_media_deps_install.py::test_install_ffmpeg_via_apt_installs_ffmpeg
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
