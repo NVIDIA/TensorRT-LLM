@@ -190,7 +190,10 @@ class CudaStream
 public:
     CudaStream()
     {
-        TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&mStream, cudaStreamNonBlocking));
+        // A blocking stream: the fixtures upload inputs with pageable cudaMemcpy and fill canaries with
+        // cudaMemset, both of which run on the legacy stream and may still be in flight when the copy
+        // call returns. A non-blocking stream would let the kernels read the slot before the DMA lands.
+        TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&mStream, cudaStreamDefault));
     }
 
     ~CudaStream()
