@@ -35,6 +35,9 @@ class TimeBreakdownMetrics(TypedDict):
     ctx_chunk_metrics: NotRequired[List[StepMetrics]]
     ctx_gpu_forward_time: NotRequired[float]
     ctx_gpu_sample_time: NotRequired[float]
+    # py_decoding_iter of step_metrics[0]; entry i is step_iter_base + i. Sent
+    # once per request instead of a per-entry "iter" field.
+    step_iter_base: NotRequired[int]
 
 
 class TimingMetrics(TypedDict):
