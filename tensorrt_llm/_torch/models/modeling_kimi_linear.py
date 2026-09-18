@@ -18,10 +18,10 @@ TRT-LLM PyTorch-backend flow (``LLM(model=<ckpt>) -> generate``):
 
 Caching
 -------
-KDA states live on the mamba side of a ``MixedMambaHybridCacheManager``
+KDA states live on the mamba side of a ``MambaHybridCacheManagerV2``
 (wired in ``pyexecutor/_util.py``): per layer, a short-conv slot of
-``[3 * num_heads * head_dim, W]`` bf16 (the full FLA ``ShortConvolution``
-cache window, sections ``[q | k | v]``) and a delta-rule recurrent slot of
+``[3 * num_heads * head_dim, W - 1]`` bf16 (the convolution history,
+sections ``[q | k | v]``) and a delta-rule recurrent slot of
 ``[num_heads, head_dim, head_dim]`` fp32 (``[H, V, K]``, the
 ``state_v_first`` FLA layout). MLA layers use the paged-KV side with
 ``num_kv_heads=1`` and ``head_dim = kv_lora_rank + qk_rope_head_dim`` (576),
@@ -67,14 +67,12 @@ Chunked prefill is supported: continuation chunks feed the previous KDA
 conv/recurrent state back into the FLA kernels (``use_initial_states``)
 and the MLA prefill path natively attends over the cached latent prefix
 (``kv_len = cached + q_len``). KV-cache block reuse is supported as an
-opt-in via ``kv_cache_config.enable_block_reuse=true``, which routes to
-the unified-pool ``CppMambaHybridCacheManager`` (per-block KDA state
-snapshots every ``mamba_state_cache_interval`` tokens, FORCE_CHUNK
-context chunking).
+opt-in via ``kv_cache_config.enable_block_reuse=true``; the hybrid manager
+tracks recurrent-state snapshots alongside the MLA cache blocks.
 
 Not supported: pipeline parallelism, draft-head spec-dec modes
 (MTP/Eagle — no draft-head checkpoint exists). SA speculative decoding
-is validated only without block reuse (Mixed cache manager).
+is validated only without block reuse.
 """
 
 from __future__ import annotations
@@ -2102,10 +2100,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
-        # - enable_block_reuse defaults off: reuse is supported as an
-        #   explicit opt-in (routes to CppMambaHybridCacheManager with
-        #   per-block KDA state snapshots); the default stays on the
-        #   Mixed manager, which SA speculative decoding requires.
+        # - enable_block_reuse defaults off: keep reuse an explicit opt-in.
+        #   V2 manages both KDA state and the paged MLA cache, including
+        #   speculative-decoding state.
         # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
         #   rejects the MLA (576, 512) generation kernel (marked slower) and
         #   the fallback C++ path requires num_heads % 64 == 0, which K3's
@@ -2116,6 +2113,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "tokens_per_block": 64,
             }
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(

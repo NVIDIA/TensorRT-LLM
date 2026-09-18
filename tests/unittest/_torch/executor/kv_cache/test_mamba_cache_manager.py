@@ -68,6 +68,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MambaStateConfig,
     MTPDecodingConfig,
+    SADecodingConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.llm_utils import (
@@ -844,10 +845,15 @@ def test_qwen3_gdn_replay_uses_v2_preference(
     )
 
 
-def test_kimi_without_v2_preference_uses_mixed_manager(
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("manager_setting", ["auto", True, False])
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_kimi_model_preference_selects_cache_manager(
     monkeypatch: pytest.MonkeyPatch,
+    manager_setting: str | bool,
+    is_disagg: bool,
 ) -> None:
-    """Kimi K3 uses separate KV and recurrent-state pools for SA decoding."""
+    """Resolve the registered text model before selecting its hybrid manager."""
     from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
@@ -856,19 +862,31 @@ def test_kimi_without_v2_preference_uses_mixed_manager(
     llm_args = TorchLlmArgs(
         model="/tmp/dummy_model",
         kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=manager_setting,
             enable_block_reuse=False,
             tokens_per_block=64,
         ),
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL") if is_disagg else None,
     )
+    _resolve_transceiver_runtime_auto(llm_args, KimiLinearForCausalLM)
     resolved = _resolve_kv_cache_manager_v2_auto(llm_args, KimiLinearForCausalLM)
 
-    assert resolved is False
-    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+    expected_v2 = manager_setting is not False
+    assert resolved is expected_v2
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected_v2
     assert llm_args.kv_cache_config.enable_block_reuse is False
     assert llm_args.kv_cache_config.tokens_per_block == 64
+    if is_disagg:
+        assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+    expected_manager = MambaHybridCacheManagerV2 if expected_v2 else MixedMambaHybridCacheManager
     assert (
-        get_kv_cache_manager_cls(_kimi_model_config(), llm_args.kv_cache_config)
-        is MixedMambaHybridCacheManager
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            llm_args.kv_cache_config,
+            is_disagg=is_disagg,
+            cache_transceiver_config=llm_args.cache_transceiver_config,
+        )
+        is expected_manager
     )
 
 
@@ -878,6 +896,73 @@ def test_kimi_preferred_transceiver_runtime() -> None:
     from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 
     assert KimiLinearForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("use_sa", [False, True])
+def test_kimi_auto_v2_allocates_kda_and_mla_cache(
+    monkeypatch: pytest.MonkeyPatch, use_sa: bool
+) -> None:
+    """Construct the resolved Kimi manager with real KDA and MLA storage."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(
+            max_tokens=1024,
+            enable_block_reuse=False,
+            tokens_per_block=64,
+        ),
+        speculative_config=SADecodingConfig(max_draft_len=2) if use_sa else None,
+    )
+    _resolve_kv_cache_manager_v2_auto(llm_args, KimiLinearForCausalLM)
+    model_config = _kimi_model_config()
+    manager_cls = get_kv_cache_manager_cls(model_config, llm_args.kv_cache_config)
+    manager = _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=manager_cls,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=llm_args.kv_cache_config,
+        tokens_per_block=64,
+        max_seq_len=256,
+        max_batch_size=4,
+        spec_config=llm_args.speculative_config,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+    try:
+        assert isinstance(manager, MambaHybridCacheManagerV2)
+        assert manager.kv_cache_type == CacheTypeCpp.SELFKONLY
+        assert manager.local_num_mamba_layers == 2
+        assert manager.blocks_in_primary_pool > 0
+        for layer_idx in (1, 3):
+            buffers = manager.get_buffers(layer_idx)
+            assert buffers.shape[1:] == (1, 64, 1, 40)
+            assert buffers.dtype is torch.bfloat16
+        assert manager.mamba_pp_layers == [0, 2]
+        for layer_idx in manager.mamba_pp_layers:
+            cache = manager.mamba_layer_cache(layer_idx)
+            assert cache.conv.shape[1:] == (96, 3)
+            assert cache.conv.dtype is torch.bfloat16
+            assert cache.temporal.shape[1:] == (4, 8, 8)
+            assert cache.temporal.dtype is torch.float32
+
+        manager.add_dummy_requests([123], token_nums=[8], is_gen=False)
+        indices = manager.get_state_indices([123], [False])
+        assert indices[0] >= 0
+        assert manager.cuda_state_indices[0].item() == indices[0]
+        if use_sa:
+            cache = manager.mamba_layer_cache(0)
+            assert cache.kda_qkg_cache is not None or cache.intermediate_ssm is not None
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.parametrize(

@@ -13,10 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+
 import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.configs import KimiK3Config, KimiLinearConfig
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
@@ -163,6 +167,82 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_less_device_memory(140000)
+    @pytest.mark.parametrize("mode", ["baseline", "sa"])
+    def test_text_only_gsm8k_tep16(
+        self, mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Validate the complete text model and automatic V2 selection.
+
+        For a multinode run, set pytest's --basetemp to a shared directory
+        mounted at the same path on every worker. The checkpoint overlay must
+        remain visible until all workers have finished loading the model.
+        """
+        source = Path(self.MODEL_PATH)
+        config = json.loads((source / "config.json").read_text())
+        config["language_model_only"] = True
+        checkpoint = tmp_path / "kimi-linear"
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text(json.dumps(config))
+        for entry in source.iterdir():
+            if entry.name != "config.json":
+                (checkpoint / entry.name).symlink_to(entry)
+
+        resolved = load_pretrained_config(str(checkpoint), trust_remote_code=True)
+        assert isinstance(resolved, KimiLinearConfig)
+        assert resolved.architectures == ["KimiLinearForCausalLM"]
+        model_class = get_registered_model_class(resolved.architectures[0])
+        assert model_class.get_preferred_kv_cache_manager_version(resolved) == "V2"
+        assert resolved.num_hidden_layers == 93
+        assert len(resolved.linear_attn_config["kda_layers"]) == 69
+        assert len(resolved.linear_attn_config["full_attn_layers"]) == 24
+
+        if mode == "sa":
+            monkeypatch.setenv("TLLM_EVAL_SPEC_STATS", "1")
+        batch_size = 8 if mode == "sa" else 32
+        with LLM(
+            str(checkpoint),
+            # Apply the reference precision on every MPI worker, including
+            # workers that were started before this test process.
+            env_overrides={"KIMI_K3_ROUTER_BF16": "0", "KIMI_K3_FP8_WEIGHT_READ": "0"},
+            tensor_parallel_size=16,
+            moe_expert_parallel_size=16,
+            enable_attention_dp=False,
+            allreduce_strategy="NCCL",
+            max_batch_size=batch_size,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            enable_chunked_prefill=mode == "baseline",
+            disable_overlap_scheduler=mode == "sa",
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=mode == "baseline", max_batch_size=batch_size
+            ),
+            moe_config=MoeConfig(
+                backend="TRTLLM",
+                max_num_tokens=33024,
+                use_low_precision_moe_combine=True,
+            ),
+            speculative_config=SADecodingConfig(max_draft_len=2) if mode == "sa" else None,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.25,
+                tokens_per_block=64,
+            ),
+            enable_iter_perf_stats=True,
+            max_stats_len=-1 if mode == "sa" else 256,
+            return_perf_metrics=True,
+        ) as llm:
+            self._assert_resolved_args(llm, mode, attention_dp=False)
+            # Resolution happens in the MPI workers; keep the frontend in
+            # auto mode so this exercises the registered model preference.
+            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 == "auto"
+            GSM8K(self.MODEL_NAME).evaluate(llm)
+            if mode == "sa":
+                assert_acceptance_length_for_llm("TestKimiK3::test_text_only_gsm8k_tep16[sa]", llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(16)
     @pytest.mark.skip_less_device_memory(200000)
     def test_gpqa_diamond_w4a16_mxfp4(self) -> None:
         """Run GPQA Diamond on the K3 checkpoint with DEP16."""
@@ -220,8 +300,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         assert getattr(config.text_config, "sliding_window", None) is None
 
     @staticmethod
-    def _assert_resolved_args(llm: LLM, mode: str) -> None:
-        assert llm.args.enable_attention_dp is True
+    def _assert_resolved_args(llm: LLM, mode: str, attention_dp: bool = True) -> None:
+        assert llm.args.enable_attention_dp is attention_dp
         assert llm.args.kv_cache_config.enable_block_reuse is (mode == "reuse")
         # K3's routed-expert quantization is nested in the composite checkpoint
         # and is not represented by the modelopt-style args quant_algo field.
