@@ -1278,6 +1278,11 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"
@@ -1554,11 +1559,6 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "speculative_config.eagle3_model_arch"
-    },
-    {
-      "capture_policy": "list[list[int]]|none",
-      "kind": "value",
-      "path": "speculative_config.eagle_choices"
     },
     {
       "capture_policy": "bool",
