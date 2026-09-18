@@ -32,7 +32,10 @@
 // APPLY_PROFILES (default on) re-BOLTs that tarball in the same run
 // ("consume immediately after generating"); PROMOTE (set by the postmerge launch,
 // opt-in elsewhere) publishes the packaged bundle to the branch-keyed Artifactory
-// path so premerge can pull `latest` (apply_latest.sh).
+// path so premerge can pull `latest` (apply_latest.sh). PUBLISH_BOLTED_TARBALL
+// pushes that re-BOLTed tarball back to the input artifactPath as
+// bolted-<tarball>, a SECOND object alongside the canonical one, so consumers of
+// the postmerge build that need optimized binaries have something to depend on.
 // =============================================================================
 
 import groovy.transform.Field
@@ -84,15 +87,24 @@ PROMOTE       = (params.promote ?: "false").toString()
 // bundle -> bolted tarball on the cluster ("consume immediately after generating").
 // The merge job (slurm_merge.sh) runs apply_bolt.py when BOLT_APPLY=1.
 APPLY_PROFILES = (params.applyProfiles ?: "true").toString()
-// publishBoltedCanonical: after merge (and, if applicable, promote), push the
-// just-BOLTed tarball back to the input artifactPath under the CANONICAL name so
-// downstream consumers of that build get BOLT transparently, preserving the
-// original as unbolted-<tarball>. Requires APPLY_PROFILES=true (the bolted tarball
-// is produced by the merge job's BOLT_APPLY=1 step) and PROMOTE=true (only the
-// postmerge producer repushes a canonical). Default OFF -- the rollout is flipped
-// on in a follow-up change -- so this is inert until then. Resolution mirrors the
-// other toggles: param, then env.
-PUBLISH_BOLTED_CANONICAL = (params.boltPublishCanonical ?: env.boltPublishCanonical ?: "false").toString() == "true"
+// publishBoltedTarball: after merge (and, if applicable, promote), push the
+// just-BOLTed tarball back to the input artifactPath as bolted-<tarball>.
+//
+// A DISTINCT object, never an overwrite of the canonical name. Overwriting is
+// what made the optimization unreliable: the canonical tarball exists from the
+// moment the build stage finishes, and Build-Docker-Images (which runs in
+// parallel with this branch) downloads it as soon as it appears -- hours before
+// this job could replace it -- so the image kept the unoptimized wheel forever
+// even when BOLT later succeeded. A separate name has no such window: it appears
+// atomically, only on success, so its existence IS proof that the optimized
+// build is what you are about to fetch. It also makes the input unambiguous --
+// canonical is always the un-BOLTed build, so a re-run cannot double-BOLT.
+//
+// Requires APPLY_PROFILES=true (the bolted tarball is produced by the merge job's
+// BOLT_APPLY=1 step) and PROMOTE=true (only the postmerge producer publishes).
+// Default OFF -- the rollout is flipped on in a follow-up change -- so this is
+// inert until then. Resolution mirrors the other toggles: param, then env.
+PUBLISH_BOLTED_TARBALL = (params.boltPublishBolted ?: env.boltPublishBolted ?: "false").toString() == "true"
 // Multiply each workload's client `iterations` (num_requests = concurrency *
 // iterations) to lengthen the measured serving window without editing the shared
 // perf-sanity configs. Default 64: the point where the aggregated workloads'
@@ -381,18 +393,12 @@ def submitProfileGen(pipeline)
                 return 0
             }
         '''.stripIndent()
-        // If a prior run against THIS artifactPath already published the BOLTed build
-        // as canonical, publishBoltedCanonical preserved the original as
-        // unbolted-<tarball>. Prefer it so we profile/BOLT the un-BOLTed input rather
-        // than double-BOLTing. Inert for a fresh artifactPath (no unbolted- object),
-        // where canonical IS the un-BOLTed build.
-        def unboltedTarUrl = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}/unbolted-${BOLT_TARNAME}"
+        // Always the canonical tarball: publishBoltedTarball writes the optimized
+        // build to a separate name and never touches this one, so canonical is the
+        // un-BOLTed input by construction -- on a fresh artifactPath and on a
+        // re-run alike. Nothing to disambiguate, and no way to double-BOLT.
         def tarStage = """
             URL='${llmTarfile}'
-            if curl -fsI '${unboltedTarUrl}' >/dev/null 2>&1; then
-                echo '[INFO] found unbolted-${BOLT_TARNAME}; using it as the un-BOLTed input (avoids double-BOLT on reuse)'
-                URL='${unboltedTarUrl}'
-            fi
             DEST='${ws}/builds/${BOLT_TARNAME}'
             PARTS=16
         """.stripIndent() + boltFetchLib + '''
@@ -528,24 +534,23 @@ def submitProfileGen(pipeline)
             pipeline.echo("PROMOTE=false: skipping Artifactory promote of ${bundle}")
         }
 
-        // Publish the freshly BOLTed build back to the input artifactPath under the
-        // CANONICAL name (unbolted-<tarball> preserved), so downstream consumers of
-        // that build get BOLT transparently. The merge job (APPLY_PROFILES=true)
-        // already produced ${outDir}/bolt-${BOLT_TARNAME} natively on the aarch64
-        // cluster node; without this it is reclaimed by the retention sweep below.
-        // Runs BEFORE that sweep. Coupled to PROMOTE so only the postmerge producer
-        // (which promotes the bundle) repushes a canonical -- a premerge
-        // generate-and-consume run (promote=false) never does, even with the toggle
-        // on. Gated off by default (PUBLISH_BOLTED_CANONICAL).
-        if (PUBLISH_BOLTED_CANONICAL && APPLY_PROFILES == "true" && PROMOTE == "true") {
-            stage("Publish BOLTed build as canonical") {
-                publishBoltedCanonical(pipeline, remote,
+        // Publish the freshly BOLTed build back to the input artifactPath as
+        // bolted-<tarball>, so consumers that require optimized binaries have a
+        // distinct object to depend on. The merge job (APPLY_PROFILES=true) already
+        // produced ${outDir}/bolt-${BOLT_TARNAME} natively on the aarch64 cluster
+        // node; without this it is reclaimed by the retention sweep below. Runs
+        // BEFORE that sweep. Coupled to PROMOTE so only the postmerge producer
+        // (which promotes the bundle) publishes -- a premerge generate-and-consume
+        // run (promote=false) never does, even with the toggle on. Gated off by
+        // default (PUBLISH_BOLTED_TARBALL).
+        if (PUBLISH_BOLTED_TARBALL && APPLY_PROFILES == "true" && PROMOTE == "true") {
+            stage("Publish BOLTed build") {
+                publishBoltedTarball(pipeline, remote,
                     "${outDir}/bolt-${BOLT_TARNAME}",       // bolted build from the merge job
-                    "${ws}/builds/${BOLT_TARNAME}",         // un-BOLTed input on the cluster
                     "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}", BOLT_TARNAME)
             }
-        } else if (!PUBLISH_BOLTED_CANONICAL) {
-            pipeline.echo("PUBLISH_BOLTED_CANONICAL=false: not repushing a BOLTed canonical tarball.")
+        } else if (!PUBLISH_BOLTED_TARBALL) {
+            pipeline.echo("PUBLISH_BOLTED_TARBALL=false: not publishing a BOLTed tarball.")
         }
 
         // Retention: best-effort purge of workspaces older than 7 days so scratch
@@ -772,28 +777,32 @@ def promoteBundle(pipeline, remote, String bundle)
 }
 
 // ---------------------------------------------------------------------------
-// Publish the just-BOLTed build under the CANONICAL name at the input artifactPath,
-// mirroring Build.groovy's premerge apply/consume convention: BOLT is the DEFAULT,
-// so canonical <tarName> becomes the BOLTed build and the original is preserved as
-// unbolted-<tarName>. The merge job (BOLT_APPLY=1) produced the bolted tarball
-// natively on the aarch64 cluster node into ${outDir}/bolt-<tarName>.
+// Publish the just-BOLTed build at the input artifactPath as bolted-<tarName>.
+// The merge job (BOLT_APPLY=1) produced it natively on the aarch64 cluster node
+// into ${outDir}/bolt-<tarName>.
+//
+// The canonical <tarName> is NOT touched. Consumers that need optimized binaries
+// name bolted-<tarName> explicitly and get a hard failure when it is absent;
+// consumers that do not care keep reading the canonical object, which never
+// changes under them. That split is deliberate: the same overwrite that made the
+// optimization transparent also made it racy, because the canonical object is
+// already downloadable hours before BOLT could replace it.
 //
 // Runs CLUSTER-SIDE (the frontend reaches Artifactory and the tarballs live on
-// scratch). Fails loudly if the bolted tarball is missing, and is idempotent on a
-// reused artifactPath: the unbolted- snapshot is skipped if it already exists, so a
-// re-run never overwrites the real unbolted with an already-BOLTed canonical.
+// scratch). Fails loudly if the bolted tarball is missing. Re-running against the
+// same artifactPath re-uploads the same name with equivalent content, which is
+// safe precisely because the input it was built from (canonical) is immutable.
 //
 // Credentials use the same stdin-fed netrc pattern as promoteBundle(): the secret
 // travels over ssh stdin (read by `cat > netrc`), never embedded in the base64'd
 // script, so it can't leak via the decoded remote command or `ps`.
 // ---------------------------------------------------------------------------
-def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unboltedLocal, String artifactBase, String tarName)
+def publishBoltedTarball(pipeline, remote, String boltedLocal, String artifactBase, String tarName)
 {
     def host = URM_ARTIFACTORY_BASE.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
     def netrc = "${boltedLocal}.netrc"
-    def canonicalUrl = "${artifactBase}/${tarName}"
-    def unboltedUrl  = "${artifactBase}/unbolted-${tarName}"
-    pipeline.echo("Publishing BOLTed build as canonical ${canonicalUrl} (un-BOLTed preserved at ${unboltedUrl})")
+    def boltedUrl = "${artifactBase}/bolted-${tarName}"
+    pipeline.echo("Publishing BOLTed build as ${boltedUrl} (canonical ${tarName} left untouched)")
     // Remote side carries no secret: it reads the netrc from stdin. Clean up via
     // trap, not a trailing rm, so a failed curl under `set -e` still removes the
     // plaintext netrc; umask covers the window before chmod.
@@ -801,27 +810,14 @@ def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unbolted
         set -e
         umask 077
         trap 'rm -f "${netrc}"' EXIT
-        test -f "${boltedLocal}"   || { echo "[ERROR] bolted tarball missing: ${boltedLocal} (did the merge run with BOLT_APPLY=1?)" >&2; exit 1; }
-        test -f "${unboltedLocal}" || { echo "[ERROR] un-BOLTed tarball missing: ${unboltedLocal}" >&2; exit 1; }
+        test -f "${boltedLocal}" || { echo "[ERROR] bolted tarball missing: ${boltedLocal} (did the merge run with BOLT_APPLY=1?)" >&2; exit 1; }
         cat > "${netrc}"
         chmod 600 "${netrc}"
-        # 1) Preserve the un-BOLTed build as unbolted-${tarName}, unless already there.
-        #    A PUT-upload, NOT /api/copy: the target repo is virtual, so a server-side
-        #    copy returns 409. Idempotent via the existence check: on a re-run the
-        #    canonical is ALREADY the BOLTed build, and re-publishing would otherwise
-        #    overwrite the real unbolted with a bolted copy.
-        if curl -fsI --netrc-file "${netrc}" "${unboltedUrl}" >/dev/null 2>&1; then
-            echo "[INFO] unbolted-${tarName} already exists; skipping upload"
-        else
-            echo "[INFO] uploading un-BOLTed tarball -> unbolted-${tarName}"
-            curl -fS --netrc-file "${netrc}" --retry 5 --retry-all-errors \\
-                 --connect-timeout 30 --speed-time 300 --speed-limit 1024 \\
-                 -T "${unboltedLocal}" "${unboltedUrl}"
-        fi
-        # 2) Overwrite canonical ${tarName} with the BOLTed build (the release name).
+        # A PUT-upload, NOT /api/copy: the target repo is virtual, so a server-side
+        # copy returns 409.
         curl -fS --netrc-file "${netrc}" --retry 5 --retry-all-errors \\
              --connect-timeout 30 --speed-time 300 --speed-limit 1024 \\
-             -T "${boltedLocal}" "${canonicalUrl}"
+             -T "${boltedLocal}" "${boltedUrl}"
     """.stripIndent()
     pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
@@ -829,7 +825,7 @@ def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unbolted
         Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
             script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(publish, "${boltedLocal}.publish.sh")))
     }
-    pipeline.echo("Published. canonical = ${canonicalUrl}")
+    pipeline.echo("Published. BOLTed build = ${boltedUrl}")
 }
 
 
@@ -899,9 +895,9 @@ pipeline {
             description: "Re-BOLT the input tarball with the just-generated bundle in the merge job, as a same-commit check that the profiles apply. No extra GPU allocation."
         )
         choice(
-            name: "boltPublishCanonical",
+            name: "boltPublishBolted",
             choices: ["false", "true"],
-            description: "After merge (requires applyProfiles=true), push the BOLTed build back to the input artifactPath under the canonical name (original preserved as unbolted-<tarball>). Default false; the rollout is turned on in a follow-up change."
+            description: "After merge (requires applyProfiles=true and promote=true), push the BOLTed build back to the input artifactPath as bolted-<tarball>, a distinct object alongside the untouched canonical one. Default false; the rollout is turned on in a follow-up change. Renamed from boltPublishCanonical, which overwrote the canonical name; the first run after this lands drops the parent's value (an undeclared parameter is dropped even when sent) and publishes nothing."
         )
         string(
             name: "slurmPlatform",

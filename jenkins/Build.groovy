@@ -580,8 +580,11 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
             error("[bolt-consume] apply_latest.sh failed (rc=${rc}) for ${branch}/${triple}")
         }
         // Applied: preserve the un-BOLTed original as unbolted-<tarName> and promote
-        // the BOLTed build to the canonical name. Matches the postmerge
-        // publishBoltedCanonical convention (canonical = BOLTed).
+        // the BOLTed build to the canonical name. Safe to name the BOLTed build
+        // canonical HERE, unlike postmerge (BoltProfileGen::publishBoltedTarball,
+        // which publishes a separate bolted-<tarName>): this runs before the upload,
+        // so the canonical object is written once, already BOLTed, and no consumer
+        // can have fetched an earlier version of it.
         sh """
             set -e
             cp -f ${tarName} unbolted-${tarName}
