@@ -31,7 +31,15 @@ from torch import nn
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
+import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3SparseConfig,
+    MiniMaxM3SparseMetadataParams,
+    MiniMaxM3SparseParams,
+    index_head_range,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
@@ -39,9 +47,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
     MiniMaxM3DecoderLayer,
+    MiniMaxM3ForCausalLM,
     MiniMaxM3Model,
     MiniMaxM3MoE,
+    MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
+    _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _moe_routed_output_is_global,
     _strip_language_model_prefix,
@@ -53,6 +64,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     get_text_config,
     is_minimax_m3_vl_config,
 )
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
@@ -63,6 +75,8 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
 from tensorrt_llm._torch.utils import AuxStreamType, EventType
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -92,7 +106,8 @@ class _M3CompositionExperts(nn.Module):
 
 
 class _M3CompositionShared(nn.Module):
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, lora_params: dict | None = None) -> torch.Tensor:
+        del lora_params
         return torch.full_like(hidden_states, 2.0)
 
 
@@ -236,6 +251,311 @@ def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
     )
 
     _validate_sparse_attention_runtime_config(model_config)
+
+
+@pytest.mark.cpu_only
+def test_validate_fused_projection_requires_fp8_main_kv_cache() -> None:
+    sparse_config = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        indexer_kv_dtype="fp8",
+        fuse_qkv_index_projection=True,
+    )
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=sparse_config,
+    )
+    with pytest.raises(ValueError, match="requires an FP8 main KV cache"):
+        _validate_sparse_attention_runtime_config(model_config)
+
+    model_config.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    _validate_sparse_attention_runtime_config(model_config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_fused_qkv_index_projection_preserves_index_head_groups(
+    tp_size: int, attention_dp: bool
+) -> None:
+    cfg = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        indexer_kv_dtype="fp8",
+        fuse_qkv_index_projection=True,
+        num_attention_heads=64,
+        num_key_value_heads=4,
+    )
+    sparse_params = cfg.to_sparse_params()
+    metadata_params = cfg.to_sparse_metadata_params()
+    checkpoint_cfg = cfg.model_copy(
+        update={"num_attention_heads": None, "num_key_value_heads": None}
+    )
+    checkpoint = SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    assert checkpoint_cfg.to_sparse_params(pretrained_config=checkpoint) == sparse_params
+    assert checkpoint_cfg.to_sparse_metadata_params(pretrained_config=checkpoint) == metadata_params
+    mapping = SimpleNamespace(tp_size=tp_size, tp_rank=0, enable_attention_dp=attention_dp)
+    local_q_heads = 64 if attention_dp else 64 // tp_size
+    local_kv_heads = 4 if attention_dp else max(4 // tp_size, 1)
+
+    assert sparse_params.fuse_qkv_index_projection is True
+    assert metadata_params.sharded_head_counts(mapping) == (local_q_heads, local_kv_heads)
+    assert metadata_params.num_index_heads == 4
+    assert metadata_params.sharded_index_head_count(mapping) == local_kv_heads
+    kernel_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+        sparse_params, num_q_heads=local_q_heads, num_kv_heads=local_kv_heads, head_dim=128
+    )
+    assert kernel_cfg.num_index_heads == local_kv_heads
+
+    compatibility_cfg = cfg.model_copy(update={"fuse_qkv_index_projection": False})
+    assert compatibility_cfg.to_sparse_metadata_params() == metadata_params
+    compatibility_kernel_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+        compatibility_cfg.to_sparse_params(),
+        num_q_heads=local_q_heads,
+        num_kv_heads=local_kv_heads,
+        head_dim=128,
+    )
+    # Rank zero keeps its own index/KV pairs, not a max over other ranks'
+    # index heads. Each head favors a distinct block to expose misgrouping.
+    scores = torch.diag(torch.tensor([1.0, 2.0, 3.0, 4.0])).unsqueeze(-1)
+    fused_scores = _group_max_reduce(scores[:local_kv_heads], kernel_cfg)
+    reference_scores = _group_max_reduce(scores[:local_kv_heads], compatibility_kernel_cfg)
+    torch.testing.assert_close(fused_scores, reference_scores)
+    expected_blocks = torch.arange(local_kv_heads)
+    torch.testing.assert_close(fused_scores.argmax(dim=1).flatten(), expected_blocks)
+    with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
+        MiniMaxM3SparseAttentionConfig(implementation="triton", fuse_qkv_index_projection=True)
+    with pytest.raises(ValueError, match=r"requires indexer_kv_dtype='fp8'"):
+        MiniMaxM3SparseAttentionConfig(implementation="msa", fuse_qkv_index_projection=True)
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_uses_one_engine_speculative_base() -> None:
+    assert issubclass(MiniMaxM3ForCausalLM, SpecDecOneEngineForCausalLM)
+
+
+@pytest.mark.cpu_only
+def test_setup_aliases_preserves_one_engine_draft_weight_loading() -> None:
+    loaded = []
+
+    class DraftModel:
+        shares_target_kv_cache = True
+
+        def load_weights_from_target_model(self, target) -> None:
+            loaded.append(target)
+
+    target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
+    layers = [
+        SimpleNamespace(input_layernorm=object()),
+        SimpleNamespace(input_layernorm=object()),
+    ]
+    final_norm = object()
+    object.__setattr__(target, "draft_model", DraftModel())
+    object.__setattr__(target, "model", SimpleNamespace(layers=layers, norm=final_norm))
+
+    target.setup_aliases()
+
+    assert loaded == [target]
+    assert layers[0].next_layer_layernorm is layers[1].input_layernorm
+    assert layers[1].next_layer_layernorm is final_norm
+
+
+@pytest.mark.cpu_only
+def test_eagle_capture_precedes_next_layer_norm() -> None:
+    class CaptureMetadata:
+        def __init__(self) -> None:
+            self.captured = None
+
+        def is_layer_capture(self, layer_idx: int) -> bool:
+            return layer_idx == 25
+
+        def maybe_capture_hidden_states(self, layer_idx, hidden_states, residual) -> None:
+            self.captured = (layer_idx, hidden_states.clone(), residual.clone())
+
+    layer = SimpleNamespace(
+        layer_idx=25,
+        _apply_pre_feed_forward_norm=lambda hidden, residual: (hidden + 1, residual + 2),
+        block_sparse_moe=lambda hidden, unused_metadata, **unused_kwargs: hidden + 3,
+        _feed_forward_all_reduce_params=lambda: None,
+        _apply_next_layer_layernorm=lambda hidden, residual: (hidden + 10, residual + 20),
+    )
+    spec_metadata = CaptureMetadata()
+    hidden_states = torch.tensor([1.0])
+    residual = torch.tensor([2.0])
+
+    output, output_residual = MiniMaxM3DecoderLayer.forward_MoE(
+        layer,
+        hidden_states,
+        SimpleNamespace(),
+        residual,
+        spec_metadata,
+    )
+
+    assert spec_metadata.captured is not None
+    layer_idx, captured_hidden, captured_residual = spec_metadata.captured
+    assert layer_idx == 25
+    torch.testing.assert_close(captured_hidden, torch.tensor([5.0]))
+    torch.testing.assert_close(captured_residual, torch.tensor([4.0]))
+    torch.testing.assert_close(output, torch.tensor([15.0]))
+    torch.testing.assert_close(output_residual, torch.tensor([24.0]))
+
+
+@pytest.mark.cpu_only
+def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> None:
+    class FakeAttentionLayer:
+        def __init__(self) -> None:
+            self.producer_shapes = None
+
+        def _fused_fp8_qkv_indexer_norm_rope_kv_insert(self, packed, position_ids, attn_metadata):
+            self.producer_shapes = (
+                tuple(packed.shape),
+                tuple(position_ids.shape),
+                attn_metadata.num_tokens,
+            )
+            return packed[:, :3].clone(), packed[:, :1].clone()
+
+        def _dispatch_attention_backend(self, q, k, v, idx_q, idx_k, attn_metadata, output) -> None:
+            assert k is None and v is None and idx_k is None
+            assert idx_q.shape == (attn_metadata.num_tokens, 1)
+            output.copy_(q)
+
+    metadata = SimpleNamespace(num_tokens=2)
+    layer = FakeAttentionLayer()
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (metadata, layer),
+    )
+    packed = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    position_ids = torch.arange(4, dtype=torch.int32).reshape(1, 4)
+    output = torch.full((4, 3), -1.0)
+
+    modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
+        None,
+        None,
+        None,
+        None,
+        None,
+        packed,
+        position_ids,
+        "3",
+        output,
+    )
+
+    assert layer.producer_shapes == ((2, 5), (1, 2), 2)
+    torch.testing.assert_close(output[:2], packed[:2, :3])
+    torch.testing.assert_close(output[2:], torch.full((2, 3), -1.0))
+
+
+@pytest.mark.cpu_only
+def test_piecewise_projection_fake_preserves_padded_hidden_rows(monkeypatch) -> None:
+    projection = object.__new__(MiniMaxM3QKVIndexerLinear)
+    nn.Module.__init__(projection)
+    projection.local_output_sizes = (3, 4)
+    layer = SimpleNamespace(qkv_proj=projection)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (SimpleNamespace(), layer),
+    )
+    hidden_states = torch.randn(256, 5)
+    position_ids = torch.arange(6).reshape(1, 6)
+
+    packed = modeling_minimaxm3._minimax_m3_qkv_index_proj_fake(hidden_states, position_ids, "3")
+
+    # The real GEMM projects every padded hidden row. Position IDs remain an
+    # input solely to carry the unpadded token symbol to the piecewise segment.
+    assert packed.shape == (hidden_states.shape[0], 7)
+
+
+@pytest.mark.cpu_only
+def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch) -> None:
+    """Do not inherit a bucket-specialized token dimension from the GEMM output."""
+    packed = torch.randn(2, 7)
+    captured = {}
+
+    def fake_boundary(q, k, v, idx_q, idx_k, packed_arg, position_ids, layer_idx, output):
+        assert q is None and k is None and v is None
+        assert idx_q is None and idx_k is None
+        captured["packed"] = packed_arg
+        captured["position_ids"] = position_ids
+        captured["output_shape"] = tuple(output.shape)
+        output.zero_()
+
+    layer = SimpleNamespace(
+        enable_fused_qkv_index_projection=True,
+        qkv_proj=lambda hidden_states: packed,
+        register_to_config=True,
+        num_heads=1,
+        head_dim=3,
+        attn_activation_dtype=torch.float32,
+        layer_idx_str="3",
+        o_proj=lambda output, all_reduce_params: output,
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (SimpleNamespace(), layer),
+    )
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "maybe_bcg_minimax_m3_attn_custom_op_inplace",
+        fake_boundary,
+    )
+    hidden_states = torch.randn(4, 5)
+    position_ids = torch.arange(6).reshape(1, 6)
+
+    result = MiniMaxM3Attention._sparse_forward(
+        layer,
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+    )
+
+    assert captured["packed"] is packed
+    assert captured["position_ids"] is position_ids
+    assert captured["output_shape"] == (position_ids.shape[-1], 3)
+    assert result.shape == (position_ids.shape[-1], 3)
+
+
+@pytest.mark.cpu_only
+def test_msa_attention_core_routes_compact_q_to_attention_dispatcher() -> None:
+    selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
+
+    class FakeMsaBackend:
+        def __init__(self) -> None:
+            self.prepopulated_call = None
+
+        def write_layer_caches(self, k, v, idx_k, metadata) -> None:
+            pytest.fail("The horizontal producer has already written both caches")
+
+        def run_indexer(self, idx_q, idx_k, metadata, *, idx_k_prewritten):
+            assert idx_k is None
+            assert idx_k_prewritten
+            assert metadata is attn_metadata
+            return selected_blocks
+
+        def forward(self, q, k, v, metadata, forward_args) -> None:
+            assert k is None and v is None
+            self.prepopulated_call = (q, metadata, forward_args)
+
+    layer = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    backend = FakeMsaBackend()
+    layer.attn = backend
+    layer.is_sparse_attention_layer = True
+    q = torch.randn(2, 8)
+    idx_q = torch.randn(2, 4)
+    attn_metadata = SimpleNamespace()
+    output = torch.empty_like(q)
+
+    result = layer._msa_attention_core(q, None, None, idx_q, None, attn_metadata, output)
+
+    assert result is output
+    assert backend.prepopulated_call is not None
+    called_q, called_metadata, forward_args = backend.prepopulated_call
+    assert called_q is q
+    assert called_metadata is attn_metadata
+    assert forward_args.output is output
+    assert forward_args.sparse_backend_args.topk_indices is selected_blocks
 
 
 def test_model_init_validates_sparse_attention_runtime_config() -> None:
@@ -463,7 +783,7 @@ def test_get_moe_layer_ids_length_mismatch_raises():
 #    ``use_gemma=True`` and ``hidden_size=head_dim``; the
 #    :meth:`apply_qk_norm` reshape matches an independent hand-written
 #    reference.
-#  * Sparse index branch: fused replicated (tp_mode None) index_qk_proj with
+#  * Sparse index branch: KV-group-sharded index_qk_proj with
 #    output [idx_q | idx_k] = num_index_heads * sparse_index_dim + sparse_index_dim
 #    (idx_k is one K per token).
 #  * Dense layers do not expose any index branch attributes (negative
@@ -662,9 +982,9 @@ def test_minimax_m3_attention_apply_qk_norm_matches_reference():
 def test_minimax_m3_attention_sparse_construction_matches_config():
     """Sparse layer adds the index branch with the fused index projection.
 
-    * index_qk_proj is replicated (tp_mode None), out =
+    * At TP1, index_qk_proj retains all index heads, out =
       num_index_heads * sparse_index_dim (idx_q) + sparse_index_dim (idx_k),
-      where idx_k is one K per token (SGLang ReplicatedLinear contract).
+      where idx_k is one replicated K per token.
     * index_q_norm / index_k_norm are per-head Gemma RMSNorm of width
       sparse_index_dim.
     """
@@ -683,16 +1003,12 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
     assert attn.is_sparse_attention_layer is True
     assert attn.disable_index_value is True
 
-    # Replication keeps the idx_q -> [num_tokens, num_index_heads,
-    # sparse_index_dim] reshape valid at any TP geometry, whereas a
-    # column-parallel split would slice the head dimension.
+    # Explicit shard ranges retain whole index heads and replicate index-K.
     assert attn.index_q_size == num_index_heads * sparse_index_dim
     assert attn.index_k_size == sparse_index_dim
     assert attn.index_qk_proj.in_features == hidden
     assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
-    assert attn.index_qk_proj.tp_mode is None, (
-        f"index_qk_proj must be replicated, got {attn.index_qk_proj.tp_mode!r}"
-    )
+    assert attn.index_qk_proj.tp_mode == modeling_minimaxm3.TensorParallelMode.COLUMN
     # Only the fused projection exists.
     assert not hasattr(attn, "index_q_proj")
     assert not hasattr(attn, "index_k_proj")
@@ -715,6 +1031,243 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
         assert "attn_metadata" in msg or "kv_cache_manager" in msg, msg
     else:  # pragma: no cover
         raise AssertionError("sparse forward must raise RuntimeError when attn_metadata is None")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_minimax_m3_five_way_projection_shard_geometry(tp_size: int) -> None:
+    shard_geometry = MiniMaxM3QKVIndexerLinear._shard_geometry
+    for tp_rank in range(tp_size):
+        module = SimpleNamespace(
+            tp_size=tp_size, tp_rank=tp_rank, total_num_kv_heads=4, total_num_index_heads=4
+        )
+        kv_world = min(tp_size, 4)
+        kv_rank = tp_rank // max(tp_size // 4, 1)
+        assert shard_geometry(module, "q") == (tp_size, tp_rank)
+        assert shard_geometry(module, "k") == (kv_world, kv_rank)
+        assert shard_geometry(module, "v") == (kv_world, kv_rank)
+        assert shard_geometry(module, "index_q") == (kv_world, kv_rank)
+        assert shard_geometry(module, "index_k") == (1, 0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: int) -> None:
+    def init_linear(self, in_features, out_features, **kwargs) -> None:
+        nn.Module.__init__(self)
+        self.tp_size = kwargs["mapping"].tp_size
+        self.tp_rank = kwargs["mapping"].tp_rank
+        self.tp_mode = kwargs["tensor_parallel_mode"]
+        self.weights_loading_config = kwargs["weights_loading_config"]
+        self.out_features = out_features // self.tp_size
+
+    monkeypatch.setattr(modeling_minimaxm3.Linear, "__init__", init_linear)
+    # Exercise the real checkpoint loader on CPU; only its destination device
+    # is substituted, leaving the TP slicing and five-way packing intact.
+    load_weight_shard = modeling_minimaxm3.load_weight_shard
+
+    def load_cpu_shard(weight, world_size, rank, mode, *, device):
+        return load_weight_shard(weight, world_size, rank, mode, device=torch.device("cpu"))
+
+    monkeypatch.setattr(modeling_minimaxm3, "load_weight_shard", load_cpu_shard)
+    for tp_rank in range(tp_size):
+        projection = MiniMaxM3QKVIndexerLinear(
+            hidden_size=2,
+            head_dim=128,
+            total_num_heads=64,
+            total_num_kv_heads=4,
+            total_num_index_heads=4,
+            index_head_dim=128,
+            dtype=torch.bfloat16,
+            mapping=SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank),
+            quant_config=None,
+            skip_create_weights_in_init=True,
+            force_dynamic_quantization=False,
+            disable_deep_gemm=False,
+            use_custom_cublas_mm=False,
+            use_cute_dsl_bf16_gemm=False,
+            use_cute_dsl_blockscaling_mm=False,
+        )
+        kv_heads = max(4 // tp_size, 1)
+        assert projection.local_output_sizes == (
+            64 // tp_size * 128,
+            kv_heads * 128,
+            kv_heads * 128,
+            kv_heads * 128,
+            128,
+        )
+        assert projection.local_num_index_heads == kv_heads
+        assert projection.out_features == sum(projection.local_output_sizes)
+        shards = {
+            name: {"weight": torch.arange(heads * 128 * 2).reshape(heads * 128, 2)}
+            for name, heads in zip(projection._SHARD_NAMES, (64, 4, 4, 4, 1), strict=True)
+        }
+        loaded = []
+        projection.load_weights = loaded.extend
+        projection.load_five_way_weights(shards)
+        packed = loaded[0]["weight"].split(projection.local_output_sizes)
+        torch.testing.assert_close(packed[4], shards["index_k"]["weight"])
+        kv_rank = tp_rank // max(tp_size // 4, 1)
+        torch.testing.assert_close(
+            packed[3], shards["index_q"]["weight"].chunk(min(tp_size, 4))[kv_rank]
+        )
+        torch.testing.assert_close(packed[1], shards["k"]["weight"].chunk(min(tp_size, 4))[kv_rank])
+        assert projection.tp_size == tp_size and projection.tp_rank == tp_rank
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("num_index_heads", [4, 8])
+def test_minimax_m3_index_tp_matches_unsharded_reference(
+    tp_size: int, attention_dp: bool, num_index_heads: int
+) -> None:
+    """Checkpoint row ownership and selected blocks must be TP invariant."""
+    generator = torch.Generator().manual_seed(2718)
+    head_dim, hidden_dim, global_kv_heads = 2, 8, 4
+    q_weight = torch.randn(num_index_heads * head_dim, hidden_dim, generator=generator)
+    k_weight = torch.randn(head_dim, hidden_dim, generator=generator)
+    hidden = torch.randn(5, hidden_dim, generator=generator)
+    key_hidden = torch.randn(11, 3, hidden_dim, generator=generator)
+    global_q = torch.nn.functional.linear(hidden, q_weight).reshape(5, num_index_heads, head_dim)
+    keys = torch.nn.functional.linear(key_hidden, k_weight)
+    global_scores = torch.einsum("thd,bkd->hbkt", global_q, keys).amax(dim=2)
+    params = MiniMaxM3SparseParams(num_index_heads=num_index_heads, global_num_kv_heads=4)
+    reference_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+        params, num_q_heads=64, num_kv_heads=4, head_dim=head_dim
+    )
+    reference_scores = _group_max_reduce(global_scores, reference_cfg)
+    metadata = MiniMaxM3SparseMetadataParams(
+        global_num_q_heads=64, global_num_kv_heads=4, num_index_heads=num_index_heads
+    )
+    effective_tp = 1 if attention_dp else tp_size
+    local_kv_heads = max(global_kv_heads // effective_tp, 1)
+    for rank in range(tp_size):
+        mapping = SimpleNamespace(tp_size=tp_size, tp_rank=rank, enable_attention_dp=attention_dp)
+        start, end = index_head_range(num_index_heads, global_kv_heads, mapping)
+        kv_start = 0 if attention_dp else rank // max(tp_size // 4, 1) * local_kv_heads
+        assert (start, end) == (
+            kv_start * (num_index_heads // 4),
+            (kv_start + local_kv_heads) * (num_index_heads // 4),
+        )
+        assert metadata.sharded_index_head_count(mapping) == end - start
+
+        # Exercise Linear's real per-shard loader, as used by index_qk_proj:
+        # index-Q uses the KV group's rows; index-K always uses all its rows.
+        projection = object.__new__(modeling_minimaxm3.Linear)
+        nn.Module.__init__(projection)
+        projection.tp_size = effective_tp
+        projection.tp_rank = 0 if attention_dp else rank
+        projection.tp_mode = modeling_minimaxm3.TensorParallelMode.COLUMN
+        projection.tp_sharding = {"gate": (start * head_dim, end * head_dim), "up": (0, head_dim)}
+        projection.weights_loading_config = modeling_minimaxm3.WeightsLoadingConfig(
+            weight_mode=modeling_minimaxm3.WeightMode.FUSED_GATE_UP_LINEAR
+        )
+        local_q_weight = projection.load_shard({"weight": q_weight}, "weight", name="gate")
+        local_k_weight = projection.load_shard({"weight": k_weight}, "weight", name="up")
+        assert (
+            projection.calculate_local_out_features((num_index_heads + 1) * head_dim)
+            == (end - start + 1) * head_dim
+        )
+        torch.testing.assert_close(local_k_weight, k_weight)
+        local_q = torch.nn.functional.linear(hidden, local_q_weight).reshape(
+            5, end - start, head_dim
+        )
+        torch.testing.assert_close(local_q, global_q[:, start:end])
+        local_scores = torch.einsum("thd,bkd->hbkt", local_q, keys).amax(dim=2)
+        local_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+            params, num_q_heads=64 // effective_tp, num_kv_heads=local_kv_heads, head_dim=head_dim
+        )
+        assert local_cfg.num_index_heads == end - start
+        grouped_scores = _group_max_reduce(local_scores, local_cfg)
+        expected = reference_scores[kv_start : kv_start + local_kv_heads]
+        torch.testing.assert_close(grouped_scores, expected)
+        torch.testing.assert_close(
+            grouped_scores.topk(3, dim=1).indices, expected.topk(3, dim=1).indices
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_index_heads,num_kv_heads,tp_size", [(0, 4, 1), (6, 4, 2), (4, 4, 3), (4, 0, 2)]
+)
+def test_minimax_m3_index_head_range_rejects_invalid_geometry(
+    num_index_heads: int, num_kv_heads: int, tp_size: int
+) -> None:
+    with pytest.raises(ValueError):
+        index_head_range(
+            num_index_heads,
+            num_kv_heads,
+            SimpleNamespace(tp_size=tp_size, tp_rank=0, enable_attention_dp=False),
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_minimax_m3_unfused_index_projection_tp_construction(
+    tp_size: int, attention_dp: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify the model wires Linear's shard overrides to effective attention TP."""
+    import tensorrt_llm._torch.distributed as distributed
+
+    # Simulate each rank on one GPU without creating distributed workspaces.
+    # No forward runs here; projection construction and shard sizing stay real.
+    monkeypatch.setattr(distributed, "AllReduce", lambda **_kwargs: nn.Identity())
+    for rank in range(tp_size):
+        text_cfg, model_cfg = _make_attention_test_config()
+        text_cfg.hidden_size = 256
+        text_cfg.num_attention_heads = 8
+        text_cfg.num_key_value_heads = 4
+        text_cfg.sparse_attention_config["sparse_num_index_heads"] = 4
+        model_cfg.mapping = Mapping(
+            world_size=tp_size, rank=rank, tp_size=tp_size, enable_attention_dp=attention_dp
+        )
+        attn = MiniMaxM3Attention(
+            model_config=model_cfg,
+            layer_idx=3,
+            is_sparse_attention_layer=True,
+            disable_index_value=True,
+        )
+        kv_heads = 4 if attention_dp else max(4 // tp_size, 1)
+        kv_start = 0 if attention_dp else rank // max(tp_size // 4, 1) * kv_heads
+        assert attn.sparse_num_index_heads == kv_heads
+        assert attn.index_qk_proj.out_features == (kv_heads + 1) * 32
+        assert attn.index_qk_proj.tp_sharding == {
+            "gate": (kv_start * 32, (kv_start + kv_heads) * 32),
+            "up": (0, 32),
+        }
+        assert attn.index_qk_proj.mapping == attn.qkv_proj.mapping
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_five_way_loader_returns_exact_generic_skip() -> None:
+    projection = object.__new__(MiniMaxM3QKVIndexerLinear)
+    nn.Module.__init__(projection)
+    captured = {}
+    projection.load_five_way_weights = lambda shards: captured.update(shards)
+
+    model = nn.Module()
+    model.sparse = nn.Module()
+    model.sparse.qkv_proj = projection
+    weights = {
+        f"sparse.{name}_proj.weight": torch.empty(1)
+        for name in ("q", "k", "v", "index_q", "index_k")
+    }
+
+    loaded_modules = _load_qkv_index_proj_weights(model, weights)
+
+    assert loaded_modules == ["sparse.qkv_proj"]
+    assert set(captured) == {"q", "k", "v", "index_q", "index_k"}
+    assert all(set(shard) == {"weight"} for shard in captured.values())
+    assert weights == {}
+
+    mapper = MiniMaxM3HfWeightMapper()
+    mapper.add_skip_modules(loaded_modules)
+    mapper._model = SimpleNamespace(config=SimpleNamespace(tie_word_embeddings=False))
+    assert mapper.should_skip_module("sparse.qkv_proj")
+    assert not mapper.should_skip_module("dense.qkv_proj")
 
 
 @pytest.mark.gpu
@@ -1089,7 +1642,7 @@ def test_minimax_m3_attention_real_config_index_branch_shapes():
     assert attn.index_k_size == sparse_index_dim
     assert attn.index_qk_proj.in_features == int(text_cfg.hidden_size)
     assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
-    assert attn.index_qk_proj.tp_mode is None
+    assert attn.index_qk_proj.tp_mode == modeling_minimaxm3.TensorParallelMode.COLUMN
     assert not hasattr(attn, "index_q_proj")
     assert not hasattr(attn, "index_k_proj")
 

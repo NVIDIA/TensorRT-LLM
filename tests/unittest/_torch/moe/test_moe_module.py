@@ -692,6 +692,9 @@ def _test_moe_worker_impl(
                 weight_loading_mode=weight_loading_mode,
             ) as fused_moe,
         ):
+            # Direct construction: no host post-init to allocate for us, and
+            # the branch below reads the backend's quant_method shapes.
+            fused_moe.create_weights()
             # W4A8_MXFP4_MXFP8 needs backend-layout-aware weights.  In
             # particular, MegaMoEDeepGemm and TRTLLMGen can have different
             # padded backend/ref tensor layouts, so create weights after the

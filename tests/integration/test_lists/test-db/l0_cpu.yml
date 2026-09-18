@@ -47,12 +47,28 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
+  - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_fp8_main_kv_cache
+  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_index_projection_preserves_index_head_groups
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shards_index_rows
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_tp_matches_unsharded_reference
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_head_range_rejects_invalid_geometry
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_uses_one_engine_speculative_base
+  - unittest/_torch/models/test_minimax_m3.py::test_setup_aliases_preserves_one_engine_draft_weight_loading
+  - unittest/_torch/models/test_minimax_m3.py::test_eagle_capture_precedes_next_layer_norm
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_projection_fake_preserves_padded_hidden_rows
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_fused_projection_preserves_input_token_dimension
+  - unittest/_torch/models/test_minimax_m3.py::test_msa_attention_core_routes_compact_q_to_attention_dispatcher
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
+  # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
+  - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_utils.py

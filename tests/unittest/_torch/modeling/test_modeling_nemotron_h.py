@@ -25,7 +25,7 @@ def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
 
 def extract_decode_logprobs(result: RequestOutput,
                             gen_idx: int = 0) -> torch.Tensor:
-    """Shared by test_modeling_nemotron_nano_v2_vl.py."""
+    """Shared by test_modeling_nemotron_h_multimodal.py."""
     token_ids = torch.tensor(result.outputs[gen_idx].token_ids)
     logits = result.outputs[gen_idx].generation_logits
     return get_logprobs(token_ids, logits)
