@@ -1343,7 +1343,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
     op->mUseSpecDecoding = use_spec_decoding;
     op->mIsSpecDecTree = is_spec_dec_tree;
-    // Include static tree length in the AttentionOp cache key.
+    // Include the tree length in the AttentionOp cache key.
     if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
@@ -1463,8 +1463,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         if (workspace_.value().numel() < workspace_size)
         {
-            TLLM_LOG_WARNING("Attention workspace size is not enough, increase the size from %ld bytes to %ld bytes",
-                workspace_.value().numel(), workspace_size);
+            auto const capacity = workspace_.value().storage().nbytes();
+            if (capacity < static_cast<size_t>(workspace_size))
+            {
+                TLLM_LOG_WARNING(
+                    "Attention workspace size is not enough, increase the size from %zu bytes to %ld bytes", capacity,
+                    workspace_size);
+            }
             workspace_.value().resize_({workspace_size});
         }
         workspace = workspace_.value();

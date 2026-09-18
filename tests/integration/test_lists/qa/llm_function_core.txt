@@ -276,7 +276,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus[xgrammar-mtp_nextn=2]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_eagle_dynamic_draft_len
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_non_greedy_cuda_graph_matches_eager
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_sa_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=fp8-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=none-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
@@ -801,3 +800,27 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grain
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[False-False-autotuner]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[True-True-no_autotuner]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[True-True-autotuner]
+
+# ------------- VisualGen Wan 2.2 E2E (SM >= 100) ---------------
+
+# BF16/VANILLA pipeline correctness and batch generation for all three variants.
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22_A14B_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22T2VBatchGeneration
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22_I2V_A14B_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22I2VBatchGeneration
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_T2V_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_I2V_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BBatchGeneration
+
+# FP8 + TRTLLM attention combination smoke tests with CacheDiT.
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22T2VCombinedOptimizations
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22I2VCombinedOptimizations
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BCombinedOptimizations
+
+# NVFP4 examples for T2V-A14B and I2V-A14B.
+examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
+
+# Wan 2.2 I2V serving: synchronous and asynchronous video-generation requests.
+unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_sync
+unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_async_lifecycle

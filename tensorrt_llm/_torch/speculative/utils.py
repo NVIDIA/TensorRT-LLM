@@ -12,6 +12,8 @@ import torch
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from ..pyexecutor.config_utils import match_nemotron_h_layer_types
@@ -345,8 +347,7 @@ def get_spec_metadata(spec_config,
                                     max_num_tokens,
                                     spec_resource_manager=spec_resource_manager,
                                     is_draft_model=is_draft_model,
-                                    max_seq_len=max_seq_len,
-                                    num_seq_slots=num_seq_slots)
+                                    max_seq_len=max_seq_len)
     # Set here rather than in each branch below: every one-model mode needs it and
     # the per-mode constructors are easy to miss one of.
     if metadata is not None:
@@ -359,6 +360,8 @@ def get_spec_metadata(spec_config,
         # dispatcher routes to a backend that takes no min_p argument -- so the filter is
         # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
+        if num_seq_slots is not None:
+            metadata.num_seq_slots = num_seq_slots
     return metadata
 
 
@@ -368,14 +371,9 @@ def _build_spec_metadata(spec_config,
                          max_num_tokens,
                          spec_resource_manager=None,
                          is_draft_model=False,
-                         max_seq_len=262144,
-                         num_seq_slots=None):
+                         max_seq_len=262144):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
-    # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
-    # DeepSeek-V4 overlap can exceed max_num_requests.
-    num_seq_slots = (num_seq_slots
-                     if num_seq_slots is not None else max_num_requests)
     vocab_size = getattr(model_config, "vocab_size", 0)
     # Draft-model vocab size, used to gate the d2t-expanded full_draft_probs
     # buffer allocation (see SpecMetadata.prepare_rejection_sampling_buffers).
@@ -398,7 +396,6 @@ def _build_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
-            num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=getattr(spec_config, 'use_dynamic_tree', False),
@@ -430,7 +427,6 @@ def _build_spec_metadata(spec_config,
             draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=_is_effective_dynamic_tree(spec_config),
-            eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
@@ -538,6 +534,11 @@ def get_mtp_hidden_size(model_config) -> int:
     return hidden_size
 
 
+def seat_pool_or_none(model_engine) -> Optional[int]:
+    """The engine's sequence-slot pool size, or None if it publishes none."""
+    return getattr(model_engine, "max_num_seq_slots", None)
+
+
 def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
@@ -546,13 +547,16 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_num_requests = model_engine.batch_size
     max_seq_len = model_engine.max_seq_len
     max_num_tokens = model_engine.max_num_tokens
+    num_seq_slots = seat_pool_or_none(model_engine)
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         # Dynamic tree combines SpecTreeManager with MTP hidden-state slots.
         if getattr(spec_config, 'use_dynamic_tree', False):
             return MTPEagleDynamicTreeResourceManager(
@@ -561,6 +565,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
                 get_mtp_hidden_size(model_config),
                 max_num_requests,
                 sa_manager=sa_manager,
+                num_seq_slots=num_seq_slots,
             )
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             # Unified resource manager: the unified worker reads
@@ -574,6 +579,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
                 max_seq_len,
                 max_num_tokens,
                 sa_manager=sa_manager,
+                num_seq_slots=num_seq_slots,
             )
         else:
             return None
@@ -581,25 +587,30 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
             get_mtp_hidden_size(model_config),
             max_num_requests,
             sa_manager=sa_manager,
+            num_seq_slots=num_seq_slots,
         )
     if spec_dec_mode.is_eagle3_one_model() and _is_effective_dynamic_tree(
             spec_config):
-        return Eagle3OneModelDynamicTreeResourceManager(spec_config,
-                                                        max_num_requests)
+        return Eagle3OneModelDynamicTreeResourceManager(
+            spec_config, max_num_requests, num_seq_slots=num_seq_slots)
     if spec_dec_mode.is_eagle3_one_model():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
-                                                max_seq_len)
+            sa_manager = SuffixAutomatonManager(sa_cfg,
+                                                max_num_requests,
+                                                max_seq_len,
+                                                num_seq_slots=num_seq_slots)
         return Eagle3ResourceManager(
             spec_config,
             model_config.torch_dtype,
@@ -608,6 +619,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_seq_len,
             max_num_tokens,
             sa_manager=sa_manager,
+            num_seq_slots=num_seq_slots,
         )
     if spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesResourceManager(
@@ -620,13 +632,18 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_parallel_draft():
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
-            return SuffixAutomatonManager(sa_cfg, max_num_requests, max_seq_len)
+            return SuffixAutomatonManager(sa_cfg,
+                                          max_num_requests,
+                                          max_seq_len,
+                                          num_seq_slots=num_seq_slots)
         return None
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_sa():
-        return SuffixAutomatonManager(spec_config, max_num_requests,
-                                      max_seq_len)
+        return SuffixAutomatonManager(spec_config,
+                                      max_num_requests,
+                                      max_seq_len,
+                                      num_seq_slots=num_seq_slots)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None
@@ -643,26 +660,14 @@ def get_spec_decoder(
         # moves the worker's pre-sampled output around, and its buffer shapes
         # derive from sampler_args alone.
         #
-        # WORKAROUND (remove with eagle_choices in release 1.4): the static
-        # tree is the one mode where a step can accept more than
-        # max_draft_len + 1 tokens. The one-model drafter never builds the tree
-        # -- _forward_draft_loop is linear over runtime_draft_len, which for a
-        # non-linear tree is max_total_draft_tokens -- so max_draft_len only
-        # describes a tree depth that is never used, and acceptance is bounded
-        # by the wire width instead.
-        accepted_path_len = None
-        if getattr(spec_config, "eagle_choices", None):
-            accepted_path_len = sampler_args.max_total_draft_tokens + 1
         # Occurrence penalties assume the linear row layout: one logits row per
         # speculative position, so a position's prefix is the positions before it.
         # A tree's rows are nodes whose prefix is their root path instead, and
         # sibling branches must not penalize each other -- so tree modes are not
         # supported yet and are rejected at admission rather than mispenalized.
-        penalty_supported = not (getattr(spec_config, "eagle_choices", None)
-                                 or _is_effective_dynamic_tree(spec_config))
+        penalty_supported = not _is_effective_dynamic_tree(spec_config)
         fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
         return SpecSampler(sampler_args,
-                           accepted_path_len=accepted_path_len,
                            enable_penalty=spec_config.enable_penalty,
                            penalty_supported=penalty_supported,
                            fused_sampling=fused_sampling)
@@ -942,3 +947,84 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
 
     # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
     return 0
+
+
+def get_static_draft_len(model_engine: "ModelEngine") -> int:
+    """Return logical K for linear modes or total tree tokens for tree modes.
+
+    This selects the static maximum without applying a batch-size schedule or
+    changing engine state. PARD's physical buffer width is derived separately.
+    """
+    spec_config = model_engine.spec_config
+    if spec_config is None or spec_config.is_linear_tree:
+        return model_engine.max_draft_len
+    return model_engine.max_total_draft_tokens
+
+
+def update_draft_len(model_engine: "ModelEngine",
+                     scheduled_batch: "ScheduledRequests",
+                     *,
+                     draft_len: Optional[int] = None,
+                     speculation_permanently_disabled: bool = False) -> None:
+    """Resolve this batch's draft length and synchronize its draft buffers.
+
+    Normal iterations must call this before ``prepare_resources`` so KV cache
+    allocation uses the selected draft length. Dynamic and explicit lengths
+    pad or truncate generation-request buffers to a uniform width, as required
+    by CUDA graph replay and the attention kernel. Static normal decoding
+    preserves the drafter's proposals instead.
+
+    Warmup supplies the explicit length used to allocate its dummy batch,
+    including graph shapes that differ from the normal batch-size schedule.
+    """
+    if not hasattr(model_engine, 'max_draft_len'):
+        return
+
+    if speculation_permanently_disabled:
+        for request in scheduled_batch.generation_requests:
+            request.py_draft_tokens = []
+        model_engine.runtime_draft_len = 0
+        return
+
+    spec_config = model_engine.spec_config
+    if draft_len is None:
+        if (spec_config is not None
+                and spec_config.draft_len_schedule is not None
+                and spec_config.spec_dec_mode.support_dynamic_draft_len()):
+            draft_len = get_draft_len_for_batch_size(
+                spec_config.draft_len_schedule, scheduled_batch.batch_size,
+                model_engine.max_draft_len)
+        else:
+            # Static decoding preserves the proposals produced by the drafter,
+            # including requests intentionally entering with no draft tokens.
+            model_engine.runtime_draft_len = get_static_draft_len(model_engine)
+            return
+
+    draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
+    rejection_on = getattr(spec_config, "use_rejection_sampling", False)
+    for request in scheduled_batch.generation_requests:
+        current_num_draft_tokens = len(request.py_draft_tokens)
+        # A generation request without a prior proposal has no draft-probability
+        # scatter. Preserve that fact before padding so input preparation can
+        # populate the one-hot placeholder instead of reading a stale row.
+        request.py_needs_onehot_draft_probs |= (rejection_on and
+                                                current_num_draft_tokens == 0)
+        if spec_config is not None and spec_config.spec_dec_mode.is_pard():
+            # PARD carries K proposals followed by K-1 placeholders.
+            buffer_width = spec_config.get_runtime_tokens_per_gen_step(
+                draft_len) - 1
+            current_draft_len = ((current_num_draft_tokens + 1) //
+                                 2 if current_num_draft_tokens > 0 else 0)
+            draft_tokens = request.py_draft_tokens[:min(current_draft_len,
+                                                        draft_len)]
+            draft_tokens.extend([draft_buffer_pad] *
+                                (draft_len - len(draft_tokens)))
+            request.py_draft_tokens = draft_tokens + [draft_buffer_pad] * (
+                buffer_width - len(draft_tokens))
+        elif current_num_draft_tokens < draft_len:
+            request.py_draft_tokens.extend(
+                [draft_buffer_pad] * (draft_len - current_num_draft_tokens))
+        elif current_num_draft_tokens > draft_len:
+            request.py_draft_tokens = request.py_draft_tokens[:draft_len]
+
+    model_engine.runtime_draft_len = draft_len
