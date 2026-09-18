@@ -442,7 +442,7 @@ def test_nemotron35_lightning_30b(serve_test_root, tmp_path, precision):
         "--port",
         str(port),
         "--max_batch_size",
-        "1",
+        "8",
         "--max_num_tokens",
         "8192",
         "--trust_remote_code",
