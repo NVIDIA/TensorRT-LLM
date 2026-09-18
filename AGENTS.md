@@ -182,8 +182,6 @@ The `CodeRabbit Semantic Conflict Review` workflow performs best-effort semantic
 compatibility analysis for open, non-draft PRs targeting `main` or `release/**`.
 No opt-in label is needed. It compares both branches from their merge base and
 follows affected callers, contracts, configuration, and tests across files.
-It explicitly checks tests and test doubles changed on either branch against
-combined production signatures, required attributes, and return contracts.
 
 - PR creation, reopening, updates, and becoming ready evaluate the threshold;
   they do not automatically spend an AI call. An hourly scan also evaluates it.
