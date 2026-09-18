@@ -125,8 +125,8 @@ class MnnvlAllReduceWorker:
         # The point of the Ray path: the workspace is built from the TP ProcessGroup, never from
         # an MPI communicator.
         workspace = allreduce.mnnvl_allreduce.allreduce_mnnvl_workspaces[self.mapping]
-        assert isinstance(workspace["comm"], torch.distributed.ProcessGroup), (
-            f"workspace comm is {type(workspace['comm'])!r}, expected a torch ProcessGroup"
+        assert isinstance(workspace["mpi_comm"], torch.distributed.ProcessGroup), (
+            f"workspace comm is {type(workspace["mpi_comm"])!r}, expected a torch ProcessGroup"
         )
 
         eps = 1e-5

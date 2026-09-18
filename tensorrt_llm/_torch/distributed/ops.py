@@ -45,7 +45,11 @@ from tensorrt_llm.mapping import Mapping
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
-_MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+# Bytes of the full all-reduce message (tokens * hidden * ranks * element size) up to which the
+# MNNVL path uses the one-shot kernel; mirrors kOneShotSizeThreshold in thop/allreduceOp.cpp and
+# the same TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES override, so the lamport workspace is sized for it.
+_MNNVL_ONE_SHOT_THRESHOLD_BYTES = int(
+    os.environ.get("TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES", 64 * 1024 * 8 * 2))
 
 _thread_local = threading.local()
 
@@ -281,7 +285,9 @@ def get_or_scale_allreduce_mnnvl_workspace(
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
 
-    if mapping in allreduce_mnnvl_workspaces:
+    # The handle probe is a nanobind call, which dynamo cannot trace; the
+    # compiled path relies on the pre-scaled workspace being attached.
+    if mapping in allreduce_mnnvl_workspaces and not torch.compiler.is_compiling():
         workspace = allreduce_mnnvl_workspaces[mapping]
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")
@@ -293,6 +299,17 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
+        if torch.compiler.is_compiling():
+            # The scaling path allocates multicast memory over MPI/ProcessGroup
+            # and synchronizes the device - none of which can run inside a
+            # dynamo-traced region (and a post-capture rescale would leave
+            # captured graphs holding freed buffer pointers).
+            raise RuntimeError(
+                f"[MNNVL] AllReduce workspace must grow to {buffer_size_bytes} "
+                "bytes inside a torch.compile'd region, but allocation cannot "
+                "run under tracing. Pre-scale the workspace before compiling "
+                "via MNNVLAllReduce.prescale_workspace (PyTorchModelEngine "
+                "does this for max_num_tokens x hidden_size).")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
@@ -866,6 +883,28 @@ class MNNVLAllReduce(nn.Module):
             raise
         if protocol_error is not None:
             raise protocol_error
+
+    def prescale_workspace(self, max_num_tokens: int, hidden_dim: int) -> None:
+        """Grow the lamport workspace to cover the largest shard forward() can see.
+
+        forward() lazily rescales the workspace, which allocates multicast
+        memory and synchronizes the device - illegal inside a dynamo-traced
+        region. Engines that torch.compile the model must call this after the
+        model is built and before the first compiled forward so the traced
+        path is a pure lookup.
+        """
+        # One-shot calls never need more than the threshold bytes, so together
+        # with the two-shot size at max_num_tokens this covers every call.
+        workspace_size_bytes = max(
+            self.get_required_workspace_size(max_num_tokens, hidden_dim,
+                                             self.mapping.tp_size, self.dtype),
+            _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
+        # forward() rejects >= uint32 sizes before touching the workspace, so
+        # larger calls fall back to other strategies and need no headroom here.
+        uint32_aligned_max = (2**32 - 1) // (8 << 20) * (8 << 20)
+        workspace_size_bytes = min(workspace_size_bytes, uint32_aligned_max)
+        get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=workspace_size_bytes)
 
     def forward(
         self,

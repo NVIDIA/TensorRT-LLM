@@ -27,10 +27,6 @@ class AsyncLLM(LLM):
             per_worker_gpu_share=per_worker_gpu_share,
         )
 
-        # WAR: RL integration needs to use NCCL AllReduce for TP>1 due to a bug in TRTLLM's AllReduce
-        # which will cause convergence issue when using multiple rollout instances.
-        kwargs["allreduce_strategy"] = "NCCL"
-
         if "ray_worker_extension_cls" not in kwargs:
             kwargs["ray_worker_extension_cls"] = "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension"
 
