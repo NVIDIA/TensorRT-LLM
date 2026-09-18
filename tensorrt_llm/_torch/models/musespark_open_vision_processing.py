@@ -58,7 +58,26 @@ temporal clip, and each clip carries the timestamp of its *first* frame.
 a 96-frame video really does produce ``48 * 144 = 6912`` video rows. Matching
 the reference matters more here than honouring the declared cap, but the cap is
 what the reference reports to its scheduler, so an encoder budget sized from it
-will be ~68% short.
+will be ~68% short. The two numbers are therefore NOT alternatives: 4096 is a
+per-item cap that only the scheduler sees, and the per-frame budget is what the
+canvas is actually fitted to.
+
+Where the per-frame budget comes from
+-------------------------------------
+144 is a code default, not a checkpoint value -- no export has ever declared it,
+and it is pinned here because it reproduces the reference runtime token for
+token (``TestOracleExpansion::test_video_prompt_expansion`` replays a captured
+reference prompt whose video expands to ``48 * 144 = 6912`` rows).
+
+Newer exports do declare it. They drop ``config.json ->
+vision_config.navit_config`` and ship a HuggingFace-style
+``processor_config.json`` instead, renaming the same knobs on the way:
+``max_num_image_tokens`` -> ``image_processor.max_image_tokens``, and a
+per-frame video budget that never had a config home before as
+``video_processor.max_video_frame_tokens``. :func:`with_processor_config` reads
+that file so the checkpoint's own declaration governs;
+:data:`_PROCESSOR_ALIASES` is the rename map, and a checkpoint that ships no
+such file keeps the defaults above unchanged.
 
 Placeholder expansion
 ---------------------
@@ -101,20 +120,28 @@ top-level model config, a plain dict, or ``None`` for the checkpoint defaults;
 
 from __future__ import annotations
 
+import copy
 import itertools
+import json
 import math
+import os
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 
+from tensorrt_llm.logger import logger
+
 __all__ = [
     "VISION_TOKEN_IDS",
     "RGBA_BACKGROUND_COLOR",
+    "PROCESSOR_CONFIG_FILE",
     "MuseSparkOpenPreprocessConfig",
+    "processor_config_overrides",
+    "with_processor_config",
     "ExpandedPrompt",
     "VisionPreprocessError",
     "least_distortion_fit",
@@ -268,6 +295,112 @@ def _lookup(node: Any, name: str, default: Any = None) -> Any:
 
 def _cfg(cfg: Any) -> MuseSparkOpenPreprocessConfig:
     return MuseSparkOpenPreprocessConfig.from_config(cfg)
+
+
+PROCESSOR_CONFIG_FILE = "processor_config.json"
+
+# HuggingFace-style spellings in ``processor_config.json``, per block, mapped
+# onto this module's names. Only keys this module acts on appear here; a key
+# outside the map is ignored rather than guessed at.
+_PROCESSOR_ALIASES: dict[str, dict[str, str]] = {
+    "image_processor": {
+        "max_image_tokens": "max_num_image_tokens",
+    },
+    "video_processor": {
+        "max_video_frame_tokens": "max_num_tokens_per_frame",
+        "fps": "sampling_fps",
+    },
+}
+
+# Declared by newer exports and deliberately NOT adopted, each with the reason.
+# Recorded here rather than left as silence, so the next reader finds out that
+# ignoring them was a decision and what would have to change to revisit it.
+_PROCESSOR_KEYS_NOT_ADOPTED: dict[str, str] = {
+    # 600 frames at a 256-row budget claims 300 * 256 = 76 800 decoder rows for
+    # a single video, against a per-item cap (max_num_video_tokens) that this
+    # module deliberately does not enforce. Raising the frame cap is only safe
+    # once that cap question is settled, which is a separate decision.
+    "num_frames": "would raise num_frames_per_video past what any cap bounds",
+    # Changes the timestamp TEXT inside the expansion, so it moves prompt
+    # tokens. The only captured reference expansion pins the current
+    # one-decimal form; nothing measures the declared two-decimal form.
+    "frame_timestamp_format": "moves prompt tokens; no reference capture for it",
+}
+
+
+def processor_config_overrides(model_path: str | os.PathLike[str] | None) -> dict[str, Any]:
+    """Preprocessing values ``model_path``'s ``processor_config.json`` declares.
+
+    Returns them under this module's names, ready to hand to
+    :meth:`MuseSparkOpenPreprocessConfig.from_config`. An absent or unreadable
+    file yields ``{}`` -- a checkpoint that ships no processor config is the
+    normal case for older exports and must not become a hard failure.
+    """
+    if not model_path:
+        return {}
+    path = os.path.join(str(model_path), PROCESSOR_CONFIG_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            declared = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(declared, dict):
+        return {}
+
+    overrides: dict[str, Any] = {}
+    for block, aliases in _PROCESSOR_ALIASES.items():
+        section = declared.get(block)
+        if not isinstance(section, dict):
+            continue
+        for declared_name, local_name in aliases.items():
+            if declared_name in section and section[declared_name] is not None:
+                overrides[local_name] = section[declared_name]
+    return overrides
+
+
+def with_processor_config(vision_config: Any, model_path: str | os.PathLike[str] | None) -> Any:
+    """``vision_config`` carrying whatever the checkpoint declares about preprocessing.
+
+    The open re-export moved the preprocessing knobs out of ``config.json``
+    (dropping ``vision_config.navit_config`` wholesale) into
+    ``processor_config.json``, so a config object built from ``config.json``
+    alone no longer sees them and every value silently falls back to this
+    module's defaults. Reading them here is what lets the CHECKPOINT decide its
+    own supported preprocessing rather than a constant in this file.
+
+    Returns ``vision_config`` UNCHANGED, same object, when the checkpoint
+    declares nothing -- so exports without a ``processor_config.json`` keep
+    byte-identical behaviour and stay comparable with captured reference runs.
+    Otherwise returns a copy carrying the declared values; the original is not
+    mutated, because the tower and the weight mapper share it.
+
+    Accepts either config shape. The serve path hands over the checkpoint's
+    ``MuseSparkOpenVisionConfig`` (a mutable attribute bag), but an already
+    resolved :class:`MuseSparkOpenPreprocessConfig` is frozen AND short-circuits
+    :meth:`MuseSparkOpenPreprocessConfig.from_config`, so attaching attributes to
+    it would both raise and, if it did not, be ignored -- it has to be rebuilt
+    with :func:`dataclasses.replace` instead.
+    """
+    overrides = processor_config_overrides(model_path)
+    if not overrides:
+        return vision_config
+    if isinstance(vision_config, MuseSparkOpenPreprocessConfig):
+        fields = {
+            name: value
+            for name, value in overrides.items()
+            if name in vision_config.__dataclass_fields__
+        }
+        enriched = replace(vision_config, **fields)
+    else:
+        enriched = copy.copy(vision_config)
+        for name, value in overrides.items():
+            setattr(enriched, name, value)
+    logger.info(
+        "MuseSparkOpen: preprocessing values taken from %s: %s",
+        PROCESSOR_CONFIG_FILE,
+        ", ".join(f"{k}={v!r}" for k, v in sorted(overrides.items())),
+    )
+    return enriched
 
 
 @dataclass

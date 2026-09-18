@@ -18,6 +18,7 @@ wrapper hands the decoder the same ``input_ids`` it received, no
 after a lookup" -- the same object.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -321,14 +322,31 @@ class _StubTokenizer:
         return ids
 
 
-def _build_processor():
+def _build_processor(model_path="/nonexistent/checkpoint"):
     from tensorrt_llm._torch.models.modeling_musespark_open_omni import MuseSparkOpenOmniInputProcessor
 
     return MuseSparkOpenOmniInputProcessor(
-        model_path="/nonexistent/checkpoint",
+        model_path=model_path,
         config=_tiny_vision_config(),
         tokenizer=_StubTokenizer(),
     )
+
+
+def _patch_items(data):
+    """The `(modality, item)` pairs of `get_dummy_mm_data` that carry patches.
+
+    The returned mapping is deliberately not uniform: a multi-modality call
+    also carries an `mm_item_order` manifest (a list, so that a mixed request
+    can be replayed in prompt order) and an audio entry holds waveforms rather
+    than pixel patches. Only the vision entries have a grid and a
+    `pixel_values` tensor, so only they can answer the grid-vs-allocation
+    questions below.
+    """
+    return [
+        (modality, item)
+        for modality, item in data.items()
+        if isinstance(item, dict) and "pixel_values" in item
+    ]
 
 
 def test_the_input_processor_can_be_instantiated():
@@ -570,6 +588,66 @@ def test_a_missing_item_is_an_error_not_a_silent_drop():
 
 
 # --------------------------------------------------------------------------
+# Both spellings of a media slot
+#
+# The two shipped checkpoints mark a media slot differently: the earlier
+# template writes the plain "<image>" / "<video>" / "<audio>", the open-export
+# template writes "<|patch|>" / "<|video|>" / "<|audio|>". A scan that knows
+# only one spelling finds zero markers against the other template, so every
+# media request dies with "prompt has 0 <modality> markers". Both spellings are
+# accepted and whichever the active template emitted is the one that matches.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "modality, marker, expansion",
+    [
+        ("image", "<|patch|>", [10, 11, 12]),
+        ("video", "<|video|>", [20, 21]),
+        ("audio", "<|audio|>", [30, 31]),
+    ],
+)
+def test_the_open_export_marker_spelling_is_spliced(modality, marker, expansion):
+    processor = _build_processor()
+    out = _spliced(processor, f"describe {marker} this", [(modality, expansion)])
+    assert expansion == out[1:-1], f"{marker} was not spliced as a {modality} marker"
+
+
+def test_both_marker_spellings_keep_prompt_order():
+    """Items land on markers in TEXT order, whichever spelling each one used."""
+    processor = _build_processor()
+    out = _spliced(
+        processor,
+        "<|video|> and <image> that",
+        [("image", [30, 31]), ("video", [20, 21])],
+    )
+    assert out == [20, 21, 902, 30, 31, 903]
+
+
+def test_the_open_export_marker_is_consumed_whole():
+    """The cursor advances past the marker it MATCHED, not a fixed length.
+
+    With one hard-coded marker length the scan leaves the tail of a longer
+    spelling behind and re-tokenizes it as ordinary text, so adjacent markers
+    splice in the wrong place.
+    """
+    processor = _build_processor()
+    out = _spliced(processor, "<|patch|><|patch|>", [("image", [10]), ("image", [11])])
+    assert out == [10, 11]
+
+
+def test_an_open_export_audio_prompt_is_not_read_as_zero_markers():
+    """The exact failure the released checkpoint's template produced.
+
+    Before both spellings were accepted, an audio request rendered by the
+    open-export template contained no "<audio>" anywhere, so the splice saw
+    zero markers against one supplied item and every audio request failed --
+    which would have taken the whole audio suite down.
+    """
+    processor = _build_processor()
+    out = _spliced(processor, "<|audio|>transcribe", [("audio", [30, 31])])
+    assert out[:2] == [30, 31]
+
+
+# --------------------------------------------------------------------------
 # The contracts the runtime calls on the hashing path
 #
 # These four are called once per media item per request, and every exception
@@ -622,6 +700,42 @@ def test_the_framework_can_count_a_video():
     assert counted == num_placeholder_rows(grid, processor.config.vision_config)
 
 
+def test_the_checkpoints_declared_video_budget_reaches_the_count(tmp_path):
+    """The wiring, at the call the serve path actually makes.
+
+    A checkpoint that declares `max_video_frame_tokens` in
+    `processor_config.json` must have that budget govern the token count, not
+    the module default. Counting is where it matters first: the scheduler and
+    the KV-cache profiler size their work from this number before a single
+    pixel is preprocessed, so a count taken at the wrong budget mis-sizes the
+    request even when the preprocessing that follows is correct.
+    """
+    import json  # noqa: PLC0415
+
+    from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
+        MuseSparkOpenOmniInputProcessor,
+    )
+
+    # 4 frames at 1 fps survive sampling whole and pair into 2 clips. The tiny
+    # config's token patch is 4 px, so a 64x64 frame is exactly 16x16 cells --
+    # over the 144 default (shrunk to 12x12) and exactly on a 256 declaration.
+    frames = [_pil(64, 64) for _ in range(4)]
+    metadata = {"fps": 1.0}
+
+    default_count = _build_processor().get_num_tokens_per_video(
+        video=frames, video_metadata=metadata
+    )
+    assert default_count == 2 * 144, "two clips at the 144-token default"
+
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps({"video_processor": {"max_video_frame_tokens": 256}})
+    )
+    declared = MuseSparkOpenOmniInputProcessor(
+        model_path=str(tmp_path), config=_tiny_vision_config(), tokenizer=_StubTokenizer()
+    )
+    assert declared.get_num_tokens_per_video(video=frames, video_metadata=metadata) == 2 * 256
+
+
 def test_counting_a_video_without_a_frame_rate_says_why():
     """No safe default: 2 fps out of the source rate decides the frame count."""
     processor = _build_processor()
@@ -632,17 +746,20 @@ def test_counting_a_video_without_a_frame_rate_says_why():
 def test_the_multimodal_ids_do_not_route_through_the_absent_processor():
     """The base class would look for `self.processor.mm_token_ids` and raise.
 
-    Only the two embed-carrying ids belong here, and no specials: an image is
-    one unbroken run of <|patch|>, and a video's per-clip timestamp text is
-    ordinary text that no id set can cover.
+    Only the embed-carrying ids belong here, and no specials: an image is one
+    unbroken run of <|patch|>, a video's per-clip timestamp text is ordinary
+    text that no id set can cover, and the audio delimiters
+    (<|soft_audio_start|> / <|soft_audio_end|>) keep their own text embeddings
+    while the interior <|audio|> run carries the encoder rows.
     """
+    from tensorrt_llm._torch.models.musespark_open_audio import AUDIO_TOKEN_IDS  # noqa: PLC0415
     from tensorrt_llm._torch.models.musespark_open_vision_processing import (  # noqa: PLC0415
         VISION_TOKEN_IDS,
     )
 
     processor = _build_processor()
     assert sorted(processor.get_mm_token_ids().tolist()) == sorted(
-        [VISION_TOKEN_IDS["patch"], VISION_TOKEN_IDS["video"]]
+        [VISION_TOKEN_IDS["patch"], VISION_TOKEN_IDS["video"], AUDIO_TOKEN_IDS["audio"]]
     )
     assert processor.get_mm_special_token_ids() is None
 
@@ -660,7 +777,9 @@ def test_the_dummy_grid_describes_exactly_the_patches_it_allocates():
     data = processor.get_dummy_mm_data(
         max_num_encoder_tokens=256, mm_counts={"image": 2, "video": 1}, dtype=torch.bfloat16
     )
-    for modality, item in data.items():
+    patch_items = _patch_items(data)
+    assert [modality for modality, _ in patch_items] == ["image", "video"]
+    for modality, item in patch_items:
         grid = item[f"{modality}_grid_thw"]
         described = int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum())
         allocated = item["pixel_values"].shape[0]
@@ -950,9 +1069,11 @@ def test_the_dummy_batch_fits_the_aggregate_encoder_budget():
         data = processor.get_dummy_mm_data(
             max_num_encoder_tokens=budget, mm_counts=counts, dtype=torch.bfloat16
         )
-        allocated = sum(item["pixel_values"].shape[0] for item in data.values())
+        patch_items = _patch_items(data)
+        assert [modality for modality, _ in patch_items] == list(counts)
+        allocated = sum(item["pixel_values"].shape[0] for _, item in patch_items)
         assert allocated <= budget, f"{counts}: allocated {allocated} patches against {budget}"
-        for modality, item in data.items():
+        for modality, item in patch_items:
             grid = item[f"{modality}_grid_thw"]
             described = int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum())
             assert described == item["pixel_values"].shape[0]
@@ -966,6 +1087,50 @@ def test_the_model_asks_the_loaders_for_pil():
     prefs = processor.get_preferred_media_io_kwargs()
     assert prefs["image"]["format"] == "pil"
     assert prefs["video"]["format"] == "pil"
+
+
+def test_the_model_declares_its_own_video_sampling():
+    """The video loader defaults to `num_frames=10, fps=30` -- 10 frames per
+    video regardless of length -- while this model's sampling policy is
+    `sampling_fps` capped at `num_frames_per_video`. Without declaring both
+    here, a bare serve boot hands the model 10 frames per video with no error
+    anywhere: a silent quality collapse on video inputs."""
+    prefs = _build_processor().get_preferred_media_io_kwargs()
+    assert prefs["video"]["num_frames"] == 96
+    assert prefs["video"]["fps"] == 2.0
+    # Frame sampling is a video concept; the image loader takes neither key.
+    assert set(prefs["image"]) == {"format"}
+
+
+def test_video_sampling_prefs_follow_the_processor_config(tmp_path):
+    """A checkpoint-declared sampling rate must reach the loader defaults, the
+    same way the frame token budget reaches the row math: through
+    `with_processor_config`, so the checkpoint decides its own policy."""
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps({"video_processor": {"fps": 1.0, "max_video_frame_tokens": 256}})
+    )
+    prefs = _build_processor(model_path=str(tmp_path)).get_preferred_media_io_kwargs()
+    assert prefs["video"]["fps"] == 1.0
+    # The frame cap is deliberately not read from processor_config.json
+    # (`num_frames` is in `_PROCESSOR_KEYS_NOT_ADOPTED`); it stays at the
+    # module policy.
+    assert prefs["video"]["num_frames"] == 96
+
+
+def test_a_null_sampling_fps_omits_the_fps_key():
+    """`sampling_fps=None` is a legal preprocess-config value meaning "no
+    rate-based sampling". Emitting `fps=None` would override the loader's
+    built-in with a value its arithmetic cannot take; omitting the key leaves
+    the frame cap as the only bound."""
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.models.musespark_open_vision_processing import MuseSparkOpenPreprocessConfig
+
+    processor = _build_processor()
+    processor._vision_config = replace(MuseSparkOpenPreprocessConfig(), sampling_fps=None)
+    prefs = processor.get_preferred_media_io_kwargs()
+    assert "fps" not in prefs["video"]
+    assert prefs["video"]["num_frames"] == 96
 
 
 # --------------------------------------------------------------------------
@@ -1188,16 +1353,18 @@ def test_the_mixin_sits_ahead_of_pretrainedmodel_in_the_mro():
     assert mro.index(MultimodalModelMixin) < mro.index(PreTrainedModel)
 
 
-def test_the_merge_hooks_are_the_raw_embedding_and_the_two_vision_ids():
+def test_the_merge_hooks_are_the_raw_embedding_and_the_embed_carrying_ids():
     """The two invariants that make the mixin's merge identical to the old one.
 
     `fuse_input_embeds` with non-None `mm_token_ids` embeds the whole prompt
-    through `embedding_layer` and then overwrites the vision rows. So the merge
+    through `embedding_layer` and then overwrites the media rows. So the merge
     is unchanged exactly as long as (i) `text_embedding_layer` is the decoder's
     RAW `Embedding` -- handing it `embed_norm` would norm the text twice, which
     is not a no-op in bf16 at small row scale -- and (ii)
-    `multimodal_token_ids` names the same two ids the old `mm_token_ids` did.
+    `multimodal_token_ids` names exactly the ids that carry encoder rows, in
+    the order the processor publishes them.
     """
+    from tensorrt_llm._torch.models.musespark_open_audio import AUDIO_TOKEN_IDS  # noqa: PLC0415
     from tensorrt_llm._torch.models.musespark_open_vision_processing import (  # noqa: PLC0415
         VISION_TOKEN_IDS,
     )
@@ -1211,7 +1378,11 @@ def test_the_merge_hooks_are_the_raw_embedding_and_the_two_vision_ids():
     assert wrapper.text_embedding_layer is not llm.model.embed_norm
 
     ids = wrapper.multimodal_token_ids
-    assert ids.tolist() == [VISION_TOKEN_IDS["patch"], VISION_TOKEN_IDS["video"]]
+    assert ids.tolist() == [
+        VISION_TOKEN_IDS["patch"],
+        VISION_TOKEN_IDS["video"],
+        AUDIO_TOKEN_IDS["audio"],
+    ]
     # The old spelling stays as an alias for one release: the executor prefers
     # the new name and falls back to this one.
     assert wrapper.mm_token_ids.tolist() == ids.tolist()

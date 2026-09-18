@@ -57,10 +57,12 @@ from tensorrt_llm._torch.models.musespark_open_vision_processing import (
     patchify,
     preprocess_image,
     preprocess_video,
+    processor_config_overrides,
     resize_lanczos,
     sample_video_frame_indices,
     to_rgb,
     video_placeholder_ids,
+    with_processor_config,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -416,6 +418,134 @@ class TestPreprocessVideo:
         # 64x64 ties (2,2) against (3,3); the reference takes (3,3) -> 84x84.
         _, grid_thw, _ = preprocess_video([textured(64, 64)] * 2, 1.0, CFG)
         assert grid_thw == (1, 6, 6)
+
+
+class TestProcessorConfigDeclaration:
+    """The checkpoint's own ``processor_config.json`` decides the budgets.
+
+    Exports that dropped ``config.json -> vision_config.navit_config`` declare
+    the preprocessing knobs in a HuggingFace-style ``processor_config.json``
+    under different names. Before this was read, every one of those values
+    silently fell back to this module's defaults -- including the per-frame
+    video token budget, where the default and the declaration differ and the
+    difference is a 1.78x change in how many decoder rows a video costs.
+    """
+
+    DECLARED_PER_FRAME = 256
+
+    @staticmethod
+    def _checkpoint(tmp_path, video=None, image=None):
+        body = {"processor_class": "MuseSparkProcessor"}
+        if video is not None:
+            body["video_processor"] = video
+        if image is not None:
+            body["image_processor"] = image
+        (tmp_path / "processor_config.json").write_text(json.dumps(body))
+        return tmp_path
+
+    def test_a_checkpoint_without_the_file_changes_nothing(self, tmp_path):
+        """The identity case, and the reason captured reference runs stay valid.
+
+        Older exports ship no ``processor_config.json``. They must resolve to
+        byte-identical preprocessing, so the same object comes back -- not a
+        copy that merely happens to compare equal.
+        """
+        config = MuseSparkOpenPreprocessConfig()
+        assert processor_config_overrides(tmp_path) == {}
+        assert with_processor_config(config, tmp_path) is config
+        assert with_processor_config(config, None) is config
+        assert with_processor_config(config, "/nonexistent/checkpoint") is config
+
+    def test_declared_per_frame_budget_is_read_under_its_own_name(self, tmp_path):
+        root = self._checkpoint(
+            tmp_path,
+            video={"max_video_frame_tokens": self.DECLARED_PER_FRAME, "fps": 2.0},
+            image={"max_image_tokens": 4096},
+        )
+        assert processor_config_overrides(root) == {
+            "max_num_tokens_per_frame": self.DECLARED_PER_FRAME,
+            "sampling_fps": 2.0,
+            "max_num_image_tokens": 4096,
+        }
+
+    def test_the_declaration_reaches_the_resolved_config(self, tmp_path):
+        root = self._checkpoint(tmp_path, video={"max_video_frame_tokens": self.DECLARED_PER_FRAME})
+        resolved = MuseSparkOpenPreprocessConfig.from_config(
+            with_processor_config(MuseSparkOpenPreprocessConfig(), root)
+        )
+        assert resolved.max_num_tokens_per_frame == self.DECLARED_PER_FRAME
+        assert CFG.max_num_tokens_per_frame == 144, "the default must not move"
+
+    def test_the_declared_budget_changes_the_canvas_it_is_fitted_to(self, tmp_path):
+        """The measurable consequence, not just the plumbing.
+
+        Four 448x448 frames at 1 fps make two clips. 448x448 is exactly 16x16
+        cells of 28 px, so a 256-cell budget passes the frame through at native
+        resolution while the 144 default shrinks it to 12x12.
+        """
+        frames = [textured(448, 448)] * 4
+        _, default_grid, _ = preprocess_video(frames, 1.0, CFG)
+        assert default_grid == (2, 24, 24)
+        assert num_placeholder_rows(default_grid, CFG) == 2 * 144
+
+        root = self._checkpoint(tmp_path, video={"max_video_frame_tokens": self.DECLARED_PER_FRAME})
+        declared = with_processor_config(MuseSparkOpenPreprocessConfig(), root)
+        _, grid, _ = preprocess_video(frames, 1.0, declared)
+        assert grid == (2, 32, 32)
+        assert num_placeholder_rows(grid, declared) == 2 * self.DECLARED_PER_FRAME
+
+    def test_undeclared_keys_keep_their_defaults(self, tmp_path):
+        """Reading the file is not adopting all of it.
+
+        ``num_frames`` and ``frame_timestamp_format`` are declared by the same
+        block and deliberately not mapped; this pins that so a later widening
+        of the alias map is a deliberate edit rather than a side effect.
+        """
+        root = self._checkpoint(
+            tmp_path,
+            video={
+                "max_video_frame_tokens": self.DECLARED_PER_FRAME,
+                "num_frames": 600,
+                "frame_timestamp_format": "Time: {timestamp:.2f}s",
+            },
+        )
+        resolved = MuseSparkOpenPreprocessConfig.from_config(
+            with_processor_config(MuseSparkOpenPreprocessConfig(), root)
+        )
+        assert resolved.num_frames_per_video == CFG.num_frames_per_video == 96
+        assert resolved.video_frame_timestamp_format == CFG.video_frame_timestamp_format
+
+    def test_every_skipped_key_is_named_with_a_reason(self):
+        """Silence is not a decision.
+
+        A key the checkpoint declares and this module ignores has to say why,
+        and no key may be in both lists -- otherwise "we ignore it" and "we
+        read it" can drift apart without anything noticing.
+        """
+        from tensorrt_llm._torch.models.musespark_open_vision_processing import (
+            _PROCESSOR_ALIASES,
+            _PROCESSOR_KEYS_NOT_ADOPTED,
+        )
+
+        adopted = {name for block in _PROCESSOR_ALIASES.values() for name in block}
+        assert not adopted & set(_PROCESSOR_KEYS_NOT_ADOPTED)
+        assert set(_PROCESSOR_KEYS_NOT_ADOPTED) == {"num_frames", "frame_timestamp_format"}
+        assert all(_PROCESSOR_KEYS_NOT_ADOPTED.values())
+
+    def test_a_malformed_file_is_not_fatal(self, tmp_path):
+        """A checkpoint must not become unloadable because this file is bad."""
+        (tmp_path / "processor_config.json").write_text("{ not json")
+        assert processor_config_overrides(tmp_path) == {}
+        (tmp_path / "processor_config.json").write_text('["not a mapping"]')
+        assert processor_config_overrides(tmp_path) == {}
+
+    def test_the_original_config_object_is_not_mutated(self, tmp_path):
+        """The tower and the weight mapper share the config this came from."""
+        root = self._checkpoint(tmp_path, video={"max_video_frame_tokens": self.DECLARED_PER_FRAME})
+        config = MuseSparkOpenPreprocessConfig()
+        enriched = with_processor_config(config, root)
+        assert enriched is not config
+        assert config.max_num_tokens_per_frame == 144
 
 
 class TestPlaceholderIds:

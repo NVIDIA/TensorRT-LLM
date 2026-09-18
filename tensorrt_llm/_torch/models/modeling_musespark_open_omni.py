@@ -91,6 +91,7 @@ from .musespark_open_audio import (
 from .musespark_open_vision import MuseSparkOpenNaViTVisionTower
 from .musespark_open_vision_processing import (
     VISION_TOKEN_IDS,
+    MuseSparkOpenPreprocessConfig,
     image_placeholder_ids,
     least_distortion_fit,
     num_placeholder_rows,
@@ -98,10 +99,12 @@ from .musespark_open_vision_processing import (
     preprocess_video,
     video_grid_thw,
     video_placeholder_ids,
+    with_processor_config,
 )
 
 __all__ = [
     "MEDIA_MARKERS",
+    "MEDIA_MARKER_ALIASES",
     "MuseSparkOpenOmniForConditionalGeneration",
     "MuseSparkOpenOmniInputProcessor",
     "MuseSparkOpenVisionEncoder",
@@ -118,6 +121,24 @@ __all__ = [
 # audio_url content parts to the literal string "<audio>" and escapes any
 # caller-typed occurrence to "< audio>".
 MEDIA_MARKERS = {"image": "<image>", "video": "<video>", "audio": "<audio>"}
+
+# The same slot, spelled the other way. The open-export checkpoint ships a
+# chat template that writes the control-token spellings -- "<|patch|>",
+# "<|video|>", "<|audio|>" -- where the earlier template wrote the plain
+# strings above, while still escaping the plain forms out of caller text. A
+# scan that knows only one spelling finds zero markers against the other
+# template and every media request fails with "prompt has 0 <modality>
+# markers", so both spellings are accepted and whichever the active template
+# emits is the one that matches.
+#
+# MEDIA_MARKERS stays the canonical modality -> placeholder map (it is what
+# the input-processor registration publishes and what the modality key set is
+# taken from); this is the scan alphabet only.
+MEDIA_MARKER_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "image": (MEDIA_MARKERS["image"], "<|patch|>"),
+    "video": (MEDIA_MARKERS["video"], "<|video|>"),
+    "audio": (MEDIA_MARKERS["audio"], "<|audio|>"),
+}
 
 #: Per-item audio token budget for the runtime profiler, in decoder rows
 #: (1 row = 80 ms, so 1024 rows = 81.92 s per clip). Neither reference has an
@@ -160,7 +181,13 @@ class MuseSparkOpenOmniInputProcessor(BaseMultimodalInputProcessor, BaseMultimod
         self._config = config
         self._tokenizer = tokenizer
         self._model_path = model_path
-        self._vision_config = config.vision_config
+        # `config.json` is not the whole preprocessing config on newer exports:
+        # they drop `vision_config.navit_config` and declare the same knobs in
+        # `processor_config.json` under HuggingFace spellings. Without this the
+        # per-frame video token budget silently falls back to the module
+        # default on a checkpoint that declares its own. Returns the same
+        # object for exports that ship no such file.
+        self._vision_config = with_processor_config(config.vision_config, model_path)
         # Audio is gated on the config exactly as both references gate it:
         # `audio_perception_modality_args.input_mode == "wav"`. The other keys
         # in that dict (`encoder_family`, `next_audio_token`,
@@ -399,17 +426,38 @@ class MuseSparkOpenOmniInputProcessor(BaseMultimodalInputProcessor, BaseMultimod
         return caps
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        """Ask the loaders for PIL, which is what the preprocessing is written against.
+        """Ask the loaders for PIL and for the model's own video sampling.
 
-        The framework's default is ``pt`` -- ``ToTensor()`` output, a float32
-        CHW tensor in 0..1 -- and this model's preprocessing needs PIL:
-        ``to_rgb`` composites RGBA by image *mode* and ``resize_lanczos`` calls
-        ``Image.resize``. Declaring the format is the framework's own mechanism
-        for that and it avoids a lossy-looking round-trip through 0..1 floats
-        on every request. ``_to_pil`` still normalizes whatever arrives,
-        because a per-request ``media_io_kwargs`` override outranks this.
+        Format: the framework's default is ``pt`` -- ``ToTensor()`` output, a
+        float32 CHW tensor in 0..1 -- and this model's preprocessing needs
+        PIL: ``to_rgb`` composites RGBA by image *mode* and ``resize_lanczos``
+        calls ``Image.resize``. Declaring the format is the framework's own
+        mechanism for that and it avoids a lossy-looking round-trip through
+        0..1 floats on every request. ``_to_pil`` still normalizes whatever
+        arrives, because a per-request ``media_io_kwargs`` override outranks
+        this.
+
+        Video sampling: ``VideoMediaIO`` defaults to ``num_frames=10,
+        fps=30`` -- 10 frames per video regardless of length -- while this
+        model's declared policy is ``sampling_fps`` capped at
+        ``num_frames_per_video`` (2 fps / 96 frames on the shipped
+        checkpoint, ``processor_config.json`` values included via
+        ``with_processor_config``). Without declaring it here, a bare
+        ``trtllm-serve`` boot silently hands the model 10 frames per video.
+        The loader samples ``min(num_frames, floor(duration * fps))``
+        uniformly, which is exactly the model's own policy. A server-level
+        ``--media_io_kwargs`` and per-request kwargs still override these
+        defaults (``VideoMediaIO.merge_kwargs`` also drops the unmentioned
+        ``fps``/``num_frames`` partner when an override sets only one).
         """
-        return {"image": {"format": "pil"}, "video": {"format": "pil"}}
+        cfg = MuseSparkOpenPreprocessConfig.from_config(self._vision_config)
+        video: Dict[str, Any] = {
+            "format": "pil",
+            "num_frames": cfg.num_frames_per_video,
+        }
+        if cfg.sampling_fps:
+            video["fps"] = cfg.sampling_fps
+        return {"image": {"format": "pil"}, "video": video}
 
     def get_dummy_mm_data(self, *, max_num_encoder_tokens: int, mm_counts, dtype):
         """Worst-case encoder tensors, built directly rather than via PIL.
@@ -614,9 +662,13 @@ class MuseSparkOpenOmniInputProcessor(BaseMultimodalInputProcessor, BaseMultimod
         tokenized separately. Two wrong ways to do this, both tried:
 
         * Matching the special ``<|image|>`` 200090 in the id stream finds
-          nothing. The template emits the plain string ``<image>``
-          (``render_content`` in chat_template.jinja) and the tokenizer has
-          no added token for it, so 200090 never appears in a templated prompt.
+          nothing. Neither shipped template emits it: the earlier one writes the
+          plain string ``<image>`` (``render_content`` in
+          chat_template.jinja), for which the tokenizer has no added token,
+          and the open-export one writes ``<|patch|>``. So 200090 never appears
+          in a templated prompt either way. Which spelling a prompt carries is a
+          property of the checkpoint's template, which is why the scan accepts
+          both (``MEDIA_MARKER_ALIASES``) instead of assuming one.
         * Matching ``tokenizer.encode("<image>")`` in the id stream finds
           nothing either as soon as two media are adjacent, which is the norm
           rather than an edge case -- every MindCube item carries 2 to 4 images
@@ -649,7 +701,7 @@ class MuseSparkOpenOmniInputProcessor(BaseMultimodalInputProcessor, BaseMultimod
         used = {modality: 0 for modality in MEDIA_MARKERS}
         position = 0
         while position < len(text):
-            modality, start = self._next_marker(text, position)
+            modality, start, marker = self._next_marker(text, position)
             if modality is None:
                 break
             out.extend(self._encode(text[position:start]))
@@ -662,7 +714,7 @@ class MuseSparkOpenOmniInputProcessor(BaseMultimodalInputProcessor, BaseMultimod
             out.extend(pending[modality][index])
             item_order.append({"modality": modality, "index": index})
             used[modality] = index + 1
-            position = start + len(MEDIA_MARKERS[modality])
+            position = start + len(marker)
         out.extend(self._encode(text[position:]))
 
         for modality, count in used.items():
@@ -673,18 +725,26 @@ class MuseSparkOpenOmniInputProcessor(BaseMultimodalInputProcessor, BaseMultimod
                 )
         return out, item_order
 
-    def _next_marker(self, text: str, position: int) -> Tuple[Optional[str], int]:
-        """The first marker at or after ``position``, and where it starts.
+    def _next_marker(self, text: str, position: int) -> Tuple[Optional[str], int, str]:
+        """The first marker at or after ``position``: modality, start, spelling.
 
-        Both modalities are searched together and the earliest wins, so an
+        Every modality is searched together and the earliest wins, so an
         interleaved prompt keeps its media in the order they were written.
+        Every accepted spelling of a modality is searched, because which one
+        appears depends on the checkpoint's chat template; the matched spelling
+        comes back so the caller advances past the marker it actually found.
+        On a tie the longer spelling wins, so a marker is never consumed as a
+        prefix of itself.
         """
-        best_modality, best_start = None, len(text)
-        for modality, marker in MEDIA_MARKERS.items():
-            found = text.find(marker, position)
-            if found != -1 and found < best_start:
-                best_modality, best_start = modality, found
-        return best_modality, best_start
+        best_modality, best_start, best_marker = None, len(text), ""
+        for modality, markers in MEDIA_MARKER_ALIASES.items():
+            for marker in markers:
+                found = text.find(marker, position)
+                if found == -1:
+                    continue
+                if found < best_start or (found == best_start and len(marker) > len(best_marker)):
+                    best_modality, best_start, best_marker = modality, found, marker
+        return best_modality, best_start, best_marker
 
     def _encode(self, text: str) -> List[int]:
         """Tokenize a text segment, through the lazily-built tokenizer."""

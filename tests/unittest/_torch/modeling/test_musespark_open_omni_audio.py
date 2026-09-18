@@ -299,13 +299,36 @@ def _golden_files():
 
 
 def _load_real_tower():
-    """Build the tower and load the 72 audio tensors from the checkpoint shards."""
+    """Build the tower and load the 72 audio tensors from the checkpoint shards.
+
+    Works on either checkpoint layout. The source export names the tower
+    ``modalities.soft_audio_perception.interaction_encoder.*``; the open (HF
+    re-export) layout names it ``model.audio_tower.*``. Filtering on the source
+    prefix alone finds ZERO tensors in an open-format checkpoint and the test
+    dies at the count assertion before it ever compares an embedding, so the
+    layout is resolved through the tier's own mapper rather than a second
+    hard-coded name table -- if the mapper is wrong, the parity test should
+    fail, not silently test nothing.
+    """
     from safetensors import safe_open
+
+    from tensorrt_llm._torch.models.checkpoints.hf.musespark_open_format import (  # noqa: PLC0415
+        is_open_format,
+        open_format_to_source_key,
+    )
 
     index_path = os.path.join(_CKPT_DIR, "model.safetensors.index.json")
     with open(index_path) as f:
         weight_map = json.load(f)["weight_map"]
-    audio_keys = {k: v for k, v in weight_map.items() if k.startswith(_AUDIO_CKPT_PREFIX)}
+    # key in the file -> key in source spelling (identity on a source checkpoint)
+    to_source = (
+        {k: open_format_to_source_key(k) for k in weight_map}
+        if is_open_format(weight_map)
+        else {k: k for k in weight_map}
+    )
+    audio_keys = {
+        k: weight_map[k] for k, src in to_source.items() if src.startswith(_AUDIO_CKPT_PREFIX)
+    }
     assert len(audio_keys) == 72, f"expected 72 audio tensors, found {len(audio_keys)}"
 
     tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
@@ -319,7 +342,7 @@ def _load_real_tower():
             for key in keys:
                 tensor = f.get_tensor(key)
                 assert tensor.dtype == torch.bfloat16, f"{key} is {tensor.dtype}, not BF16"
-                param = state[key[len(_AUDIO_CKPT_PREFIX) :]]
+                param = state[to_source[key][len(_AUDIO_CKPT_PREFIX) :]]
                 assert param.shape == tensor.shape, key
                 with torch.no_grad():
                     param.copy_(tensor)
@@ -345,8 +368,18 @@ def test_golden_embeddings_parity(golden_path):
     assert expected.shape == (n_tokens, HIDDEN_SIZE)
 
     tower = _load_real_tower()
-    with torch.no_grad():
-        (got,) = tower([wav])
+    # The goldens are minted under torch.set_num_threads(1). At the container
+    # default (144 threads here) CPU reductions split differently and the tower
+    # lands 0.0156-0.0469 away -- above the tolerance below, from thread count
+    # alone. Pin it for the comparison and restore it, so one test cannot
+    # reconfigure the rest of the session.
+    threads_before = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        with torch.no_grad():
+            (got,) = tower([wav])
+    finally:
+        torch.set_num_threads(threads_before)
 
     assert got.shape == expected.shape
     assert got.dtype == torch.bfloat16
