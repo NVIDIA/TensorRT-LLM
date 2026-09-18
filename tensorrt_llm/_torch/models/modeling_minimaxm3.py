@@ -33,6 +33,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
@@ -228,6 +229,14 @@ class MiniMaxM3QKVIndexerLinear(Linear):
                     [local_shards[name][key] for name in self._SHARD_NAMES], dim=0
                 ).contiguous()
 
+        # KV calibration is per tensor, independent of the TP row partition.
+        for key in ("k_scale", "v_scale"):
+            scales = [
+                shards[name][key].reshape(()) for name in ("q", "k", "v") if key in shards[name]
+            ]
+            if scales:
+                combined[key] = torch.stack(scales).amax()
+
         # The checkpoint tensors above are already rank-local and packed.
         # Temporarily select vanilla loading so Linear copies them without a
         # second TP split or the three-shard QKV loader.
@@ -353,10 +362,13 @@ def _validate_sparse_attention_runtime_config(
         if (
             quant_config is None
             or quant_config.quant_mode is None
-            or not quant_config.quant_mode.has_fp8_kv_cache()
+            or not (
+                quant_config.quant_mode.has_fp8_kv_cache()
+                or quant_config.quant_mode.has_fp4_kv_cache()
+            )
         ):
             raise ValueError(
-                "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 main KV cache."
+                "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 or NVFP4 main KV cache."
             )
 
 
@@ -955,6 +967,11 @@ class MiniMaxM3Attention(Attention):
             and quant_config.quant_mode is not None
             and quant_config.quant_mode.has_fp8_kv_cache()
         )
+        self.main_kv_is_nvfp4 = bool(
+            quant_config is not None
+            and quant_config.quant_mode is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+        )
 
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
@@ -1297,12 +1314,14 @@ class MiniMaxM3Attention(Attention):
 
         The CUDA kernel is token-major and batch-type agnostic: per-token
         positions and cache slots cover pure prefill, mixed aggregate batches,
-        and CUDA-graph decode.
+        and CUDA-graph decode.  FP8 caches receive FP8 K/V directly.  NVFP4
+        caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
+        Q, index-Q, and index-K remain FP8.
         """
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-            or not self._emit_fp8_main_qkv()
+            or not (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
             or self.attn.indexer_kv_dtype != "fp8"
         ):
             return None
@@ -1344,20 +1363,52 @@ class MiniMaxM3Attention(Attention):
         index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
         out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
         num_tokens = int(packed.shape[0])
-        supported_main_cache = (
-            buffers is not None
-            and buffers.is_cuda
-            and buffers.dtype == torch.float8_e4m3fn
-            and buffers.dim() == 5
-            and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
-            and buffers.stride(4) == 1
-            and buffers.stride(3) == 128
-            and buffers.stride(2) == 128 * 128
-            and buffers.stride(1) >= self.num_key_value_heads * buffers.stride(2)
-            and buffers.stride(0) >= 2 * buffers.stride(1)
-            and buffers.stride(0) % 4 == 0
-            and buffers.stride(1) % 4 == 0
+        layer_uses_nvfp4 = bool(
+            getattr(kv_cache_manager, "is_nvfp4_layer", lambda _layer_idx: False)(self.layer_idx)
         )
+        scale_buffers = (
+            kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
+            if layer_uses_nvfp4
+            else None
+        )
+        kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
+        if layer_uses_nvfp4:
+            supported_main_cache = (
+                buffers is not None
+                and buffers.is_cuda
+                and buffers.dtype in (torch.int8, torch.uint8)
+                and buffers.dim() == 5
+                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 64)
+                and buffers.stride(4) == 1
+                and buffers.stride(3) == 64
+                and scale_buffers is not None
+                and scale_buffers.is_cuda
+                and scale_buffers.dtype == torch.uint8
+                and scale_buffers.dim() == 5
+                and tuple(scale_buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 8)
+                and scale_buffers.stride(4) == 1
+                and scale_buffers.stride(3) == 8
+                and kv_quant_scale is not None
+                and kv_quant_scale.is_cuda
+                and kv_quant_scale.dtype == torch.float32
+                and kv_quant_scale.numel() >= 3
+                and kv_quant_scale.is_contiguous()
+            )
+        else:
+            supported_main_cache = (
+                buffers is not None
+                and buffers.is_cuda
+                and buffers.dtype == torch.float8_e4m3fn
+                and buffers.dim() == 5
+                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
+                and buffers.stride(4) == 1
+                and buffers.stride(3) == 128
+                and buffers.stride(2) == 128 * 128
+                and buffers.stride(1) >= self.num_key_value_heads * buffers.stride(2)
+                and buffers.stride(0) >= 2 * buffers.stride(1)
+                and buffers.stride(0) % 4 == 0
+                and buffers.stride(1) % 4 == 0
+            )
         supported_index_cache = (
             index_k_cache.is_cuda
             and index_k_cache.dtype == torch.float8_e4m3fn
@@ -1392,10 +1443,7 @@ class MiniMaxM3Attention(Attention):
         ):
             return None
 
-        q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
-            packed.contiguous(),
-            buffers,
-            index_k_cache,
+        common_args = (
             out_cache_loc[:num_tokens],
             self.num_heads,
             self.num_key_value_heads,
@@ -1410,6 +1458,23 @@ class MiniMaxM3Attention(Attention):
             rotary_cos_sin,
             position_ids.reshape(-1).contiguous().to(torch.int32),
         )
+        if layer_uses_nvfp4:
+            q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers.view(torch.uint8),
+                scale_buffers,
+                index_k_cache,
+                common_args[0],
+                kv_quant_scale,
+                *common_args[1:],
+            )
+        else:
+            q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers,
+                index_k_cache,
+                *common_args,
+            )
         return q.flatten(1), index_q.flatten(1)
 
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
@@ -1846,12 +1911,22 @@ class MiniMaxM3Attention(Attention):
         already resident", so neither FMHA phase writes them again.
         """
         assert (k is None) == (v is None)
+        kv_scale_orig_quant = (
+            getattr(self.qkv_proj, "inv_kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        kv_scale_quant_orig = (
+            getattr(self.qkv_proj, "kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        if self.main_kv_is_nvfp4 and (kv_scale_orig_quant is None or kv_scale_quant_orig is None):
+            raise RuntimeError("MiniMax-M3 NVFP4 KV cache requires QKV quantization scales")
         if self.is_sparse_attention_layer:
             assert idx_q is not None
             # On the FP8 indexer path idx_k is None: the fused producer already
             # inserted E4M3 index-K into the side cache, so only K/V are written.
             if k is not None:
-                self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
+                self.attn.write_layer_caches(
+                    k, v, idx_k, attn_metadata, kv_scale_orig_quant=kv_scale_orig_quant
+                )
             else:
                 # The horizontal producer has already written both caches.
                 assert idx_k is None
@@ -1868,9 +1943,13 @@ class MiniMaxM3Attention(Attention):
         else:
             assert idx_q is None and idx_k is None
             if k is not None:
-                self.attn.write_layer_caches(k, v, None, attn_metadata)
+                self.attn.write_layer_caches(
+                    k, v, None, attn_metadata, kv_scale_orig_quant=kv_scale_orig_quant
+                )
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
+        forward_args.kv_scale_orig_quant = kv_scale_orig_quant
+        forward_args.kv_scale_quant_orig = kv_scale_quant_orig
         self.attn.forward(q, None, None, attn_metadata, forward_args=forward_args)
         return output
 
@@ -2632,6 +2711,12 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         raw_pretrained = model_config.pretrained_config
         if is_minimax_m3_vl_config(raw_pretrained):
             model_config = get_text_model_config(model_config)
+        if model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4:
+            # M3's 57 sparse target layers have an MSA NVFP4 consumer, but the
+            # one-model Eagle layer has no shipped P32 NVFP4 decode cubin.
+            # Keep its modules and separate cache on their established FP8
+            # representation while the target remains NVFP4.
+            model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
 
     def load_weights(

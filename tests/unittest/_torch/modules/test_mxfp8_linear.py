@@ -34,6 +34,8 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
 from tensorrt_llm._torch.modules.linear import (
     Linear,
     MXFP8LinearMethod,
+    WeightMode,
+    WeightsLoadingConfig,
     flashinfer_mxfp8_autotune,
     flashinfer_mxfp8_decode_graph_capture,
     get_quant_method,
@@ -74,6 +76,33 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     assert isinstance(method, MXFP8LinearMethod)
     assert method.backend == "trtllm"
     assert not method.use_native_autotuner
+
+
+def test_mxfp8_fused_qkv_creates_nvfp4_kv_scales(monkeypatch):
+    """MXFP8 QKV weights retain the scales required by an NVFP4 KV cache."""
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: False)
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.MXFP8,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        group_size=32,
+    )
+    linear = Linear(
+        in_features=128,
+        out_features=384,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+        weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.FUSED_QKV_LINEAR),
+    )
+
+    torch.testing.assert_close(linear.kv_scales, torch.ones(3))
+    torch.testing.assert_close(linear.inv_kv_scales, torch.ones(3))
+
+    linear.quant_method.load_kv_cache_scales(
+        linear, [{"k_scale": torch.tensor(0.5)}, {"v_scale": torch.tensor(0.25)}]
+    )
+    torch.testing.assert_close(linear.kv_scales, torch.tensor([1.0, 0.5, 0.25]))
+    torch.testing.assert_close(linear.inv_kv_scales, torch.tensor([1.0, 2.0, 4.0]))
 
 
 def _mock_mxfp8_ops(monkeypatch):

@@ -11,3 +11,9 @@ nvidia/MiniMax-M3-NVFP4:
     spec_dec_algo: Eagle3
     accuracy: 97.0
     threshold: 94.0
+  # Same InferenceX protocol and acceptance floor with hybrid NVFP4 KV storage.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: Eagle3
+    accuracy: 97.0
+    threshold: 94.0

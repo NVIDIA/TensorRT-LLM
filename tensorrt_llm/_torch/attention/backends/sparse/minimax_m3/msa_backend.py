@@ -162,6 +162,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # plan, so both forms are staged rather than derived at the call site.
     msa_block_table: Optional[torch.Tensor] = None
     msa_seq_lens_cuda: Optional[torch.Tensor] = None
+    msa_cu_q_lens: Optional[torch.Tensor] = None
+    msa_cu_kv_lens: Optional[torch.Tensor] = None
     # msa_block_table with each slot expanded into the K and V sub-pages the
     # trtllm-gen dense kernel indexes. _msa_subpages_per_slot is the expansion
     # factor, or 0 where the pool has no single one; see msa_subpage_rows.
@@ -345,7 +347,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         dtype check in run_msa_prefill_gqa.
         """
         kv_cache_manager = self.kv_cache_manager
-        return kv_cache_manager is not None and kv_cache_manager.dtype == DataType.FP8
+        return kv_cache_manager is not None and kv_cache_manager.dtype in (
+            DataType.FP8,
+            DataType.NVFP4,
+        )
 
     def _validate_decode_kernel_support(self) -> None:
         """Require the decode kernels to accept this run's cache geometry.
@@ -434,6 +439,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        if getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4:
+            self.msa_cu_q_lens = self.get_empty(
+                buffers,
+                (max_num_sequences + 1,),
+                cache_name="msa_cu_q_lens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.msa_cu_kv_lens = self.get_empty(
+                buffers,
+                (max_num_sequences + 1,),
+                cache_name="msa_cu_kv_lens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Resolved once here rather than per step: the factor is fixed by the
         # pool's layout for the life of the manager.
         self._msa_subpages_per_slot = uniform_subpages_per_slot(kv_cache_manager)
@@ -1033,6 +1053,51 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             maybe_pin_memory(block_ids_cpu.to(torch.int32)), non_blocking=True
         )
         self.msa_seq_lens_cuda[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
+        if self.msa_cu_q_lens is not None:
+            self._msa_live_batch = batch_size
+            self.msa_cu_q_lens[0].zero_()
+            self.msa_cu_kv_lens[0].zero_()
+            torch.cumsum(
+                maybe_pin_memory(qo_lens_cpu).to(cache_device, non_blocking=True),
+                0,
+                out=self.msa_cu_q_lens[1 : batch_size + 1],
+            )
+            torch.cumsum(
+                self.msa_seq_lens_cuda[:batch_size],
+                0,
+                out=self.msa_cu_kv_lens[1 : batch_size + 1],
+            )
+            self._msa_max_q_len = int(qo_lens_cpu.max().item())
+            self._msa_max_kv_len_all = int(kv_lens_cpu.max().item())
+            self._msa_total_k = int(kv_lens_cpu.to(torch.int64).sum().item())
+            self._msa_total_k_rows = int(
+                torch.div(
+                    kv_lens_cpu.to(torch.int64) + page_size - 1,
+                    page_size,
+                    rounding_mode="floor",
+                )
+                .sum()
+                .item()
+            )
+            # The same four bounds over the context prefix alone, which is what an
+            # NVFP4 sparse layer's CSR kernel covers once the ported decode kernels
+            # take the generation suffix. Sizing that call from the whole batch
+            # would let a long generation row inflate its worklist.
+            context_rows = min(int(self.num_contexts or 0), batch_size)
+            if context_rows > 0:
+                prefix_kv = kv_lens_cpu[:context_rows].to(torch.int64)
+                self._msa_context_prefix_bounds = (
+                    int(qo_lens_cpu[:context_rows].max().item()),
+                    int(prefix_kv.max().item()),
+                    int(prefix_kv.sum().item()),
+                    int(
+                        torch.div(prefix_kv + page_size - 1, page_size, rounding_mode="floor")
+                        .sum()
+                        .item()
+                    ),
+                )
+            else:
+                self._msa_context_prefix_bounds = (0, 0, 0, 0)
         # Sub-page expansion for the trtllm-gen dense layers, staged once here
         # instead of once per layer, outside capture into a graph-stable
         # buffer as with the slot table above.
@@ -1215,6 +1280,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         v: torch.Tensor,
         idx_k: Optional[torch.Tensor],
         metadata,
+        kv_scale_orig_quant: Optional[torch.Tensor] = None,
     ) -> None:
         """Write this layer's new-token K, V and (bf16 indexer) index-K.
 
@@ -1228,9 +1294,32 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         `metadata` only supplies the step's write slots (msa_out_cache_loc,
         filled by prepare()) and the cache manager.
         """
-        from .kernels.msa_scatter import fused_write_layer_caches
+        from .kernels.msa_scatter import fused_write_layer_caches, fused_write_layer_caches_nvfp4
 
         layer_idx = self.layer_idx
+        manager = metadata.kv_cache_manager
+        if getattr(manager, "is_nvfp4_layer", lambda _: False)(layer_idx):
+            if kv_scale_orig_quant is None:
+                raise RuntimeError("NVFP4 cache writes require quantization scales")
+            buffers = manager.get_buffers(layer_idx, "HND")
+            scales = manager.get_block_scale_buffers(layer_idx, "HND")
+            idx_cache = metadata.msa_idx_k_cache(layer_idx) if idx_k is not None else None
+            if not fused_write_layer_caches_nvfp4(
+                buffers[:, 0],
+                buffers[:, 1],
+                scales[:, 0],
+                scales[:, 1],
+                idx_cache,
+                metadata.msa_out_cache_loc[: k.shape[0]],
+                k,
+                v,
+                idx_k,
+                kv_scale_orig_quant,
+            ):
+                raise RuntimeError(
+                    "NVFP4 cache writes require CUDA HND cache views and FP32 scales"
+                )
+            return
         buffers = metadata.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
         k_view, v_view = buffers[:, 0], buffers[:, 1]
         idx_cache = metadata.msa_idx_k_cache(layer_idx) if idx_k is not None else None

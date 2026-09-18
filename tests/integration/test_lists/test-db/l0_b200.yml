@@ -32,6 +32,7 @@ l0_b200:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction

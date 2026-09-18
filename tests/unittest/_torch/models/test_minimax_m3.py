@@ -254,7 +254,8 @@ def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
 
 
 @pytest.mark.cpu_only
-def test_validate_fused_projection_requires_fp8_main_kv_cache() -> None:
+@pytest.mark.parametrize("kv_algo", [QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_validate_fused_projection_requires_quantized_main_kv_cache(kv_algo: QuantAlgo) -> None:
     sparse_config = MiniMaxM3SparseAttentionConfig(
         implementation="msa",
         indexer_kv_dtype="fp8",
@@ -264,10 +265,10 @@ def test_validate_fused_projection_requires_fp8_main_kv_cache() -> None:
         pretrained_config=_make_text_config(),
         sparse_attention_config=sparse_config,
     )
-    with pytest.raises(ValueError, match="requires an FP8 main KV cache"):
+    with pytest.raises(ValueError, match="requires an FP8 or NVFP4 main KV cache"):
         _validate_sparse_attention_runtime_config(model_config)
 
-    model_config.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_algo)
     _validate_sparse_attention_runtime_config(model_config)
 
 
@@ -542,6 +543,7 @@ def test_msa_attention_core_routes_compact_q_to_attention_dispatcher() -> None:
     backend = FakeMsaBackend()
     layer.attn = backend
     layer.is_sparse_attention_layer = True
+    layer.main_kv_is_nvfp4 = False
     q = torch.randn(2, 8)
     idx_q = torch.randn(2, 4)
     attn_metadata = SimpleNamespace()
@@ -1103,8 +1105,12 @@ def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: 
             for name, heads in zip(projection._SHARD_NAMES, (64, 4, 4, 4, 1), strict=True)
         }
         loaded = []
+        shards["k"]["k_scale"] = torch.tensor(0.5)
+        shards["v"]["v_scale"] = torch.tensor(0.25)
         projection.load_weights = loaded.extend
         projection.load_five_way_weights(shards)
+        torch.testing.assert_close(loaded[0]["k_scale"], shards["k"]["k_scale"])
+        torch.testing.assert_close(loaded[0]["v_scale"], shards["v"]["v_scale"])
         packed = loaded[0]["weight"].split(projection.local_output_sizes)
         torch.testing.assert_close(packed[4], shards["index_k"]["weight"])
         kv_rank = tp_rank // max(tp_size // 4, 1)

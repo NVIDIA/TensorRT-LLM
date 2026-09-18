@@ -7290,8 +7290,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
     @parametrize_with_ids("use_msa", [False, True])
-    def test_nvfp4(self, use_msa):
+    def test_nvfp4(self, use_msa, kv_dtype):
+        if kv_dtype == "nvfp4" and not use_msa:
+            pytest.skip("NVFP4 KV cache requires the MSA backend")
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
         # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
         # Triton path keeps the KV cache in BF16.
@@ -7300,7 +7303,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto")
+                                        dtype=kv_dtype if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton",
             indexer_kv_dtype="fp8" if use_msa else "bf16")
@@ -7314,6 +7317,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if kv_dtype == "nvfp4":
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = MMLU(model_name)
             task.evaluate(llm)
             task = GSM8K(model_name)
@@ -7321,6 +7326,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
     @parametrize_with_ids("eval_mode", ["default", "inferencex"])
     @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
     @parametrize_with_ids("overlap_scheduler", [False, True])
@@ -7328,7 +7334,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
                           overlap_scheduler, fuse_qkv_index_projection,
-                          eval_mode):
+                          eval_mode, kv_dtype):
         # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
         # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K, or
         # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy
@@ -7348,7 +7354,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # The MSA path runs an FP8 KV cache, as in test_nvfp4.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8")
+                                        dtype=kv_dtype)
         # InferenceX mode: 16k context for thinking output, batch 64 (the
         # InferenceX default). Otherwise fmha_sm100 caps total_q x heads at
         # 65536; with 4 verify tokens per row that is 512 (256 unsharded).
@@ -7382,6 +7388,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 max_stats_len=5000,
                 trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if kv_dtype == "nvfp4":
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
             def drain_spec_stats(llm):
                 drafted = accepted = steps = 0
@@ -7434,10 +7442,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
-            assert chat_rate > 0.80, \
+            min_rate = 0.78 if kv_dtype == "nvfp4" else 0.80
+            min_length = 3.3 if kv_dtype == "nvfp4" else 3.4
+            assert chat_rate > min_rate, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
-                f"(threshold 0.80, reference 0.839 from the drafter card)"
-            assert chat_length > 3.4, \
+                f"(threshold {min_rate}, reference 0.839 from the drafter card)"
+            assert chat_length > min_length, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
-                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
+                f"{chat_length:.3f} (threshold {min_length}, reference 3.518 from " \
                 f"the drafter card)"
