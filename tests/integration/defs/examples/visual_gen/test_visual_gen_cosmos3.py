@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from defs import conftest
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
@@ -452,17 +453,33 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
     _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2I_THRESHOLD)
 
 
-def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/cosmos3/cosmos3.py with FP8 config end-to-end.
+@pytest.fixture
+def _cosmos3_example_deps(request, model_subpath):
+    """Filter the Super release platform before checking media dependencies."""
+    if model_subpath == "Cosmos3-Super" and conftest.get_sm_version() != 100:
+        pytest.skip("Cosmos3-Super release tests target B200/GB200 (SM100)")
+    request.getfixturevalue("_visual_gen_deps")
 
-    Validates that the Cosmos3-Nano example script and ``configs/cosmos3-nano-1gpu.yaml``
-    work together as documented. Uses the local Cosmos3-Nano checkpoint and
-    the shared FP8 dynamic-quant config.
+
+@pytest.mark.parametrize(
+    "model_subpath",
+    [
+        pytest.param("Cosmos3-Nano", id="nano-1gpu"),
+        pytest.param("Cosmos3-Super", id="super-1gpu"),
+    ],
+)
+def test_cosmos3_example(_cosmos3_example_deps, model_subpath, llm_root, llm_venv):
+    """Run the Nano or Super example with the shared single-GPU config.
+
+    Uses VANILLA attention and the checkpoint's quantization settings through
+    ``configs/cosmos3-nano-1gpu.yaml``, which supports both models.
     """
-    model_path = _lpips_model_path("Cosmos3-Nano")
-    _require_exists(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+    model_path = _lpips_model_path(model_subpath)
+    _require_exists(model_path, f"{model_subpath} checkpoint", is_dir=True)
 
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example")
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example", model_subpath
+    )
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "cosmos3_output.mp4")
 
