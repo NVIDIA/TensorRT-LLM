@@ -84,7 +84,13 @@ def _eligible(
         return False
     if tuple(x.stride()) != _channels_last_stride(tuple(x.shape)):
         return False
-    if tuple(weight.stride()) != _channels_last_stride(tuple(weight.shape)):
+    # Singleton weight axes have index zero, so their strides do not affect addresses.
+    if any(
+        size != 1 and actual != expected
+        for size, actual, expected in zip(
+            weight.shape, weight.stride(), _channels_last_stride(tuple(weight.shape))
+        )
+    ):
         return False
     if bias.ndim != 1 or bias.shape[0] != weight.shape[0] or not bias.is_contiguous():
         return False

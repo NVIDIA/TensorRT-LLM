@@ -316,6 +316,51 @@ def test_no_grad_accepts_real_parameter_defaults():
 
 
 @pytest.mark.parametrize(
+    "shape,wshape",
+    [
+        ((1, 512, 4, 352, 640), (256, 512, 1, 1, 1)),
+        ((1, 1024, 4, 176, 320), (512, 1024, 1, 1, 1)),
+    ],
+)
+def test_singleton_weight_strides_preserve_addresses_and_eligibility(shape, wshape):
+    x = torch.empty_strided(
+        shape, helper._channels_last_stride(shape), dtype=torch.bfloat16, device="meta"
+    )
+    # contiguous() preserves this already-contiguous 1x1x1 weight layout.
+    w = torch.nn.Parameter(
+        torch.randn(wshape, dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last_3d)
+    )
+    canonical = w.as_strided(wshape, helper._channels_last_stride(wshape))
+    assert tuple(w.stride()) == (wshape[1], 1, 1, 1, 1)
+    assert w.stride() != canonical.stride()
+    assert w.data_ptr() == canonical.data_ptr()
+    assert torch.equal(w, canonical)
+    b = torch.nn.Parameter(torch.empty(wshape[0], dtype=torch.bfloat16, device="meta"))
+    args = ((1, 1, 1), (0, 0, 0), (1, 1, 1), 1, False)
+    with metadata_cuda():
+        assert helper._eligible(x, w, b, *args)
+        # Keep the input guard strict even for an unused singleton batch stride.
+        input_strides = list(x.stride())
+        input_strides[0] += 1
+        assert not helper._eligible(x.as_strided(shape, input_strides), w, b, *args)
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2, 3, 4])
+def test_nonsingleton_weight_stride_changes_fall_back(axis):
+    x, w, b = metadata_tensors()
+    signature = sorted(helper._QUALIFIED)[0]
+    assert w.shape[axis] > 1
+    strides = list(w.stride())
+    strides[axis] += 1
+    changed = torch.nn.Parameter(
+        torch.empty_strided(w.shape, strides, dtype=torch.bfloat16, device="meta")
+    )
+    with metadata_cuda():
+        assert helper._eligible(x, w, b, *signature[2:], 1, False)
+        assert not helper._eligible(x, changed, b, *signature[2:], 1, False)
+
+
+@pytest.mark.parametrize(
     "guard", ["compile", "capture", "device", "arch", "autocast", "deterministic", "frost"]
 )
 def test_eligibility_fallbacks(guard):
