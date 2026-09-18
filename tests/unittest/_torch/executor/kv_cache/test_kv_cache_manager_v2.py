@@ -149,6 +149,7 @@ def _make_cache_config_for_test(
     cache_manager.max_attention_window_vec = max_attention_window_vec
     cache_manager.max_seq_len = max_seq_len
     cache_manager.max_batch_size = max_batch_size
+    cache_manager.max_cuda_graph_batch_size = None
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
     cache_manager._can_publish_block_reuse = not is_draft
@@ -1831,6 +1832,7 @@ def _make_admission_manager(
     """
     manager = object.__new__(KVCacheManagerV2)
     manager.conversation_manager = None
+    manager.kv_connector_manager = None
     manager.enable_block_reuse = True
     manager.tokens_per_block = TOKENS_PER_BLOCK
     manager.is_draft = False
