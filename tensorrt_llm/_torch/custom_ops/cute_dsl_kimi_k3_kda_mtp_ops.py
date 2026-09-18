@@ -265,6 +265,17 @@ def _require_stride_layout(
         raise ValueError(
             f"Expected recurrent_state shape [pool, {HV}, {V}, {K}] (V-first pool layout)."
         )
+    if recurrent_state.dtype != torch.float32:
+        # This kernel generation reads and writes the state pool as fp32. A
+        # bf16 pool (kv_cache_config.mamba_ssm_cache_dtype=bfloat16) is staged
+        # to fp32 for prefill and single-token decode, but the fused verify
+        # path updates the pool rows in place through ssm_state_indices and has
+        # no staging, so reject it here instead of reinterpreting the bytes.
+        raise ValueError(
+            "kda_mtp_decode requires an fp32 recurrent_state pool; got "
+            f"{recurrent_state.dtype}. A bf16 KDA state pool is not supported "
+            "together with fused KDA MTP verify."
+        )
     if qkg_cache.ndim != 4 or qkg_cache.shape[1:] != (num_spec, 3, H * K):
         raise ValueError(f"Expected qkg_cache shape [pool, {num_spec}, 3, {H * K}].")
     if v_cache.ndim != 3 or v_cache.shape[1:] != (num_spec, HV * V):
