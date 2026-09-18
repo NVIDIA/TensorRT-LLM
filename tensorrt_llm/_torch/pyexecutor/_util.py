@@ -446,7 +446,8 @@ def get_mla_context_workspace_kv_len_cap(
         max_seq_len,
         enable_chunked_prefill,
         workspace_is_chunked_prefill_bounded=True,
-        chunked_workspace_profiled=True):
+        chunked_workspace_profiled=True,
+        require_chunked_workspace_profile=True):
     """Max summed attended-KV length covered by the context-MLA workspace reserve.
 
     KV-cache reuse can grow this workspace beyond the fresh-prefill profiling
@@ -455,7 +456,9 @@ def get_mla_context_workspace_kv_len_cap(
     prefix sets ``workspace_is_chunked_prefill_bounded=False`` and receives the
     same reservation and scheduler admission protection as cache reuse. A
     bounded chunk must also be exercised by profiling before dropping its
-    reservation (``chunked_workspace_profiled``).
+    reservation (``chunked_workspace_profiled``) when
+    ``require_chunked_workspace_profile`` is enabled. Older hardware keeps
+    the existing backend-declared reserve policy without this new requirement.
 
     Otherwise the default (no override) is the never-stall worst case ``min(max_batch_size, max_num_tokens)
     * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
@@ -465,8 +468,10 @@ def get_mla_context_workspace_kv_len_cap(
     """
     workspace_can_exceed_profile = (
         kv_cache_config.enable_block_reuse and not enable_chunked_prefill) or (
-            enable_chunked_prefill and (not workspace_is_chunked_prefill_bounded
-                                        or not chunked_workspace_profiled))
+            enable_chunked_prefill and
+            (not workspace_is_chunked_prefill_bounded or
+             (require_chunked_workspace_profile
+              and not chunked_workspace_profiled)))
     if not workspace_can_exceed_profile:
         return None
     worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
@@ -1570,7 +1575,13 @@ class KvCacheCreator:
             self._max_seq_len,
             self._llm_args.enable_chunked_prefill,
             workspace_is_chunked_prefill_bounded,
-            chunked_workspace_profiled=profiled_mla_chunks)
+            chunked_workspace_profiled=profiled_mla_chunks,
+            # Chunk-aware profiling is SM100+ only. Preserve Hopper's existing
+            # backend-declared policy rather than adding a new reserve/cap to
+            # its dense full-gather path just because it cannot profile chunks.
+            require_chunked_workspace_profile=(
+                w_bytes_per_token > 0 and self._llm_args.enable_chunked_prefill
+                and get_sm_version() >= 100))
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
