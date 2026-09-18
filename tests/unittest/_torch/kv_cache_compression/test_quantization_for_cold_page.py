@@ -57,10 +57,10 @@ def _manager(
     )
 
 
-def _run(buffer):
-    """(start, length) of the NVFP4 run in each row of a compressed buffer."""
+def _quantized_range(buffer):
+    """(start, elements) of the part of each row that a compressed buffer turns into NVFP4."""
 
-    return buffer.quantized_run_start_elements, buffer.quantized_run_elements
+    return buffer.quantized_range_start, buffer.quantized_range_elements
 
 
 def _factory_model_engine(
@@ -318,7 +318,7 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
     assert layout.num_kv_heads == 4
     assert layout.tokens_per_page == 5
     assert layout.raw_row_stride_elements == 128
-    assert [_run(buffer) for buffer in layout.buffers] == [(0, 128), (0, 128)]
+    assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 128), (0, 128)]
     assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
         1.0,
         1.0,
@@ -743,7 +743,7 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
     assert layout.num_kv_heads == 1
     assert layout.tokens_per_page == 64
     assert layout.raw_row_stride_elements == 576
-    assert _run(layout.buffers[0]) == (0, 576)
+    assert _quantized_range(layout.buffers[0]) == (0, 576)
     scales = layout.buffers[0].scales
     assert scales.nvfp4_orig_quant == scales.nvfp4_quant_orig == 1.0
     assert layout.buffers[1].scales is None
@@ -847,7 +847,7 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
         32,
         512,
     )
-    assert _run(layout.buffers[0]) == (0, 448)
+    assert _quantized_range(layout.buffers[0]) == (0, 448)
     assert [buffer.scales is not None for buffer in layout.buffers] == [True, False]
 
     metadata = _configure_lifecycle(
@@ -1418,7 +1418,7 @@ def test_keep_rope_precision_leaves_the_leading_rope_elements_of_partial_rotary_
 
     native, _ = _native()
     layout = _create_kv(native, _partial_rotary_config(), 256, keep_rope_precision=True)
-    assert [_run(buffer) for buffer in layout.buffers] == [(64, 192), (0, 256)]
+    assert [_quantized_range(buffer) for buffer in layout.buffers] == [(64, 192), (0, 256)]
     assert layout.raw_row_stride_elements == 256
 
     metadata = _configure_default_lifecycle(native, raw_bytes=64 * 256 * 2)
@@ -1432,7 +1432,7 @@ def test_keep_rope_precision_leaves_the_leading_rope_elements_of_partial_rotary_
 def test_keep_rope_precision_off_quantizes_partial_rotary_keys_whole() -> None:
     native, _ = _native()
     layout = _create_kv(native, _partial_rotary_config(), 256, keep_rope_precision=False)
-    assert [_run(buffer) for buffer in layout.buffers] == [(0, 256), (0, 256)]
+    assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 256), (0, 256)]
     assert _configure_default_lifecycle(native, raw_bytes=64 * 256 * 2).cold_page_bytes == 18432
 
 
@@ -1455,7 +1455,7 @@ def test_keep_rope_precision_leaves_the_mla_rope_tail() -> None:
         num_kv_heads_per_layer=(1,),
         head_dim_per_layer=(576,),
     )
-    assert [_run(buffer) for buffer in layout.buffers] == [(0, 512)]
+    assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 512)]
 
     metadata = _configure_lifecycle(native, {0: {"key": 64 * 576 * 2}})
     # 16384 B packed + 2048 B scales + 8192 B RoPE copied.
@@ -1484,13 +1484,13 @@ def test_deepseek_v4_compressed_rows_follow_keep_rope_precision(
         num_kv_heads_per_layer=(),
         head_dim_per_layer=(),
     )
-    assert _run(layout.buffers[0]) == run
+    assert _quantized_range(layout.buffers[0]) == run
     metadata = _configure_lifecycle(
         native,
         {1: {"deepseek_v4_compress": 32 * 512, "deepseek_v4_indexer_compress": 32 * 68}},
     )
     assert metadata.cold_page_bytes == cold_page_bytes
-    # Tile sizing follows the quantized run, not the row stride: 32 * 448 / 8 vs 32 * 512 / 8.
+    # Tile sizing follows the quantized range, not the row stride: 32 * 448 / 8 vs 32 * 512 / 8.
     assert metadata.max_half_groups_per_tile == (1792 if keep_rope_precision else 2048)
 
 
@@ -1513,7 +1513,7 @@ def test_keep_rope_precision_quantizes_draft_kv_rows_whole() -> None:
             is_draft=True,
         )
     mock_logger.warning.assert_called_once()
-    assert [_run(buffer) for buffer in layout.buffers] == [(0, 256), (0, 256)]
+    assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 256), (0, 256)]
 
 
 def test_keep_rope_precision_rejects_fully_rotated_keys() -> None:
@@ -1551,7 +1551,7 @@ def test_keep_rope_precision_is_ignored_with_a_warning_outside_the_validated_mod
         )
     mock_logger.warning.assert_called_once()
     assert "keep_rope_precision" in mock_logger.warning.call_args.args[0]
-    assert [_run(buffer) for buffer in layout.buffers] == [(0, 576)]
+    assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 576)]
 
 
 def test_keep_rope_precision_requires_16_element_rope_alignment() -> None:
@@ -1565,7 +1565,7 @@ def test_keep_rope_precision_reads_the_text_config_of_a_composite_model() -> Non
     text = _partial_rotary_config()
     composite = SimpleNamespace(model_type="qwen3_5", get_text_config=lambda: text)
     layout = _create_kv(native, composite, 256, keep_rope_precision=True)
-    assert _run(layout.buffers[0]) == (64, 192)
+    assert _quantized_range(layout.buffers[0]) == (64, 192)
 
 
 def test_keep_rope_precision_reads_partial_rotary_factor_from_rope_parameters() -> None:
@@ -1575,7 +1575,7 @@ def test_keep_rope_precision_reads_partial_rotary_factor_from_rope_parameters() 
         rope_parameters={"rope_theta": 1e7, "partial_rotary_factor": 0.25},
     )
     layout = _create_kv(native, config, 256, keep_rope_precision=True)
-    assert _run(layout.buffers[0]) == (64, 192)
+    assert _quantized_range(layout.buffers[0]) == (64, 192)
 
 
 def test_keep_rope_precision_requires_mla_latent_geometry_for_key_only_layers() -> None:

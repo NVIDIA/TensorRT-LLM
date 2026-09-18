@@ -296,8 +296,8 @@ algorithm launcher.
 
 Each hot row has one contiguous range that the kernel turns into NVFP4; the bytes
 before and after that range are copied unchanged. A compressed buffer stores the
-range as `quantized_run_start_elements` and `quantized_run_elements`, and its
-layer stores `raw_row_stride_elements`.
+range as `quantized_range_start` and `quantized_range_elements`, and its layer
+stores `raw_row_stride_elements`.
 
 - `keep_rope_precision` off: the range is the whole row.
 - `keep_rope_precision` on: the RoPE elements are left out of the range, so they

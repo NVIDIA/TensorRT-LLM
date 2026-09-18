@@ -85,13 +85,12 @@ class _Nvfp4Scales:
 
 @dataclass(frozen=True)
 class _Nvfp4BufferLayout:
-    """One hot buffer. Compressed buffers (``scales`` set) quantize one run of
-    each row and copy the elements before and after it byte-for-byte."""
+    """One hot buffer; a compressed one (``scales`` set) turns ``quantized_range_*`` of each row into NVFP4."""
 
     role: str
     scales: _Nvfp4Scales | None = None
-    quantized_run_start_elements: int = 0
-    quantized_run_elements: int = 0
+    quantized_range_start: int = 0
+    quantized_range_elements: int = 0
 
 
 @dataclass(frozen=True)
@@ -194,7 +193,7 @@ def _load_modelopt_nvfp4_scales(
     return result
 
 
-def _text_config(pretrained_config: object) -> object:
+def _get_text_config(pretrained_config: object) -> object:
     """The text sub-config of a composite (VLM) config, or the config itself."""
 
     get_text_config = getattr(pretrained_config, "get_text_config", None)
@@ -202,12 +201,11 @@ def _text_config(pretrained_config: object) -> object:
     return text if text is not None else pretrained_config
 
 
-def _rotary_elements(text: object, head_dim: int) -> int:
-    """Leading K elements that carry RoPE: ``head_dim * partial_rotary_factor``
-    (top level or inside ``rope_parameters``), else the whole head."""
+def _get_rope_elements(text_config: object, head_dim: int) -> int:
+    """Number of leading K elements that carry RoPE (``head_dim * partial_rotary_factor``)."""
 
-    factor = getattr(text, "partial_rotary_factor", None)
-    rope_parameters = getattr(text, "rope_parameters", None)
+    factor = getattr(text_config, "partial_rotary_factor", None)
+    rope_parameters = getattr(text_config, "rope_parameters", None)
     if factor is None and isinstance(rope_parameters, Mapping):
         factor = rope_parameters.get("partial_rotary_factor")
     return head_dim if factor is None else int(round(head_dim * float(factor)))
@@ -234,76 +232,60 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             )
             self._keep_rope_precision = False
 
-    def _quantized_run(
-        self, row_elements: int, rope_start: int, rope_elements: int, *, keep_rope: bool, where: str
+    def _calculate_quantized_range(
+        self,
+        row_elements: int,
+        *,
+        keep_rope: bool,
+        rope: tuple[int, int] | None = None,
+        key_only: bool = False,
+        buffer_name: str,
     ) -> tuple[int, int]:
-        """(start, length) of the one run the kernel quantizes in each row: the
-        whole row, or with ``keep_rope`` the row minus its RoPE elements, which
-        are then copied byte-for-byte."""
+        """Return (start, elements) of the part of each row that becomes NVFP4; the rest is copied as is."""
 
-        if not keep_rope or rope_elements == 0:
+        if not keep_rope:
+            return 0, row_elements
+        if rope is None:
+            text_config = _get_text_config(self.pretrained_config)
+            if key_only:
+                kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
+                rope_dim = getattr(text_config, "qk_rope_head_dim", None)
+                if (
+                    not isinstance(kv_lora_rank, int)
+                    or not isinstance(rope_dim, int)
+                    or kv_lora_rank + rope_dim != row_elements
+                ):
+                    raise NotImplementedError(
+                        f"{buffer_name}: head_dim {row_elements} is not the MLA latent geometry "
+                        f"kv_lora_rank + qk_rope_head_dim ({kv_lora_rank} + {rope_dim}), so its "
+                        "RoPE elements cannot be located; keep_rope_precision is unsupported here"
+                    )
+                rope = (kv_lora_rank, rope_dim)
+            else:
+                rope = (0, _get_rope_elements(text_config, row_elements))
+        rope_start, rope_elements = rope
+        if rope_elements == 0:
             return 0, row_elements
         if rope_elements >= row_elements:
             raise ValueError(
-                f"{where}: every element is position-encoded, so keep_rope_precision would "
+                f"{buffer_name}: every element is position-encoded, so keep_rope_precision would "
                 "leave nothing to quantize; this model cannot keep RoPE precision"
             )
         if rope_start == 0:  # RoPE leads the row (partial-rotary GQA heads).
-            start, length = rope_elements, row_elements - rope_elements
+            start, elements = rope_elements, row_elements - rope_elements
         elif rope_start + rope_elements == row_elements:  # RoPE trails the row (MLA, DeepSeek-V4).
-            start, length = 0, rope_start
+            start, elements = 0, rope_start
         else:
             raise ValueError(
-                f"{where}: RoPE elements [{rope_start}, {rope_start + rope_elements}) sit inside "
-                "the row; the kernel quantizes one contiguous run per row"
+                f"{buffer_name}: RoPE elements [{rope_start}, {rope_start + rope_elements}) sit "
+                "inside the row; the kernel quantizes one contiguous range per row"
             )
-        if start % _ELEMENTS_PER_SCALE or length % _ELEMENTS_PER_SCALE:
+        if start % _ELEMENTS_PER_SCALE or elements % _ELEMENTS_PER_SCALE:
             raise ValueError(
-                f"{where}: the quantized run [{start}, {start + length}) must start and end on "
-                f"{_ELEMENTS_PER_SCALE}-element NVFP4 scale groups"
+                f"{buffer_name}: the quantized range [{start}, {start + elements}) must start and "
+                f"end on {_ELEMENTS_PER_SCALE}-element NVFP4 scale groups"
             )
-        return start, length
-
-    def _key_quantized_run(
-        self, layer_id: int, head_dim: int, *, key_only: bool, keep_rope: bool
-    ) -> tuple[int, int]:
-        """Locate RoPE in a K row from the model config: a key-only layer holds MLA
-        latent rows (``kv_lora_rank`` NoPE elements then ``qk_rope_head_dim`` RoPE
-        elements); a K/V layer rotates the first ``head_dim * partial_rotary_factor``
-        elements of each head."""
-
-        if not keep_rope:
-            return 0, head_dim
-        text = _text_config(self.pretrained_config)
-        where = f"cold-page layer {layer_id} key"
-        if key_only:
-            kv_lora_rank = getattr(text, "kv_lora_rank", None)
-            rope_dim = getattr(text, "qk_rope_head_dim", None)
-            if (
-                not isinstance(kv_lora_rank, int)
-                or not isinstance(rope_dim, int)
-                or kv_lora_rank + rope_dim != head_dim
-            ):
-                raise NotImplementedError(
-                    f"{where}: head_dim {head_dim} is not the MLA latent geometry "
-                    f"kv_lora_rank + qk_rope_head_dim ({kv_lora_rank} + {rope_dim}), so its RoPE "
-                    "elements cannot be located; keep_rope_precision is unsupported here"
-                )
-            return self._quantized_run(
-                head_dim, kv_lora_rank, rope_dim, keep_rope=keep_rope, where=where
-            )
-        return self._quantized_run(
-            head_dim, 0, _rotary_elements(text, head_dim), keep_rope=keep_rope, where=where
-        )
-
-    def _keep_rope(self, is_draft: bool) -> bool:
-        """Draft-model KV rows always quantize whole: the codec only holds the
-        target model's config, so it cannot locate RoPE in a draft's rows."""
-
-        if self._keep_rope_precision and is_draft:
-            logger.warning("keep_rope_precision: draft-model KV rows are quantized whole.")
-            return False
-        return self._keep_rope_precision
+        return start, elements
 
     def _build_deepseek_v4_layer_layouts(
         self,
@@ -313,6 +295,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         pp_layers: Sequence[int],
         runtime_type: int,
         is_draft: bool,
+        keep_rope: bool,
     ) -> dict[int, _Nvfp4LayerLayout | None]:
         """Build layouts for DeepSeek-V4 lifecycles; None selects lossless fallback."""
 
@@ -357,7 +340,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     "DeepSeek-V4 KVCM layout and pp_layers have different model-layer counts"
                 )
 
-        keep_rope = self._keep_rope(is_draft)
         layouts: dict[int, _Nvfp4LayerLayout | None] = {}
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
@@ -415,12 +397,11 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     scale = model_scales["k"]
 
             # A compressed row is 448 NoPE elements followed by 64 RoPE elements.
-            run_start, run_elements = self._quantized_run(
+            range_start, range_elements = self._calculate_quantized_range(
                 _DEEPSEEK_V4_ROW_STRIDE,
-                _DEEPSEEK_V4_NOPE_DIM,
-                _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM,
                 keep_rope=keep_rope,
-                where=f"cold-page layer {layer_id} {_DEEPSEEK_V4_COMPRESS}",
+                rope=(_DEEPSEEK_V4_NOPE_DIM, _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM),
+                buffer_name=f"cold-page layer {layer_id} {_DEEPSEEK_V4_COMPRESS}",
             )
             layouts[layer_id] = _Nvfp4LayerLayout(
                 layer_id=layer_id,
@@ -431,8 +412,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     _Nvfp4BufferLayout(
                         role=str(buffer.role),
                         scales=_Nvfp4Scales(*scale),
-                        quantized_run_start_elements=run_start,
-                        quantized_run_elements=run_elements,
+                        quantized_range_start=range_start,
+                        quantized_range_elements=range_elements,
                     )
                     if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
                     else _Nvfp4BufferLayout(role=str(buffer.role))
@@ -468,6 +449,13 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 f"Attention KV, not {runtime_dtype}"
             )
 
+        # The codec holds only the target model's config, so it cannot locate RoPE
+        # in a draft model's rows: draft KVCMs always quantize whole rows.
+        keep_rope = self._keep_rope_precision
+        if keep_rope and is_draft:
+            logger.warning("keep_rope_precision: draft-model KV rows are quantized whole.")
+            keep_rope = False
+
         deepseek_v4_layouts = {}
         if self.pretrained_config.model_type == "deepseek_v4":
             deepseek_v4_layouts = self._build_deepseek_v4_layer_layouts(
@@ -476,9 +464,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 pp_layers=pp_layers,
                 runtime_type=runtime_type if runtime_type is not None else 0,
                 is_draft=is_draft,
+                keep_rope=keep_rope,
             )
 
-        keep_rope = self._keep_rope(is_draft) if not deepseek_v4_layouts else False
         layer_layouts = []
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
@@ -512,15 +500,18 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 raise ValueError(
                     f"NVFP4 cold pages require head_dim divisible by 16, got {head_dim}"
                 )
-            key_run = self._key_quantized_run(
-                layer_id, head_dim, key_only=compressed_roles == ("key",), keep_rope=keep_rope
+            key_range = self._calculate_quantized_range(
+                head_dim,
+                keep_rope=keep_rope,
+                key_only=compressed_roles == ("key",),
+                buffer_name=f"cold-page layer {layer_id} key",
             )
             buffer_layouts = [
                 _Nvfp4BufferLayout(
                     role=role,
                     scales=_Nvfp4Scales(*scales[index]),
-                    quantized_run_start_elements=key_run[0] if role == "key" else 0,
-                    quantized_run_elements=key_run[1] if role == "key" else head_dim,
+                    quantized_range_start=key_range[0] if role == "key" else 0,
+                    quantized_range_elements=key_range[1] if role == "key" else head_dim,
                 )
                 for index, role in enumerate(compressed_roles)
             ]
@@ -569,12 +560,12 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             # buffer][opaque buffers][16-byte padding].
             compressed = [buffer for buffer in layout.buffers if buffer.scales is not None]
             packed_bytes = {
-                buffer.role: rows * buffer.quantized_run_elements // _ELEMENTS_PER_BYTE
+                buffer.role: rows * buffer.quantized_range_elements // _ELEMENTS_PER_BYTE
                 for buffer in compressed
             }
             scale_and_lossless_bytes = {
-                buffer.role: rows * buffer.quantized_run_elements // _ELEMENTS_PER_SCALE
-                + rows * (stride - buffer.quantized_run_elements) * element_bytes
+                buffer.role: rows * buffer.quantized_range_elements // _ELEMENTS_PER_SCALE
+                + rows * (stride - buffer.quantized_range_elements) * element_bytes
                 for buffer in compressed
             }
             layer_start = cold_page_bytes
@@ -601,7 +592,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         raise ValueError(
                             "NVFP4 hot address and Slot stride must be 16-byte aligned"
                         )
-                    half_groups = rows * buffer.quantized_run_elements // _ELEMENTS_PER_HALF_GROUP
+                    half_groups = rows * buffer.quantized_range_elements // _ELEMENTS_PER_HALF_GROUP
                     max_half_groups_per_tile = max(
                         max_half_groups_per_tile,
                         min(half_groups, _MAX_HALF_GROUPS_PER_TILE),
@@ -629,9 +620,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         transform,
                         layout.num_kv_heads if is_compressed else 0,
                         layout.tokens_per_page if is_compressed else 0,
-                        buffer.quantized_run_elements if is_compressed else 0,
+                        buffer.quantized_range_elements if is_compressed else 0,
                         stride if is_compressed else 0,
-                        buffer.quantized_run_start_elements if is_compressed else 0,
+                        buffer.quantized_range_start if is_compressed else 0,
                     ]
                 )
                 buffer_scales = buffer.scales if is_compressed else _Nvfp4Scales(1.0, 1.0)

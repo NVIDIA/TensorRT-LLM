@@ -52,9 +52,9 @@ struct Nvfp4ColdPageKernelParams
 {
     std::int32_t numKvHeads;
     std::int32_t tokensPerPage;
-    std::int32_t quantizedRunElements;
+    std::int32_t quantizedRangeElements;
     std::int32_t rawRowStrideElements;
-    std::int32_t quantizedRunStartElements;
+    std::int32_t quantizedRangeStart;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -107,15 +107,15 @@ Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPag
                 static_cast<std::int64_t>(buffer.coldScaleOffset), static_cast<std::int64_t>(buffer.coldPaddingOffset)};
         metadata.integers[index]
             = {static_cast<std::int32_t>(buffer.coldPaddingBytes), static_cast<std::int32_t>(buffer.transform),
-                buffer.params.numKvHeads, buffer.params.tokensPerPage, buffer.params.quantizedRunElements,
-                buffer.params.rawRowStrideElements, buffer.params.quantizedRunStartElements};
+                buffer.params.numKvHeads, buffer.params.tokensPerPage, buffer.params.quantizedRangeElements,
+                buffer.params.rawRowStrideElements, buffer.params.quantizedRangeStart};
         metadata.scales[index] = {buffer.params.nvfp4ScaleOrigQuant, buffer.params.nvfp4ScaleQuantOrig,
             buffer.params.fp8ScaleOrigQuant, buffer.params.fp8ScaleQuantOrig};
         if (buffer.transform != Nvfp4ColdPageTransform::kLosslessCopy)
         {
             auto const halfGroups = static_cast<std::uint32_t>(buffer.params.numKvHeads)
                 * static_cast<std::uint32_t>(buffer.params.tokensPerPage)
-                * (static_cast<std::uint32_t>(buffer.params.quantizedRunElements) / 8U);
+                * (static_cast<std::uint32_t>(buffer.params.quantizedRangeElements) / 8U);
             metadata.maxHalfGroupsPerTile = std::max(metadata.maxHalfGroupsPerTile, std::min(halfGroups, 2048U));
         }
     }
@@ -147,7 +147,7 @@ struct PageGeometry
 {
     std::int32_t numHeads;
     std::int32_t tokensPerPage;
-    std::int32_t quantizedRunElements; // NVFP4 run length per row; equals the row stride for fully quantized rows
+    std::int32_t quantizedRangeElements; // NVFP4 elements per row; equals the row stride for fully quantized rows
 };
 
 constexpr PageGeometry kDefaultGeometry{2, 8, 32};
@@ -344,7 +344,7 @@ struct LayerBuffers
 
 std::size_t numElements(PageGeometry const& geometry)
 {
-    return static_cast<std::size_t>(geometry.numHeads) * geometry.tokensPerPage * geometry.quantizedRunElements;
+    return static_cast<std::size_t>(geometry.numHeads) * geometry.tokensPerPage * geometry.quantizedRangeElements;
 }
 
 std::size_t rawBytes(RawKind kind, PageGeometry const& geometry)
@@ -372,8 +372,8 @@ Nvfp4ColdPageKernelParams makeParams(PageGeometry const& geometry = kDefaultGeom
     Nvfp4ColdPageKernelParams params{};
     params.numKvHeads = geometry.numHeads;
     params.tokensPerPage = geometry.tokensPerPage;
-    params.quantizedRunElements = geometry.quantizedRunElements;
-    params.rawRowStrideElements = geometry.quantizedRunElements;
+    params.quantizedRangeElements = geometry.quantizedRangeElements;
+    params.rawRowStrideElements = geometry.quantizedRangeElements;
     params.nvfp4ScaleOrigQuant = role == 0U ? 1.0F : 2.0F;
     params.nvfp4ScaleQuantOrig = role == 0U ? 1.0F : 0.5F;
     params.fp8ScaleOrigQuant = role == 0U ? 2.0F : 4.0F;
@@ -431,7 +431,7 @@ float loadRawValue(
 
 std::uint32_t linearScaleOffset(std::uint32_t row, std::uint32_t scaleInRow, PageGeometry const& geometry)
 {
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(geometry.quantizedRunElements) / 16;
+    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(geometry.quantizedRangeElements) / 16;
     return row * scalesPerRow + scaleInRow;
 }
 
@@ -520,7 +520,7 @@ ReferenceNvfp4 compressReference(std::vector<std::uint8_t> const& raw, RawKind k
     ReferenceNvfp4 result{{}, {}};
     result.packed.resize(packedBytes(geometry));
     result.scales.resize(scaleBytes(geometry));
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(geometry.quantizedRunElements) / 16;
+    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(geometry.quantizedRangeElements) / 16;
     std::uint32_t const rows = static_cast<std::uint32_t>(geometry.numHeads * geometry.tokensPerPage);
 
     for (std::uint32_t row = 0; row < rows; ++row)
@@ -528,7 +528,7 @@ ReferenceNvfp4 compressReference(std::vector<std::uint8_t> const& raw, RawKind k
         for (std::uint32_t scaleInRow = 0; scaleInRow < scalesPerRow; ++scaleInRow)
         {
             std::size_t const blockStart
-                = static_cast<std::size_t>(row) * geometry.quantizedRunElements + scaleInRow * 16;
+                = static_cast<std::size_t>(row) * geometry.quantizedRangeElements + scaleInRow * 16;
             float amax = 0.0F;
             for (std::uint32_t i = 0; i < 16; ++i)
             {
@@ -554,7 +554,7 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
     Nvfp4ColdPageKernelParams const& params, PageGeometry const& geometry)
 {
     std::vector<std::uint8_t> raw(rawBytes(kind, geometry));
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(geometry.quantizedRunElements) / 16;
+    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(geometry.quantizedRangeElements) / 16;
     std::uint32_t const rows = static_cast<std::uint32_t>(geometry.numHeads * geometry.tokensPerPage);
     for (std::uint32_t row = 0; row < rows; ++row)
     {
@@ -564,7 +564,7 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
             blockScale.__x = compressed.scales[linearScaleOffset(row, scaleInRow, geometry)];
             float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig;
             std::size_t const blockStart
-                = static_cast<std::size_t>(row) * geometry.quantizedRunElements + scaleInRow * 16;
+                = static_cast<std::size_t>(row) * geometry.quantizedRangeElements + scaleInRow * 16;
             for (std::uint32_t i = 0; i < 16; ++i)
             {
                 std::uint8_t const byte = compressed.packed[(blockStart + i) / 2];
@@ -612,7 +612,7 @@ std::vector<std::uint8_t> makeDeepseekV4RawPage(RawKind kind, std::size_t page, 
     std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
     std::size_t const elementBytes = rawElementBytes(kind);
     std::size_t const rowBytes = static_cast<std::size_t>(kDeepseekV4RowElements) * elementBytes;
-    std::size_t const nopeRowBytes = static_cast<std::size_t>(geometry.quantizedRunElements) * elementBytes;
+    std::size_t const nopeRowBytes = static_cast<std::size_t>(geometry.quantizedRangeElements) * elementBytes;
     std::size_t const ropeRowBytes = rowBytes - nopeRowBytes;
     auto const activeNope = makeRawPage(kind, page, 0U, params, geometry, InputPattern::kDense);
     auto const inactiveNope = makeRawPage(kind, page + 32U, 0U, params, geometry, InputPattern::kDense);
@@ -640,7 +640,7 @@ std::vector<std::uint8_t> deepseekV4ExpectedRoundTrip(std::vector<std::uint8_t> 
 {
     std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
     auto expected = raw;
-    replaceRowSpan(expected, kind, rows, kDeepseekV4RowElements, 0U, geometry.quantizedRunElements,
+    replaceRowSpan(expected, kind, rows, kDeepseekV4RowElements, 0U, geometry.quantizedRangeElements,
         decompressReference(reference, kind, params, geometry));
     return expected;
 }
@@ -822,10 +822,10 @@ std::vector<std::uint8_t> makePartialRawPage(RawKind kind, std::int32_t validTok
     {
         for (std::int32_t token = 0; token < geometry.tokensPerPage; ++token)
         {
-            for (std::int32_t dim = 0; dim < geometry.quantizedRunElements; ++dim)
+            for (std::int32_t dim = 0; dim < geometry.quantizedRangeElements; ++dim)
             {
-                std::size_t const index
-                    = (static_cast<std::size_t>(head) * geometry.tokensPerPage + token) * geometry.quantizedRunElements
+                std::size_t const index = (static_cast<std::size_t>(head) * geometry.tokensPerPage + token)
+                        * geometry.quantizedRangeElements
                     + dim;
                 float value = 0.0F;
                 if (token < validTokens)
@@ -863,7 +863,7 @@ std::vector<std::uint8_t> makePartialRawPage(RawKind kind, std::int32_t validTok
 void expectSameValidPrefix(std::vector<std::uint8_t> const& lhs, std::vector<std::uint8_t> const& rhs, RawKind kind,
     std::int32_t validTokens, PageGeometry const& geometry)
 {
-    std::size_t const rowBytes = static_cast<std::size_t>(geometry.quantizedRunElements) * rawElementBytes(kind);
+    std::size_t const rowBytes = static_cast<std::size_t>(geometry.quantizedRangeElements) * rawElementBytes(kind);
     for (std::int32_t head = 0; head < geometry.numHeads; ++head)
     {
         for (std::int32_t token = 0; token < validTokens; ++token)
@@ -878,7 +878,7 @@ void expectSameValidPrefix(std::vector<std::uint8_t> const& lhs, std::vector<std
 void expectZeroTail(
     std::vector<std::uint8_t> const& bytes, RawKind kind, std::int32_t validTokens, PageGeometry const& geometry)
 {
-    std::size_t const rowBytes = static_cast<std::size_t>(geometry.quantizedRunElements) * rawElementBytes(kind);
+    std::size_t const rowBytes = static_cast<std::size_t>(geometry.quantizedRangeElements) * rawElementBytes(kind);
     std::vector<std::uint8_t> const zero(rowBytes, 0);
     for (std::int32_t head = 0; head < geometry.numHeads; ++head)
     {
@@ -981,7 +981,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
     std::size_t constexpr numPages = 2U;
     std::size_t constexpr slotCapacity = 8U;
     std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
-    std::size_t const ropeElements = kDeepseekV4RowElements - geometry.quantizedRunElements;
+    std::size_t const ropeElements = kDeepseekV4RowElements - geometry.quantizedRangeElements;
     auto params = makeParams(geometry);
     params.rawRowStrideElements = kDeepseekV4RowElements;
     params.nvfp4ScaleOrigQuant = nvfp4ScaleOrigQuant;
@@ -1011,7 +1011,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
     {
         rawHost[page] = makeDeepseekV4RawPage(kind, page, geometry.tokensPerPage, true, params, geometry);
         auto const nope
-            = extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements, 0U, geometry.quantizedRunElements);
+            = extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements, 0U, geometry.quantizedRangeElements);
         references[page] = compressReference(nope, kind, params, geometry);
         rawInput.copyFrom(static_cast<std::size_t>(inputSlots[page]) * rawSlotBytes, rawHost[page]);
         offloadTasks.push_back({coldSlots[page], inputSlots[page]});
@@ -1045,7 +1045,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
         EXPECT_EQ(coldRegion(coldSlot, packed, scales), references[page].scales);
         EXPECT_EQ(coldRegion(coldSlot, packed + scales, suffix),
             extractRowSpan(
-                rawHost[page], kind, rows, kDeepseekV4RowElements, geometry.quantizedRunElements, ropeElements));
+                rawHost[page], kind, rows, kDeepseekV4RowElements, geometry.quantizedRangeElements, ropeElements));
         auto const padding = coldRegion(coldSlot, payloadBytes, paddingBytes);
         EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0U; }));
 
@@ -1089,7 +1089,7 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
     std::size_t constexpr variantsPerCount = 2U;
     std::size_t constexpr rows
         = static_cast<std::size_t>(kDeepseekV4NopeGeometry.numHeads * kDeepseekV4NopeGeometry.tokensPerPage);
-    std::size_t constexpr ropeElements = kDeepseekV4RowElements - kDeepseekV4NopeGeometry.quantizedRunElements;
+    std::size_t constexpr ropeElements = kDeepseekV4RowElements - kDeepseekV4NopeGeometry.quantizedRangeElements;
     std::size_t constexpr numPages = variantsPerCount * kDeepseekV4ValidTokenCounts.size();
     auto params = makeParams(kDeepseekV4NopeGeometry);
     params.rawRowStrideElements = kDeepseekV4RowElements;
@@ -1136,7 +1136,7 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
 
     std::size_t const rawRowBytes = static_cast<std::size_t>(kDeepseekV4RowElements) * elementBytes;
     std::size_t const nopeRowBytes
-        = static_cast<std::size_t>(kDeepseekV4NopeGeometry.quantizedRunElements) * elementBytes;
+        = static_cast<std::size_t>(kDeepseekV4NopeGeometry.quantizedRangeElements) * elementBytes;
     for (std::size_t pair = 0; pair < kDeepseekV4ValidTokenCounts.size(); ++pair)
     {
         std::size_t const zeroPage = variantsPerCount * pair;
@@ -1161,9 +1161,9 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
         {
             auto const output = rawOutput.copyToHost(page * rawSlotBytes, rawPageBytes);
             EXPECT_EQ(extractRowSpan(output, kind, rows, kDeepseekV4RowElements,
-                          kDeepseekV4NopeGeometry.quantizedRunElements, ropeElements),
+                          kDeepseekV4NopeGeometry.quantizedRangeElements, ropeElements),
                 extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements,
-                    kDeepseekV4NopeGeometry.quantizedRunElements, ropeElements));
+                    kDeepseekV4NopeGeometry.quantizedRangeElements, ropeElements));
             auto const tail = rawOutput.copyToHost(page * rawSlotBytes + rawPageBytes, rawSlotBytes - rawPageBytes);
             EXPECT_TRUE(std::all_of(tail.begin(), tail.end(), [](std::uint8_t value) { return value == kCanary; }));
         }
@@ -1173,7 +1173,7 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
     coldStorage.expectCanaries();
 }
 
-// One buffer whose rows are [lossless prefix][NVFP4 run][lossless suffix]:
+// One buffer whose rows are [lossless prefix][NVFP4 range][lossless suffix]:
 // the shape the RoPE-precision switch produces for partial-rotary GQA K rows
 // (prefix) and MLA latent rows (suffix).
 std::vector<std::uint8_t> makeStridedRawPage(RawKind kind, std::size_t page, std::int32_t rowElements,
@@ -1182,9 +1182,9 @@ std::vector<std::uint8_t> makeStridedRawPage(RawKind kind, std::size_t page, std
     std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
     std::size_t const elementBytes = rawElementBytes(kind);
     std::size_t const rowBytes = static_cast<std::size_t>(rowElements) * elementBytes;
-    std::size_t const runBytes = static_cast<std::size_t>(geometry.quantizedRunElements) * elementBytes;
+    std::size_t const quantizedBytes = static_cast<std::size_t>(geometry.quantizedRangeElements) * elementBytes;
     std::size_t const prefixBytes = static_cast<std::size_t>(offsetElements) * elementBytes;
-    auto const run = makeRawPage(kind, page, 0U, params, geometry, InputPattern::kDense);
+    auto const quantizedPart = makeRawPage(kind, page, 0U, params, geometry, InputPattern::kDense);
     std::vector<std::uint8_t> raw(rows * rowBytes);
     for (std::size_t row = 0; row < rows; ++row)
     {
@@ -1193,7 +1193,7 @@ std::vector<std::uint8_t> makeStridedRawPage(RawKind kind, std::size_t page, std
         {
             rowStart[byte] = static_cast<std::uint8_t>((41U * row + 23U * byte + 13U * page + 7U) & 0xFFU);
         }
-        std::memcpy(rowStart + prefixBytes, run.data() + row * runBytes, runBytes);
+        std::memcpy(rowStart + prefixBytes, quantizedPart.data() + row * quantizedBytes, quantizedBytes);
     }
     return raw;
 }
@@ -1206,17 +1206,17 @@ void runPrefixSuffixStridedRoundTrip(RawKind kind, PageGeometry const& geometry,
     {
         GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
     }
-    ASSERT_LE(offsetElements + geometry.quantizedRunElements, rowElements);
+    ASSERT_LE(offsetElements + geometry.quantizedRangeElements, rowElements);
 
     std::size_t constexpr numPages = 2U;
     std::size_t constexpr slotCapacity = 8U;
     std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
     std::size_t const elementBytes = rawElementBytes(kind);
     std::size_t const suffixElements
-        = static_cast<std::size_t>(rowElements - offsetElements - geometry.quantizedRunElements);
+        = static_cast<std::size_t>(rowElements - offsetElements - geometry.quantizedRangeElements);
     auto params = makeParams(geometry);
     params.rawRowStrideElements = rowElements;
-    params.quantizedRunStartElements = offsetElements;
+    params.quantizedRangeStart = offsetElements;
     params.nvfp4ScaleOrigQuant = nvfp4ScaleOrigQuant;
     params.nvfp4ScaleQuantOrig = nvfp4ScaleQuantOrig;
     params.fp8ScaleOrigQuant = 1.0F;
@@ -1245,9 +1245,9 @@ void runPrefixSuffixStridedRoundTrip(RawKind kind, PageGeometry const& geometry,
     for (std::size_t page = 0; page < numPages; ++page)
     {
         rawHost[page] = makeStridedRawPage(kind, page, rowElements, offsetElements, params, geometry);
-        auto const run = extractRowSpan(rawHost[page], kind, rows, static_cast<std::size_t>(rowElements),
-            static_cast<std::size_t>(offsetElements), static_cast<std::size_t>(geometry.quantizedRunElements));
-        references[page] = compressReference(run, kind, params, geometry);
+        auto const quantizedPart = extractRowSpan(rawHost[page], kind, rows, static_cast<std::size_t>(rowElements),
+            static_cast<std::size_t>(offsetElements), static_cast<std::size_t>(geometry.quantizedRangeElements));
+        references[page] = compressReference(quantizedPart, kind, params, geometry);
         rawInput.copyFrom(static_cast<std::size_t>(inputSlots[page]) * rawSlotBytes, rawHost[page]);
         offloadTasks.push_back({coldSlots[page], inputSlots[page]});
         onboardTasks.push_back({outputSlots[page], coldSlots[page]});
@@ -1285,7 +1285,7 @@ void runPrefixSuffixStridedRoundTrip(RawKind kind, PageGeometry const& geometry,
         auto const prefix = extractRowSpan(rawHost[page], kind, rows, static_cast<std::size_t>(rowElements), 0U,
             static_cast<std::size_t>(offsetElements));
         auto const suffix = extractRowSpan(rawHost[page], kind, rows, static_cast<std::size_t>(rowElements),
-            static_cast<std::size_t>(offsetElements + geometry.quantizedRunElements), suffixElements);
+            static_cast<std::size_t>(offsetElements + geometry.quantizedRangeElements), suffixElements);
         for (std::size_t row = 0; row < rows; ++row)
         {
             expectedLossless.insert(expectedLossless.end(), prefix.begin() + row * prefixBytesPerRow,
@@ -1297,10 +1297,10 @@ void runPrefixSuffixStridedRoundTrip(RawKind kind, PageGeometry const& geometry,
         auto const padding = coldRegion(coldSlot, payloadBytes, paddingBytes);
         EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0U; }));
 
-        // Restored page: NVFP4 round trip in the run, bit-exact prefix and suffix.
+        // Restored page: NVFP4 round trip in the quantized range, bit-exact prefix and suffix.
         auto expected = rawHost[page];
         replaceRowSpan(expected, kind, rows, static_cast<std::size_t>(rowElements),
-            static_cast<std::size_t>(offsetElements), static_cast<std::size_t>(geometry.quantizedRunElements),
+            static_cast<std::size_t>(offsetElements), static_cast<std::size_t>(geometry.quantizedRangeElements),
             decompressReference(references[page], kind, params, geometry));
         auto const restored
             = rawOutput.copyToHost(static_cast<std::size_t>(outputSlots[page]) * rawSlotBytes, rawPageBytes);
@@ -1427,9 +1427,9 @@ TEST_P(Nvfp4ColdPageRopePrecisionTest, PrefixAndSuffixInOneRow)
     runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 33, 96}, 160, 32, 2.0F, 0.5F);
 }
 
-// 2200 half-groups exceed one 2048-half-group tile, so the nonzero run start is applied to
+// 2200 half-groups exceed one 2048-half-group tile, so the nonzero range start is applied to
 // groups whose first half-group is not zero in every tile loop.
-TEST_P(Nvfp4ColdPageRopePrecisionTest, NonzeroRunStartAcrossTiles)
+TEST_P(Nvfp4ColdPageRopePrecisionTest, NonzeroRangeStartAcrossTiles)
 {
     runPrefixSuffixStridedRoundTrip(GetParam(), PageGeometry{1, 1100, 16}, 48, 16);
 }
