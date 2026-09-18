@@ -280,6 +280,114 @@ def _logic_wan_t2v_tp3_uneven_vs_single_gpu(rank, world_size):
     _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, _WAN_UNEVEN_TP3_CONFIG)
 
 
+def _logic_wan_t2v_tp_fullgraph_vs_single_gpu(rank, world_size):
+    """WAN T2V: TP output, with each block torch.compile(fullgraph=True)'d
+    like pipeline.py's torch_compile() does, matches the single-GPU reference."""
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+
+    device = torch.device(f"cuda:{rank}")
+    compute_dtype = torch.bfloat16
+
+    batch = 1
+    T, H, W = 2, 4, 4
+    in_channels = 16
+    txt_seq = 8
+
+    torch.manual_seed(123)
+    ref_config = _make_model_config(_WAN_T2V_TEST_CONFIG, tp_size=1)
+    ref_model = WanTransformer3DModel(ref_config).to(device).to(compute_dtype)
+    _stabilize_model_weights(ref_model)
+    ref_model.eval()
+
+    torch.manual_seed(123)
+    tp_config = _make_model_config(_WAN_T2V_TEST_CONFIG, tp_size=world_size)
+    tp_model = WanTransformer3DModel(tp_config).to(device).to(compute_dtype)
+    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size, _WAN_T2V_TEST_CONFIG)
+    tp_model.eval()
+
+    # Mirror pipeline.py's torch_compile(): compile each transformer block
+    # individually with fullgraph=True.
+    tp_model.blocks = torch.nn.ModuleList(
+        [torch.compile(block, fullgraph=True, dynamic=None) for block in tp_model.blocks]
+    )
+
+    torch.manual_seed(456)
+    hidden_states = (
+        torch.randn(batch, in_channels, T, H, W, device=device, dtype=compute_dtype) * 0.1
+    )
+    encoder_hidden_states = (
+        torch.randn(batch, txt_seq, 128, device=device, dtype=compute_dtype) * 0.1
+    )
+    timestep = torch.tensor([0.5], device=device, dtype=compute_dtype)
+
+    with torch.no_grad():
+        ref_output = ref_model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+        )
+        tp_output = tp_model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+        )
+
+    torch.testing.assert_close(
+        tp_output,
+        ref_output,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=(
+            f"Rank {rank}: WAN T2V TP + torch.compile(fullgraph=True) output "
+            "differs from single-GPU eager reference"
+        ),
+    )
+
+
+def _logic_wan_tp_fullgraph_uncached_init_boundary(rank, world_size):
+    """WAN T2V: fullgraph=True compiled right after constructing a fresh TP
+    model, with no prior device-mesh/AllReduce access in this process to warm
+    up caching, still traces cleanly."""
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+
+    # Force the uncached path: no mesh has been built yet in this process.
+    DeviceMeshTopologyImpl.device_mesh = None
+    DeviceMeshTopologyImpl.tp_mesh = None
+    VisualGenMapping.seq_mesh = None
+
+    device = torch.device(f"cuda:{rank}")
+    compute_dtype = torch.bfloat16
+
+    tp_config = _make_model_config(_WAN_T2V_TEST_CONFIG, tp_size=world_size)
+    tp_model = WanTransformer3DModel(tp_config).to(device).to(compute_dtype)
+    _stabilize_model_weights(tp_model)
+    tp_model.eval()
+
+    tp_model.blocks = torch.nn.ModuleList(
+        [torch.compile(block, fullgraph=True, dynamic=None) for block in tp_model.blocks]
+    )
+
+    batch = 1
+    T, H, W = 2, 4, 4
+    in_channels = 16
+    txt_seq = 8
+    hidden_states = torch.randn(batch, in_channels, T, H, W, device=device, dtype=compute_dtype)
+    encoder_hidden_states = torch.randn(batch, txt_seq, 128, device=device, dtype=compute_dtype)
+    timestep = torch.tensor([0.5], device=device, dtype=compute_dtype)
+
+    with torch.no_grad():
+        output = tp_model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+        )
+
+    assert not torch.isnan(output).any(), f"Rank {rank}: NaN in output"
+    assert not torch.isinf(output).any(), f"Rank {rank}: Inf in output"
+
+
 def _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     """WAN T2V: TP output matches single-GPU reference."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
@@ -531,6 +639,19 @@ class TestWanT2VTP:
     def test_wan_t2v_tp_vs_single_gpu(self):
         """WAN T2V TP 2-GPU output matches single-GPU reference."""
         run_test_in_distributed(world_size=2, test_fn=_logic_wan_t2v_tp_vs_single_gpu)
+
+    def test_wan_t2v_tp_fullgraph_vs_single_gpu(self):
+        """WAN T2V TP 4-GPU, torch.compile(fullgraph=True) per block, matches
+        single-GPU reference with zero graph breaks."""
+        run_test_in_distributed(world_size=4, test_fn=_logic_wan_t2v_tp_fullgraph_vs_single_gpu)
+
+    def test_wan_tp_fullgraph_uncached_init_boundary(self):
+        """WAN T2V TP 2-GPU, torch.compile(fullgraph=True) compiled immediately
+        after construction, with no prior device-mesh/AllReduce access in this
+        process to warm up caching."""
+        run_test_in_distributed(
+            world_size=2, test_fn=_logic_wan_tp_fullgraph_uncached_init_boundary
+        )
 
 
 class TestWanT2VTPUlyssesCombined:
