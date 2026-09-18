@@ -1566,6 +1566,25 @@ class KvCacheCreator:
                 f"max_gpu_total_bytes={self._max_gpu_total_bytes_in / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
+        if self._is_kv_cache_manager_v2:
+            # KVCacheManagerV2 normally uses max_gpu_total_bytes alone, so we'd
+            # just restore the user-provided max_tokens here. However, when a
+            # one-model speculative-decoding draft KV cache shares the same
+            # config, max_gpu_total_bytes doesn't scale with the draft's much
+            # smaller per-token byte footprint (which depends on
+            # num_local_layers), so both managers read the same cap and the
+            # draft double-claims the budget -> OOM. Mirror V1's behaviour:
+            # derive max_tokens from the final estimated memory so V2's quota
+            # = min(max_gpu_total_bytes, max_tokens * bytes_per_token)
+            # naturally picks the layer-scaled draft budget when the draft
+            # manager reads the shared config. Respect an explicit
+            # user-provided max_tokens if present.
+            if self._max_kv_tokens_in is not None:
+                self._kv_cache_config.max_tokens = self._max_kv_tokens_in
+            else:
+                self._kv_cache_config.max_tokens = (self._get_kv_size_per_token(
+                ).tokens_for_budget(kv_cache_max_memory))
+
         logger.info(
             f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
         )
