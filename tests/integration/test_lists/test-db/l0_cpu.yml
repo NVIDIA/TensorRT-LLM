@@ -12,7 +12,6 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
-  - unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py::test_cute_dsl_scaled_mm_rejects_mixed_clusters
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
@@ -73,6 +72,7 @@ l0_cpu:
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_utils.py
+  - unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
