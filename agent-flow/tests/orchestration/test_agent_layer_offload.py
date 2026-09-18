@@ -1,10 +1,9 @@
 """The seam between the DAG scheduler and a synchronous ``AgentLayer``.
 
-A workflow may already own a working, synchronous agent loop — perf-optimize's
-optimizer ⇄ evaluator attempt loop is one — and rewriting it as a coroutine to
-adopt the scheduler is a large, risky change. The alternative is to offload the
-loop from an async ``run_node`` with ``anyio.to_thread.run_sync``, which is what
-perf-optimize does.
+A workflow may already own a working, synchronous agent loop, and rewriting it
+as a coroutine to adopt the scheduler is a large, risky change. The alternative
+is to offload the loop from an async ``run_node`` with
+``anyio.to_thread.run_sync``.
 
 That combination has two ways to be silently wrong, and both are pinned here:
 
