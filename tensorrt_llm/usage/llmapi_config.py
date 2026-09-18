@@ -42,7 +42,6 @@ CAPTURE_SOURCE = "effective_validated_llm_args"
 MAX_CONFIG_BYTES = 16384
 
 _TELEMETRY_EXTRA_KEY = "telemetry"
-_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 
 # Per-sequence cap, applied recursively so each inner list of a nested
 # List[List[int]] is bounded independently. 256 sits above the longest realistic
@@ -114,8 +113,6 @@ def _normalize_metadata(metadata: Any) -> dict[str, Any] | None:
 
 def _get_telemetry_metadata(field_info: Any) -> dict[str, Any] | None:
     json_schema_extra = getattr(field_info, "json_schema_extra", None)
-    if callable(json_schema_extra):
-        json_schema_extra = getattr(json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
     if not isinstance(json_schema_extra, dict):
         return None
     return _normalize_metadata(json_schema_extra.get(_TELEMETRY_EXTRA_KEY))
