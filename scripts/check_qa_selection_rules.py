@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Check tests/qa_selection/rules.json against the suite's skip decorators.
+"""Check tests/qa_selection/core/rules.json against the suite's skip decorators.
 
 Every rule is resolved through the `skip_*` decorator it names, not through the
 reason string it matches on. Names survive edits to prose, so the check can say
@@ -48,7 +48,7 @@ class RepoPaths:
     SKIP_DECORATORS = ROOT / "tests" / "integration" / "defs"
 
     # Named in every message, so it stays repo-relative and pasteable.
-    RULES_FILE = "tests/qa_selection/rules.json"
+    RULES_FILE = "tests/qa_selection/core/rules.json"
 
     @classmethod
     def enable_package_import(cls) -> None:
@@ -60,7 +60,7 @@ class RepoPaths:
 
 RepoPaths.enable_package_import()
 
-from qa_selection.rules import SkipRule, SkipRuleTable, default_rule_table  # noqa: E402
+from qa_selection.core.rules import SkipRule, SkipRuleTable, default_rule_table  # noqa: E402
 
 
 @dataclass(frozen=True)
