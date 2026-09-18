@@ -325,6 +325,8 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': [
                 'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:32-maxnt:8448',
+                # VR200 4-GPU case uses the serve backend instead of bench.
+                'deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448',
             ],
             'config': {
                 'enable_attention_dp': True,
@@ -361,6 +363,8 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': [
                 'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:128-maxnt:8448',
+                # VR200 4-GPU case uses the serve backend instead of bench.
+                'deepseek_v4_pro_fp4-serve-pytorch-float4-maxbs:128-maxnt:8448',
             ],
             'config': {
                 'enable_attention_dp': False,
