@@ -533,98 +533,96 @@ if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
   message(STATUS "USE_CXX11_ABI is set by python Torch to ${USE_CXX11_ABI}")
 endif()
 
-if(BUILD_PYT)
-  # ignore values passed from the environment
-  if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
-    message(
-      WARNING
-        "Ignoring environment variable TORCH_CUDA_ARCH_LIST=$ENV{TORCH_CUDA_ARCH_LIST}"
-    )
-  endif()
-  unset(ENV{TORCH_CUDA_ARCH_LIST})
-  # Torch maintains custom logic to add CUDA architecture flags into
-  # CMAKE_CUDA_FLAGS based on TORCH_CUDA_ARCH_LIST variable, instead of using
-  # the native support introduced in newer CMake versions. And it always tries
-  # to add some flags, even given empty TORCH_CUDA_ARCH_LIST.
-
-  # We prefer CMake's native support to be able to easily customize the CUDA
-  # architectures to be compiled for, for each kernel individually. So we set
-  # TORCH_CUDA_ARCH_LIST to a placeholder value and remove the generated flags
-  # then to effectively prevent Torch from adding CUDA architecture flags.
+# Torch has to be located even when the Python bindings are not built.
+# Core C++ sources include torch headers unconditionally, for example
+# batch_manager/cacheTransceiver.h -> runtime/utils/pgUtils.h -> <torch/torch.h>,
+# so a BUILD_PYT=OFF configure used to fail on the REQUIRED torch_python
+# lookup in runtime/utils/CMakeLists.txt with an empty TORCH_INSTALL_PREFIX.
+# ignore values passed from the environment
+if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
   message(
-    STATUS
-      "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\" to make Torch happy. "
-      "This is NOT the list of architectures that will be compiled for.")
-  set(TORCH_CUDA_ARCH_LIST "8.0")
-
-  find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-  message(STATUS "Found Python executable at ${Python3_EXECUTABLE}")
-  message(STATUS "Found Python libraries at ${Python3_LIBRARY_DIRS}")
-  link_directories("${Python3_LIBRARY_DIRS}")
-  list(APPEND COMMON_HEADER_DIRS ${Python3_INCLUDE_DIRS})
-
-  execute_process(
-    COMMAND
-      ${Python3_EXECUTABLE} "-c"
-      "from __future__ import print_function; import torch; print(torch.__version__,end='');"
-    RESULT_VARIABLE _PYTHON_SUCCESS
-    OUTPUT_VARIABLE TORCH_VERSION)
-  if(TORCH_VERSION VERSION_LESS "1.5.0")
-    message(FATAL_ERROR "PyTorch >= 1.5.0 is needed for TorchScript mode.")
-  endif()
-
-  execute_process(
-    COMMAND ${Python3_EXECUTABLE} "-c"
-            "from __future__ import print_function; import os; import torch;
-print(os.path.dirname(torch.__file__),end='');"
-    RESULT_VARIABLE _PYTHON_SUCCESS
-    OUTPUT_VARIABLE TORCH_DIR)
-  if(NOT _PYTHON_SUCCESS EQUAL 0)
-    message(FATAL_ERROR "Torch config Error.")
-  endif()
-  list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
-  set(USE_SYSTEM_NVTX ON)
-  set(nvtx3_dir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
-  set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
-  find_package(Torch REQUIRED)
-  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
-  message(
-    STATUS
-      "Removing Torch generated placeholder CUDA architecture flags: -gencode arch=compute_80,code=sm_80."
+    WARNING
+      "Ignoring environment variable TORCH_CUDA_ARCH_LIST=$ENV{TORCH_CUDA_ARCH_LIST}"
   )
-  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS_NEW
-                 "${CMAKE_CUDA_FLAGS}")
-  if("${CMAKE_CUDA_FLAGS_NEW}" STREQUAL "${CMAKE_CUDA_FLAGS}")
-    message(
-      FATAL_ERROR
-        "Torch didn't generate expected placeholder CUDA architecture flags.")
-  endif()
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS_NEW}")
+endif()
+unset(ENV{TORCH_CUDA_ARCH_LIST})
+# Torch maintains custom logic to add CUDA architecture flags into
+# CMAKE_CUDA_FLAGS based on TORCH_CUDA_ARCH_LIST variable, instead of using
+# the native support introduced in newer CMake versions. And it always tries
+# to add some flags, even given empty TORCH_CUDA_ARCH_LIST.
 
+# We prefer CMake's native support to be able to easily customize the CUDA
+# architectures to be compiled for, for each kernel individually. So we set
+# TORCH_CUDA_ARCH_LIST to a placeholder value and remove the generated flags
+# then to effectively prevent Torch from adding CUDA architecture flags.
+message(
+  STATUS
+    "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\" to make Torch happy. "
+    "This is NOT the list of architectures that will be compiled for.")
+set(TORCH_CUDA_ARCH_LIST "8.0")
+
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+message(STATUS "Found Python executable at ${Python3_EXECUTABLE}")
+message(STATUS "Found Python libraries at ${Python3_LIBRARY_DIRS}")
+link_directories("${Python3_LIBRARY_DIRS}")
+list(APPEND COMMON_HEADER_DIRS ${Python3_INCLUDE_DIRS})
+
+execute_process(
+  COMMAND
+    ${Python3_EXECUTABLE} "-c"
+    "from __future__ import print_function; import torch; print(torch.__version__,end='');"
+  RESULT_VARIABLE _PYTHON_SUCCESS
+  OUTPUT_VARIABLE TORCH_VERSION)
+if(TORCH_VERSION VERSION_LESS "1.5.0")
+  message(FATAL_ERROR "PyTorch >= 1.5.0 is needed for TorchScript mode.")
+endif()
+
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} "-c"
+          "from __future__ import print_function; import os; import torch;
+print(os.path.dirname(torch.__file__),end='');"
+  RESULT_VARIABLE _PYTHON_SUCCESS
+  OUTPUT_VARIABLE TORCH_DIR)
+if(NOT _PYTHON_SUCCESS EQUAL 0)
+  message(FATAL_ERROR "Torch config Error.")
+endif()
+list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
+set(USE_SYSTEM_NVTX ON)
+set(nvtx3_dir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
+set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
+find_package(Torch REQUIRED)
+set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
+message(
+  STATUS
+    "Removing Torch generated placeholder CUDA architecture flags: -gencode arch=compute_80,code=sm_80."
+)
+string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS_NEW
+               "${CMAKE_CUDA_FLAGS}")
+if("${CMAKE_CUDA_FLAGS_NEW}" STREQUAL "${CMAKE_CUDA_FLAGS}")
+  message(
+    FATAL_ERROR
+      "Torch didn't generate expected placeholder CUDA architecture flags.")
+endif()
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS_NEW}")
+
+if(BUILD_PYT)
   add_compile_definitions(TORCH_CUDA=1)
+endif()
 
-  if(DEFINED TORCH_CXX_FLAGS)
-    message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
-    add_compile_options(${TORCH_CXX_FLAGS})
-    if(DEFINED USE_CXX11_ABI)
-      parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
-      if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
-         AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL
-             ${USE_CXX11_ABI})
-        message(
-          WARNING
-            "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
-            "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
-            "setting will be discarded.")
-      endif()
+if(DEFINED TORCH_CXX_FLAGS)
+  message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
+  add_compile_options(${TORCH_CXX_FLAGS})
+  if(DEFINED USE_CXX11_ABI)
+    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL
+           ${USE_CXX11_ABI})
+      message(
+        WARNING
+          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+          "setting will be discarded.")
     endif()
-  endif()
-else()
-  if(NOT WIN32)
-    if(NOT USE_CXX11_ABI)
-      add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
-    endif()
-    message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
   endif()
 endif()
 
