@@ -292,22 +292,26 @@ The framework connects storage-bound compression to KVCM V2 through the
 existing interfaces. A new compression format implements its provider APIs and
 algorithm launcher.
 
-#### Row contract of the NVFP4 cold-page codec
+#### Which elements of a row the NVFP4 codec quantizes
 
-The kernels quantize one contiguous run per hot row and copy the bytes around it
-unchanged. Each compressed buffer carries `quantized_run_start_elements` and
-`quantized_run_elements`; its layer carries `raw_row_stride_elements`. With
-`keep_rope_precision` off the run is the whole row. With it on, the codec locates
-the RoPE elements from the model config (the `qk_rope_head_dim` tail of an MLA
-latent row, the first `head_dim * partial_rotary_factor` elements of a
-partial-rotary GQA head, the 64-element tail of a DeepSeek-V4 compressed row) and
-leaves them out of the run, so they land in the cold page byte-for-byte after that
-buffer's scales. Rows that are entirely RoPE, rows whose RoPE elements sit in the
-middle, and runs that would not start and end on a 16-element scale group are
-rejected. The switch only takes effect for the model types in
-`_KEEP_ROPE_PRECISION_MODEL_TYPES`, whose RoPE layout and accuracy have been
-checked; other models log a warning and quantize whole rows. Draft KVCMs always
-quantize whole rows because the codec holds only the target model's config.
+Each hot row has one contiguous range that the kernel turns into NVFP4; the bytes
+before and after that range are copied unchanged. A compressed buffer stores the
+range as `quantized_run_start_elements` and `quantized_run_elements`, and its
+layer stores `raw_row_stride_elements`.
+
+- `keep_rope_precision` off: the range is the whole row.
+- `keep_rope_precision` on: the RoPE elements are left out of the range, so they
+  land in the cold page byte-for-byte after that buffer's scales. The codec finds
+  them from the model config: the `qk_rope_head_dim` tail of an MLA latent row,
+  the first `head_dim * partial_rotary_factor` elements of a partial-rotary GQA
+  head, or the 64-element tail of a DeepSeek-V4 compressed row.
+
+Rows that are entirely RoPE, rows with RoPE in the middle, and ranges that do not
+start and end on a 16-element scale group are rejected. The switch only takes
+effect for the model types in `_KEEP_ROPE_PRECISION_MODEL_TYPES`, whose RoPE
+layout and accuracy have been checked; other models log a warning and quantize
+whole rows. Draft KVCMs always quantize whole rows because the codec holds only
+the target model's config.
 
 ### 4. Add method-specific kernels
 
