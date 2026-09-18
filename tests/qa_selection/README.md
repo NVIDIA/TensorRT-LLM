@@ -9,13 +9,37 @@ occupies the allocation, and only then skips — because pytest evaluates skip c
 at run time, on the node. The cost being attacked is queue time, not runtime.
 
 ```
-profiles.json ─┐
-               ├─ machines.py ── MachineProfile ─┐
-rules.json ────┴─ rules.py ───── SkipRuleTable ──┴─ selector.py ── Selector.decide()
+core/profiles.json ─┐
+                    ├─ machines.py ── MachineProfile ─┐
+core/rules.json ────┴─ rules.py ───── SkipRuleTable ──┴─ selector.py ── Selector.decide()
+                                                            └─ allocation.py ── rung
 ```
 
-`selector.py` imports neither pytest nor torch, so decisions are made from plain data and
-this package loads on a login node with no GPU.
+## Layout
+
+The package splits on what each half is allowed to depend on:
+
+```text
+qa_selection/
+  core/          the decision layer -- stdlib only, never pytest
+    machines.py    machine facts, read from profiles.json
+    rules.py       skip rules, read from rules.json
+    selector.py    feasibility: can this machine run this test
+    allocation.py  demand and rung: which allocation a test belongs to
+  collection.py  options, markers, the item adapter, the decisions
+  report.py      the .ids files, the JSON record, the terminal summary
+  plugin.py      the pytest hooks; the `-p qa_selection.plugin` entry point
+```
+
+Code inside `core/` imports neither pytest nor torch, so decisions are made from plain data
+and this package loads on a login node with no GPU. The invariant is a one-liner:
+
+```bash
+grep -lE '^(import|from) pytest' tests/qa_selection/core/*.py   # prints nothing
+```
+
+`plugin.py` is deliberately short: a reader opening the entry point should see the hook
+contract — `trylast`, non-wrapper, inert without `--machine` — with nothing else in the way.
 
 ## Why rules are keyed on the reason string
 
@@ -44,7 +68,7 @@ a required `decorator` field, listed first:
 }
 ```
 
-Nothing in `selector.py` reads it — a collected mark carries only its `kwargs`, so `reason`
+Nothing in `core/selector.py` reads it — a collected mark carries only its `kwargs`, so `reason`
 stays the only key selection can match on. Its purpose is the drift check: an identifier is
 stable under the edit the check exists to catch, which turns *"this rule matches nothing"*
 into *"`skip_no_hopper`'s reason is now **X** — paste it in"*.
@@ -214,7 +238,7 @@ A rule starts from a decorator name, not from a reason string.
 
 1. **Pick the `skip_*` to curate.** It must already exist at module level under
    `tests/integration/defs`; if the skip is written inline at a test, name it there first.
-2. **Add the entry to `rules.json`**, `decorator` first, then its `reason` copied **byte for
+2. **Add the entry to `core/rules.json`**, `decorator` first, then its `reason` copied **byte for
    byte** — including anything that looks like a typo. `skip_when` accepts six
    `MachineProfile` fields and ten operators, both validated at load, so a mistake fails
    immediately naming the legal set.
@@ -225,7 +249,7 @@ current reason, JSON-quoted, so paste it over the rule's `reason` and re-run.
 
 ## Machine profiles
 
-`profiles.json` covers the six machines in selection scope: H100, B200, B300, GB200, GB300,
+`core/profiles.json` covers the six machines in selection scope: H100, B200, B300, GB200, GB300,
 VR200. Values come from the in-production catalogue in `trt_jenkins`
 (`src/com/nvidia/dlswqa/LLMCluster.groovy`, `MAKO_PROFILES` and `CLUSTER_CONFIGS`) and are
 maintained by hand from there.

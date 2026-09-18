@@ -129,7 +129,7 @@ class Selector:
             raise UnknownSkipRuleError(
                 f"{test.nodeid}: no rule for skipif reason(s) "
                 f"{', '.join(repr(reason) for reason in unknown)}; "
-                f"add them to tests/qa_selection/rules.json"
+                f"add them to tests/qa_selection/core/rules.json"
             )
 
         blockers = skipif_blockers + self.resource_blockers(test)
