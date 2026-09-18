@@ -21,8 +21,8 @@ included and residency is capped at ``max_batch_size * pp_size`` however many
 seats exist. It stays off for V1 (the V1 capacity schedulers hardcode
 ``GENERATION_COMPLETE``) and for hybrid models (SSM state is sized from
 ``max_batch_size``). "V1" there is the manager the creator *selects*, not the
-``use_kv_cache_manager_v2`` request: a plain model with ``max_beam_width > 1`` is
-demoted to V1 after the request is honoured, so the gate reads
+``use_kv_cache_manager_v2`` request: a plain Python-backend model with
+``max_beam_width > 1`` is demoted to V1, so the gate reads
 ``resolved_kv_cache_manager_is_v2``. It also stays off for the Qwen-VL models that
 keep an MRoPE delta cache, which is sized ``max_num_tokens * pp_size + 1`` yet
 indexed by ``py_seq_slot``.
@@ -280,12 +280,14 @@ def test_resolve_mrope_delta_cache_finds_the_model_and_draft_buffers():
 
 
 @pytest.mark.parametrize("max_beam_width,expected_factor", [(1, 2), (2, 1), (4, 1)])
-def test_v2_requested_but_beam_search_selects_v1_keeps_b_slots(max_beam_width, expected_factor):
+def test_v2_requested_but_beam_search_selects_v1_keeps_b_slots(
+    max_beam_width, expected_factor, monkeypatch
+):
     """``use_kv_cache_manager_v2=True`` is a request, not the manager selected.
 
     ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
-    V2 manager to ``KVCacheManager`` when ``max_beam_width > 1``, so gating the
-    seat pool on the *configured* preference left V2 geometry -- ``2B`` seats,
+    Python V2 manager to ``KVCacheManager`` when ``max_beam_width > 1``, so gating
+    the seat pool on the *configured* preference left V2 geometry -- ``2B`` seats,
     plus ``ADPRouter.exclude_retiring_requests`` admitting a replacement cohort
     on top of a retiring one -- on a V1 executor whose capacity scheduler
     hardcodes ``GENERATION_COMPLETE`` and never releases the retirees early. The
@@ -293,6 +295,7 @@ def test_v2_requested_but_beam_search_selects_v1_keeps_b_slots(max_beam_width, e
     wasted, so the request must be resolved through
     ``resolved_kv_cache_manager_is_v2`` before it reaches the gate.
     """
+    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "python")
     max_batch_size = 8
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
@@ -358,8 +361,9 @@ def test_resolved_v2_respects_an_explicit_v1_request():
     )
 
 
-def test_v2_incompatible_features_reports_every_trigger():
+def test_v2_incompatible_features_reports_every_trigger(monkeypatch):
     """The strings reach the creator's user-facing fallback/rejection message."""
+    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "python")
     assert kv_cache_manager_v2_incompatible_features(1) == []
     assert kv_cache_manager_v2_incompatible_features(None) == []
     assert kv_cache_manager_v2_incompatible_features(2) == ["max_beam_width > 1"]

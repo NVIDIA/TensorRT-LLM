@@ -122,7 +122,10 @@ def kv_cache_manager_v2_incompatible_features(
     passing it.
     """
     incompat: List[str] = []
-    if max_beam_width is not None and max_beam_width > 1:
+    python_v2_backend = (os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND",
+                                        "cpp").lower() == "python")
+    if (max_beam_width is not None and max_beam_width > 1
+            and python_v2_backend):
         incompat.append("max_beam_width > 1")
     return incompat
 
@@ -840,11 +843,8 @@ class KvCacheCreator:
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             sparse_attn_config = model_config.sparse_attention_config
-            # The KV connector is supported through the pool layout
-            # registration path, so it no longer forces a fallback.
-            incompat: List[str] = []
-            python_v2_backend = (os.environ.get(
-                "TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python")
+            incompat = kv_cache_manager_v2_incompatible_features(
+                self._max_beam_width)
             # Sparse attention: ModelEngine only forwards cache_indirection when
             # the metadata type is exactly TrtllmAttentionMetadata, and every
             # sparse backend uses a subclass, so beams would read beam 0's
@@ -854,8 +854,9 @@ class KvCacheCreator:
             # The C++ V2 cache expands beams after receive completion, copying
             # the prompt's partial tail before the first generation step.
             if (self._max_beam_width is not None and self._max_beam_width > 1
-                    and (python_v2_backend or is_hybrid_linear(config)
-                         or sparse_attn_config is not None)):
+                    and
+                (is_hybrid_linear(config) or sparse_attn_config is not None)
+                    and "max_beam_width > 1" not in incompat):
                 incompat.append("max_beam_width > 1")
             if incompat:
                 incompat_str = ", ".join(incompat)
