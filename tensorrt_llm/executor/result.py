@@ -209,6 +209,9 @@ class GenerationResultBase:
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
+        self.ctx_computed_tokens = 0
+        self.ctx_first_begin = -1
+        self.ctx_num_chunks = 0
         self.per_pos_drafted = None
         self.per_pos_accepted = None
         # Cumulative (accepted, drafted) draft-token totals attached by the
@@ -544,6 +547,9 @@ class GenerationResultBase:
 
         if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
+            self.ctx_computed_tokens = getattr(response, 'ctx_computed_tokens', 0)
+            self.ctx_first_begin = getattr(response, 'ctx_first_begin', -1)
+            self.ctx_num_chunks = getattr(response, 'ctx_num_chunks', 0)
             if isinstance(response.res, CompletionOutput):
                 # in streaming mode
                 self._outputs[0] = response.res
@@ -599,6 +605,9 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
+            self.ctx_computed_tokens = getattr(response_result, 'ctx_computed_tokens', 0)
+            self.ctx_first_begin = getattr(response_result, 'ctx_first_begin', -1)
+            self.ctx_num_chunks = getattr(response_result, 'ctx_num_chunks', 0)
             self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',

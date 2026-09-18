@@ -1320,7 +1320,11 @@ class TestListenerAbortAndShutdown:
         executor = object.__new__(PyExecutor)
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
-        executor.dist = SimpleNamespace(rank=1)
+        executor.dist = SimpleNamespace(rank=1, pp_size=1)
+        # The fire point retires the overlap loop's in-flight batch and, under
+        # attention-DP, votes before a drain fires; neither applies here.
+        executor.disable_overlap_scheduler = True
+        executor.enable_attention_dp = False
         executor.control_request_barrier = threading.Event()
         executor.control_action_done = threading.Event()
         executor.control_requests = [RequestQueueItem(id=CONTROL_REQUEST_ID, control_id=op_id)]

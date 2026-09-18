@@ -88,6 +88,9 @@ class PostprocWorker:
         should_abort: bool = False
         finish_reason: Optional[str] = None
         num_generated_tokens: Optional[int] = None
+        ctx_computed_tokens: int = 0
+        ctx_first_begin: int = -1
+        ctx_num_chunks: int = 0
 
     def __init__(
         self,
@@ -264,6 +267,10 @@ class PostprocWorker:
                         should_abort=should_abort,
                         finish_reason=finish_reason,
                         num_generated_tokens=num_generated_tokens,
+                        ctx_computed_tokens=getattr(response_result,
+                                                    "ctx_computed_tokens", 0),
+                        ctx_first_begin=getattr(response_result, "ctx_first_begin", -1),
+                        ctx_num_chunks=getattr(response_result, "ctx_num_chunks", 0),
                     ))
                 if is_final:
                     self._records.pop(client_id, None)
