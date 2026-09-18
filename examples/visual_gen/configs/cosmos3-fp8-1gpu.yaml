@@ -25,11 +25,13 @@
 # checkpoint's own metadata. FP8 is single-GPU only -- multi-GPU is refused
 # with an explicit error, so use BF16 there (see cosmos3-super-4gpu.yaml).
 #
-# That makes memory the binding constraint, since the weights cannot be split:
-# Nano is ~21 GB and Super ~70 GB, so Super needs an 80 GB card at minimum and
-# realistically more once activations are counted. Only Blackwell is exercised
-# in CI (the FP8 tests run on l0_b200); nothing gates other architectures, but
-# they are untested.
+# That makes memory the binding constraint, since the weights cannot be split.
+# Weight footprint on the fp8 branch: Nano 21 GB, Super 70 GB. Activations are
+# on top of that and scale with resolution and frame count, so size the card
+# against your request shape rather than against the weights alone.
+#
+# Only Blackwell is exercised in CI (the FP8 tests run on l0_b200); nothing
+# gates other architectures, but they are untested.
 revision: fp8
 attention_config:
   backend: VANILLA
