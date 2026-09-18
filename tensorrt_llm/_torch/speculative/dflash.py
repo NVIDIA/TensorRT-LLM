@@ -1188,6 +1188,8 @@ class DFlashWorker(SpecWorkerBase):
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
 
+        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
+
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,
             next_draft_tokens,
