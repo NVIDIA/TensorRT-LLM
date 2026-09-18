@@ -104,8 +104,7 @@ class Attention(nn.Module):
             self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
         )
 
-
-        # SEPARATE_QKV fallback: TRTLLM and CUTEDSL VSA cannot serve it.
+        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
         # Sol-Attn is absent by design; see SolAttention._can_serve.
         if separate_qkv_cross_attention and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
