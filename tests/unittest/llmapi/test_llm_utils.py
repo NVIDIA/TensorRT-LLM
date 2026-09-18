@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-from tensorrt_llm.llmapi.llm_utils import ModelLoader
+from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
 from tensorrt_llm.llmapi.utils import AsyncQueue
 
 # isort: off
@@ -59,6 +59,15 @@ def test_load_hf_generation_config_dict_returns_empty_for_json_array(tmp_path):
     (tmp_path / "generation_config.json").write_text("[1, 2]", encoding="utf-8")
 
     assert ModelLoader.load_hf_generation_config_dict(tmp_path) == {}
+
+
+@pytest.mark.cpu_only
+def test_cached_model_loader_returns_model_dir(tmp_path):
+    llm_args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
+
+    model_dir = CachedModelLoader(llm_args)()
+
+    assert model_dir == tmp_path
 
 
 @pytest.mark.cpu_only
