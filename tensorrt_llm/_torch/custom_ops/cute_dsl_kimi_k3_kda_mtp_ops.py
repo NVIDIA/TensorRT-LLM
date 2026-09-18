@@ -271,10 +271,17 @@ def _require_stride_layout(
         # to fp32 for prefill and single-token decode, but the fused verify
         # path updates the pool rows in place through ssm_state_indices and has
         # no staging, so reject it here instead of reinterpreting the bytes.
+        # bf16 acceptance is a property of the tensor-core (tcgen05) kernel
+        # formulation, not a dtype switch: it derives the TMA box geometry from
+        # the element width (64 vs 32 state columns per 128 B row) and skips the
+        # hi/lo tf32 split GEMM that an fp32 state needs. This kernel generation
+        # is register-resident with no TMA or tcgen05 path to attach that to.
         raise ValueError(
             "kda_mtp_decode requires an fp32 recurrent_state pool; got "
             f"{recurrent_state.dtype}. A bf16 KDA state pool is not supported "
-            "together with fused KDA MTP verify."
+            "together with fused KDA MTP verify; set "
+            "kv_cache_config.mamba_ssm_cache_dtype=float32 (the Kimi K3 "
+            "default) to run speculative decoding."
         )
     if qkg_cache.ndim != 4 or qkg_cache.shape[1:] != (num_spec, 3, H * K):
         raise ValueError(f"Expected qkg_cache shape [pool, {num_spec}, 3, {H * K}].")

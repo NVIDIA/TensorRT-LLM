@@ -391,7 +391,7 @@ class KimiKDALinearAttention(nn.Module):
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
-        ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32
+        ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32 or bf16
         generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
         if generation_state_indices is None:
             generation_state_indices = state_indices[num_prefills:]
