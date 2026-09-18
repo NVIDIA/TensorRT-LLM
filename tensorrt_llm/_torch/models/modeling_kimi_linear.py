@@ -2119,6 +2119,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         cls,
         pretrained_config: Any = None,
     ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for KimiLinear."""
         return "V2"
 
     @classmethod

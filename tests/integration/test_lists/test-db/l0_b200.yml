@@ -119,7 +119,6 @@ l0_b200:
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
-  - unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_auto_v2_allocates_kda_and_mla_cache
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
