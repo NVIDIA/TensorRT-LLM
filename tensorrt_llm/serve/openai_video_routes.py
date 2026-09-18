@@ -13,6 +13,7 @@ is strictly unchanged from the inlined version.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -528,9 +529,20 @@ class _VideoRoutesMixin:
                 # Offload the blocking encode to a thread so the event loop
                 # stays responsive during ``postprocessing`` — pollers can
                 # observe the state and other requests progress meanwhile.
-                saved_paths = await asyncio.get_running_loop().run_in_executor(
+                save_future = asyncio.get_running_loop().run_in_executor(
                     None, lambda: output.save(paths_in, **_save_kwargs)
                 )
+                try:
+                    saved_paths = await asyncio.shield(save_future)
+                except asyncio.CancelledError:
+                    # A cancel cannot stop the encode once the thread picked it
+                    # up, and ``delete_video`` cleans up by path before this
+                    # coroutine records them. Outwait the thread and remove what
+                    # it wrote, so the cancellation leaves nothing behind.
+                    with contextlib.suppress(Exception):
+                        for path in await save_future:
+                            Path(path).unlink(missing_ok=True)
+                    raise
             latency = time.perf_counter() - background_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0
