@@ -16,12 +16,33 @@ from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
 
-# Skip every test in this module: the MPI publish/lookup control channel these
-# tests rely on does not work with the Open MPI 5 shipped by the DLFW 26.08 base
-# image. See https://nvbugs/6770878.
-pytestmark = pytest.mark.skip(
-    reason="Disaggregated single-GPU tests are broken on Open MPI 5, "
-    "see https://nvbugs/6770878")
+# With the Ray orchestrator, workers spawned through MPI hang inside ray.init()
+# on the Open MPI 5 shipped by the DLFW 26.08 base image: the raylet forked from
+# an MPI-spawned process never answers its clients' RegisterClient requests.
+# See https://nvbugs/6759021. The MPI orchestrator path is not affected.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("TLLM_DISABLE_MPI") == "1",
+    reason="Ray orchestrator: MPI-spawned workers hang in ray.init() on "
+    "Open MPI 5, see https://nvbugs/6759021")
+
+
+def _noop(x):
+    return x
+
+
+@pytest.fixture(scope="module", autouse=True)
+def bootstrap_prte_dvm():
+    """Spawn a trivial MPI worker once per module before any test runs.
+
+    Open MPI 5 (DLFW 26.08) fails MPI.Publish_name with MPI_ERR_INTERN in a
+    singleton-initialized process unless a PRRTE DVM is already running; the
+    first dynamic spawn bootstraps that DVM for the rest of the process
+    lifetime. Without this, whether these tests pass depends on whether an
+    earlier test in the same pytest session happened to spawn MPI workers.
+    See https://nvbugs/6770878.
+    """
+    with MPIPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(_noop, 1).result() == 1
 
 
 def get_ucx_tls():
