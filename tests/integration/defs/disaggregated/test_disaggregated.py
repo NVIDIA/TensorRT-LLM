@@ -1105,36 +1105,36 @@ def run_disaggregated_test(example_dir,
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
-                                       disaggregated_example_root, llm_venv,
-                                       llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                       disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks_diff_max_tokens",
                            env=llm_venv._new_env,
                            prompt_file="long_prompts.json",
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_single_gpu(disaggregated_test_root,
-                                  disaggregated_example_root, llm_venv,
-                                  llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                  disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1198,13 +1198,14 @@ def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
     )
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
-                                                    disaggregated_example_root,
-                                                    llm_venv, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+def test_disaggregated_qwen3_multi_orchestrator(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
@@ -1212,54 +1213,55 @@ def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
                            "multi_orchestrator",
                            num_iters=1,
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
-                                          disaggregated_example_root, llm_venv,
-                                          llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                          disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("router_type",
                          ["load_balancing", "kv_cache_aware", "conversation"])
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_router(disaggregated_test_root,
                               disaggregated_example_root, llm_venv,
-                              llama_model_root, router_type):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                              router_type):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            router_type,
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_benchmark_gen_only_insufficient_kv(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root):
+        disaggregated_test_root, disaggregated_example_root, llm_venv):
     """Test that gen-only benchmark mode raises an error when KV cache is too small to hold all benchmark requests, instead of hanging forever."""
     import openai
 
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
@@ -1271,7 +1273,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file,
-                             model_name=llama_model_root,
+                             model_name=qwen_model_root,
                              env=env,
                              cwd=llm_venv.get_working_directory())
 
@@ -1286,7 +1288,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
         def send_request():
             try:
                 stream = client.completions.create(
-                    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                    model="Qwen3/Qwen3-0.6B",
                     prompt="What is the capital of Germany?",
                     max_tokens=10,
                     temperature=0.0,
@@ -1312,97 +1314,100 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_genbs1(disaggregated_test_root,
-                              disaggregated_example_root, llm_venv,
-                              llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                              disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_bs1",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_multi_gpu(disaggregated_test_root,
-                                 disaggregated_example_root, llm_venv,
-                                 llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                 disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
-                                  disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                  disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "cuda_graph",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                             disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "mixed",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
-                               disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                               disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     def post_client_test(server_url: str):
-        verify_usage_with_cache_reuse(server_url,
-                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        verify_usage_with_cache_reuse(server_url, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
                            post_client_test=post_client_test,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 @pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
 def test_disaggregated_overlap_gen_first(disaggregated_test_root,
                                          disaggregated_example_root, llm_venv,
-                                         llama_model_root, ctx_pp):
+                                         ctx_pp):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
@@ -1410,33 +1415,32 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
 
     def post_client_test(server_url: str):
-        verify_usage_with_cache_reuse(server_url,
-                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        verify_usage_with_cache_reuse(server_url, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(
         disaggregated_example_root,
         "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
         env=llm_venv._new_env,
-        model_path=llama_model_root,
+        model_path=qwen_model_root,
         cwd=llm_venv.get_working_directory(),
         disagg_schedule_style="generation_first",
         post_client_test=post_client_test)
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap_transceiver_runtime_python(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1446,13 +1450,13 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 # platforms with MNNVL fabric-memory support; on other devices the env var would silently fall
 # back to a non-fabric allocation, which would defeat the purpose of this test.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
@@ -1460,7 +1464,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1477,13 +1481,13 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 # logged the coalesced-bounce marker, so a silent fall-back to the per-fragment path fails the
 # test instead of passing quietly.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_overlap_transceiver_runtime_python_bounce(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
@@ -1493,7 +1497,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python_bounce",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory(),
                            assert_gen_log_contains="[kv-bounce] coalesced")
 
@@ -1517,7 +1521,7 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
          succeeds; without it, the sender either crashes on a primary
          assertion or returns nonsense tokens.
 
-    Assertions are deliberately content-agnostic (TinyLlama outputs vary
+    Assertions are deliberately content-agnostic (Qwen3-0.6B outputs vary
     run-to-run): we check that responses are non-empty, the server stays
     up across the eviction/onboard cycle, and `cached_tokens > 0` on
     repeats so we know reuse actually fired.
@@ -1624,11 +1628,8 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
     asyncio.run(drive())
 
 
-@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"],
-                         indirect=True)
 def test_disaggregated_python_transceiver_host_offload(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
     """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
 
     See `_verify_python_transceiver_under_host_offload` for what this
@@ -1637,30 +1638,33 @@ def test_disaggregated_python_transceiver_host_offload(
     that prefix reuse is forced through an offload+onboard cycle before
     each KV transfer.
     """
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
 
     def post_client_test(server_url: str):
-        _verify_python_transceiver_under_host_offload(
-            server_url, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        _verify_python_transceiver_under_host_offload(server_url,
+                                                      "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "python_transceiver_host_offload",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory(),
                            post_client_test=post_client_test)
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
-                                    disaggregated_example_root,
-                                    llama_model_root, tmp_path):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                    disaggregated_example_root, tmp_path):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     perf_metrics_output_dir = str(tmp_path / "perf_metrics")
 
@@ -1680,36 +1684,36 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=env,
                            extra_endpoints_test=extra_endpoints_test,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory(),
                            perf_metrics_output_dir=perf_metrics_output_dir)
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                                                   llm_venv,
-                                                  disaggregated_example_root,
-                                                  llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                                  disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "tool_calls",
                            num_iters=1,
                            prompt_file="tool_call_prompts.json",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
-                                            disaggregated_example_root,
-                                            llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                            disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
     env = llm_venv._new_env.copy()
@@ -1722,7 +1726,7 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
                            env=env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
     # The C++ transceiver names timing files "<instanceId>_<rank>_<tag>.csv"
@@ -1760,183 +1764,185 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
         assert matched
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
-                                    disaggregated_example_root,
-                                    llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                    disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "load_balance",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                           disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "cache_aware_balance",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
-                                   disaggregated_example_root,
-                                   llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                   disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
                            "conditional",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                             disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_sa(disaggregated_test_root, llm_venv,
-                          disaggregated_example_root, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                          disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "sa",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
-                                 disaggregated_example_root, llama_model_root):
+                                 disaggregated_example_root):
     """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
 
     NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
     covers this split only on the C++ DEFAULT backend.
     """
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "sa_python",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_genpp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2_genpp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_gentp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                           disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
-#tiny llama pp4 will have uneven layer per pp. pp4
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
-                           model_path=llama_model_root,
+                           model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
 
 

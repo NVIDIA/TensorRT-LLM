@@ -21,7 +21,7 @@ Uses a local HTTP capture server to intercept the telemetry payload without
 hitting any external endpoint.
 
 Requirements:
-    - GPU (loads TinyLlama via PyTorch backend)
+    - GPU (loads Qwen3-0.6B via PyTorch backend)
     - LLM_MODELS_ROOT set (or /home/scratch.trt_llm_data_ci accessible)
     - Must be run with TRTLLM_USAGE_FORCE_ENABLED=1 to bypass pytest
       auto-detection (conftest or env)
@@ -48,11 +48,11 @@ import pytest
 # Model path resolution (same pattern as test_llm_telemetry.py)
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 
 
 def _get_model_path():
-    """Resolve TinyLlama model path from LLM_MODELS_ROOT."""
+    """Resolve Qwen3-0.6B model path from LLM_MODELS_ROOT."""
     root = os.environ.get("LLM_MODELS_ROOT")
     if root is None:
         # Fallback to standard scratch path
@@ -297,7 +297,7 @@ class TestE2ECapture:
         assert "cudaVersion" in params
 
         # Model architecture
-        assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassName"] == "Qwen3ForCausalLM"
         assert params["architectureClassHash"] == ""
 
         # Backend

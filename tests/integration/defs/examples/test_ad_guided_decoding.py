@@ -32,8 +32,7 @@ def test_autodeploy_guided_decoding_main_json():
         '"bandwidth": {"title": "Bandwidth", "type": "string"}}, '
         '"required": ["ssid", "securityProtocol", "bandwidth"]}')
 
-    model_path = os.path.join(llm_models_root(),
-                              "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3/Qwen3-0.6B")
 
     print(f"model_path: {model_path}")
     llm_args = {

@@ -136,7 +136,7 @@ def llm_check_output(llm: LLM,
                  stop_reasons=stop_reasons)
 
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3/Qwen3-0.6B"
 qwen3_tokenizer_model_name = "Qwen3/Qwen3-0.6B"
 
 llama_model_path = get_model_path(default_model_name)

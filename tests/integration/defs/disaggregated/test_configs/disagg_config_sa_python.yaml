@@ -5,7 +5,7 @@
 # The existing test_disaggregated_sa covers the spec split only on the
 # C++ DEFAULT backend.
 hostname: localhost
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+model: Qwen3/Qwen3-0.6B
 free_gpu_memory_fraction: 0.1
 backend: pytorch
 disable_overlap_scheduler: true
