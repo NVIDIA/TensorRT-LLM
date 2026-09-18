@@ -30,8 +30,6 @@ from .config import (
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
-    _fp4_mla_q1_preload_variants,
-    _fp4_mla_triton_preload_key_set,
     _HPUpdatePhase,
 )
 from .fp4_mla_kernels import (
@@ -477,7 +475,6 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
 
     max_gen_len = num_tokens // num_gen
     _validate_fp4_mla_hp_generation_width(hp_pool_size, max_gen_len)
-    max_rewind_len = hp_pool_size - HP_BLOCK_SIZE
     page_ids = _fp4_mla_generation_page_ids(metadata, num_gen)
     rope_dim = head_dim - v_head_dim
     block_q_heads = 32
@@ -645,159 +642,6 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             Q1_KV_BLOCKS_PER_PROGRAM=q1_kv_blocks_per_program_variant,
             maxnreg=56,
         )
-
-    # Triton compiles and loads a CUDA module on first launch. Use runtime-zero
-    # work here so every reachable static tuning variant is resident before
-    # warmup hands the engine to serving.
-    if getattr(metadata, "is_warmup", False) and not torch.cuda.is_current_stream_capturing():
-        configured_generation_len = int(getattr(metadata, "max_total_draft_tokens", 0) or 0) + 1
-        max_preload_generation_len = max(max_gen_len, configured_generation_len)
-        if max_preload_generation_len - 1 > max_rewind_len:
-            raise NotImplementedError(
-                "FP4 MLA finite Triton preload exceeds the HP ring's rewind slack: "
-                f"max_rewind={max_rewind_len}, generation="
-                f"{max_preload_generation_len}."
-            )
-        max_num_sequences = int(getattr(metadata, "max_num_sequences", num_seqs) or num_seqs)
-        q1_variants = _fp4_mla_q1_preload_variants(
-            max_num_sequences,
-            v_head_dim,
-        )
-        multi_token_tiles = tuple(
-            sorted(
-                {
-                    _ceil_div(gen_len + FP4_BLOCK_SIZE - 1, FP4_BLOCK_SIZE)
-                    for gen_len in range(2, max_preload_generation_len + 1)
-                }
-            )
-        )
-        preload_key = (
-            "generation-cache-update",
-            str(latent_cache.device),
-            hp_pool_size,
-            hp_head_dim,
-            v_head_dim,
-            num_q_heads,
-            metadata.page_size,
-            write_v_packed,
-            store_k_residual,
-            tuple(q1_variants),
-            multi_token_tiles,
-            tuple(kv_cache.stride()),
-            tuple(sf_cache.stride()),
-            tuple(pool.stride()),
-            tuple(v_sf.stride()),
-            tuple(v_packed_output.stride()),
-            tuple(q_pe_input.stride()),
-            tuple(q_rope_output.stride()),
-            str(kv_cache.dtype),
-            str(latent_cache.dtype),
-            str(q_pe_input.dtype),
-            str(q_fp4_output.dtype),
-            str(q_sf_output.dtype),
-        )
-        preload_keys = _fp4_mla_triton_preload_key_set(metadata)
-        if preload_key not in preload_keys:
-            context_page_ids = getattr(metadata.fp4_mla_state, "_paged_kv_indices", None)
-            if not isinstance(context_page_ids, torch.Tensor):
-                context_page_ids = page_ids
-            context_indptr = getattr(metadata.fp4_mla_state, "_paged_kv_indptr", None)
-            if not isinstance(context_indptr, torch.Tensor):
-                context_indptr = metadata.fp4_mla_state.paged_kv_indptr_decode
-            context_batch_indices = getattr(metadata.fp4_mla_state, "batch_indices", None)
-            if not isinstance(context_batch_indices, torch.Tensor):
-                context_batch_indices = hp_page_ids
-            context_positions = getattr(metadata.fp4_mla_state, "positions", None)
-            if not isinstance(context_positions, torch.Tensor):
-                context_positions = hp_page_ids
-            _fp4_mla_context_cache_update_kernel[(1, num_dim_blocks)](
-                kv_cache,
-                sf_cache,
-                v_sf,
-                v_packed_output,
-                latent_cache,
-                latent_cache,
-                global_scale,
-                rotary_table,
-                pool,
-                hp_page_ids,
-                context_batch_indices,
-                context_positions,
-                context_page_ids,
-                context_indptr,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                metadata.page_size,
-                kv_cache.stride(0),
-                kv_cache.stride(2),
-                kv_cache.stride(4),
-                sf_cache.stride(0),
-                latent_cache.stride(0),
-                latent_cache.stride(1),
-                latent_cache.stride(0),
-                0,
-                0,
-                v_sf.stride(0),
-                v_sf.stride(1),
-                v_packed_s0,
-                v_packed_s1,
-                pool.stride(0),
-                pool.stride(1),
-                HEAD_D=head_dim,
-                V_HEAD_D=v_head_dim,
-                HP_BLOCK=FP4_BLOCK_SIZE,
-                HP_POOL_SIZE=hp_pool_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_TOKEN=sf_per_token,
-                SF_PER_PAGE=sf_per_page,
-                K_RESIDUAL_D=FP4_MLA_K_RESIDUAL_DIM,
-                STORE_K_RESIDUAL=store_k_residual,
-                ROPE_DIM=rope_dim,
-                APPLY_K_ROPE=True,
-                APPLY_Q_ROPE=False,
-                NUM_DIM_BLOCKS=num_dim_blocks,
-                NUM_Q_HEADS=0,
-                Q_NOPE_DIM=0,
-                BLOCK_Q_HEADS=16,
-                POOL_HEAD_D=hp_head_dim,
-                STORE_HP_TAIL=True,
-                WRITE_V_PACKED=write_v_packed,
-            )
-            q1_prefix_blocks = FP4_MLA_Q_PREFIX_DIM // FP4_MLA_Q1_PREFIX_BLOCK_DIM
-            for q1_kv_blocks, q1_prefix_blocks_per_program in q1_variants:
-                launch_generation_update(
-                    (1, 1),
-                    page_ids_len=0,
-                    indptr_len=0,
-                    max_gen_tiles_variant=1,
-                    q_prefix_block_dim_variant=FP4_MLA_Q1_PREFIX_BLOCK_DIM,
-                    q_prefix_blocks_variant=q1_prefix_blocks,
-                    q_prefix_blocks_per_program_variant=q1_prefix_blocks_per_program,
-                    q1_kv_blocks_per_program_variant=q1_kv_blocks,
-                )
-            multi_prefix_blocks = FP4_MLA_Q_PREFIX_DIM // FP4_MLA_Q_PREFIX_BLOCK_DIM
-            for multi_token_tile in multi_token_tiles:
-                launch_generation_update(
-                    (1, 1),
-                    page_ids_len=0,
-                    indptr_len=0,
-                    max_gen_tiles_variant=multi_token_tile,
-                    q_prefix_block_dim_variant=FP4_MLA_Q_PREFIX_BLOCK_DIM,
-                    q_prefix_blocks_variant=multi_prefix_blocks,
-                    q_prefix_blocks_per_program_variant=1,
-                    q1_kv_blocks_per_program_variant=1,
-                )
-            torch.cuda.synchronize(latent_cache.device)
-            preload_keys.add(preload_key)
 
     launch_generation_update(
         launch_grid,

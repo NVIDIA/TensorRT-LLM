@@ -102,9 +102,6 @@ _FP4_MLA_Q1_PREFIX_GROUP4_BATCH_THRESHOLD = 768
 _HPUpdatePhase = Literal["context", "generation"]
 
 
-_FP4_MLA_TRITON_PRELOAD_KEYS = "_fp4_mla_triton_preload_keys"
-
-
 _FP4_MLA_PAGE_TABLE_TILE_SIZE = 128
 
 
@@ -200,43 +197,3 @@ def _fp4_mla_q1_prefix_blocks_per_program(
             return min(4, max_prefix_blocks)
         return min(2, max_prefix_blocks)
     return 1
-
-
-def _fp4_mla_q1_preload_variants(
-    max_num_sequences: int,
-    v_head_dim: int,
-) -> tuple[tuple[int, int], ...]:
-    """Return every Q1 tuning variant reachable by the configured batch limit."""
-    batch_sizes = [1]
-    for threshold in (
-        _FP4_MLA_Q1_KV_MEDIUM_BATCH_THRESHOLD,
-        _FP4_MLA_Q1_KV_LARGE_BATCH_THRESHOLD,
-        _FP4_MLA_Q1_PREFIX_PAIR_BATCH_THRESHOLD,
-        _FP4_MLA_Q1_PREFIX_GROUP4_BATCH_THRESHOLD,
-    ):
-        if threshold <= max_num_sequences:
-            batch_sizes.append(threshold)
-
-    variants = []
-    for batch_size in batch_sizes:
-        kv_blocks = _fp4_mla_q1_kv_blocks_per_program(batch_size, v_head_dim)
-        prefix_blocks = _fp4_mla_q1_prefix_blocks_per_program(
-            batch_size,
-            kv_blocks,
-        )
-        variant = (kv_blocks, prefix_blocks)
-        if variant not in variants:
-            variants.append(variant)
-    return tuple(variants)
-
-
-def _fp4_mla_triton_preload_key_set(metadata: Any) -> set[tuple[object, ...]]:
-    """Return the engine-scoped set of Triton variants loaded during warmup."""
-    owner = getattr(metadata, "kv_cache_manager", None)
-    if owner is None:
-        owner = metadata
-    preload_keys = getattr(owner, _FP4_MLA_TRITON_PRELOAD_KEYS, None)
-    if preload_keys is None:
-        preload_keys = set()
-        setattr(owner, _FP4_MLA_TRITON_PRELOAD_KEYS, preload_keys)
-    return preload_keys

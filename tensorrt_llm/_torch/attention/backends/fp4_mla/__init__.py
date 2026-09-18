@@ -33,7 +33,6 @@ from .config import (
 from .config import (
     _FP4_MLA_Q1_PREFIX_PAIR_BATCH_THRESHOLD as _FP4_MLA_Q1_PREFIX_PAIR_BATCH_THRESHOLD,
 )
-from .config import _FP4_MLA_TRITON_PRELOAD_KEYS as _FP4_MLA_TRITON_PRELOAD_KEYS
 from .config import (
     FP4_BLOCK_SIZE,
     FP4_MLA_ATTENTION_BACKEND_ENV,
@@ -68,8 +67,6 @@ from .config import (
 from .config import _fp4_mla_cutedsl_kernel_module as _fp4_mla_cutedsl_kernel_module
 from .config import _fp4_mla_q1_kv_blocks_per_program as _fp4_mla_q1_kv_blocks_per_program
 from .config import _fp4_mla_q1_prefix_blocks_per_program as _fp4_mla_q1_prefix_blocks_per_program
-from .config import _fp4_mla_q1_preload_variants as _fp4_mla_q1_preload_variants
-from .config import _fp4_mla_triton_preload_key_set as _fp4_mla_triton_preload_key_set
 from .config import _HPUpdatePhase as _HPUpdatePhase
 from .decode import _SM_COUNT_CACHE as _SM_COUNT_CACHE
 from .decode import _cutedsl_pad_q_and_sf_kernel as _cutedsl_pad_q_and_sf_kernel

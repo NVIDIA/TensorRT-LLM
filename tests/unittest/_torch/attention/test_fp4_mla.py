@@ -737,7 +737,6 @@ def _build_multi_seq_metadata(
         request_ids=request_ids,
         runtime_features=SimpleNamespace(has_speculative_draft_tokens=False),
         is_cuda_graph=False,
-        is_warmup=False,
         fp4_mla_state=Fp4MlaState(
             batch_indices=batch_indices,
             positions=positions,
@@ -1174,10 +1173,10 @@ def _fp4_mla_attention_decode_reference(
     )
 
     p_dequant = None
-    if hasattr(metadata, "_fp4_mla_attention_p_buf"):
+    if "_fp4_mla_attention_p_buf" in metadata.fp4_mla_state.workspaces:
         p_dequant = _dequant_fp4_swizzled(
-            metadata._fp4_mla_attention_p_buf,
-            metadata._fp4_mla_attention_p_sf_buf,
+            metadata.fp4_mla_state.workspaces["_fp4_mla_attention_p_buf"],
+            metadata.fp4_mla_state.workspaces["_fp4_mla_attention_p_sf_buf"],
             logical_dim=metadata.page_size,
             sf_per_token=metadata.page_size // FP4_BLOCK_SIZE,
             global_scale=FP4_MLA_P_GLOBAL_SCALE,
