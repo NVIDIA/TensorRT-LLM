@@ -175,6 +175,25 @@ def get_or_scale_allreduce_mnnvl_workspace(
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
     """
 
+    allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+    if mapping in allreduce_mnnvl_workspaces:
+        workspace = allreduce_mnnvl_workspaces[mapping]
+        if not workspace["handle"].is_mapped():
+            raise RuntimeError("MNNVL workspace handles are not attached")
+        if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
+            return workspace
+
+    workspace_lock = MNNVLAllReduce._get_allreduce_mnnvl_workspace_lock(mapping)
+    with workspace_lock:
+        return _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
+                                                       buffer_size_bytes)
+
+
+def _get_or_scale_allreduce_mnnvl_workspace(
+        mapping: Mapping,
+        dtype: torch.dtype,
+        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
+
     NUM_LAMPORT_BUFFERS = 3
 
     # Use MNNVLAllReduce class to share across threads
@@ -665,6 +684,13 @@ class MNNVLAllReduce(nn.Module):
     allreduce_mnnvl_pending_comms: typing.ClassVar[dict[Mapping,
                                                         _MpiCommProtocol]] = {}
 
+    # The guard makes lock creation atomic, while each mapping lock serializes
+    # its complete workspace construction and publication lifecycle.
+    _allreduce_mnnvl_workspace_locks: typing.ClassVar[dict[
+        Mapping, threading.Lock]] = {}
+    _allreduce_mnnvl_workspace_locks_guard: typing.ClassVar[
+        threading.Lock] = threading.Lock()
+
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -672,6 +698,13 @@ class MNNVLAllReduce(nn.Module):
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
     })
+
+    @classmethod
+    def _get_allreduce_mnnvl_workspace_lock(cls,
+                                            mapping: Mapping) -> threading.Lock:
+        with cls._allreduce_mnnvl_workspace_locks_guard:
+            return cls._allreduce_mnnvl_workspace_locks.setdefault(
+                mapping, threading.Lock())
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
