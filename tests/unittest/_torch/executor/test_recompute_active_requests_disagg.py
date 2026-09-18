@@ -85,6 +85,37 @@ class _RecomputeExecutor:
         self.reset_calls += 1
 
 
+class _BoundRequest:
+    """Request whose state predicates are plain attributes, as the nanobind
+    ``LlmRequest`` exposes them (``def_prop_ro``), not methods."""
+
+    def __init__(self, request_id: int, *, is_context_only: bool, is_generation_only: bool):
+        self.py_request_id = request_id
+        self.state = LlmRequestState.GENERATION_IN_PROGRESS
+        self.is_context_only_request = is_context_only
+        self.is_generation_only_request = is_generation_only
+
+
+class TestTransferBoundPredicateShapes:
+    """``_is_disagg_transfer_bound`` must read the request predicates whether
+    they are properties (C++ binding) or methods (Python wrapper)."""
+
+    def test_property_shaped_generation_only_request_is_bound(self):
+        ex = _RecomputeExecutor([], transceiver=object(), transfer_manager=None)
+        req = _BoundRequest(60, is_context_only=False, is_generation_only=True)
+        assert PyExecutor._is_disagg_transfer_bound(ex, req) is True
+
+    def test_property_shaped_plain_request_is_not_bound(self):
+        ex = _RecomputeExecutor([], transceiver=object(), transfer_manager=None)
+        req = _BoundRequest(61, is_context_only=False, is_generation_only=False)
+        assert PyExecutor._is_disagg_transfer_bound(ex, req) is False
+
+    def test_method_shaped_request_still_works(self):
+        ex = _RecomputeExecutor([], transceiver=object(), transfer_manager=None)
+        req = _request(62, is_generation_only=True)
+        assert PyExecutor._is_disagg_transfer_bound(ex, req) is True
+
+
 def _transfer_manager():
     resource_manager = MagicMock()
     kv_cache_manager = MagicMock()
