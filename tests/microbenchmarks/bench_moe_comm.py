@@ -21,8 +21,10 @@ This benchmarks ONLY the communication kernels, specifically:
 - Communication.dispatch()
 - Communication.combine()
 
-Latency is measured with CUDA events, using CUDA graph replay by default or
-eager execution with --no_cuda_graph. Optional kernel breakdown uses CUPTI.
+dispatch_us and combine_us report CUPTI kernel spans, using CUDA graph replay by
+default or eager execution with --no_cuda_graph. If CUPTI is unavailable, timing
+falls back to CUDA events and benchmark_metadata.warning records the reason;
+otherwise it is null. --kernel_breakdown additionally prints per-kernel statistics.
 
 Launch (examples):
 
@@ -266,7 +268,7 @@ def _build_kernel_stats_cupti(
     cupti_events: list[tuple[int, int]],
     phase_event_ids: list[tuple[int, int, int, int]],
 ) -> Dict[str, Any]:
-    """Categorize kernels by the GPU timestamps of the benchmark's timing events."""
+    """Attribute kernels to event windows and measure each iteration's kernel span."""
     expected_ids = {event_id for iteration in phase_event_ids for event_id in iteration}
     if len(expected_ids) != 4 * len(phase_event_ids):
         raise RuntimeError("Each benchmark timing event must have a distinct CUPTI event ID.")
@@ -293,7 +295,13 @@ def _build_kernel_stats_cupti(
         )
         if not d_start <= d_end <= c_start <= c_end:
             raise RuntimeError("CUPTI timing events are not in dispatch/combine execution order.")
+        if phase_windows and d_start < phase_windows[-1][3]:
+            raise RuntimeError("CUPTI iteration timing windows overlap.")
         phase_windows.append((d_start, d_end, c_start, c_end))
+
+    phase_bounds: dict[str, list[tuple[int, int] | None]] = {
+        phase: [None] * len(phase_windows) for phase in ("dispatch", "combine")
+    }
 
     cupti_kernels.sort(key=lambda kernel: kernel[1])
 
@@ -306,13 +314,23 @@ def _build_kernel_stats_cupti(
     }
 
     for name, kernel_start, kernel_end in cupti_kernels:
+        if kernel_start <= 0 or kernel_end <= kernel_start:
+            raise RuntimeError(f"CUPTI returned invalid kernel timestamps for {name}.")
         category = "other"
-        for d_start, d_end, c_start, c_end in phase_windows:
-            if kernel_start >= d_start and kernel_end <= d_end:
-                category = "dispatch"
-                break
-            if kernel_start >= c_start and kernel_end <= c_end:
-                category = "combine"
+        for iteration, (d_start, d_end, c_start, c_end) in enumerate(phase_windows):
+            for phase, start, end in (("dispatch", d_start, d_end), ("combine", c_start, c_end)):
+                if kernel_start >= start and kernel_end <= end:
+                    category = phase
+                    bounds = phase_bounds[phase][iteration]
+                    phase_bounds[phase][iteration] = (
+                        (min(bounds[0], kernel_start), max(bounds[1], kernel_end))
+                        if bounds is not None
+                        else (kernel_start, kernel_end)
+                    )
+                    break
+                if kernel_start < end and kernel_end > start:
+                    raise RuntimeError(f"CUPTI kernel {name} crosses a {phase} timing boundary.")
+            if category != "other":
                 break
 
         demangled_name = demangled_names.get(name, name)
@@ -328,7 +346,19 @@ def _build_kernel_stats_cupti(
         result.sort(key=lambda kernel: sum(kernel["_times"]) / len(kernel["_times"]), reverse=True)
         return result
 
+    spans = {}
+    for phase, bounds in phase_bounds.items():
+        if any(bound is None for bound in bounds):
+            raise RuntimeError(
+                f"CUPTI captured no {phase} kernels in one or more timed iterations."
+            )
+        # A span retains inter-kernel gaps but counts overlapping PDL kernels only once.
+        spans[f"{phase}_us_kernel_span"] = [
+            (bound[1] - bound[0]) / 1e3 for bound in bounds if bound is not None
+        ]
+
     return {
+        **spans,
         "dispatch_kernels": _build("dispatch"),
         "combine_kernels": _build("combine"),
         "other_kernels": _build("other"),
@@ -352,11 +382,66 @@ def _init_cupti() -> tuple[Any, list[tuple[str, int, int]], list[tuple[int, int]
             elif activity.kind == cupti.ActivityKind.CUDA_EVENT:
                 cupti_events.append((activity.event_id, activity.device_timestamp))
 
-    cupti.activity_register_callbacks(_buf_requested, _buf_completed)
-    cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    cupti.activity_enable(cupti.ActivityKind.CUDA_EVENT)
-    cupti.activity_enable_cuda_event_device_timestamps(1)
+    enabled = []
+    try:
+        cupti.activity_register_callbacks(_buf_requested, _buf_completed)
+        for kind in (cupti.ActivityKind.CONCURRENT_KERNEL, cupti.ActivityKind.CUDA_EVENT):
+            cupti.activity_enable(kind)
+            enabled.append(kind)
+        cupti.activity_enable_cuda_event_device_timestamps(1)
+    except (cupti.cuptiError, AttributeError) as exc:
+        cleanup_errors = []
+        for kind in reversed(enabled):
+            try:
+                cupti.activity_disable(kind)
+            except cupti.cuptiError as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+        raise RuntimeError(
+            f"Cannot enable CUPTI kernel/event tracing: {exc}; cleanup errors: {cleanup_errors}"
+        ) from exc
     return cupti, cupti_kernels, cupti_events
+
+
+_CUPTI_FALLBACK_WARNING_SHOWN = False
+
+
+def _warn_kernel_span_unavailable(reason: str) -> str:
+    global _CUPTI_FALLBACK_WARNING_SHOWN
+    warning = (
+        "CUPTI kernel-span timing is unavailable. "
+        "Falling back to CUDA-event timing, which may include non-kernel bubbles before "
+        "the first kernel and after the last kernel. Kernel-span timing excludes these "
+        "boundary bubbles and is generally more representative of communication-kernel "
+        f"execution time in E2E workloads. Reason: {reason}"
+    )
+    if not _CUPTI_FALLBACK_WARNING_SHOWN:
+        _maybe_warn_rank0(f"[bench_moe_comm] WARNING: {warning}")
+        _CUPTI_FALLBACK_WARNING_SHOWN = True
+    return warning
+
+
+def _init_cupti_for_workers() -> tuple[Optional[Any], str | None]:
+    """Attempt tracing before CUDA context creation; keep MPI ranks on the same path."""
+    ctx = None
+    error = None
+    try:
+        ctx = _init_cupti()
+        if ctx is None:
+            error = "CUPTI initialization returned no collector"
+    except (ImportError, OSError, RuntimeError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    errors = mpi_allgather(error)
+    if any(errors):
+        reasons = [f"rank{rank}: {error}" for rank, error in enumerate(errors) if error]
+        if ctx is not None:
+            cupti = ctx[0]
+            for kind in (cupti.ActivityKind.CUDA_EVENT, cupti.ActivityKind.CONCURRENT_KERNEL):
+                try:
+                    cupti.activity_disable(kind)
+                except cupti.cuptiError as exc:
+                    reasons.append(f"Local CUPTI cleanup failed: {exc}")
+        return None, _warn_kernel_span_unavailable("; ".join(reasons))
+    return ctx, None
 
 
 def _time_dispatch_and_combine(
@@ -389,7 +474,7 @@ def _time_dispatch_and_combine(
       5. Read per-iteration dispatch/combine latency from CUDA events.
       6. Attribute CUPTI kernels to phases using the timing events' GPU timestamps.
 
-    Returns dispatch times, combine times, and per-kernel activity statistics.
+    Returns event times and activity statistics containing per-iteration kernel spans.
     """
     device = hidden_states.device
     max_tokens = max(all_rank_num_tokens)
@@ -531,7 +616,11 @@ def _time_dispatch_and_combine(
     # ---- 6. Attribute CUPTI kernels to dispatch/combine phases ----
     detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
     if cupti_ctx is not None:
-        detailed_stats = _build_kernel_stats_cupti(cupti_kernels, cupti_events, phase_event_ids)
+        try:
+            detailed_stats = _build_kernel_stats_cupti(cupti_kernels, cupti_events, phase_event_ids)
+        except RuntimeError as exc:
+            # Let every MPI rank reach the reporting collectives even if one trace is incomplete.
+            detailed_stats["cupti_error"] = str(exc)
 
     return dispatch_times_us, combine_times_us, detailed_stats
 
@@ -553,16 +642,19 @@ def _compute_stats(values: List[float]) -> Dict[str, float]:
     }
 
 
-def _gather_per_rank(times_us: List[float], iter_stats: bool = False) -> Dict[str, Any]:
+def _gather_per_rank(times_us: Optional[List[float]], iter_stats: bool = False) -> Dict[str, Any]:
     """Allgather per-iteration times from each rank, return per-rank results.
 
     If iter_stats=True, return full stats (mean/median/stdev/min/max).
     If iter_stats=False, return just the mean.
     """
     all_times = mpi_allgather(times_us)
-    if iter_stats:
-        return {f"rank{i}": _compute_stats(t) for i, t in enumerate(all_times)}
-    return {f"rank{i}": (sum(t) / len(t) if t else 0.0) for i, t in enumerate(all_times)}
+    return {
+        f"rank{i}": None
+        if t is None
+        else (_compute_stats(t) if iter_stats else (sum(t) / len(t) if t else 0.0))
+        for i, t in enumerate(all_times)
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -657,7 +749,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kernel_breakdown",
         action="store_true",
-        help="Show per-kernel timing breakdown using CUPTI.",
+        help="Also output per-kernel details. CUPTI kernel-span timing is attempted regardless of this flag.",
     )
     parser.add_argument(
         "--iter_stats",
@@ -767,7 +859,7 @@ def _run_benchmark_worker_under_current_mpi(
     args: argparse.Namespace, launcher: str = "spawn"
 ) -> None:
     # Late CUPTI initialization captures kernels but misses CUDA_EVENT records.
-    cupti_ctx = _init_cupti() if args.kernel_breakdown else None
+    cupti_ctx, cupti_warning = _init_cupti_for_workers()
 
     # Keep benchmark output clean.
     tllm.logger.set_level("error")
@@ -826,6 +918,8 @@ def _run_benchmark_worker_under_current_mpi(
         "device_count": torch.cuda.device_count(),
         "cuda_graph": not args.no_cuda_graph,
         "pdl": bool(args.pdl),
+        "cupti_enabled": cupti_ctx is not None,
+        "warning": cupti_warning,
     }
     if rank == 0:
         print(json.dumps(benchmark_metadata, indent=2), flush=True)
@@ -936,15 +1030,29 @@ def _run_benchmark_worker_under_current_mpi(
             )
 
             iter_stats = bool(args.iter_stats)
-            dispatch_stats = _gather_per_rank(dispatch_times_us, iter_stats=iter_stats)
-            combine_stats = _gather_per_rank(combine_times_us, iter_stats=iter_stats)
+            cupti_errors = mpi_allgather(detailed_stats.get("cupti_error"))
+            if any(cupti_errors):
+                warning = _warn_kernel_span_unavailable(
+                    f"{backend_name} @ local_batch_size={local_num_tokens}: "
+                    + "; ".join(
+                        f"rank{rank}: {error}" for rank, error in enumerate(cupti_errors) if error
+                    )
+                )
+                previous_warning = benchmark_metadata["warning"]
+                benchmark_metadata["warning"] = (
+                    f"{previous_warning}\n{warning}" if previous_warning else warning
+                )
+            elif cupti_ctx is not None:
+                # Use the same timing source on every rank for this measurement.
+                dispatch_times_us = detailed_stats["dispatch_us_kernel_span"]
+                combine_times_us = detailed_stats["combine_us_kernel_span"]
 
             # Prepare output
             output = {
                 "backend": backend_name,
                 "local_batch_size": int(local_num_tokens),
-                "dispatch_us": dispatch_stats,
-                "combine_us": combine_stats,
+                "dispatch_us": _gather_per_rank(dispatch_times_us, iter_stats=iter_stats),
+                "combine_us": _gather_per_rank(combine_times_us, iter_stats=iter_stats),
             }
 
             # Add kernel breakdown if requested and available
