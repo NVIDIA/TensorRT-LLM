@@ -471,6 +471,8 @@ def test_clean_overwrites_stale_managed_files(tmp_path):
 def test_all_agents_use_claude_code_backend(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for layer in (
             workflow.benchmarker,
             workflow.projector,
@@ -479,8 +481,55 @@ def test_all_agents_use_claude_code_backend(tmp_path):
         ):
             assert layer.config.backend.kind == "claude-code"
             assert layer.config.backend.model == CLAUDE_CODE_DEFAULT_MODEL
-            # Each role is gated by a required-tool stop hook.
-            assert layer.config.backend.hooks is not None
+            append_tool = next(
+                tool for tool in layer.config.backend.tools if tool.name.startswith("append_")
+            )
+            assert append_tool.required_before_stop
+    finally:
+        workflow.close()
+
+
+def test_projector_and_analyzer_can_use_codex(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text(
+        yaml.safe_dump(
+            {
+                "agents": {
+                    "roles": {
+                        role: {
+                            "backend": "codex",
+                            "model": "gpt-6-astra",
+                            "reasoning_effort": "ultra",
+                        }
+                        for role in ("projector", "analyzer")
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        workflow._configure_agents()
+        for role in ("projector", "analyzer"):
+            backend = getattr(workflow, role).config.backend
+            assert (backend.kind, backend.model, backend.reasoning_effort) == (
+                "codex",
+                "gpt-6-astra",
+                "ultra",
+            )
+        assert workflow.benchmarker.config.backend.kind == "claude-code"
+        assert workflow.reporter.config.backend.kind == "claude-code"
+    finally:
+        workflow.close()
+
+
+def test_casebook_disable_reaches_every_backend(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text("casebook: {enabled: false}\n", encoding="utf-8")
+    try:
+        workflow._configure_agents()
+        for role in ("benchmarker", "projector", "analyzer", "reporter"):
+            assert getattr(workflow, role).config.backend.disabled_skills
     finally:
         workflow.close()
 
@@ -495,6 +544,8 @@ def test_no_role_wires_an_external_mcp_server(tmp_path):
     """
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for layer in (
             workflow.benchmarker,
             workflow.projector,
@@ -613,6 +664,8 @@ def test_each_agent_has_its_progress_tools(tmp_path):
         "reporter": "append_reporter_progress",
     }
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role, append_name in expected.items():
             layer = getattr(workflow, role)
             tool_names = [t.name for t in layer.config.backend.tools]

@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import sys
@@ -31,6 +45,7 @@ from agent_flow.backends.codex import (
     _extract_final_response,
     _mcp_to_codex_content,
 )
+from agent_flow.config import BackendConfig
 from agent_flow.types import (
     AgentTextEvent,
     CompactBoundaryEvent,
@@ -40,6 +55,7 @@ from agent_flow.types import (
     ThinkingEvent,
     ToolCallEvent,
 )
+from agent_flow.workflow_tool import ToolCompletion, WorkflowTool
 
 
 class ServerToolUseBlock:
@@ -345,6 +361,14 @@ class TestCreateBackend:
     def test_factory_rejects_unknown_backends(self):
         with pytest.raises(ValueError, match="Unknown backend"):
             create_backend("unknown")
+
+    def test_factory_passes_disabled_skills(self):
+        config = BackendConfig(
+            kind="codex",
+            model="gpt-6-astra",
+            disabled_skills=("perf-optimization-casebook",),
+        )
+        assert create_backend(config)._disabled_skills == ("perf-optimization-casebook",)
 
 
 class TestClaudeBackend:
@@ -1009,7 +1033,7 @@ class TestClaudeBackendCreateClient:
         # but we patch defensively in case that changes.
         monkeypatch.setattr(cc_mod, "create_sdk_mcp_server", lambda **_: object())
 
-        backend = ClaudeCodeBackend()
+        backend = kwargs.pop("backend", None) or ClaudeCodeBackend()
         async with backend.create_client(system_prompt="hi", model="claude-test", **kwargs):
             pass
         return captured["options"]
@@ -1026,6 +1050,50 @@ class TestClaudeBackendCreateClient:
         # permission prompt the CLI would otherwise raise.
         options = await self._capture_options(monkeypatch)
         assert options.permission_mode == "bypassPermissions"
+
+    async def test_create_client_uses_configured_reasoning_effort(self, monkeypatch):
+        options = await self._capture_options(
+            monkeypatch,
+            backend=ClaudeCodeBackend(reasoning_effort="medium"),
+        )
+        assert options.effort == "medium"
+
+    async def test_create_client_uses_resolved_claude_cli(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/usr/bin/claude")
+        options = await self._capture_options(monkeypatch)
+        assert options.cli_path == "/usr/bin/claude"
+
+    async def test_create_client_denies_disabled_skills(self, monkeypatch):
+        options = await self._capture_options(
+            monkeypatch,
+            backend=ClaudeCodeBackend(
+                disabled_skills=("perf-optimization-casebook",),
+            ),
+        )
+        assert options.disallowed_tools == ["Skill(perf-optimization-casebook)"]
+
+    async def test_workflow_tool_marks_completion_and_installs_stop_hook(self, monkeypatch):
+        completion = ToolCompletion({"append_progress"})
+
+        async def append(_args):
+            return "recorded"
+
+        native = cc_mod._claude_tool(
+            WorkflowTool(
+                "append_progress",
+                "record progress",
+                {"type": "object"},
+                append,
+                required_before_stop=True,
+            ),
+            completion,
+        )
+        hooks = cc_mod._completion_hooks(None, completion)
+
+        blocked = await hooks["Stop"][0].hooks[0]({}, None, None)
+        assert blocked["decision"] == "block"
+        assert await native.handler({}) == {"content": [{"type": "text", "text": "recorded"}]}
+        assert await hooks["Stop"][0].hooks[0]({}, None, None) == {}
 
     async def test_create_client_can_use_tool_always_allows(self, monkeypatch):
         # Defense-in-depth: even if a tool ends up being routed through
@@ -1536,6 +1604,19 @@ class TestCodexBackend:
         assert config.kwargs["experimental_api"] is True
         assert "launch_args_override" not in config.kwargs
 
+    async def test_enter_disables_skills_in_codex_config(self, monkeypatch):
+        _install_codex_sdk_modules()
+        monkeypatch.setattr(codex_mod, "_resolve_codex_bin", lambda: "/bin/codex")
+        monkeypatch.setattr(CodexBackend, "_install_server_request_handler", lambda self: None)
+
+        backend = CodexBackend(disabled_skills=("perf-optimization-casebook",))
+        async with backend:
+            config = backend._codex.config
+
+        assert config.kwargs["config_overrides"] == (
+            'skills.config=[{name="perf-optimization-casebook", enabled=false}]',
+        )
+
     def test_extract_final_response_prefers_final_answer_phase(self):
         sdk = _install_codex_sdk_modules()
 
@@ -1546,10 +1627,15 @@ class TestCodexBackend:
 
         assert _extract_final_response(items) == "final"
 
-    async def _run_create_client(self, system_prompt: str) -> dict[str, Any]:
+    async def _run_create_client(
+        self,
+        system_prompt: str,
+        backend: CodexBackend | None = None,
+        tools: list[Any] | None = None,
+    ) -> dict[str, Any]:
         _install_codex_sdk_modules()
 
-        backend = CodexBackend()
+        backend = backend or CodexBackend()
         captured: dict[str, Any] = {}
 
         async def fake_thread_start(payload):
@@ -1561,7 +1647,11 @@ class TestCodexBackend:
             _client=SimpleNamespace(thread_start=fake_thread_start),
         )
 
-        async with backend.create_client(system_prompt=system_prompt, model="gpt-5.4"):
+        async with backend.create_client(
+            system_prompt=system_prompt,
+            model="gpt-5.4",
+            tools=tools,
+        ):
             pass
 
         return captured["payload"]
@@ -1600,6 +1690,32 @@ class TestCodexBackend:
         payload = await self._run_create_client(system_prompt="hi")
         assert payload["config"]["model_reasoning_effort"] == "max"
 
+    async def test_create_client_uses_configured_reasoning_effort(self):
+        backend = CodexBackend(reasoning_effort="ultra")
+        payload = await self._run_create_client(system_prompt="hi", backend=backend)
+        assert payload["config"]["model_reasoning_effort"] == "ultra"
+
+    async def test_workflow_tool_installs_native_stop_hook(self):
+        async def append(_args):
+            return "recorded"
+
+        payload = await self._run_create_client(
+            system_prompt="hi",
+            tools=[
+                WorkflowTool(
+                    "append_progress",
+                    "record progress",
+                    {"type": "object"},
+                    append,
+                    required_before_stop=True,
+                )
+            ],
+        )
+
+        hook = payload["config"]["hooks"]["Stop"][0]["hooks"][0]
+        assert hook["type"] == "command"
+        assert "workflow_tool.py" in hook["command"]
+
     async def test_create_client_bypasses_all_approvals_in_thread_start(self):
         # The Codex backend runs in fully autonomous mode: no sandbox
         # restrictions and the model never asks for approval. The mock
@@ -1608,10 +1724,7 @@ class TestCodexBackend:
         assert payload["sandbox"] == "danger_full_access"
         assert payload["approvalPolicy"].root == "never"
 
-    async def test_create_client_accepts_extra_mcp_servers_as_noop(self):
-        # ``extra_mcp_servers`` is currently a Claude-Code-only concept;
-        # the Codex backend must accept the kwarg without erroring and
-        # without leaking it into ``thread/start``.
+    async def test_create_client_maps_portable_extra_mcp_servers(self):
         _install_codex_sdk_modules()
         backend = CodexBackend()
         captured: dict[str, Any] = {}
@@ -1632,15 +1745,21 @@ class TestCodexBackend:
                 "knowledge-base": {
                     "type": "http",
                     "url": "https://example.test/mcp",
+                    "headers": {"X-Environment": "test"},
                 },
+                "local": {"command": "server", "args": ["--stdio"], "env": {"A": "B"}},
             },
         ):
             pass
 
-        # Codex thread/start payload must not carry MCP-server config.
         payload = captured["payload"]
-        assert "mcp_servers" not in payload
-        assert "mcpServers" not in payload
+        assert payload["config"]["mcp_servers"] == {
+            "knowledge-base": {
+                "url": "https://example.test/mcp",
+                "http_headers": {"X-Environment": "test"},
+            },
+            "local": {"command": "server", "args": ["--stdio"], "env": {"A": "B"}},
+        }
 
     async def test_create_client_emits_codex_session_init_snapshot(self):
         sdk = _install_codex_sdk_modules()
@@ -1650,16 +1769,19 @@ class TestCodexBackend:
         async def fake_thread_start(payload):
             return SimpleNamespace(thread=SimpleNamespace(id="t-1"))
 
-        async def fake_skills_list(payload):
-            return SimpleNamespace(
-                data=[
-                    SimpleNamespace(
-                        skills=[
-                            SimpleNamespace(name="skill-a", enabled=True),
-                            SimpleNamespace(name="skill-disabled", enabled=False),
-                        ]
-                    )
-                ]
+        async def fake_request(method, payload, *, response_model):
+            assert method == "skills/list"
+            return response_model(
+                root={
+                    "data": [
+                        {
+                            "skills": [
+                                {"name": "skill-a", "enabled": True},
+                                {"name": "skill-disabled", "enabled": False},
+                            ]
+                        }
+                    ]
+                }
             )
 
         async def fake_plugin_list(payload):
@@ -1673,7 +1795,7 @@ class TestCodexBackend:
         backend._codex = SimpleNamespace(
             _ensure_initialized=AsyncMock(),
             _client=SimpleNamespace(
-                skills_list=fake_skills_list,
+                request=fake_request,
                 plugin_list=fake_plugin_list,
                 thread_start=fake_thread_start,
             ),
@@ -1696,6 +1818,51 @@ class TestCodexBackend:
         init = next(e for e in events if isinstance(e, SessionInitEvent))
         assert init.skills == ["skill-a"]
         assert init.plugins == ["plugin-a", "plugin-b"]
+
+    async def test_create_client_lists_skills_through_public_sdk_request(self):
+        sdk = _install_codex_sdk_modules()
+        requests = []
+
+        async def fake_thread_start(payload):
+            return SimpleNamespace(thread=SimpleNamespace(id="t-1"))
+
+        async def fake_request(method, payload, *, response_model):
+            requests.append((method, payload))
+            return response_model(
+                root={"data": [{"skills": [{"name": "skill-a", "enabled": True}]}]}
+            )
+
+        backend = CodexBackend()
+        backend._codex = SimpleNamespace(
+            _ensure_initialized=AsyncMock(),
+            _client=SimpleNamespace(
+                request=fake_request,
+                thread_start=fake_thread_start,
+            ),
+        )
+
+        async with backend.create_client(system_prompt="hi", model="gpt-5.4") as client:
+            thread = client._thread
+            turn = MagicMock()
+            turn.id = "turn-1"
+
+            async def stream():
+                yield SimpleNamespace(
+                    payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+                )
+
+            turn.stream = stream
+            thread.turn = AsyncMock(return_value=turn)
+            events = [event async for event in client.send_message("hi")]
+
+        init = next(e for e in events if isinstance(e, SessionInitEvent))
+        assert init.skills == ["skill-a"]
+        assert requests == [
+            (
+                "skills/list",
+                {"cwds": [str(Path.cwd())], "forceReload": False},
+            )
+        ]
 
     async def test_client_lists_skills_from_the_creation_time_session_init(self):
         # ``skills_list`` already ran when the client was created, so the
@@ -2034,6 +2201,10 @@ class TestClaudeBackendVersion:
 
         monkeypatch.setattr(cc_mod.subprocess, "run", fake_run)
         assert cc_mod._claude_cli_version() == "2.1.123"
+
+    def test_find_cli_prefers_system_install(self, monkeypatch):
+        monkeypatch.setattr(cc_mod.shutil, "which", lambda name: "/usr/bin/claude")
+        assert cc_mod._find_claude_cli() == "/usr/bin/claude"
 
     def test_cli_version_returns_empty_on_failure(self, monkeypatch):
         monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/bin/claude")

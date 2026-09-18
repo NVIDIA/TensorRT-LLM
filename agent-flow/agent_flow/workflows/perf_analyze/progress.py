@@ -57,14 +57,27 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from claude_agent_sdk import tool
 from rich.syntax import Syntax
 
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
+from agent_flow.workflow_tool import workflow_tool
+
+from .roles import ROLES
+
+
+def tool(name: str, description: str, input_schema: dict[str, Any]):
+    """Build a workflow tool; append tools are required before stopping."""
+    return workflow_tool(
+        name,
+        description,
+        input_schema,
+        required_before_stop=name.startswith("append_"),
+    )
+
 
 ANALYSIS_STAGE = "analysis"
-_AGENTS = ("benchmarker", "projector", "analyzer", "reporter")
+_AGENTS = ROLES
 
 
 def _empty_progress() -> dict[str, list[dict[str, Any]]]:
@@ -206,10 +219,8 @@ class ProgressContext:
 def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     """Build the per-agent tool lists for ``BackendConfig(tools=...)``.
 
-    Returns a dict keyed by agent name (``"benchmarker"`` / ``"projector"``
-    / ``"analyzer"`` / ``"reporter"``). The tool objects are ``SdkMcpTool``
-    instances, which the claude-code backend wraps into an in-process MCP
-    server.
+    Returns SDK-neutral tools keyed by workflow role. Each backend adapts
+    the same handlers to its native tool format.
     """
 
     @tool(
@@ -232,7 +243,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             "required": ["summary"],
         },
     )
-    async def append_benchmarker_progress(args: dict[str, Any]) -> dict[str, Any]:
+    async def append_benchmarker_progress(args: dict[str, Any]) -> str:
         entry: dict[str, Any] = {
             "step": ctx.current_step,
             "agent": "benchmarker",
@@ -241,14 +252,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         }
         _append(ctx.path, entry)
         _log_progress_write("benchmarker", entry)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (f"Recorded benchmarker entry for step {ctx.current_step}."),
-                }
-            ]
-        }
+        return f"Recorded benchmarker entry for step {ctx.current_step}."
 
     @tool(
         "append_projector_progress",
@@ -271,7 +275,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             "required": ["summary"],
         },
     )
-    async def append_projector_progress(args: dict[str, Any]) -> dict[str, Any]:
+    async def append_projector_progress(args: dict[str, Any]) -> str:
         entry = {
             "step": ctx.current_step,
             "agent": "projector",
@@ -280,14 +284,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         }
         _append(ctx.path, entry)
         _log_progress_write("projector", entry)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (f"Recorded projector entry for step {ctx.current_step}."),
-                }
-            ]
-        }
+        return f"Recorded projector entry for step {ctx.current_step}."
 
     @tool(
         "append_analyzer_progress",
@@ -308,7 +305,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             "required": ["summary"],
         },
     )
-    async def append_analyzer_progress(args: dict[str, Any]) -> dict[str, Any]:
+    async def append_analyzer_progress(args: dict[str, Any]) -> str:
         entry = {
             "step": ctx.current_step,
             "agent": "analyzer",
@@ -317,14 +314,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         }
         _append(ctx.path, entry)
         _log_progress_write("analyzer", entry)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (f"Recorded analyzer entry for step {ctx.current_step}."),
-                }
-            ]
-        }
+        return f"Recorded analyzer entry for step {ctx.current_step}."
 
     @tool(
         "append_reporter_progress",
@@ -346,7 +336,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             "required": ["summary"],
         },
     )
-    async def append_reporter_progress(args: dict[str, Any]) -> dict[str, Any]:
+    async def append_reporter_progress(args: dict[str, Any]) -> str:
         entry = {
             "step": ctx.current_step,
             "agent": "reporter",
@@ -355,14 +345,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         }
         _append(ctx.path, entry)
         _log_progress_write("reporter", entry)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (f"Recorded reporter entry for step {ctx.current_step}."),
-                }
-            ]
-        }
+        return f"Recorded reporter entry for step {ctx.current_step}."
 
     # ``read_latest_progress`` is shared; each caller gets a closure so the
     # log attribution shows *who is reading*, not which agent's entries
@@ -396,7 +379,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "required": [],
             },
         )
-        async def read_latest_progress(args: dict[str, Any]) -> dict[str, Any]:
+        async def read_latest_progress(args: dict[str, Any]) -> str:
             steps = int(args.get("steps") or 4)
             agent = args.get("agent") or None
             selected = find_entries(ctx.path, agent=agent, last_steps=steps)
@@ -405,7 +388,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             else:
                 text = _yaml_dump(selected)
             _log_progress_read(caller, agent, steps, text)
-            return {"content": [{"type": "text", "text": text}]}
+            return text
 
         return read_latest_progress
 
