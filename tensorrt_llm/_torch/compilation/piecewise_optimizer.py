@@ -1,4 +1,6 @@
+import copy
 import dataclasses
+import os
 from typing import Callable, List, Optional, Sequence, Union
 from unittest.mock import patch
 
@@ -10,12 +12,31 @@ from torch.fx import GraphModule, Interpreter
 from torch.fx.passes.split_module import split_module
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
+from tensorrt_llm.logger import logger
+
+# When torch_compile_config.max_num_streams > 1, apply the multi-stream schedule
+# only to piecewise graphs running at most this many tokens; larger token counts
+# (prefill / mixed iterations) keep the single-stream piece. Unset or 0 = no
+# limit. Rationale (Qwen3.5-397B TP8 gen-only): the second stream overlaps the
+# MoE shared expert / dense GEMMs with the routed experts and cuts small-decode
+# iterations by 0.3-0.7 ms, but at prefill sizes both sides are compute-bound
+# and the extra cross-stream events only add gaps.
+_MULTI_STREAM_MAX_TOKENS: Optional[int] = (int(
+    os.environ.get("TLLM_MULTI_STREAM_MAX_TOKENS", "0")) or None)
+
+
+def multi_stream_max_tokens() -> Optional[int]:
+    return _MULTI_STREAM_MAX_TOKENS
 
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
                      set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
+# TLLM_PWCG_NVTX_PROBE=1 brackets every piecewise runner call in an NVTX range
+# (host-side attribution of the glue between graph launches in nsys traces).
+_PWCG_NVTX_PROBE = os.environ.get("TLLM_PWCG_NVTX_PROBE", "0") == "1"
+
 from .utils import (get_capture_piecewise_cuda_graph_flag,
                     get_optional_trtllm_op, is_call_function)
 
@@ -101,7 +122,14 @@ class PiecewiseInterpreter(Interpreter):
                         "Cannot identify dynamic shape, please disable enable_piecewise_cuda_graph in TorchCompileConfig"
                     )
 
+            single_stream_submod = None
             if self.max_num_streams > 1 and not self.enable_inductor:
+                if multi_stream_max_tokens() is not None:
+                    # Keep a single-stream twin of the piece for token counts
+                    # above the limit: same parameters/buffers (shared by
+                    # reference), its own copy of the graph.
+                    single_stream_submod = GraphModule(
+                        submod, copy.deepcopy(submod.graph))
                 num_events = multi_stream_schedule(submod, self.max_num_streams)
                 self.num_events = max(self.num_events, num_events)
                 submod.recompile()
@@ -118,6 +146,8 @@ class PiecewiseInterpreter(Interpreter):
                 self.enable_inductor,
                 self.piecewise_runner_idx == 0,
                 self.piecewise_runner_idx == self.piecewise_runner_num - 1,
+                large_callable=single_stream_submod,
+                multi_stream_max_tokens=multi_stream_max_tokens(),
             )
             self.module.__dict__[target] = runner
             self.runners.append(runner)
@@ -156,13 +186,20 @@ class PiecewiseRunner(object):
         enable_inductor: bool,
         is_first_runner: bool,
         is_last_runner: bool,
+        large_callable: Optional[Callable] = None,
+        multi_stream_max_tokens: Optional[int] = None,
     ):
+        """``large_callable`` (optional) is the single-stream twin of the piece,
+        used instead of ``default_callable`` (the multi-stream schedule) for
+        token counts above ``multi_stream_max_tokens``."""
         if runtime_num_tokens_idx != None:
             assert isinstance(compile_time_num_tokens, torch.SymInt)
 
         self.graph = graph
         self.name = name
         self.default_callable = default_callable
+        self.large_callable = large_callable
+        self.multi_stream_max_tokens = multi_stream_max_tokens
         self.compile_time_num_tokens = compile_time_num_tokens
         self.runtime_num_tokens_idx = runtime_num_tokens_idx
         self.call_count = 0
@@ -177,8 +214,19 @@ class PiecewiseRunner(object):
             self.entries[num_tokens] = Entry(
                 num_tokens,
                 enable_inductor=self.enable_inductor,
-                callable=default_callable,
+                callable=self.callable_for(num_tokens),
             )
+
+    def callable_for(self, num_tokens: Optional[int]) -> Callable:
+        """The piece to run for ``num_tokens``: the single-stream twin above
+        the multi-stream token limit, the (possibly multi-stream) default
+        otherwise. Unknown token counts take the default."""
+        if (self.large_callable is not None
+                and self.multi_stream_max_tokens is not None
+                and num_tokens is not None
+                and num_tokens > self.multi_stream_max_tokens):
+            return self.large_callable
+        return self.default_callable
 
     def clear_cuda_graphs(self):
         """Release captures while retaining buckets for a later warmup."""
@@ -192,6 +240,15 @@ class PiecewiseRunner(object):
             entry.output = None
 
     def __call__(self, *args):
+        if _PWCG_NVTX_PROBE:
+            torch.cuda.nvtx.range_push("pwcg_runner")
+            try:
+                return self._call(*args)
+            finally:
+                torch.cuda.nvtx.range_pop()
+        return self._call(*args)
+
+    def _call(self, *args):
         runtime_num_of_token = None
         if self.runtime_num_tokens_idx != None:
             runtime_num_of_token = int(
@@ -204,7 +261,7 @@ class PiecewiseRunner(object):
                 or runtime_num_of_token not in self.entries
                 or not get_piecewise_cuda_graph_flag()
                 or not get_per_request_prefill_cuda_graph_flag()):
-            return self.default_callable(*args)
+            return self.callable_for(runtime_num_of_token)(*args)
 
         if self.is_first_runner or self.is_last_runner:
             if self.is_first_runner == self.is_last_runner:
@@ -324,5 +381,12 @@ def piecewise_optimizer(
     )
 
     interpreter.run(*example_inputs)
+
+    if max_num_streams > 1:
+        logger.info(
+            f"piecewise multi-stream schedule: {len(interpreter.runners)} pieces, "
+            f"max_num_streams={max_num_streams}, events={interpreter.num_events}, "
+            f"token gate={multi_stream_max_tokens()}, "
+            f"dump={os.environ.get('TLLM_MULTI_STREAM_DUMP') or 'off'}")
 
     return gm, interpreter.num_events, interpreter.runners

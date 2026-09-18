@@ -270,6 +270,21 @@ def inplace_info():
             1: "fused_q",
             2: "q_pe"
         },
+        # Registered lazily: the op only exists once fused_shared_expert is
+        # imported (Qwen3-Next family). Omitting this entry is a correctness
+        # bug, not just perf: the following allreduce would consume the
+        # functionalization clone instead of the allocate_output
+        # symmetric-heap buffer.
+        "fused_sigmoid_gate_mul_add_": {
+            1: "output"
+        },
+        # CuTe DSL MXFP8 fused FC1+FC2 MoE kernel (Rubin): scatter-adds the
+        # expert outputs into the memset ``output`` buffer. Without this entry
+        # auto_functionalize clones ``output`` before every call, which puts an
+        # extra copy kernel on the MoE critical path of each layer.
+        "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin": {
+            1: "output"
+        },
     }
     for op_name, mutates_args in optional_inplace_infos.items():
         op = get_optional_trtllm_op(op_name)

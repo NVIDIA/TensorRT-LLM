@@ -1,10 +1,14 @@
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from operator import getitem
 from queue import PriorityQueue
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
+from torch._higher_order_ops.auto_functionalize import (
+    auto_functionalized, auto_functionalized_v2)
 from torch.fx import Graph, GraphModule, Node
 
 from tensorrt_llm.logger import logger
@@ -20,69 +24,167 @@ def is_symint_node(node: Node) -> bool:
     return False
 
 
+# Cost model: rough relative device time of one op at small token counts
+# (roughly microseconds of a decode step). Only the ratios matter: they decide
+# the critical path (priority) and which stream an op lands on.
+MOE_MODULE_COST = 60  # moe_custom_op: routing + quantize + sort + expert GEMMs
+MOE_OP_COST = 20  # fused expert GEMMs (all local experts in one launch)
+GROUPED_GEMM_COST = 12  # one grouped GEMM of a two-launch expert path
+GEMM_OP_COST = 10
+COMM_OP_COST = 10  # all-reduce / all-to-all: latency bound, exposed
+MOE_SORT_COST = 6
+ROUTING_OP_COST = 3
+QUANT_OP_COST = 2
+NORM_OP_COST = 2
+DEFAULT_OP_COST = 1
+
+_NO_COST_OPS = {
+    getitem, torch.ops.aten.view.default, torch.ops.aten.view.dtype,
+    torch.ops.aten.alias.default, torch.ops.aten.empty.memory_format,
+    torch.ops.aten.permute.default
+}
+
+_ATEN_GEMM_OPS = {torch.ops.aten.mm.default}
+
+# trtllm ops by class name: many are registered only when their backend (CuTe
+# DSL, cuda.tile, FlashInfer, ...) is available, so they are matched by op name.
+_TRTLLM_OP_COSTS = (
+    # The whole MoE forward behind one op (torch.compile wraps the routing
+    # kernel, activation quantize, moe_sort, output memset and the expert GEMMs
+    # in moe_custom_op). It has to dominate the shared-expert chain that runs
+    # next to it: costed as a single fused GEMM it let the scheduler queue the
+    # shared-expert gate GEMM behind it on the same stream, and the join then
+    # waited for that GEMM after the experts had finished.
+    (MOE_MODULE_COST, ("moe_custom_op", )),
+    (MOE_OP_COST, (
+        "fp4_block_scale_moe_runner",
+        "fp8_block_scale_moe_runner",
+        "mxfp8_block_scale_moe_runner",
+        "fused_moe",
+        "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
+        "cute_dsl_megamoe_nvfp4_blackwell",
+    )),
+    (GROUPED_GEMM_COST, (
+        "cute_dsl_nvfp4_grouped_gemm_blackwell",
+        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin",
+        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin",
+        "cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+        "cute_dsl_nvfp4_grouped_gemm_finalize_locality_domain_inplace_rubin",
+        "cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin",
+        "cute_dsl_bf16_gather_grouped_gemm_swiglu_locality_domain_inplace_rubin",
+        "cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin",
+        "cute_dsl_bf16_grouped_gemm_finalize_locality_domain_inplace_rubin",
+    )),
+    (GEMM_OP_COST, (
+        "nvfp4_gemm",
+        "fp8_batched_gemm_trtllmgen",
+        "w4a8_mxfp4_fp8_gemm",
+        "finegrained_mixed_dtype_gemm",
+        "bmm_out",
+        "cublas_scaled_mm",
+        "cublas_mm",
+        "dsv3_router_gemm_op",
+        "dsv3_fused_a_gemm_op",
+        "fp4_gemm",
+        "fp4_bmm",
+        "fp8_block_scaling_gemm",
+        "matmul_to_ub",
+        "cute_dsl_bf16_gemm_rubin",
+        "cute_dsl_bf16_gemm_blackwell",
+        "cute_dsl_bf16_gemm_locality_domain_inplace_rubin",
+        "cute_dsl_nvfp4_gemm_blackwell",
+        "cute_dsl_nvfp4_gemm_inplace_rubin",
+        "cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin",
+        "cute_dsl_nvfp4_dense_gemm_swiglu_blackwell",
+        "cute_dsl_nvfp4_dense_gemm_gelu_blackwell",
+        "cute_dsl_fp8_bmm_rubin",
+        "cute_dsl_fp8_bmm_blackwell",
+        "cute_dsl_bf16_bmm_rubin",
+        "cute_dsl_bf16_bmm_blackwell",
+        "cute_dsl_bf16_bmm_locality_domain_inplace_rubin",
+    )),
+    (COMM_OP_COST, (
+        "allreduce",
+        "mnnvl_fusion_allreduce",
+        "moe_finalize_allreduce",
+        "userbuffers_allreduce_finalize",
+        "allgather",
+        "reducescatter",
+        "mnnvl_moe_alltoallv",
+        "mnnvl_moe_alltoallv_combine",
+    )),
+    (MOE_SORT_COST, (
+        "moe_sort",
+    )),
+    (ROUTING_OP_COST, (
+        "renorm_moe_routing_op",
+        "default_moe_routing_op",
+        "noaux_tc_op",
+        "moe_permute_op",
+        "moe_permute",
+        "moe_finalize_scale_op",
+        "moe_unpermute_inplace",
+    )),
+    (QUANT_OP_COST, (
+        "mxfp8_quantize",
+        "fp4_quantize",
+        "fp8_quantize",
+        "fp8_quantize_1x128",
+        "quantize_e4m3_per_tensor",
+    )),
+    (NORM_OP_COST, (
+        "cuda_tile_rms_norm",
+        "cuda_tile_rms_norm_fuse_residual_",
+        "flashinfer_rmsnorm",
+        "flashinfer_fused_add_rmsnorm",
+        "flashinfer_fused_add_rmsnorm_quant",
+        "fused_qk_norm_rope",
+    )),
+)
+
+_TRTLLM_OP_COSTS_BY_NAME: Dict[str, int] = {
+    name: cost
+    for cost, names in _TRTLLM_OP_COSTS
+    for name in names
+}
+
+
+def trtllm_op_name(target) -> Optional[str]:
+    """``name`` for ``torch.ops.trtllm.<name>`` overloads (C++ or Python custom
+    ops), None for anything else. Resolved from the op schema so the lookup does
+    not depend on which backends happened to register their ops."""
+    schema = getattr(target, "_schema", None)
+    if schema is None:
+        return None
+    namespace, _, name = schema.name.partition("::")
+    return name if namespace == "trtllm" else None
+
+
+def effective_target(node: Node):
+    """The op a node runs: unwrap the auto_functionalize HOP so a mutating op
+    that is not registered in inplace_info() is still costed as itself."""
+    target = node.target
+    if target in (auto_functionalized, auto_functionalized_v2) and node.args:
+        return node.args[0]
+    return target
+
+
 def estimate_time(node: Node) -> int:
     if node is None:
         return 0
     if is_symint_node(node):
         # This is a symint call that happens on host. No need to count time on stream.
         return 0
-
-    # Add cost model for ops that need special handling.
-    # We can start with rough estimation and refine it later.
-
-    no_cost_ops = {
-        getitem, torch.ops.aten.view.default, torch.ops.aten.view.dtype,
-        torch.ops.aten.alias.default, torch.ops.aten.empty.memory_format,
-        torch.ops.aten.permute.default
-    }
-
-    moe_ops = {
-        torch.ops.trtllm.fp4_block_scale_moe_runner.default,
-        torch.ops.trtllm.fused_moe.default,
-        torch.ops.trtllm.moe_custom_op.default,
-    }
-
-    gemm_ops = {
-        torch.ops.aten.mm.default,
-        torch.ops.trtllm.nvfp4_gemm.default,
-        torch.ops.trtllm.fp8_batched_gemm_trtllmgen.default,
-        torch.ops.trtllm.w4a8_mxfp4_fp8_gemm.default,
-        torch.ops.trtllm.finegrained_mixed_dtype_gemm.default,
-        torch.ops.trtllm.bmm_out.default,
-        torch.ops.trtllm.cublas_scaled_mm.default,
-        torch.ops.trtllm.cublas_mm.default,
-        torch.ops.trtllm.dsv3_router_gemm_op.default,
-        torch.ops.trtllm.dsv3_fused_a_gemm_op.default,
-        torch.ops.trtllm.fp4_gemm.default,
-        torch.ops.trtllm.fp4_bmm.default,
-        torch.ops.trtllm.fp8_block_scaling_gemm.default,
-        torch.ops.trtllm.matmul_to_ub.default,
-    }
-
-    # These ops are not counted in the time estimation.
-    if node.op == "call_function" and node.target in no_cost_ops:
+    if node.op != "call_function":
+        return DEFAULT_OP_COST
+    target = effective_target(node)
+    if target in _NO_COST_OPS:
         return 0
-
-    # Add estimation below. With accurate estimation, the stream assignment
-    # can give the best performance. But it is hard to get accurate estimation.
-    #
-    # So currently, these estimations are not accurate. They just make sure the key path
-    # is correctly scheduled. Adjust the estimation or add new ones
-    # if the stream assignment is not desired.
-
-    MOE_OP_COST = 20
-    GEMM_OP_COST = 10
-    DEFAULT_OP_COST = 1
-
-    # Adjust MOE weight to make the router -> MOE key path
-    if node.op == "call_function" and node.target in moe_ops:
-        return MOE_OP_COST
-
-    # GEMM ops
-    if node.op == "call_function" and node.target in gemm_ops:
+    if target in _ATEN_GEMM_OPS:
         return GEMM_OP_COST
-
-    # Refine the estimation of time for nodes.
+    name = trtllm_op_name(target)
+    if name is not None:
+        return _TRTLLM_OP_COSTS_BY_NAME.get(name, DEFAULT_OP_COST)
     return DEFAULT_OP_COST
 
 
@@ -416,6 +518,53 @@ class MultiStreamDAG:
         return num_events
 
 
+def _dump_schedule(dag: "MultiStreamDAG", directory: str) -> None:
+    """Write the piece's nodes (target, cost estimate, stream, edges) as JSON so
+    the schedule can be inspected and re-simulated offline.
+    Enabled by TLLM_MULTI_STREAM_DUMP=<dir>; one file per scheduled piece and
+    process."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        nodes = []
+        for node, v in dag.nodes.items():
+            target = str(node.target)
+            if "auto_functionalized" in target and node.args:
+                # Record the mutating op wrapped by the functionalization HOP.
+                target = f"{target}[{node.args[0]}]"
+            val = node.meta.get("val") if isinstance(node.meta, dict) else None
+            shape = None
+            if isinstance(val, torch.Tensor):
+                shape = [str(d) for d in val.shape] + [str(val.dtype)]
+            elif isinstance(val, (tuple, list)):
+                shape = [[str(d) for d in t.shape] + [str(t.dtype)]
+                         if isinstance(t, torch.Tensor) else str(t) for t in val]
+            nodes.append({
+                "name": node.name,
+                "op": node.op,
+                "target": target,
+                "shape": shape,
+                "weight": v.weight,
+                "distance": v.distance,
+                "stream": None if v.stream is None else v.stream.id,
+                "end_time": v.end_time,
+                "in_edges": [e.node.name for e in v.in_edges.values() if e.node is not None],
+                "waits_on": [e.node.name for e, _ in v.wait_on if e.node is not None],
+            })
+        fn = os.path.join(
+            directory,
+            f"piece_{os.getpid()}_{_dump_schedule.counter}.json")
+        _dump_schedule.counter += 1
+        with open(fn, "w") as f:
+            json.dump({"streams": [len(st.nodes) for st in dag.streams],
+                       "nodes": nodes}, f)
+        logger.debug(f"multi-stream schedule dumped to {fn}")
+    except Exception as e:  # never let a debug dump break compilation
+        logger.warning(f"multi-stream schedule dump failed: {e}")
+
+
+_dump_schedule.counter = 0
+
+
 def multi_stream_schedule(gm: GraphModule, max_num_streams: int) -> int:
     """
     Schedule the graph module for multi stream execution.
@@ -424,7 +573,13 @@ def multi_stream_schedule(gm: GraphModule, max_num_streams: int) -> int:
     Return the number of events created.
     """
     dag = MultiStreamDAG(gm)
-    return dag.optimize(max_num_streams)
+    num_events = dag.assign_streams(max_num_streams)
+    dump_dir = os.environ.get("TLLM_MULTI_STREAM_DUMP")
+    if dump_dir:
+        _dump_schedule(dag, dump_dir)
+    new_graph = dag.create_new_graph()
+    dag.gm.graph = new_graph
+    return num_events
 
 
 # Following code is for debug purpose. Use print_dag_to_dot to print a MultiStreamDAG to dot file.
