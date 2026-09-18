@@ -1834,7 +1834,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
 
         has_q_only = False
-        if not self.is_mla_enable and not metadata.is_cross and k is None and v is None:
+        if self.is_mla_enable:
+            forward_args.is_fused_qkv = False
+            forward_args.update_kv_cache = True
+            has_q_only = k is None and v is None
+        elif not metadata.is_cross and k is None and v is None:
             q_hidden_size = self.num_heads * self.head_dim
             qkv_hidden_size = q_hidden_size + 2 * self.num_kv_heads * self.head_dim
             has_q_only = q.size(-1) == q_hidden_size
@@ -2000,19 +2004,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
+            assert not forward_args.is_fused_qkv
             sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
             is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
             ) > 0
             if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
-                assert forward_args.is_fused_qkv
+                assert k is None and v is None
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
             elif attention_input_type == AttentionInputType.context_only:
-                assert not forward_args.is_fused_qkv
+                assert k is not None and v is not None
                 qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                     self.qk_rope_head_dim)
             elif attention_input_type == AttentionInputType.generation_only:
-                assert forward_args.is_fused_qkv
+                assert k is None and v is None
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
             else:
