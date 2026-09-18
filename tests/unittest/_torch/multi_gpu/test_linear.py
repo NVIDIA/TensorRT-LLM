@@ -571,7 +571,7 @@ def bf16_row_linear_locality_domain_forward(x, hidden_size, dtype,
         output = linear(input_shard, all_reduce_params=AllReduceParams())
     expected = x.float() @ weights[0].cuda().t().float()
     torch.cuda.synchronize()
-    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=2.0)
+    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=0.5)
 
 
 def _prepare_fp4_row_linear_allreduce_case(

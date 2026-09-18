@@ -2036,6 +2036,8 @@ class CuteDslFusedMoE(MoEImplBase):
     def load_weights(self,
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
+        if self._locality_domain_weight_shards is not None:
+            self.pre_reload_weights()
         super().load_weights(weights,
                              allow_partial_loading=allow_partial_loading)
         # Keep DWDP registration after base weight loading. This preserves
@@ -2070,6 +2072,7 @@ class CuteDslFusedMoE(MoEImplBase):
             # Weight splitting initializes the process-lifetime locality domain resource.
             # Resolve the borrowed remainder stream now, never during capture.
             self._get_reserved_moe_output_memset_stream()
+
     def pre_reload_weights(self) -> None:
         # The quant method rebuilds the original full-weight schemas. Drop
         # shards so the next transform uses the newly loaded checkpoint.
