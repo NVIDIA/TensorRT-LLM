@@ -511,20 +511,20 @@ class CuteDslMlaFmha(PhasedFmha):
         self,
         params: FmhaParams,
     ) -> None:
-        if params.qkv_input is None:
-            raise RuntimeError("CuTe DSL MLA generation requires qkv_input.")
-        if params.context_buf is None:
-            raise RuntimeError("CuTe DSL MLA generation requires context_buf.")
+        if params.query_input is None:
+            raise RuntimeError("CuTe DSL MLA generation requires query_input.")
+        if params.output is None:
+            raise RuntimeError("CuTe DSL MLA generation requires output.")
         if params.sequence_lengths is None:
             raise RuntimeError("CuTe DSL MLA generation requires sequence lengths.")
 
-        kernel_dtype = self._get_kernel_dtype(params.attn, params.qkv_input)
+        kernel_dtype = self._get_kernel_dtype(params.attn, params.query_input)
         if kernel_dtype is None:
             raise RuntimeError("CuTe DSL MLA generation was selected for an unsupported dtype.")
 
         self._run_mla_decode(
-            params.qkv_input,
-            params.context_buf,
+            params.query_input,
+            params.output,
             params,
             kernel_dtype,
         )
