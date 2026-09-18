@@ -109,21 +109,63 @@ def test_enum_schema():
     }
 
 
-@pytest.mark.parametrize(
-    "original",
-    [
-        {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}}},
-        {"type": "object", "additionalProperties": {"type": "string"}},
-        {"$ref": "#/$defs/arguments", "$defs": {"arguments": {"type": "object"}}},
-    ],
-)
-def test_explicit_json_schema_is_copied_without_reinterpretation(original):
+def test_explicit_json_schema_is_copied_without_reinterpretation():
+    original = {
+        "type": "object",
+        "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+    }
     pristine = copy.deepcopy(original)
     normalized = normalize_input_schema(original)
     assert normalized == pristine
     assert normalized is not original
-    if "properties" in normalized:
-        normalized["properties"]["names"]["items"]["type"] = "integer"
+    normalized["properties"]["names"]["items"]["type"] = "integer"
+    assert original == pristine
+
+
+@pytest.mark.parametrize(
+    "original, expected",
+    [
+        (
+            {"type": "object", "additionalProperties": {"type": "string"}},
+            {"type": "object", "properties": {}, "additionalProperties": {"type": "string"}},
+        ),
+        (
+            {"$ref": "#/$defs/arguments", "$defs": {"arguments": {"type": "object"}}},
+            {
+                "type": "object",
+                "properties": {},
+                "allOf": [{"$ref": "#/$defs/arguments"}],
+                "$defs": {"arguments": {"type": "object"}},
+            },
+        ),
+        (
+            {
+                "type": ["object", "null"],
+                "properties": {"name": {"type": "string"}},
+                "allOf": [{"required": ["name"]}],
+            },
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "allOf": [{"type": ["object", "null"]}, {"required": ["name"]}],
+            },
+        ),
+        (
+            {"anyOf": [{"required": ["a"]}, {"required": ["b"]}]},
+            {
+                "type": "object",
+                "properties": {},
+                "anyOf": [{"required": ["a"]}, {"required": ["b"]}],
+            },
+        ),
+    ],
+)
+def test_explicit_json_schema_is_normalized_to_mcp_object_shape(original, expected):
+    # The Claude SDK only recognises a JSON Schema when it has a string ``type`` and a
+    # ``properties`` key; anything else is re-read as Python shorthand. Root keywords that
+    # do not fit that shape move into ``allOf`` with their meaning intact.
+    pristine = copy.deepcopy(original)
+    assert normalize_input_schema(original) == expected
     assert original == pristine
 
 

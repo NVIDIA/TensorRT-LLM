@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import claude_agent_sdk
+import jsonschema
 import pytest
 from claude_agent_sdk import types as sdk_types
 from claude_agent_sdk.types import (
@@ -722,6 +724,23 @@ class TestClaudeBackend:
         assert result.permission_denials == []
 
 
+# A recursive explicit JSON Schema: the form ``normalize_input_schema`` points users
+# to when a TypedDict refers to itself.
+_RECURSIVE_NODE_SCHEMA = {
+    "$ref": "#/$defs/node",
+    "$defs": {
+        "node": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "children": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+            },
+            "required": ["name"],
+        }
+    },
+}
+
+
 class TestClaudeBackendCreateClient:
     async def test_framework_tools_keep_annotations_and_independent_handlers(self):
         from agent_flow.tools import tool
@@ -744,6 +763,39 @@ class TestClaudeBackendCreateClient:
         assert (await image_sdk.handler({}))["content"] == [
             {"type": "image", "data": "YWJj", "mimeType": "image/png"}
         ]
+
+    @pytest.mark.parametrize(
+        "schema, accepted, rejected",
+        [
+            (
+                {"type": "object", "additionalProperties": {"type": "string"}},
+                {"key": "value"},
+                {"key": 1},
+            ),
+            (
+                _RECURSIVE_NODE_SCHEMA,
+                {"name": "root", "children": [{"name": "leaf"}]},
+                {"name": "root", "children": [{"children": []}]},
+            ),
+        ],
+    )
+    def test_explicit_json_schema_survives_sdk_schema_builder(self, schema, accepted, rejected):
+        from agent_flow.tools import tool
+
+        @tool("explicit", "Explicit JSON Schema", schema)
+        async def explicit(args):
+            return {"content": []}
+
+        [sdk_tool] = cc_mod._sdk_tools([explicit])
+        # ``_build_input_schema`` is the pinned SDK's wire-schema builder. A dict without a
+        # string ``type`` and a ``properties`` key is re-read as Python shorthand, so the
+        # schema's own keywords would be advertised, and then validated on every call, as
+        # required parameters. The framework must hand it a shape it passes through as is.
+        advertised = claude_agent_sdk._build_input_schema(sdk_tool)
+        assert advertised is sdk_tool.input_schema
+        jsonschema.validate(instance=accepted, schema=advertised)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=rejected, schema=advertised)
 
     async def _capture_options(self, monkeypatch, **kwargs):
         # Stand-in for ``ClaudeSDKClient`` that just records the options
