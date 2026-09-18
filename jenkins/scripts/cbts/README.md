@@ -326,6 +326,10 @@ CBTS defers to the existing filter chain when:
   decorator line), has no usable patch, has unparsable source, or has a closure
   change with no wider row set (see `coverage_selection/SELECTION.md` §3-4)
 - No touch DB artifact could be resolved — Tier 2 never runs
+- The Tier-2 residual cannot be applied without conflicts to the selected coverage DB (the
+  freshest complete build on a PR head's first run, then pinned for that head)
+  revision (or the check cannot be completed) — Tier 1-owned file conflicts are ignored, while
+  residual conflicts decline Tier 2 before download
 - The resolved DB sits more than `--coverage-max-drift` commits from the PR's
   base commit, on either side, or an unmeasurable distance from it — Tier 2
   declines (`coverage_freshness` = `stale` / `unknown`)
