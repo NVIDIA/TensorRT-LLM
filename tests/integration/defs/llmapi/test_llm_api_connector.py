@@ -1392,7 +1392,7 @@ def test_connector_adp_persistent_pool(monkeypatch: pytest.MonkeyPatch,
         connector_worker_class="PersistentKvCacheConnectorWorker",
     )
     kwargs = dict(
-        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        model=f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
         backend="pytorch",
         tensor_parallel_size=2,
         enable_attention_dp=True,
