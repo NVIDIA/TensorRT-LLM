@@ -1119,11 +1119,32 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     )
 
 
-@pytest.mark.parametrize("chunked_workspace_profiled", [False, True])
+@pytest.mark.parametrize(
+    (
+        "sm",
+        "chunked_workspace_profiled",
+        "chunked_prefill",
+        "bounded",
+        "expected_budget",
+        "expected_cap",
+    ),
+    [
+        (100, False, True, True, 384, 128),
+        (100, True, True, True, 512, None),
+        (90, False, True, True, 512, None),
+        (90, False, False, True, 384, 128),
+        (90, False, True, False, 384, 128),
+    ],
+)
 def test_estimation_temporarily_uses_inferred_pool_sizing(
+    sm: int,
     chunked_workspace_profiled: bool,
+    chunked_prefill: bool,
+    bounded: bool,
+    expected_budget: int,
+    expected_cap: int | None,
 ) -> None:
-    """Restore user sizing and reserve workspace only when chunks were not profiled."""
+    """Verify measured chunk capacity and preserve Hopper's existing reserve policy."""
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
     max_seq_len = 4096
@@ -1131,6 +1152,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     estimation_max_tokens = 256
     kv_cache_config = KvCacheConfig(
         max_tokens=user_max_tokens,
+        enable_block_reuse=True,
         pool_ratio=pool_ratio,
         avg_seq_len=avg_seq_len,
     )
@@ -1142,7 +1164,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     # A bare Mock would auto-create the attribute; real engines set it to
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
-    llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=True)
+    llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=chunked_prefill)
 
     with patch.object(
         KvCacheCreator,
@@ -1179,6 +1201,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
 
     with (
+        patch("tensorrt_llm._torch.pyexecutor._util.get_sm_version", return_value=sm),
         patch.object(
             creator,
             "_get_token_num_for_estimation",
@@ -1203,7 +1226,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
         ),
         patch(
             "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
-            return_value=True,
+            return_value=bounded,
         ),
     ):
         assert creator.try_prepare_estimation()
@@ -1213,8 +1236,8 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
 
         creator.configure_kv_cache_capacity(py_executor)
 
-    assert kv_cache_config.max_gpu_total_bytes == (512 if chunked_workspace_profiled else 384)
-    assert creator._fp8_ctx_mla_kv_len_cap == (None if chunked_workspace_profiled else 128)
+    assert kv_cache_config.max_gpu_total_bytes == expected_budget
+    assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
     py_executor.start_worker.assert_called_once()
     py_executor.shutdown.assert_called_once()
     assert kv_cache_config.max_tokens == user_max_tokens
