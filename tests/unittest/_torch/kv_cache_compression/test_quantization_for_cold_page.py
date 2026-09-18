@@ -1466,9 +1466,9 @@ def test_keep_rope_precision_leaves_the_mla_rope_tail() -> None:
 @pytest.mark.parametrize(
     ("keep_rope_precision", "run", "cold_page_bytes"),
     [
-        # 8192 B packed + 1024 B scales + 2176 B opaque indexer.
+        # 8192 B NVFP4 data + 1024 B scales + 2176 B indexer copied whole.
         (False, (0, 512), 11392),
-        # 7168 B packed + 896 B scales + 2048 B RoPE copied + 2176 B opaque indexer.
+        # 7168 B NVFP4 data + 896 B scales + 2048 B RoPE copied + 2176 B indexer copied whole.
         (True, (0, 448), 12288),
     ],
 )
