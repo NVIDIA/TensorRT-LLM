@@ -2677,6 +2677,23 @@ class SpecWorkerBase(nn.Module, ABC):
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
 
+    def _rollback_guided_decoder_after_verify(self, num_accepted_tokens):
+        """Restore the accepted grammar prefix after a one-shot draft step.
+
+        ``execute`` advances every matcher through the golden token and the
+        draft tokens the grammar accepts. Workers that draft through
+        ``execute_draft_batch(draft_step=0)`` undo the rejected suffix there.
+        Workers that draft in one shot never enter that loop, so they must
+        roll back here; otherwise their matchers keep tokens the target
+        rejected and the next target step masks from the wrong state.
+
+        Call this after the native drafting kernels are enqueued: the
+        rollback's host callbacks need the GIL, and a native call that
+        synchronizes the stream while holding it would stall against them.
+        """
+        if self.guided_decoder is not None:
+            self.guided_decoder.rollback_rejected_batch(num_accepted_tokens)
+
     def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens,
                                  batch_indices_cuda, batch_size,
                                  num_accepted_tokens):
