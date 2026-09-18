@@ -308,6 +308,12 @@ public:
         return !mNextNodes.empty();
     }
 
+    //! \brief Number of values (one per value key) held by this node.
+    [[nodiscard]] std::size_t numValues() const
+    {
+        return mValue.size();
+    }
+
     //! \brief Get all (key, value) pairs for direct child nodes that have a value for vkey.
     //! \param vkey Value key to look up in each child.
     //! \return Vector of (NodeKey, Value) pairs for children that have a value for vkey.

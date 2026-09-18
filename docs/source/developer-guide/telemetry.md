@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-302 captured fields.
+304 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -54,6 +54,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `batch_wait_max_tokens_ratio` | `float` | `value` |  |
 | `batch_wait_timeout_iters` | `int` | `value` |  |
 | `batch_wait_timeout_ms` | `float` | `value` |  |
+| `cache_transceiver_config.agent_bounce_buffer_enable` | `bool` | `value` |  |
 | `cache_transceiver_config.backend` | `literal\|none` | `categorical` | `DEFAULT`, `UCX`, `NIXL`, `MOONCAKE`, `MPI` |
 | `cache_transceiver_config.enable_pipelined_transfer` | `bool` | `value` |  |
 | `cache_transceiver_config.kv_cache_bounce_size_mb` | `int` | `value` |  |
@@ -150,6 +151,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.kv_events_config.hwm` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.max_queue_size` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.publisher` | `literal\|none` | `categorical` | `null`, `zmq` |
+| `kv_cache_config.mamba_max_off_grid_snapshots_per_chain` | `int` | `value` |  |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `literal` | `categorical` | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `int` | `value` |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `bool` | `value` |  |
@@ -308,6 +310,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_matching_ngram_size` | `int` | `value` |  |
 | `speculative_config.max_non_leaves_per_layer` | `int\|none` | `value` |  |
 | `speculative_config.max_total_draft_tokens` | `int\|none` | `value` |  |
+| `speculative_config.moe_backend` | `literal\|none` | `categorical` | `AUTO`, `CUTLASS`, `CUTEDSL`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
 | `speculative_config.num_eagle_layers` | `int\|none` | `value` |  |
 | `speculative_config.num_nextn_predict_layers` | `int\|none` | `value` |  |
 | `speculative_config.relaxed_delta` | `float` | `value` |  |

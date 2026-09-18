@@ -167,6 +167,54 @@ protected:
             streamPtr, maxNumTokensPerSeq, maxNumTokensPerSeq, enableReuse, cacheType);
     }
 
+    //! GDN-style hybrid manager: one linear-attention layer (kRecurrentStates
+    //! window) + one full-attention layer. The extra recurrent window makes
+    //! isVariableWindow() true but must NOT disable prefix-aware scheduling
+    //! (isVariableAttentionWindow() stays false). Snapshots at every block so
+    //! recurrent-state reuse floors to the same block granularity as the
+    //! single-window manager.
+    static std::shared_ptr<kv_cache_manager::BaseKVCacheManager> getHybridKvCacheManager(SizeType32 maxNumRequests,
+        SizeType32 tokensPerBlock, SizeType32 maxNumTokens, SizeType32 maxNumTokensPerSeq,
+        SizeType32 statesSnapshotInterval = 0, SizeType32 recurrentPrimaryBlocks = 0)
+    {
+        auto const nbKvHeads = 10;
+        auto constexpr sizePerHead = 1;
+        auto const maxNumBlocks = tc::divUp(maxNumTokens, tokensPerBlock);
+        auto const recurrentBlocks = recurrentPrimaryBlocks > 0 ? recurrentPrimaryBlocks : maxNumBlocks;
+        auto const snapshotInterval = statesSnapshotInterval > 0 ? statesSnapshotInterval : tokensPerBlock;
+        auto const kvDtype = tensorrt_llm::DataType::kHALF;
+        CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+        SizeType32 constexpr recurrentStatesWindow
+            = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+        kv_cache_manager::LinearAttentionMetadata const linearAttentionMetadata{
+            .linearLayerIndices = {0},
+            .cacheType = recurrentStatesWindow,
+            .allRecurrentStatesBytes = 64,
+            .statesSnapshotInterval = snapshotInterval,
+            .saveLastSnapshot = true,
+        };
+        using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+        auto const blocksPerWindow = BlocksPerWindow{
+            {recurrentStatesWindow, {recurrentBlocks, 0}},
+            {maxNumTokensPerSeq, {maxNumBlocks, 0}},
+        };
+        auto const poolConfigurations = std::vector<kv_cache_manager::PoolConfiguration>{
+            {recurrentStatesWindow, sizePerHead, kvDtype},
+            {maxNumTokensPerSeq, sizePerHead, kvDtype},
+        };
+        auto kvCacheManager = std::make_shared<kv_cache_manager::KVCacheManager>(std::vector<SizeType32>{0, nbKvHeads},
+            sizePerHead, tokensPerBlock, blocksPerWindow, maxNumRequests, 1,
+            std::vector<SizeType32>{recurrentStatesWindow, maxNumTokensPerSeq}, kvDtype,
+            /*sinkTokenLength=*/0, streamPtr, maxNumTokensPerSeq, /*chunkSize=*/0, /*enableBlockReuse=*/true,
+            kv_cache_manager::CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false,
+            /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128,
+            /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false, /*indexerKCacheLayerMask=*/std::nullopt,
+            linearAttentionMetadata, poolConfigurations);
+        kvCacheManager->allocatePools(/*useUvm=*/false);
+        return kvCacheManager;
+    }
+
     static std::shared_ptr<BasePeftCacheManager> getPeftCacheManager()
     {
         return std::make_shared<MockPeftCacheManager>();
@@ -1843,6 +1891,413 @@ TEST_F(CapacitySchedulerTest, DelayDuplicateRequest)
             }
             EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), promptLen / kvCacheTokensPerBlock * 2);
         }
+    }
+}
+
+TEST_F(CapacitySchedulerTest, HybridDelayDuplicateRequest)
+{
+    // GDN-style hybrid: the extra kRecurrentStates window makes
+    // isVariableWindow() true, which used to disable prefix-aware dedup
+    // entirely — identical concurrent prompts all ran full prefill. With
+    // isVariableAttentionWindow() gating instead, hybrid managers must defer
+    // duplicates exactly like the single-window DelayDuplicateRequest above.
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    SizeType32 maxInputLen = 1000;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kMAX_UTILIZATION, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager = getHybridKvCacheManager(
+            maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq);
+        auto peftCacheManager = getPeftCacheManager();
+        auto capacityScheduler = CapacityScheduler(maxNumRequests, capacitySchedulerPolicy, kvCacheManager != nullptr);
+
+        int32_t maxNewTokens = 2;
+        int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+
+        RequestList activeRequests;
+        auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 1);
+        std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 0, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 1, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 2, 1234));
+
+        std::vector<ExpectedState> expectedStates;
+        expectedStates.push_back(ExpectedState{0, 1, {0, 1, 2}, {{0, maxNewTokens, promptLen, 0}}});
+        expectedStates.push_back(ExpectedState{1, maxNewTokens, {0, 1, 2},
+            {{0, maxNewTokens, promptLen, 1, promptLen}, {1, maxNewTokens, promptLen, 0},
+                {2, maxNewTokens, promptLen, 0}}});
+        expectedStates.push_back(ExpectedState{maxNewTokens, maxNewTokens + 1, {1, 2},
+            {{1, maxNewTokens, promptLen, maxNewTokens - 1, promptLen},
+                {2, maxNewTokens, promptLen, maxNewTokens - 1, promptLen}}});
+
+        auto addNewRequestsCb = [this](RequestList& activeRequests, int itCount) {};
+
+        int numIterations = runTest(capacityScheduler, kvCacheManager, activeRequests, expectedStates, addNewRequestsCb,
+            maxInputLen, peftCacheManager);
+
+        EXPECT_EQ(numIterations, maxNewTokens + 1);
+        EXPECT_GT(kvCacheManager->getNumReusedBlocks(), 0);
+    }
+}
+
+TEST_F(CapacitySchedulerTest, HybridRecurrentPromptEndAdmissionDoesNotOvercommit)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr recurrentPrimaryBlocks = 7;
+    auto constexpr attentionPrimaryBlocks = 32;
+    auto constexpr maxNumTokens = attentionPrimaryBlocks * tokensPerBlock;
+    auto constexpr maxNumTokensPerSeq = 128;
+    auto constexpr maxNumRequests = 2;
+    auto constexpr maxInputLen = 1000;
+    auto constexpr promptLength = 87;
+    auto constexpr maxNewTokens = 1;
+
+    // Each prompt needs four recurrent blocks: interval snapshots at 32/64,
+    // save-last at 80, and the prompt-end live state at 96. Seven physical
+    // blocks therefore admit one request, never both. Before prompt-end was
+    // counted, the scheduler estimated three per request and admitted both;
+    // onboarding the second request then exhausted the recurrent pool.
+    auto kvCacheManager = getHybridKvCacheManager(maxNumRequests, tokensPerBlock, maxNumTokens, maxNumTokensPerSeq,
+        statesSnapshotInterval, recurrentPrimaryBlocks);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+
+    auto inputTokens0 = std::make_shared<std::vector<int32_t>>(promptLength);
+    auto inputTokens1 = std::make_shared<std::vector<int32_t>>(promptLength);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), 0);
+    std::iota(inputTokens1->begin(), inputTokens1->end(), 1000);
+
+    RequestList activeRequests;
+    activeRequests.push_back(createRequest(inputTokens0, maxNewTokens, 0));
+    activeRequests.push_back(createRequest(inputTokens1, maxNewTokens, 1));
+
+    std::vector<ExpectedState> expectedStates;
+    expectedStates.push_back(ExpectedState{0, 1, {0, 1}, {{0, maxNewTokens, promptLength, 0}}});
+    expectedStates.push_back(ExpectedState{1, 2, {1}, {{1, maxNewTokens, promptLength, 0}}});
+
+    auto addNewRequestsCb = [this](RequestList& activeRequests, int itCount) {};
+    auto const numIterations = runTest(capacityScheduler, kvCacheManager, activeRequests, expectedStates,
+        addNewRequestsCb, maxInputLen, peftCacheManager);
+
+    EXPECT_EQ(numIterations, 2);
+}
+
+TEST_F(CapacitySchedulerTest, HybridAlignedLookAheadAndHotReuseRespectExactGnePool)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr hotPromptLength = 87;
+    auto constexpr maxNumTokens = 32 * tokensPerBlock;
+    auto constexpr maxNumTokensPerSeq = 128;
+    auto constexpr maxNumRequests = 2;
+    auto constexpr maxNewTokens = 2;
+    SizeType32 constexpr recurrentWindow = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    struct TestCase
+    {
+        SizeType32 alignedPromptLength;
+        bool seedSecondOffGridTurn;
+        SizeType32 expectedAlignedOneStep;
+        SizeType32 expectedAlignedPhysical;
+        SizeType32 expectedHotOffGrid;
+        SizeType32 expectedHotNeed;
+    };
+
+    std::vector<TestCase> const testCases{
+        // P32/P64 are interval-aligned: the common initial estimate already
+        // reserves look-ahead, but the reservation must persist after onboard.
+        {32, true, 3, 2, 2, 6},
+        // P48 is off-interval aligned and needs an explicit initial extra block.
+        {48, true, 2, 2, 2, 6},
+        {64, false, 4, 3, 1, 5},
+    };
+
+    for (auto const& testCase : testCases)
+    {
+        for (auto const recurrentPrimaryBlocks : {8, 9})
+        {
+            auto kvCacheManager = getHybridKvCacheManager(maxNumRequests, tokensPerBlock, maxNumTokens,
+                maxNumTokensPerSeq, statesSnapshotInterval, recurrentPrimaryBlocks);
+
+            // Leave one or two historical off-grid recurrent snapshots in the
+            // free-cache tree. A hot P87 continuation therefore needs its cold
+            // four blocks plus the case-specific free-cache claims.
+            auto const hotTokens = std::make_shared<std::vector<int32_t>>(hotPromptLength);
+            std::iota(hotTokens->begin(), hotTokens->end(), 0);
+            auto seedTurn = [&](RequestIdType requestId, SizeType32 turnPromptLength)
+            {
+                auto turnTokens
+                    = std::make_shared<std::vector<int32_t>>(hotTokens->begin(), hotTokens->begin() + turnPromptLength);
+                auto request = createRequest(turnTokens, maxNewTokens, requestId);
+                kvCacheManager->addSequenceBatch(
+                    {{{request->mRequestId, request->getPromptLen(), 1}}}, {std::ref(*request)});
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+                request->addNewToken(static_cast<TokenIdType>(100000 + requestId), 0);
+                kvCacheManager->storeContextBlocks(*request);
+                (void) kvCacheManager->removeSequence(request->mRequestId, *request);
+            };
+            seedTurn(/*requestId=*/0, /*turnPromptLength=*/23);
+            if (testCase.seedSecondOffGridTurn)
+            {
+                seedTurn(/*requestId=*/1, /*turnPromptLength=*/55);
+            }
+
+            auto hot = createRequest(hotTokens, maxNewTokens, 2);
+            auto const hotSummary = kvCacheManager->analyzePrefixReuse(hot->getUniqueTokens(0), *hot);
+            ASSERT_TRUE(hotSummary.recurrentFreeOffGridBlocks.has_value());
+            EXPECT_EQ(*hotSummary.recurrentFreeOffGridBlocks, testCase.expectedHotOffGrid);
+            EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(*hot, recurrentWindow, hotSummary),
+                testCase.expectedHotNeed);
+
+            // Keep the aligned prompt disjoint from the hot tree. Its context
+            // physically uses expectedAlignedPhysical blocks and needs one more
+            // primary block for the first decode.
+            auto const alignedTokens = std::make_shared<std::vector<int32_t>>(testCase.alignedPromptLength);
+            std::iota(alignedTokens->begin(), alignedTokens->end(), 10000);
+            auto aligned = createRequest(alignedTokens, maxNewTokens, 3);
+            EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(*aligned, /*twoStepsLookAhead=*/false, recurrentWindow),
+                testCase.expectedAlignedOneStep);
+            EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(*aligned, recurrentWindow),
+                testCase.expectedAlignedOneStep + (testCase.alignedPromptLength % statesSnapshotInterval != 0 ? 1 : 0));
+
+            // Isolate capacity accounting from beneficial-to-skip. First admit and
+            // physically onboard only the aligned context.
+            auto capacityScheduler = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
+                /*hasKvCacheManager=*/true, /*twoStepsLookAhead=*/false,
+                /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+                /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE,
+                /*enablePrefixAwareScheduling=*/false);
+            RequestList initialRequests{aligned};
+            auto [initialScheduled, initialDisagg, initialPaused]
+                = capacityScheduler(initialRequests, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+            EXPECT_TRUE(initialDisagg.empty());
+            EXPECT_TRUE(initialPaused.empty());
+            ASSERT_EQ(initialScheduled.size(), 1);
+            EXPECT_EQ(initialScheduled.front()->mRequestId, aligned->mRequestId);
+            EXPECT_NO_THROW(kvCacheManager->addSequenceBatch(
+                {{{aligned->mRequestId, aligned->getPromptLen(), 1}}}, {std::ref(*aligned)}));
+            EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow),
+                recurrentPrimaryBlocks - testCase.expectedAlignedPhysical);
+            EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(*aligned, recurrentWindow), 1);
+
+            // On the next scheduler iteration the aligned request already has a
+            // sequence but is still in context. Its one-block reservation must
+            // persist. Pool8 is exactly one block short of fitting aligned+hot;
+            // pool9 admits both exactly. Returning zero for the existing aligned
+            // sequence would admit hot in both cases and lose the look-ahead.
+            RequestList activeRequests{aligned, hot};
+            auto [scheduled, disaggInit, paused]
+                = capacityScheduler(activeRequests, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+            EXPECT_TRUE(disaggInit.empty());
+            EXPECT_TRUE(paused.empty());
+            ASSERT_EQ(scheduled.size(), recurrentPrimaryBlocks == 8 ? 1U : 2U);
+            EXPECT_EQ(scheduled.front()->mRequestId, aligned->mRequestId);
+            if (recurrentPrimaryBlocks == 9)
+            {
+                EXPECT_EQ(scheduled.back()->mRequestId, hot->mRequestId);
+                EXPECT_NO_THROW(
+                    kvCacheManager->addSequenceBatch({{{hot->mRequestId, hot->getPromptLen(), 1}}}, {std::ref(*hot)}));
+            }
+            EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow),
+                recurrentPrimaryBlocks == 8 ? recurrentPrimaryBlocks - testCase.expectedAlignedPhysical : 1);
+            EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+
+            // Mirror production ordering: append the first sampled token before storing
+            // the context blocks. The prompt-end block then has a lookup node, forcing
+            // addToken() to allocate the reserved primary look-ahead block.
+            tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*aligned);
+            aligned->addNewToken(200000, 0);
+            kvCacheManager->storeContextBlocks(*aligned);
+            aligned->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+            RequestList generationRequests{aligned};
+            auto [generationScheduled, generationDisagg, generationPaused]
+                = capacityScheduler(generationRequests, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+            EXPECT_TRUE(generationDisagg.empty());
+            EXPECT_TRUE(generationPaused.empty());
+            ASSERT_EQ(generationScheduled.size(), 1);
+            EXPECT_EQ(generationScheduled.front()->mRequestId, aligned->mRequestId);
+            EXPECT_NO_THROW(kvCacheManager->addToken(aligned->mRequestId));
+            EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow),
+                recurrentPrimaryBlocks == 8 ? 8 - testCase.expectedAlignedPhysical - 1 : 0);
+
+            (void) kvCacheManager->removeSequence(aligned->mRequestId, *aligned);
+            if (recurrentPrimaryBlocks == 9)
+            {
+                (void) kvCacheManager->removeSequence(hot->mRequestId, *hot);
+            }
+            EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow),
+                recurrentPrimaryBlocks);
+            EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+        }
+    }
+}
+
+TEST_F(CapacitySchedulerTest, HybridMultiTurnFreeOffGridAdmissionUsesExactSmallPoolBudget)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    auto constexpr maxNumTokens = 32 * tokensPerBlock;
+    auto constexpr maxNumTokensPerSeq = 128;
+    auto constexpr maxNumRequests = 1;
+    auto constexpr maxNewTokens = 1;
+    SizeType32 constexpr recurrentWindow = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    auto const fullTokens = std::make_shared<std::vector<int32_t>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+    auto seedTurn =
+        [&](kv_cache_manager::BaseKVCacheManager& kvCacheManager, RequestIdType requestId, SizeType32 turnPromptLength)
+    {
+        auto turnTokens
+            = std::make_shared<std::vector<int32_t>>(fullTokens->begin(), fullTokens->begin() + turnPromptLength);
+        auto request = createRequest(turnTokens, maxNewTokens, requestId);
+        kvCacheManager.addSequenceBatch({{{request->mRequestId, request->getPromptLen(), 1}}}, {std::ref(*request)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        request->addNewToken(static_cast<TokenIdType>(100000 + requestId), 0);
+        kvCacheManager.storeContextBlocks(*request);
+        (void) kvCacheManager.removeSequence(request->mRequestId, *request);
+    };
+
+    auto const policies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    for (auto const policy : policies)
+    {
+        for (auto const recurrentPrimaryBlocks : {5, 6})
+        {
+            auto kvCacheManager = getHybridKvCacheManager(maxNumRequests, tokensPerBlock, maxNumTokens,
+                maxNumTokensPerSeq, statesSnapshotInterval, recurrentPrimaryBlocks);
+            seedTurn(*kvCacheManager, 0, /*turnPromptLength=*/23);
+            seedTurn(*kvCacheManager, 1, /*turnPromptLength=*/55);
+
+            auto request = createRequest(fullTokens, maxNewTokens, 2);
+            auto const summary = kvCacheManager->analyzePrefixReuse(request->getUniqueTokens(0), *request);
+            ASSERT_TRUE(summary.recurrentFreeOffGridBlocks.has_value());
+            ASSERT_TRUE(summary.recurrentSchedulingFreeOffGridBlocks.has_value());
+            EXPECT_EQ(*summary.recurrentFreeOffGridBlocks, 2);
+            EXPECT_EQ(*summary.recurrentSchedulingFreeOffGridBlocks, 2);
+            EXPECT_EQ(
+                kvCacheManager->getNeededBlocksOneStep(*request, /*twoStepsLookAhead=*/false, recurrentWindow, summary),
+                6);
+            EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(*request, recurrentWindow, summary), 6);
+
+            auto capacityScheduler = CapacityScheduler(maxNumRequests, policy, /*hasKvCacheManager=*/true);
+            RequestList activeRequests{request};
+            auto [scheduled, disaggInit, paused]
+                = capacityScheduler(activeRequests, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+            EXPECT_TRUE(disaggInit.empty());
+            EXPECT_TRUE(paused.empty());
+            EXPECT_EQ(scheduled.size(), recurrentPrimaryBlocks == 6 ? 1 : 0)
+                << "policy=" << static_cast<int>(policy) << ", recurrentPrimaryBlocks=" << recurrentPrimaryBlocks;
+
+            if (recurrentPrimaryBlocks == 6)
+            {
+                ASSERT_EQ(scheduled.size(), 1);
+                EXPECT_NO_THROW(kvCacheManager->addSequenceBatch(
+                    {{{request->mRequestId, request->getPromptLen(), 1}}}, {std::ref(*request)}));
+                EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 0);
+                EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+                (void) kvCacheManager->removeSequence(request->mRequestId, *request);
+                EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 6);
+                EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+            }
+        }
+    }
+}
+
+TEST_F(CapacitySchedulerTest, HybridMaxUtilPauseRetryReservesSchedulingFreeOffGridBlocks)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr pendingPromptLength = 87;
+    auto constexpr activePromptLength = 55;
+    auto constexpr maxNumTokens = 32 * tokensPerBlock;
+    auto constexpr maxNumTokensPerSeq = 128;
+    auto constexpr maxNumRequests = 2;
+    auto constexpr pendingMaxNewTokens = 1;
+    auto constexpr activeMaxNewTokens = 2;
+    SizeType32 constexpr recurrentWindow = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    auto const fullTokens = std::make_shared<std::vector<int32_t>>(pendingPromptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    for (auto const recurrentPrimaryBlocks : {5, 6})
+    {
+        auto kvCacheManager = getHybridKvCacheManager(maxNumRequests, tokensPerBlock, maxNumTokens, maxNumTokensPerSeq,
+            statesSnapshotInterval, recurrentPrimaryBlocks);
+
+        // Seed an off-grid save-last snapshot at 16, then extend the same
+        // prefix to 55 while keeping that second turn physically active.
+        auto seedTokens = std::make_shared<std::vector<int32_t>>(fullTokens->begin(), fullTokens->begin() + 23);
+        auto seed = createRequest(seedTokens, pendingMaxNewTokens, 0);
+        kvCacheManager->addSequenceBatch({{{seed->mRequestId, seed->getPromptLen(), 1}}}, {std::ref(*seed)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seed);
+        seed->addNewToken(100000, 0);
+        kvCacheManager->storeContextBlocks(*seed);
+        (void) kvCacheManager->removeSequence(seed->mRequestId, *seed);
+
+        auto activeTokens
+            = std::make_shared<std::vector<int32_t>>(fullTokens->begin(), fullTokens->begin() + activePromptLength);
+        auto active = createRequest(activeTokens, activeMaxNewTokens, 1);
+        kvCacheManager->addSequenceBatch({{{active->mRequestId, active->getPromptLen(), 1}}}, {std::ref(*active)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*active);
+        active->addNewToken(100001, 0);
+        kvCacheManager->storeContextBlocks(*active);
+        active->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+
+        auto pending = createRequest(fullTokens, pendingMaxNewTokens, 2);
+        auto capacityScheduler = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION,
+            /*hasKvCacheManager=*/true, /*twoStepsLookAhead=*/false,
+            /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+            /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE,
+            /*enablePrefixAwareScheduling=*/false);
+
+        // Put the pending request first. It initially cannot fit, so MaxUtil
+        // simulates pausing the active P55 request and retries P87 against the
+        // scheduling-free count. Cold need is four and the two historical
+        // off-grid matches make the exact retry need six, not five.
+        RequestList activeRequests{pending, active};
+        auto [scheduled, disaggInit, paused]
+            = capacityScheduler(activeRequests, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+        EXPECT_TRUE(disaggInit.empty());
+        ASSERT_EQ(paused.size(), 1);
+        EXPECT_EQ(paused.front()->mRequestId, active->mRequestId);
+
+        auto const retrySummary = kvCacheManager->analyzePrefixReuse(pending->getUniqueTokens(0), *pending);
+        ASSERT_TRUE(retrySummary.recurrentFreeOffGridBlocks.has_value());
+        ASSERT_TRUE(retrySummary.recurrentSchedulingFreeOffGridBlocks.has_value());
+        EXPECT_EQ(*retrySummary.recurrentFreeOffGridBlocks, 0);
+        EXPECT_EQ(*retrySummary.recurrentSchedulingFreeOffGridBlocks, 2);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(
+                      *pending, /*twoStepsLookAhead=*/false, recurrentWindow, retrySummary),
+            6);
+
+        ASSERT_EQ(scheduled.size(), recurrentPrimaryBlocks == 6 ? 1U : 0U);
+        if (recurrentPrimaryBlocks == 6)
+        {
+            ASSERT_EQ(scheduled.front()->mRequestId, pending->mRequestId);
+        }
+
+        // Apply the simulated pause physically, then prove the exact-six case
+        // can onboard without exhausting or corrupting the recurrent queue.
+        (void) kvCacheManager->removeSequence(active->mRequestId, *active);
+        EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow),
+            recurrentPrimaryBlocks);
+        if (recurrentPrimaryBlocks == 6)
+        {
+            EXPECT_NO_THROW(kvCacheManager->addSequenceBatch(
+                {{{pending->mRequestId, pending->getPromptLen(), 1}}}, {std::ref(*pending)}));
+            EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 0);
+            (void) kvCacheManager->removeSequence(pending->mRequestId, *pending);
+        }
+        EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
     }
 }
 

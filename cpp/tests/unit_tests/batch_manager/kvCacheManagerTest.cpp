@@ -7203,6 +7203,922 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
     EXPECT_EQ(remaining, (promptLength / tokensPerBlock) + (maxNewTokens / tokensPerBlock));
 }
 
+namespace
+{
+//! Hybrid (GDN-style) manager for reuse-credit tests: one linear-attention layer
+//! (kRecurrentStates window) + one full-attention layer. The snapshot interval is
+//! passed in COARSER than the block size so the recurrent snapshot floor on the
+//! token-budget credit is observable (attention match > snapshot-floored match).
+std::shared_ptr<KVCacheManager> createHybridKvCacheManagerForReuseAccounting(SizeType32 tokensPerBlock,
+    SizeType32 statesSnapshotInterval, bool saveLastSnapshot, SizeType32 maxAttentionWindow,
+    SizeType32 numPrimaryBlocks, SizeType32 maxOffGridSnapshotsPerChain = 0,
+    std::optional<SizeType32> numPlaceholderBlocks = std::nullopt)
+{
+    auto constexpr nbKvHeads = 1;
+    auto constexpr sizePerHead = 1;
+    auto constexpr maxNumRequests = 8;
+    auto const kvDtype = tensorrt_llm::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    SizeType32 constexpr recurrentStatesWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0},
+        .cacheType = recurrentStatesWindow,
+        .allRecurrentStatesBytes = 64,
+        .statesSnapshotInterval = statesSnapshotInterval,
+        .saveLastSnapshot = saveLastSnapshot,
+        .maxOffGridSnapshotsPerChain = maxOffGridSnapshotsPerChain,
+        .numPlaceholderBlocks = numPlaceholderBlocks,
+    };
+    auto const blocksPerWindow = BlocksPerWindow{
+        {recurrentStatesWindow, {numPrimaryBlocks, 0}},
+        {maxAttentionWindow, {numPrimaryBlocks, 0}},
+    };
+    auto const poolConfigurations = std::vector<PoolConfiguration>{
+        {recurrentStatesWindow, sizePerHead, kvDtype},
+        {maxAttentionWindow, sizePerHead, kvDtype},
+    };
+    auto kvCacheManager = std::make_shared<KVCacheManager>(std::vector<SizeType32>{0, nbKvHeads}, sizePerHead,
+        tokensPerBlock, blocksPerWindow, maxNumRequests, 1,
+        std::vector<SizeType32>{recurrentStatesWindow, maxAttentionWindow}, kvDtype,
+        /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/true, CacheType::kSELF,
+        std::nullopt, nullptr, /*enablePartialReuse=*/false,
+        /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128,
+        /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
+        /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata, poolConfigurations);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+    return kvCacheManager;
+}
+
+//! Seed the reuse tree with one completed request, then return a fresh identical-prefix probe request.
+LlmRequest seedHybridReuseTree(
+    KVCacheManager& kvCacheManager, std::shared_ptr<std::vector<TokenIdType>> const& tokens, SizeType32 maxNewTokens)
+{
+    auto req0 = LlmRequest{0, maxNewTokens, tokens, tle::SamplingConfig{1}, true};
+    kvCacheManager.addSequenceBatch({{{req0.mRequestId, req0.getPromptLen(), 1}}}, {std::ref(req0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
+    // Production-faithful: _update_requests appends the first sampled token BEFORE
+    // update_resources() calls storeContextBlocks(), so for a block-aligned prompt the
+    // seed stores promptLen/tokensPerBlock full keys (one more than promptLen-1 would).
+    req0.addNewToken(424242, 0);
+    kvCacheManager.storeContextBlocks(req0);
+    kvCacheManager.removeSequence(req0.mRequestId, req0);
+    return LlmRequest{1, maxNewTokens, tokens, tle::SamplingConfig{1}, true};
+}
+} // namespace
+
+// Exact duplicate of a completed request with saveLastSnapshot: the recurrent tree holds a
+// materialized snapshot on the last full prompt block, so the snapshot floor coincides with
+// the attention-window match and the twin is credited the full stored prefix.
+TEST(KVCacheManagerReuseAccountingTest, HybridExactTwinCreditsUpToSaveLastSnapshot)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr promptLength = 87; // 5 full blocks + 7; last full block ends at 80
+    auto constexpr maxNewTokens = 16;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock,
+        /*statesSnapshotInterval=*/2 * tokensPerBlock, /*saveLastSnapshot=*/true,
+        /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64);
+
+    auto const tokens = std::make_shared<std::vector<TokenIdType>>();
+    for (SizeType32 i = 0; i < promptLength; ++i)
+    {
+        tokens->push_back(i);
+    }
+    auto req1 = seedHybridReuseTree(*kvCacheManager, tokens, maxNewTokens);
+
+    auto const summary = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    EXPECT_EQ(summary.reusableBlocksAll, (promptLength - 1) / tokensPerBlock); // 5 attention blocks
+    ASSERT_TRUE(summary.recurrentReusableTokens.has_value());
+    EXPECT_EQ(*summary.recurrentReusableTokens, 80); // saveLast snapshot on the last full block
+
+    auto const attentionWindow = 512;
+    (void) kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, attentionWindow);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 80);
+
+    (void) kvCacheManager->getRemainingBlocksToCompletion(req1, attentionWindow);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 80);
+
+    // Safety property: the pre-admission credit must not exceed the authoritative
+    // prepopulated length that admission computes (min across windows).
+    kvCacheManager->addSequenceBatch({{{req1.mRequestId, req1.getPromptLen(), 1}}}, {std::ref(req1)});
+    EXPECT_EQ(req1.getPrepopulatedPromptLen(), 80);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0); // cleared once the authoritative value is set
+}
+
+// Without saveLastSnapshot the recurrent tree only materializes interval snapshots, so the
+// token-budget credit must floor to the snapshot grid even though the attention window
+// matches further. This is the hybrid overestimate the recurrent floor exists to prevent.
+TEST(KVCacheManagerReuseAccountingTest, HybridCreditFloorsToSnapshotGridWithoutSaveLast)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock; // snapshots at 32, 64, ...
+    auto constexpr promptLength = 87;                           // attention match 80 > snapshot floor 64
+    auto constexpr maxNewTokens = 16;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/false, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64);
+
+    auto const tokens = std::make_shared<std::vector<TokenIdType>>();
+    for (SizeType32 i = 0; i < promptLength; ++i)
+    {
+        tokens->push_back(i);
+    }
+    auto req1 = seedHybridReuseTree(*kvCacheManager, tokens, maxNewTokens);
+
+    auto const summary = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    EXPECT_EQ(summary.reusableBlocksAll, 5);         // attention window matches all 5 stored blocks (80 tokens)
+    ASSERT_TRUE(summary.recurrentReusableTokens.has_value());
+    EXPECT_EQ(*summary.recurrentReusableTokens, 64); // last materialized interval snapshot
+
+    auto const attentionWindow = 512;
+    (void) kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, attentionWindow);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 64);
+
+    (void) kvCacheManager->getRemainingBlocksToCompletion(req1, attentionWindow);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 64);
+
+    kvCacheManager->addSequenceBatch({{{req1.mRequestId, req1.getPromptLen(), 1}}}, {std::ref(req1)});
+    EXPECT_EQ(req1.getPrepopulatedPromptLen(), 64);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+}
+
+// Block-aligned prompt: a duplicate can match at most promptLen - 1 tokens, so the block
+// ending exactly at promptLen (always materialized via the end-of-sequence rule) is
+// unreachable for reuse. saveLastSnapshot therefore materializes the REACHABLE terminal
+// block one block earlier (ends at 80 here, off the 32-token interval grid), and a
+// duplicate reuses through it instead of falling all the way back to the interval
+// snapshot at 64 — the aligned-prompt reuse-floor trap. The estimate walk still probes
+// only admission's promptLen-1 key set so estimate == admission exactly.
+TEST(KVCacheManagerReuseAccountingTest, HybridAlignedPromptCreditMatchesAdmission)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr promptLength = 96; // 6 full blocks, block-aligned
+    auto constexpr maxNewTokens = 16;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock,
+        /*statesSnapshotInterval=*/2 * tokensPerBlock, /*saveLastSnapshot=*/true,
+        /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64);
+
+    auto const tokens = std::make_shared<std::vector<TokenIdType>>();
+    for (SizeType32 i = 0; i < promptLength; ++i)
+    {
+        tokens->push_back(i);
+    }
+    auto req1 = seedHybridReuseTree(*kvCacheManager, tokens, maxNewTokens);
+
+    auto const summary = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    EXPECT_EQ(summary.reusableBlocksAll, 6); // attention matches all 6 stored keys
+    ASSERT_TRUE(summary.recurrentReusableTokens.has_value());
+    // Admission probes 5 keys (95 tokens); block 4 (ends at 80) holds the reachable
+    // saveLast snapshot, so the committed recurrent prefix reaches 80.
+    EXPECT_EQ(*summary.recurrentReusableTokens, 80);
+
+    auto const attentionWindow = 512;
+    (void) kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, attentionWindow);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 80);
+
+    (void) kvCacheManager->getRemainingBlocksToCompletion(req1, attentionWindow);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 80);
+
+    kvCacheManager->addSequenceBatch({{{req1.mRequestId, req1.getPromptLen(), 1}}}, {std::ref(req1)});
+    EXPECT_EQ(req1.getPrepopulatedPromptLen(), 80);
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+}
+
+// Scaled-down replica of the production crash (prompt 12255 resumed at 7840 with a 4096 chunk):
+// a request sharing a prefix with a cached request resumes from the seed's saveLast snapshot
+// (80 here), which is OFF the interval grid (interval 32, 80 % 32 == 16). The scheduler-assigned
+// first chunk (32, sized from position 0) must be re-clipped by admission to end on the next
+// expected snapshot point (96), i.e. chunk 16 — not shifted to end at 112 where only a
+// placeholder state block exists. (The seed prompt of 87 is NOT block-aligned, so its saveLast
+// snapshot at 80 is reachable by prefix matches; contrast with the aligned test below.)
+TEST(KVCacheManagerReuseAccountingTest, HybridOffGridResumeClipsFirstChunkToSnapshotPoint)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr seedPromptLength = 87; // saveLast snapshot at 80, off the 32-token interval grid
+    auto constexpr resumePromptLength = 200;
+    auto constexpr maxNewTokens = 16;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock,
+        /*statesSnapshotInterval=*/2 * tokensPerBlock, /*saveLastSnapshot=*/true,
+        /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64);
+
+    auto const seedTokens = std::make_shared<std::vector<TokenIdType>>();
+    for (SizeType32 i = 0; i < seedPromptLength; ++i)
+    {
+        seedTokens->push_back(i);
+    }
+    (void) seedHybridReuseTree(*kvCacheManager, seedTokens, maxNewTokens);
+
+    // Shares the seed's first 80 tokens (5 full blocks), diverges afterwards.
+    auto const resumeTokens = std::make_shared<std::vector<TokenIdType>>();
+    for (SizeType32 i = 0; i < resumePromptLength; ++i)
+    {
+        resumeTokens->push_back(i < 80 ? i : 5000 + i);
+    }
+    auto req1 = LlmRequest{2, maxNewTokens, resumeTokens, tle::SamplingConfig{1}, true};
+    // What the FORCE_CHUNK scheduler assigns before reuse is discovered (position 0):
+    req1.setContextChunkSize(2 * tokensPerBlock);
+    req1.setExpectedSnapshotPoints({32, 64, 96, 128, 160, 192});
+
+    kvCacheManager->addSequenceBatch({{{req1.mRequestId, req1.getPromptLen(), 1}}}, {std::ref(req1)});
+
+    EXPECT_EQ(req1.getPrepopulatedPromptLen(), 80);
+    EXPECT_EQ(req1.getContextCurrentPosition(), 80);
+    EXPECT_EQ(req1.getContextChunkSize(), 16); // clipped to end at snapshot point 96, not 112
+}
+
+TEST(KVCacheManagerReuseAccountingTest, RecurrentBlockNeedAccountsForPromptEnd)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata const withSaveLast{
+        .linearLayerIndices = {0},
+        .cacheType = recurrentWindow,
+        .allRecurrentStatesBytes = 64,
+        .statesSnapshotInterval = statesSnapshotInterval,
+        .saveLastSnapshot = true,
+    };
+    LinearAttentionMetadata const withoutSaveLast{
+        .linearLayerIndices = {0},
+        .cacheType = recurrentWindow,
+        .allRecurrentStatesBytes = 64,
+        .statesSnapshotInterval = statesSnapshotInterval,
+        .saveLastSnapshot = false,
+    };
+
+    struct TestCase
+    {
+        SizeType32 promptLength;
+        bool saveLastSnapshot;
+        bool enableReuse;
+        SizeType32 expectedBlocks;
+    };
+
+    std::vector<TestCase> const testCases{
+        // Shorter than one block: only the prompt-end live state.
+        {7, true, true, 1},
+        // Non-aligned: reachable save-last plus prompt-end live state.
+        {17, true, true, 2},
+        // Block- and interval-aligned: interval, save-last, and aligned look-ahead.
+        {32, true, true, 3},
+        // Block-aligned but not interval-aligned: interval plus prompt-end/live look-ahead.
+        {48, true, true, 2},
+        // A later interval-aligned boundary retains the same aligned look-ahead rule.
+        {64, true, true, 4},
+        // Production-shaped non-aligned prompt: intervals 32/64, save-last 80, end 96.
+        {87, true, true, 4},
+        // Without save-last, only interval snapshots plus prompt-end live state remain.
+        {87, false, true, 3},
+        // Reuse-off remains exactly one live recurrent-state block.
+        {87, true, false, 1},
+        {87, false, false, 1},
+        // Aligned prompts also stay at one live block when reuse is disabled.
+        {48, true, false, 1},
+    };
+
+    for (auto const& testCase : testCases)
+    {
+        auto const& metadata = testCase.saveLastSnapshot ? withSaveLast : withoutSaveLast;
+        EXPECT_EQ(metadata.calcNumBlocksNeededForReq(testCase.promptLength, tokensPerBlock, testCase.enableReuse),
+            testCase.expectedBlocks)
+            << "promptLength=" << testCase.promptLength << ", saveLastSnapshot=" << testCase.saveLastSnapshot
+            << ", enableReuse=" << testCase.enableReuse;
+    }
+}
+
+TEST(KVCacheManagerReuseAccountingTest, HybridAlignedLookAheadIsReservedOnlyForCompletion)
+{
+    struct TestCase
+    {
+        SizeType32 tokensPerBlock;
+        SizeType32 statesSnapshotInterval;
+        SizeType32 promptLength;
+        SizeType32 expectedOneStepBlocks;
+        SizeType32 expectedCompletionBlocks;
+    };
+
+    std::vector<TestCase> const testCases{
+        // Short aligned prompt: context needs one live block; first decode needs another.
+        {16, 32, 16, 1, 2},
+        // Interval-aligned prompt already has a conservative interval/end overlap slot.
+        {16, 32, 32, 3, 3},
+        // Off-interval aligned boundaries need a completion-only look-ahead reservation.
+        {16, 32, 48, 2, 3},
+        {16, 32, 64, 4, 4},
+        {16, 32, 80, 3, 4},
+        // Production-shaped block/interval pair and first off-interval aligned prompt.
+        {32, 4096, 4128, 2, 3},
+        // Aligned prompt whose reachable saveLast block is OFF the interval grid
+        // (reachable 4128, 4128 % 4096 != 0): the look-ahead is needed here too, not
+        // only when the reachable block coincides with the grid.
+        {32, 4096, 4160, 3, 4},
+        // Non-aligned prompt: the prompt-end live block rolls through generation via
+        // placeholder swap, so no look-ahead is reserved for completion.
+        {16, 32, 24, 2, 2},
+    };
+
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    for (auto const& testCase : testCases)
+    {
+        auto const maxAttentionWindow = std::max<SizeType32>(512, testCase.promptLength + testCase.tokensPerBlock);
+        auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(testCase.tokensPerBlock,
+            testCase.statesSnapshotInterval, /*saveLastSnapshot=*/true, maxAttentionWindow,
+            /*numPrimaryBlocks=*/512);
+        auto const tokens
+            = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(testCase.promptLength), 7);
+        auto request
+            = LlmRequest{0, /*maxNewTokens=*/2, tokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow),
+            testCase.expectedOneStepBlocks)
+            << "tokensPerBlock=" << testCase.tokensPerBlock
+            << ", statesSnapshotInterval=" << testCase.statesSnapshotInterval
+            << ", promptLength=" << testCase.promptLength;
+        EXPECT_EQ(
+            kvCacheManager->getRemainingBlocksToCompletion(request, recurrentWindow), testCase.expectedCompletionBlocks)
+            << "tokensPerBlock=" << testCase.tokensPerBlock
+            << ", statesSnapshotInterval=" << testCase.statesSnapshotInterval
+            << ", promptLength=" << testCase.promptLength;
+    }
+}
+
+// The recurrent pseudo-window's encoded size is a negative sentinel; the estimator must
+// compute the recurrent block need from the full prompt, not from min(prompt, windowSize)
+// which underflows to a huge negative length (and a negative block count that disables
+// the recurrent budget check entirely).
+TEST(KVCacheManagerReuseAccountingTest, HybridRecurrentWindowBlockNeedIsPositive)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr promptLength = 87; // interval snapshots at 32, 64 + reachable saveLast at 80
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock,
+        /*statesSnapshotInterval=*/2 * tokensPerBlock, /*saveLastSnapshot=*/true,
+        /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64);
+
+    auto const tokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(promptLength), 7);
+    auto req = LlmRequest{0, 16, tokens, tle::SamplingConfig{1}, true};
+
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto const needed = kvCacheManager->getNeededBlocksOneStep(req, /*twoStepsLookAhead=*/false, recurrentWindow);
+    // 2 interval snapshots (32, 64) + the reachable saveLast block (80, off the interval grid)
+    // + the block containing the prompt-end live state (96).
+    EXPECT_EQ(needed, 4);
+}
+
+namespace
+{
+std::shared_ptr<KVCacheManager> createVariableAttentionHybridKvCacheManagerForReuseAccounting(
+    SizeType32 tokensPerBlock, SizeType32 statesSnapshotInterval, SizeType32 numPrimaryBlocks)
+{
+    auto constexpr nbKvHeads = 1;
+    auto constexpr sizePerHead = 1;
+    auto constexpr maxNumRequests = 8;
+    auto constexpr minAttentionWindow = 256;
+    auto constexpr maxAttentionWindow = 512;
+    auto const kvDtype = tensorrt_llm::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0},
+        .cacheType = recurrentWindow,
+        .allRecurrentStatesBytes = 64,
+        .statesSnapshotInterval = statesSnapshotInterval,
+        .saveLastSnapshot = true,
+    };
+    auto const blocksPerWindow = BlocksPerWindow{
+        {recurrentWindow, {numPrimaryBlocks, 0}},
+        {minAttentionWindow, {numPrimaryBlocks, 0}},
+        {maxAttentionWindow, {numPrimaryBlocks, 0}},
+    };
+    auto const poolConfigurations = std::vector<PoolConfiguration>{
+        {recurrentWindow, sizePerHead, kvDtype},
+        {minAttentionWindow, sizePerHead, kvDtype},
+        {maxAttentionWindow, sizePerHead, kvDtype},
+    };
+    auto kvCacheManager = std::make_shared<KVCacheManager>(std::vector<SizeType32>{0, nbKvHeads, nbKvHeads},
+        sizePerHead, tokensPerBlock, blocksPerWindow, maxNumRequests, 1,
+        std::vector<SizeType32>{recurrentWindow, maxAttentionWindow, minAttentionWindow}, kvDtype,
+        /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/true, CacheType::kSELF,
+        std::nullopt, nullptr, /*enablePartialReuse=*/false,
+        /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false,
+        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
+        /*indexerKCacheUseFp4=*/false,
+        /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata, poolConfigurations);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+    return kvCacheManager;
+}
+
+void seedHybridAgentTurn(KVCacheManager& kvCacheManager, std::shared_ptr<std::vector<TokenIdType>> const& fullTokens,
+    LlmRequest::RequestIdType requestId, SizeType32 promptLength)
+{
+    auto turnTokens
+        = std::make_shared<std::vector<TokenIdType>>(fullTokens->begin(), fullTokens->begin() + promptLength);
+    auto request = LlmRequest{requestId, 1, turnTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    kvCacheManager.addSequenceBatch({{{request.mRequestId, request.getPromptLen(), 1}}}, {std::ref(request)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(request);
+    // Production appends the first sampled token before storeContextBlocks.
+    request.addNewToken(static_cast<TokenIdType>(100000 + requestId), 0);
+    kvCacheManager.storeContextBlocks(request);
+    (void) kvCacheManager.removeSequence(request.mRequestId, request);
+}
+} // namespace
+
+TEST(KVCacheManagerReuseAccountingTest, HybridMultiTurnFreeOffGridBlocksAreFullyReserved)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64);
+
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    // Turn 1 stores an off-grid save-last snapshot at 16. Turn 2 reuses it and
+    // extends the same trie path, retaining 16 and adding snapshots at 32 and 48.
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 0, /*promptLength=*/23);
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 1, /*promptLength=*/55);
+
+    auto request = LlmRequest{2, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto const summary = kvCacheManager->analyzePrefixReuse(request.getUniqueTokens(0), request);
+    ASSERT_TRUE(summary.recurrentReusableTokens.has_value());
+    EXPECT_EQ(*summary.recurrentReusableTokens, 48);
+    // The current cold layout is 32/64 interval, 80 save-last, and 96 prompt-end.
+    // Cached free snapshots at 16 and 48 are both off-grid and both get claimed.
+    ASSERT_TRUE(summary.recurrentFreeOffGridBlocks.has_value());
+    ASSERT_TRUE(summary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*summary.recurrentFreeOffGridBlocks, 2);
+    EXPECT_EQ(*summary.recurrentSchedulingFreeOffGridBlocks, 2);
+
+    EXPECT_EQ(
+        kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow, summary), 6);
+    EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(request, recurrentWindow, summary), 6);
+
+    // No caller cache and an explicitly empty cache must both trigger a fresh
+    // recurrent tree walk. A present zero remains distinguishable from either.
+    EXPECT_EQ(
+        kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow, std::nullopt), 6);
+    EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(request, recurrentWindow, std::nullopt), 6);
+    // An explicitly empty caller cache is not authoritative for a hybrid manager;
+    // both paths must perform a fresh recurrent tree walk and retain the surcharge.
+    auto const emptySummary = PrefixReuseSummary{};
+    EXPECT_EQ(
+        kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow, emptySummary), 6);
+    EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(request, recurrentWindow, emptySummary), 6);
+
+    kvCacheManager->addSequenceBatch({{{request.mRequestId, request.getPromptLen(), 1}}}, {std::ref(request)});
+    EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 58);
+
+    // The same historical blocks no longer consume the free queue while held by
+    // an active/shared sequence, so they must not be charged a second time.
+    auto allocatedProbe = LlmRequest{3, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto const allocatedSummary = kvCacheManager->analyzePrefixReuse(allocatedProbe.getUniqueTokens(0), allocatedProbe);
+    ASSERT_TRUE(allocatedSummary.recurrentFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*allocatedSummary.recurrentFreeOffGridBlocks, 0);
+
+    // Max-utilization uses a separate scheduling reference/free-count view.
+    // Before a simulated pause, both views agree that the prefix is allocated.
+    kvCacheManager->startScheduling();
+    auto const scheduledSummary = kvCacheManager->analyzePrefixReuse(allocatedProbe.getUniqueTokens(0), allocatedProbe);
+    ASSERT_TRUE(scheduledSummary.recurrentFreeOffGridBlocks.has_value());
+    ASSERT_TRUE(scheduledSummary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*scheduledSummary.recurrentFreeOffGridBlocks, 0);
+    EXPECT_EQ(*scheduledSummary.recurrentSchedulingFreeOffGridBlocks, 0);
+
+    // A simulated pause releases only scheduling refs. The physical GNE view
+    // remains allocated, while MaxUtil must reserve both newly scheduling-free
+    // off-grid blocks before it retries this pending request.
+    kvCacheManager->schedulingRemoveSequence(request.mRequestId);
+    auto const pausedSummary = kvCacheManager->analyzePrefixReuse(allocatedProbe.getUniqueTokens(0), allocatedProbe);
+    ASSERT_TRUE(pausedSummary.recurrentFreeOffGridBlocks.has_value());
+    ASSERT_TRUE(pausedSummary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*pausedSummary.recurrentFreeOffGridBlocks, 0);
+    EXPECT_EQ(*pausedSummary.recurrentSchedulingFreeOffGridBlocks, 2);
+    EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(
+                  allocatedProbe, /*twoStepsLookAhead=*/false, recurrentWindow, pausedSummary),
+        6);
+    EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(allocatedProbe, recurrentWindow, pausedSummary), 4);
+
+    (void) kvCacheManager->removeSequence(request.mRequestId, request);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+
+    // startScheduling initializes scheduling refs only for physically allocated
+    // blocks. A subsequent physical removal does not clear those scheduling
+    // refs, so a free-cached block can retain a stale positive scheduling ref.
+    // The scheduling surcharge must still count every physically free off-grid
+    // match; checking only !hasSchedulingRefs would incorrectly report zero.
+    auto staleRefRequest = LlmRequest{4, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    kvCacheManager->addSequenceBatch(
+        {{{staleRefRequest.mRequestId, staleRefRequest.getPromptLen(), 1}}}, {std::ref(staleRefRequest)});
+    kvCacheManager->startScheduling();
+    (void) kvCacheManager->removeSequence(staleRefRequest.mRequestId, staleRefRequest);
+
+    auto staleRefProbe = LlmRequest{5, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto const staleRefSummary = kvCacheManager->analyzePrefixReuse(staleRefProbe.getUniqueTokens(0), staleRefProbe);
+    ASSERT_TRUE(staleRefSummary.recurrentFreeOffGridBlocks.has_value());
+    ASSERT_TRUE(staleRefSummary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*staleRefSummary.recurrentFreeOffGridBlocks, 2);
+    EXPECT_EQ(*staleRefSummary.recurrentSchedulingFreeOffGridBlocks, 2);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+}
+
+TEST(KVCacheManagerReuseAccountingTest, HybridVariableAttentionFallbackAnalyzesOnlyRecurrentWindow)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createVariableAttentionHybridKvCacheManagerForReuseAccounting(
+        tokensPerBlock, statesSnapshotInterval, /*numPrimaryBlocks=*/64);
+    ASSERT_TRUE(kvCacheManager->getBlockManager().isVariableAttentionWindow());
+
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 0, /*promptLength=*/23);
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 1, /*promptLength=*/55);
+
+    auto request = LlmRequest{2, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto const emptySummary = PrefixReuseSummary{};
+    EXPECT_EQ(
+        kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow, std::nullopt), 6);
+    EXPECT_EQ(
+        kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow, emptySummary), 6);
+    EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(request, recurrentWindow, std::nullopt), 6);
+    EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(request, recurrentWindow, emptySummary), 6);
+}
+
+TEST(KVCacheManagerReuseAccountingTest, HybridColdAndOnGridReuseHaveNoOffGridSurcharge)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64);
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    auto cold = LlmRequest{0, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto const coldSummary = kvCacheManager->analyzePrefixReuse(cold.getUniqueTokens(0), cold);
+    ASSERT_TRUE(coldSummary.recurrentFreeOffGridBlocks.has_value());
+    ASSERT_TRUE(coldSummary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*coldSummary.recurrentFreeOffGridBlocks, 0);
+    EXPECT_EQ(*coldSummary.recurrentSchedulingFreeOffGridBlocks, 0);
+
+    // Prompt 33 stores only the on-grid interval snapshot at 32.
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 1, /*promptLength=*/33);
+    auto onGrid = LlmRequest{2, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto const summary = kvCacheManager->analyzePrefixReuse(onGrid.getUniqueTokens(0), onGrid);
+    ASSERT_TRUE(summary.recurrentReusableTokens.has_value());
+    EXPECT_EQ(*summary.recurrentReusableTokens, 32);
+    ASSERT_TRUE(summary.recurrentFreeOffGridBlocks.has_value());
+    ASSERT_TRUE(summary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*summary.recurrentFreeOffGridBlocks, 0);
+    EXPECT_EQ(*summary.recurrentSchedulingFreeOffGridBlocks, 0);
+}
+
+namespace
+{
+//! analyzePrefixReuse for a probe request made of the first promptLength tokens of fullTokens.
+PrefixReuseSummary probeHybridPrefix(KVCacheManager& kvCacheManager,
+    std::shared_ptr<std::vector<TokenIdType>> const& fullTokens, LlmRequest::RequestIdType requestId,
+    SizeType32 promptLength)
+{
+    auto probeTokens
+        = std::make_shared<std::vector<TokenIdType>>(fullTokens->begin(), fullTokens->begin() + promptLength);
+    auto probe = LlmRequest{requestId, 1, probeTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    return kvCacheManager.analyzePrefixReuse(probe.getUniqueTokens(0), probe);
+}
+
+//! seedHybridAgentTurn that also returns the beam-0 recurrent block ids the turn held before its release.
+std::vector<SizeType32> seedHybridAgentTurnReturningBlockIds(KVCacheManager& kvCacheManager,
+    std::shared_ptr<std::vector<TokenIdType>> const& fullTokens, LlmRequest::RequestIdType requestId,
+    SizeType32 promptLength)
+{
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto turnTokens
+        = std::make_shared<std::vector<TokenIdType>>(fullTokens->begin(), fullTokens->begin() + promptLength);
+    auto request = LlmRequest{requestId, 1, turnTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    kvCacheManager.addSequenceBatch({{{request.mRequestId, request.getPromptLen(), 1}}}, {std::ref(request)});
+    auto const blockIds = kvCacheManager.getSequence(request.mRequestId).getCacheBlockIds(recurrentWindow).at(0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(request);
+    request.addNewToken(static_cast<TokenIdType>(100000 + requestId), 0);
+    kvCacheManager.storeContextBlocks(request);
+    (void) kvCacheManager.removeSequence(request.mRequestId, request);
+    return blockIds;
+}
+
+//! Tokens of fullTokens with every token from position `from` on shifted by `delta` (a sibling that shares
+//! only the first `from` tokens).
+std::shared_ptr<std::vector<TokenIdType>> divergeTokensFrom(
+    std::vector<TokenIdType> const& fullTokens, SizeType32 from, TokenIdType delta)
+{
+    auto tokens = std::make_shared<std::vector<TokenIdType>>(fullTokens);
+    for (std::size_t i = static_cast<std::size_t>(from); i < tokens->size(); ++i)
+    {
+        (*tokens)[i] += delta;
+    }
+    return tokens;
+}
+} // namespace
+
+// Knob on (K=1): when turn 2 of a conversation finishes, its own save-last snapshot (48) stays and the
+// turn-1 save-last (16) -- an off-grid snapshot with exactly one continuation -- is demoted to a
+// placeholder: the prefix stays traversable, the recurrent block becomes the evict-first free block.
+TEST(KVCacheManagerReuseAccountingTest, HybridDemoteOlderSaveLastOnRelease)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64,
+        /*maxOffGridSnapshotsPerChain=*/1);
+    auto const& recurrentManager = kvCacheManager->getBlockManager().getWindowBlockManager(recurrentWindow);
+
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    auto const turn1BlockIds
+        = seedHybridAgentTurnReturningBlockIds(*kvCacheManager, fullTokens, 0, /*promptLength=*/23);
+    ASSERT_FALSE(turn1BlockIds.empty());
+    // Turn 1 alone: its save-last at 16 is the newest snapshot of the chain and stays materialized.
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 0);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 10, /*promptLength=*/23).recurrentReusableTokens, 16);
+
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 1, /*promptLength=*/55);
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 1);
+    EXPECT_EQ(recurrentManager.getNumDemotionsRefusedNoPlaceholder(), 0);
+
+    // A duplicate of turn 1 no longer floors on 16: the placeholder there does not commit a prefix.
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 11, /*promptLength=*/23).recurrentReusableTokens, 0);
+
+    // Turn 3 traverses the placeholder to the retained snapshots 32 (grid) and 48 (turn-2 save-last).
+    // Only 48 is a free off-grid snapshot now, so the admission surcharge drops 2 -> 1 and both
+    // reservations drop 6 -> 5 versus knob-off HybridMultiTurnFreeOffGridBlocksAreFullyReserved.
+    auto request = LlmRequest{2, 1, fullTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto const summary = kvCacheManager->analyzePrefixReuse(request.getUniqueTokens(0), request);
+    ASSERT_TRUE(summary.recurrentReusableTokens.has_value());
+    EXPECT_EQ(*summary.recurrentReusableTokens, 48);
+    ASSERT_TRUE(summary.recurrentFreeOffGridBlocks.has_value());
+    ASSERT_TRUE(summary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*summary.recurrentFreeOffGridBlocks, 1);
+    EXPECT_EQ(*summary.recurrentSchedulingFreeOffGridBlocks, 1);
+    EXPECT_EQ(
+        kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow, summary), 5);
+    EXPECT_EQ(kvCacheManager->getRemainingBlocksToCompletion(request, recurrentWindow, summary), 5);
+
+    // Demotion frees exactly what a normal release frees; the placeholder pool is exchanged 1:1.
+    EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 64);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+
+    // The demoted block is the evict-first free block: a cold request is handed it before anything else,
+    // whereas a normally released (attached) block would have gone to the back of the free queue.
+    auto const coldTokens = std::make_shared<std::vector<TokenIdType>>(23);
+    std::iota(coldTokens->begin(), coldTokens->end(), 5000);
+    auto cold = LlmRequest{3, 1, coldTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    kvCacheManager->addSequenceBatch({{{cold.mRequestId, cold.getPromptLen(), 1}}}, {std::ref(cold)});
+    auto const coldBlockIds = kvCacheManager->getSequence(cold.mRequestId).getCacheBlockIds(recurrentWindow).at(0);
+    ASSERT_FALSE(coldBlockIds.empty());
+    EXPECT_EQ(coldBlockIds.front(), turn1BlockIds.front());
+    (void) kvCacheManager->removeSequence(cold.mRequestId, cold);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+}
+
+// K=2 keeps one historical fallback below the newest save-last: after turn 2 the turn-1 snapshot (16)
+// survives; only when turn 3 (save-last 80) releases is 16 demoted while 48 stays as the fallback.
+TEST(KVCacheManagerReuseAccountingTest, HybridDemoteKeepsNewestUnderFallbackK2)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64,
+        /*maxOffGridSnapshotsPerChain=*/2);
+    auto const& recurrentManager = kvCacheManager->getBlockManager().getWindowBlockManager(recurrentWindow);
+
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 0, /*promptLength=*/23);
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 1, /*promptLength=*/55);
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 0);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 10, /*promptLength=*/23).recurrentReusableTokens, 16);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 11, /*promptLength=*/55).recurrentReusableTokens, 48);
+
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 2, /*promptLength=*/87);
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 1);
+    EXPECT_EQ(recurrentManager.getNumDemotionsRefusedNoPlaceholder(), 0);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 12, /*promptLength=*/23).recurrentReusableTokens, 0);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 13, /*promptLength=*/55).recurrentReusableTokens, 48);
+    auto const duplicate = probeHybridPrefix(*kvCacheManager, fullTokens, 14, /*promptLength=*/87);
+    EXPECT_EQ(*duplicate.recurrentReusableTokens, 80);
+    // 48 is the only free off-grid snapshot on the way (16 is a placeholder, 32/64 are on the grid and
+    // 80 is this prompt's own save-last position).
+    ASSERT_TRUE(duplicate.recurrentFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*duplicate.recurrentFreeOffGridBlocks, 1);
+
+    EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 64);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+}
+
+// Refs and branch points protect a shared snapshot: while sibling B still runs, A's release leaves 16
+// alone (refs); once both siblings stored their own continuation, 16 has two recurrent children and is
+// kept as the branch point's floor.
+TEST(KVCacheManagerReuseAccountingTest, HybridDemoteRespectsInFlightRefs)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    auto constexpr sharedPromptLength = 23;
+    auto constexpr siblingPromptLength = 55;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64,
+        /*maxOffGridSnapshotsPerChain=*/1);
+    auto const& recurrentManager = kvCacheManager->getBlockManager().getWindowBlockManager(recurrentWindow);
+
+    auto const tokensA = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(tokensA->begin(), tokensA->end(), 0);
+    auto const tokensB = divergeTokensFrom(*tokensA, sharedPromptLength, 1000);
+    auto const tokensC = divergeTokensFrom(*tokensA, sharedPromptLength, 2000);
+
+    seedHybridAgentTurn(*kvCacheManager, tokensA, 0, sharedPromptLength);
+
+    auto siblingTokensA
+        = std::make_shared<std::vector<TokenIdType>>(tokensA->begin(), tokensA->begin() + siblingPromptLength);
+    auto siblingTokensB
+        = std::make_shared<std::vector<TokenIdType>>(tokensB->begin(), tokensB->begin() + siblingPromptLength);
+    auto siblingA
+        = LlmRequest{1, 1, siblingTokensA, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto siblingB
+        = LlmRequest{2, 1, siblingTokensB, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const requestInfos{
+        {siblingA.mRequestId, siblingA.getPromptLen(), 1}, {siblingB.mRequestId, siblingB.getPromptLen(), 1}};
+    kvCacheManager->addSequenceBatch(requestInfos, {std::ref(siblingA), std::ref(siblingB)});
+
+    // A finishes while B still holds 16.
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(siblingA);
+    siblingA.addNewToken(100001, 0);
+    kvCacheManager->storeContextBlocks(siblingA);
+    (void) kvCacheManager->removeSequence(siblingA.mRequestId, siblingA);
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 0);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, tokensA, 10, sharedPromptLength).recurrentReusableTokens, 16);
+
+    // B finishes: 16 now has two recurrent children (A's and B's continuation) and stays materialized.
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(siblingB);
+    siblingB.addNewToken(100002, 0);
+    kvCacheManager->storeContextBlocks(siblingB);
+    (void) kvCacheManager->removeSequence(siblingB.mRequestId, siblingB);
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 0);
+    EXPECT_EQ(recurrentManager.getNumDemotionsRefusedNoPlaceholder(), 0);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, tokensA, 11, sharedPromptLength).recurrentReusableTokens, 16);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, tokensA, 12, siblingPromptLength).recurrentReusableTokens, 48);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, tokensB, 13, siblingPromptLength).recurrentReusableTokens, 48);
+
+    // A third sibling sharing only the turn-1 prompt still reuses 16 and reserves that one free off-grid block.
+    auto const third = probeHybridPrefix(*kvCacheManager, tokensC, 14, siblingPromptLength);
+    ASSERT_TRUE(third.recurrentReusableTokens.has_value());
+    EXPECT_EQ(*third.recurrentReusableTokens, 16);
+    ASSERT_TRUE(third.recurrentFreeOffGridBlocks.has_value());
+    EXPECT_EQ(*third.recurrentFreeOffGridBlocks, 1);
+
+    EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 64);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+}
+
+// Block-aligned prompt: two off-grid blocks belong to the finishing request itself (save-last at 48 and
+// the frozen prompt-end block at 64); both are protected, only the turn-1 save-last (16) is demoted.
+TEST(KVCacheManagerReuseAccountingTest, HybridDemoteAlignedPromptProtectsSaveLastAndFrozenEnd)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 8 * tokensPerBlock; // every position below 128 is off-grid
+    auto constexpr promptLength = 87;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64,
+        /*maxOffGridSnapshotsPerChain=*/1);
+    auto const& recurrentManager = kvCacheManager->getBlockManager().getWindowBlockManager(recurrentWindow);
+
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 0, /*promptLength=*/23);
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 1, /*promptLength=*/64);
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 1);
+    EXPECT_EQ(recurrentManager.getNumDemotionsRefusedNoPlaceholder(), 0);
+
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 10, /*promptLength=*/23).recurrentReusableTokens, 0);
+    // An exact duplicate matches at most 63 tokens and floors on the protected save-last at 48.
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 11, /*promptLength=*/64).recurrentReusableTokens, 48);
+    // An extension of the turn reaches the frozen prompt-end block at 64.
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 12, /*promptLength=*/71).recurrentReusableTokens, 64);
+
+    EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 64);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+}
+
+// A request removed without committing its own save-last (cancellation, fast ctx termination) must not
+// demote anything: the conversation's newest snapshot is still the ancestor at 16.
+TEST(KVCacheManagerReuseAccountingTest, HybridDemoteSkipsWhenOwnSnapshotNotStored)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 2 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64,
+        /*maxOffGridSnapshotsPerChain=*/1);
+    auto const& recurrentManager = kvCacheManager->getBlockManager().getWindowBlockManager(recurrentWindow);
+
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 0, /*promptLength=*/23);
+
+    auto cancelledTokens = std::make_shared<std::vector<TokenIdType>>(fullTokens->begin(), fullTokens->begin() + 55);
+    auto cancelled = LlmRequest{1, 1, cancelledTokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    kvCacheManager->addSequenceBatch({{{cancelled.mRequestId, cancelled.getPromptLen(), 1}}}, {std::ref(cancelled)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(cancelled);
+    cancelled.addNewToken(100001, 0);
+    // No storeContextBlocks: the request's save-last at 48 never reaches the tree.
+    (void) kvCacheManager->removeSequence(cancelled.mRequestId, cancelled);
+
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 0);
+    EXPECT_EQ(recurrentManager.getNumDemotionsRefusedNoPlaceholder(), 0);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 10, /*promptLength=*/23).recurrentReusableTokens, 16);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 11, /*promptLength=*/55).recurrentReusableTokens, 16);
+    EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 64);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+}
+
+// With a single pooled placeholder, turn 2 attaches it between 16 and its save-last (32 is off the
+// 64-token grid). At release that placeholder is the only free one and it is tree-resident -- recycling
+// it would orphan the save-last -- so the demotion is refused and 16 stays materialized.
+TEST(KVCacheManagerReuseAccountingTest, HybridDemoteRefusesWithoutFreePlaceholder)
+{
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr statesSnapshotInterval = 4 * tokensPerBlock;
+    auto constexpr promptLength = 87;
+    SizeType32 constexpr recurrentWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    auto kvCacheManager = createHybridKvCacheManagerForReuseAccounting(tokensPerBlock, statesSnapshotInterval,
+        /*saveLastSnapshot=*/true, /*maxAttentionWindow=*/512, /*numPrimaryBlocks=*/64,
+        /*maxOffGridSnapshotsPerChain=*/1, /*numPlaceholderBlocks=*/1);
+    auto const& recurrentManager = kvCacheManager->getBlockManager().getWindowBlockManager(recurrentWindow);
+
+    auto const fullTokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+    std::iota(fullTokens->begin(), fullTokens->end(), 0);
+
+    seedHybridAgentTurn(*kvCacheManager, fullTokens, 0, /*promptLength=*/23);
+    EXPECT_NO_THROW(seedHybridAgentTurn(*kvCacheManager, fullTokens, 1, /*promptLength=*/55));
+    EXPECT_EQ(recurrentManager.getNumDemotedOffGridSnapshots(), 0);
+    EXPECT_EQ(recurrentManager.getNumDemotionsRefusedNoPlaceholder(), 1);
+
+    // Both snapshots remain reachable: 16 directly, 48 through the tree-resident placeholder at 32.
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 10, /*promptLength=*/23).recurrentReusableTokens, 16);
+    EXPECT_EQ(*probeHybridPrefix(*kvCacheManager, fullTokens, 11, /*promptLength=*/55).recurrentReusableTokens, 48);
+    EXPECT_EQ(kvCacheManager->getBlockManager().getNumFreeBlocksPerWindowSize().at(recurrentWindow), 64);
+    EXPECT_TRUE(kvCacheManager->getBlockManager().verifyQueueIntegrity(recurrentWindow));
+}
+
+// A manager without a recurrent window must not report a recurrent floor.
+TEST(KVCacheManagerReuseAccountingTest, NonHybridSummaryHasNoRecurrentFloor)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr promptLength = 64;
+    auto kvCacheManager = createKvCacheManager(
+        KvCacheManagerInstantiationParameters{
+            /* numLayers */ 1,
+            /* numHeads */ 1,
+            /* sizePerHead */ 1,
+            /* tokensPerBlock */ tokensPerBlock,
+            /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 64, /* windowSize */ 512),
+            /* sinkTokenLength */ 0,
+            /* maxAttentionWindow */ 512,
+            /* maxBeamWidth */ 1,
+            /* maxNumTokens */ 1024,
+            /* kvCacheBlockReuse */ true,
+        },
+        stream);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+
+    auto const tokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(promptLength), 7);
+    auto req0 = LlmRequest{0, 16, tokens, tle::SamplingConfig{1}, true};
+    kvCacheManager->addSequenceBatch({{{req0.mRequestId, req0.getPromptLen(), 1}}}, {std::ref(req0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
+    kvCacheManager->storeContextBlocks(req0);
+    kvCacheManager->removeSequence(req0.mRequestId, req0);
+
+    auto req1 = LlmRequest{1, 16, tokens, tle::SamplingConfig{1}, true};
+    auto const summary = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    EXPECT_FALSE(summary.recurrentReusableTokens.has_value());
+    EXPECT_FALSE(summary.recurrentFreeOffGridBlocks.has_value());
+    EXPECT_FALSE(summary.recurrentSchedulingFreeOffGridBlocks.has_value());
+    EXPECT_EQ(summary.reusableBlocksAll, (promptLength - 1) / tokensPerBlock);
+}
+
 // All remove events for the same window size during a single iteration must be consolidated
 // into a single KVCacheRemovedData (not emitted as separate events).
 TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
@@ -7789,6 +8705,97 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     ASSERT_EQ(matchedLen, numReusedBlocks * tokensPerBlock);
 }
 
+void testBlockManagerLinearAttention_ContextReuseSkipsTrailingPlaceholders()
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr statesSnapshotInterval = tokensPerBlock * 2;
+    auto constexpr blocksInPrimaryPool = 32;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr beamWidth = 1;
+    auto constexpr shortPromptLen = 65;
+    auto constexpr longPromptLen = 129;
+    auto constexpr maxAttentionWindow = longPromptLen * 2;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    SizeType32 constexpr linearWindowSizeCode = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    LinearAttentionMetadata linearAttentionMetadata{
+        .cacheType = linearWindowSizeCode,
+        .allRecurrentStatesBytes = 440 * 1024, // dummy value
+        .statesSnapshotInterval = statesSnapshotInterval,
+        .saveLastSnapshot = true,
+    };
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool * 2, blocksInSecondaryPool}},
+        {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, stream, maxAttentionWindow, beamWidth,
+        std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+        0,
+        /*chunkSize*/ 0, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, std::nullopt, false, 128, 0,
+        false, /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata);
+    blockManager.allocatePools(false);
+
+    auto makeInputTokens = [](SizeType32 len)
+    {
+        auto tokens = std::make_shared<VecTokens>();
+        for (SizeType32 i = 0; i < len; ++i)
+        {
+            tokens->push_back(i);
+        }
+        return tokens;
+    };
+
+    tle::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    SizeType32 constexpr maxNewTokens{0};
+    auto seedAndRelease = [&](LlmRequest::RequestIdType requestId, SizeType32 promptLen, bool enableBlockReuse)
+    {
+        auto inputTokens = makeInputTokens(promptLen);
+        auto llmRequest
+            = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+        GenerationRequest sequence{requestId, promptLen, beamWidth, blockManager.getWindowSizesMetadata()};
+        auto const numContextBlocks = tc::ceilDiv(promptLen, tokensPerBlock);
+        (void) blockManager.addSequenceBatch({&sequence}, {promptLen}, {numContextBlocks}, {std::ref(*llmRequest)},
+            maxAttentionWindow, enableBlockReuse);
+        (void) blockManager.addSequenceBatch({&sequence}, {promptLen}, {numContextBlocks}, {std::ref(*llmRequest)},
+            linearWindowSizeCode, enableBlockReuse);
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+        llmRequest->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+        blockManager.storeContextBlocks(sequence, *llmRequest);
+        blockManager.releaseBlocks(sequence);
+    };
+
+    // Seed a reusable snapshot at recurrent block 1 (token 64), then extend the same trie path with a block-reuse-off
+    // request. The latter stores placeholders at blocks 2 and 3 after the materialized snapshot.
+    seedAndRelease(LlmRequest::RequestIdType{0}, shortPromptLen, /*enableBlockReuse=*/true);
+    seedAndRelease(LlmRequest::RequestIdType{1}, longPromptLen, /*enableBlockReuse=*/false);
+
+    auto inputTokens = makeInputTokens(longPromptLen);
+    auto llmRequest = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    GenerationRequest sequence{2, longPromptLen, beamWidth, blockManager.getWindowSizesMetadata()};
+    auto const numContextBlocks = tc::ceilDiv(longPromptLen, tokensPerBlock);
+    (void) blockManager.addSequenceBatch({&sequence}, {longPromptLen}, {numContextBlocks}, {std::ref(*llmRequest)},
+        maxAttentionWindow, /*isEnableBlockReuse=*/true);
+    (void) blockManager.addSequenceBatch({&sequence}, {longPromptLen}, {numContextBlocks}, {std::ref(*llmRequest)},
+        linearWindowSizeCode, /*isEnableBlockReuse=*/true);
+
+    auto const& recurrentBlockIds = sequence.getCacheBlockIds(linearWindowSizeCode).front();
+    ASSERT_EQ(recurrentBlockIds.size(), numContextBlocks);
+    EXPECT_EQ(sequence.getCurrentPrepopulatedPromptLen(), statesSnapshotInterval);
+    EXPECT_LT(recurrentBlockIds.at(0), 0);
+    EXPECT_GE(recurrentBlockIds.at(1), 0);
+    EXPECT_LT(recurrentBlockIds.at(2), 0);
+    EXPECT_GE(recurrentBlockIds.at(3), 0)
+        << "The regular recurrent snapshot after the reused prefix must not remain a claimed placeholder";
+    EXPECT_GE(recurrentBlockIds.at(4), 0);
+    blockManager.releaseBlocks(sequence);
+}
+
 std::vector<std::vector<int>> getExpectedBlockIds(int beamWidth, int numTotalBlocks, int numContextBlocks,
     int tokensPerBlock, bool enableContextReuse, int numContextTokens, int statesSnapshotInterval)
 {
@@ -8208,6 +9215,11 @@ INSTANTIATE_TEST_SUITE_P(BlockManagerLinearAttention, LinearAttentionContextReus
         std::make_tuple(1, 97, 135, 97),             // beamWidth = 1, reuse on the last snapshot
         std::make_tuple(4, 130, 135, 101)            // normal case
         ));
+
+TEST_F(KVCacheManagerTest, LinearAttentionContextReuseSkipsTrailingPlaceholders)
+{
+    testBlockManagerLinearAttention_ContextReuseSkipsTrailingPlaceholders();
+}
 
 class LinearAttentionDecodingBlockGrowthTest : public ::testing::TestWithParam<std::tuple<int, int, int, bool>>
 {

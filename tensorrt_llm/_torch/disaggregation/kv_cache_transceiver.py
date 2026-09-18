@@ -160,6 +160,24 @@ def create_kv_cache_transceiver(
             "MixedMambaHybridCacheManager requires the Python transceiver "
             "runtime in disaggregated serving.")
 
+    # Backstop for the py_executor_creator guard: by now the knob is baked into
+    # the C++ manager's LinearAttentionMetadata and cannot be forced to 0, so a
+    # manager built with off-grid snapshot demotion on an unsupported transfer
+    # path (C++ transceiver: no snapshot-count negotiation between ctx and gen
+    # chains) must not start.
+    linear_attention_metadata = getattr(mamba_cache_manager,
+                                        "linear_attention_metadata", None)
+    max_off_grid_snapshots_per_chain = getattr(
+        linear_attention_metadata, "max_off_grid_snapshots_per_chain", 0)
+    if max_off_grid_snapshots_per_chain > 0 and not (
+            cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and isinstance(mamba_cache_manager, CppMambaHybridCacheManager)
+            and getenv("TRTLLM_HYBRID_DISAGG_REUSE", "0") == "1"):
+        raise ValueError(
+            "mamba_max_off_grid_snapshots_per_chain > 0 requires the Python "
+            "transceiver runtime, TRTLLM_HYBRID_DISAGG_REUSE=1 and "
+            "CppMambaHybridCacheManager in disaggregated serving.")
+
     # Runs while backend may still be "DEFAULT", which it rejects as ambiguous.
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
@@ -200,11 +218,19 @@ def create_kv_cache_transceiver(
 
     if use_python_transceiver:
         if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
-            raise ValueError(
-                "transceiver_runtime='PYTHON' cannot drive "
-                "CppMambaHybridCacheManager (C++ pool backed). Use "
-                "transceiver_runtime='CPP', or select the V2 manager "
-                "with use_kv_cache_manager_v2=True.")
+            if getenv("TRTLLM_HYBRID_DISAGG_REUSE", "0") == "1":
+                # Opt-in (see _util.get_kv_cache_manager_cls): the Python
+                # transceiver reads recurrent states straight from the unified
+                # C++ pool (kv_extractor._build_layer_group_for_mamba_cpp).
+                logger.warning(
+                    "TRTLLM_HYBRID_DISAGG_REUSE=1: driving CppMambaHybridCacheManager "
+                    "with transceiver_runtime='PYTHON'")
+            else:
+                raise ValueError(
+                    "transceiver_runtime='PYTHON' cannot drive "
+                    "CppMambaHybridCacheManager (C++ pool backed). Use "
+                    "transceiver_runtime='CPP', or select the V2 manager "
+                    "with use_kv_cache_manager_v2=True.")
         # DEFAULT has already been resolved above, so Python must see NIXL.
         if cache_transceiver_config.backend != "NIXL":
             raise ValueError(

@@ -283,6 +283,83 @@ TEST_F(LlmRequestTest, pause)
     EXPECT_EQ(llmReq.getMaxNumGeneratedTokens(), 0);
 }
 
+namespace
+{
+//! Context request mid-scheduling: the FORCE_CHUNK scheduler sized the first chunk from
+//! position 0, then block reuse advances the position via setPrepopulatedPromptLen.
+tb::LlmRequest makeChunkedContextRequest(
+    SizeType32 promptLen, SizeType32 chunkSize, std::vector<SizeType32> expectedSnapshotPoints)
+{
+    auto inputTokens = std::make_shared<VecTokens>(static_cast<std::size_t>(promptLen), 7);
+    tb::LlmRequest llmReq(1, /*maxNewTokens=*/16, inputTokens, texec::SamplingConfig(1), false);
+    llmReq.setContextChunkSize(chunkSize);
+    llmReq.setExpectedSnapshotPoints(std::move(expectedSnapshotPoints));
+    return llmReq;
+}
+} // namespace
+
+// A recurrent-state (hybrid Mamba/GDN) request writes its running state only into the block a
+// context chunk ENDS on, and real state blocks exist only at the expected snapshot points plus
+// the end-of-prompt block. setPrepopulatedPromptLen must therefore re-clip the pre-sized first
+// chunk to end exactly on the next expected point; ending elsewhere lands on a placeholder
+// (production crash: prompt 12255 resumed at 7840 with a 4096 chunk ending at 11936).
+TEST_F(LlmRequestTest, prepopulatedResumeClipsChunkToNextSnapshotPoint)
+{
+    // The exact production shape: off-grid saveLast resume, chunk must shrink 4096 -> 352.
+    auto llmReq = makeChunkedContextRequest(12255, 4096, {4096, 8192, 12224});
+    llmReq.setPrepopulatedPromptLen(7840, 32);
+    EXPECT_EQ(llmReq.getContextCurrentPosition(), 7840);
+    EXPECT_EQ(llmReq.getContextChunkSize(), 352);
+}
+
+TEST_F(LlmRequestTest, prepopulatedResumeOnGridKeepsChunk)
+{
+    // Resume exactly on a snapshot point: the shifted end (8192) is the next point already.
+    auto llmReq = makeChunkedContextRequest(12255, 4096, {4096, 8192, 12224});
+    llmReq.setPrepopulatedPromptLen(4096, 32);
+    EXPECT_EQ(llmReq.getContextCurrentPosition(), 4096);
+    EXPECT_EQ(llmReq.getContextChunkSize(), 4096);
+}
+
+TEST_F(LlmRequestTest, prepopulatedResumeMustNotSkipSnapshotPointInFinalStretch)
+{
+    // The shifted end (15104) runs past the prompt, but a snapshot point (12224) still lies
+    // ahead; running through it would leave its materialized block unwritten and poison the
+    // reuse tree, so the chunk must stop there even though the raw end looks like a last chunk.
+    auto llmReq = makeChunkedContextRequest(12255, 4096, {4096, 8192, 12224});
+    llmReq.setPrepopulatedPromptLen(11008, 32);
+    EXPECT_EQ(llmReq.getContextCurrentPosition(), 11008);
+    EXPECT_EQ(llmReq.getContextChunkSize(), 1216);
+}
+
+TEST_F(LlmRequestTest, prepopulatedResumeBeyondLastPointIsFinalChunk)
+{
+    // Past the last snapshot point the chunk ends on the end-of-prompt block, which is always
+    // materialized; setContextChunkSize itself clamps to the remaining 31 tokens.
+    auto llmReq = makeChunkedContextRequest(12255, 4096, {4096, 8192, 12224});
+    llmReq.setPrepopulatedPromptLen(12224, 32);
+    EXPECT_EQ(llmReq.getContextCurrentPosition(), 12224);
+    EXPECT_EQ(llmReq.getContextChunkSize(), 31);
+}
+
+TEST_F(LlmRequestTest, prepopulatedResumeOffGridWithUnreachablePointThrows)
+{
+    // A chunk too short to reach the next snapshot point would end mid-prompt on a placeholder;
+    // fail fast rather than let the state write corrupt.
+    auto llmReq = makeChunkedContextRequest(12255, 96, {4096, 8192, 12224});
+    EXPECT_THROW(llmReq.setPrepopulatedPromptLen(7840, 32), tc::TllmException);
+}
+
+TEST_F(LlmRequestTest, prepopulatedResumeWithoutSnapshotPointsKeepsBlockFloor)
+{
+    // Non-hybrid requests (no expected snapshot points) keep the original behavior: the shifted
+    // end is floored to the tokens-per-block grid only.
+    auto llmReq = makeChunkedContextRequest(12255, 4100, {});
+    llmReq.setPrepopulatedPromptLen(96, 32);
+    EXPECT_EQ(llmReq.getContextCurrentPosition(), 96);
+    EXPECT_EQ(llmReq.getContextChunkSize(), 4096); // end 4196 floored to 4192
+}
+
 TEST_F(LlmRequestTest, testAllocateLogitsBuffer)
 {
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});

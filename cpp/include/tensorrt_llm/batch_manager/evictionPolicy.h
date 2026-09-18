@@ -41,6 +41,15 @@ public:
     /// @returns The pointer to the free block, along with whether it can be offloaded
     /// @param wantPlaceholder If true, return a placeholder block instead of a normal block
     virtual std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
+    /// @brief Get a free pooled placeholder block that is DETACHED from the lookup tree (isDetached()).
+    /// @details Unlike getFreeBlock(wantPlaceholder=true), which returns the LRU front and may hand out a
+    /// tree-resident placeholder of another chain, this never returns an attached placeholder. The block is
+    /// not claimed; callers must claimBlock() it.
+    /// @returns The placeholder, or nullptr when no detached placeholder is free.
+    virtual BlockPtr getFreeDetachedPlaceholder()
+    {
+        return nullptr;
+    }
     /// @brief Release a block. Prioritize the block for eviction if toFront=true
     virtual void releaseBlock(BlockPtr block) = 0;
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
@@ -79,6 +88,8 @@ public:
     void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById);
 
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
+
+    BlockPtr getFreeDetachedPlaceholder() override;
 
     void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;

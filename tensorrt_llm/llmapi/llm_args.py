@@ -4265,6 +4265,20 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default_factory=MambaStateConfig,
         description="Configuration for reusable Mamba state snapshots.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_max_off_grid_snapshots_per_chain: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Cap on the materialized off-grid Mamba / linear-attention recurrent snapshots kept per "
+        "reuse chain (hybrid models with block reuse). When a request finishes, its own save-last "
+        "snapshot is kept together with the newest K-1 historical save-last snapshots below it on "
+        "the same conversation chain; older ones are demoted to placeholders (the prefix stays "
+        "traversable, the recurrent-state block is freed). 0 (default) keeps every historical "
+        "snapshot until LRU eviction. Interval-grid snapshots are never demoted. Requires "
+        "enable_block_reuse; under disaggregated serving it additionally requires the Python "
+        "cache transceiver runtime with TRTLLM_HYBRID_DISAGG_REUSE=1, otherwise it is forced to 0.")
+
     use_kv_cache_manager_v2: bool | Literal["auto"] = Field(
         default="auto",
         status="prototype",
@@ -4439,6 +4453,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             return self
         if ("periodic_snapshot_interval"
                 in self.mamba_state_config.model_fields_set):
+            if (self.mamba_state_config.periodic_snapshot_interval
+                    == self.mamba_state_cache_interval):
+                # Already migrated: the deprecated field stays set on the
+                # instance, so a re-validation (a KvCacheConfig object handed
+                # to TorchLlmArgs, or a model_dump/reload) sees both fields.
+                return self
             raise ValueError("Cannot set both "
                              "'kv_cache_config.mamba_state_cache_interval' and "
                              "'kv_cache_config.mamba_state_config."

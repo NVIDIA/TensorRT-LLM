@@ -1163,7 +1163,32 @@ public:
             // Currently, the runtime process is to apply for cache first and then determine prepopulation.
             // Use the prepopulated length to advance the context position and decrease chunk size if necessary.
             auto chunkSize = getContextChunkSize();
-            if (prepopulatedPromptLen + chunkSize < promptLen)
+            if (!mExpectedSnapshotPoints.empty())
+            {
+                // Recurrent-state (hybrid Mamba/GDN) request: the running state is written only
+                // into the block a chunk ENDS on, and real (non-placeholder) state blocks exist
+                // only at the expected snapshot points plus the end-of-prompt block. The scheduler
+                // sized this first chunk before reuse was discovered (position 0), so shifting the
+                // window right by the prepopulated length can cross a snapshot point or end off
+                // the snapshot grid on a placeholder. Re-clip the chunk to end exactly on the
+                // NEXT expected point; running past the last point is legal only for the final
+                // chunk, which ends on the always-materialized end-of-prompt block.
+                auto const nextPoint = std::upper_bound(
+                    mExpectedSnapshotPoints.begin(), mExpectedSnapshotPoints.end(), prepopulatedPromptLen);
+                if (nextPoint != mExpectedSnapshotPoints.end() && *nextPoint <= prepopulatedPromptLen + chunkSize)
+                {
+                    chunkSize = *nextPoint - prepopulatedPromptLen;
+                }
+                else
+                {
+                    TLLM_CHECK_WITH_INFO(prepopulatedPromptLen + chunkSize >= promptLen,
+                        "Request %lu resumes at %d with chunk size %d, which ends off the recurrent state "
+                        "snapshot grid before the prompt end (%d); the chunk end block would hold no "
+                        "materialized state.",
+                        mRequestId, prepopulatedPromptLen, chunkSize, promptLen);
+                }
+            }
+            else if (prepopulatedPromptLen + chunkSize < promptLen)
             {
                 // make sure to end at block boundary after current chunk
                 auto const flooredEndPosition

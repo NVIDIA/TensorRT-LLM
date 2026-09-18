@@ -233,8 +233,9 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         = peftCacheManager ? peftCacheManager->getMaxDevicePages() : std::numeric_limits<SizeType32>::max();
 
     // The optimization of delaying requests won't work for variable window attention
-    bool skippingIsRelevant = mEnablePrefixAwareScheduling && (!kvCacheManager.getBlockManager().isVariableWindow())
-        && (!crossKvCacheManager || !crossKvCacheManager->getBlockManager().isVariableWindow());
+    bool skippingIsRelevant = mEnablePrefixAwareScheduling
+        && (!kvCacheManager.getBlockManager().isVariableAttentionWindow())
+        && (!crossKvCacheManager || !crossKvCacheManager->getBlockManager().isVariableAttentionWindow());
 
     // Keep track of blocks contributed by requests in context phase
     std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedContextBlocks;
@@ -336,20 +337,21 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     {
                         // analyzePrefixReuse asserts on variable-window managers; skip the walk there
                         // and let downstream callers fall back to their fresh tree-walk path.
-                        if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
+                        if (kvCacheManager.isEnableBlockReuse()
+                            && !kvCacheManager.getBlockManager().isVariableAttentionWindow())
                         {
                             auto uniqueTokens = req->getUniqueTokens(0);
                             summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
                         }
                         if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                            && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                            && !crossKvCacheManager->getBlockManager().isVariableAttentionWindow())
                         {
                             auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                             crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                         }
                     }
                     else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                        && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                        && !crossKvCacheManager->getBlockManager().isVariableAttentionWindow())
                     {
                         // Encoder admission only needs the cross summary for reuse ordering.
                         auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
@@ -475,7 +477,8 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     }
 
     // The optimization of delaying requests won't work for variable window attention
-    bool skippingIsRelevant = mEnablePrefixAwareScheduling && !kvCacheManager.getBlockManager().isVariableWindow();
+    bool skippingIsRelevant
+        = mEnablePrefixAwareScheduling && !kvCacheManager.getBlockManager().isVariableAttentionWindow();
 
     // Keep track of number of requests and block needed for the scheduled requests
     auto scheduledBlocksManager
@@ -554,7 +557,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             summary = kv_cache_manager::PrefixReuseSummary{};
         }
         else if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse()
-            && !kvCacheManager.getBlockManager().isVariableWindow())
+            && !kvCacheManager.getBlockManager().isVariableAttentionWindow())
         {
             auto uniqueTokens = req->getUniqueTokens(0);
             summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);

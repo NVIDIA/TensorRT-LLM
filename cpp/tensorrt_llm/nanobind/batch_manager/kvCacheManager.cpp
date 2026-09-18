@@ -334,6 +334,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("all_recurrent_states_bytes", &tbk::LinearAttentionMetadata::allRecurrentStatesBytes)
         .def_rw("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval)
         .def_rw("save_last_snapshot", &tbk::LinearAttentionMetadata::saveLastSnapshot)
+        .def_rw("max_off_grid_snapshots_per_chain", &tbk::LinearAttentionMetadata::maxOffGridSnapshotsPerChain)
         .def_rw("rnn_num_heads", &tbk::LinearAttentionMetadata::rnnNumHeads)
         .def_rw("rnn_head_dim", &tbk::LinearAttentionMetadata::rnnHeadDim)
         .def_rw("rnn_d_state", &tbk::LinearAttentionMetadata::rnnDState)
@@ -359,6 +360,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def(nb::init<>())
         .def_ro("reusable_blocks_allocated", &tbk::PrefixReuseSummary::reusableBlocksAllocated)
         .def_ro("reusable_blocks_all", &tbk::PrefixReuseSummary::reusableBlocksAll)
+        .def_ro("recurrent_reusable_tokens", &tbk::PrefixReuseSummary::recurrentReusableTokens)
+        .def_ro("recurrent_free_off_grid_blocks", &tbk::PrefixReuseSummary::recurrentFreeOffGridBlocks)
+        .def_ro(
+            "recurrent_scheduling_free_off_grid_blocks", &tbk::PrefixReuseSummary::recurrentSchedulingFreeOffGridBlocks)
         .def_ro("first_new_block", &tbk::PrefixReuseSummary::firstNewBlock);
 
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
@@ -705,6 +710,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("num_required"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); })
+        .def_prop_ro("is_variable_attention_window",
+            [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableAttentionWindow(); })
         // Per-pool introspection: lets Python discover (windowSize, sizePerHead, dtype) per
         // hosted pool so a single KVCacheManager can host mixed-shape pools without a
         // Python-side wrapper duplicating the layer->pool routing.

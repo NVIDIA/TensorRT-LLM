@@ -34,7 +34,9 @@ auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentio
 executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
 int const kNumCacheLevels = 2;
-int const kPlaceholderLevel = kNumCacheLevels; // placeholder blocks live at level 2
+// Placeholder blocks live at the level after the real cache levels; the constant is exposed as
+// kv_cache_manager::kPlaceholderLevel so WindowBlockManager can probe that queue.
+static_assert(kPlaceholderLevel == kNumCacheLevels, "kPlaceholderLevel must follow the real cache levels");
 
 namespace
 {
@@ -158,6 +160,24 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
         }
     }
     TLLM_THROW("No free block found. This shouldn't happen!");
+}
+
+BlockPtr LRUEvictionPolicy::getFreeDetachedPlaceholder()
+{
+    // Detached placeholders are released to the FRONT of their queue and attached ones to the BACK
+    // (WindowBlockManager::releaseBlocks), so in the common case the scan ends at the first entry.
+    // refresh() can move expired entries to the back, hence the full scan rather than a front check.
+    for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
+    {
+        for (auto const& block : mFreeQueues[kPlaceholderLevel][pri])
+        {
+            if (block->isDetached())
+            {
+                return block;
+            }
+        }
+    }
+    return nullptr;
 }
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)

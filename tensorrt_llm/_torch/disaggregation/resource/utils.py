@@ -253,10 +253,23 @@ def get_unique_pool_memory_descs(
                         unique_pools[pool_key] = pool_counter
                         pool_counter += 1
             else:
-                # Layer-major (MambaHybridCacheManager): each role is a separate
-                # allocation. Register each: size = num_layers * layer_stride.
-                for pv in lg.pool_views:
-                    pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+                # Layer-major: each role is either a separate allocation
+                # (MambaHybridCacheManager) or a strided view over one
+                # interleaved recurrent block ([layers, blocks, ssm | conv],
+                # CppMambaHybridCacheManager). Register size = num_layers *
+                # layer_stride from each base, lowest base first, and skip a
+                # view whose base falls inside an already registered region:
+                # the Cpp conv view starts ssm_bytes into the ssm view's
+                # region and every conv payload lies within it, so one
+                # registration covers both (two overlapping registrations are
+                # backend-dependent).
+                pools = sorted(
+                    ((get_physical_pool(page_table, lg_idx, pv.pool_idx), pv) for pv in lg.pool_views),
+                    key=lambda item: item[0].base_address,
+                )
+                for pool, pv in pools:
+                    if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
+                        continue
                     num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
                     pool_size = num_layers * pool.layer_stride_bytes
                     pool_key = (pool.base_address, pool_size)

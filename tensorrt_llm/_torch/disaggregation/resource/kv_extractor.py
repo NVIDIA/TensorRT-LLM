@@ -14,9 +14,10 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     DataLayout,
@@ -47,6 +48,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    CppMambaHybridCacheManager,
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
@@ -284,6 +286,174 @@ def _build_layer_group_for_mamba(
     return layer_group, pool_group
 
 
+def _build_layer_group_for_mamba_cpp(
+    manager: CppMambaHybridCacheManager, pool_group_idx: int
+) -> "tuple[MambaLayerGroup, PhysicalPoolGroup]":
+    """MambaLayerGroup over CppMambaHybridCacheManager's unified recurrent pool.
+
+    The C++ pool interleaves both states per block --
+    ``[layers, blocks, ssm_bytes | conv_bytes]`` -- so the ssm and conv pools
+    are strided views (slot stride = ssm_bytes + conv_bytes, layer stride =
+    blocks * slot stride) over one allocation. get_unique_pool_memory_descs
+    registers that allocation once: the conv view starts ssm_bytes into the
+    ssm view's region and every conv payload lies inside it.
+
+    This is what lets the Python transceiver serve a reuse-enabled hybrid
+    engine: block reuse (incl. recurrent-state snapshots) only exists in the
+    Cpp manager, which was previously unreachable under transceiver_runtime=
+    PYTHON because only the Mixed manager's separate pools were describable.
+    """
+    ssm = manager.all_ssm_states  # [layers, blocks, nheads, head_dim, d_state]
+    conv = manager.all_conv_states  # [layers, blocks, conv_dim, d_conv - 1]
+    if ssm is None or conv is None:
+        raise ValueError(
+            "CppMambaHybridCacheManager recurrent pool is not initialised; "
+            "cannot build a Mamba layer group for disaggregated transfer."
+        )
+    num_slots = int(ssm.shape[1])
+    slot_stride_bytes = int(manager.ssm_bytes + manager.conv_bytes)
+    layer_stride_bytes = num_slots * slot_stride_bytes
+    assert ssm.stride(1) * ssm.element_size() == slot_stride_bytes
+    assert conv.stride(1) * conv.element_size() == slot_stride_bytes
+
+    ssm_pool = PhysicalPool(
+        base_address=int(ssm.data_ptr()),
+        slot_bytes=int(manager.ssm_bytes),
+        num_slots=num_slots,
+        slot_stride_bytes=slot_stride_bytes,
+        layer_stride_bytes=layer_stride_bytes,
+    )
+    conv_pool = PhysicalPool(
+        base_address=int(conv.data_ptr()),
+        slot_bytes=int(manager.conv_bytes),
+        num_slots=num_slots,
+        slot_stride_bytes=slot_stride_bytes,
+        layer_stride_bytes=layer_stride_bytes,
+    )
+
+    local_layers = [
+        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
+        for gid, lid in sorted(manager.mamba_layer_offsets.items(), key=lambda x: x[1])
+    ]
+
+    # Same section derivation as PythonMambaCacheManager (see
+    # conv_section_dims there): sections only matter to the TP-mismatch
+    # mappers; TP-match transfers copy whole slots.
+    conv_dim_local, d_conv_m1 = manager.conv_state_shape
+    ng_ds_local = manager._n_groups_per_rank * manager._rnn_d_state
+    d_inner_local = conv_dim_local - 2 * ng_ds_local
+    if manager._rnn_conv_section_layout == "qwen3_next":
+        conv_section_dims = [ng_ds_local, ng_ds_local, d_inner_local]
+    else:  # nemotron_hybrid
+        conv_section_dims = [d_inner_local, ng_ds_local, ng_ds_local]
+    conv_elem_size = conv.element_size()
+    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in conv_section_dims]
+
+    head_dim = int(ssm.shape[3])
+    d_state = int(ssm.shape[4])
+    ssm_bytes_per_head = head_dim * d_state * ssm.element_size()
+
+    pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
+    layer_group = MambaLayerGroup(
+        pool_group_idx=pool_group_idx,
+        local_layers=local_layers,
+        pool_views=_build_mamba_pool_views(
+            conv_pool,
+            ssm_pool,
+            local_layers,
+            conv_section_bytes=conv_section_bytes,
+            ssm_bytes_per_head=ssm_bytes_per_head,
+        ),
+    )
+    return layer_group, pool_group
+
+
+def _slot_stride_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.stride(0) * tensor.element_size())
+
+
+def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
+    """Describe affine layer/slot addressing for one V2 Mamba state role."""
+    if not states:
+        raise ValueError("V2 Mamba state pool requires at least one layer")
+
+    first_state = states[0]
+    base_address = int(first_state.data_ptr())
+    num_slots = int(first_state.shape[0])
+    slot_bytes = int(first_state[0].numel() * first_state.element_size())
+    slot_stride_bytes = _slot_stride_bytes(first_state)
+
+    num_layers = len(states)
+    if slot_stride_bytes % num_layers != 0:
+        raise ValueError("V2 Mamba physical slot must divide evenly across layers")
+    # Each role appears once per layer in its size-class pool. Equal-size SSM
+    # and convolution states share that pool and are interleaved, so their
+    # layer stride includes both role payloads.
+    layer_stride_bytes = slot_stride_bytes // num_layers
+
+    for layer_offset, state in enumerate(states):
+        state_slot_bytes = int(state[0].numel() * state.element_size())
+        if (
+            int(state.shape[0]) != num_slots
+            or state_slot_bytes != slot_bytes
+            or _slot_stride_bytes(state) != slot_stride_bytes
+        ):
+            raise ValueError("V2 Mamba state tensors must share one slot layout per role")
+        expected_address = base_address + layer_offset * layer_stride_bytes
+        if int(state.data_ptr()) != expected_address:
+            raise ValueError("V2 Mamba state tensors must have a uniform layer stride per role")
+
+    return PhysicalPool(
+        base_address=base_address,
+        slot_bytes=slot_bytes,
+        num_slots=num_slots,
+        slot_stride_bytes=slot_stride_bytes,
+        layer_stride_bytes=layer_stride_bytes,
+    )
+
+
+def _build_layer_group_for_v2_mamba(
+    manager: MambaHybridCacheManagerV2, pool_group_idx: int
+) -> "tuple[MambaLayerGroup, PhysicalPoolGroup]":
+    local_layers = [
+        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
+        for gid, lid in sorted(manager.mamba_layer_offsets.items(), key=lambda x: x[1])
+    ]
+
+    num_layers = len(local_layers)
+    expected_offsets = list(range(num_layers))
+    if sorted(ll.local_layer_id for ll in local_layers) != expected_offsets:
+        raise ValueError("V2 Mamba layer offsets must be dense")
+    if len(manager.all_conv_states) != num_layers or len(manager.all_ssm_states) != num_layers:
+        raise ValueError("V2 Mamba state tensors must match the layer-offset table")
+
+    first_conv_state = manager.all_conv_states[0]
+    first_ssm_state = manager.all_ssm_states[0]
+    conv_pool = _build_v2_mamba_state_pool(manager.all_conv_states)
+    ssm_pool = _build_v2_mamba_state_pool(manager.all_ssm_states)
+    if conv_pool.num_slots != ssm_pool.num_slots:
+        raise ValueError("V2 Mamba convolution and SSM states must have the same number of slots")
+
+    d_conv_m1 = manager.conv_state_shape[1]
+    conv_elem_size = first_conv_state.element_size()
+    _, head_dim, d_state = manager.ssm_state_shape
+    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in manager.conv_section_dims]
+
+    ssm_elem_size = first_ssm_state.element_size()
+    ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
+
+    pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
+    layer_group = MambaLayerGroup(
+        pool_group_idx=pool_group_idx,
+        local_layers=local_layers,
+        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, local_layers),
+        conv_section_bytes=conv_section_bytes,
+        ssm_bytes_per_head=ssm_bytes_per_head,
+        slot_major_layout=True,
+    )
+    return layer_group, pool_group
+
+
 def _build_non_kv_layers(
     manager,
     layer_groups: List[LayerGroup],
@@ -296,7 +466,18 @@ def _build_non_kv_layers(
     recurrent ones included, from ``pool_group_descs`` in
     ``_build_page_table_v2``.
     """
-    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
+    if isinstance(manager, CppMambaHybridCacheManager):
+        # Unified-pool C++ hybrid manager: the recurrent states live in the
+        # KVCacheManager's RECURRENT_STATES window (dropped from the attention
+        # layer groups by build_page_table) and travel through a
+        # MambaLayerGroup of strided views. Attention-only PP ranks own no
+        # recurrent pool.
+        if manager.local_num_mamba_layers > 0:
+            pool_group_idx = len(pool_groups)
+            layer_group, pool_group = _build_layer_group_for_mamba_cpp(manager, pool_group_idx)
+            layer_groups.append(layer_group)
+            pool_groups.append(pool_group)
+    elif isinstance(manager, MambaHybridCacheManager) and not isinstance(
         manager, MambaHybridCacheManagerV2
     ):
         pool_group_idx = len(pool_groups)
@@ -323,6 +504,15 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
     sorted_window_sizes = sorted(
         window_size_to_local_layer_ids.keys(), key=lambda x: (x is None, x)
     )
+    # CppMambaHybridCacheManager registers recurrent-state layers under the
+    # negative LinearCacheType.RECURRENT_STATES sentinel window with
+    # kv_heads == 0. They are not attention KV: the per-request final state
+    # (and its retained snapshot slots) travels as the slot list of the
+    # CacheKind.STATE group over the MambaLayerGroup built below, so drop the
+    # sentinel group from the attention layer groups.
+    sorted_window_sizes = [
+        w for w in sorted_window_sizes if w is None or w > 0
+    ]
 
     pool_groups: List[PhysicalPoolGroup] = []
     layer_groups: List[LayerGroup] = []

@@ -68,6 +68,10 @@ static constexpr SizeType32 kPrimaryLevel = 0;
 
 static constexpr SizeType32 kSecondaryLevel = 1;
 
+// Free-queue level that holds the pooled linear-attention placeholder blocks of a
+// kRecurrentStates manager (see LRUEvictionPolicy). Not a memory pool level.
+static constexpr SizeType32 kPlaceholderLevel = 2;
+
 // Extra block buffer allocated for SWA to be able to always keep "window size"
 // tokens held in the blocks.
 static constexpr SizeType32 kSWAExtraBlock = 1;
@@ -156,6 +160,15 @@ struct LinearAttentionMetadata
     SizeType32 statesSnapshotInterval;  // Only used for kRecurrentStates
     bool saveLastSnapshot;              // Take additional snapshot of recurrent states at the end of the input sequence
 
+    // Cap on the materialized OFF-GRID recurrent snapshots kept per reuse chain. Evaluated in
+    // WindowBlockManager::releaseBlocks when a request finishes: the request's own save-last
+    // snapshot always stays; of the historical off-grid (save-last) snapshots below it on the
+    // same chain the newest (K - 1) are kept and older ones are demoted to pooled placeholders
+    // (the trie node stays traversable, the recurrent-state block is freed evict-first).
+    // 0 disables the rule (default). Only effective with saveLastSnapshot,
+    // statesSnapshotInterval > 0 and beamWidth == 1; interval-grid snapshots are never demoted.
+    SizeType32 maxOffGridSnapshotsPerChain{0};
+
     // Optional: explicit number of placeholder blocks for this kRecurrentStates manager.
     // If set, overrides the automatic computation (fullAttention.primaryBlocks - this.primaryBlocks).
     std::optional<SizeType32> numPlaceholderBlocks;
@@ -175,8 +188,12 @@ struct LinearAttentionMetadata
     [[nodiscard]] bool shouldAllocateRecurrentStates(
         SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen, SizeType32 tokensPerBlock) const
     {
-        // Allocate the last full block for maximum reuse opportunity.
-        if (saveLastSnapshot && (currentBlockEndTokenIdx / tokensPerBlock == promptLen / tokensPerBlock))
+        // Allocate the last block a duplicate request can actually reach, for maximum reuse
+        // opportunity. A duplicate matches at most promptLen - 1 tokens (at least one token
+        // must be recomputed to produce logits), so for a block-aligned prompt the last full
+        // block ends AT promptLen and is unreachable for reuse; the usable terminal snapshot
+        // is one block earlier. For non-aligned prompts this is the last full block.
+        if (saveLastSnapshot && currentBlockEndTokenIdx == (promptLen - 1) / tokensPerBlock * tokensPerBlock)
         {
             TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: saveLastSnapshot",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
@@ -214,17 +231,24 @@ struct LinearAttentionMetadata
         {
             count += promptLen / statesSnapshotInterval; // round down
         }
-        if (saveLastSnapshot
-            && (promptLen / tokensPerBlock * tokensPerBlock
-                != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+        auto const reachableEnd = (promptLen - 1) / tokensPerBlock * tokensPerBlock;
+        if (saveLastSnapshot && reachableEnd > 0 && reachableEnd % statesSnapshotInterval != 0)
         {
             count += 1;
         }
-        if (promptLen % tokensPerBlock == 0)
-        {
-            // corner case
-            count += 1;
-        }
+        // Always account for the block containing the prompt-end recurrent state. For
+        // non-aligned prompts this is the mutable live block that rolls through
+        // generation. For block-aligned prompts the end block is frozen into the reuse
+        // tree instead (production appends the first sampled token before
+        // storeContextBlocks), so this +1 is absorbed by that frozen block and the
+        // first-decode look-ahead block (calcNumAdditionalBlocksNeededForReq) is NOT
+        // reserved here for ANY aligned prompt — regardless of whether the reachable
+        // saveLast block sits on the interval grid. The only self-funding case is an
+        // interval-aligned prompt (promptLen % statesSnapshotInterval == 0), where the
+        // interval term and the end block overlap physically, leaving one slack block
+        // for the first decode. getRemainingBlocksToCompletion reserves the explicit
+        // look-ahead for the aligned off-interval case.
+        count += 1;
         return count;
     }
 
@@ -838,6 +862,29 @@ struct PrefixReuseSummary
     /// Used by the token budget (NoEvict) since all cached tokens avoid recompute.
     SizeType32 reusableBlocksAll{0};
 
+    /// Snapshot-floored reusable token count from the recurrent-state window of a
+    /// hybrid linear-attention model; std::nullopt when the manager has no recurrent
+    /// window. Admission mins the prepopulated length across windows and recurrent
+    /// reuse only reaches a materialized state snapshot, so the attention-only
+    /// counts above overestimate hybrid reuse; the token budget caps with this.
+    std::optional<SizeType32> recurrentReusableTokens{std::nullopt};
+
+    /// Number of free-cached recurrent-state blocks in the reusable prefix that
+    /// are not part of the current prompt's normal snapshot/end-state layout.
+    /// Claiming one of these blocks removes it from the recurrent free queue,
+    /// but calcNumBlocksNeededForReq does not otherwise reserve it. Historical
+    /// save-last snapshots can accumulate across agent turns, so this is a
+    /// count rather than a boolean.
+    /// std::nullopt means this summary did not analyze a recurrent window;
+    /// a present zero is an authoritative recurrent analysis with no surcharge.
+    std::optional<SizeType32> recurrentFreeOffGridBlocks{std::nullopt};
+
+    /// Scheduling-view counterpart to recurrentFreeOffGridBlocks. Max-utilization
+    /// may simulate pausing a sequence before its physical references are released;
+    /// this count follows scheduling references and therefore the scheduling free
+    /// count used by schedulingHasFreeBlocks.
+    std::optional<SizeType32> recurrentSchedulingFreeOffGridBlocks{std::nullopt};
+
     /// First block key NOT found in the radix tree. std::nullopt means either all full
     /// prefix blocks matched (full prefix hit) or the request has no full block key to
     /// probe yet; a concrete BlockKey identifies the first missing full block.
@@ -1100,6 +1147,25 @@ public:
         return mMissedBlocks;
     }
 
+    //! \brief Historical off-grid recurrent snapshots demoted to placeholders at release
+    //! (LinearAttentionMetadata::maxOffGridSnapshotsPerChain).
+    [[nodiscard]] SizeType32 getNumDemotedOffGridSnapshots() const noexcept
+    {
+        return mDemotedOffGridSnapshots;
+    }
+
+    //! \brief Demotions skipped because no detached pooled placeholder was free.
+    [[nodiscard]] SizeType32 getNumDemotionsRefusedNoPlaceholder() const noexcept
+    {
+        return mDemotionsRefusedNoPlaceholder;
+    }
+
+    //! \brief Refcount-0 tree-resident placeholders replaced by a real block in storeBlocks.
+    [[nodiscard]] SizeType32 getNumRematerializedPlaceholders() const noexcept
+    {
+        return mRematerializedPlaceholders;
+    }
+
     // Get num free blocks in the secondary (host) memory pool
     [[nodiscard]] SizeType32 getNumFreeSecondaryBlocks() const noexcept;
 
@@ -1217,8 +1283,10 @@ public:
         std::string const& directory = "");
 
     //! \brief Combined prefix reuse analysis — single radix tree walk.
-    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+    //! \param tokenCount when set, only the first tokenCount tokens are chopped into
+    //! block keys (used to mirror admission's inputLength - 1 key set exactly).
+    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(VecUniqueTokens const& uniqueTokens,
+        LlmRequest const& llmRequest, std::optional<std::size_t> tokenCount = std::nullopt) const;
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
@@ -1255,6 +1323,13 @@ public:
     [[nodiscard]] bool isSWA() const
     {
         return mIsSWA;
+    }
+
+    //! \brief This WindowBlockManager is for holding SSM states for linear attention models.
+    [[nodiscard]] bool isRecurrentState() const
+    {
+        return mLinearAttentionMetadata.has_value()
+            && LinearAttentionMetadata::hasRecurrentStatesCache(mLinearAttentionMetadata->cacheType);
     }
 
     [[nodiscard]] bool isEnablePartialReuse() const
@@ -1360,6 +1435,52 @@ private:
     //! \details Caller must hold mLookupTree->getMutex().
     void releaseSubtree(BlockPtr const& block);
 
+    //! \brief Per-release state of the "keep only the newest off-grid save-last snapshots" rule
+    //! (LinearAttentionMetadata::maxOffGridSnapshotsPerChain). Built once per releaseBlocks call.
+    struct OffGridDemotionPlan
+    {
+        bool enabled{false};
+        //! Position of the releasing request's own save-last snapshot, (promptLen - 1) / tokensPerBlock - 1.
+        //! Every position >= saveLastIdx (save-last and, for block-aligned prompts, the frozen end block) is protected.
+        SizeType32 saveLastIdx{0};
+        //! Demotable off-grid snapshots retained so far, walking newest -> oldest. Seeded with 1 for the
+        //! request's own save-last snapshot whether or not it sits on the interval grid. Only candidates
+        //! that pass every other gate (a still-referenced one included) consume a slot, so exactly the
+        //! newest K - 1 qualifying historical snapshots survive.
+        SizeType32 retained{0};
+        //! Deepest node already verified on the walk from the save-last node towards the root.
+        radix_block_tree::LookupNodePtr chainWalker{nullptr};
+        //! False once a value-less node was found between the save-last node and a candidate.
+        bool chainIntact{true};
+        //! True after a demotion was refused for lack of a DETACHED placeholder; cleared when this release
+        //! returns one of the request's own detached pooled placeholders to the free queue. Skips the
+        //! per-candidate scan of the placeholder queue while it cannot succeed.
+        bool noDetachedPlaceholder{false};
+    };
+
+    //! \brief Evaluate the demotion gates for a request being released (recurrent manager, knob > 0,
+    //! saveLastSnapshot && statesSnapshotInterval > 0, beamWidth == 1, real non-dummy request whose own
+    //! save-last snapshot is materialized and attached to the lookup tree).
+    //! \details Caller must hold mLookupTree->getMutex().
+    [[nodiscard]] OffGridDemotionPlan planOffGridSnapshotDemotion(GenerationRequest const& sequence,
+        OptionalRef<LlmRequest const> llmRequest, std::vector<BlockPtr> const& allocatedBlocks) const;
+
+    //! \brief Decide whether \p block, at \p position in the released path and after the request's own
+    //! decRef, is a historical off-grid snapshot that must be demoted under \p plan. Updates the plan's
+    //! budget and chain-integrity cursor; a candidate that is still referenced is kept but counted.
+    //! \details Caller must hold mLookupTree->getMutex().
+    [[nodiscard]] bool shouldDemoteOffGridSnapshot(
+        OffGridDemotionPlan& plan, BlockPtr const& block, SizeType32 position) const;
+
+    //! \brief Replace a refcount-0, tree-resident real recurrent block by a detached pooled placeholder
+    //! at the same trie node (key, hash, prevInSeq and children's owning links are carried over), so the
+    //! node stays traversable while the recurrent state is dropped. The real block is left detached with
+    //! an empty key; the caller releases it evict-first. Returns false (nothing changed) when no
+    //! DETACHED placeholder is free — a tree-resident placeholder is never recycled here because that
+    //! would punch a value-less hole into another chain (or into the releasing request's own path).
+    //! \details Caller must hold mLookupTree->getMutex().
+    [[nodiscard]] bool tryDemoteToPlaceholder(BlockPtr const& real);
+
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
     //! \param wantPlaceholder If true, return a pre-allocated placeholder block instead of a normal block
@@ -1374,13 +1495,6 @@ private:
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
-
-    //! \brief This WindowBlockManager is for holding SSM states for linear attention models.
-    [[nodiscard]] bool isRecurrentState() const
-    {
-        return mLinearAttentionMetadata.has_value()
-            && LinearAttentionMetadata::hasRecurrentStatesCache(mLinearAttentionMetadata->cacheType);
-    }
 
 private:
     tensorrt_llm::DataType mDataType;
@@ -1453,6 +1567,12 @@ private:
     SizeType32 mMissedBlocks;
     // Number of blocks allocated during generation phase
     SizeType32 mGenAllocBlocks;
+    // Historical off-grid recurrent snapshots demoted to placeholders at release (recurrent manager only)
+    SizeType32 mDemotedOffGridSnapshots{0};
+    // Demotions refused because no detached pooled placeholder was free
+    SizeType32 mDemotionsRefusedNoPlaceholder{0};
+    // Refcount-0 tree-resident placeholders replaced by a real block in storeBlocks (inverse of demotion)
+    SizeType32 mRematerializedPlaceholders{0};
     // Only be 1 or 2. If 2: general KV stored. If 1: K == V for any token, so only K is stored to optimize the
     // max_num_tokens(For DeepSeek). Controlled by mCacheType
     SizeType32 mKVFactor;
@@ -1820,6 +1940,16 @@ public:
         return mIsVariableWindow;
     }
 
+    //! \brief True when the ATTENTION (non-recurrent-state) windows have more
+    //! than one unique size, i.e. true variable sliding-window attention. A
+    //! hybrid model's extra kRecurrentStates window makes isVariableWindow()
+    //! true but not this: its single attention window still supports
+    //! prefix-reuse analysis and prefix-aware scheduling.
+    [[nodiscard]] bool isVariableAttentionWindow() const noexcept
+    {
+        return mIsVariableAttentionWindow;
+    }
+
     [[nodiscard]] SizeType32 getMaxBlockPerSeqWhenSingleWindowSize() const
     {
         TLLM_CHECK_WITH_INFO(!isVariableWindow(),
@@ -1905,6 +2035,11 @@ public:
         return mWindowBlockManagers.at(windowSize);
     }
 
+    [[nodiscard]] WindowBlockManager const& getWindowBlockManager(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize);
+    }
+
     [[nodiscard]] runtime::BufferManager const& getBufferManager(SizeType32 windowSize) const
     {
         return mWindowBlockManagers.at(windowSize).getBufferManager();
@@ -1973,6 +2108,7 @@ private:
     CacheType mCacheType;
 
     bool mIsVariableWindow;
+    bool mIsVariableAttentionWindow;
     bool mIsVariableGQA;
 
     // Shared radix lookup tree used by all WindowBlockManager instances.

@@ -10,7 +10,7 @@ reached through the ``interfaces`` Protocols.
 
 import os
 import time
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
@@ -432,8 +432,24 @@ class DisaggTransferCoordinator:
                 # and pins them; it must run before respond_and_send_async
                 # sends the final slice and (for the Python transceiver) moves
                 # the request toward completion.
-                self._transfers.start_transfer(req)
-                self._transceiver.respond_and_send_async(req)
+                try:
+                    self._transfers.start_transfer(req)
+                    self._transceiver.respond_and_send_async(req)
+                except (IndexError, KeyError, RuntimeError, ValueError) as e:
+                    # Fail the request, not the executor loop of this rank. Do
+                    # not report it from here: under attention-DP only the
+                    # owning rank reaches this branch and the response path
+                    # gathers. Mark the error and let the rank-synchronized
+                    # error path (handle_errors_synced) report it.
+                    logger.error(
+                        f"KV cache send failed for context request "
+                        f"{req.py_request_id}: {e!r}; failing the request"
+                    )
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    if req.py_request_id in self._transfers.requests_in_transfer():
+                        # Undo start_transfer(): untrack and unpin.
+                        self._transfers.end_transfer(req)
+                    continue
                 # Bridge validation can reject before a transfer session exists.
                 # Release the claim right away: there is no physical accessor
                 # whose retirement the reap could poll.
@@ -537,6 +553,9 @@ class DisaggTransferCoordinator:
             response = request.create_response(False, self._dist.rank)
             if response:
                 response.result.cached_tokens = request.cached_tokens
+                response.result.ctx_computed_tokens = getattr(request, 'py_ctx_computed_tokens', 0)
+                response.result.ctx_first_begin = getattr(request, 'py_ctx_first_begin', -1)
+                response.result.ctx_num_chunks = getattr(request, 'py_ctx_num_chunks', 0)
                 attach_ctx_usage(request, response)
             released = self._transfers.end_transfer(request)
             if released:
@@ -617,6 +636,62 @@ class DisaggTransferCoordinator:
             self._effects.fail_requests(
                 "Request timed out (KV transfer)", timed_out, charge_budget=False
             )
+
+    def take_pending_timed_out(self) -> List[LlmRequest]:
+        """Drain the ADP timeout buffer without voting.
+
+        For the packed attention-DP exchange (TLLM_ADP_PACKED_SYNC): the
+        executor reports ``bool(buffer)`` on its loop-head all-gather and,
+        on a positive vote, fails the drained requests through
+        ``fail_timed_out_synced`` -- the same action ``handle_timeouts_synced``
+        takes after its own collective.
+        """
+        timed_out = self._pending_timed_out_requests
+        self._pending_timed_out_requests = []
+        return timed_out
+
+    def fail_timed_out_synced(self, requests: List[LlmRequest]) -> None:
+        """Fail requests drained by ``take_pending_timed_out`` after a
+        positive rank-wide timeout vote.
+
+        Called on every rank of the vote, with an empty list on ranks that
+        had no timeout, exactly as ``handle_timeouts_synced`` does: the error
+        path may enter collectives of its own, so it must be reached
+        symmetrically.
+        """
+        self._effects.fail_requests(
+            "Request timed out (KV transfer)", requests, charge_budget=False
+        )
+
+    def local_error_vote(self) -> Dict[str, List[int]]:
+        """This rank's contribution to the ``handle_errors_synced`` vote.
+
+        For the packed attention-DP exchange (TLLM_ADP_PACKED_SYNC): runs the
+        head of ``handle_errors_synced`` (context sends that failed after
+        leaving the transfer manager are marked ``DISAGG_TRANS_ERROR``) and
+        returns the vote ids of the local error requests and of those whose
+        cleanup is still blocked. The executor ships the two counts on its
+        loop-head all-gather and, on a positive vote, runs
+        ``handle_errors_synced`` itself on every rank.
+        """
+        pending_ids = self.take_pending_context_failures()
+        if pending_ids:
+            for req in self._registry.active_requests():
+                if get_unique_rid(req) in pending_ids:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        local_error_requests = [
+            req
+            for req in self._registry.active_requests()
+            if req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        ]
+        return {
+            "error_ids": [self._vote_id(req) for req in local_error_requests],
+            "blocked_ids": [
+                self._vote_id(req)
+                for req in local_error_requests
+                if self._is_error_cleanup_blocked(req)
+            ],
+        }
 
     def take_pending_context_failures(self) -> Set[int]:
         """Drain context sends that failed after leaving the transfer manager."""
@@ -856,6 +931,15 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def handle_timeouts_synced(self) -> None:
         return None
+
+    def take_pending_timed_out(self) -> List[LlmRequest]:
+        return []
+
+    def fail_timed_out_synced(self, requests: List[LlmRequest]) -> None:
+        return None
+
+    def local_error_vote(self) -> Dict[str, List[int]]:
+        return {"error_ids": [], "blocked_ids": []}
 
     def take_pending_context_failures(self) -> Set[int]:
         return set()

@@ -4,7 +4,7 @@
 
 import os
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     MambaCacheManager,
+    MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
     MixedMambaHybridCacheManager,
@@ -91,6 +92,12 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
+
+@pytest.fixture(autouse=True)
+def _two_chunk_save_last_schedule(monkeypatch):
+    # These tests describe the two-chunk save-last schedule; the folded schedule
+    # (the default) has its own tests (test_fold_save_last_*).
+    monkeypatch.setenv("TLLM_MAMBA_FOLD_SAVE_LAST", "0")
 
 def test_advance_replay_state_uses_checkpoint_predicate_and_skips_dummies():
     metadata = ReplayStateUpdateMetadata(
@@ -1893,7 +1900,10 @@ def test_cpp_hybrid_prepare_expect_snapshot_points():
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
     )
-    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=64)
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=64, save_last_snapshot=True
+    )
+    mgr.tokens_per_block = 32
     requests = [
         SimpleNamespace(prompt_len=150, expect_snapshot_points=[999]),
         SimpleNamespace(prompt_len=128, expect_snapshot_points=[]),
@@ -1903,8 +1913,12 @@ def test_cpp_hybrid_prepare_expect_snapshot_points():
     mgr.prepare_expect_snapshot_points(requests)
 
     assert [request.expect_snapshot_points for request in requests] == [
+        # prompt 150: reachable terminal block (128) coincides with an interval point.
         [64, 128],
-        [64, 128],
+        # prompt 128 (block-aligned): the reachable terminal block (96) is off the
+        # interval grid and sorts BEFORE the final interval point.
+        [64, 96, 128],
+        # prompt 32: reachable block is 0; nothing to snapshot.
         [],
     ]
 
@@ -2171,11 +2185,13 @@ def _build_hybrid_with_mamba_layer(
     enable_block_reuse=False,
     periodic_snapshot_interval=256,
     is_estimating_kv_cache=False,
+    max_tokens=512,
     dtype=DataType.HALF,
     mamba_layer_mask=None,
     attention_layer_mask=None,
     mamba_ssm_cache_dtype=torch.float16,
     use_replay_state_update=False,
+    mamba_max_off_grid_snapshots_per_chain=0,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
@@ -2184,11 +2200,11 @@ def _build_hybrid_with_mamba_layer(
     mamba_mask = mamba_layer_mask or [True, False]
     attn_mask = attention_layer_mask or [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
-    # Cap max_tokens to keep the real C++ pool allocation tiny.
     kv_cache_config = KvCacheConfig(
-        max_tokens=512,
+        max_tokens=max_tokens,
         enable_block_reuse=enable_block_reuse,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=periodic_snapshot_interval),
+        mamba_max_off_grid_snapshots_per_chain=mamba_max_off_grid_snapshots_per_chain,
     )
     return CppMambaHybridCacheManager(
         mamba_d_state=8,
@@ -3582,10 +3598,14 @@ def test_v2_kda_replay_resets_context_slots():
     mgr._use_replay_state_update = False
     mgr.cuda_state_indices = torch.tensor([2, 1], dtype=torch.int32)
     mgr.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
-    mgr.mamba_ssm_rand_seed = None
 
-    mgr._reset_context_mamba_slots(num_contexts=1)
+    # The base reset needs a fully built manager (host state indices, batch
+    # size, ...); this test only covers the V2 override on top of it.
+    with patch.object(MambaHybridCacheManager,
+                      "_reset_context_mamba_slots") as base_reset:
+        mgr._reset_context_mamba_slots(num_contexts=1)
 
+    base_reset.assert_called_once_with(1)
     assert mgr.prev_num_accepted_tokens.tolist() == [5, 6, 0]
 
 
@@ -4083,15 +4103,16 @@ def test_cpp_hybrid_merges_compact_scale_rows_with_unmanaged_layers():
 @skip_no_cuda
 def test_cpp_hybrid_recurrent_pool_reserves_cuda_graph_padding_slot():
     """Without spec decoding, the recurrent-state snapshot pool must
-    have at least max_batch_size + 1 slots — one extra for the
+    have exactly max_batch_size + 1 fixed slots — one extra for the
     CUDA-graph padding sentinel (CUDA_GRAPH_DUMMY_REQUEST_ID). Without
     it, the padding sentinel evicts live recurrent state under load."""
     max_batch_size = 4
     mgr = _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=max_batch_size)
     recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
-    assert recurrent_primary >= max_batch_size + 1, (
+    expected = max_batch_size + 1
+    assert recurrent_primary == expected, (
         f"recurrent-state pool has {recurrent_primary} slots, "
-        f"need >= max_batch_size + 1 = {max_batch_size + 1} to host the "
+        f"need max_batch_size + 1 = {expected} to host the "
         f"CUDA-graph padding sentinel without evicting live state"
     )
 
@@ -4107,15 +4128,20 @@ def test_cpp_hybrid_recurrent_pool_reserves_draft_len_sentinel_slots():
     mgr = _build_hybrid_with_mamba_layer(spec_config=spec_config, max_batch_size=max_batch_size)
     recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
     expected_min = max_batch_size + 1 + max_draft_len
-    assert recurrent_primary >= expected_min, (
+    assert recurrent_primary == expected_min, (
         f"recurrent-state pool has {recurrent_primary} slots, "
-        f"need >= max_batch_size + 1 + max_draft_len = {expected_min} so "
+        f"need max_batch_size + 1 + max_draft_len = {expected_min} so "
         f"per-draft-len sentinels don't collide with live state"
     )
 
 
 def _build_hybrid_with_mamba_layer_pp(
-    spec_config=None, max_batch_size=4, enable_block_reuse=False, pp_size=2
+    spec_config=None,
+    max_batch_size=4,
+    enable_block_reuse=False,
+    periodic_snapshot_interval=256,
+    pp_size=2,
+    mamba_max_off_grid_snapshots_per_chain=0,
 ):
     """Same as ``_build_hybrid_with_mamba_layer`` but with ``pp_size`` >= 1.
 
@@ -4132,7 +4158,12 @@ def _build_hybrid_with_mamba_layer_pp(
     mamba_num_layers = sum(mamba_mask)
     num_layers = sum(attn_mask)
     mapping = Mapping(world_size=pp_size, rank=0, tp_size=1, pp_size=pp_size)
-    kv_cache_config = KvCacheConfig(max_tokens=512, enable_block_reuse=enable_block_reuse)
+    kv_cache_config = KvCacheConfig(
+        max_tokens=512,
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=periodic_snapshot_interval),
+        mamba_max_off_grid_snapshots_per_chain=mamba_max_off_grid_snapshots_per_chain,
+    )
     return CppMambaHybridCacheManager(
         mamba_d_state=8,
         mamba_d_conv=4,
@@ -4176,8 +4207,8 @@ def test_cpp_hybrid_recurrent_pool_scales_with_pp_size(pp_size):
     """With pipeline parallelism, multiple microbatches are in-flight on the
     same rank concurrently, each holding up to ``max_batch_size`` sequences'
     Mamba state. The recurrent-state pool must therefore size for
-    ``max_batch_size * pp_size`` live slots (plus the CUDA-graph padding
-    sentinel). Without this scaling, the first inference batch under PP>1
+    ``max_batch_size * pp_size`` live slots when reuse is off (plus the
+    CUDA-graph padding sentinel). Without this scaling, the first batch under PP>1
     trips ``No free block found`` once requests beyond the first microbatch
     enter the pool (cf. TestNemotronV3Super::test_nvfp4_parallelism[TP4_PP2]).
     """
@@ -4187,10 +4218,34 @@ def test_cpp_hybrid_recurrent_pool_scales_with_pp_size(pp_size):
     )
     recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
     expected_min = max_batch_size * pp_size + 1
-    assert recurrent_primary >= expected_min, (
+    assert recurrent_primary == expected_min, (
         f"recurrent-state pool has {recurrent_primary} slots with pp_size={pp_size}, "
-        f"need >= max_batch_size * pp_size + 1 = {expected_min} so concurrent "
+        f"need max_batch_size * pp_size + 1 = {expected_min} so concurrent "
         f"in-flight microbatches don't exhaust live-state slots"
+    )
+
+
+@_skip_under_ray
+@skip_no_cuda
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_cpp_hybrid_save_last_snapshot_pool_scales_with_pp_size(pp_size):
+    """Reuse needs a live state and immutable save-last state per request."""
+    max_batch_size = 4
+    interval = 256
+    max_tokens = 512
+    mgr = _build_hybrid_with_mamba_layer_pp(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        periodic_snapshot_interval=interval,
+        pp_size=pp_size,
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    expected = 2 * max_batch_size * pp_size + 1 + max_tokens // interval
+    assert recurrent_primary == expected, (
+        f"recurrent-state pool has {recurrent_primary} slots with reuse and "
+        f"pp_size={pp_size}, need {expected} for live + save-last + padding + "
+        f"regular snapshots"
     )
 
 
@@ -4200,10 +4255,11 @@ def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
     live-state + CUDA-graph-padding floor.
 
     With max_batch_size=4, periodic_snapshot_interval=256, max_tokens=512:
-      naive: max_snapshots = 512 // 256 = 2  (drops live-state floor!)
-      fixed: max_snapshots = max(2, 4 + 1) = 5
+      fixed: 4 live + 4 save-last + 1 padding + 2 regular snapshots = 11.
     """
     max_batch_size = 4
+    max_tokens = 512
+    interval = 256
     mgr = _build_hybrid_with_mamba_layer(
         spec_config=None,
         max_batch_size=max_batch_size,
@@ -4211,20 +4267,91 @@ def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
         periodic_snapshot_interval=256,
     )
     recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
-    assert recurrent_primary >= max_batch_size + 1, (
+    expected = 2 * max_batch_size + 1 + max_tokens // interval
+    assert recurrent_primary == expected, (
         f"recurrent-state pool has {recurrent_primary} slots with block reuse enabled, "
-        f"need >= max_batch_size + 1 = {max_batch_size + 1} to prevent the padding "
-        f"sentinel from evicting live recurrent state"
+        f"need {expected} for live + save-last + padding + regular snapshots"
+    )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("retained_k", [1, 2, 3])
+def test_cpp_hybrid_recurrent_pool_reserves_retained_save_last_slots(retained_k):
+    """With ``mamba_max_off_grid_snapshots_per_chain = K`` a finished request
+    keeps K save-last snapshots of its chain alive for the next turn. Those
+    outlive the request, so the pool must reserve them per sequence slot on
+    top of the live state and the request's own save-last:
+    max_batch_size * (1 + 1 + K) + padding + regular snapshots.
+    """
+    max_batch_size = 4
+    interval = 256
+    max_tokens = 512
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        periodic_snapshot_interval=interval,
+        mamba_max_off_grid_snapshots_per_chain=retained_k,
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    expected = (2 + retained_k) * max_batch_size + 1 + max_tokens // interval
+    assert recurrent_primary == expected, (
+        f"recurrent-state pool has {recurrent_primary} slots with K={retained_k}, "
+        f"need {expected} for live + save-last + {retained_k} retained save-last per "
+        f"sequence slot + padding + regular snapshots"
+    )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_recurrent_pool_retention_requires_block_reuse():
+    """K is inert without block reuse: no save-last snapshots exist, so
+    nothing is retained and the pool keeps the reuse-off size (live states
+    + padding)."""
+    max_batch_size = 4
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=False,
+        mamba_max_off_grid_snapshots_per_chain=2,
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    assert recurrent_primary == max_batch_size + 1, (
+        f"recurrent-state pool has {recurrent_primary} slots without block reuse, "
+        f"expected live + padding = {max_batch_size + 1}"
+    )
+
+
+@_skip_under_ray
+@skip_no_cuda
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_cpp_hybrid_retained_save_last_pool_scales_with_pp_size(pp_size):
+    """Retained save-last slots follow the live-request terms' PP scaling."""
+    max_batch_size = 4
+    interval = 256
+    max_tokens = 512
+    retained_k = 2
+    mgr = _build_hybrid_with_mamba_layer_pp(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        periodic_snapshot_interval=interval,
+        pp_size=pp_size,
+        mamba_max_off_grid_snapshots_per_chain=retained_k,
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    expected = (2 + retained_k) * max_batch_size * pp_size + 1 + max_tokens // interval
+    assert recurrent_primary == expected, (
+        f"recurrent-state pool has {recurrent_primary} slots with K={retained_k} and "
+        f"pp_size={pp_size}, need {expected}"
     )
 
 
 @skip_no_cuda
 def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
     """Dry-run path (is_estimating_kv_cache=True) under block reuse must
-    keep the live-state floor *plus* room for snapshots, not collapse to
-    max(snapshots, live). With max_batch_size=4, interval=256, max_tokens=512:
-      old:  max_snapshots = max(512//256, 4)         = 4   (no headroom for snapshots)
-      new:  max_snapshots = 4 + 512//256             = 6   (live + snapshots)
+    reserve a live state and a save-last state per request plus room for
+    regular snapshots. With max_batch_size=4, interval=256, max_tokens=512,
+    that is 4 + 4 + 2 = 10 slots.
     """
     max_batch_size = 4
     mgr = _build_hybrid_with_mamba_layer(
@@ -4235,13 +4362,41 @@ def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
         is_estimating_kv_cache=True,
     )
     recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
-    # 4 live state slots + 2 reuse snapshots = 6.
-    expected_min = max_batch_size + (512 // 256)
-    assert recurrent_primary >= expected_min, (
+    expected = 2 * max_batch_size + (512 // 256)
+    assert recurrent_primary == expected, (
         f"dry-run recurrent-state pool has {recurrent_primary} slots, "
-        f"need >= live_state + reuse_snapshots = {expected_min}; the old "
-        f"max(reuse, live) formula dropped reuse headroom"
+        f"need live + save-last + regular snapshots = {expected}"
     )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_non_aligned_full_batch_reserves_save_last_slots():
+    """A full batch of non-block-aligned prompts needs one terminal snapshot
+    per request in addition to each mutable live state.
+
+    This matches the failed rollout shape: 128 active requests per replica,
+    4096-token intervals, and prompts whose terminal reusable block does not
+    coincide with an interval snapshot.
+    """
+    max_batch_size = 128
+    interval = 4096
+    max_tokens = 16384
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        periodic_snapshot_interval=interval,
+        max_tokens=max_tokens,
+    )
+    requests = [
+        SimpleNamespace(prompt_len=7639, expect_snapshot_points=[]) for _ in range(max_batch_size)
+    ]
+    mgr.prepare_expect_snapshot_points(requests)
+    assert all(request.expect_snapshot_points == [4096, 7616] for request in requests)
+
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    expected = 2 * max_batch_size + 1 + max_tokens // interval
+    assert recurrent_primary == expected
 
 
 # ---------------------------------------------------------------------------
@@ -4265,6 +4420,7 @@ def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
 def _build_zero_mamba_hybrid(
     enable_block_reuse=False,
     periodic_snapshot_interval=256,
+    mamba_max_off_grid_snapshots_per_chain=0,
 ):
     """Construct a real CppMambaHybridCacheManager whose this-rank slice has
     no mamba layers. world_size=1 / pp_size=1 keeps the real parent
@@ -4282,6 +4438,7 @@ def _build_zero_mamba_hybrid(
         max_tokens=128,
         enable_block_reuse=enable_block_reuse,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=periodic_snapshot_interval),
+        mamba_max_off_grid_snapshots_per_chain=mamba_max_off_grid_snapshots_per_chain,
     )
 
     mgr = CppMambaHybridCacheManager(
@@ -4418,3 +4575,162 @@ def test_v2_stack_state_views_rejects_non_affine_layout():
     assert stack([pool[0], pool[1], pool[3]]) is None
     assert stack([pool[0], torch.zeros(5, 8)]) is None
     assert stack([]) is None
+
+
+# ---------------------------------------------------------------------------
+# KvCacheConfig.mamba_max_off_grid_snapshots_per_chain plumbing
+#
+# The knob caps the materialized off-grid (save-last) recurrent snapshots kept
+# per reuse chain in the C++ recurrent manager. It must reach
+# LinearAttentionMetadata.max_off_grid_snapshots_per_chain on BOTH constructor
+# branches (ranks with and without local Mamba layers publish identical
+# metadata) and must be inert (0) without block reuse.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_cache_config_mamba_max_off_grid_snapshots_per_chain_defaults_to_zero():
+    assert KvCacheConfig().mamba_max_off_grid_snapshots_per_chain == 0
+    assert (
+        KvCacheConfig(
+            mamba_max_off_grid_snapshots_per_chain=2
+        ).mamba_max_off_grid_snapshots_per_chain
+        == 2
+    )
+    with pytest.raises(ValueError):
+        KvCacheConfig(mamba_max_off_grid_snapshots_per_chain=-1)
+
+
+def test_linear_attention_metadata_binding_exposes_max_off_grid_snapshots_per_chain():
+    from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata
+
+    metadata = LinearAttentionMetadata()
+    assert metadata.max_off_grid_snapshots_per_chain == 0
+    metadata.max_off_grid_snapshots_per_chain = 2
+    assert metadata.max_off_grid_snapshots_per_chain == 2
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "enable_block_reuse,expected",
+    [(True, 2), (False, 0)],
+    ids=["reuse_on", "reuse_off_forces_zero"],
+)
+def test_cpp_hybrid_plumbs_max_off_grid_snapshots_per_chain(enable_block_reuse, expected):
+    mgr = _build_hybrid_with_mamba_layer(
+        enable_block_reuse=enable_block_reuse,
+        periodic_snapshot_interval=64,
+        mamba_max_off_grid_snapshots_per_chain=2,
+    )
+    assert mgr.linear_attention_metadata.max_off_grid_snapshots_per_chain == expected
+    # The default stays off.
+    default_mgr = _build_hybrid_with_mamba_layer(
+        enable_block_reuse=enable_block_reuse, periodic_snapshot_interval=64
+    )
+    assert default_mgr.linear_attention_metadata.max_off_grid_snapshots_per_chain == 0
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "enable_block_reuse,expected",
+    [(True, 2), (False, 0)],
+    ids=["reuse_on", "reuse_off_forces_zero"],
+)
+def test_cpp_hybrid_zero_local_mamba_plumbs_max_off_grid_snapshots_per_chain(
+    enable_block_reuse, expected
+):
+    # PP ranks without local Mamba layers replay the same scheduling decisions
+    # and must publish the same knob as the Mamba-owning ranks.
+    mgr = _build_zero_mamba_hybrid(
+        enable_block_reuse=enable_block_reuse,
+        periodic_snapshot_interval=64,
+        mamba_max_off_grid_snapshots_per_chain=2,
+    )
+    assert mgr.local_num_mamba_layers == 0
+    assert mgr.linear_attention_metadata.max_off_grid_snapshots_per_chain == expected
+
+
+# --------------------------------------------------------------------------
+# get_final_state_index: the fold table is per-iteration; under the overlap
+# scheduler the previous batch's KV send runs after the next prepare_resources
+# rebuilt it, so the slot must be derivable from the sequence's block list.
+# --------------------------------------------------------------------------
+
+
+def _fake_hybrid_for_final_state(raw_ids, slots, primary=7):
+    """CppMambaHybridCacheManager surface used by get_final_state_index, with
+    the per-iteration fold table already rebuilt for the next batch (empty)."""
+    sentinel = LinearCacheType.RECURRENT_STATES.value
+    calls = []
+
+    def get_batch_cache_indices(request_ids, window_size=None):
+        assert window_size == sentinel
+        calls.append(("indices", tuple(request_ids)))
+        return [list(raw_ids)]
+
+    def get_memory_pool_block_indices(block_ids, window_size=None):
+        assert window_size == sentinel
+        calls.append(("slots", tuple(block_ids)))
+        return [slots[b] for b in block_ids]
+
+    fake = SimpleNamespace(
+        _request_id_to_fold={},
+        _request_id_to_state_index={42: primary},
+        tokens_per_block=32,
+        get_batch_cache_indices=get_batch_cache_indices,
+        get_memory_pool_block_indices=get_memory_pool_block_indices,
+    )
+    return fake, calls
+
+
+def test_final_state_index_resolves_end_of_prompt_block_after_fold_table_reset():
+    """prompt_len 90 -> tokens 0..89 -> last token in block 2 -> its slot."""
+    fake, calls = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12],
+                                               slots={12: 300},
+                                               primary=200)  # S1 = stale
+    assert CppMambaHybridCacheManager.get_final_state_index(
+        fake, 42, prompt_len=90) == 300
+    assert calls == [("indices", (42, )), ("slots", (12, ))]
+
+
+def test_final_state_index_block_aligned_prompt_uses_last_full_block():
+    """prompt_len 96 -> last token 95 -> block 2 (not block 3)."""
+    fake, _ = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12],
+                                           slots={12: 301})
+    assert CppMambaHybridCacheManager.get_final_state_index(
+        fake, 42, prompt_len=96) == 301
+
+
+def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_requests():
+    """A generation-phase request that already carries its points is left alone
+    (nothing reads them any more); context-phase and unprepared requests are
+    (re)computed. The points of a request depend only on its prompt length."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+    )
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=64, save_last_snapshot=True)
+    mgr.tokens_per_block = 32
+    mgr.enable_block_reuse = True
+    ctx = SimpleNamespace(prompt_len=150, expect_snapshot_points=[], state=LlmRequestState.CONTEXT_INIT)
+    gen_new = SimpleNamespace(prompt_len=128, expect_snapshot_points=[], state=LlmRequestState.GENERATION_IN_PROGRESS)
+    gen_done = SimpleNamespace(
+        prompt_len=128,
+        expect_snapshot_points=[1, 2, 3],
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_snapshot_points_ready=True,
+    )
+    mgr.prepare_expect_snapshot_points([ctx, gen_new, gen_done])
+    assert ctx.expect_snapshot_points == [64, 128] and ctx.py_snapshot_points_ready
+    assert gen_new.expect_snapshot_points == [64, 96, 128] and gen_new.py_snapshot_points_ready
+    assert gen_done.expect_snapshot_points == [1, 2, 3], "prepared generation-phase request untouched"
+    # a context-phase request is recomputed every pass, marker or not
+    ctx.expect_snapshot_points = [999]
+    mgr.prepare_expect_snapshot_points([ctx])
+    assert ctx.expect_snapshot_points == [64, 128]
+    # reuse disabled: same skip rule, empty lists otherwise
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    mgr.prepare_expect_snapshot_points([ctx, gen_done])
+    assert ctx.expect_snapshot_points == [] and gen_done.expect_snapshot_points == [1, 2, 3]

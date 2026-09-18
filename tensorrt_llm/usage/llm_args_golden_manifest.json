@@ -684,6 +684,11 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_max_off_grid_snapshots_per_chain"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",

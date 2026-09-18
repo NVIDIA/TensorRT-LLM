@@ -1341,6 +1341,31 @@ class Sender(SenderBase):
         return dst_block_ids[block_diff:]
 
     @nvtx_range("_build_kv_write_meta")
+    @staticmethod
+    def _mamba_slot_pairs(src_slots: np.ndarray, dst_slots: np.ndarray) -> list[tuple[int, int]]:
+        """(src, dst) recurrent-state slot pairs for one STATE layer group.
+
+        Entry 0 on each side is the request's current-state slot. The remaining
+        entries are prompt-range recurrent snapshot slots in grid order (Cpp
+        hybrid manager with receiver-side block reuse): both engines lay
+        snapshots on the same prompt-derived grid, the receiver lists only the
+        suffix past its snapshot-floored reuse hit and the sender lists every
+        materialized point, so the receiver's entries pair with the sender's
+        suffix.
+        """
+        pairs = [(int(src_slots[0]), int(dst_slots[0]))]
+        num_dst_snapshots = int(dst_slots.size) - 1
+        if num_dst_snapshots > 0:
+            num_src_snapshots = int(src_slots.size) - 1
+            if num_dst_snapshots > num_src_snapshots:
+                raise ValueError(
+                    "receiver needs more recurrent snapshot slots "
+                    f"({num_dst_snapshots}) than the sender materialized ({num_src_snapshots})"
+                )
+            src_suffix = src_slots[1 + num_src_snapshots - num_dst_snapshots :]
+            pairs.extend((int(s), int(d)) for s, d in zip(src_suffix, dst_slots[1:]))
+        return pairs
+
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         self_ri = self._registrar.self_rank_info
@@ -1398,8 +1423,17 @@ class Sender(SenderBase):
                     continue
                 if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
                     continue
-                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
-                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
+                # Entry 0 is the request's current-state slot; any further
+                # entries are prompt-range recurrent snapshot slots (Cpp hybrid
+                # manager with receiver-side block reuse), suffix-aligned by
+                # _mamba_slot_pairs. Each pair is one slot-to-slot transfer.
+                region_pairs_in = [
+                    (
+                        extractor.extract_slot(src_slot, self_lg, self_pi),
+                        peer_extractor.extract_slot(dst_slot, peer_lg, peer_pi),
+                    )
+                    for src_slot, dst_slot in Sender._mamba_slot_pairs(src_block_ids, dst_block_ids)
+                ]
             else:
                 tpb = extractor.page_table.tokens_per_block
                 if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
@@ -1465,17 +1499,22 @@ class Sender(SenderBase):
                     dst_token_start=dst_start,
                     tokens_per_block=tpb,
                 )
-                src_region = extractor.extract(src_block_ids, self_lg, self_pi)
-                dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
+                region_pairs_in = [
+                    (
+                        extractor.extract(src_block_ids, self_lg, self_pi),
+                        peer_extractor.extract(dst_block_ids, peer_lg, peer_pi),
+                    )
+                ]
 
             # Map and collect fragments (same for all layer types)
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-            region_pair = mapper.map(src_region, dst_region)
-            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-            for rp in region_pairs:
-                src_frag_parts.append(rp.src.memory.ptrs)
-                dst_frag_parts.append(rp.dst.memory.ptrs)
-                size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+            for src_region, dst_region in region_pairs_in:
+                region_pair = mapper.map(src_region, dst_region)
+                region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+                for rp in region_pairs:
+                    src_frag_parts.append(rp.src.memory.ptrs)
+                    dst_frag_parts.append(rp.dst.memory.ptrs)
+                    size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -2678,6 +2717,21 @@ class Receiver(ReceiverBase):
                     return int(block_ids[0])
         return None
 
+    def _get_mamba_slot_count(self, req_info: RecvReqInfo) -> int:
+        """Number of recurrent-state slots the receiver expects for a request.
+
+        1 for the current state alone; more when the Cpp hybrid manager also
+        receives prompt-range recurrent snapshot slots (receiver-side block
+        reuse), each of which lands as a full per-layer slot payload.
+        """
+        pt = self._registrar.self_extractor.page_table
+        if pt is None:
+            return 0
+        for lg_idx, lg in enumerate(pt.layer_groups):
+            if lg.kind == CacheKind.STATE:
+                return int(req_info.block_ids_per_layer_groups[lg_idx].size)
+        return 0
+
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
         logger.debug(
@@ -2769,7 +2823,7 @@ class Receiver(ReceiverBase):
                     sender_page_table=peer_infos.page_table,
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=mamba_dst_slot,
-                )
+                ) * self._get_mamba_slot_count(receiver_req)
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
         )

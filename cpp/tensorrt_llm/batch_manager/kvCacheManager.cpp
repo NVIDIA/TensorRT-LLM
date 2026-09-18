@@ -38,6 +38,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -554,6 +555,10 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     auto const numUniqueWindowSizes = static_cast<SizeType32>(uniqueWindowSizeToLayers.size());
 
     mIsVariableWindow = numUniqueWindowSizes > 1;
+    auto const numUniqueAttentionWindowSizes
+        = std::count_if(uniqueWindowSizeToLayers.cbegin(), uniqueWindowSizeToLayers.cend(),
+            [](auto const& entry) { return !LinearAttentionMetadata::hasLinearCache(entry.first); });
+    mIsVariableAttentionWindow = numUniqueAttentionWindowSizes > 1;
     mIsVariableGQA = std::unordered_set(numKvHeadsPerLayer.begin(), numKvHeadsPerLayer.end()).size() > 1;
 
     // Build a window -> PoolConfiguration index for fast lookup.  Today, one pool per window
@@ -1228,6 +1233,197 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
     }
 }
 
+WindowBlockManager::OffGridDemotionPlan WindowBlockManager::planOffGridSnapshotDemotion(
+    GenerationRequest const& sequence, OptionalRef<LlmRequest const> llmRequest,
+    std::vector<BlockPtr> const& allocatedBlocks) const
+{
+    OffGridDemotionPlan plan;
+    // G1: recurrent manager with the rule enabled and a snapshot layout that produces off-grid save-lasts.
+    if (!isRecurrentState() || mLinearAttentionMetadata->maxOffGridSnapshotsPerChain <= 0
+        || !mLinearAttentionMetadata->saveLastSnapshot || mLinearAttentionMetadata->statesSnapshotInterval <= 0)
+    {
+        return plan;
+    }
+    // G2: with beamWidth > 1 mAllocatedBlocksPerSeq is beam-interleaved, so index != block position.
+    if (sequence.getBeamWidth() != 1)
+    {
+        return plan;
+    }
+    // G3: the prompt length comes from the request; dummy requests never store anything.
+    if (!llmRequest.has_value() || llmRequest->isDummyRequest())
+    {
+        return plan;
+    }
+    auto const promptLen = llmRequest->getPromptLen();
+    if (promptLen <= 1)
+    {
+        return plan;
+    }
+    // Same position as the save-last term of LinearAttentionMetadata::shouldAllocateRecurrentStates: the last
+    // full block a duplicate can reach. A block-aligned prompt additionally freezes its end block at
+    // saveLastIdx + 1; both are protected because every position >= saveLastIdx is.
+    auto const saveLastIdx = (promptLen - 1) / mTokensPerBlock - 1;
+    if (saveLastIdx < 1 || static_cast<SizeType32>(allocatedBlocks.size()) <= saveLastIdx)
+    {
+        return plan;
+    }
+    // G4: the request's own save-last snapshot must be materialized AND committed to the tree. That is
+    // not the case for cancelled / paused / fast-terminated requests that never reached their final
+    // storeContextBlocks, nor when storeBlocks skipped it because the slot was already occupied. Then the
+    // conversation's newest snapshot is an ancestor and nothing may be demoted.
+    auto const& saveLast = allocatedBlocks[saveLastIdx];
+    if (!saveLast || saveLast->isPlaceholder() || saveLast->getBlockId() < 0 || saveLast->isDetached())
+    {
+        return plan;
+    }
+    plan.enabled = true;
+    plan.saveLastIdx = saveLastIdx;
+    // The request's own save-last counts as retained whether or not it sits on the interval grid, so
+    // K == 1 demotes every eligible historical snapshot and K keeps the newest K - 1 of them.
+    plan.retained = 1;
+    plan.chainWalker = saveLast->getLookupNode();
+    return plan;
+}
+
+bool WindowBlockManager::shouldDemoteOffGridSnapshot(
+    OffGridDemotionPlan& plan, BlockPtr const& block, SizeType32 position) const
+{
+    // C1: positions >= saveLastIdx (own save-last, frozen end block of an aligned prompt) are protected.
+    if (!plan.enabled || position >= plan.saveLastIdx)
+    {
+        return false;
+    }
+    // C2: materialized and tree-resident. Detached blocks carry no reusable state, placeholders hold none.
+    if (block->isPlaceholder() || block->getBlockId() < 0 || block->isDetached())
+    {
+        return false;
+    }
+    // C3: interval-grid snapshots are load-bearing for forced chunking, expect_snapshot_points and the
+    // disagg transfer pairing; only off-grid (historical save-last) snapshots are eligible.
+    auto const blockEndToken = (position + 1) * mTokensPerBlock;
+    if (blockEndToken % mLinearAttentionMetadata->statesSnapshotInterval == 0)
+    {
+        return false;
+    }
+    if (!plan.chainIntact)
+    {
+        return false;
+    }
+    // Chain integrity: every node between the save-last node and this block's node must hold a recurrent
+    // value. Otherwise the newer snapshot is unreachable through this position (findReusableBlockMatches
+    // stops at a value-less node) and this block is the effective floor of the chain: keep it.
+    auto const node = block->getLookupNode();
+    while (plan.chainWalker && plan.chainWalker != node)
+    {
+        auto const value = plan.chainWalker->getValue(mWindowSize);
+        if (!value.has_value() || !(*value))
+        {
+            plan.chainIntact = false;
+            return false;
+        }
+        plan.chainWalker = plan.chainWalker->getParentNode();
+    }
+    if (plan.chainWalker != node)
+    {
+        plan.chainIntact = false;
+        return false;
+    }
+    // C5: exactly one recurrent child. Zero would mean a hole right below this block; more than one means
+    // another branch (sibling generations, retries) may still floor on this snapshot.
+    if (node->getChildKeyValues(mWindowSize).size() != 1)
+    {
+        return false;
+    }
+    // C6: budget. Walking newest -> oldest, the newest K - 1 historical off-grid snapshots that pass
+    // every gate above are kept; branch points and chain-broken blocks never consume a slot.
+    if (plan.retained < mLinearAttentionMetadata->maxOffGridSnapshotsPerChain)
+    {
+        ++plan.retained;
+        return false;
+    }
+    // C4: still referenced by an in-flight request (sibling turn, transfer in progress): kept, and it
+    // already occupies its slot in the budget, so nothing is added for it.
+    if (block->hasRefs())
+    {
+        return false;
+    }
+    return true;
+}
+
+bool WindowBlockManager::tryDemoteToPlaceholder(BlockPtr const& real)
+{
+    TLLM_CHECK_WITH_INFO(
+        isRecurrentState(), "%s::tryDemoteToPlaceholder - only recurrent-state managers demote", mLogPrefix.c_str());
+    TLLM_CHECK_WITH_INFO(real && !real->isPlaceholder() && real->getBlockId() >= 0,
+        "%s::tryDemoteToPlaceholder - expected a materialized pooled block", mLogPrefix.c_str());
+    TLLM_CHECK_WITH_INFO(!real->hasRefs(), "%s::tryDemoteToPlaceholder - block %d is still referenced",
+        mLogPrefix.c_str(), real->getBlockId());
+    auto const node = real->getLookupNode();
+    TLLM_CHECK_WITH_INFO(node != nullptr, "%s::tryDemoteToPlaceholder - block %d is not in the lookup tree",
+        mLogPrefix.c_str(), real->getBlockId());
+    // Detaching the real block must not cascade-prune the node; the caller guarantees a continuation.
+    TLLM_CHECK_WITH_INFO(node->hasChildren(), "%s::tryDemoteToPlaceholder - block %d has no continuation",
+        mLogPrefix.c_str(), real->getBlockId());
+
+    // C7: only a DETACHED pooled placeholder may be used. The level-2 LRU front may be a tree-resident
+    // placeholder of another conversation or of this very request (its own placeholders between this
+    // block and its save-last were released to the back of that queue a moment ago); recycling it would
+    // punch a value-less hole into that chain. No candidate means: keep the block materialized.
+    auto placeholder = mEvictionPolicy->getFreeDetachedPlaceholder();
+    if (!placeholder)
+    {
+        ++mDemotionsRefusedNoPlaceholder;
+        TLLM_LOG_DEBUG("%s::tryDemoteToPlaceholder - no detached placeholder free, keeping block %d",
+            mLogPrefix.c_str(), real->getBlockId());
+        return false;
+    }
+    TLLM_CHECK_WITH_INFO(placeholder->isPlaceholder() && placeholder->isDetached() && !placeholder->hasRefs(),
+        "%s::tryDemoteToPlaceholder - eviction policy returned an unusable placeholder %d", mLogPrefix.c_str(),
+        placeholder->getBlockId());
+    mEvictionPolicy->claimBlock(placeholder);
+
+    if (mEventManager && blockInRadixTree(real))
+    {
+        // Same semantics as an interior eviction in getFreeBlock: the state is gone while the descendants
+        // (whose chained hashes stay valid through the copied hash below) remain stored. No Stored event is
+        // emitted for the placeholder (storeBlocks filters placeholders for the same reason).
+        mEventManager->enqueueRemovedEvent(real, mWindowSize);
+    }
+
+    auto const blockKey = real->getBlockKey();
+    auto const isFull = real->isFull();
+    auto const hash = real->getHash();
+    auto const prevBlockInSeq = real->getPrevBlockInSeq();
+    auto const children = real->getNextBlocks(); // needs the lookup node, so before detaching
+
+    real->detachFromLookupNode();
+    placeholder->setBlockKey(blockKey, isFull);
+    placeholder->setPrevBlockInSeq(prevBlockInSeq);
+    placeholder->attachToLookupNode(node, mWindowSize);
+    placeholder->setHash(hash);
+    for (auto const& [_, child] : children)
+    {
+        if (child->getPrevBlockInSeq() == real)
+        {
+            child->setPrevBlockInSeq(placeholder);
+        }
+    }
+    // A recycled placeholder may still carry its last owner's retention priority / duration; a
+    // min-priority placeholder at a hot node would be the first one recycled by getFreeBlock(wantPlaceholder).
+    placeholder->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
+    placeholder->setDurationMs(std::nullopt);
+    mEvictionPolicy->releaseBlock(placeholder, /*toFront=*/false);
+
+    // The real block represents no prefix any more: clear its key so getFreeBlock does not treat it as
+    // offloadable state, and drop the owning link so front-queue reuse cannot chain completed requests.
+    real->setBlockKey(BlockKey{}, /*isFull=*/false);
+    real->setPrevBlockInSeq(nullptr);
+    ++mDemotedOffGridSnapshots;
+    TLLM_LOG_DEBUG("%s::tryDemoteToPlaceholder - block %d demoted, placeholder %d now holds its trie slot",
+        mLogPrefix.c_str(), real->getBlockId(), placeholder->getBlockId());
+    return true;
+}
+
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory, bool wantPlaceholder)
@@ -1410,35 +1606,98 @@ void WindowBlockManager::offloadBlock(
 PrefixReuseSummary BlockManager::analyzePrefixReuse(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
-    TLLM_CHECK_WITH_INFO(!isVariableWindow(), "analyzePrefixReuse does not work for variable window attention");
-    auto const& onlyManager = mWindowBlockManagers.cbegin()->second;
-    return onlyManager.analyzePrefixReuse(uniqueTokens, llmRequest);
+    TLLM_CHECK_WITH_INFO(
+        !isVariableAttentionWindow(), "analyzePrefixReuse does not work for variable window attention");
+    // Walk the attention window's tree. A hybrid model additionally has a
+    // kRecurrentStates manager which sorts FIRST in the window map (its
+    // encoded window size is negative), so cbegin() must not be used here.
+    WindowBlockManager const* attentionManager = nullptr;
+    WindowBlockManager const* recurrentManager = nullptr;
+    for (auto const& [windowSize, manager] : mWindowBlockManagers)
+    {
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            recurrentManager = &manager;
+        }
+        else if (attentionManager == nullptr)
+        {
+            attentionManager = &manager;
+        }
+    }
+    TLLM_CHECK_WITH_INFO(attentionManager != nullptr, "analyzePrefixReuse found no attention window manager");
+    auto summary = attentionManager->analyzePrefixReuse(uniqueTokens, llmRequest);
+    if (recurrentManager != nullptr)
+    {
+        // Admission (addSequenceBatch) mins the match across windows, and the
+        // recurrent walk only commits a prefix that ends on a materialized state
+        // snapshot, so the recurrent window is the binding reuse constraint for
+        // hybrid models. Its committed match includes traversed placeholders, so
+        // block count times block size is exactly the snapshot-floored token count.
+        //
+        // The walk must probe exactly admission's key set: claimMatchingBlocks chops
+        // inputLength - 1 tokens, so a block-aligned prompt probes one FEWER full key
+        // than the full-prompt chop. The snapshot floor is non-monotone in the key
+        // count — dropping the final key rolls the committed prefix back to the
+        // previous materialized snapshot, not back by one block — so probing the
+        // extra key (whose end-of-sequence block is always materialized) would
+        // over-credit every block-aligned duplicate.
+        auto const admissionTokenCount = uniqueTokens.empty() ? std::size_t{0} : uniqueTokens.size() - 1;
+        auto const recurrentSummary
+            = recurrentManager->analyzePrefixReuse(uniqueTokens, llmRequest, admissionTokenCount);
+        summary.recurrentReusableTokens = recurrentSummary.reusableBlocksAll * getTokensPerBlock();
+        summary.recurrentFreeOffGridBlocks = recurrentSummary.recurrentFreeOffGridBlocks;
+        summary.recurrentSchedulingFreeOffGridBlocks = recurrentSummary.recurrentSchedulingFreeOffGridBlocks;
+    }
+    return summary;
 }
 
 PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
-    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, std::optional<std::size_t> tokenCount) const
 {
-    auto blockedUniqueTokens
-        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size(), mTokensPerBlock, false);
+    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+        uniqueTokens, tokenCount.value_or(uniqueTokens.size()), mTokensPerBlock, false);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
 
     PrefixReuseSummary summary;
+
+    if (isRecurrentState())
+    {
+        summary.recurrentFreeOffGridBlocks = 0;
+        summary.recurrentSchedulingFreeOffGridBlocks = 0;
+    }
 
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto reuseMatches = findReusableBlockMatches(
         blockKeys, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, std::numeric_limits<SizeType32>::max());
 
-    for (auto const& match : reuseMatches.matches)
+    for (std::size_t matchIdx = 0; matchIdx < reuseMatches.matches.size(); ++matchIdx)
     {
+        auto const& match = reuseMatches.matches[matchIdx];
         if (match.isTraversalOnly)
         {
             continue;
         }
 
         ++summary.reusableBlocksAll;
-        if (match.block->hasRefs())
+        auto const isAllocated = match.block->hasRefs();
+        auto const isSchedulingAllocated = match.block->hasSchedulingRefs();
+        if (isAllocated)
         {
             ++summary.reusableBlocksAllocated;
+        }
+        auto const isOffGrid = isRecurrentState() && !match.block->isPlaceholder()
+            && !mLinearAttentionMetadata->shouldAllocateRecurrentStates(
+                static_cast<SizeType32>(matchIdx + 1) * mTokensPerBlock, llmRequest.getPromptLen(), mTokensPerBlock);
+        if (isOffGrid && !isAllocated)
+        {
+            // A free historical save-last snapshot is physically claimed in
+            // addSequenceBatch Phase 1 even though the current cold layout
+            // would place a placeholder at this block index.
+            ++(*summary.recurrentFreeOffGridBlocks);
+        }
+        if (isOffGrid && (!isAllocated || !isSchedulingAllocated))
+        {
+            ++(*summary.recurrentSchedulingFreeOffGridBlocks);
         }
     }
     summary.firstNewBlock = reuseMatches.firstNewBlock;
@@ -1467,6 +1726,18 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     SizeType32 safeMatchedTokens{0};
     auto updateSafePrefix = [&]()
     {
+        // A recurrent-state placeholder is only useful for traversing to a later materialized snapshot. Keep it in
+        // candidateMatches, but do not expose a reusable prefix that ends in a placeholder. If a later real snapshot
+        // matches, that snapshot commits the entire candidate prefix, including the intervening placeholders.
+        if (isRecurrentState() && !candidateMatches.empty())
+        {
+            auto const& lastMatch = candidateMatches.back();
+            if (lastMatch.isTraversalOnly || !lastMatch.block || lastMatch.block->isPlaceholder())
+            {
+                return;
+            }
+        }
+
         if (!mIsSWA || latestMissingAnchorEndToken == 0
             || candidateMatchedTokens >= latestMissingAnchorEndToken + mWindowSize)
         {
@@ -2671,7 +2942,52 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
         auto const bid = block->getBlockId();
         auto const existing = node->getValue(mWindowSize);
 
-        if (existing.has_value())
+        if (existing.has_value() && *existing && isRecurrentState()
+            && mLinearAttentionMetadata->maxOffGridSnapshotsPerChain > 0 && (*existing)->isPlaceholder()
+            && (*existing)->getBlockId() != KVCacheBlock::kPlaceholderBlockId && !(*existing)->hasRefs()
+            && (node->hasChildren() || node->numValues() > 1))
+        {
+            // A real recurrent snapshot arrives at a slot held by an unreferenced pooled placeholder,
+            // typically a position demoted by tryDemoteToPlaceholder that a retry or a sibling of that
+            // turn re-materialized. Swap them (the exact inverse of the demotion) so the slot regains a
+            // reusable state instead of staying a placeholder for good. The node keeps another value or
+            // a child, so detaching the placeholder cannot cascade-prune it. Gated on the demotion knob so
+            // that knob == 0 keeps today's store behaviour (occupied slot -> skip) unchanged.
+            auto const placeholder = *existing;
+            mEvictionPolicy->claimBlock(placeholder); // out of the level-2 free queue (no-op if not queued)
+            auto const children = placeholder->getNextBlocks();
+            placeholder->detachFromLookupNode();
+
+            block->detachFromLookupNode();
+            block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+            block->setPrevBlockInSeq(prevBlock);
+            block->attachToLookupNode(node, mWindowSize);
+            auto const newHash = BlockKeyHasher()(blockKey, prevBlock->getHash());
+            if (block->getHash() != newHash)
+            {
+                block->setHash(newHash);
+            }
+            for (auto const& [_, child] : children)
+            {
+                if (child->getPrevBlockInSeq() == placeholder)
+                {
+                    child->setPrevBlockInSeq(block);
+                }
+            }
+            placeholder->setBlockKey(BlockKey{}, /*isFull=*/false);
+            placeholder->setPrevBlockInSeq(nullptr);
+            placeholder->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
+            placeholder->setDurationMs(std::nullopt);
+            mEvictionPolicy->releaseBlock(placeholder, /*toFront=*/true);
+            TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: re-materialized trie slot held by placeholder %d",
+                mLogPrefix.c_str(), bid, placeholder->getBlockId());
+
+            storedBlocks.push_back(block);
+            prevBlock = block;
+            numBlocksStoredForReuse++;
+            ++mRematerializedPlaceholders;
+        }
+        else if (existing.has_value())
         {
             // Trie slot already occupied (block previously stored by this or another sequence).
             // Advance prevBlock and continue. Subsequent blocks may still need
@@ -2892,11 +3208,18 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
 
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1
-            || mLinearAttentionMetadata.has_value()
-            /* Hybrid model we only store context blocks for reuse*/)
+        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1)
         {
             lastStoredId = manager.releaseBlocks(sequence, std::nullopt);
+        }
+        else if (mLinearAttentionMetadata.has_value())
+        {
+            // Hybrid model: only context blocks are stored for reuse, so the attention managers must not
+            // see the request (they would store generation blocks at release). The recurrent manager does
+            // receive it, for the off-grid save-last demotion rule (planOffGridSnapshotDemotion); its store
+            // guard `llmRequest.has_value() && !isRecurrentState()` keeps it from storing anything.
+            lastStoredId = manager.releaseBlocks(
+                sequence, manager.isRecurrentState() ? llmRequest : OptionalRef<LlmRequest const>{std::nullopt});
         }
         else
         {
@@ -3145,6 +3468,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
             sequence.getRequestId(), numBlocksStoredForReuse);
     }
+    // Recurrent manager only: decide up front whether this release may demote historical off-grid
+    // save-last snapshots of the request's chain (LinearAttentionMetadata::maxOffGridSnapshotsPerChain).
+    auto demotionPlan = planOffGridSnapshotDemotion(sequence, llmRequest, allocatedBlocks);
     // Iterate all allocated blocks (including placeholder sentinels at OOW positions);
     // EvictionPolicy::releaseBlock silently skips placeholders.
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
@@ -3156,6 +3482,39 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
             // An out-of-window block may not have any ref count.
             block->decRefCount();
         }
+        if (demotionPlan.enabled)
+        {
+            // beamWidth == 1 is gated in the plan, so the index in allocatedBlocks is the block position.
+            // Evaluated before the refcount branch so that a still-referenced snapshot is counted against
+            // the budget (it is kept either way); shouldDemoteOffGridSnapshot never returns true for it.
+            auto const position = static_cast<SizeType32>(std::distance(it, allocatedBlocks.rend())) - 1;
+            if (shouldDemoteOffGridSnapshot(demotionPlan, block, position))
+            {
+                TLLM_CHECK_WITH_INFO(
+                    ((position + 1) * mTokensPerBlock) % mLinearAttentionMetadata->statesSnapshotInterval != 0,
+                    "%s::releaseBlocks - refusing to demote the interval-grid snapshot at position %d",
+                    mLogPrefix.c_str(), position);
+                if (demotionPlan.noDetachedPlaceholder)
+                {
+                    // The placeholder queue held no detached entry a moment ago and nothing has been returned to
+                    // it since: refuse without rescanning it.
+                    ++mDemotionsRefusedNoPlaceholder;
+                }
+                else if (tryDemoteToPlaceholder(block))
+                {
+                    // The real block is detached and key-less now: recycle it first, like an evicted block.
+                    block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+                    block->setDurationMs(std::nullopt);
+                    mEvictionPolicy->releaseBlock(block, /*toFront=*/true);
+                    continue;
+                }
+                else
+                {
+                    // tryDemoteToPlaceholder fails only for lack of a detached placeholder.
+                    demotionPlan.noDetachedPlaceholder = true;
+                }
+            }
+        }
         // If ref count is zero, move block to free blocks. Placeholder blocks have
         // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
@@ -3166,6 +3525,13 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
                 // Detached blocks have no reusable hash chain. Drop the stale owning link before recycling the block;
                 // otherwise front-queue reuse can join completed request chains into an unbounded ownership chain.
                 block->setPrevBlockInSeq(nullptr);
+                if (demotionPlan.noDetachedPlaceholder && block->isPlaceholder()
+                    && block->getBlockId() != KVCacheBlock::kPlaceholderBlockId)
+                {
+                    // One of this request's own detached pooled placeholders goes back to the front of the
+                    // placeholder queue below: older candidates on this path may be demoted onto it.
+                    demotionPlan.noDetachedPlaceholder = false;
+                }
             }
             // Send block to front of free queue if it has no reusable state,
             // so detached blocks are evicted before blocks cached for reuse.
@@ -3409,23 +3775,46 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
         auto const maxDraftTokensToAdd = std::min(req.getNumDraftTokens(), req.mMaxNewTokens);
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            // The recurrent pseudo-window's encoded "size" is a negative sentinel, so the
+            // attention-window truncation below would produce a garbage negative length and
+            // a nonsensical negative block count that disables the recurrent budget check.
+            // Recurrent state needs depend on the full prompt, not on an attention window.
+            auto required = mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
+                req.mPromptLen + maxDraftTokensToAdd, getTokensPerBlock(), mEnableBlockReuse);
+            if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk())
+            {
+                // Prefix-aware scheduling may be disabled, in which case the caller supplies
+                // an empty summary. Recurrent free-queue accounting guards admission capacity, so
+                // perform the tree walk whenever the recurrent portion is not authoritative.
+                auto summary = cachedSummary;
+                if (!summary.has_value() || !summary->recurrentSchedulingFreeOffGridBlocks.has_value())
+                {
+                    auto const& uniqueTokens = req.getUniqueTokens(0);
+                    auto const admissionTokenCount = uniqueTokens.empty() ? std::size_t{0} : uniqueTokens.size() - 1;
+                    summary = mBlockManager.getWindowBlockManager(LinearAttentionMetadata::kRecurrentStates)
+                                  .analyzePrefixReuse(uniqueTokens, req, admissionTokenCount);
+                }
+                required += *summary->recurrentSchedulingFreeOffGridBlocks;
+            }
+            return required;
+        }
         auto const promptCacheLen
             = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd,
                   windowSize + mChunkSize)
             + mSinkBubbleLength;
-        if (LinearAttentionMetadata::hasLinearCache(windowSize))
-        {
-            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
-                promptCacheLen, getTokensPerBlock(), mEnableBlockReuse);
-        }
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.getBeamWidth();
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
-        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
-        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
+        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention.
+        // A hybrid model's recurrent pseudo-window does not disable the credit: this branch only runs for
+        // the attention window (the recurrent window took the hasLinearCache early return above), and the
+        // token credit below is floored to the recurrent snapshot grid via recurrentReusableTokens.
+        if (mEnableBlockReuse && !mBlockManager.isVariableAttentionWindow() && !isCrossKv()
             && !req.isDisaggGenerationInitState())
         {
             // Use the cached summary if provided; otherwise perform a fresh tree walk.
@@ -3450,7 +3839,14 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // not under-credit reuse and serialize context requests.
             auto const reusableAllBlocks
                 = std::min({summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks});
-            req.setEstimatedReusableTokens(reusableAllBlocks * getTokensPerBlock());
+            auto reusableTokens = reusableAllBlocks * getTokensPerBlock();
+            if (summary.recurrentReusableTokens.has_value())
+            {
+                // Hybrid: admission mins the prepopulated length across windows, so the credit
+                // must not exceed the recurrent window's snapshot-floored match.
+                reusableTokens = std::min(reusableTokens, *summary.recurrentReusableTokens);
+            }
+            req.setEstimatedReusableTokens(reusableTokens);
         }
         return numRequiredBlocks;
     }
@@ -3514,14 +3910,45 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         }
         else if (!req.isContextFinished())
         {
+            auto const& linearAttentionMetadata = *mBlockManager.getLinearAttentionMetadata();
+            // GUARANTEED_NO_EVICT reserves through completion. Every block-aligned
+            // saveLast prompt needs a new primary recurrent-state block on the first
+            // decode because the prompt-end lookup block cannot move. The common
+            // estimator already reserves it initially when promptLen is interval-
+            // aligned (interval and prompt-end overlap in the physical layout), while
+            // off-interval aligned prompts need an explicit initial extra block. Once
+            // the context sequence exists, keep one look-ahead block reserved across
+            // scheduler iterations; otherwise a later request can consume it before
+            // the context-to-generation transition.
+            auto const needsAlignedGenerationLookAhead = mEnableBlockReuse && linearAttentionMetadata.saveLastSnapshot
+                && req.mPromptLen % getTokensPerBlock() == 0;
+            auto const initialAlignedGenerationLookAhead = needsAlignedGenerationLookAhead
+                    && linearAttentionMetadata.statesSnapshotInterval > 0
+                    && req.mPromptLen % linearAttentionMetadata.statesSnapshotInterval != 0
+                ? 1
+                : 0;
             std::scoped_lock lck(mSequencesMtx);
             auto const seqIt = mSequences.find(req.mRequestId);
             if (seqIt != mSequences.end())
             {
-                return 0;
+                return needsAlignedGenerationLookAhead ? 1 : 0;
             }
-            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
-                req.mPromptLen, getTokensPerBlock(), mEnableBlockReuse);
+            auto required = linearAttentionMetadata.calcNumBlocksNeededForReq(
+                                req.mPromptLen, getTokensPerBlock(), mEnableBlockReuse)
+                + initialAlignedGenerationLookAhead;
+            if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk())
+            {
+                auto summary = cachedSummary;
+                if (!summary.has_value() || !summary->recurrentFreeOffGridBlocks.has_value())
+                {
+                    auto const& uniqueTokens = req.getUniqueTokens(0);
+                    auto const admissionTokenCount = uniqueTokens.empty() ? std::size_t{0} : uniqueTokens.size() - 1;
+                    summary = mBlockManager.getWindowBlockManager(LinearAttentionMetadata::kRecurrentStates)
+                                  .analyzePrefixReuse(uniqueTokens, req, admissionTokenCount);
+                }
+                required += *summary->recurrentFreeOffGridBlocks;
+            }
+            return required;
         }
     }
 
@@ -3552,7 +3979,11 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     // comment in getNeededBlocksOneStep for the full rationale — free reusable blocks must
     // not be subtracted because they are already counted in the eviction policy's free count.
     SizeType32 numReusableContextBlocks = 0;
-    if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && req.isContextInitState() && req.isFirstContextChunk()
+    // hasLinearCache: kDISAGG_CONTEXT_INIT_AND_TRANS is both context-init and context-finished,
+    // so it skips the recurrent early returns above and reaches here with the recurrent window's
+    // negative encoded size; the credit math is attention-window math and must not run for it.
+    if (mEnableBlockReuse && !mBlockManager.isVariableAttentionWindow()
+        && !LinearAttentionMetadata::hasLinearCache(windowSize) && req.isContextInitState() && req.isFirstContextChunk()
         && numAllocBlocksPerBeam == 0)
     {
         // Use the cached summary if provided; otherwise perform a fresh tree walk.
@@ -3567,8 +3998,15 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
         // Token budget: count all reusable blocks (free or allocated). Cached tokens need
         // not be recomputed regardless of whether their blocks currently have active refs.
-        req.setEstimatedReusableTokens(
-            std::min({summary.reusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
+        auto reusableTokens
+            = std::min({summary.reusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock();
+        if (summary.recurrentReusableTokens.has_value())
+        {
+            // Hybrid: admission mins the prepopulated length across windows, so the credit
+            // must not exceed the recurrent window's snapshot-floored match.
+            reusableTokens = std::min(reusableTokens, *summary.recurrentReusableTokens);
+        }
+        req.setEstimatedReusableTokens(reusableTokens);
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
             "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "

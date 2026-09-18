@@ -574,24 +574,23 @@ class KVCacheManager(BaseResourceManager):
                 # max_tokens is already the affine-correct value computed
                 # upstream (_util.py:_tokens_for_budget honors the slope +
                 # intercept of CppMambaHybridCacheManager). Recurrent state
-                # slots live in a separate window: at minimum the live
-                # state per concurrent request, and -- when block reuse is
-                # enabled -- enough room for one regular snapshot per
-                # snapshot interval over the full token budget. With
-                # pipeline parallelism, multiple microbatches can be
-                # in-flight simultaneously on the same rank, each holding
-                # up to ``max_batch_size`` sequences' Mamba state, so the
-                # live-state slot count must scale with ``pp_size``.
+                # slots live in a separate window: one mutable live state
+                # per concurrent request, one immutable save-last prompt
+                # snapshot when enabled, and enough room for regular interval
+                # snapshots over the full token budget. With pipeline
+                # parallelism, multiple microbatches can be in flight on the
+                # same rank, so the fixed-state slot count scales with
+                # ``pp_size``.
                 pp_size = self.mapping.pp_size if self.mapping is not None else 1
-                live_state_slots = self.max_batch_size * pp_size
-                max_snapshots = live_state_slots
-                snapshot_interval = (
-                    linear_attention_metadata.states_snapshot_interval)
-                if (kv_cache_config.enable_block_reuse
-                        and snapshot_interval is not None
-                        and snapshot_interval > 0):
-                    max_snapshots += (kv_cache_config.max_tokens //
-                                      snapshot_interval)
+                static_slots_per_request = 1 + int(
+                    linear_attention_metadata.save_last_snapshot)
+                static_state_slots = (self.max_batch_size * pp_size *
+                                      static_slots_per_request)
+                max_snapshots = static_state_slots
+                interval = linear_attention_metadata.states_snapshot_interval
+                if (kv_cache_config.enable_block_reuse and interval is not None
+                        and interval > 0):
+                    max_snapshots += kv_cache_config.max_tokens // interval
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
@@ -2254,6 +2253,7 @@ class KVCacheManager(BaseResourceManager):
             bytes(T) = slope * T + intercept
             slope     = attention_bytes_per_token + state_bytes / interval
             intercept = max_batch_size * #mamba_layers_local * state_bytes
+                        * static_slots_per_request
 
         Recurrent state slots live in their own logical "window" keyed by
         ``LinearCacheType.RECURRENT_STATES``; attention KV blocks share the
@@ -2276,14 +2276,44 @@ class KVCacheManager(BaseResourceManager):
         else:
             mamba_slope = state_bytes_local // interval
         slope = attention_slope + mamba_slope
-        # STATIC_SLOTS_PER_REQUEST = 1 (live state); fixed-position
-        # snapshots are not yet implemented.
-        # With pipeline parallelism, multiple microbatches can be in-flight
-        # simultaneously on the same rank, so each rank holds Mamba state for
-        # up to ``max_batch_size * pp_size`` concurrent sequences. Mirror the
-        # behaviour of KVCacheManagerV2 (see max_num_sequences calculation).
+        # Reserve one mutable live state plus an immutable save-last prompt
+        # snapshot when enabled. With pipeline parallelism, multiple
+        # microbatches can be in flight on the same rank, so each rank holds
+        # these states for up to ``max_batch_size * pp_size`` concurrent
+        # sequences. Mirror KVCacheManagerV2's max_num_sequences scaling.
         pp_size = self.mapping.pp_size if self.mapping is not None else 1
-        intercept = self.max_batch_size * pp_size * state_bytes_local
+        save_last = int(
+            getattr(self.linear_attention_metadata, "save_last_snapshot", False))
+        # Retained save-last snapshots. A finished request keeps the newest K
+        # off-grid save-last snapshots of its reuse chain
+        # (``mamba_max_off_grid_snapshots_per_chain``) so the next turn of the
+        # same conversation resumes from the previous prompt end instead of the
+        # last interval-grid snapshot. Those snapshots outlive the request, so
+        # the live-request terms above do not cover them; size the retention
+        # for one conversation per sequence slot (``max_batch_size * pp_size``
+        # chains, the concurrency the engine can see). K == 0 keeps every
+        # historical save-last, which no static pool can be sized for: the
+        # pool then turns over under LRU and multi-turn reuse degrades to the
+        # grid (observed: ~5x prefill recompute on an agent workload).
+        retained_slots_per_request = 0
+        if kv_cache_config.enable_block_reuse and save_last:
+            retained_k = int(
+                getattr(self.linear_attention_metadata,
+                        "max_off_grid_snapshots_per_chain", 0) or 0)
+            if retained_k > 0:
+                retained_slots_per_request = retained_k
+            else:
+                logger.warning(
+                    "kv_cache_config.mamba_max_off_grid_snapshots_per_chain=0 with block "
+                    "reuse keeps every historical save-last recurrent snapshot; the "
+                    "recurrent-state pool is sized for live requests only, so retained "
+                    "snapshots are evicted under LRU and multi-turn prefix reuse falls "
+                    "back to interval-grid snapshots. Set it to a small K (1-2) so the "
+                    "pool reserves max_batch_size * K retained slots.")
+        static_slots_per_request = 1 + save_last + retained_slots_per_request
+        static_state_slots = (self.max_batch_size * pp_size *
+                              static_slots_per_request)
+        intercept = static_state_slots * state_bytes_local
 
         if slope > 0:
             max_tokens = max((primary_budget - intercept) // slope, 0)
@@ -2312,13 +2342,11 @@ class KVCacheManager(BaseResourceManager):
                                            self._primary_pool_memory_bytes))
 
         # Recurrent state slot count: live state per concurrent request, with
-        # extra room for one regular snapshot per snapshot interval over the
-        # full token budget when block reuse is enabled.
-        # With pipeline parallelism, multiple microbatches can be in-flight
-        # simultaneously on the same rank, each holding up to ``max_batch_size``
-        # sequences' Mamba state, so the live-state slot count must scale with
-        # ``pp_size``. +1 is for the CUDA graph padding dummy.
-        max_snapshots = self.max_batch_size * pp_size + 1
+        # an additional save-last snapshot when enabled, K retained save-last
+        # snapshots per sequence slot when demotion is configured, and regular
+        # interval snapshots over the full token budget. ``static_state_slots``
+        # already includes PP scaling. +1 is for the CUDA graph padding dummy.
+        max_snapshots = static_state_slots + 1
         if self.spec_config is not None:
             # cuda graph has different request ids for different draft len (CUDAGraphRunner::_get_padded_batch)
             # TODO: we can use a same slot for all these
@@ -3048,7 +3076,28 @@ class ResourceManager:
                 resource_manager.prepare_resources(scheduled_batch)
         # After every manager, so context_current_position / context_chunk_size
         # are final. See maybe_fit_token_budget.
+        chunk_sizes_before = [
+            request.context_chunk_size
+            for request in scheduled_batch.context_requests
+        ]
         self.maybe_fit_token_budget(scheduled_batch)
+        # A trimmed chunk ends earlier than the chunk the managers prepared
+        # for. Per-request state that depends on the chunk END must be
+        # re-derived: the hybrid Mamba manager plans the save-last fold point
+        # and the next-step recurrent-state block from it, and a fold planned
+        # inside the untrimmed chunk may now lie beyond the trimmed one
+        # (Mamba2Metadata rejects such a fold: "fold offset must lie strictly
+        # inside the chunk").
+        if chunk_sizes_before != [
+                request.context_chunk_size
+                for request in scheduled_batch.context_requests
+        ]:
+            kv_cache_manager = self.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            replan = getattr(kv_cache_manager,
+                             "prepare_resources_after_token_budget_trim", None)
+            if replan is not None:
+                replan(scheduled_batch)
         # Strictly after the trim: the connector is told how many tokens the
         # forward pass will compute, which is only settled once the trim has
         # run. See `report_batch_to_connector`.

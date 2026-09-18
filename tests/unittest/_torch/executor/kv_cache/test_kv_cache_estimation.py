@@ -12,6 +12,7 @@ share, not all copies.
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+import math
 from unittest.mock import Mock, patch
 
 import pytest
@@ -29,11 +30,13 @@ from tensorrt_llm._torch.pyexecutor._util import (
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
+    MambaStateConfig,
     MTPDecodingConfig,
     MultimodalConfig,
     TorchLlmArgs,
@@ -788,6 +791,69 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
     assert unsupported == no_draft
     assert block_reuse_disabled == no_draft
     assert single_kvcm == target == draft == CacheCost(slope=0, intercept=3 * 192 * 64)
+
+
+@pytest.mark.parametrize(
+    "enable_block_reuse,expected_static_slots",
+    [(False, 1), (True, 2)],
+)
+def test_cpp_hybrid_affine_cost_reserves_save_last_snapshot_slot(
+    enable_block_reuse,
+    expected_static_slots,
+):
+    """The estimator must match runtime's fixed recurrent-state slots.
+
+    Block reuse materializes one immutable save-last prompt snapshot in
+    addition to each request's mutable live state. Its fixed cost must remain
+    in the affine intercept (next to the CUDA-graph dummy slot) even when
+    interval snapshots add a nonzero slope.
+    """
+    state_bytes_per_layer = 128
+    local_mamba_layers = 3
+    local_attention_layers = 1
+    max_batch_size = 4
+    pp_size = 2
+    interval = 256
+    params = Mock()
+    params.get_states_bytes_per_layer.return_value = state_bytes_per_layer
+    mapping = Mock(pp_size=pp_size)
+    # main's routing probes config.architectures[0] (is_qwen4_exp), so the
+    # stand-in config needs a real list.
+    model_config = SimpleNamespace(
+        pretrained_config=Mock(architectures=["Qwen3_5MoeForCausalLM"]),
+        quant_config=None,
+    )
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=interval),
+    )
+
+    with (
+        patch.object(KVCacheManager, "get_cache_size_per_token", return_value=64),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._get_local_mamba_cache_layout",
+            return_value=(params, local_mamba_layers, local_attention_layers),
+        ),
+    ):
+        cache_cost = CacheCost.from_raw(
+            CppMambaHybridCacheManager.get_cache_size_per_token(
+                model_config,
+                mapping,
+                max_batch_size=max_batch_size,
+                kv_cache_config=kv_cache_config,
+            )
+        )
+
+    state_bytes_per_rank = local_mamba_layers * state_bytes_per_layer
+    expected_slope = 64 + (
+        math.ceil(state_bytes_per_rank / interval) if enable_block_reuse else 0
+    )
+    # max_batch_size * pp_size resident sequences x (live + save-last) slots,
+    # plus the CUDA-graph dummy slot.
+    expected_intercept = (
+        max_batch_size * pp_size * expected_static_slots + 1
+    ) * state_bytes_per_rank
+    assert cache_cost == CacheCost(slope=expected_slope, intercept=expected_intercept)
 
 
 def test_creator_uses_v2_affine_cache_cost():

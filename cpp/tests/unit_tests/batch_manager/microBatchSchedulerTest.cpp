@@ -2073,6 +2073,75 @@ TEST_F(ForceChunkTest, PromptSmallerThanUnit)
     EXPECT_EQ(reqs[0]->getContextChunkSize(), 8);
 }
 
+TEST_F(ForceChunkTest, ReusedFirstChunksChargedAnticipatedCompute)
+{
+    // Five duplicates of a cached 120-token prompt: each is sized to the face-value first
+    // chunk (64) but will only compute the 8-token tail past the reusable prefix (112,
+    // beyond the last snapshot point). With anticipated-compute charging, a capacity of 32
+    // admits four (4 x 8 = 32) and defers the fifth; face-value charging would admit none.
+    auto reqs = initRequests({120, 120, 120, 120, 120});
+    for (auto& req : reqs)
+    {
+        req->setExpectedSnapshotPoints({64, 112});
+        req->setEstimatedReusableTokens(112);
+    }
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/32, /*chunkUnitSize=*/64, std::nullopt);
+
+    expectChunkSizes(reqs, {64, 64, 64, 64, 0});
+}
+
+TEST_F(ForceChunkTest, ReusedMidPromptResumeChargedToNextPoint)
+{
+    // A duplicate resuming mid-prompt (reusable 96, next snapshot point 128) will compute
+    // the 32-token span to that point after admission re-clips the chunk. Capacity 64
+    // admits two such requests (2 x 32) and defers the third.
+    auto reqs = initRequests({200, 200, 200});
+    for (auto& req : reqs)
+    {
+        req->setExpectedSnapshotPoints({64, 128, 192});
+        req->setEstimatedReusableTokens(96);
+    }
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/64, /*chunkUnitSize=*/64, std::nullopt);
+
+    expectChunkSizes(reqs, {64, 64, 0});
+}
+
+TEST_F(ForceChunkTest, ColdRequestsKeepFaceValueTruncation)
+{
+    // Requests without a reuse estimate keep the original behavior: face-value charging
+    // with capacity truncation floored to the chunk unit (36 remaining -> 0).
+    auto reqs = initRequests({200, 200});
+    for (auto& req : reqs)
+    {
+        req->setExpectedSnapshotPoints({64, 128, 192});
+    }
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/100, /*chunkUnitSize=*/64, std::nullopt);
+
+    expectChunkSizes(reqs, {64, 0});
+}
+
+TEST_F(ForceChunkTest, MixedColdLeaderAndReusedTwins)
+{
+    // A cold leader charges its full first chunk (64); three mostly-cached duplicates
+    // charge their 8-token tails. All four fit in a capacity of 88 = 64 + 3 x 8.
+    auto reqs = initRequests({120, 120, 120, 120});
+    for (auto& req : reqs)
+    {
+        req->setExpectedSnapshotPoints({64, 112});
+    }
+    for (size_t i = 1; i < reqs.size(); ++i)
+    {
+        reqs[i]->setEstimatedReusableTokens(112);
+    }
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/88, /*chunkUnitSize=*/64, std::nullopt);
+
+    expectChunkSizes(reqs, {64, 64, 64, 64});
+}
+
 TEST_F(ForceChunkTest, ExactUnitSize)
 {
     // Without snapshot points, an exact-unit prompt is consumed in full.

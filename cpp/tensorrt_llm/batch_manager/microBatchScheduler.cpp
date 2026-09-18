@@ -268,8 +268,14 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 // Otherwise, every request consumes its full remaining context.
 // Capacity and context-length truncation are rounded down to a chunk-unit boundary.
 //
-// This policy is designed for linear attention state caching, so reusable KV-cache tokens are NOT
-// calculated because it's not supported yet.
+// Budget accounting is reuse-aware for first chunks: the chunk is sized from position 0
+// (reuse is discovered later, at admission), but admission shifts the position to the
+// reusable prefix and re-clips the chunk to end on the next snapshot point, so the
+// request actually computes only the span from the reusable prefix to that point.
+// Charging the face-value chunk size instead reserved a full chunk unit per
+// mostly-cached duplicate and throttled admission to max_num_tokens / chunk_unit
+// requests per pass (e.g. 16384 / 4096 = 4) while >99% of the reserved budget went
+// unused. Requests without a reuse estimate are charged at face value as before.
 template <>
 void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kFORCE_CHUNK>(
     RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
@@ -305,14 +311,55 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
         {
             chunkSize = maxContextLength.value() / chunkUnitSize * chunkUnitSize;
         }
-        if (ctxTokensCapacity && totalTokens + chunkSize > ctxTokensCapacity.value())
+
+        // Anticipated compute for the token budget. With a reuse estimate, admission will
+        // re-clip this chunk to [reusable, next snapshot point) — or to the final tail when
+        // no point lies beyond the reusable prefix — so charge that span, not the face value.
+        auto const contextRemaining = llmReq->getContextRemainingLength();
+        auto const reusable = llmReq->isFirstContextChunk()
+            ? std::min(llmReq->getEstimatedReusableTokens(), contextRemaining)
+            : SizeType32{0};
+        auto cost = chunkSize;
+        if (reusable > 0)
         {
-            auto const remainingCapacity = std::max<SizeType32>(0, ctxTokensCapacity.value() - totalTokens);
-            chunkSize = std::min(chunkSize, remainingCapacity) / chunkUnitSize * chunkUnitSize;
+            if (!expectedSnapshotPoints.empty())
+            {
+                std::optional<SizeType32> pointAfterReuse;
+                for (auto const point : expectedSnapshotPoints)
+                {
+                    if (point > reusable && (!pointAfterReuse || point < pointAfterReuse.value()))
+                    {
+                        pointAfterReuse = point;
+                    }
+                }
+                cost = pointAfterReuse ? std::min(chunkSize, pointAfterReuse.value() - reusable)
+                                       : std::max<SizeType32>(0, contextRemaining - reusable);
+            }
+            else
+            {
+                cost = reuse_adjusted_compute(chunkSize, reusable, contextRemaining);
+            }
+        }
+
+        if (ctxTokensCapacity && totalTokens + cost > ctxTokensCapacity.value())
+        {
+            if (reusable > 0)
+            {
+                // A reused first chunk's compute is small and indivisible; defer it to the
+                // next pass instead of truncating the chunk off the snapshot grid.
+                chunkSize = 0;
+                cost = 0;
+            }
+            else
+            {
+                auto const remainingCapacity = std::max<SizeType32>(0, ctxTokensCapacity.value() - totalTokens);
+                chunkSize = std::min(chunkSize, remainingCapacity) / chunkUnitSize * chunkUnitSize;
+                cost = chunkSize;
+            }
         }
 
         llmReq->setContextChunkSize(chunkSize);
-        totalTokens += llmReq->getContextChunkSize();
+        totalTokens += cost;
     }
 }
 
@@ -324,11 +371,10 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 //                              is exhausted.
 //   kFORCE_CHUNK           — requests advance to the next expected snapshot point, or consume
 //                              the remaining context when none are configured; budget is charged
-//                              at face value (no reuse discount).
+//                              at the anticipated post-admission compute (reuse-aware).
 //
-// EQUAL_PROGRESS and FIRST_COME_FIRST_SERVED are compute-aware: tokens covered by the
-// reusable KV-cache prefix are not charged against ctxTokensCapacity.
-// FORCE_CHUNK intentionally skips reuse accounting.
+// All three policies are compute-aware: tokens covered by the reusable KV-cache prefix
+// are not charged against ctxTokensCapacity.
 // See the individual template specialisations above for full details.
 void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChunked,
     ContextChunkingPolicy const ctxChunkPolicy, std::optional<SizeType32> ctxTokensCapacity,

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import bisect
+import functools
 import math
 import os
 from abc import ABC, abstractmethod
@@ -32,12 +34,14 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
+from tensorrt_llm._torch.modules.mamba.fold_support import \
+    fold_unsupported_reason
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
-    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
+    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest, LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
@@ -58,6 +62,80 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
                                                       SsmLayerConfig,
                                                       TokenIdExt, _KVCache)
+
+
+def _is_generation_only(request) -> bool:
+    """LlmRequest exposes this as a plain method on the Python wrapper (and as
+    a property on the C++ binding); accept both."""
+    attr = getattr(request, "is_generation_only_request", False)
+    return bool(attr()) if callable(attr) else bool(attr)
+
+
+def fold_save_last_enabled(manager=None) -> bool:
+    """Whether the save-last snapshot point is folded into a single context chunk.
+
+    Off: the scheduler ends a chunk at ``reachable = ((prompt_len-1)//tpb)*tpb``
+    so the running recurrent state is written into the save-last snapshot block
+    at a chunk end, and the <= tokens_per_block tail runs as a second chunk one
+    ADP iteration later (one extra loaded context iteration per request).
+    On (the default): the chunk runs to prompt_len and the linear-attention
+    layers materialise the snapshot at ``reachable`` inside that chunk (two scan
+    launches per layer, see ``Mamba2Metadata.prepare`` and
+    ``Qwen3NextGatedDeltaNet.forward_extend``).
+
+    ``TLLM_MAMBA_FOLD_SAVE_LAST=0`` turns the fold off. ``=1`` forces it and
+    raises at the first scheduling decision when the configuration cannot
+    support it. Left unset, an unsupported configuration (no FlashInfer GDN
+    prefill path, Mamba2 mixer layers, speculative decoding) falls back to the
+    two-chunk schedule with a one-time warning.
+    """
+    env = os.environ.get("TLLM_MAMBA_FOLD_SAVE_LAST")
+    if env == "0":
+        return False
+    reason = _fold_save_last_unsupported_reason(manager)
+    if reason is None:
+        return True
+    if env == "1":
+        raise RuntimeError(
+            "TLLM_MAMBA_FOLD_SAVE_LAST=1 but the folded save-last prefill cannot be "
+            f"used here: {reason}")
+    if reason not in _fold_disabled_warned:
+        _fold_disabled_warned.add(reason)
+        logger.warning(
+            f"Folded save-last prefill disabled ({reason}); using the two-chunk "
+            "save-last schedule. Set TLLM_MAMBA_FOLD_SAVE_LAST=0 to silence this."
+        )
+    return False
+
+
+_fold_disabled_warned: set = set()
+
+
+def _fold_save_last_unsupported_reason(manager=None) -> Optional[str]:
+    """Why the fold cannot run for this process/manager, or ``None`` if it can."""
+    reason = _fold_save_last_platform_reason()
+    if reason is not None:
+        return reason
+    reason = fold_unsupported_reason()
+    if reason is not None:
+        return reason
+    if manager is not None and getattr(manager, "spec_config",
+                                       None) is not None:
+        return "speculative decoding is enabled"
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _fold_save_last_platform_reason() -> Optional[str]:
+    """The fold needs the FlashInfer GDN prefill path (the two-launch scheme
+    relies on its indexed state I/O)."""
+    from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+    if os.environ.get("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") != "1":
+        return "the FlashInfer GDN prefill path is off (TLLM_USE_FLASHINFER_GDN_PREFILL != 1)"
+    if not is_flashinfer_gdn_supported_arch():
+        return "this architecture has no FlashInfer GDN kernels"
+    return None
+
 
 GB = 1 << 30
 
@@ -251,6 +329,11 @@ def use_py_mamba_cache_manager() -> bool:
     Cpp based on the transceiver configuration.
     """
     return os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
+
+
+# Mirrors gdn_mixer._FOLD_FUSED_BOOKKEEPING: fused/host-side fold bookkeeping
+# (TLLM_MAMBA_FOLD_FUSED=0 restores the per-layer / device-side form).
+_FOLD_FUSED_BOOKKEEPING = os.environ.get("TLLM_MAMBA_FOLD_FUSED", "1") == "1"
 
 
 class ReplayStateUpdateMetadata(NamedTuple):
@@ -1359,6 +1442,15 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     _supports_additional_snapshot_offsets = False
 
+    @property
+    def _save_last_snapshot_enabled(self) -> bool:
+        """Whether the recurrent-state manager also snapshots the last full
+        prompt block (``LinearAttentionMetadata.saveLastSnapshot``, C++ manager
+        only); the V2 manager carries no such metadata and reports False."""
+        metadata = getattr(self, "linear_attention_metadata", None)
+        return bool(metadata is not None
+                    and getattr(metadata, "save_last_snapshot", False))
+
     def _setup_mtp_intermediate_states(self, spec_config,
                                        max_batch_size: int) -> None:
         self.spec_config = spec_config
@@ -1465,11 +1557,40 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         mask_staging.copy_(self._dummy_request_mask_host)
         self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
 
-    def _reset_context_mamba_slots(self, num_contexts: int) -> None:
+    def _reset_context_mamba_slots(
+            self,
+            num_contexts: int,
+            extra_slots: Optional[List[int]] = None) -> None:
+        """Reset replay double-buffer state and rotate the SSM seed for the
+        slots of freshly scheduled context requests.
+
+        ``extra_slots`` are additional pool slots that also start a fresh
+        context here: a folded save-last chunk (C++ manager) decodes from its
+        terminal slot S2, which is not its primary slot, so S2 needs the same
+        reset/seed.
+        """
         if num_contexts == 0:
             return
 
-        context_slots = self.cuda_state_indices[:num_contexts].long()
+        # Built from ``_host_state_indices`` (what ``_setup_state_indices`` just
+        # copied into ``cuda_state_indices``) so nothing is read back from the
+        # device; the device copy is staged (see ``_stage_long_values``).
+        # ``TLLM_MAMBA_FOLD_FUSED=0`` restores the previous device-side form.
+        host_slots = self._host_state_indices[:num_contexts].tolist()
+        if extra_slots:
+            host_slots = host_slots + [int(slot) for slot in extra_slots]
+        if _FOLD_FUSED_BOOKKEEPING:
+            context_slots = self._stage_long_values(
+                host_slots, self.cuda_state_indices.device)
+        else:
+            context_slots = self.cuda_state_indices[:num_contexts].long()
+            if extra_slots:
+                context_slots = torch.cat([
+                    context_slots,
+                    torch.tensor(extra_slots,
+                                 dtype=torch.long,
+                                 device=context_slots.device)
+                ])
         if (self._use_replay_state_update
                 and self.prev_num_accepted_tokens is not None
                 and self.cache_buf_idx is not None):
@@ -1489,27 +1610,88 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self._seed_request_counter += 1
         counter = self._seed_request_counter
         rank_offset = self._seed_rank_offset
-        host_slots = self._host_state_indices[:num_contexts].tolist()
         new_seeds = [
             _compute_deterministic_mamba_seed(counter, slot, rank_offset)
             for slot in host_slots
         ]
-        self.mamba_ssm_rand_seed[context_slots] = torch.tensor(
-            new_seeds, dtype=torch.int64,
-            pin_memory=prefer_pinned()).to(self.mamba_ssm_rand_seed.device,
-                                           non_blocking=True)
+        if _FOLD_FUSED_BOOKKEEPING:
+            self.mamba_ssm_rand_seed[context_slots] = self._stage_long_values(
+                new_seeds, self.mamba_ssm_rand_seed.device)
+        else:
+            self.mamba_ssm_rand_seed[context_slots] = torch.tensor(
+                new_seeds, dtype=torch.int64,
+                pin_memory=prefer_pinned()).to(self.mamba_ssm_rand_seed.device,
+                                               non_blocking=True)
+
+    def _stage_long_values(self, values, device) -> torch.Tensor:
+        """Host int list -> device int64 tensor through a pinned, double-
+        buffered staging area with a non-blocking copy.
+
+        ``torch.tensor(values, device=cuda)`` is a blocking copy: torch issues
+        the H2D memcpy and then synchronises the main stream, i.e. the host
+        waits for the previous iteration's forward + sampler before it can go
+        on to prepare_inputs and the forward launch (measured as one
+        cudaStreamSynchronize per iteration with a folded chunk, p50 5.9 ms /
+        p90 26 ms on the fastest rank, 21-33 ms on every rank in GPU-bound
+        prefill iterations). Two buffers alternate: buffer k is rewritten two
+        calls later, and by then the executor has synchronised on the sampler
+        event of the iteration in between, which is stream-ordered after this
+        copy, so the pending copy can never read a rewritten buffer.
+        """
+        m = len(values)
+        cap = 2 * self.max_batch_size
+        if getattr(self, "_staged_long_pinned", None) is None:
+            self._staged_long_pinned = [
+                torch.empty(cap, dtype=torch.long, pin_memory=prefer_pinned())
+                for _ in range(2)
+            ]
+            self._staged_long_cuda = [
+                torch.empty(cap, dtype=torch.long, device=device)
+                for _ in range(2)
+            ]
+            self._staged_long_idx = 0
+        if m > cap:
+            return torch.tensor(values, dtype=torch.long, device=device)
+        self._staged_long_idx ^= 1
+        pinned = self._staged_long_pinned[self._staged_long_idx]
+        dev = self._staged_long_cuda[self._staged_long_idx]
+        pinned[:m].copy_(torch.tensor(values, dtype=torch.long))
+        dev[:m].copy_(pinned[:m], non_blocking=True)
+        return dev[:m]
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
-        """Set reusable Mamba snapshot boundaries before scheduling."""
+        """Set reusable Mamba snapshot boundaries before scheduling.
+
+        Runs on every active request before every scheduling pass. The points
+        of a request only depend on its prompt length, and once it is in the
+        generation phase nothing reads them any more (the scheduler consults
+        them for context chunking, the transceiver at context completion), so
+        a generation-phase request that already carries its points is skipped:
+        the loop over ~256 active requests dropped from ~110 us to ~30 us per
+        iteration on the aggregated engine.
+        """
+        generation = LlmRequestState.GENERATION_IN_PROGRESS
+
+        def _points_ready(request) -> bool:
+            return (getattr(request, "state", None) == generation
+                    and getattr(request, "py_snapshot_points_ready", False))
+
         if not self.enable_block_reuse:
             for request in requests:
-                request.expect_snapshot_points = []
+                if not _points_ready(request):
+                    request.expect_snapshot_points = []
+                    request.py_snapshot_points_ready = True
             return
 
         state_config = self.kv_cache_config.mamba_state_config
         interval = state_config.periodic_snapshot_interval
+        # C++ manager only: fold the save-last point into the prompt's last
+        # context chunk instead of ending a chunk on it (fold_save_last_enabled).
+        fold = self._save_last_snapshot_enabled and fold_save_last_enabled(self)
         for request in requests:
+            if _points_ready(request):
+                continue
             snapshot_points = set()
             if interval is not None and interval > 0:
                 snapshot_points.update(
@@ -1522,7 +1704,40 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
                     point = request.prompt_len - offset
                     if point > 0:
                         snapshot_points.add(point)
+            request.py_recurrent_fold_point = None
+            if (interval is not None and interval > 0
+                    and self._save_last_snapshot_enabled):
+                # The save-last-snapshot block only holds a valid state if a
+                # chunk ends exactly on its boundary: the running state is
+                # written at chunk ends. Without this point the block would
+                # enter the reuse tree with a stale state. The point targets
+                # the last block a DUPLICATE can reach: a duplicate matches at
+                # most prompt_len - 1 tokens (one token must be recomputed for
+                # logits), so for a block-aligned prompt the last full block
+                # ends at prompt_len and is unreachable — the usable terminal
+                # snapshot is one block earlier. Mirrors the C++ rule in
+                # LinearAttentionMetadata::shouldAllocateRecurrentStates.
+                # Boundaries on an interval multiple are covered above.
+                reachable = ((request.prompt_len - 1) //
+                             self.tokens_per_block) * self.tokens_per_block
+                if reachable > 0 and reachable % interval != 0:
+                    # The fold is a prefill-side optimisation: generation-only
+                    # (disagg gen engine) requests never run the chunk, so they
+                    # keep the unmodified point list -- the C++ side sees exactly
+                    # what it saw before on that engine.
+                    if fold and not _is_generation_only(request):
+                        # Kept out of the scheduler-facing list (and of the
+                        # C++ mExpectedSnapshotPoints re-clip in
+                        # LlmRequest::setPrepopulatedPromptLen) so the chunk
+                        # runs to prompt_len; the layers materialise the
+                        # snapshot at this point inside the chunk. The full
+                        # point list is still what the transceiver pairs on
+                        # (see get_prompt_recurrent_snapshot_slots).
+                        request.py_recurrent_fold_point = reachable
+                    else:
+                        snapshot_points.add(reachable)
             request.expect_snapshot_points = sorted(snapshot_points)
+            request.py_snapshot_points_ready = True
 
     def is_speculative(self) -> bool:
         return self.spec_config is not None
@@ -1625,6 +1840,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     speculative decoding and disaggregated serving.
     Does not support block reuse / prefix caching for mamba states.
     """
+
 
     def __init__(
         self,
@@ -2129,6 +2345,7 @@ def _estimate_mamba_hybrid_cache_cost(
     num_reserved_dummy_slots: int,
     include_explicit_snapshots: bool,
     cap_partial_attention_snapshots: bool,
+    num_save_last_slots_per_sequence: int = 0,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
     **kwargs,
@@ -2166,8 +2383,12 @@ def _estimate_mamba_hybrid_cache_cost(
     else:
         fixed_rules = 0
         unaligned_fixed_rules = 0
+    # Per resident sequence: one mutable live state, the explicit snapshot
+    # rules, and -- for the C++ manager with block reuse -- the immutable
+    # save-last prompt snapshot (LinearAttentionMetadata.saveLastSnapshot).
     fixed_state_slots = (max_resident_sequences + num_reserved_dummy_slots +
-                         max_resident_sequences * fixed_rules)
+                         max_resident_sequences *
+                         (fixed_rules + num_save_last_slots_per_sequence))
     attention_block_bytes = attention_slope * tokens_per_block
 
     interval = _mamba_regular_snapshot_interval(kv_cache_config, max_seq_len)
@@ -2330,6 +2551,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self.linear_attention_metadata.states_snapshot_interval = (
                 kv_cache_config.mamba_state_config.periodic_snapshot_interval
                 if kv_cache_config.enable_block_reuse else 0)
+            self.linear_attention_metadata.save_last_snapshot = (
+                kv_cache_config.enable_block_reuse)
+            self.linear_attention_metadata.max_off_grid_snapshots_per_chain = (
+                kv_cache_config.mamba_max_off_grid_snapshots_per_chain
+                if kv_cache_config.enable_block_reuse else 0)
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
@@ -2389,6 +2615,20 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
         self.linear_attention_metadata.states_snapshot_interval = (
             kv_cache_config.mamba_state_config.periodic_snapshot_interval
+            if kv_cache_config.enable_block_reuse else 0)
+        # Snapshot the last FULL prompt block too: agentic reuse (identical
+        # prompts; next-turn prompts extending the previous turn) matches at
+        # the prompt end, so this floors the reusable prefix to the block
+        # size instead of the (much coarser) snapshot interval. It also
+        # freezes the stored end block against generation-phase mutation
+        # (blocks stored while still live were otherwise reused stale when
+        # prompt_len is a multiple of tokens_per_block).
+        self.linear_attention_metadata.save_last_snapshot = (
+            kv_cache_config.enable_block_reuse)
+        # Keep only the newest K materialized off-grid (save-last) snapshots per
+        # reuse chain; 0 keeps them all (see KvCacheConfig). Inert without reuse.
+        self.linear_attention_metadata.max_off_grid_snapshots_per_chain = (
+            kv_cache_config.mamba_max_off_grid_snapshots_per_chain
             if kv_cache_config.enable_block_reuse else 0)
         # RNN model params for disagg TP-mismatch split/concat.
         conv_section_map = {"nemotron_hybrid": 1, "qwen3_next": 2}
@@ -2494,6 +2734,16 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                          device="cpu")
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
+        # request id -> (fold_offset, terminal_slot) for context chunks that
+        # carry the save-last snapshot point inside them (see
+        # fold_save_last_enabled); absent for every other request.
+        self._request_id_to_fold = {}
+        self._fold_terminal_slots = []
+        # Pinned double-buffered staging for host int lists that the prepare
+        # path sends to the device (see _stage_long_values).
+        self._staged_long_pinned = None
+        self._staged_long_cuda = None
+        self._staged_long_idx = 0
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -2524,12 +2774,25 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         * ``slope`` = attention KV bytes per token plus conservative periodic
           Mamba-state and partial-attention-snapshot costs.
-        * ``intercept`` = live and CUDA-graph dummy Mamba state.
+        * ``intercept`` = live and CUDA-graph dummy Mamba state plus, with
+          block reuse, one save-last snapshot and ``K`` retained save-last
+          snapshots per resident sequence (``K`` =
+          ``mamba_max_off_grid_snapshots_per_chain``; 0 adds nothing).
 
         Memory budget -> max tokens then becomes
         ``T = (budget - intercept) // slope`` instead of plain
         ``T = budget // bytes_per_token``.
         """
+        # The runtime wires save_last_snapshot to enable_block_reuse in
+        # __init__: one immutable save-last prompt snapshot per resident
+        # sequence on top of its live state, plus the K retained save-last
+        # snapshots per reuse chain (mamba_max_off_grid_snapshots_per_chain),
+        # sized for one chain per sequence slot; mirrors
+        # KVCacheManager._calculate_max_num_blocks_for_linear_attention.
+        save_last_slots = 0
+        if kv_cache_config.enable_block_reuse:
+            save_last_slots = 1 + int(
+                kv_cache_config.mamba_max_off_grid_snapshots_per_chain or 0)
         return _estimate_mamba_hybrid_cache_cost(
             model_config,
             mapping,
@@ -2540,6 +2803,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             num_reserved_dummy_slots=1,
             include_explicit_snapshots=False,
             cap_partial_attention_snapshots=False,
+            num_save_last_slots_per_sequence=save_last_slots,
             **kwargs,
         )
 
@@ -2650,6 +2914,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                          kv_cache_dtype_byte_size: float = None):
         super().update_resources(scheduled_batch, attn_metadata,
                                  kv_cache_dtype_byte_size)
+        # The forward of a folded save-last chunk left the state at the chunk
+        # end in the terminal slot S2; from here on that is the request's
+        # current slot (the next prepare_resources recomputes it anyway).
+        fold_map = getattr(self, "_request_id_to_fold", None)
+        if fold_map:
+            for rid, (_, terminal) in fold_map.items():
+                if rid in self._request_id_to_state_index:
+                    self._request_id_to_state_index[rid] = terminal
+            fold_map.clear()
 
     @nvtx_range("hybrid_prepare_resources")
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -2664,13 +2937,40 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
             self.requests)
         self._setup_state_indices()
-        self._reset_context_mamba_slots(len(scheduled_batch.context_requests))
+        # A folded save-last chunk decodes from its terminal slot S2, which is
+        # not its primary slot: give S2 the fresh-context reset/seed too.
+        self._reset_context_mamba_slots(
+            len(scheduled_batch.context_requests),
+            extra_slots=self._fold_terminal_slots)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
         if self.local_num_mamba_layers == 0:
             return
         self._prepare_resources(scheduled_batch)
+
+    def prepare_resources_after_token_budget_trim(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Re-plan the recurrent-state slots after
+        ``ResourceManager.maybe_fit_token_budget`` shrank a context chunk.
+
+        ``_setup_state_indices`` derives the save-last fold point and the
+        next-step state block of every context request from its chunk END
+        (``context_current_position + context_chunk_size``). The trim runs
+        after this manager prepared, so a chunk that shrank below a planned
+        fold point would carry a stale fold (rejected by Mamba2Metadata as
+        "fold offset must lie strictly inside the chunk") and a stale
+        next-step block. Both passes are idempotent on the same batch: the
+        planner rebuilds the fold table and the host state indices from
+        scratch, and the slot reset only re-zeroes blocks owned by the same
+        context requests.
+        """
+        if self.local_num_mamba_layers == 0:
+            return
+        self._setup_state_indices()
+        self._reset_context_mamba_slots(
+            len(scheduled_batch.context_requests),
+            extra_slots=self._fold_terminal_slots)
 
     @nvtx_range("hybrid_flush_state_transfers")
     def flush_state_transfers(self) -> None:
@@ -2785,10 +3085,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             stats = self.impl.get_kv_cache_stats()
             rs_free = stats.num_free_blocks_per_window_size.get(
                 LinearCacheType.RECURRENT_STATES.value, 0)
-            # Reserve 1 block for the always-allocated last block (corner case
-            # / final live state) so we don't promise more tokens than the
-            # pool can actually back at allocation time.
-            usable_rs_blocks = max(0, rs_free - 1)
+            # Reserve blocks for the always-allocated end-of-prompt live
+            # state (and, with save_last_snapshot, the additional last full
+            # prompt block) so we don't promise more tokens than the pool
+            # can actually back at allocation time.
+            end_blocks = 2 if getattr(self.linear_attention_metadata,
+                                      "save_last_snapshot", False) else 1
+            usable_rs_blocks = max(0, rs_free - end_blocks)
             rs_token_cap = usable_rs_blocks * interval
             result = min(result, rs_token_cap)
         return max(result, 0)
@@ -2798,6 +3101,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self.requests.remove(request)
             self._request_id_to_state_index.pop(request.py_request_id, None)
             self._request_id_to_is_dummy.pop(request.py_request_id, None)
+            self._request_id_to_fold.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self, requests=None) -> None:
@@ -2806,12 +3110,35 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if requests is None:
             requests = self.requests
         block_indices = []
-        for req in requests:
+        # Folded save-last chunks: (row, terminal block index, fold offset).
+        # The primary slot of such a chunk is S1 = the save-last snapshot block
+        # (the C++ onboard in prepare_resources lands the incoming state there
+        # and segment A [pos, reachable) reads/writes it in place); the terminal
+        # block S2 receives the tail segment's final state (see
+        # Mamba2Metadata.prepare / Qwen3NextGatedDeltaNet.forward_extend).
+        fold_rows = []
+        fold_terminal_blocks = []
+        fold_offsets = []
+        for row, req in enumerate(requests):
             if req.is_context_finished:
                 next_step = self.get_num_tokens(req) - 1
             elif self.kv_cache_config.enable_block_reuse:
-                next_step = (req.context_current_position - 1 +
-                             req.context_chunk_size)
+                pos = req.context_current_position
+                end = pos + req.context_chunk_size
+                next_step = end - 1
+                fold_point = getattr(req, "py_recurrent_fold_point", None)
+                # Only a context chunk that runs a forward on THIS engine folds;
+                # disagg generation-init requests on the gen engine also have
+                # context_current_position 0 and a full-prompt chunk size but
+                # never prefill here -- their slot must stay the terminal one.
+                if (fold_point is not None and pos < fold_point < end
+                        and getattr(req, "is_context_init_state", True)):
+                    fold_rows.append(row)
+                    fold_terminal_blocks.append(
+                        (end - 1) // self.tokens_per_block)
+                    fold_offsets.append(fold_point - pos)
+                    # S1 ends exactly at the fold point.
+                    next_step = fold_point - 1
             else:
                 next_step = req.prompt_len - 1
             block_indices.append(next_step // self.tokens_per_block)
@@ -2876,6 +3203,35 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 )
             self._host_state_indices[:n] = values
 
+        if requests is self.requests:
+            getattr(self, "_request_id_to_fold", {}).clear()
+        else:
+            for req in requests:
+                self._request_id_to_fold.pop(req.py_request_id, None)
+        self._fold_terminal_slots = []
+        if fold_rows:
+            rows_f = torch.tensor(fold_rows, dtype=torch.long)
+            bi_f = torch.tensor(fold_terminal_blocks, dtype=torch.long)
+            terminal = self.host_block_offsets[self.recurrent_states_pool_index,
+                                               rows_f, 0, bi_f]
+            bad = (terminal < 0) | (terminal >= max_blocks)
+            if bad.any():
+                bad_i = int(bad.nonzero(as_tuple=False)[0, 0])
+                req = requests[fold_rows[bad_i]]
+                raise RuntimeError(
+                    f"Invalid terminal recurrent state block index "
+                    f"{int(terminal[bad_i])} for folded context chunk of request "
+                    f"{req.py_request_id} (prompt_len={req.prompt_len}, "
+                    f"context_current_position={req.context_current_position}, "
+                    f"context_chunk_size={req.context_chunk_size}, "
+                    f"fold_point={getattr(req, 'py_recurrent_fold_point', None)})"
+                )
+            self._fold_terminal_slots = terminal.tolist()
+            for row, off, slot in zip(fold_rows, fold_offsets,
+                                      self._fold_terminal_slots):
+                self._request_id_to_fold[requests[row].py_request_id] = (off,
+                                                                         slot)
+
         idx_staging = torch.empty_like(self._host_state_indices,
                                        pin_memory=prefer_pinned())
         idx_staging.copy_(self._host_state_indices)
@@ -2890,6 +3246,56 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
+
+    def get_fold_info(self, request_ids: List[int]) -> List[Optional[tuple]]:
+        """Per request: ``(fold_offset, terminal_slot)`` when its current
+        context chunk carries the save-last snapshot point ``fold_offset``
+        tokens after the chunk start (the request's primary slot from
+        ``get_state_indices`` is then the snapshot slot S1 and the tail
+        [fold_offset, chunk_end) must end in ``terminal_slot`` S2), else None.
+        """
+        fold_map = getattr(self, "_request_id_to_fold", {})
+        return [fold_map.get(rid) for rid in request_ids]
+
+    def get_final_state_index(self,
+                              request_id: int,
+                              prompt_len: Optional[int] = None) -> int:
+        """Pool slot holding the request's recurrent state at the END of its
+        context, i.e. the state at prompt_len once prefill is complete. For a
+        folded save-last chunk that is the terminal slot S2 (the primary slot
+        S1 only holds the snapshot at the fold point); for every other request
+        it is the primary slot. This is what the KV transceiver must ship to
+        the generation engine.
+
+        The fold table ``_request_id_to_fold`` is per-iteration state: the next
+        ``prepare_resources`` rebuilds it for the NEXT batch and
+        ``update_resources`` re-points ``_request_id_to_state_index`` to S2
+        only afterwards. Under the overlap scheduler the previous batch's KV
+        send (``_send_kv_async``) runs between the two, so a finished folded
+        request is absent from the table and the raw primary slot -- the
+        snapshot at ``reachable``, up to tokens_per_block - 1 tokens BEFORE
+        the prompt end -- would be shipped: the generation engine then decodes
+        from a state missing the tail of the prompt (first-token logprob
+        mismatch vs the trainer, 3-10x more masked sequences than agg). With
+        ``prompt_len`` given the slot is therefore derived from the sequence's
+        own block list: the recurrent state at prompt_len always lives in the
+        block of token ``prompt_len - 1`` (the end-of-prompt block, which is
+        always materialised), fold or not.
+        """
+        fold = self._request_id_to_fold.get(request_id)
+        if fold is not None:
+            return fold[1]
+        if prompt_len is not None and prompt_len > 0:
+            sentinel = LinearCacheType.RECURRENT_STATES.value
+            raw_ids = self.get_batch_cache_indices([request_id],
+                                                   window_size=sentinel)[0]
+            pos = (prompt_len - 1) // self.tokens_per_block
+            if 0 <= pos < len(raw_ids) and raw_ids[pos] >= 0:
+                slot = self.get_memory_pool_block_indices(
+                    [raw_ids[pos]], window_size=sentinel)[0]
+                if slot >= 0:
+                    return int(slot)
+        return self._request_id_to_state_index[request_id]
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
@@ -2917,6 +3323,59 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self._refresh_dummy_request_mask(is_dummy)
             return indices
         return self.cuda_state_indices
+
+    def get_prompt_recurrent_snapshot_slots(
+            self, request: LlmRequest) -> tuple[List[int], List[int]]:
+        """(snapshot token points, recurrent-pool slot ids) for *request*.
+
+        One entry per materialized prompt-range snapshot, grid order. Used by
+        the Python transceiver to ship the context engine's recurrent
+        snapshots to a reuse-enabled generation engine: the C++ reuse walk
+        only commits a hybrid prefix that ends on a materialized snapshot
+        (WindowBlockManager::analyzePrefixReuse), so received prefixes are
+        only matchable in later turns if their snapshot blocks carry real
+        states. Both engines derive the same layout from prompt_len
+        (prepare_expect_snapshot_points mirrors the C++ rule), so grid-ordered
+        lists pair positionally across engines.
+        """
+        points = list(getattr(request, "expect_snapshot_points", None) or [])
+        fold_point = getattr(request, "py_recurrent_fold_point", None)
+        if fold_point is not None and fold_point not in points:
+            # The folded save-last point is a materialised snapshot exactly
+            # like the scheduler-visible ones; both engines derive it from
+            # prompt_len, so positional pairing stays intact.
+            bisect.insort(points, fold_point)
+        if not points:
+            return [], []
+        sentinel = LinearCacheType.RECURRENT_STATES.value
+        raw_ids = self.get_batch_cache_indices([request.py_request_id],
+                                               window_size=sentinel)[0]
+        if not raw_ids:
+            return [], []
+        tpb = self.tokens_per_block
+        # Select the materialized snapshot positions BEFORE translating to
+        # pool slots: the sequence's recurrent block list is mostly
+        # placeholder blocks (one entry per token block), and the pool-index
+        # translation asserts on placeholders ("Not expected to call
+        # isPrimary() on placeholder block").
+        sel_points: List[int] = []
+        sel_ids: List[int] = []
+        for pt in points:
+            pos = pt // tpb - 1
+            if 0 <= pos < len(raw_ids) and raw_ids[pos] >= 0:
+                sel_points.append(pt)
+                sel_ids.append(raw_ids[pos])
+        if not sel_ids:
+            return [], []
+        slots = self.get_memory_pool_block_indices(sel_ids,
+                                                   window_size=sentinel)
+        out_points: List[int] = []
+        out_slots: List[int] = []
+        for pt, slot in zip(sel_points, slots):
+            if slot >= 0:
+                out_points.append(pt)
+                out_slots.append(int(slot))
+        return out_points, out_slots
 
     def _setup_states(self) -> None:
         # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)

@@ -269,10 +269,26 @@ def get_kv_cache_manager_cls(
                         "backend='NIXL'.")
             else:
                 if (kv_cache_config.enable_block_reuse and runtime == "PYTHON"):
+                    # Opt-in: the Python transceiver reads the request's
+                    # recurrent state straight from the unified C++ pool
+                    # (kv_extractor._build_layer_group_for_mamba_cpp), so block
+                    # reuse (incl. recurrent-state snapshots) can stay on with
+                    # the V1 manager. Off by default until the combination has
+                    # broader coverage.
+                    if os.environ.get("TRTLLM_HYBRID_DISAGG_REUSE",
+                                      "0") == "1":
+                        logger.warning(
+                            "TRTLLM_HYBRID_DISAGG_REUSE=1: keeping block reuse "
+                            "enabled for a hybrid model under disagg + Python "
+                            "transceiver (CppMambaHybridCacheManager serves the "
+                            "transfers)")
+                        return CppMambaHybridCacheManager
                     raise ValueError(
                         "Hybrid Mamba disaggregated serving with block reuse "
                         "and transceiver_runtime='PYTHON' requires "
-                        "use_kv_cache_manager_v2=True.")
+                        "use_kv_cache_manager_v2=True (or "
+                        "TRTLLM_HYBRID_DISAGG_REUSE=1 to serve the transfers "
+                        "from CppMambaHybridCacheManager).")
                 if kv_cache_config.enable_block_reuse:
                     return CppMambaHybridCacheManager
                 if runtime == "PYTHON" and backend == "NIXL":
