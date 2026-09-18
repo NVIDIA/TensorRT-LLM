@@ -29,6 +29,11 @@ from tensorrt_llm._torch.moe.fused_moe.ep_group_health import (
     EPGroupHealthSnapshot,
 )
 
+# Bitmask bookkeeping over plain Python ints, with the concurrency cases driven
+# by threads rather than ranks. The marker is also what makes the file
+# reachable: the CPU stage collects only files that carry it.
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------------
 # Construction and validation
 # ---------------------------------------------------------------------------

@@ -25,10 +25,27 @@ from pathlib import Path
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 
+# Eight prompts of distinct lengths (4-12 tokens). Every ID stays below 30000
+# so the same probe is valid for TinyLlama (32000-token vocabulary), Mistral,
+# and Qwen tokenizers; the leading `1` mirrors a BOS token.
 _PROMPT_TOKEN_IDS = (
     (1, 42, 7, 9),
     (1, 17, 23, 5, 11),
+    (1, 306, 626, 263, 4086, 1904),
+    (1, 450, 4996, 17354, 1701, 29916, 432),
+    (1, 3, 4, 5, 6, 7, 8, 9),
+    (1, 1724, 338, 278, 7483, 310, 3444, 29973, 13),
+    (1, 15043, 3186, 29991, 1128, 526, 366, 2599, 9826, 29973),
+    (1, 12, 34, 56, 78, 910, 1112, 1314, 1516, 1718, 1920, 2122),
 )
+# Greedy tokens generated per prompt; `end_id=-1` keeps every output exactly
+# this long so the orchestrator can compare fixed-length token-ID lists.
+_MAX_NEW_TOKENS = 32
+# Engine limits sized for the probe: the longest prompt plus the generated
+# tokens fits in `_MAX_SEQ_LEN`, and one context iteration schedules the
+# whole batch within `_MAX_NUM_TOKENS`.
+_MAX_SEQ_LEN = 128
+_MAX_NUM_TOKENS = 256
 
 
 def _parse_args() -> argparse.Namespace:
@@ -54,24 +71,42 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "attn_backend": "TRTLLM",
         "skip_tokenizer_init": True,
         "max_batch_size": len(_PROMPT_TOKEN_IDS),
-        "max_num_tokens": 64,
-        "max_seq_len": 64,
+        "max_num_tokens": _MAX_NUM_TOKENS,
+        "max_seq_len": _MAX_SEQ_LEN,
         "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.15),
     }
+    env_overrides = _rank_process_env_overrides(args)
+    if env_overrides:
+        kwargs["env_overrides"] = env_overrides
     if args.role != "baseline":
         if not args.mx_url:
             raise ValueError("MX donor and receiver roles require --mx-url")
+        # ModelExpress checks once for a compatible source and otherwise loads
+        # natively; the receiver starts only after donor readiness.
+        kwargs["mx_config"] = {"server_url": args.mx_url}
+    return kwargs
+
+
+def _rank_process_env_overrides(args: argparse.Namespace) -> dict[str, str]:
+    """Environment for the executor rank processes.
+
+    MPI-spawned ranks inherit only selected `TRTLLM*`/`TLLM*` variables, so
+    everything the loaders read must travel through `LLM(env_overrides=...)`.
+    The weight-manifest variables apply to every role (the HF baseline too).
+    `MX_TRANSFER_LOG_DIR` applies to MX roles only; the MX checkpoint loader
+    raises the `modelexpress` logger to INFO when it is set, which is how the
+    RDMA completion records reach this process's log.
+    """
+    overrides: dict[str, str] = {}
+    manifest_dir = os.environ.get("MX_WEIGHT_MANIFEST_DIR")
+    if manifest_dir:
+        overrides["MX_WEIGHT_MANIFEST_DIR"] = manifest_dir
+        overrides["MX_WEIGHT_MANIFEST_ROLE"] = args.role
+    if args.role != "baseline":
         transfer_log_dir = os.environ.get("MX_TRANSFER_LOG_DIR")
         if transfer_log_dir:
-            kwargs["env_overrides"] = {"MX_TRANSFER_LOG_DIR": transfer_log_dir}
-        kwargs["mx_config"] = {
-            "server_url": args.mx_url,
-            # ModelExpress 0.4.1 skips polling at zero but still sleeps once
-            # for five seconds before disk fallback. The receiver starts only
-            # after donor readiness, so it can use a bounded discovery window.
-            "server_query_timeout_s": 0 if args.role == "donor" else 30,
-        }
-    return kwargs
+            overrides["MX_TRANSFER_LOG_DIR"] = transfer_log_dir
+    return overrides
 
 
 def main() -> None:
@@ -86,26 +121,28 @@ def main() -> None:
     with LLM(**llm_kwargs) as llm:
         load_seconds = time.perf_counter() - started
         sampling_params = SamplingParams(
-            max_tokens=8,
+            max_tokens=_MAX_NEW_TOKENS,
             temperature=0.0,
             top_k=1,
             end_id=-1,
             pad_id=0,
         )
+        generate_started = time.perf_counter()
         results = list(
             llm.generate(
                 [list(prompt) for prompt in _PROMPT_TOKEN_IDS],
                 sampling_params=sampling_params,
             )
         )
-        mx_config = llm_kwargs.get("mx_config")
-        payload = {
+        generate_seconds = time.perf_counter() - generate_started
+        payload: dict[str, object] = {
             "role": args.role,
             "tp_size": args.tp_size,
             "load_seconds": load_seconds,
-            "server_query_timeout_s": (
-                mx_config.get("server_query_timeout_s") if isinstance(mx_config, dict) else None
-            ),
+            "generate_seconds": generate_seconds,
+            "max_new_tokens": _MAX_NEW_TOKENS,
+            "prompt_count": len(_PROMPT_TOKEN_IDS),
+            "prompt_lengths": [len(prompt) for prompt in _PROMPT_TOKEN_IDS],
             "token_ids": [list(result.outputs[0].token_ids) for result in results],
         }
         args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

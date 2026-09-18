@@ -932,7 +932,6 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe._rebalance_kv_pools_now = MagicMock()
 
     # Per-iteration no-ops.
-    exe._handle_disagg_cache_errors_synced = MagicMock()
     exe._handle_control_request = MagicMock()
     exe._pad_attention_dp_dummy_request = MagicMock()
     exe._revert_gen_alloc = MagicMock()

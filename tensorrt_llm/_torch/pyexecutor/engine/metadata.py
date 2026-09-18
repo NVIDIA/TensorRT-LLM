@@ -122,7 +122,7 @@ def update_spec_metadata(
         max_draft_len = original_max_draft_len
         max_total_draft_tokens = spec_dec_max_total_draft_tokens
 
-    if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree and not is_draft_model:
+    if spec_tree_manager is not None and not is_draft_model:
         spec_tree_manager.slot_storage.fill_all_slot_ids(
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,

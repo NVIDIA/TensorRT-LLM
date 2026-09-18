@@ -1163,6 +1163,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        disable_overlap_scheduler: bool = False,
         kv_events_config: Optional[KVEventsConfig] = None,
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
@@ -1722,8 +1723,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # up to `max_num_sequences` requests are still in KV transfer
         # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
         # capacity lets the next batch of active requests acquire slots without
-        # waiting for the previous batch's transfers to finish.
+        # waiting for the previous batch's transfers to finish. With the overlap
+        # scheduler on (non-PP), a retiring request holds its lease one extra
+        # iteration and needs the same coefficient.
         max_num_sequences = max_batch_size * mapping.pp_size
+        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
         # Both diagnostics below are off unless their environment variable is
         # set; with neither set nothing here changes any allocation, any page
@@ -1742,18 +1746,21 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
+        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
         # longer be comparable with the run it is being read against.
         index_mapper_capacity = (
-            max_num_sequences * (2 if is_disagg else 1)
+            self.max_admissible_sequences
             + num_reserved_index_slots
             + (1 if self._guard_page_value is not None else 0)
         )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
+            f"disable_overlap_scheduler={disable_overlap_scheduler}, "
+            f"pp_size={mapping.pp_size}, "
             f"num_reserved_index_slots={num_reserved_index_slots}, "
             f"max_beam_width={max_beam_width})"
         )
