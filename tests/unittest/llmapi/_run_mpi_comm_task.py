@@ -77,9 +77,10 @@ def main(
             assert all(
                 Path(workspace).parent == workspace_root
                 for workspace in workspaces)
-            assert cubin_dirs == {
-                str(Path.home() / ".cache" / "flashinfer" / "cubins")
-            }
+            # Unset means FlashInfer derives the artifact cache from each
+            # worker's isolated workspace, keeping downloaded compiler inputs
+            # per-rank.
+            assert cubin_dirs == {None}
 
             nested_session = MpiPoolSession(n_workers=2)
             try:
@@ -96,6 +97,11 @@ def main(
             assert all(
                 Path(workspace).parent == workspace_root
                 for workspace in nested_workspaces)
+            nested_cubin_dirs = {
+                cubin_dir
+                for _, cubin_dir in nested_worker_envs
+            }
+            assert nested_cubin_dirs == {None}
 
 
 if __name__ == "__main__":

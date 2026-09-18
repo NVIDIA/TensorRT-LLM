@@ -22,6 +22,7 @@ import pytest
 import torch
 from defs import conftest
 from defs.common import venv_check_call
+from defs.conftest import skip_pre_blackwell
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FASTWAN_LPIPS_FRAME_RATE,
     FASTWAN_LPIPS_GUIDANCE_SCALE,
@@ -462,19 +463,22 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
 # =============================================================================
 
 
+@skip_pre_blackwell
 def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_t2v.py with NVFP4 config end-to-end.
 
-    This is a core example test: it validates that the per-model example script
-    and the shared YAML config work together as documented in the README.
-    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint and the shared
-    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant).
+    Reuse the shared ``configs/wan2.2-t2v-fp4-1gpu.yaml`` configuration. Prefer
+    the pre-quantized checkpoint, falling back to dynamic quantization of the
+    original checkpoint when it is unavailable.
     """
     scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
+    model_subpath = WAN22_A14B_NVFP4_MODEL_SUBPATH
+    if not os.path.isdir(os.path.join(scratch_space, model_subpath)):
+        model_subpath = WAN22_T2V_MODEL_SUBPATH
+    model_path = os.path.join(scratch_space, model_subpath)
     assert os.path.isdir(model_path), (
         f"Model not found: {model_path} "
-        f"(set LLM_MODELS_ROOT or place {WAN22_A14B_NVFP4_MODEL_SUBPATH} under models root)"
+        f"(set LLM_MODELS_ROOT or place {model_subpath} under models root)"
     )
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_t2v_example")
@@ -503,6 +507,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
+@skip_pre_blackwell
 def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_i2v.py with NVFP4 config end-to-end.
 

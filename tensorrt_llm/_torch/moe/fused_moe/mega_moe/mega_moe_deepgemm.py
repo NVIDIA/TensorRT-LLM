@@ -263,19 +263,11 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
     """``deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8``.
 
     DeepGEMM fused ``fp8_fp4_mega_moe``: MXFP4 weights, MXFP8 activations,
-    SM100/SM103. One class carries the identity and the whole contract:
-    construction, the MPI/process-group setup, the symmetric-buffer
-    allocation, the weight lifecycle, eligibility, quantization, and
-    ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
-    a backend supports a single quantization format -- an abstract parent
-    would carry no identity, implement nothing, and have one subclass.
+    SM100/SM103. One class carries the identity and the whole contract, which
+    is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while a backend serves a
+    single quantization format.
 
-    The kernel segment is absent from the name because the ``quant`` segment
-    already separates this one from the grouped-GEMM implementation, with which
-    it shares provider and technique.
-
-    ``MegaMoEDeepGemm`` below is an alias onto this class, so the
-    pre-identity name still resolves for the call sites that use it.
+    ``MegaMoEDeepGemm`` below is an alias onto this class.
     """
 
     descriptor = MoEImplDescriptor(
@@ -290,12 +282,10 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         doc="DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103.",
     )
 
-    # Taken off the descriptor rather than restated. The scheduler reads these
-    # three attributes and the registry publishes the descriptor; a second
-    # literal would let what is published and what is executed drift apart.
-    # ``input_requirement`` keeps the descriptor default because this backend
-    # prepares its own inputs: ``quantize_input`` emits the FP8 + packed-UE8M0
-    # pair the kernel reads, and ``run_moe`` casts the routing slots itself.
+    # Taken off the descriptor, not restated: the scheduler reads these three
+    # attributes and the registry publishes the descriptor, so a second literal
+    # would let the two drift apart. ``input_requirement`` keeps the descriptor
+    # default because this backend prepares its own inputs.
     scheduler_kind = descriptor.scheduler_kind
 
     capabilities = descriptor.capabilities
@@ -901,8 +891,5 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         return y.to(output_dtype)
 
 
-# The pre-identity name, kept as an alias rather than a base class: the
-# ``moe_backend="MEGAMOE_DEEPGEMM"`` call sites, the ``issubclass`` dispatch
-# in ``create_moe.py``, and the comments across the MoE tree that still say
-# ``MegaMoEDeepGemm`` all mean the class above.
+# An alias, not a base class, so there is no second class to keep in step.
 MegaMoEDeepGemm = DeepgemmCudaW4a8Mxfp4Mxfp8Impl

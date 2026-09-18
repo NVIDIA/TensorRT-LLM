@@ -53,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -499,6 +500,7 @@ def _build_pool_views_for_variant(
     default_mapper_kind: MapperKind,
     layer_group_id: int,
     role_layouts: Optional[Dict] = None,
+    ignored_roles: frozenset[DataRole] = frozenset(),
 ) -> List[PoolView]:
     """Bucket one slot-desc variant's coalesced buffers into pool views.
 
@@ -515,11 +517,16 @@ def _build_pool_views_for_variant(
         single_buffer_size = int(coalesced_buffer.single_buffer_size)
         offset = 0
         for buffer_id in coalesced_buffer.buffer_ids:
-            kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
-            bucket_key = (pool_idx, kind)
-            bucket_entries[bucket_key].append((int(buffer_id.layer_id), offset, single_buffer_size))
-            bucket_roles[bucket_key].add(str(buffer_id.role))
-            bucket_layouts[bucket_key].add(role_layouts.get(buffer_id.role))
+            # Local-only buffers still occupy physical slot offsets,
+            # but do not contribute model state to a transfer view.
+            if buffer_id.role not in ignored_roles:
+                kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
+                bucket_key = (pool_idx, kind)
+                bucket_entries[bucket_key].append(
+                    (int(buffer_id.layer_id), offset, single_buffer_size)
+                )
+                bucket_roles[bucket_key].add(str(buffer_id.role))
+                bucket_layouts[bucket_key].add(role_layouts.get(buffer_id.role))
             offset += single_buffer_size
 
     # All ordering below is canonicalization — the page table is
@@ -601,6 +608,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     # Every V2 manager declares how native roles map to the closed set of
     # disaggregation mapper kinds; Role.ALL is the required fallback.
     role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
+    ignored_roles = frozenset(getattr(manager, "get_disagg_ignored_roles", lambda: frozenset())())
     if Role.ALL not in role_mapper_kinds:
         raise ValueError("Disaggregation role mapping must define Role.ALL")
     for role, mapper_kind in role_mapper_kinds.items():
@@ -707,6 +715,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 default_mapper_kind,
                 layer_group_id,
                 role_layouts=role_layouts,
+                ignored_roles=ignored_roles,
             )
             for pool_view in pool_views:
                 if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:

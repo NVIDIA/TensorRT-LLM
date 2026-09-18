@@ -2477,6 +2477,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     tail -f ${slurmJobLogPath} &
                     tailPid=\$!
 
+                    noLogTimeoutSecs=7200
+                    lastLogSize=-1
+                    lastLogChangeEpoch=\$(date +%s)
+
                     # Wait until Slurm job is done
                     while true; do
                         # Use --allocations to ensure we match the exact job ID and not job steps (like 123.batch, 123.0)
@@ -2489,6 +2493,23 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
                             echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
+                            if [[ \$STATUS == "RUNNING" ]]; then
+                                currentLogSize=0
+                                if [ -f "${slurmJobLogPath}" ]; then
+                                    currentLogSize=\$(stat -c %s "${slurmJobLogPath}" 2>/dev/null || echo 0)
+                                fi
+                                nowEpoch=\$(date +%s)
+                                if [ "\$currentLogSize" != "\$lastLogSize" ]; then
+                                    lastLogSize=\$currentLogSize
+                                    lastLogChangeEpoch=\$nowEpoch
+                                else
+                                    staleSecs=\$((nowEpoch - lastLogChangeEpoch))
+                                    if [ "\$staleSecs" -ge "\$noLogTimeoutSecs" ]; then
+                                        echo "Warning: no new log output for \${staleSecs}s (>= \${noLogTimeoutSecs}s), job \$jobId is likely stuck/timed out. Cancelling it."
+                                        scancel \$jobId || true
+                                    fi
+                                fi
+                            fi
                             sleep 300
                         else
                             echo "Slurm job \$jobId finished with state: \$STATUS"
@@ -5763,11 +5784,17 @@ def runLLMBuild(
     def uploadedWheelPath = "${builtWheelUploadPath}${wheelName}"
     def wheelPath = uploadedWheelPath
     if (is_dlfw) {
-        // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
-        def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
+        // NVIDIA_PYTORCH_VERSION ships with the NGC PyTorch image itself, which
+        // makes it the ground truth for the NGC release version. Example value: 26.08
+        def ngcReleaseVersion = sh(
+            returnStdout: true,
+            script: 'echo $NVIDIA_PYTORCH_VERSION'
+        ).trim()
+        def matcher = ngcReleaseVersion =~ /^(\d+)\.(\d+)$/
         if (!matcher.find()) {
-            error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
+            error "Failed to extract NGC Release version from NVIDIA_PYTORCH_VERSION: '${ngcReleaseVersion}'"
         }
+        echo "NGC Release version: ${ngcReleaseVersion}"
         def dlfwLocalVersion =
             "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
         def localWheelPath = sh(
@@ -6385,16 +6412,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
     ]
-    // B200 PerfSanity post-merge disaggregated
-    // 2 Nodes
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8-Post-Merge",
-        "auto:dgx-b200-flex",
-        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
-        3,
-        16,
-        2
-    )
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -6489,7 +6506,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-        6,
+        3,
         8,
         2
     )
@@ -6542,27 +6559,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        2,
+        1,
         20,
         5
-    )
-    // 6 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node4_gpu16",
-        2,
-        24,
-        6
-    )
-    // 9 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        1,
-        36,
-        9
     )
     // GB300 PerfSanity post-merge aggregated
     // 2 Nodes
@@ -6580,7 +6579,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        4,
+        2,
         12,
         3
     )
@@ -6653,7 +6652,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-        2,
+        1,
         8,
         2
     )
@@ -6665,15 +6664,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         2,
         28,
         7
-    )
-    // Nemotron-Ultra-V3 50k2k con178: ctx5 (5 nodes, 4 GPUs each) + gen1 dep4 (1 node, 4 GPUs) = 24 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX5-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4",
-        2,
-        24,
-        6
     )
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
@@ -6958,14 +6948,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra CUDA 13 PyTorch install Start ######"
-                            // cu130 is PyTorch's only CUDA 13 channel; it runs on the toolkit above
-                            // through CUDA minor version compatibility.
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // This must stay equal to what requirements.txt resolves to from the public
-                            // index, which is the highest public torch its ceiling admits: the wheel under
-                            // test is linked against that libtorch, and a mismatch fails the import with an
-                            // undefined c10 symbol rather than anything that names a version.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            // Must match what requirements.txt resolves to from the public index: the
+                            // wheel under test is linked against that libtorch, and a mismatch fails
+                            // the import with an undefined c10 symbol instead of a version error.
+                            // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or

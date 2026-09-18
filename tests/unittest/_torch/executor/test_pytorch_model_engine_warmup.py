@@ -18,23 +18,61 @@ from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import pytest
 import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.speculative.utils import update_draft_len
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DraftTargetDecodingConfig,
+    PARDDecodingConfig,
+    TorchLlmArgs,
 )
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import CudaGraphConfig
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
+def test_warmup_overrides_dynamic_draft_length(config_cls):
+    config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
+    engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=3,
+        max_total_draft_tokens=config.tokens_per_gen_step - 1,
+        runtime_draft_len=3,
+    )
+    requests = [
+        SimpleNamespace(
+            py_draft_tokens=[7, 8, 9] + [0] * (config.tokens_per_gen_step - 4),
+            py_needs_onehot_draft_probs=False,
+        )
+        for _ in range(2)
+    ]
+    batch = SimpleNamespace(batch_size=2, generation_requests=requests)
+
+    # Normal iteration selects K=2. Each explicit warmup shape must then
+    # update both the engine and buffers, even when the batch size is unchanged.
+    update_draft_len(engine, batch)
+    assert engine.runtime_draft_len == 2
+    assert all(request.py_draft_tokens[:2] == [7, 8] for request in requests)
+    for draft_len in (0, 3, 1):
+        update_draft_len(engine, batch, draft_len=draft_len)
+        assert engine.runtime_draft_len == draft_len
+        assert all(
+            len(request.py_draft_tokens) == config.get_runtime_tokens_per_gen_step(draft_len) - 1
+            for request in requests
+        )
+    update_draft_len(engine, batch)
+    assert engine.runtime_draft_len == 2
 
 
 # Minimal fixtures mirroring sibling test_pytorch_model_engine.py — duplicated
@@ -96,13 +134,14 @@ def _build_engine_and_resource_manager():
         model="dummy",
         max_batch_size=batch_size,
         max_num_tokens=max_tokens,
+        kv_cache_config=KvCacheConfig(max_tokens=max_tokens, use_kv_cache_manager_v2=True),
         cuda_graph_config=CudaGraphConfig(
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]
         ),
     )
     model_engine = _DummyModelEngine(llm_args, torch.half)
-    kv_cache_manager = KVCacheManager(
-        KvCacheConfig(max_tokens=max_tokens),
+    kv_cache_manager = KVCacheManagerV2(
+        llm_args.kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,
         num_kv_heads=model_engine.model.config.num_key_value_heads,
@@ -110,11 +149,55 @@ def _build_engine_and_resource_manager():
         tokens_per_block=tokens_per_block,
         max_seq_len=max_tokens,
         max_batch_size=batch_size,
+        max_num_tokens=max_tokens,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=tensorrt_llm.bindings.DataType.HALF,
     )
     resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
     return model_engine, resource_manager
+
+
+@pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
+@pytest.mark.parametrize(
+    "draft_len", [None, 0, 3, 1], ids=["general", "cuda_graph_0", "cuda_graph_3", "cuda_graph_1"]
+)
+def test_warmup_builders_resynchronize_stale_draft_length(
+    config_cls: type[DecodingBaseConfig], draft_len: int | None
+) -> None:
+    config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
+    engine, resource_manager = _build_engine_and_resource_manager()
+    engine.spec_config = config
+    engine.max_draft_len = config.max_draft_len
+    engine.max_total_draft_tokens = config.tokens_per_gen_step - 1
+    engine.max_draft_loop_tokens = engine.max_total_draft_tokens
+    engine.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    # Profiling a batch of two leaves K=2; every requested warmup shape below
+    # differs from that value and must synchronize the real engine and requests.
+    engine.runtime_draft_len = 2
+    batch_size = 2
+
+    if draft_len is None:
+        expected_draft_len = engine.max_draft_len
+        warmup_request = engine._create_warmup_request(
+            resource_manager,
+            num_tokens=batch_size * config.tokens_per_gen_step,
+            num_gen_requests=batch_size,
+        )
+    else:
+        expected_draft_len = draft_len
+        warmup_request = engine._create_cuda_graph_warmup_request(
+            resource_manager, batch_size, draft_len, max_seq_len=16
+        )
+
+    with engine._release_batch_context(warmup_request, resource_manager) as batch:
+        assert batch is not None
+        assert len(batch.generation_requests) == batch_size
+        assert engine.runtime_draft_len == expected_draft_len
+        expected_buffer_width = config.get_runtime_tokens_per_gen_step(expected_draft_len) - 1
+        assert all(
+            len(request.py_draft_tokens) == expected_buffer_width
+            for request in batch.generation_requests
+        )
 
 
 class _Tracker:
@@ -188,6 +271,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
     def test_no_kv_cache_warmup_delegates_runner_lifecycle(self):
         model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
@@ -205,6 +289,24 @@ class TestWarmupCleanup(unittest.TestCase):
             [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
         )
         warmup_sampling.assert_not_called()
+
+    def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
+        model_engine.moe_load_balancer = None
+        model_engine.is_warmup = False
+        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._runner = Mock(spec=NoKVCacheRunner)
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = object()
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "no-KV-cache runner was initialized, but a KV cache manager was allocated",
+        ):
+            model_engine.warmup(resource_manager)
+
+        self.assertEqual(model_engine._runner.method_calls, [])
 
     def test_legacy_warmup_skips_without_kv_cache(self):
         model_engine = object.__new__(PyTorchModelEngine)
@@ -229,51 +331,20 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         warmup_sampling.assert_called_once_with()
 
-    def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
-        """Enc-dec encoder warmup is deferred and runs as two passes."""
+    def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self):
         model_engine = object.__new__(PyTorchModelEngine)
-        model_engine.cuda_graph_runner = SimpleNamespace(
-            enabled=True,
-            is_warmup_only=True,
-        )
-        model_engine.model = SimpleNamespace(modules=lambda: [])
-        model_engine._torch_compile_piecewise_cuda_graph = False
+        model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
-
-        @contextlib.contextmanager
-        def allow_capture():
-            yield
-
-        runner = SimpleNamespace(
-            enabled=True,
-            is_encoder_decoder=True,
-            is_warmup_only=False,
-            feature_mode=False,
-            allow_capture=allow_capture,
-        )
-        model_engine.encoder_cuda_graph_runner = runner
+        model_engine._runner = Mock(spec=EncoderDecoderRunner)
         resource_manager = object()
-        warmup_states = []
 
-        with (
-            patch.object(model_engine, "_capture_generation_cuda_graphs") as generation,
-            patch.object(model_engine, "_capture_mixed_encoder_decoder_cuda_graphs") as mixed,
-            patch.object(
-                model_engine,
-                "_capture_encoder_cuda_graphs_enc_dec",
-                side_effect=lambda _: warmup_states.append(runner.is_warmup_only),
-            ) as encoder,
-        ):
-            model_engine._run_cuda_graph_warmup(resource_manager)
-            generation.assert_called_once_with(resource_manager)
-            mixed.assert_called_once_with(resource_manager)
-            encoder.assert_not_called()
-            model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)
+        model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)
 
-        assert encoder.call_count == 2
-        assert warmup_states == [True, False]
-        assert not runner.is_warmup_only
+        self.assertEqual(
+            model_engine._runner.method_calls,
+            [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
+        )
 
     def test_empty_cache_fires_immediately_after_autotuner(self):
         """Change 1 placement: empty_cache must be the call right after
@@ -446,7 +517,7 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (
@@ -559,7 +630,7 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (
@@ -650,7 +721,7 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (

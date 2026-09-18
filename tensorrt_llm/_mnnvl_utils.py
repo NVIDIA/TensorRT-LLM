@@ -31,10 +31,57 @@ try:
 except ImportError:
     from cuda import cuda
 
+from torch.utils._python_dispatch import _disable_current_modes
+
 from ._dlpack_utils import pack_strided_memory
-from ._utils import get_sm_version, mpi_comm
+from ._utils import get_sm_version, mpi_comm, mpi_disabled
 from .logger import logger
 from .mapping import Mapping
+
+
+class ProcessGroupComm:
+    """mpi4py-Comm-shaped adapter over a torch ProcessGroup.
+
+    Under a non-MPI orchestrator (Ray) the workers are not launched by mpirun, so
+    ``mpi_comm()`` is each process's own singleton world and ``Get_size()``
+    returns 1. MnnvlMemory used that size as the number of segments in the
+    strided workspace tensor while the MoE workspace is sized and indexed with
+    ``moe_ep_size``; the resulting geometry mismatch made
+    FusedMoeWorkspace::initializeLocalWorkspace memset past the end of the
+    allocation (CUDA_ERROR_ILLEGAL_ADDRESS, then a poisoned context and an
+    apparently unrelated IMA at the next CUDA call).
+
+    Only the four members MnnvlMemory actually uses are implemented.
+    tensorrt_llm/_torch/distributed/ops.py::_get_mnnvl_workspace_comm already
+    takes this ProcessGroup route; this brings _mnnvl_utils in line with it.
+    """
+
+    def __init__(self, pg: torch.distributed.ProcessGroup) -> None:
+        self._pg = pg
+
+    def Get_size(self) -> int:
+        return torch.distributed.get_world_size(group=self._pg)
+
+    def Get_rank(self) -> int:
+        return torch.distributed.get_rank(group=self._pg)
+
+    def allgather(self, obj: Any) -> list[Any]:
+        gathered: list[Any] = [None] * self.Get_size()
+        # MNNVL workspaces are set up while the model may be under MetaInitMode.
+        # all_gather_object materializes real CPU tensors and calls
+        # aten.set_.source_Storage on them, which that TorchDispatchMode rejects
+        # ("Meta tensor used in unsupported function"). This exchange is host-side
+        # setup, not model construction, so pop the active modes for its duration.
+        with _disable_current_modes():
+            torch.distributed.all_gather_object(gathered, obj, group=self._pg)
+        return gathered
+
+    def barrier(self) -> None:
+        # Same MetaInitMode problem: the public ProcessGroup barrier is a c10d
+        # operator and gets intercepted before it reaches Gloo. Call the CPU
+        # backend directly, as ops.py::_mnnvl_workspace_barrier does.
+        self._pg._get_backend(torch.device("cpu")).barrier().wait()
+
 
 _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S = 20.0
 _MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S = 0.01
@@ -340,6 +387,11 @@ class MnnvlMemory:
         )
 
     @classmethod
+    def comm_process_group(cls, mapping: Mapping) -> Optional[Any]:
+        """ProcessGroup equivalent of comm_split_color_key for the non-MPI path."""
+        return mapping.tp_group_pg
+
+    @classmethod
     def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
         """Group ranks by PP+CP+MOE_TP, ordering each group by TP rank."""
         return (
@@ -369,8 +421,21 @@ class MnnvlMemory:
                 f"{cls.comm_signature}, but {signature} is requested; recreating it."
             )
             cls.drop_cached_comm()
-        color, key = cls.comm_split_color_key(mapping)
-        cls.comm = mpi_comm().Split(color, key)
+        if mpi_disabled():
+            # Under a non-MPI orchestrator (Ray) mpi_comm() is each process's
+            # own singleton, so Split() would yield a size-1 communicator while
+            # the workspace is sized with the caller's parallel size; route
+            # through the Torch ProcessGroup for the same rank group instead.
+            pg = cls.comm_process_group(mapping)
+            if pg is None:
+                raise ValueError(
+                    f"{cls.__name__}: ProcessGroup not initialised; it is "
+                    "required for MNNVL memory when MPI is disabled"
+                )
+            cls.comm = ProcessGroupComm(pg)
+        else:
+            color, key = cls.comm_split_color_key(mapping)
+            cls.comm = mpi_comm().Split(color, key)
         cls.comm_signature = signature
         return cls.comm
 
@@ -948,23 +1013,24 @@ class MnnvlMemory:
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
         available_links = 0
-        probed_links = link_count
+        rejected_links = 0
         for link_idx in range(link_count):
             try:
-                if pynvml.nvmlDeviceGetNvLinkCapability(
+                if not pynvml.nvmlDeviceGetNvLinkCapability(
                     handle, link_idx, pynvml.NVML_NVLINK_CAP_P2P_SUPPORTED
                 ):
-                    available_links += 1
-                    is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
-                    if is_active:
-                        active_links += 1
+                    continue
+                # NVML_NVLINK_MAX_LINKS is an upper bound over all architectures
+                # and the capability query answers for every index within it.
+                # Only the state query rejects the indices past this GPU's own
+                # link count, so a link counts as available once its state reads.
+                is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
             except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
+                rejected_links += 1
                 continue
-            except pynvml.NVMLError_InvalidArgument:
-                # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures;
-                # the driver rejects indices past this GPU's link count (18 on GB200).
-                probed_links = link_idx
-                break
+            available_links += 1
+            if is_active:
+                active_links += 1
         supported = (
             active_links == available_links and available_links > 0
             if need_all_up
@@ -972,7 +1038,8 @@ class MnnvlMemory:
         )
         logger.info(
             f"[MnnvlMemory] dev {dev_id} NVLink: {active_links}/{available_links} links up "
-            f"({probed_links} of {link_count} link indices accepted by the driver), "
+            f"({link_count - rejected_links} of {link_count} link indices accepted "
+            "by the driver), "
             f"need_all_up={need_all_up}, supported={supported}"
         )
         return supported
@@ -1050,6 +1117,11 @@ class HelixCpMnnvlMemory(MnnvlMemory):
     initialized via __init_subclass__ in the parent class, ensuring this class has
     its own isolated state separate from MnnvlMemory.
     """
+
+    @classmethod
+    def comm_process_group(cls, mapping: Mapping) -> Optional[Any]:
+        """ProcessGroup equivalent of comm_split_color_key for the non-MPI path."""
+        return mapping.cp_group_pg
 
     @classmethod
     def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:

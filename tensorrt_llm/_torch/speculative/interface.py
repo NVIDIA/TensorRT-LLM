@@ -462,7 +462,7 @@ class SpecMetadata:
     max_num_requests: int
     # The number of draft layers. (Also the number of draft tokens for the linear tree.)
     max_draft_len: int
-    # The max number of draft tokens for the static tree and dynamic tree   .
+    # The max number of draft tokens for the dynamic tree.
     max_total_draft_tokens: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
@@ -511,11 +511,9 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
-    # NOTE: For the linear tree, though it can be treated as a special case of static tree.
-    # NOTE: But we do not set `is_spec_dec_tree` to True for this cases.
-    # NOTE: i.e., for the linear tree, is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
-    # whether the spec-dec mode is a tree (can be static tree or dynamic tree).
+    # whether the spec-dec mode is a tree.
+    # NOTE: The linear tree is not treated as a tree here: for the linear tree,
+    # NOTE: is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
     is_spec_dec_tree: bool = False
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
@@ -782,7 +780,7 @@ class SpecMetadata:
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
-        # clamped to the executor's batch size (_filter_cuda_graph_batch_sizes),
+        # clamped to the executor's batch size (filter_cuda_graph_batch_sizes),
         # and graph padding refuses to cross it, so exceeding it here means the
         # invariant broke upstream and should surface.
         assert len(requests) <= self.max_num_requests, (
@@ -2678,6 +2676,23 @@ class SpecWorkerBase(nn.Module, ABC):
         """Execute guided decoder on target model logits if available."""
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
+
+    def _rollback_guided_decoder_after_verify(self, num_accepted_tokens):
+        """Restore the accepted grammar prefix after a one-shot draft step.
+
+        ``execute`` advances every matcher through the golden token and the
+        draft tokens the grammar accepts. Workers that draft through
+        ``execute_draft_batch(draft_step=0)`` undo the rejected suffix there.
+        Workers that draft in one shot never enter that loop, so they must
+        roll back here; otherwise their matchers keep tokens the target
+        rejected and the next target step masks from the wrong state.
+
+        Call this after the native drafting kernels are enqueued: the
+        rollback's host callbacks need the GIL, and a native call that
+        synchronizes the stream while holding it would stall against them.
+        """
+        if self.guided_decoder is not None:
+            self.guided_decoder.rollback_rejected_batch(num_accepted_tokens)
 
     def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens,
                                  batch_indices_cuda, batch_size,

@@ -69,6 +69,8 @@ The checkpoint config may contain multiple `config_groups` for different sparse 
 - `disabled_until_timestep` — optional normalized `[0, 1]` transformer-forward timestep cutoff. Denoising starts near 1 and moves toward 0, so Skip Softmax Attention is disabled while `timestep >= disabled_until_timestep` and enabled after the timestep drops below the cutoff.
 - `ignore` — optional fnmatch layer patterns where the calibrated Skip Softmax Attention config should not apply. Patterns match both full module names and component-relative names, so `blocks.0.attn1` matches `transformer.blocks.0.attn1` and `transformer_2.blocks.0.attn1`.
 
+TRT-LLM imports NumExpr only when it needs to consume a checkpoint formula. During package bootstrap, TRT-LLM defaults `NUMEXPR_NUM_THREADS` to `1` without overriding an explicit environment setting. This evaluates the scalar formulas without creating a NumExpr worker pool while allowing applications with substantial NumExpr work to opt into parallel evaluation. This setting controls only NumExpr and does not replace workload-specific OpenMP tuning. Applications that import NumExpr before TRT-LLM must configure it before process startup.
+
 Diffusers checkpoints with multiple transformer components keep calibration per component:
 
 ```text

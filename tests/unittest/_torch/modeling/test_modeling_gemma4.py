@@ -645,6 +645,7 @@ class TestGemma4Assistant(unittest.TestCase):
         model_config = _make_assistant_model_config()
         model_config.extra_attrs["_speculative_position_headroom"] = 2 * 4
         assistant = Gemma4AssistantForCausalLM(model_config)
+        self.assertIs(assistant.model.model_config.extra_attrs, model_config.extra_attrs)
         self.assertEqual(len(assistant.model.layers), 4)
         self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
         self.assertEqual(

@@ -65,7 +65,7 @@ __all__ = [
     "MllamaForConditionalGeneration",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
-    "NemotronH_Nano_VL_V2",
+    "NemotronHMultimodalModel",
     "NemotronNASForCausalLM",
     "Phi3ForCausalLM",
     "Phi4MMForCausalLM",

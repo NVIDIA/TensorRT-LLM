@@ -1254,9 +1254,7 @@ int AttentionOp::mlaGeneration(
             {
                 tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool;
 
-                bool const usesAuxiliaryKvPool
-                    = tllmRunnerParams.kvPtr != nullptr && tllmRunnerParams.kvPtr != kv_cache_buffer.mPrimaryPoolPtr;
-                if (usesAuxiliaryKvPool)
+                if (mUseNvfp4MlaKvCache)
                 {
                     // Static sparse MLA indexes a compact KV pool containing at most
                     // mSparseTopK rows per query. Do not let the original dense KV

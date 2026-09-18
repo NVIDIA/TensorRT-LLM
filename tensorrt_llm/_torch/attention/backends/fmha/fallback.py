@@ -58,6 +58,7 @@ class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
 
     supports_skip_correction = True
+    supports_workspace_reclamation = True
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:

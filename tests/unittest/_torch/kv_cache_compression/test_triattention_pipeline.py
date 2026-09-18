@@ -87,6 +87,7 @@ class TestConfigAndFactory:
         # The factory contract is independent of GPU-owned persistent buffers.
         fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
+        pretrained_config = _make_test_pretrained_config()
         with (
             mock.patch(
                 "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
@@ -98,7 +99,7 @@ class TestConfigAndFactory:
         ):
             mgr = create_kv_cache_compression_manager(
                 cfg,
-                model_engine=_factory_model_engine(_make_test_pretrained_config()),
+                model_engine=_factory_model_engine(pretrained_config),
                 kv_cache_config=SimpleNamespace(enable_block_reuse=True),
             )
             mgr.bind_kv_cache_managers(fake_v2)
@@ -106,6 +107,7 @@ class TestConfigAndFactory:
         assert mgr.budget == 32
         assert mgr.beta == 16
         assert mgr.eviction_mode == "per_head"
+        assert mgr.pretrained_config is pretrained_config
         assert mgr.kv_cache_manager is fake_v2
         assert fake_v2.kv_compression_manages_history
         assert cfg.changes_physical_kv_length

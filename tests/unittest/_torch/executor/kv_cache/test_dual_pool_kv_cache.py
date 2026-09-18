@@ -183,6 +183,7 @@ def _make_creator(
     creator._max_beam_width = 1
     creator._kv_connector_manager = None
     creator._llm_args = llm_args
+    creator._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
     creator._cache_transceiver_config = None
     creator._speculative_config = None
     creator._sparse_attention_config = None

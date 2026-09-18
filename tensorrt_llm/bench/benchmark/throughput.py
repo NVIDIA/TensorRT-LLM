@@ -32,8 +32,8 @@ from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # isort: off
-from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
+from tensorrt_llm.bench.benchmark.utils.general import (ALL_SUPPORTED_BACKENDS,
+                                                        get_settings)
 # isort: on
 from tensorrt_llm.bench.benchmark.utils.general import (
     generate_warmup_dataset, update_sampler_args_with_extra_options)
@@ -51,16 +51,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 @click.command(name="throughput")
 @optgroup.group("Engine run configuration.",
-                help="Runtime settings for executing a TensorRT LLM engine.")
-@optgroup.option(
-    "--engine_dir",
-    type=click.Path(exists=True,
-                    readable=True,
-                    path_type=Path,
-                    resolve_path=True),
-    default=None,
-    help="Path to a serialized TRT-LLM engine.",
-)
+                help="Runtime settings for executing a TensorRT LLM model.")
 @optgroup.option(
     "--backend",
     type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -326,7 +317,7 @@ def throughput_command(
     bench_env: BenchmarkEnvironment,
     **params,
 ) -> None:
-    """Run a throughput test on a TRT-LLM engine."""
+    """Run a throughput benchmark with TRT-LLM."""
     logger.info("Preparing to run throughput benchmark...")
 
     # Parameters from CLI
@@ -398,36 +389,16 @@ def throughput_command(
         #       The accurate table for multimodal models will be logged after the benchmark is done.
         logger.info(metadata.get_summary_for_print())
 
-    # Engine configuration parsing
-    if options.backend and options.backend.lower(
-    ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
-        # If we're dealing with a model name, perform a snapshot download to
-        # make sure we have a local copy of the model.
-        if bench_env.checkpoint_path is None:
-            snapshot_download(options.model, revision=bench_env.revision)
+    # If we're dealing with a model name, perform a snapshot download to make
+    # sure we have a local copy of the model.
+    if bench_env.checkpoint_path is None:
+        snapshot_download(options.model, revision=bench_env.revision)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
-                                     bench_env.checkpoint_path)
-        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
-        logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["max_seq_len"] = kwargs_max_sql
-    elif options.backend.lower() == "tensorrt":
-        assert options.max_seq_len is None, (
-            "max_seq_len is not a runtime parameter for C++ backend")
-        exec_settings, build_cfg = get_settings_from_engine(options.engine_dir)
-        engine_max_seq_len = build_cfg["max_seq_len"]
-
-        # TODO: Verify that the engine can handle the max/min ISL/OSL.
-        if metadata.max_sequence_length > engine_max_seq_len:
-            raise RuntimeError(
-                f"Engine supports a max sequence of {engine_max_seq_len}. "
-                "Provided dataset contains a maximum sequence of "
-                f"{metadata.max_sequence_length}. Please rebuild a new engine "
-                "to support this dataset.")
-    else:
-        raise click.BadParameter(
-            f"{options.backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+    exec_settings = get_settings(params, metadata, bench_env.model,
+                                 bench_env.checkpoint_path)
+    kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
+    logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
+    kwargs["max_seq_len"] = kwargs_max_sql
 
     exec_settings["model"] = options.model
     exec_settings["revision"] = bench_env.revision

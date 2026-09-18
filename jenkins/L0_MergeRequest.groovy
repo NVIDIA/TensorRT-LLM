@@ -184,8 +184,9 @@ def INFRA_DRY_RUN = "infra_dry_run"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
-// Version-controlled Tier 2 rollout policy. Keep this in the infra-owned Groovy
-// boundary so changing who receives coverage-based narrowing requires infra review.
+// Version-controlled Tier 2 application policy. Coverage decisions are evaluated
+// for every eligible PR, but only these authors receive coverage-based narrowing.
+// Keep the policy in the infra-owned Groovy boundary so rollout requires infra review.
 @Field
 def CBTS_COVERAGE_PILOT_USERS = [
     "crazydemo",
@@ -617,11 +618,15 @@ def launchReleaseCheck(pipeline, globalVars)
                     "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz",
                     "*/triton_kernels/*.py"
                 ]
-                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
-                def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
-                if (lastLine.toLowerCase().contains("error")) {
-                    error "GUARDWORDS_WARN: Guardwords Scan Failed."
-                }
+                sh """#!/bin/bash
+                    set -eo pipefail
+                    cd ${LLM_ROOT}
+                    # Batch files below ARG_MAX; pipefail propagates scan failures to prevent false greens.
+                    find . -type f \\
+                        ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')} \\
+                        -not -path "./scan.log" \\
+                        -exec confidentiality-scan {} + 2>&1 | tee scan.log
+                """.stripIndent()
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -787,7 +792,7 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 }
                 rawDataList.find { rawData ->
                     if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
-                        result = rawData.get("patch")
+                        result = rawData.get("patch") ?: ""
                         return true
                     }
                     return false
@@ -807,13 +812,97 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 rawDataList.each { rawData ->
                     [rawData.get("filename"), rawData.get("previous_filename")]
                         .findAll { it }
-                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") ?: "" }
                 }
             }
             if (!rawDataList) { break }
         }
     }
     return result
+}
+
+def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
+    def headCommit = env.gitlabCommit?.toString()
+    def baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
+    pipeline.withEnv(["GIT_DIFF_BASE_REF=${baseRef}"]) {
+        withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
+            pipeline.sh "git -C ${LLM_ROOT} fetch --no-tags --depth=1 origin \"\${GIT_DIFF_BASE_REF}\""
+        }
+    }
+    def baseCommit = pipeline.sh(script: "git -C ${LLM_ROOT} rev-parse FETCH_HEAD", returnStdout: true).trim()
+    pipeline.echo("Using internal Git mirror diff: ${baseCommit}...${headCommit}")
+
+    def nameStatus = pipeline.sh(
+        script: "git -C ${LLM_ROOT} -c core.quotepath=false diff --name-status --find-renames ${baseCommit} ${headCommit}",
+        returnStdout: true
+    )
+    def changedFiles = nameStatus.readLines().collect { line ->
+        def fields = line.split('\t', -1)
+        def paths = []
+        for (int index = 1; index < fields.length; index++) {
+            if (fields[index]) {
+                paths.add(fields[index])
+            }
+        }
+        [status: fields[0], paths: paths]
+    }
+    if (function == "getChangedFileList") {
+        return changedFiles.collectMany { changedFile ->
+            changedFile.status.startsWith("R") || changedFile.status.startsWith("C")? changedFile.paths.reverse(): changedFile.paths
+        }
+    }
+
+    def renamePaths = [:]
+    changedFiles.findAll { changedFile ->
+        changedFile.status.startsWith("R") || changedFile.status.startsWith("C")
+    }.each { changedFile ->
+        changedFile.paths.each { changedFilePath -> renamePaths[changedFilePath] = changedFile.paths }
+    }
+    def cachedDiffs = [:]
+    def getFileDiff = { changedFilePath ->
+        if (cachedDiffs.containsKey(changedFilePath)) {
+            return cachedDiffs[changedFilePath]
+        }
+        def diffPaths = renamePaths.get(changedFilePath, [changedFilePath])
+        def rawDiff = ""
+        pipeline.withEnv([
+            "GIT_DIFF_PATH=${diffPaths[0]}",
+            "GIT_DIFF_RENAME_PATH=${diffPaths.size() > 1 ? diffPaths[1] : diffPaths[0]}",
+        ]) {
+            rawDiff = pipeline.sh(
+                script: "git -C ${LLM_ROOT} diff --unified=3 --inter-hunk-context=1 --find-renames ${baseCommit} ${headCommit} -- \":(literal)\${GIT_DIFF_PATH}\" \":(literal)\${GIT_DIFF_RENAME_PATH}\"",
+                returnStdout: true
+            )
+        }
+        def lines = rawDiff.readLines()
+        def firstHunk = lines.findIndexOf { it.startsWith("@@") }
+        def diff = firstHunk < 0 ? "" : lines.drop(firstHunk).join("\n")
+        diffPaths.each { diffPath -> cachedDiffs[diffPath] = diff }
+        return diff
+    }
+
+    if (function == "getOneFileChanges") {
+        return getFileDiff(filePath)
+    }
+    if (function == "getFileChanges") {
+        return filePaths.unique().collectEntries { changedFilePath -> [(changedFilePath): getFileDiff(changedFilePath)] }
+    }
+    pipeline.error("Unsupported PR diff operation: ${function}")
+}
+
+def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    try {
+        return getGithubMRChangedFile(pipeline, globalVars[GITHUB_PR_API_URL], function, filePath)
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] GitHub PR files API failed for ${function}; " +
+                      "trying the internal Git mirror. Error: ${e.toString()}")
+        def result = getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] Internal Git mirror fallback succeeded for ${function}.")
+        return result
+    }
 }
 
 // Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
@@ -881,7 +970,7 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
     try {
         def changedFileList = []
         if (githubPrApiUrl != null) {
-            changedFileList = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
+            changedFileList = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getChangedFileList")
         } else {
             changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
         }
@@ -914,7 +1003,7 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     def diff = ""
 
     if (githubPrApiUrl != null) {
-        diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
+        diff = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getOneFileChanges", filePath)
     } else {
         diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
     }
@@ -999,8 +1088,11 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Download the touch DB only for PRs in the coverage-tier pilot.
-        def coverageDb = _cbtsCoverageAudit(pipeline)
+        // Evaluate Tier 2 for every eligible PR. The pilot gate below controls
+        // application only; non-pilot coverage hits remain shadow decisions.
+        def coverageContext = _cbtsCoverageAudit(pipeline)
+        def coverageDb = coverageContext?.db
+        def coveragePilotEligible = coverageContext?.pilotEligible ?: false
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -1015,7 +1107,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (filesNeedingDiff) {
             def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
             def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+                ? getGithubMRChangedFileWithFallback(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
                 : getGitlabMRChangedFile(pipeline, "getFileChanges")
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
@@ -1042,7 +1134,21 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
                           "Reasons: ${result.reasons.join('; ')}")
-            _cbtsReportDecision(pipeline, globalVars, "fallback", "", output)
+            _cbtsReportDecision(pipeline, globalVars, "fallback", "", output,
+                                false, false, false, coveragePilotEligible)
+            return null
+        }
+        def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
+        def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
+        def multiGpuLabelGateOpen = multiGpuRequired &&
+            _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+        def coverageShadow = result.scope == "coverage" && !coveragePilotEligible
+        if (coverageShadow) {
+            pipeline.echo("CBTS: shadow coverage decision — scope=${result.scope}, " +
+                          "stages=${result.affected_stages.size()}; baseline remains active")
+            _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
+                                multiGpuRequired, multiGpuLabelGateOpen, false,
+                                coveragePilotEligible)
             return null
         }
         // Upload the generated cbts_test_db/ to Artifactory so each L0_Test
@@ -1067,12 +1173,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
-        def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
-        def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
-        def multiGpuLabelGateOpen = multiGpuRequired &&
-            _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
         _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
-                            multiGpuRequired, multiGpuLabelGateOpen)
+                            multiGpuRequired, multiGpuLabelGateOpen, true,
+                            coveragePilotEligible)
         return result
     } catch (InterruptedException e) {
         throw e
@@ -1099,10 +1202,11 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
     }
 }
 
-// Check pilot eligibility, then fetch and audit the touch DB; artifact.py's
-// {path, meta} verbatim, or null on failure.
+// Resolve pilot application eligibility, then fetch and audit the touch DB for
+// every PR. Returns {db, pilotEligible}; db is null on a non-fatal preparation failure.
 def _cbtsCoverageAudit(pipeline)
 {
+    def pilotEligible = false
     try {
         // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
@@ -1110,7 +1214,6 @@ def _cbtsCoverageAudit(pipeline)
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
         def readyJson = ""
         def prAuthor = ""
-        def pilotEligible = false
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
             prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
@@ -1118,30 +1221,24 @@ def _cbtsCoverageAudit(pipeline)
             ).trim()
             pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
             pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
-            if (pilotEligible) {
-                readyJson = sh(
-                    script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                            "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
-                    returnStdout: true,
-                ).trim()
-            }
-        }
-        if (!pilotEligible) {
-            pipeline.echo("CBTS: coverage tier disabled for this PR — running Tier 1 only")
-            return null
+            readyJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                returnStdout: true,
+            ).trim()
         }
         if (!readyJson) {
-            pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
-            return null
+            pipeline.echo("CBTS audit: no coverage DB could be prepared — Tier 2 decision unavailable")
+            return [db: null, pilotEligible: pilotEligible]
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
-        return ready
+        return [db: ready, pilotEligible: pilotEligible]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
-        return null
+        return [db: null, pilotEligible: pilotEligible]
     }
 }
 
@@ -1150,7 +1247,8 @@ def _cbtsCoverageAudit(pipeline)
 // Multi-GPU enters the pre-merge denominator only when normal CI requires it
 // and the approval-label gate is open at CBTS decision time.
 def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson,
-                        boolean multiGpuRequired = false, boolean multiGpuLabelGateOpen = false)
+                        boolean multiGpuRequired = false, boolean multiGpuLabelGateOpen = false,
+                        boolean cbtsApplied = false, boolean coveragePilotEligible = false)
 {
     try {
         def args = "--status ${status}"
@@ -1159,6 +1257,12 @@ def _cbtsReportDecision(pipeline, globalVars, String status, String reason, Stri
         }
         if (multiGpuLabelGateOpen) {
             args += " --multi-gpu-label-gate-open"
+        }
+        if (cbtsApplied) {
+            args += " --cbts-applied"
+        }
+        if (coveragePilotEligible) {
+            args += " --coverage-pilot-eligible"
         }
         if (decisionJson != null) {
             pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
@@ -1390,7 +1494,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/defs/model_express/",
         "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
-        "tests/integration/test_lists/test-db/l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
@@ -1405,9 +1508,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300.yml",

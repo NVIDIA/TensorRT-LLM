@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ast
 import functools
 import json
 import math
@@ -859,7 +858,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     algorithm: Literal["minimax_m3"] = "minimax_m3"
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
-        description="Number of index-attention heads (per TP rank's view).",
+        description=
+        "Global checkpoint index-attention head count. Index heads shard with "
+        "their KV-head groups in both separate and fused projections.",
     )
     sparse_index_dim: int = Field(
         default=128,
@@ -899,6 +900,17 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "by the MSA implementation.",
         status="prototype",
     )
+    fuse_qkv_index_projection: bool = Field(
+        default=False,
+        description=
+        "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q "
+        "is sharded with the KV heads and index-K is replicated. MSA batches "
+        "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
+        "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
+        "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
+        "main KV cache.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -933,6 +945,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
             raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
                              "sparse_disable_index_value=True.")
+        if self.fuse_qkv_index_projection and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "the 'msa' implementation.")
+        if self.fuse_qkv_index_projection and self.indexer_kv_dtype != "fp8":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "indexer_kv_dtype='fp8'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -947,6 +967,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
         return MiniMaxM3SparseParams(
             num_index_heads=self.sparse_num_index_heads,
+            global_num_kv_heads=(
+                self.to_sparse_metadata_params(**kwargs).global_num_kv_heads
+                or None),
             sparse_index_dim=self.sparse_index_dim,
             block_size=self.sparse_block_size,
             topk=self.sparse_topk_blocks,
@@ -956,6 +979,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
             indexer_kv_dtype=self.indexer_kv_dtype,
+            fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1602,16 +1626,18 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
+                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+                      "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
-    backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
-        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
-        "MEGAMOE_CUTEDSL"] = Field(
-            default='AUTO',
-            description="MoE backend to use. "
-            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
-        )
+    backend: _MoeBackend = Field(
+        default='AUTO',
+        description="MoE backend to use. "
+        "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+    )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -1732,8 +1758,8 @@ class AttentionDpConfig(StrictBaseModel):
         default=False,
         description=
         "Enable explicit conversation-affinity routing for attention DP. When "
-        "True, the first request of each conversation is round-robined across "
-        "ranks and every subsequent request carrying the same "
+        "True, the first request is placed by kv_cache_routing_new_conv_placement "
+        "and every subsequent request carrying the same "
         "conversation_params.conversation_id is pinned to that conversation's "
         "first-turn rank. OpenAI requests use the body conversation_params as "
         "canonical; the serve edge only creates conversation_params from the "
@@ -1742,8 +1768,8 @@ class AttentionDpConfig(StrictBaseModel):
         "block reuse, minimizing cross-rank migration). Unlike "
         "enable_kv_cache_aware_routing (affinity inferred from prefix-match "
         "length, which is lost when blocks are evicted), the conversation->rank "
-        "map is explicit and survives eviction. Falls back to load-balanced "
-        "round-robin when no conversation_id is available. Takes precedence "
+        "map is explicit and survives eviction. The same placement policy is "
+        "used when no conversation_id is available. Takes precedence "
         "over enable_kv_cache_aware_routing when both are set.")
     kv_cache_routing_max_sessions: int = Field(
         default=65536,
@@ -1753,18 +1779,17 @@ class AttentionDpConfig(StrictBaseModel):
         "are tracked, bounding memory on long-running servers. Only used when "
         "kv_cache_routing_conversation_affinity is True.")
     kv_cache_routing_new_conv_placement: Literal[
-        "round_robin", "least_queued"] = Field(
+        "round_robin", "least_queued", "least_tokens"] = Field(
             default="round_robin",
             description=
             "Placement policy in conversation-affinity routing for requests "
             "with no pinned rank yet (first turn of a conversation, requests "
             "without a conversation_id, sticky overflow). 'round_robin' "
-            "(default) equalizes per-rank conversation counts. 'least_queued' "
-            "places them on the rank with the fewest live requests instead: "
-            "per-conversation load (turn rate, fan-out, prefill length) is "
-            "not uniform, so count-uniform round-robin can leave some ranks "
-            "with deep queues while others idle; steering new conversations "
-            "by queue depth evens that out and cuts tail TTFT. Existing "
+            "(default) rotates across eligible ranks. 'least_queued' chooses "
+            "the fewest live requests. 'least_tokens' chooses the fewest active "
+            "prompt tokens, including requests assigned in the current batch; "
+            "ties use live request count, then the rotating rank cursor. "
+            "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
 
@@ -1966,6 +1991,21 @@ class DecodingBaseConfig(StrictBaseModel):
         "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
         "target's embedded mtp.* weights.")
 
+    moe_backend: Optional[_MoeBackend] = Field(
+        default=None,
+        description=(
+            "MoE backend override for a neural draft model or embedded MTP "
+            "layers on the PyTorch backend. None inherits the target model's "
+            "backend. AUTO resolves from the draft checkpoint or embedded MTP "
+            "layer quantization, and a concrete backend applies only to the "
+            "draft model or layers. Resolution may fall back based on model, "
+            "quantization, and hardware support. Replacement-head MTP "
+            "checkpoints are unsupported because their independent "
+            "quantization metadata is not loaded. Nemotron-H embedded MTP "
+            "layers must inherit the target backend because their checkpoint "
+            "mapper uses a shared backend-dependent layout. Decoding methods "
+            "without a neural draft model ignore this option."))
+
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
@@ -2166,6 +2206,19 @@ class DecodingBaseConfig(StrictBaseModel):
         """
         return True
 
+    def _validate_moe_backend_compatibility(self,
+                                            *,
+                                            model_config_resolved: bool = False
+                                            ) -> None:
+        if (self.moe_backend is None or not model_config_resolved
+                or not self.uses_replacement_heads):
+            return
+        raise ValueError(
+            "speculative_config.moe_backend does not support replacement-head "
+            "MTP checkpoints because their independent quantization metadata "
+            "is not loaded. Leave moe_backend unset to inherit the target "
+            "backend, or use a full external draft-model checkpoint.")
+
     @property
     def uses_replacement_heads(self) -> bool:
         """Whether `speculative_model` contains replacement MTP heads."""
@@ -2304,16 +2357,9 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
 
 class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Eagle"] = Field(default="Eagle")
-    eagle_choices: Optional[List[List[int]]] = Field(
-        default=None,
-        description=
-        "Static tree structure for draft token generation. Each sublist represents a path in the tree. Mutually exclusive with use_dynamic_tree."
-    )
     use_dynamic_tree: Optional[bool] = Field(
         default=False,
-        description=
-        "Whether to use dynamic tree (Eagle-2 algorithm). Mutually exclusive with eagle_choices."
-    )
+        description="Whether to use dynamic tree (Eagle-2 algorithm).")
     dynamic_tree_max_topK: Optional[int] = Field(
         default=None,
         description=
@@ -2337,22 +2383,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         default="llama3",
         description="The model architecture of the eagle3 model.")
 
-    @field_validator('eagle_choices', mode='before')
-    @classmethod
-    def validate_eagle_choices(cls, v):
-        if v is not None:
-            logger.warning(
-                "The eagle_choices/static tree feature is deprecated and will be removed in release 1.4."
-            )
-            if not isinstance(v, list):
-                if isinstance(v, str):
-                    v = ast.literal_eval(v.replace(" ", ""))
-                else:
-                    raise ValueError(
-                        "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
-                    )
-        return v
-
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
@@ -2362,28 +2392,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
             self.eagle3_layers_to_capture = {-1}
-
-        # Static tree logic
-        # Checks whether the input eagle choices is valid
-        # and reset the max_draft_len and num_eagle_layers if necessary
-        if self.eagle_choices is not None:
-            if self.use_dynamic_tree:
-                raise ValueError(
-                    "If eagle_choices is provided, use_dynamic_tree should be False"
-                )
-
-            # Get num_eagle_layers from eagle_choices
-            num_eagle_layers_from_choices = self.check_eagle_choices()
-            if num_eagle_layers_from_choices != self.num_eagle_layers:
-                logger.warning(
-                    f"Based on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
-                )
-                self.num_eagle_layers = num_eagle_layers_from_choices
-                self.max_draft_len = num_eagle_layers_from_choices
-
-            # Each draft node has a path(choice) from the root to it.
-            # So the number of choices also represents the number of max draft nodes.
-            self.max_total_draft_tokens = len(self.eagle_choices)
 
         # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
         # dynamic_tree_max_topK alone does not turn it on.
@@ -2396,9 +2404,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
         # Dynamic tree logic
         if self.use_dynamic_tree:
-            if self.eagle_choices is not None:
-                raise ValueError(
-                    "If use_dynamic_tree is True, eagle_choices should be None")
             if self.max_draft_len is None or self.max_draft_len <= 0:
                 raise ValueError(
                     "max_draft_len should be provided, which indicates the number of drafter layers"
@@ -2434,25 +2439,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("Draft model must be provided for EAGLE")
         return self
 
-    def check_eagle_choices(self):
-        # 1) Check connectivity
-        unique_choices = set(
-            tuple(sub_choice)
-            for sub_choice in self.eagle_choices)  # remove repeated choices
-        self.eagle_choices = sorted([list(t) for t in unique_choices],
-                                    key=lambda x: (len(x), x))  # sort choices
-        for choice in self.eagle_choices:
-            if len(choice) > 1:
-                assert choice[
-                    0:
-                    -1] in self.eagle_choices, f"Error: choice {choice} is not connected"
-
-        # 2) Get num_eagle_layers_from_choices
-        num_eagle_layers_from_choices = max(
-            len(choice) for choice in self.eagle_choices)
-
-        return num_eagle_layers_from_choices
-
     @functools.cached_property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
@@ -2471,9 +2457,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def is_linear_tree(self) -> bool:
-        if self.eagle_choices is None and self.use_dynamic_tree is False:
-            return True
-        return False
+        return not self.use_dynamic_tree
 
 
 class SAEnhancerConfig(StrictBaseModel):
@@ -2549,12 +2533,6 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
         init=False,
         description=
         "Internal field, not user-configurable. Fixed to 1 since this mode captures hidden states without draft token generation."
-    )
-    eagle_choices: Optional[List[List[int]]] = Field(
-        default=None,
-        init=False,
-        description=
-        "Internal field, not user-configurable. Always None since this mode does not use tree-based draft token structures."
     )
 
     _last_hidden_in_save: bool = PrivateAttr(default=True)
@@ -4652,8 +4630,15 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
-    )
+        "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
+        "coalesces a request's scattered per-block KV for a single multi-rail "
+        "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
+        "the per-block path, >0 enables bounce at that capacity. By default "
+        "two buffers of this size are allocated (one for send, one for recv); "
+        "with agent_bounce_buffer_enable a single shared buffer is allocated "
+        "instead and the size should be a power of two (256/512/1024). "
+        "Requires the Python (v2) transceiver (transceiver_runtime); the C++ "
+        "transceiver does not support bounce and ignores this field.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -4661,9 +4646,77 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Transfer each completed prefill chunk's KV cache while later chunks "
         "compute. Requires Python NIXL, generation-first scheduling, chunked "
         "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
-        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
-        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent "
+        "bounce selected by agent_bounce_buffer_enable is allowed) or "
+        "Mamba/hybrid cache, and block reuse disabled or set to all_reusable. "
+        "Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
+
+    agent_bounce_buffer_enable: bool = Field(
+        default=False,
+        description=
+        "Run the KV-cache bounce in the C++ transfer agent instead of the "
+        "Python transceiver, using one shared kv_cache_bounce_size_mb buffer "
+        "(use a power of two). Set this identically on context and "
+        "generation; kv_cache_bounce_size_mb matters only when its usable "
+        "capacity (rounded down to a power of two) is below max_chunk_size; "
+        "both sides must then clamp to the same chunk cap, otherwise the pair "
+        "falls back to standard NIXL. By default only writes with "
+        "many small descriptors (>= 1024, <= 16 KiB average, i.e. "
+        "head-mismatch layouts) take the path; head-matched layouts (MLA, "
+        "symmetric TP) stay on standard NIXL unless agent_bounce_params "
+        "relaxes the gate. Requires the Python (v2) transceiver; see the "
+        "disaggregated-serving docs.")
+
+    agent_bounce_params: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see "
+        "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
+        "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
+        "Precedence: this dict > environment variable > built-in default. "
+        "Requires agent_bounce_buffer_enable. request_timeout_ms and the "
+        "effective max_chunk_size (after the arena clamp) must match between "
+        "context and generation. "
+        "max_average_descriptor_size=0 stops outbound routing only (arena, "
+        "handshake and inbound scatter stay active); set "
+        "agent_bounce_buffer_enable=False to turn the feature off.")
+
+    @field_validator('agent_bounce_params', mode='before')
+    @classmethod
+    def coerce_agent_bounce_params_to_str(cls, v):
+        """Coerce agent_bounce_params values to strings (YAML often yields ints/bools)."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"agent_bounce_params must be a dict of str to str, got "
+                f"{type(v).__name__}")
+        return {str(k): str(val) for k, val in v.items()}
+
+    @model_validator(mode='after')
+    def validate_bounce_config(self) -> 'CacheTransceiverConfig':
+        if self.agent_bounce_buffer_enable and self.kv_cache_bounce_size_mb == 0:
+            raise ValueError(
+                "agent_bounce_buffer_enable selects the C++ transfer-agent "
+                "bounce implementation, but kv_cache_bounce_size_mb is 0 "
+                "(bounce disabled); set a positive capacity.")
+        if self.agent_bounce_params:
+            if not self.agent_bounce_buffer_enable:
+                raise ValueError(
+                    "agent_bounce_params only applies to the C++ transfer-agent "
+                    "bounce implementation; set agent_bounce_buffer_enable=True "
+                    "or drop the params.")
+            # Lazy: importing tensorrt_llm._torch at module scope is circular.
+            from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
+                AGENT_BOUNCE_PARAM_KEYS
+            unknown = sorted(
+                set(self.agent_bounce_params) - AGENT_BOUNCE_PARAM_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown agent_bounce_params key(s) {unknown}; valid keys "
+                    f"are {sorted(AGENT_BOUNCE_PARAM_KEYS)}.")
+        return self
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
@@ -6000,12 +6053,17 @@ class TorchLlmArgs(BaseLlmArgs):
     use_cute_dsl_bf16_bmm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        "If true, use CuTe DSL BF16 BMM on Blackwell (SM100/SM103) and Rubin (SM107), "
+        "including the DeepSeek-V4 o_a projection on Rubin when DSL support and "
+        "dimension alignment permit. Defaults to false; automatically enabled "
+        "with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
     use_cute_dsl_bf16_gemm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
+        "If true, use CuTe DSL BF16 persistent GEMM for Linear layers on Blackwell "
+        "(SM100/SM103) and Rubin (SM107) when supported. Defaults to false; "
+        "automatically enabled with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
 
     # PrivateVars
@@ -6202,6 +6260,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            self.speculative_config._validate_moe_backend_compatibility()
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
@@ -6740,7 +6800,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if (not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
                 and self.pipeline_parallel_size > 1 and is_sm_100f()):
             logger.info("Automatically enabling CuTe DSL BF16 BMM and GEMM for "
-                        "SM100/SM103 PP.")
+                        "SM100/SM103/SM107 with pipeline_parallel_size > 1.")
             self.use_cute_dsl_bf16_bmm = True
             self.use_cute_dsl_bf16_gemm = True
 
@@ -6750,7 +6810,7 @@ class TorchLlmArgs(BaseLlmArgs):
             if sm < 100:
                 raise ValueError(
                     f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
-                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"supported on SM >= 100 (Blackwell or newer), but current device has "
                     f"sm {sm}.")
         return self
 

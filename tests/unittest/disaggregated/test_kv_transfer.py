@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
 import os
@@ -39,16 +53,10 @@ except ImportError as e:
 else:
     TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import (
-    KVSlice,
-    LayerRange,
-    SessionStatus,
-    TokenRange,
-    WaitResult,
-)
+from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -128,48 +136,25 @@ def test_token_range_invalid_start_gt_end():
 
 
 @pytest.mark.cpu_only
-def test_layer_range_valid():
-    lr = LayerRange(start=0, end=32)
-    assert lr.start == 0
-    assert lr.end == 32
-
-
-@pytest.mark.cpu_only
-def test_layer_range_invalid_negative():
-    with pytest.raises(ValueError, match="non-negative"):
-        LayerRange(start=-1, end=5)
-    with pytest.raises(ValueError, match="non-negative"):
-        LayerRange(start=0, end=-1)
-
-
-@pytest.mark.cpu_only
-def test_layer_range_invalid_start_ge_end():
-    with pytest.raises(ValueError, match="Invalid range"):
-        LayerRange(start=5, end=5)
-    with pytest.raises(ValueError, match="Invalid range"):
-        LayerRange(start=10, end=3)
-
-
-@pytest.mark.cpu_only
-def test_kv_slice_construction():
-    lr = LayerRange(0, 32)
-    s = KVSlice(
-        layer_range=lr,
+def test_chunk_construction():
+    c = Chunk(
         block_ids_per_layer_groups=[[1, 2, 3]],
-        is_last_slice=True,
+        kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=3),
+        is_last=True,
     )
-    assert s.layer_range == lr
-    assert s.block_ids_per_layer_groups == [[1, 2, 3]]
-    assert s.is_last_slice is True
-    assert s.token_range == TokenRange(start=0, end=3)
+    assert c.block_ids_per_layer_groups == [[1, 2, 3]]
+    assert c.kind_per_layer_group == [CacheKind.PAGED]
+    assert c.token_range == TokenRange(start=0, end=3)
+    assert c.is_last is True
 
-    # Test defaults
-    s2 = KVSlice()
-    assert s2.layer_range is None
-    assert s2.block_ids_per_layer_groups == []
-    assert s2.is_last_slice is False
-    assert s2.token_range is None
+    # Everything a reader cannot recompute has to be stated.
+    with pytest.raises(TypeError):
+        Chunk(
+            block_ids_per_layer_groups=[],
+            kind_per_layer_group=[],
+            token_range=TokenRange(start=0, end=0),
+        )
 
 
 @pytest.mark.cpu_only
@@ -178,15 +163,14 @@ def test_session_status_enum():
         "INIT",
         "READY",
         "TRANSFERRING",
-        "KV_TRANSFERRED",
-        "FULLY_TRANSFERRED",
+        "TRANSFERRED",
         "ERROR",
         "CANCELLED",
     ]
     for name in expected:
         assert hasattr(SessionStatus, name)
         assert SessionStatus[name].value == name
-    assert len(SessionStatus) == 7
+    assert len(SessionStatus) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +189,17 @@ def _send_prefill_chunks(
     """Build and optionally send slices through the real prefill-chunk path."""
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
-    base_slice = KVSlice(block_ids_per_layer_groups=all_block_ids)
+    whole = Chunk(
+        block_ids_per_layer_groups=all_block_ids,
+        kind_per_layer_group=[CacheKind.PAGED] * len(all_block_ids),
+        token_range=TokenRange(start=0, end=total_blocks * tokens_per_block),
+        is_last=True,
+    )
     session = sender_session if sender_session is not None else MagicMock()
     session.kv_tasks = []
     transceiver = MagicMock()
     transceiver._get_or_create_send_session.return_value = session
-    transceiver._create_kv_slice = MagicMock(return_value=base_slice)
+    transceiver._describe_local = MagicMock(return_value=whole)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
@@ -254,7 +243,8 @@ def _send_prefill_chunks(
         is_last_chunk = idx == len(chunk_bounds) - 1
         req.py_last_context_chunk = (chunk_start_pos, chunk_end_pos)
         req.context_remaining_length = 0 if is_last_chunk else prompt_len - chunk_end_pos
-        kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+        extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
+        kv_slice = None if extent is None else extent.local
         if kv_slice is None:
             continue
         slices.append(kv_slice)
@@ -280,9 +270,12 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     transceiver._page_table.layer_groups = [SimpleNamespace(sliding_window_size=None)]
     transceiver._send_reqs = {}
     # A full-attention group keeps the whole prompt resident from block 0, so
-    # _create_kv_slice describes every block regardless of prefill progress.
-    transceiver._create_kv_slice.return_value = KVSlice(
-        block_ids_per_layer_groups=[np.arange(prompt_blocks, dtype=np.int64)]
+    # _describe_local describes every block regardless of prefill progress.
+    transceiver._describe_local.return_value = Chunk(
+        block_ids_per_layer_groups=[np.arange(prompt_blocks, dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=prompt_blocks * tokens_per_block),
+        is_last=True,
     )
 
     req = MagicMock()
@@ -301,7 +294,9 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
         )
         req.context_remaining_length = req.prompt_len - req.py_last_context_chunk[1]
 
-        kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+        extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
+
+        kv_slice = None if extent is None else extent.local
 
         assert np.array_equal(
             kv_slice.block_ids_per_layer_groups[0],
@@ -352,7 +347,9 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     req.context_remaining_length = 3 * tokens_per_block
     req.is_generation_only_request = False
 
-    kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+    extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
+
+    kv_slice = None if extent is None else extent.local
 
     assert kv_slice is None
 
@@ -372,10 +369,10 @@ def test_send_prefill_chunks_basic(all_block_ids, chunk_size_blocks, expected_nu
     """Pipelined prefill chunking produces the expected number of slices."""
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks)
     assert len(slices) == expected_num_slices
-    assert slices[-1].is_last_slice is True
+    assert slices[-1].is_last is True
     if expected_num_slices > 1:
         for s in slices[:-1]:
-            assert s.is_last_slice is False
+            assert s.is_last is False
 
 
 @pytest.mark.parametrize("prepopulated_blocks", [0, 1, 5], ids=["no_reuse", "reuse_1", "reuse_5"])
@@ -485,8 +482,14 @@ def create_transfer_worker_setup(
     ctx_transfer_workers = []
     ctx_kv_cache_managers = []
     device_id = 0
-    ctx_instance_name = "ctx_instance"
-    gen_instance_name = "gen_instance"
+    # NIXL agent names share one namespace per node, and this file and the multi-process one both
+    # used to name themselves the same thing. Two xdist workers then registered one name twice and
+    # the loser's transfer came back "remote agent was invalidated" -- a red that reads like a
+    # transport bug. The worker id is inherited by any process this test spawns, so every rank of
+    # one test agrees while two concurrent tests do not.
+    suffix = os.environ.get("PYTEST_XDIST_WORKER", "")
+    ctx_instance_name = f"ctx_instance{suffix}"
+    gen_instance_name = f"gen_instance{suffix}"
 
     request_len = 16
 
@@ -999,9 +1002,11 @@ def add_and_verify_request(
         ]
 
         send_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=ctx_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids_per_group),
+                token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                is_last=True,
             )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
@@ -1016,9 +1021,11 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=gen_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(gen_block_ids_per_group),
+                token_range=TokenRange(start=0, end=gen_request.prompt_len),
+                is_last=True,
             )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
@@ -1031,9 +1038,11 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=gen_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(gen_block_ids_per_group),
+                token_range=TokenRange(start=0, end=gen_request.prompt_len),
+                is_last=True,
             )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
@@ -1053,9 +1062,11 @@ def add_and_verify_request(
             assert sender_session.status != SessionStatus.INIT
 
         send_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
+            Chunk(
                 block_ids_per_layer_groups=ctx_block_ids_per_group,
+                kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids_per_group),
+                token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                is_last=True,
             )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
@@ -1074,9 +1085,8 @@ def add_and_verify_request(
         for send_aux_task in send_aux_tasks:
             send_aux_task.wait()
 
-    sync_session_status = (
-        SessionStatus.KV_TRANSFERRED if send_first else SessionStatus.FULLY_TRANSFERRED
-    )
+    # No aux is owed here, so whether the auxiliary task has landed does not change the status.
+    sync_session_status = SessionStatus.TRANSFERRED
     for sender_session in sender_sessions:
         assert sender_session.status == sync_session_status
     if not send_first:
@@ -1452,17 +1462,21 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
 
         # Gen receives only the suffix list; dst_start is derived from block count.
         rx = gen_tw.create_rx_session(gen_request)
-        recv_slice = KVSlice(
-            is_last_slice=True,
+        recv_slice = Chunk(
             block_ids_per_layer_groups=gen_suffix_block_ids,
+            kind_per_layer_group=[CacheKind.PAGED] * len(gen_suffix_block_ids),
+            token_range=TokenRange(start=0, end=gen_request.prompt_len),
+            is_last=True,
         )
         rx.receive(recv_slice)
 
         if chunk_size_blocks is None:
             tx.send(
-                KVSlice(
-                    is_last_slice=True,
+                Chunk(
                     block_ids_per_layer_groups=ctx_block_ids,
+                    kind_per_layer_group=[CacheKind.PAGED] * len(ctx_block_ids),
+                    token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                    is_last=True,
                 )
             )
         else:
@@ -1603,7 +1617,12 @@ def test_session_cancel_after_send():
         # changed shape across versions).
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
-        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        kv_slice = Chunk(
+            block_ids_per_layer_groups=block_ids_per_groups,
+            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+            is_last=True,
+        )
         tx_session.send(kv_slice)
 
         # No receiver registered yet; task is INIT.
@@ -1711,9 +1730,9 @@ def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessi
     gen_block_ids = ctx_info["gen_block_ids"]
 
     for session in sender_sessions:
-        assert session.status == SessionStatus.KV_TRANSFERRED
+        assert session.status == SessionStatus.TRANSFERRED
     for session in receiver_sessions:
-        assert session.status == SessionStatus.KV_TRANSFERRED
+        assert session.status == SessionStatus.TRANSFERRED
 
     num_layer_groups = len(ctx_block_ids[0])
     for lg_id in range(num_layer_groups):
@@ -1852,7 +1871,12 @@ def test_session_has_transferring_tasks_false():
         # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
-        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        kv_slice = Chunk(
+            block_ids_per_layer_groups=block_ids_per_groups,
+            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+            is_last=True,
+        )
         tx_session.send(kv_slice)
         assert not tx_session.has_transferring_tasks()
         tx_session.close()
@@ -1917,9 +1941,11 @@ def test_incompatible_peer_fails_only_affected_requests():
     # dispatch_task fails at peer validation, before any block transfer, so
     # empty per-layer-group block lists suffice (no KV sequence needed).
     page_table = gen_tw._rank_info.page_table
-    empty_slice = KVSlice(
-        is_last_slice=True,
+    empty_slice = Chunk(
         block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=0),
+        is_last=True,
     )
 
     validate_calls = []
@@ -2005,9 +2031,11 @@ def add_and_verify_pipelined_request(
         tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
     ]
     for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids, strict=True):
-        full_slice = KVSlice(
-            is_last_slice=True,
+        full_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
+            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            token_range=TokenRange(start=0, end=ctx_info["gen_request"].prompt_len),
+            is_last=True,
         )
         recv_session.receive(full_slice)
 

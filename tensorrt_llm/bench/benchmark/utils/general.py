@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from random import choices, shuffle
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Union
 
 import yaml
 
@@ -25,46 +24,6 @@ _KV_CACHE_MAP = {
 }
 
 ALL_SUPPORTED_BACKENDS = ["pytorch", "_autodeploy"]
-
-
-def get_settings_from_engine(
-    engine_path: Path
-) -> Tuple[Dict[str, Union[str, int]], Dict[str, Union[str, int]]]:
-    """Retrieve basic engine information.
-
-    Args:
-        engine_path (Path): Path to a TRT-LLM engine directory.
-
-    Returns:
-        Tuple[Dict[str, Union[str, int]], Dict[str, Union[str, int]]]: Engine
-        properties parsed from the engine at engine_path.
-    """
-    config_path = engine_path / "config.json"
-    runtime_config = {}
-
-    with open(config_path, "r") as config_json:
-        config = json.load(config_json)
-
-    mapping = config["pretrained_config"]["mapping"]
-    engine_build_cfg = config["build_config"]
-
-    executor_settings = {
-        "max_batch_size": engine_build_cfg["max_batch_size"],
-        "max_num_tokens": engine_build_cfg["max_num_tokens"],
-    }
-
-    runtime_config.update({
-        "sw_version": config["version"],
-        "engine_dir": str(engine_path.absolute()),
-        "settings_config": executor_settings,
-        "mapping": mapping,
-    })
-
-    runtime_config["performance_options"] = {}
-    runtime_config["decoding_config"] = {
-        "decoding_mode": engine_build_cfg["speculative_decoding_mode"]
-    }
-    return runtime_config, engine_build_cfg
 
 
 def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,

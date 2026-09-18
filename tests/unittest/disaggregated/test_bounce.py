@@ -780,7 +780,7 @@ class TestHybridK3Bounce:
 
     def test_reserve_engages_on_k3_mixed_layout(self, monkeypatch):
         # Regression pin: a K3 recv request always carries a trailing EMPTY entry for
-        # the mamba layer group (transceiver._create_kv_slice), which used to trip the
+        # the mamba layer group (transceiver._create_chunk), which used to trip the
         # unknown-slot-size guard and silently push every K3 request onto the per-fragment
         # (~0.4 GB/s host-staged) path. It must engage bounce, sized for MLA KV + KDA state.
         t = _make_transport(

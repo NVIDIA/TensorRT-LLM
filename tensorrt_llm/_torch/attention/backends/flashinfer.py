@@ -1067,9 +1067,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # Note: even though flashinfer only recommends 128 MB, we have to push it
             # a bit higher to cover all possible CUDA graph cases. If it's too small,
             # warmup will crash.
+            # FlashInfer's split-KV decode plan sizes its temp buffers proportionally to
+            # SM count; 320 MB was tuned for a 148-SM baseline, so scale up (never down)
+            # on GPUs with more SMs.
+            baseline_sms = 148
+            baseline_bytes = 320 * 1024 * 1024
+            num_sms = torch.cuda.get_device_properties(
+                torch.cuda.current_device()).multi_processor_count
+            workspace_bytes = max(baseline_bytes,
+                                  baseline_bytes * num_sms // baseline_sms)
             self.workspace_buffer = self.get_empty(
                 buffers,
-                (320 * 1024 * 1024, ),
+                (workspace_bytes, ),
                 dtype=torch.uint8,
                 cache_name="workspace_buffer",
                 capture_graph=capture_graph,

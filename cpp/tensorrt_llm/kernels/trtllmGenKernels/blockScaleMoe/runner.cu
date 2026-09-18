@@ -528,6 +528,11 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
+    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
+    {
+        // Keep in sync with run(): the kernel is launched with the 512-rounded valid hidden size.
+        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
+    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
@@ -538,6 +543,10 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
+    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
+    {
+        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
+    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,

@@ -64,15 +64,15 @@ def make_gen_request(
 
 
 def make_ctx_request(
-    request_id,
-    context_remaining_length,
-    prompt_len=None,
-    num_draft_tokens=0,
-    is_first_context_chunk=True,
-    is_last_context_chunk=True,
-    lora_task_id=None,
-    encoder_output_len=None,
-):
+    request_id: int,
+    context_remaining_length: int,
+    prompt_len: int | None = None,
+    num_draft_tokens: int = 0,
+    is_first_context_chunk: bool = True,
+    is_last_context_chunk: bool = True,
+    lora_task_id: int | None = None,
+    encoder_output_len: int | None = None,
+) -> Mock:
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
@@ -80,6 +80,7 @@ def make_ctx_request(
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len or context_remaining_length
     req.context_current_position = 0
+    req.py_connector_served_position = 0
     req.expect_snapshot_points = []
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0

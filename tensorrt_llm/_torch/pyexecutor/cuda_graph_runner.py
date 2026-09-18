@@ -39,6 +39,11 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 
+def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
+    """Cache slot index reserved for MRoPE dummy/no-delta requests."""
+    return max_num_tokens * pp_size
+
+
 class KeyType(NamedTuple):
     batch_size: int
     draft_len: int
@@ -771,20 +776,59 @@ class CUDAGraphRunner:
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
+        expected_num_tokens = self._get_num_tokens_for_key(key)
+        if seqlen != expected_num_tokens:
+            raise ValueError(
+                f"replay() got {seqlen} tokens for key {key}, but the graph "
+                f"was captured for {expected_num_tokens} tokens. A shorter "
+                "input_ids leaves the tail of the static input buffer stale.")
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
+            expected_position_ids_shape = (3, 1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
+            num_slots = key.batch_size * self.max_beam_width
             if mrope_delta_read_seq_slots is not None:
+                if mrope_delta_read_seq_slots.shape[0] != num_slots:
+                    raise ValueError(
+                        f"replay() got {mrope_delta_read_seq_slots.shape[0]} "
+                        f"mrope_delta_read_seq_slots for key {key}, but the graph "
+                        f"was captured for {num_slots} "
+                        "mrope_delta_read_seq_slots.")
                 static_tensors[
                     'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
                                                   shape[0]].copy_(
                                                       mrope_delta_read_seq_slots,
                                                       non_blocking=True)
+            else:
+                # Omission means every slot reads the dummy seq slot's
+                # permanently-zero delta (model_engine.py's mrope_dummy_seq_slot
+                # fast path). Fill explicitly instead of leaving stale values.
+                logger.debug(
+                    "replay() got no mrope_delta_read_seq_slots for a "
+                    "use_mrope graph; filling the static buffer with the "
+                    "dummy seq slot instead of copying real values.")
+                mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
+                    self.config.max_num_tokens, self.config.mapping.pp_size)
+                static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
+                    mrope_dummy_seq_slot)
         else:
+            expected_position_ids_shape = (1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
@@ -1312,8 +1356,8 @@ class EncoderCUDAGraphRunner:
 
         # Replays served from a captured feature graph. A populated `graphs`
         # only proves capture happened; both `pad_batch` and the shape checks
-        # in `_maybe_forward_encoder_graph` can route every request to the
-        # eager encoder without emptying it, so tests need this to tell a
+        # in `EncoderMixin._prepare_encoder_feature_graph_inputs` can route requests
+        # to the eager encoder without emptying it, so tests need this to tell a
         # working graph path from a silent eager fallback.
         self.num_feature_replays = 0
 
@@ -1837,7 +1881,7 @@ class EncoderCUDAGraphRunner:
             return None, None
 
         if "multi_item_part_lens" in inputs:
-            # See model_engine.py for more details
+            # Per-request scoring metadata cannot share captured graph state.
             logger.warning_once(
                 "Encoder CUDA graph does not support multi-item scoring; "
                 "falling back to eager.",

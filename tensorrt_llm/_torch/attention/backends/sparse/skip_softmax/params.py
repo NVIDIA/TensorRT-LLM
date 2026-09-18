@@ -17,7 +17,6 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Literal, Optional, Union
 
-import numexpr
 import torch
 from pydantic import ConfigDict, model_validator
 from pydantic import Field as PydanticField
@@ -126,7 +125,9 @@ class SkipSoftmaxFormula(StrictBaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_formula(self):
+    def _validate_formula(self) -> "SkipSoftmaxFormula":
+        import numexpr
+
         try:
             parsed = numexpr.NumExpr(self.formula)
         except Exception as exc:
@@ -151,6 +152,8 @@ class SkipSoftmaxFormula(StrictBaseModel):
 
     def compute_threshold_scale_factor(self, target_sparsity: float) -> float:
         """Evaluate the formula at ``target_sparsity`` to get threshold_scale_factor."""
+        import numexpr
+
         result = numexpr.evaluate(
             self.formula,
             local_dict={**self.coefficients, "target_sparsity": float(target_sparsity)},

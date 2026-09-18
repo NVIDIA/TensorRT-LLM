@@ -4771,15 +4771,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         along the last axis to ``flat_size`` so the registered Parameter
         shape matches.
         """
-        from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import (
-            stack_byte_reinterpretable_tensors, to_blocked)
-
         device = raw_sf.device
         # Multi-node EPLB can leave this rank with zero shared-load
-        # experts (``len(local_shared_load_expert_ids) == 0``), making
-        # the per-slot SF list empty. ``stack_byte_reinterpretable_tensors``
-        # rejects an empty input, so short-circuit to the registered
-        # flat shape.
+        # experts (``len(local_shared_load_expert_ids) == 0``), so
+        # short-circuit before stacking the per-slot scales.
         if num_slots == 0:
             return torch.empty((0, flat_size), dtype=torch.uint8, device=device)
         sf_cols = raw_sf.shape[-1]  # int32 units
@@ -4794,10 +4789,14 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             raw_sf = interleaved.view(num_slots, expand_intermediate, sf_cols)
         per_slot: List[torch.Tensor] = []
         for slot_idx in range(num_slots):
-            sf_fp8 = raw_sf[slot_idx].view(torch.float8_e4m3fn)
-            per_slot.append(to_blocked(sf_fp8).view(torch.uint8))
-        stacked = stack_byte_reinterpretable_tensors(per_slot,
-                                                     dim=0).contiguous()
+            sf = raw_sf[slot_idx].view(torch.uint8)
+            rows, cols = sf.shape
+            padded = F.pad(sf, (0, -cols % 4, 0, -rows % 128))
+            # The kernel consumes 128x4 blocks in 32x4x4 atom order.
+            blocked = padded.view((rows + 127) // 128, 4, 32, (cols + 3) // 4,
+                                  4)
+            per_slot.append(blocked.permute(0, 3, 2, 1, 4).reshape(-1))
+        stacked = torch.stack(per_slot, dim=0).contiguous()
         if stacked.shape[-1] == flat_size:
             return stacked
         # Pad zero on the tail so the output shape matches the

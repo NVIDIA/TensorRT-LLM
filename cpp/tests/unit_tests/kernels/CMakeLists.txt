@@ -104,11 +104,15 @@ endif()
 
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
+add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
 set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
     nvfp4ColdPageKernelsTest.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
+    # ~HostMem reports a failed cleanup through the poison latch, so this target
+    # needs the latch itself: NO_TLLM_LINKAGE means nothing else supplies it.
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/logger.cpp

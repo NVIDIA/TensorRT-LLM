@@ -56,6 +56,10 @@ For each file under `tests/` in the diff:
    `@pytest.mark.parametrize` stays at method level and a class-level
    `@skip_pre_blackwell` stays at class level instead of dropping to
    module scope.
+   Python helper modules instead query the shared `RepositoryReferenceIndex`.
+   A complete set of direct `test_*.py` importers becomes the anchors; an
+   ambiguous, dynamic, transitive, or non-test importer retains the directory
+   fallback.
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
    (bidirectional pytest-tree lineage) for each anchor; matches feed
    `block_filters`. For non-`test_*.py` paths, the lookup walks up

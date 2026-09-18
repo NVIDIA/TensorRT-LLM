@@ -92,10 +92,9 @@ def _make_v2_kv_cache_manager() -> Mock:
 
 
 def _stub_transfer_entry_points(ex) -> None:
-    """Mock the coordinator's transfer polls once the executor builds it.
-
-    The build stays lazy so a test can still swap delegated executor methods
-    (admission, gen init) before the first ``ex.disagg`` use.
+    """Mock the coordinator's transfer polls and receive start once the
+    executor builds it; the build stays lazy so a test can finish configuring
+    the executor before the first ``ex.disagg`` use.
     """
     build = ex._build_disagg_coordinator
 
@@ -104,6 +103,7 @@ def _stub_transfer_entry_points(ex) -> None:
         coordinator.poll_gen_transfers = Mock()
         coordinator.check_transfer_timeouts = Mock()
         coordinator.reap_context_sends = Mock()
+        coordinator.receive_gen_init = Mock()
         return coordinator
 
     ex._build_disagg_coordinator = build_and_stub
@@ -757,6 +757,8 @@ class MockPadDummyExecutor:
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
 
+        self.adp_router = Mock(exclude_retiring_requests=True)
+
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _ADPForwardIntent
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
@@ -879,7 +881,6 @@ class TestPrepareAndScheduleBatchNoBlock:
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
-        ex._prepare_disagg_gen_init = Mock()
 
         ex._prepare_and_schedule_batch()
 
@@ -1270,7 +1271,6 @@ class TestFailFastDuringBenchmarkFill:
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
-        ex._prepare_disagg_gen_init = Mock()
         ex._handle_errors = Mock()
 
         scheduled = ScheduledRequests()
@@ -1312,13 +1312,13 @@ class TestFailFastDuringBenchmarkFill:
         deferred_req = _make_active_request(in_init=True)
         candidates = [admitted_req, deferred_req]
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=candidates)
-        ex._apply_disagg_transfer_admission = Mock(return_value=([admitted_req], False))
+        ex.disagg.admit = Mock(return_value=([admitted_req], False))
 
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
-        ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
+        ex.disagg.admit.assert_called_once_with(candidates)
+        ex.disagg.receive_gen_init.assert_called_once_with([admitted_req])
         ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
@@ -1342,7 +1342,7 @@ class TestFailFastDuringBenchmarkFill:
         monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
         fitting_req = _make_active_request(in_init=True)
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+        ex.disagg.admit = Mock(return_value=([], True))
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1350,8 +1350,8 @@ class TestFailFastDuringBenchmarkFill:
             "Fail-fast should NOT fire when the scheduler fit an INIT request "
             "that transfer admission temporarily deferred"
         )
-        ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
-        ex._prepare_disagg_gen_init.assert_called_once_with([])
+        ex.disagg.admit.assert_called_once_with([fitting_req])
+        ex.disagg.receive_gen_init.assert_called_once_with([])
         ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
@@ -1384,7 +1384,7 @@ class TestFailFastDuringBenchmarkFill:
         all_rank_status[-1] = (True, True)
         gather = getattr(ex.dist, gather_name)
         gather.return_value = all_rank_status
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+        ex.disagg.admit = Mock(return_value=([], True))
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1406,7 +1406,7 @@ class TestFailFastDuringBenchmarkFill:
             (True, False),
             (True, False),
         ]
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+        ex.disagg.admit = Mock(return_value=([], True))
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1541,7 +1541,6 @@ class TestFillPhaseEndToEnd:
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
-        ex._prepare_disagg_gen_init = Mock()
         ex._handle_errors = Mock()
 
         scheduled = ScheduledRequests()

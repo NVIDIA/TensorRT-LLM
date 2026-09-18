@@ -762,30 +762,39 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
     )
 
     assert session._deadline_monotonic_s is None
-    session.send(Mock(is_last_slice=False))
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
 
     clock.advance(0.5)
-    session.send(Mock(is_last_slice=False))
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
     assert sender.dispatch_task.call_count == 2
     session.close()
 
 
-@pytest.mark.parametrize(
-    ("transfer_timeout_ms", "sender_wait_ms", "expected_timeout_s", "expected_slice_s"),
-    [
-        (60_000, 1_000, 60.0, 1.0),
-        (60_000, None, 60.0, None),
-    ],
-)
-def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
-    monkeypatch,
-    transfer_timeout_ms: Optional[int],
-    sender_wait_ms: Optional[int],
-    expected_timeout_s: Optional[float],
-    expected_slice_s: Optional[float],
-) -> None:
+def _make_cache_config(**overrides) -> SimpleNamespace:
+    """SimpleNamespace standing in for CacheTransceiverConfig.
+
+    Every attribute the KvCacheTransceiverV2 constructor reads must be present here.
+    """
+    fields = dict(
+        kv_transfer_timeout_ms=60_000,
+        kv_transfer_poll_interval_ms=5_000,
+        kv_transfer_sender_future_timeout_ms=1_000,
+        kv_cache_bounce_size_mb=0,
+        agent_bounce_buffer_enable=False,
+        agent_bounce_params=None,
+        enable_pipelined_transfer=False,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
+    """Build a KvCacheTransceiverV2 with all collectives/native setup mocked out.
+
+    Returns the TransferWorkerConfig it wired.
+    """
     worker = SimpleNamespace(page_table=None)
     worker_constructor = Mock(return_value=worker)
     monkeypatch.setattr(
@@ -796,9 +805,11 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
         "tensorrt_llm._torch.disaggregation.transceiver.create_cache_reuse_adapter",
         Mock(return_value=Mock()),
     )
+    # Echo the routed size: None for 0 (off, mirroring the real helper), a sentinel
+    # carrying the size otherwise, so tests can assert which implementation got it.
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.bounce_config_from_size",
-        Mock(return_value=None),
+        Mock(side_effect=lambda size_mb: ("bounce", size_mb) if size_mb > 0 else None),
     )
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.torch.cuda.current_device",
@@ -816,18 +827,17 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
     )
     monkeypatch.setattr(KvCacheTransceiverV2, "_init_sync_policy", lambda _self: None)
     monkeypatch.setattr(KvCacheTransceiverV2, "_exchange_rank_info", lambda _self: None)
+    # Everything the constructor can reach, not only what it reaches with these values: the
+    # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
         cp_size=1,
+        world_size=1,
+        pp_size=1,
+        has_cp_helix=lambda: False,
+        cp_config={},
         tp_rank=0,
         tp_size=1,
         enable_attention_dp=False,
-    )
-    cache_config = SimpleNamespace(
-        kv_transfer_timeout_ms=transfer_timeout_ms,
-        kv_transfer_poll_interval_ms=5_000,
-        kv_transfer_sender_future_timeout_ms=sender_wait_ms,
-        kv_cache_bounce_size_mb=0,
-        enable_pipelined_transfer=False,
     )
 
     KvCacheTransceiverV2(
@@ -839,9 +849,62 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
 
     worker_config = worker_constructor.call_args.args[0]
     assert isinstance(worker_config, TransferWorkerConfig)
+    return worker_config
+
+
+@pytest.mark.parametrize(
+    ("transfer_timeout_ms", "sender_wait_ms", "expected_timeout_s", "expected_slice_s"),
+    [
+        (60_000, 1_000, 60.0, 1.0),
+        (60_000, None, 60.0, None),
+    ],
+)
+def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
+    monkeypatch,
+    transfer_timeout_ms: Optional[int],
+    sender_wait_ms: Optional[int],
+    expected_timeout_s: Optional[float],
+    expected_slice_s: Optional[float],
+) -> None:
+    worker_config = _construct_worker_config(
+        monkeypatch,
+        _make_cache_config(
+            kv_transfer_timeout_ms=transfer_timeout_ms,
+            kv_transfer_sender_future_timeout_ms=sender_wait_ms,
+        ),
+    )
     assert worker_config.tx_timeout_s == expected_slice_s
     assert worker_config.tx_overall_timeout_s == expected_timeout_s
     assert worker_config.rx_timeout_s == expected_timeout_s
+
+
+@pytest.mark.parametrize(
+    ("bounce_size_mb", "agent_enable", "expected_python_bounce", "expected_buffer_size_mb"),
+    [
+        # Shared capacity, Python implementation (default): per-region bounce on, agent off.
+        (384, False, ("bounce", 384), 0),
+        # Shared capacity, C++ agent implementation: the agent bounce buffer gets the size, Python off.
+        (384, True, None, 384),
+        # Size 0 keeps both implementations off.
+        (0, False, None, 0),
+    ],
+)
+def test_transceiver_routes_bounce_capacity_to_one_implementation(
+    monkeypatch,
+    bounce_size_mb: int,
+    agent_enable: bool,
+    expected_python_bounce,
+    expected_buffer_size_mb: int,
+) -> None:
+    worker_config = _construct_worker_config(
+        monkeypatch,
+        _make_cache_config(
+            kv_cache_bounce_size_mb=bounce_size_mb,
+            agent_bounce_buffer_enable=agent_enable,
+        ),
+    )
+    assert worker_config.bounce == expected_python_bounce
+    assert worker_config.agent_buffer_size_mb == expected_buffer_size_mb
 
 
 def test_transceiver_rejects_unset_transfer_timeout() -> None:
@@ -895,7 +958,6 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         aux_buffer=worker._aux_buffer,
         timeout_s=0.25,
         prompt_len=128,
-        beam_width=1,
         overall_timeout_s=60.0,
     )
 
@@ -1028,7 +1090,7 @@ def test_generation_first_tx_session_nonblocking_missing_aux_stays_pending() -> 
     session = _make_tx_session([task], need_aux=True)
 
     assert session.wait_complete(blocking=False) is None
-    assert session.status == SessionStatus.KV_TRANSFERRED
+    assert session.status == SessionStatus.TRANSFERRING
     assert session.exception is None
     assert task.wait_calls == []
 
