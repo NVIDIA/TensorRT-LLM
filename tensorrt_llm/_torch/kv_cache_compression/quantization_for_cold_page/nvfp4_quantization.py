@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -18,6 +18,7 @@ from tensorrt_llm.quantization.modelopt_config import (
     read_modelopt_quant_config,
 )
 
+from ...attention.backends.interface import RopeParams
 from ...pyexecutor.resource_manager import DataType
 from .quantization_for_cold_page import ColdPageQuantizationCompression
 
@@ -193,24 +194,6 @@ def _load_modelopt_nvfp4_scales(
     return result
 
 
-def _get_text_config(pretrained_config: object) -> object:
-    """The text sub-config of a composite (VLM) config, or the config itself."""
-
-    get_text_config = getattr(pretrained_config, "get_text_config", None)
-    text = get_text_config() if callable(get_text_config) else None
-    return text if text is not None else pretrained_config
-
-
-def _get_rope_elements(text_config: object, head_dim: int) -> int:
-    """Number of leading K numbers that carry position information (``head_dim * partial_rotary_factor``)."""
-
-    factor = getattr(text_config, "partial_rotary_factor", None)
-    rope_parameters = getattr(text_config, "rope_parameters", None)
-    if factor is None and isinstance(rope_parameters, Mapping):
-        factor = rope_parameters.get("partial_rotary_factor")
-    return head_dim if factor is None else int(round(head_dim * float(factor)))
-
-
 class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     """NVFP4 layout, calibration metadata, and CUDA dispatch."""
 
@@ -246,23 +229,20 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         if not keep_rope:
             return 0, row_elements
         if rope is None:
-            text_config = _get_text_config(self.pretrained_config)
-            if key_only:
+            # The same RoPE width the attention layers use.
+            text_config = self.pretrained_config.get_text_config()
+            rope_dim = RopeParams.from_config(text_config).dim
+            if key_only:  # MLA latent vector: kv_lora_rank NoPE numbers, then the RoPE numbers.
                 kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
-                rope_dim = getattr(text_config, "qk_rope_head_dim", None)
-                if (
-                    not isinstance(kv_lora_rank, int)
-                    or not isinstance(rope_dim, int)
-                    or kv_lora_rank + rope_dim != row_elements
-                ):
+                if not isinstance(kv_lora_rank, int) or kv_lora_rank + rope_dim != row_elements:
                     raise NotImplementedError(
                         f"{buffer_name}: head_dim {row_elements} is not kv_lora_rank + "
                         f"qk_rope_head_dim ({kv_lora_rank} + {rope_dim}) of an MLA latent vector, "
                         "so its RoPE part cannot be located; keep_rope_precision is unsupported here"
                     )
                 rope = (kv_lora_rank, rope_dim)
-            else:
-                rope = (0, _get_rope_elements(text_config, row_elements))
+            else:  # GQA head: the leading numbers carry RoPE.
+                rope = (0, rope_dim)
         rope_start, rope_elements = rope
         if rope_elements == 0:
             return 0, row_elements
