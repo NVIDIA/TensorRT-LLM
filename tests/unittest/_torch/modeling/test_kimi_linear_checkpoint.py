@@ -461,6 +461,9 @@ def test_mla_load_preserves_checkpoint_and_absorption_pairs(tp_size, tp_rank, cp
     torch.testing.assert_close(
         attention.v_b_proj_scale, scale[:, 1:].chunk(cp_size, dim=0)[attention.mapping.cp_rank]
     )
+    for module in model.modules():
+        if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
+            module.post_load_weights()
     hidden = torch.randn(7, 256, dtype=torch.bfloat16, device="cuda")
     assert torch.isfinite(attention.kv_a_proj_with_mqa(hidden)).all()
     assert torch.isfinite(attention.kv_b_proj(hidden)).all()
