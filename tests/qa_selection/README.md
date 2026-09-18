@@ -41,6 +41,51 @@ grep -lE '^(import|from) pytest' tests/qa_selection/core/*.py   # prints nothing
 `plugin.py` is deliberately short: a reader opening the entry point should see the hook
 contract — `trylast`, non-wrapper, inert without `--machine` — with nothing else in the way.
 
+## Generating the lists
+
+One machine per invocation; run it once per machine into one directory for a fleet.
+
+```bash
+pytest --collect-only -q -p qa_selection.plugin \
+       --machine=B200 --ladder=1,4,8 --selection-out-dir=out/
+```
+
+| file | what it holds |
+|---|---|
+| `B200.json` | the auditable record: counts, per-test outcome, the source revision |
+| `B200-{1,4,8}gpu.ids` | bare node ids per allocation; every rung written, even when empty |
+
+Without `--ladder` a single `B200.ids` replaces the per-rung files. The ids are **unprefixed** — the
+on-disk test-list contract — so a consumer joining against prefixed Jenkins artifacts adds the
+prefix itself. They carry no `TIMEOUT`/`SKIP`/`XFAIL` decoration either, which is what lets the
+pipeline filter its own decorated list by first field and keep every suffix:
+
+```bash
+awk 'NR==FNR{keep[$0];next} ($1 in keep)' out/B200-4gpu.ids l0_excluded_test_list.txt
+```
+
+`--gpus` narrows the live item list instead of the output, so it is for running, not generating:
+`--gpus` together with `--selection-out-dir` and `--ladder` is a usage error, because the rung's
+list is already one of the files the command above writes.
+
+### Three populations the report never merges
+
+Each has a different fix and a different owner, so a combined count would be one nobody can act on:
+
+| key | meaning | fix |
+|---|---|---|
+| `unknown_reasons` | a `skipif` reason with no rule | curate a rule in `core/rules.json` |
+| `unkeyable_skipif` | a `skipif` with no `reason=` at all | give the decorator a reason |
+| `unclassified` | an id in the consumer's list this run never collected | the artifact is stale |
+
+`unassignable` is a fourth and separate key: a test this machine can run that no rung fits. It is
+never folded into the largest rung.
+
+Every test entry reports `required_gpus` beside `required_gpus_from`, because the number is an
+*inference* — `skip_less_device(4)` declares a lower bound for running, not a demand. An empty
+`required_gpus_from` marks the tests that got `1` by assumption, which is the population most likely
+to hang if the assumption is wrong.
+
 ## Why rules are keyed on the reason string
 
 `pytest.mark.skipif` evaluates its condition when the conftest is imported and freezes the

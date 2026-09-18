@@ -23,6 +23,7 @@ hooks; `core/` holds the decisions and imports no pytest.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -135,6 +136,7 @@ class SelectionRequest:
     profile: MachineProfile
     ladder: Optional[Ladder]
     target_rung: Optional[int]
+    out_dir: Optional[Path]
 
     @classmethod
     def of(cls, config: pytest.Config) -> Optional["SelectionRequest"]:
@@ -145,12 +147,32 @@ class SelectionRequest:
         gpus = config.getoption(SelectionOptions.GPUS)
         profile = cls.profile_for(machine, gpus)
         ladder = cls.ladder_for(config.getoption(SelectionOptions.LADDER), profile)
+        target_rung = cls.target_rung_for(gpus, ladder)
         return cls(
             machine=machine,
             profile=profile,
             ladder=ladder,
-            target_rung=cls.target_rung_for(gpus, ladder),
+            target_rung=target_rung,
+            out_dir=cls.out_dir_for(config.getoption(SelectionOptions.OUT_DIR), target_rung),
         )
+
+    @staticmethod
+    def out_dir_for(text: Optional[str], target_rung: Optional[int]) -> Optional[Path]:
+        """Where to write, or None when nothing is written.
+
+        Naming a rung and asking for artifacts at once is a usage error. The
+        rung's list is one of the files the same command writes *without*
+        `--gpus`, so the combination can only ever produce a subset of an
+        artifact you would get anyway, with the other rungs truncated.
+        """
+        if text is None:
+            return None
+        if target_rung is not None:
+            raise pytest.UsageError(
+                "--selection-out-dir: cannot be combined with --gpus and --ladder; "
+                "drop --gpus and every rung is written at once"
+            )
+        return Path(text)
 
     @staticmethod
     def ladder_for(text: Optional[str], profile: MachineProfile) -> Optional[Ladder]:
@@ -197,9 +219,21 @@ class SelectionRequest:
         except (ProfileConfigError, OSError) as error:
             raise pytest.UsageError(f"--machine: cannot read the machine catalogue: {error}")
         try:
-            return catalog.profile_for(machine, gpus)
+            node = catalog.profile_for(machine)
         except KeyError as error:
             raise pytest.UsageError(f"--machine: {error.args[0]}")
+
+        if gpus is None:
+            return node
+        if gpus > node.max_gpu_per_node:
+            # Same veto the ladder gets: an allocation this large cannot be
+            # requested, and sizing a profile past the node over-selects.
+            raise pytest.UsageError(
+                f"--gpus: {gpus} exceeds {node.name}, which has "
+                f"{node.max_gpu_per_node} GPUs per node"
+            )
+        try:
+            return node.with_gpu_count(gpus)
         except ProfileConfigError as error:
             raise pytest.UsageError(f"--gpus: {error}")
 
@@ -241,6 +275,7 @@ class Selection:
 
     request: SelectionRequest
     assignments: Tuple[Assignment, ...]
+    views: Tuple[CollectedTest, ...]
 
     @classmethod
     def of(cls, request: SelectionRequest, items: List[pytest.Item]) -> "Selection":
@@ -249,14 +284,18 @@ class Selection:
         Feasibility is decided first and independently: a `Decision` says the
         test can run on the machine, and the rung says which allocation it
         belongs to.
+
+        The views are kept beside the assignments because the report reads them
+        for one fact no `Decision` carries: a `skipif` with no `reason=` at all.
         """
         selector = Selector(request.profile)
-        views = [ItemView.of(item) for item in items]
+        views = tuple(ItemView.of(item) for item in items)
         return cls(
             request=request,
             assignments=tuple(
                 Assignment.of(selector.decide(view), view, request.ladder) for view in views
             ),
+            views=views,
         )
 
     def is_live(self, assignment: Assignment) -> bool:
