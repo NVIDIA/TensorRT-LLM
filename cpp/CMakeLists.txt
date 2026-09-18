@@ -484,10 +484,10 @@ endif()
 
 if((WIN32))
   if((MSVC_VERSION GREATER_EQUAL 1914))
-    # MSVC does not apply the correct __cplusplus version per the C++ standard
-    # by default. This is required for compiling CUTLASS 3.0 kernels on windows
-    # with C++-17 constexpr enabled. The 2017 15.7 MSVC adds /Zc:__cplusplus to
-    # set __cplusplus to 201703 with std=c++17. See
+    # MSVC does not report the correct __cplusplus version per the C++ standard
+    # by default, which the CUTLASS kernels rely on to enable their constexpr
+    # paths. /Zc:__cplusplus makes it follow the standard it is compiling
+    # against. See
     # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus for
     # more info.
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
