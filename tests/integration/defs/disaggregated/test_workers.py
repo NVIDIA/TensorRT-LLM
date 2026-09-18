@@ -807,16 +807,7 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
         asyncio.run(tester.test_multi_round_request(prompts, 8, 4))
 
 
-@pytest.fixture
-def _router_eviction_setup_fault():
-    """Temporary setup hard exit to verify unfinished-test recording."""
-    # Match pytest-timeout's thread-mode termination before setup reports exist.
-    print("Injected router eviction setup hard exit", flush=True)
-    os._exit(1)
-
-
-def test_workers_kv_cache_aware_router_eviction(_router_eviction_setup_fault,
-                                                disaggregated_test_root,
+def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
                                                 disaggregated_example_root,
                                                 llm_venv):
     config_file = os.path.join(disaggregated_test_root,

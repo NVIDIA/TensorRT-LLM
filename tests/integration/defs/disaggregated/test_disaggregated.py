@@ -1228,7 +1228,16 @@ def test_disaggregated_diff_max_tokens(disaggregated_test_root,
                            cwd=llm_venv.get_working_directory())
 
 
-def test_disaggregated_single_gpu(disaggregated_test_root,
+@pytest.fixture
+def _disaggregated_single_gpu_setup_fault():
+    """Temporary setup hard exit to verify unfinished-test recording."""
+    # Match pytest-timeout's thread-mode termination before setup reports exist.
+    print("Injected disaggregated single GPU setup hard exit", flush=True)
+    os._exit(1)
+
+
+def test_disaggregated_single_gpu(_disaggregated_single_gpu_setup_fault,
+                                  disaggregated_test_root,
                                   disaggregated_example_root, llm_venv):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     assert os.path.exists(
