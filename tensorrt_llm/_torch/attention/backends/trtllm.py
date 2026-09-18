@@ -1598,6 +1598,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.layer_idx]
         return self.local_layer_idx
 
+    def get_fp4_mla_local_layer_idx(self,
+                                    metadata: TrtllmAttentionMetadata) -> int:
+        """Return the compact index used by FP4 MLA-only side pools."""
+        local_layer_idx = self.get_local_layer_idx(metadata)
+        if metadata.kv_cache_manager is None:
+            return local_layer_idx
+        to_compact = getattr(metadata.kv_cache_manager,
+                             "_fp4_mla_compact_layer_idx", None)
+        if not callable(to_compact):
+            raise RuntimeError(
+                "FP4 MLA requires a cache manager with compact layer mapping.")
+        return to_compact(local_layer_idx)
+
     def use_nvfp4_output(
         self,
         metadata: TrtllmAttentionMetadata,
