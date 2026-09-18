@@ -1245,7 +1245,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
 
 class MiniMaxM3DraftSubpageView:
-    """Present the shared manager's draft-layer pool at a smaller kernel page size.
+    """Present one shared draft layer's pool at a smaller kernel page size.
 
     With unified KV cache the drafter's KV lives inside the shared manager's
     128-token logical blocks, but the Eagle3 kernels are only healthy at
@@ -1270,6 +1270,11 @@ class MiniMaxM3DraftSubpageView:
     """
 
     def __init__(self, manager, draft_layer_ids: Sequence[int], subpage_tokens: int):
+        if len(draft_layer_ids) != 1:
+            raise NotImplementedError(
+                "MiniMax-M3 draft subpage views support exactly one local shared draft layer; "
+                f"got {len(draft_layer_ids)}. Multiple layers require separate P32 pool roots."
+            )
         self._manager = manager
         self.tokens_per_block = int(subpage_tokens)
         layer_id = draft_layer_ids[0]

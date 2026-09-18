@@ -277,7 +277,7 @@ def test_hybrid_view_rejects_non_p32_draft_pages():
         raise AssertionError("expected NVFP4 Eagle draft view to require P32 pages")
 
 
-@pytest.mark.parametrize("local_draft_layers", [[], [60], [61], [60, 61]])
+@pytest.mark.parametrize("local_draft_layers", [[], [60], [61]])
 @pytest.mark.parametrize("swa_scratch_reuse", [False, True])
 def test_draft_subpage_accessor_respects_local_layers(
     monkeypatch: pytest.MonkeyPatch, local_draft_layers: list[int], swa_scratch_reuse: bool
@@ -308,6 +308,28 @@ def test_draft_subpage_accessor_respects_local_layers(
         assert manager.get_draft_subpage_view() is view
         create_view.assert_called_once_with(manager, local_draft_layers, 32)
     assert manager._shared_draft_layer_ids == [60, 61]
+
+
+@pytest.mark.parametrize("via_accessor", [False, True])
+def test_draft_subpage_view_rejects_multiple_local_layers(via_accessor: bool) -> None:
+    """The real single-pool view must reject a second layer before publishing wrong pointers."""
+    manager = _Nvfp4HybridManager()
+    manager.layer_offsets[61] = 61
+    manager.kv_cache_pool_mapping = torch.cat(
+        [manager.kv_cache_pool_mapping, torch.tensor([[1, 9]], dtype=torch.int32)]
+    )
+    manager.is_draft = False
+    manager._shared_draft_layer_ids = [60, 61]
+    manager.enable_swa_scratch_reuse = False
+    manager.draft_manager_tokens_per_block = 32
+    manager._draft_subpage_view_obj = None
+
+    with pytest.raises(NotImplementedError, match="exactly one local shared draft layer"):
+        if via_accessor:
+            MiniMaxM3KVCacheManagerV2.get_draft_subpage_view(manager)
+        else:
+            MiniMaxM3DraftSubpageView(manager, [60, 61], 32)
+    assert manager._draft_subpage_view_obj is None
 
 
 def test_nvfp4_manager_rejects_dynamic_tree_eagle_before_allocation():
