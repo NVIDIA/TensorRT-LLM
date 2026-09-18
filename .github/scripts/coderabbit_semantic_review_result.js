@@ -135,14 +135,13 @@ async function publish({github, context, core}) {
   const latestRequest = allRequests.find(r => r.branch === pair.branch &&
     r.head === pair.head && r.target === pair.target && r.mergeBase === pair.mergeBase &&
     (pair.merged ? (r.merged === pair.merged || (!r.merged && r.tree && r.tree === pair.tree)) : !r.merged));
-  const candidates = preview ? comments.toSorted((a, b) => b.id - a.id) :
-    [(await github.rest.issues.getComment({...repo, comment_id: context.payload.comment.id})).data];
   let result;
-  for (const comment of candidates) {
+  // Reconcile the latest API result, even when an older comment event is replayed.
+  for (const comment of comments.toSorted((a, b) => b.id - a.id)) {
     const parsed = parseResult(comment);
     if (!parsed || parsed.head !== pair.head || parsed.target !== pair.target ||
         parsed.mergeBase !== pair.mergeBase) continue;
-    if (preview && !parsed.merged) { result = parsed; break; }
+    if (preview && !latestRequest && !parsed.merged) { result = parsed; break; }
     if (latestRequest && matches(parsed, latestRequest) &&
         comment.id > latestRequest.id &&
         Date.parse(comment.created_at) >= Date.parse(latestRequest.created_at)) {

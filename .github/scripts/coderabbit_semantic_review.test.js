@@ -66,7 +66,7 @@ function harness(overrides = {}) {
         }}; },
       },
       issues: {
-        listComments: 'comments', getComment: async args => ({data: comments.find(c => c.id === args.comment_id)}),
+        listComments: 'comments',
         createComment: async args => {
           posted.push(args); writes.push(['comment', args]);
           const comment = {id: comments.length + 1, issue_number: args.issue_number, body: args.body,
@@ -395,6 +395,35 @@ test('a manual retry cannot be satisfied by an older comment event', async () =>
   h.setNow(NOW + HOUR); await h.run('workflow_dispatch'); await h.publish(oldReply);
   assert.equal(h.checks[0].conclusion, 'neutral');
   await h.publish(h.reply('FAIL')); assert.equal(h.checks[0].conclusion, 'failure');
+});
+
+test('delayed result events reconcile the newest verdict for open PRs and audits', async () => {
+  for (const merged of [false, true]) {
+    for (const verdict of ['PASS', 'FAIL', 'INCONCLUSIVE']) {
+      const h = harness({merged, state: merged ? 'closed' : 'open'});
+      await h.run();
+      const older = h.reply(verdict === 'PASS' ? 'FAIL' : 'PASS');
+      const newer = h.reply(verdict);
+      await h.publish(newer);
+      await h.publish(older);
+      assert.equal(h.checks[0].conclusion,
+        {PASS: 'success', FAIL: 'failure', INCONCLUSIVE: 'neutral'}[verdict]);
+      assert.equal(h.checks[0].details_url, newer.html_url);
+      if (merged) assert.equal(h.posted.length, 2); // Request and one current audit receipt.
+    }
+  }
+});
+
+test('preview waits for the latest manual retry before accepting a verdict', async () => {
+  const h = harness(); await h.run(); await h.publish(h.reply('PASS'));
+  h.setNow(NOW + HOUR); await h.run('workflow_dispatch');
+  const writes = h.writes.length;
+  await h.publish(null, true);
+  assert.equal(h.outputs.verdict, 'INCONCLUSIVE');
+  assert.equal(h.writes.length, writes);
+  await h.publish(h.reply('FAIL'), true);
+  assert.equal(h.outputs.verdict, 'FAIL');
+  assert.equal(h.writes.length, writes);
 });
 
 test('a new audit request cannot be overwritten by an older pre-merge result', async () => {
