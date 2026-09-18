@@ -352,6 +352,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# C++20 makes CMake scan the sources for module imports, which needs a scanner
+# the build images do not ship. Nothing here uses modules, so skip the scan.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
