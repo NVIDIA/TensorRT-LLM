@@ -97,9 +97,12 @@ class TestStepPolicy:
         controller.set_step(1, num_steps=50)
         assert controller.high_precision is first is True
 
-    def test_single_step_schedule_stays_on_the_quantized_path(self):
-        """A one-step schedule is the warmup probe, not an all-edge request."""
+    def test_one_step_request_follows_the_declared_policy(self):
+        """A real one-step request is all edge; the policy decides, not the step count."""
         controller = StepPrecisionController(first_steps=3, last_steps=3)
+        controller.set_step(0, num_steps=1)
+        assert controller.high_precision is True
+        controller = StepPrecisionController(first_steps=0, last_steps=0)
         controller.set_step(0, num_steps=1)
         assert controller.high_precision is False
 

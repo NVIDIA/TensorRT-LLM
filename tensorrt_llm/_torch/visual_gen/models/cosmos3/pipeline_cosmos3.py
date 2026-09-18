@@ -2230,6 +2230,28 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
         return prepared
 
+    def _select_step_precision(self, step_index: int) -> None:
+        """Select this denoising step's activation precision on the transformer.
+
+        A pure function of step_index, so the conditional and unconditional CFG
+        branches of one step always select the same path even though each
+        calls this separately. No-op unless the checkpoint declares a step
+        policy.
+
+        Warmup leaves the transformer on the checkpoint's native path: its
+        short schedule would land every step inside the policy's edge windows
+        and warm only the 16-bit path, while the quantized GEMMs -- the ones
+        with tactics to tune -- would first run on a user's request.
+        """
+        if self._is_warmup:
+            return
+        # getattr: the transformer is not always a Cosmos3Transformer.
+        # Distilled-pipeline tests substitute a lightweight stand-in, and a
+        # transformer with no step policy has no reason to carry these.
+        set_step = getattr(self.transformer, "set_denoising_step", None)
+        if set_step is not None:
+            set_step(step_index=step_index, num_steps=len(self.scheduler.timesteps))
+
     def _denoise_request(
         self,
         request: _ResolvedRequest,
@@ -2291,16 +2313,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             encoder_hidden_states,
             extra_tensors,
         ):
-            # Activation precision for this step. A pure function of step_index,
-            # so the conditional and unconditional CFG branches of one step
-            # always select the same path even though each calls this
-            # separately. No-op unless the checkpoint declares a step policy.
-            # getattr: the transformer is not always a Cosmos3Transformer.
-            # Distilled-pipeline tests substitute a lightweight stand-in, and a
-            # transformer with no step policy has no reason to carry these.
-            set_step = getattr(self.transformer, "set_denoising_step", None)
-            if set_step is not None:
-                set_step(step_index=step_index, num_steps=len(self.scheduler.timesteps))
+            self._select_step_precision(step_index)
 
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
             current_action = extra_stream_latents.get("action") if extra_stream_latents else None

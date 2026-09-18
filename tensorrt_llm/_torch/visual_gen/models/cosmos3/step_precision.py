@@ -196,13 +196,6 @@ class StepPrecisionController:
             raise ValueError(f"num_steps must be positive, got {num_steps}")
         if step_index < 0 or step_index >= num_steps:
             raise IndexError(f"step_index must be in [0, {num_steps}), got {step_index}")
-        # A single-step schedule is the warmup probe rather than a real
-        # request, and treating every step as an edge step would make warmup
-        # exercise a path the measured run never takes.
-        if num_steps == 1:
-            self.high_precision = False
-            self._rebind_all()
-            return
         self.high_precision = (
             step_index < self.first_steps or step_index >= num_steps - self.last_steps
         )
