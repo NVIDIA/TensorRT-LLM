@@ -64,10 +64,13 @@ def _make_creator(
     c._max_seq_len = 1024
     c._max_num_tokens = 0
     c._max_batch_size = 1
+    c._is_disagg = False
+    c._cache_transceiver_config = None
     c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
     c._llm_args = SimpleNamespace(kv_cache_compression_config=None)
+    c._disable_overlap_scheduler = False
 
     c._kv_cache_manager_cls = Mock()
     c._kv_cache_manager_cls.get_cache_size_per_token = Mock(
@@ -141,6 +144,7 @@ class TestSplitGpuBudgetForDraft:
         )
         draft_model_config = SimpleNamespace(
             quant_config=None,
+            sparse_attention_config=None,
             pretrained_config=SimpleNamespace(
                 num_hidden_layers=1,
                 hidden_size=2880,
@@ -182,6 +186,7 @@ class TestSplitGpuBudgetForDraft:
     ) -> None:
         class DraftModelConfig:
             quant_config = None
+            sparse_attention_config = None
             pretrained_config = SimpleNamespace(
                 num_hidden_layers=1,
                 hidden_size=32,
@@ -217,6 +222,9 @@ class TestSplitGpuBudgetForDraft:
         creator._max_seq_len = 16384
         creator._max_batch_size = 1
         creator._max_num_tokens = 128
+        creator._max_beam_width = 1
+        creator._kv_connector_manager = None
+        creator._cache_transceiver_config = None
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
@@ -255,10 +263,7 @@ class TestSplitGpuBudgetForDraft:
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]
         assert target_kv_config.max_attention_window == [16384]
-        if mode.is_external_drafter():
-            assert get_manager_cls.call_args.args[1] is draft_kv_config
-        else:
-            get_manager_cls.assert_not_called()
+        assert get_manager_cls.call_args.args[1] is draft_kv_config
 
     def test_target_cost_uses_derived_layer_type_windows(self) -> None:
         """A target with a mixed sliding/full `layer_types` schedule on

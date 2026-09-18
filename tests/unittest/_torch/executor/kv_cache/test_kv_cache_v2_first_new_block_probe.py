@@ -44,11 +44,11 @@ TOKENS_PER_BLOCK = 4
 
 
 def make_stub_manager(
-    tokens_per_block=TOKENS_PER_BLOCK,
-    enable_block_reuse=True,
-    num_reusable=0,
-    reuse_match_backoff=0,
-):
+    tokens_per_block: int = TOKENS_PER_BLOCK,
+    enable_block_reuse: bool = True,
+    num_reusable: int = 0,
+    reuse_match_backoff: int = 0,
+) -> KVCacheManagerV2:
     """A KVCacheManagerV2 reduced to what the two token paths need."""
     mgr = object.__new__(KVCacheManagerV2)
     mgr.tokens_per_block = tokens_per_block
@@ -58,6 +58,7 @@ def make_stub_manager(
     mgr.reuse_match_backoff = reuse_match_backoff
     mgr.vocab_size = 32000
     mgr.conversation_manager = None
+    mgr.kv_connector_manager = None
     mgr.kv_cache_map = {}
     mgr.index_mapper = Mock()
     mgr.index_mapper.num_free_slots.return_value = 1
@@ -69,6 +70,7 @@ def make_stub_manager(
     # per-request stats are opt-in and off in this stub's manager.
     mgr.is_draft = False
     mgr.enable_stats = False
+    mgr.is_estimating_kv_cache = False
     mgr._request_stats_enabled_ids = set()
     mgr._stream = Mock()
     mgr.impl = Mock()

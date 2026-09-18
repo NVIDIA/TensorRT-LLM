@@ -157,6 +157,7 @@ l0_b200:
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
+  - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
@@ -178,7 +179,6 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
-  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_bakes_situ_softcaps_as_uniform_scalars
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_plain_swiglu_carries_no_constants
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
@@ -342,7 +342,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[nano-1gpu]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[super-1gpu]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_policy_droid_example TIMEOUT (20)
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example
@@ -383,7 +384,6 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_non_greedy_cuda_graph_matches_eager
 - condition:
     ranges:
       system_gpu_count:
