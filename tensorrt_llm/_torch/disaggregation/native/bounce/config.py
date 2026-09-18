@@ -34,6 +34,12 @@ _MIB = 1024 * 1024
 # admission control.
 _MIN_BYTES_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES"  # byte gate for recurrent-state payloads
 _MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"  # block-count gate for plain-KV payloads
+# How long the RECEIVER may wait for recv-region space before a transfer falls back to the
+# per-fragment path. The receiver reserves on the executor thread (gen-init admission runs
+# inside the scheduling step), so any wait here stalls every request in the engine: 0 (the
+# default) falls back at once when the region is full. The sender reserves on its own worker
+# threads and keeps its short blocking wait.
+_RECV_RESERVE_TIMEOUT_ENV = "TRTLLM_KV_CACHE_BOUNCE_RECV_RESERVE_TIMEOUT_S"
 
 
 def _env_int_gate(name: str, default: int) -> int:
@@ -50,6 +56,23 @@ def _env_int_gate(name: str, default: int) -> int:
     if value < 1:
         logger.warning(f"{name}={value} < 1; clamping to 1 (bounce always clears the gate)")
         return 1
+    return value
+
+
+def _env_float_nonneg(name: str, default: float) -> float:
+    """Read a non-negative float from the env, defensively: unset or malformed falls back to the
+    default (never crashing), a negative value clamps to 0."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(f"{name}={raw!r} is not a number; using default {default}")
+        return default
+    if value < 0:
+        logger.warning(f"{name}={value} < 0; clamping to 0 (no wait)")
+        return 0.0
     return value
 
 
@@ -120,6 +143,13 @@ def fit_within_free(
 # via TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES.
 DEFAULT_MIN_BYTES = 2 * _MIB
 
+# Receiver-side wait for recv-region space, in seconds (see _RECV_RESERVE_TIMEOUT_ENV). The
+# receiver reserves on the executor thread, so the default is no wait: a full region means the
+# transfer goes per-fragment immediately instead of stalling the scheduling step. Size the region
+# for the concurrent admissions instead (a hybrid model's recurrent state can be ~100 MiB per
+# request per rank, so 256 MiB holds only two such transfers).
+DEFAULT_RECV_RESERVE_TIMEOUT_S = 0.0
+
 
 @dataclass
 class Config:
@@ -133,21 +163,35 @@ class Config:
     # block-count gate for plain-KV payloads (roughly 12k tokens at 128 per block); heuristic,
     # tunable via TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS
     min_blocks: int = 96
+    # receiver-side wait for region space before the per-fragment fallback; the receiver reserves on
+    # the executor thread, so it defaults to no wait (see DEFAULT_RECV_RESERVE_TIMEOUT_S)
+    recv_reserve_timeout_s: float = DEFAULT_RECV_RESERVE_TIMEOUT_S
 
 
 def config_from_size(
-    size_mb: int, min_blocks: Optional[int] = None, min_bytes: Optional[int] = None
+    size_mb: int,
+    min_blocks: Optional[int] = None,
+    min_bytes: Optional[int] = None,
+    recv_reserve_timeout_s: Optional[float] = None,
 ) -> Optional[Config]:
     """Build a bounce config from a per-region size in MiB, or None to leave bounce off (size <= 0).
     Size is both the capacity and the on/off switch. min_bytes (recurrent-state payloads) and
     min_blocks (plain-KV payloads) are the gates below which a transfer stays on the per-block
-    path; when unset they come from the env, else the defaults."""
+    path; recv_reserve_timeout_s is how long the receiver waits for region space before that
+    fallback. When unset they come from the env, else the defaults."""
     if size_mb is None or size_mb <= 0:
         return None
     if min_blocks is None:
         min_blocks = _env_int_gate(_MIN_BLOCKS_ENV, Config.min_blocks)
     if min_bytes is None:
         min_bytes = _env_int_gate(_MIN_BYTES_ENV, Config.min_bytes)
+    if recv_reserve_timeout_s is None:
+        recv_reserve_timeout_s = _env_float_nonneg(
+            _RECV_RESERVE_TIMEOUT_ENV, Config.recv_reserve_timeout_s
+        )
     return Config(
-        sizing=FixedSizing(capacity_mb=size_mb), min_bytes=min_bytes, min_blocks=min_blocks
+        sizing=FixedSizing(capacity_mb=size_mb),
+        min_bytes=min_bytes,
+        min_blocks=min_blocks,
+        recv_reserve_timeout_s=recv_reserve_timeout_s,
     )

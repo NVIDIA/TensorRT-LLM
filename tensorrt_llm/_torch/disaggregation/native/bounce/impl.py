@@ -39,7 +39,12 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
 from tensorrt_llm._utils import CUASSERT
 
 from .buffer import SlotAllocator
-from .config import DEFAULT_MIN_BYTES, SizingContext, fit_within_free
+from .config import (
+    DEFAULT_MIN_BYTES,
+    DEFAULT_RECV_RESERVE_TIMEOUT_S,
+    SizingContext,
+    fit_within_free,
+)
 from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
 
@@ -49,7 +54,9 @@ if TYPE_CHECKING:
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
 _SCATTER_POLL_S = 0.5  # how often the scatter worker wakes to re-check the stop flag and reclaim
-_RESERVE_TIMEOUT_S = 0.2  # max wait for a bounce region before falling back to per-fragment
+# Max wait of a SENDER worker thread for a send region before falling back to per-fragment. The
+# receiver's wait is configured (Config.recv_reserve_timeout_s): it reserves on the executor thread.
+_RESERVE_TIMEOUT_S = 0.2
 _CLOSE_JOIN_S = 2.0  # max wait for the scatter thread to drain on close
 _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
 
@@ -90,6 +97,7 @@ class VmmBounceTransport(BounceTransport):
             block_bytes_per_group=block_bytes_per_group,
             min_bytes=cfg.min_bytes,
             min_blocks=cfg.min_blocks,
+            recv_reserve_timeout_s=cfg.recv_reserve_timeout_s,
         )
 
     def __init__(
@@ -102,6 +110,7 @@ class VmmBounceTransport(BounceTransport):
         block_bytes_per_group: list[int | None],
         min_bytes: int = DEFAULT_MIN_BYTES,
         min_blocks: int = 96,
+        recv_reserve_timeout_s: float = DEFAULT_RECV_RESERVE_TIMEOUT_S,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
         name: str = "kv_bounce",
     ):
@@ -115,6 +124,11 @@ class VmmBounceTransport(BounceTransport):
         # min_blocks applies to plain-KV payloads (see the gate in reserve()).
         self._min_bytes = min_bytes
         self._min_blocks = min_blocks
+        # How long reserve() waits for recv-region space. It runs on the executor thread (gen-init
+        # admission), so the default is no wait: a full region sends the transfer per-fragment at
+        # once rather than stalling the scheduling step for every request in the engine.
+        self._recv_reserve_timeout_s = max(0.0, float(recv_reserve_timeout_s))
+        self._recv_backpressure_fallbacks = 0
         # how long an orphaned region is held out of reuse; must outlast the worst in-flight write
         self._quarantine_grace_s = quarantine_grace_s
 
@@ -233,7 +247,7 @@ class VmmBounceTransport(BounceTransport):
         recv_req,
         num_writers: int = 1,
         *,
-        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        timeout: Optional[float] = None,
         extra_bytes: int = 0,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
@@ -241,7 +255,10 @@ class VmmBounceTransport(BounceTransport):
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
         ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
-        neighboring slot."""
+        neighboring slot. ``timeout`` is how long to wait for region space; None takes the
+        configured receiver wait (no wait by default: this runs on the executor thread)."""
+        if timeout is None:
+            timeout = self._recv_reserve_timeout_s
         total = 0
         has_state_group = False
         for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
@@ -330,8 +347,11 @@ class VmmBounceTransport(BounceTransport):
             )
         res = self._recv_alloc.reserve(total, timeout=timeout)
         if res is None:
+            self._recv_backpressure_fallbacks += 1
             return self._skip_bounce(
-                f"no recv region space for {total // _MIB}MiB within {timeout}s (backpressure)",
+                f"no recv region space for {total // _MIB}MiB within {timeout}s (backpressure; "
+                f"the {self._recv_alloc.capacity // _MIB}MiB recv region is full); raise "
+                "kv_cache_bounce_size_mb to keep more concurrent transfers coalesced",
                 warn_key="kv-bounce-recv-backpressure",
             )
         slot_id, addr = res
@@ -354,6 +374,11 @@ class VmmBounceTransport(BounceTransport):
             key="kv-bounce-coalesced",
         )
         return True
+
+    @property
+    def recv_backpressure_fallbacks(self) -> int:
+        """How many receives went per-fragment because the recv region was full (observability)."""
+        return self._recv_backpressure_fallbacks
 
     def writer_base(self, rid_slice: RidSlice, writer_index: int) -> Optional[int]:
         """Where the given fan-in writer writes in the region."""
@@ -558,12 +583,38 @@ def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
         transport = VmmBounceTransport.from_config(
             agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table)
         )
+        if transport is not None:
+            _log_recurrent_state_fit(transport, page_table)
         return transport if transport is not None else NoBounceTransport()
     except (
         Exception
     ) as e:  # rare race: memory taken between the free-memory query and the allocation
         logger.warning(f"[kv-bounce] disabled (alloc failed: {e}); using in-place path")
         return NoBounceTransport()
+
+
+def _log_recurrent_state_fit(transport: VmmBounceTransport, page_table) -> None:
+    """Say how many recurrent-state (mamba/KDA) payloads the recv region holds at once. Every
+    receive of such a model carries the whole per-rank state (~100 MiB per rank for a 397B hybrid
+    under attention DP), so a region sized for plain KV holds only a couple of concurrent
+    transfers; the rest go per-fragment (or wait, when a receiver timeout is configured)."""
+    try:
+        from ..mixers.ssm.peer import mamba_receiver_payload_bytes
+
+        state_bytes = mamba_receiver_payload_bytes(
+            sender_page_table=page_table, receiver_page_table=page_table, dst_slot=0
+        )
+    except Exception:  # observability only; never fail transport setup for the log line
+        return
+    if state_bytes <= 0:
+        return
+    capacity = transport._recv_alloc.capacity
+    logger.info(
+        f"[kv-bounce] recurrent-state payload ~{state_bytes / _MIB:.1f}MiB per request on this "
+        f"rank: the {capacity / _MIB:.0f}MiB recv region coalesces at most "
+        f"{capacity // state_bytes} such transfers at once (receiver wait "
+        f"{transport._recv_reserve_timeout_s}s, then per-fragment)"
+    )
 
 
 def build_send_request(bounce, write_meta, fallback):

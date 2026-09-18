@@ -110,6 +110,8 @@ class TestSizing:
         # Byte gate for recurrent-state payloads; block gate for plain-KV payloads.
         assert cfg.min_bytes == bcfg.DEFAULT_MIN_BYTES == 2 * _MIB
         assert cfg.min_blocks == 96
+        # The receiver reserves on the executor thread, so by default it never waits for space.
+        assert cfg.recv_reserve_timeout_s == bcfg.DEFAULT_RECV_RESERVE_TIMEOUT_S == 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -144,6 +146,22 @@ class TestConfigFromSize:
         monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "48")
         assert bcfg.config_from_size(2048).min_blocks == 48  # env override
         assert bcfg.config_from_size(2048, 250).min_blocks == 250  # explicit arg beats env
+
+    def test_recv_reserve_timeout_defaults_and_overrides(self, monkeypatch):
+        # The receiver-side wait defaults to none (it runs on the executor thread) and can be
+        # raised for tests / deployments that prefer waiting for a region over the fallback.
+        env = "TRTLLM_KV_CACHE_BOUNCE_RECV_RESERVE_TIMEOUT_S"
+        monkeypatch.delenv(env, raising=False)
+        assert bcfg.config_from_size(2048).recv_reserve_timeout_s == 0.0
+        assert bcfg.config_from_size(2048, recv_reserve_timeout_s=0.2).recv_reserve_timeout_s == 0.2
+        monkeypatch.setenv(env, "0.05")
+        assert bcfg.config_from_size(2048).recv_reserve_timeout_s == 0.05  # env override
+        assert bcfg.config_from_size(2048, recv_reserve_timeout_s=1.5).recv_reserve_timeout_s == 1.5
+        # Defensive parsing: malformed keeps the default, negative clamps to no wait.
+        monkeypatch.setenv(env, "soon")
+        assert bcfg.config_from_size(2048).recv_reserve_timeout_s == 0.0
+        monkeypatch.setenv(env, "-3")
+        assert bcfg.config_from_size(2048).recv_reserve_timeout_s == 0.0
 
     @pytest.mark.parametrize(
         "env,attr,default",
@@ -330,13 +348,16 @@ class _FakeAlloc:
         self.released = []
         self.quarantined = []
         self.reserved_sizes = []
+        self.timeouts = []  # the wait the transport asked for on each reserve
+        self.full = False  # simulate a full region: every reserve reports backpressure
 
     @property
     def capacity(self):
         return self._cap
 
     def reserve(self, size, timeout=None):
-        if size > self._cap:
+        self.timeouts.append(timeout)
+        if size > self._cap or self.full:
             return None
         sid = self.next_id
         self.next_id += 1
@@ -357,7 +378,12 @@ class _FakeAlloc:
 
 
 def _make_transport(
-    monkeypatch, block_bytes_per_group, capacity=1 << 30, min_bytes=1, min_blocks=1
+    monkeypatch,
+    block_bytes_per_group,
+    capacity=1 << 30,
+    min_bytes=1,
+    min_blocks=1,
+    recv_reserve_timeout_s=None,
 ):
     monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
     monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
@@ -367,6 +393,9 @@ def _make_transport(
         lambda self, name: setattr(self, "_scatter_q", queue.Queue()),
     )
     agent = SimpleNamespace(register_memory=lambda d: None)
+    extra = {}
+    if recv_reserve_timeout_s is not None:
+        extra["recv_reserve_timeout_s"] = recv_reserve_timeout_s
     return btr.VmmBounceTransport(
         agent,
         device_id=0,
@@ -375,7 +404,62 @@ def _make_transport(
         block_bytes_per_group=block_bytes_per_group,
         min_bytes=min_bytes,
         min_blocks=min_blocks,
+        **extra,
     )
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+class TestRecvReserveTimeout:
+    """The receiver's wait for region space is configured and defaults to none.
+
+    It reserves on the executor thread (gen-init admission), so a full region falls back
+    per-fragment at once instead of stalling the scheduling step.
+    """
+
+    def test_default_is_no_wait(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        assert t.reserve(_recv_req([4]), num_writers=1) is True
+        assert t._recv_alloc.timeouts == [0.0]
+
+    def test_configured_wait_is_passed_to_the_allocator(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100], recv_reserve_timeout_s=0.05)
+        assert t.reserve(_recv_req([4]), num_writers=1) is True
+        assert t._recv_alloc.timeouts == [0.05]
+
+    def test_explicit_timeout_wins_over_the_configured_one(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100], recv_reserve_timeout_s=0.05)
+        assert t.reserve(_recv_req([4]), num_writers=1, timeout=0.3) is True
+        assert t._recv_alloc.timeouts == [0.3]
+
+    def test_from_config_carries_the_wait(self, monkeypatch):
+        monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
+        monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
+        monkeypatch.setattr(
+            btr.VmmBounceTransport,
+            "_start_scatter_worker",
+            lambda self, name: setattr(self, "_scatter_q", queue.Queue()),
+        )
+        monkeypatch.setattr(btr, "CUASSERT", lambda x: x)
+        monkeypatch.setattr(btr.cudart, "cudaMemGetInfo", lambda: (8 << 30, 16 << 30))
+        cfg = bcfg.config_from_size(256, recv_reserve_timeout_s=0.1)
+        t = btr.VmmBounceTransport.from_config(
+            SimpleNamespace(register_memory=lambda d: None),
+            cfg,
+            device_id=0,
+            block_bytes_per_group=[100],
+        )
+        assert t._recv_reserve_timeout_s == 0.1
+
+    def test_full_region_falls_back_and_counts(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t._recv_alloc.full = True
+        req = _recv_req([4])
+        assert t.reserve(req, num_writers=1) is False
+        assert req.bounce_dst_base is None  # nothing stamped: the sender writes per-fragment
+        assert t.is_bounced((req.unique_rid, req.slice_id)) is False
+        assert t.recv_backpressure_fallbacks == 1
+        assert t.reserve(_recv_req([4], rid=2), num_writers=1) is False
+        assert t.recv_backpressure_fallbacks == 2
 
 
 def _recv_req(block_counts, rid=1, slice_id=0):
@@ -904,6 +988,20 @@ class TestSlotAllocator:
             ),
         )
         return btr.SlotAllocator(cap, 512)
+
+    def test_zero_timeout_returns_at_once_when_full(self, monkeypatch):
+        # The receiver's default wait: a full region answers None immediately instead of holding
+        # the caller (the executor thread) for the timeout.
+        import time as _time
+
+        a = self._alloc(monkeypatch, cap=1024)
+        assert a.reserve(1024, timeout=0) is not None  # fills the region
+        t0 = _time.monotonic()
+        assert a.reserve(512, timeout=0) is None
+        assert _time.monotonic() - t0 < 0.05
+        t0 = _time.monotonic()
+        assert a.reserve(512, timeout=0.05) is None  # a positive wait still honors its deadline
+        assert _time.monotonic() - t0 >= 0.04
 
     def test_reuses_out_of_order_freed_hole(self, monkeypatch):
         a = self._alloc(monkeypatch, cap=1024)  # two 512-byte slots
