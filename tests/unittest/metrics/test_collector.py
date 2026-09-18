@@ -731,12 +731,24 @@ class TestLogIterationStatsKvCacheIteration:
                 }
             }
         }
+        stats["iterDiskPrefetchBlocks"] = 7
+        # Two GPU levels: the split keeps them apart even though they share a tier name.
+        stats["iterCachedTokensByLevel"] = [5, 2, 1]
+        stats["kvCacheLevelTiers"] = ["gpu", "gpu", "host"]
         collector.log_iteration_stats(stats)
 
         # Host utilization = 20/50 = 0.4
         assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
         # Iter reuse rate = 5/(5+3) = 0.625
         assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(0.625)
+        assert _get_counter_value(collector, "kv_cache_disk_prefetch_blocks_total") == 7
+        assert [
+            _counter_value_with_labels(
+                collector.counter_tokens_cached_prompt_by_tier,
+                {**collector.labels, "cache_level": str(level), "cache_tier": tier},
+            )
+            for level, tier in enumerate(["gpu", "gpu", "host"])
+        ] == [5, 2, 1]
 
     def test_counters_incremented(self):
         """Counter metrics should accumulate deltas across calls."""

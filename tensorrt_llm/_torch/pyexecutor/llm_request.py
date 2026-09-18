@@ -1275,7 +1275,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        return LlmResponse(
+        response = LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,
             result=LlmResult(result,
@@ -1283,6 +1283,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                              is_final,
                              time_breakdown_metrics=time_breakdown_metrics),
             client_id=self.py_client_id) if len(result) > 0 else None
+        if response is not None:
+            response.result.cached_tokens = self.cached_tokens
+        return response
 
     @property
     def is_dummy(self):

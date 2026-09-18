@@ -61,6 +61,7 @@ SUPPORTED_GPU_MAPPING = {
     "B200": "b200",
     "B300": "b300",
     "H200": "h200",
+    "VR200": "vr200",
 }
 
 # benchmark_client value selecting the AgentX trace-replay client
