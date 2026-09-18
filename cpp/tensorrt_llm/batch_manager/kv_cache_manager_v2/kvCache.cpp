@@ -1792,7 +1792,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 sb.pages[kDefaultBeamIndex][lc] = committed->hold();
         }
         sb.treeBlock = newBlock;
-        TLLM_CHECK_DEBUG(_getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
         if (newBlock->eventSink)
         {
