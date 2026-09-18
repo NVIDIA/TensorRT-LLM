@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from safetensors.torch import save_file
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
     Nvfp4ColdPageQuantizationCompression,
@@ -1371,18 +1372,28 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
 # --- keep_rope_precision ---------------------------------------------------------------------
 
 
-def _mla_config(kv_lora_rank=512, qk_rope_head_dim=64):
-    """MLA latent rows: kv_lora_rank NoPE elements then qk_rope_head_dim RoPE elements."""
+def _text_config(model_type, **fields):
+    """A real HF config with the fields RopeParams.from_config reads."""
 
-    return SimpleNamespace(
-        model_type="glm_moe_dsa", kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+    config = PretrainedConfig(
+        hidden_size=2048, num_attention_heads=8, max_position_embeddings=4096, **fields
+    )
+    config.model_type = model_type
+    return config
+
+
+def _mla_config(kv_lora_rank=512, qk_rope_head_dim=64):
+    """GLM-5 style MLA: one vector per token, kv_lora_rank NoPE numbers then qk_rope_head_dim RoPE."""
+
+    return _text_config(
+        "glm_moe_dsa", head_dim=576, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
     )
 
 
-def _partial_rotary_config(partial_rotary_factor=0.25):
-    """Qwen3.5 / Qwen3-Next style GQA: the first head_dim * factor K elements carry RoPE."""
+def _partial_rotary_config(partial_rotary_factor=0.25, head_dim=256):
+    """Qwen3.5 style GQA: the first head_dim * factor numbers of each K head carry RoPE."""
 
-    return SimpleNamespace(model_type="qwen3_5", partial_rotary_factor=partial_rotary_factor)
+    return _text_config("qwen3_5", head_dim=head_dim, partial_rotary_factor=partial_rotary_factor)
 
 
 def _kv_layer(head_dim, *, tokens=64, element_bytes=2):
@@ -1521,7 +1532,7 @@ def test_keep_rope_precision_rejects_fully_rotated_keys() -> None:
 
     native, _ = _native()
     with pytest.raises(ValueError, match="cannot keep RoPE precision"):
-        _create_kv(native, SimpleNamespace(model_type="qwen3_5"), 128, keep_rope_precision=True)
+        _create_kv(native, _text_config("qwen3_5", head_dim=128), 128, keep_rope_precision=True)
 
 
 @pytest.mark.parametrize("model_type", ("qwen3", "deepseek_v3", None))
@@ -1529,7 +1540,7 @@ def test_keep_rope_precision_is_ignored_with_a_warning_outside_the_validated_mod
     model_type,
 ) -> None:
     native, _ = _native()
-    config = SimpleNamespace(model_type=model_type, kv_lora_rank=512, qk_rope_head_dim=64)
+    config = _text_config(model_type, head_dim=576, kv_lora_rank=512, qk_rope_head_dim=64)
     cache_config = SimpleNamespace(
         tokens_per_block=64,
         layers=(
@@ -1557,7 +1568,9 @@ def test_keep_rope_precision_is_ignored_with_a_warning_outside_the_validated_mod
 def test_keep_rope_precision_requires_16_element_rope_alignment() -> None:
     native, _ = _native()
     with pytest.raises(ValueError, match="scale groups"):
-        _create_kv(native, _partial_rotary_config(0.1875), 128, keep_rope_precision=True)
+        _create_kv(
+            native, _partial_rotary_config(0.1875, head_dim=128), 128, keep_rope_precision=True
+        )
 
 
 def test_keep_rope_precision_reads_the_text_config_of_a_composite_model() -> None:
@@ -1570,8 +1583,9 @@ def test_keep_rope_precision_reads_the_text_config_of_a_composite_model() -> Non
 
 def test_keep_rope_precision_reads_partial_rotary_factor_from_rope_parameters() -> None:
     native, _ = _native()
-    config = SimpleNamespace(
-        model_type="qwen3_5_moe_text",
+    config = _text_config(
+        "qwen3_5_moe_text",
+        head_dim=256,
         rope_parameters={"rope_theta": 1e7, "partial_rotary_factor": 0.25},
     )
     layout = _create_kv(native, config, 256, keep_rope_precision=True)
