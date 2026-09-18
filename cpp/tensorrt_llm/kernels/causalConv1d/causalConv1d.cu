@@ -21,8 +21,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include <cub/block/block_load.cuh>
-#include <cub/block/block_store.cuh>
+#include <type_traits>
 
 #include "tensorrt_llm/kernels/causalConv1d/causalConv1d.h"
 
@@ -31,67 +30,217 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::causal_conv1d
 {
 
-template <int kNThreads_, int kWidth_, bool kIsVecLoad_, typename input_t_, typename weight_t_>
+// One warp owns one (sequence, channel) row of the input. Each thread keeps
+// kNPasses 128-bit vectors in flight to cover memory latency; the kWidth-1
+// neighbor elements come from warp shuffles and cross-pass/chunk carries stay
+// in registers, so the kernel needs no shared memory and no __syncthreads().
+template <int kNThreads_, int kNPasses_, int kWidth_, typename input_t_, typename weight_t_>
 struct Causal_conv1d_fwd_kernel_traits
 {
     using input_t = input_t_;
     using weight_t = weight_t_;
     static constexpr int kNThreads = kNThreads_;
+    static constexpr int kNPasses = kNPasses_;
     static constexpr int kWidth = kWidth_;
     static constexpr int kNBytes = sizeof(input_t);
     static_assert(kNBytes == 2 || kNBytes == 4);
     static constexpr int kNElts = kNBytes == 4 ? 4 : 8;
     static_assert(kWidth <= kNElts);
-    static constexpr bool kIsVecLoad = kIsVecLoad_;
     using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
+    static_assert(sizeof(vec_t) == 16, "vec_t must be 16 bytes");
     static_assert(kNThreads_ % 32 == 0, "kNThreads must be a multiple of 32 for warp shuffle");
-    static_assert(sizeof(vec_t) == 16, "vec_t must be 16 bytes for warp shuffle optimization");
-    using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNElts, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-    using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, 1, cub::BLOCK_LOAD_DIRECT>;
-    using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNElts, cub::BLOCK_STORE_WARP_TRANSPOSE>;
-    using BlockStoreVecT = cub::BlockStore<vec_t, kNThreads, 1, cub::BLOCK_STORE_DIRECT>;
-    static constexpr int kSmemIOSize = kIsVecLoad
-        ? 0
-        : custom_max({sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage)});
-    static constexpr int kSmemExchangeSize = kNThreads * kNBytes * kNElts;
-    static constexpr int kSmemSize = kSmemIOSize + kSmemExchangeSize;
+    static constexpr int kNWarps = kNThreads / 32;
+    // Minimum resident blocks per SM requested via __launch_bounds__: bounds the
+    // register budget so occupancy stays at the SM thread limit.
+    static constexpr int kMinBlocksPerSM = 1024 / kNThreads;
+    // Tokens processed by one warp per chunk-loop iteration.
+    static constexpr int kChunkSize = 32 * kNElts * kNPasses;
+    // 16-bit outputs use the single-MUFU tanh approximation of SiLU only for
+    // pre-activations above kTanhSiluCutoff: silu(v) = h + h*tanh.approx(h)
+    // amplifies the tanh absolute error by 1/(1+tanh(h)) as tanh(h) -> -1,
+    // drifting up to 30 fp16 ulp below v ~ -8 (bf16 flushes to +0 below
+    // v ~ -13), while exhaustive 16-bit-value sweeps show <= 1 ulp of the
+    // correctly rounded value for v > -7.5 (the -7.0 cutoff adds margin; the
+    // fp32 pre-activation domain between 16-bit grid points is empirical).
+    // Any pass holding a pre-activation at or below the cutoff reroutes via a
+    // warp-uniform vote to the exact __expf formula, which is valid over the
+    // full range and bit-identical to the pre-optimization kernel. Measured
+    // at the 16x1024x3072 prefill shape: ~30 us on either voted path, vs
+    // ~44 us when the 16-bit kernels are compiled exact-only with this
+    // switch off (ptxas emits a slower exact-silu loop without the branch),
+    // so the voted configuration is also the faster one.
+    static constexpr bool kUseTanhSilu = kNBytes == 2;
 };
 
+// Pre-activation threshold below which the tanh-approximation SiLU is not
+// accurate to 1 ulp of the 16-bit result (see the traits comment).
+static constexpr float kTanhSiluCutoff = -7.0f;
+
+template <bool kUseTanh>
+__device__ __forceinline__ float silu_fast(float v)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    if constexpr (kUseTanh)
+    {
+        // silu(v) = v * sigmoid(v) = v/2 * (1 + tanh(v/2))
+        float const h = 0.5f * v;
+        float t;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(h));
+        return __fmaf_rn(h, t, h);
+    }
+#endif
+    return v * __frcp_rn(1.0f + __expf(-v));
+}
+
+// Widen kN packed elements to fp32.
+template <typename input_t, int kN>
+__device__ __forceinline__ void convert_to_float(input_t const* vals, float* dst)
+{
+    if constexpr (std::is_same_v<input_t, nv_bfloat16>)
+    {
+        // bf16 is the top half of fp32: expand with full-rate integer ops
+        // instead of CVT (bit-exact).
+        uint32_t const* u = reinterpret_cast<uint32_t const*>(vals);
+#pragma unroll
+        for (int i = 0; i < kN / 2; ++i)
+        {
+            dst[2 * i] = __uint_as_float(u[i] << 16);
+            dst[2 * i + 1] = __uint_as_float(u[i] & 0xFFFF0000u);
+        }
+        if constexpr (kN % 2)
+        {
+            dst[kN - 1] = float(vals[kN - 1]);
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int i = 0; i < kN; ++i)
+        {
+            dst[i] = float(vals[i]);
+        }
+    }
+}
+
+// Narrow kN fp32 values to the packed output type (paired F2FP where possible).
+template <typename input_t, int kN>
+__device__ __forceinline__ void convert_from_float(float const* src, input_t* dst)
+{
+    if constexpr (std::is_same_v<input_t, nv_bfloat16> && kN % 2 == 0)
+    {
+        nv_bfloat162* d2 = reinterpret_cast<nv_bfloat162*>(dst);
+#pragma unroll
+        for (int i = 0; i < kN / 2; ++i)
+        {
+            d2[i] = __float22bfloat162_rn(make_float2(src[2 * i], src[2 * i + 1]));
+        }
+    }
+    else if constexpr (std::is_same_v<input_t, half> && kN % 2 == 0)
+    {
+        half2* d2 = reinterpret_cast<half2*>(dst);
+#pragma unroll
+        for (int i = 0; i < kN / 2; ++i)
+        {
+            d2[i] = __float22half2_rn(make_float2(src[2 * i], src[2 * i + 1]));
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int i = 0; i < kN; ++i)
+        {
+            dst[i] = input_t(src[i]);
+        }
+    }
+}
+
 template <typename Ktraits, bool kHasConvStateIndices, bool kSiluActivation>
-__global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(ConvParamsBase params)
+__global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocksPerSM) void causal_conv1d_fwd_kernel(
+    ConvParamsBase params)
 {
     constexpr int kWidth = Ktraits::kWidth;
-    constexpr int kNThreads = Ktraits::kNThreads;
     constexpr int kNElts = Ktraits::kNElts;
-    constexpr bool kIsVecLoad = Ktraits::kIsVecLoad;
+    constexpr int kNPasses = Ktraits::kNPasses;
+    constexpr int kNWarps = Ktraits::kNWarps;
+    constexpr int kChunkSize = Ktraits::kChunkSize;
     using input_t = typename Ktraits::input_t;
     using vec_t = typename Ktraits::vec_t;
     using weight_t = typename Ktraits::weight_t;
-
-    // Shared memory.
-    extern __shared__ char smem_[];
-    auto& smem_load = reinterpret_cast<typename Ktraits::BlockLoadT::TempStorage&>(smem_);
-    auto& smem_load_vec = reinterpret_cast<typename Ktraits::BlockLoadVecT::TempStorage&>(smem_);
-    auto& smem_store = reinterpret_cast<typename Ktraits::BlockStoreT::TempStorage&>(smem_);
-    auto& smem_store_vec = reinterpret_cast<typename Ktraits::BlockStoreVecT::TempStorage&>(smem_);
-    vec_t* smem_exchange = reinterpret_cast<vec_t*>(smem_ + Ktraits::kSmemIOSize);
+    // First 32-bit word of a vector that contains one of the last kWidth-1
+    // elements (word-aligned because elements are 2 or 4 bytes).
+    constexpr int kTailWordLo = ((kNElts - (kWidth - 1)) * Ktraits::kNBytes) / 4;
+    constexpr int kNbrCount = (4 - kTailWordLo) * 4 / Ktraits::kNBytes;
 
     bool const kVarlen = params.query_start_loc_ptr != nullptr;
     int const tidx = threadIdx.x;
+    int const warp_id = tidx / 32;
+    int const lane_id = tidx & 31;
     int const batch_id = blockIdx.x;
-    int const channel_id = blockIdx.y;
+    int const channel_id = blockIdx.y * kNWarps + warp_id;
+    if (channel_id >= params.dim)
+    {
+        return;
+    }
     int const* query_start_loc = kVarlen ? reinterpret_cast<int*>(params.query_start_loc_ptr) : nullptr;
     int const sequence_start_index = kVarlen ? query_start_loc[batch_id] : batch_id;
     int const seqlen = kVarlen ? query_start_loc[batch_id + 1] - sequence_start_index : params.seqlen;
 
     input_t* x = reinterpret_cast<input_t*>(params.x_ptr) + sequence_start_index * params.x_batch_stride
         + channel_id * params.x_c_stride;
-    weight_t* weight = reinterpret_cast<weight_t*>(params.weight_ptr) + channel_id * params.weight_c_stride;
     input_t* out = reinterpret_cast<input_t*>(params.out_ptr) + sequence_start_index * params.out_batch_stride
         + channel_id * params.out_c_stride;
-    float bias_val = params.bias_ptr == nullptr ? 0.f : float(reinterpret_cast<weight_t*>(params.bias_ptr)[channel_id]);
 
-    bool has_initial_state = params.has_initial_state_ptr == nullptr
+    bool const x_vec_ok = (reinterpret_cast<uintptr_t>(x) & 15) == 0 && params.x_l_stride == 1;
+    bool const out_vec_ok = (reinterpret_cast<uintptr_t>(out) & 15) == 0 && params.out_l_stride == 1;
+
+    // Kick off the chunk-0 loads before touching any metadata below, so the
+    // streaming pipeline starts as early as possible.
+    input_t x_vals_load[kNPasses][kNElts];
+#pragma unroll
+    for (int p = 0; p < kNPasses; ++p)
+    {
+        vec_t& v = *reinterpret_cast<vec_t*>(x_vals_load[p]);
+        int const offset = (p * 32 + lane_id) * kNElts;
+        if (x_vec_ok && offset + kNElts <= seqlen)
+        {
+            v = *reinterpret_cast<vec_t const*>(x + offset);
+        }
+        else
+        {
+#pragma unroll
+            for (int i = 0; i < kNElts; ++i)
+            {
+                x_vals_load[p][i] = offset + i < seqlen ? x[(offset + i) * params.x_l_stride] : input_t(0.0f);
+            }
+        }
+    }
+
+    weight_t* weight = reinterpret_cast<weight_t*>(params.weight_ptr) + channel_id * params.weight_c_stride;
+    float weight_vals[kWidth];
+    if (kWidth == 4 && sizeof(weight_t) == 2 && params.weight_width_stride == 1
+        && (reinterpret_cast<uintptr_t>(weight) & 7) == 0)
+    {
+        uint2 const wv = __ldg(reinterpret_cast<uint2 const*>(weight));
+        weight_t wtmp[8 / sizeof(weight_t)];
+        *reinterpret_cast<uint2*>(wtmp) = wv;
+#pragma unroll
+        for (int i = 0; i < kWidth; ++i)
+        {
+            weight_vals[i] = float(wtmp[i]);
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int i = 0; i < kWidth; ++i)
+        {
+            weight_vals[i] = float(__ldg(&weight[i * params.weight_width_stride]));
+        }
+    }
+    float const bias_val
+        = params.bias_ptr == nullptr ? 0.f : float(reinterpret_cast<weight_t*>(params.bias_ptr)[channel_id]);
+
+    bool const has_initial_state = params.has_initial_state_ptr == nullptr
         ? false
         : reinterpret_cast<bool*>(params.has_initial_state_ptr)[batch_id];
 
@@ -101,7 +250,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
         cache_index = reinterpret_cast<int*>(params.cache_indices_ptr)[batch_id];
         if (cache_index == params.pad_slot_id)
         {
-            return;
+            return; // no stores have been issued yet
         }
     }
     else
@@ -112,226 +261,217 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
                                                              : reinterpret_cast<input_t*>(params.conv_states_ptr)
             + cache_index * params.conv_states_batch_stride + channel_id * params.conv_states_c_stride;
 
-    // Thread 0 will load the last elements of the previous chunk, so we initialize those to 0.
-    if (tidx == 0)
+    // Carry into the first output of the row: initial state (or zeros) in the
+    // last kWidth-1 elements of a vector; only lane 0 consumes it.
+    input_t carry_vals[kNElts] = {input_t(0.0f)};
+    bool const read_init = has_initial_state && conv_states != nullptr;
+    if (lane_id == 0 && read_init)
     {
-        input_t initial_state[kNElts] = {0};
-        if (has_initial_state)
-        {
 #pragma unroll
-            for (int w = 0; w < kWidth - 1; ++w)
-            {
-                initial_state[kNElts - 1 - (kWidth - 2) + w] = conv_states[w];
-            }
-        }
-        smem_exchange[kNThreads - 1] = reinterpret_cast<vec_t*>(initial_state)[0];
-    }
-
-    // Save final conv_state from the tail of x directly, instead of reconstructing it
-    // from smem_exchange after the main loop.
-    if (conv_states != nullptr && tidx == 0)
-    {
-        if (seqlen >= kWidth - 1)
+        for (int w = 0; w < kWidth - 1; ++w)
         {
-#pragma unroll
-            for (int w = 0; w < kWidth - 1; ++w)
-            {
-                conv_states[w] = x[(seqlen - (kWidth - 1) + w) * params.x_l_stride];
-            }
-        }
-        else
-        {
-#pragma unroll
-            for (int w = 0; w < kWidth - 1; ++w)
-            {
-                if (w < (kWidth - 1) - seqlen)
-                {
-                    conv_states[w] = has_initial_state ? conv_states[w + seqlen] : input_t(0.0f);
-                }
-                else
-                {
-                    conv_states[w] = x[(w - ((kWidth - 1) - seqlen)) * params.x_l_stride];
-                }
-            }
+            carry_vals[kNElts - 1 - (kWidth - 2) + w] = conv_states[w];
         }
     }
-
-    float weight_vals[kWidth];
-#pragma unroll
-    for (int i = 0; i < kWidth; ++i)
+    if (conv_states != nullptr && seqlen == 0 && lane_id == 0 && !has_initial_state)
     {
-        weight_vals[i] = float(__ldg(&weight[i * params.weight_width_stride]));
+        // Degenerate empty sequence: the state becomes all zeros.
+#pragma unroll
+        for (int w = 0; w < kWidth - 1; ++w)
+        {
+            conv_states[w] = input_t(0.0f);
+        }
+    }
+    // Order the initial-state reads (lane 0) before the in-loop conv_state tail
+    // store (possibly issued by another lane of this warp).
+    if (read_init)
+    {
+        __syncwarp();
     }
 
-    constexpr int kChunkSize = kNThreads * kNElts;
     int const n_chunks = (seqlen + kChunkSize - 1) / kChunkSize;
     for (int chunk = 0; chunk < n_chunks; ++chunk)
     {
-        input_t x_vals_load[2 * kNElts] = {0};
-        if constexpr (kIsVecLoad)
+        int const remaining = seqlen - chunk * kChunkSize;
+        if (chunk > 0)
         {
-            typename Ktraits::BlockLoadVecT(smem_load_vec)
-                .Load(reinterpret_cast<vec_t*>(x), *reinterpret_cast<vec_t(*)[1]>(&x_vals_load[kNElts]),
-                    (seqlen - chunk * kChunkSize) / kNElts);
-        }
-        else
-        {
-            __syncthreads();
-            typename Ktraits::BlockLoadT(smem_load).Load(
-                x, *reinterpret_cast<input_t(*)[kNElts]>(&x_vals_load[kNElts]), seqlen - chunk * kChunkSize);
-        }
-        x += kChunkSize;
-
-        int const lane_id = tidx & 31;
-        vec_t high_val = reinterpret_cast<vec_t*>(x_vals_load)[1];
-
-        __syncthreads();
-        // Thread kNThreads - 1 don't write yet, so that thread 0 can read
-        // the last elements of the previous chunk.
-        if (tidx < kNThreads - 1)
-        {
-            smem_exchange[tidx] = high_val;
-        }
-        __syncthreads();
-
-        // Get neighbor data: use warp shuffle for most threads, shared memory for warp boundaries
-        vec_t neighbor;
-        uint32_t* high_val_p = reinterpret_cast<uint32_t*>(&high_val);
-        uint32_t* nbr_p = reinterpret_cast<uint32_t*>(&neighbor);
-        nbr_p[0] = __shfl_up_sync(0xFFFFFFFF, high_val_p[0], 1);
-        nbr_p[1] = __shfl_up_sync(0xFFFFFFFF, high_val_p[1], 1);
-        nbr_p[2] = __shfl_up_sync(0xFFFFFFFF, high_val_p[2], 1);
-        nbr_p[3] = __shfl_up_sync(0xFFFFFFFF, high_val_p[3], 1);
-
-        // Lane 0 must use shared memory to handle the cross-warp boundary.
-        // thread 0 uses the last element of the previous chunk.
-        if (lane_id == 0)
-        {
-            neighbor = smem_exchange[tidx > 0 ? tidx - 1 : kNThreads - 1];
-        }
-        reinterpret_cast<vec_t*>(x_vals_load)[0] = neighbor;
-
-        __syncthreads();
-        // Now thread kNThreads - 1 can write the last elements of the current chunk.
-        if (tidx == kNThreads - 1)
-        {
-            smem_exchange[tidx] = high_val;
-        }
-
-        float x_vals[2 * kNElts];
 #pragma unroll
-        for (int i = 0; i < 2 * kNElts; ++i)
-        {
-            x_vals[i] = float(x_vals_load[i]);
-        }
-
-        float out_vals[kNElts];
-#pragma unroll
-        // Process 2 outputs at a time for better ILP (instruction level parallelism).
-        for (int i = 0; i < kNElts; i += 2)
-        {
-            float acc0 = bias_val;
-            float acc1 = bias_val;
-#pragma unroll
-            for (int w = 0; w < kWidth; ++w)
+            for (int p = 0; p < kNPasses; ++p)
             {
-                float wt = weight_vals[w];
-                acc0 = __fmaf_rn(wt, x_vals[kNElts + i - (kWidth - w - 1)], acc0);
-                acc1 = __fmaf_rn(wt, x_vals[kNElts + i + 1 - (kWidth - w - 1)], acc1);
-            }
-            out_vals[i] = acc0;
-            out_vals[i + 1] = acc1;
-        }
-
-        if constexpr (kSiluActivation)
-        {
+                vec_t& v = *reinterpret_cast<vec_t*>(x_vals_load[p]);
+                int const offset = (p * 32 + lane_id) * kNElts;
+                if (x_vec_ok && offset + kNElts <= remaining)
+                {
+                    v = *reinterpret_cast<vec_t const*>(x + offset);
+                }
+                else
+                {
 #pragma unroll
-            for (int i = 0; i < kNElts; i += 2)
-            {
-                // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
-                // Using fast math: __expf and __frcp_rn
-                float v0 = out_vals[i];
-                float v1 = out_vals[i + 1];
-                out_vals[i] = v0 * __frcp_rn(1.0f + __expf(-v0));
-                out_vals[i + 1] = v1 * __frcp_rn(1.0f + __expf(-v1));
+                    for (int i = 0; i < kNElts; ++i)
+                    {
+                        x_vals_load[p][i]
+                            = offset + i < remaining ? x[(offset + i) * params.x_l_stride] : input_t(0.0f);
+                    }
+                }
             }
         }
 
-        input_t out_vals_store[kNElts];
+#pragma unroll
+        for (int p = 0; p < kNPasses; ++p)
+        {
+            // Exchange the tail words (last kWidth-1 elements) of the previous
+            // vector: lanes 1..31 take lane-1 of the same pass, lane 0 takes
+            // lane 31 of the previous pass (or the chunk carry/initial state).
+            uint32_t* my_vec_p = reinterpret_cast<uint32_t*>(x_vals_load[p]);
+            input_t nbr_tail_vals[kNbrCount];
+            uint32_t* nbr_p = reinterpret_cast<uint32_t*>(nbr_tail_vals);
+            uint32_t* prev_p = reinterpret_cast<uint32_t*>(p == 0 ? carry_vals : x_vals_load[p - 1]);
+#pragma unroll
+            for (int i = kTailWordLo; i < 4; ++i)
+            {
+                uint32_t const from_prev31 = __shfl_sync(0xFFFFFFFF, prev_p[i], 31);
+                uint32_t const from_up = __shfl_up_sync(0xFFFFFFFF, my_vec_p[i], 1);
+                nbr_p[i - kTailWordLo] = lane_id == 0 ? ((p == 0 && chunk == 0) ? prev_p[i] : from_prev31) : from_up;
+            }
+
+            float x_vals[kNElts + kWidth - 1];
+#pragma unroll
+            for (int i = 0; i < kWidth - 1; ++i)
+            {
+                x_vals[i] = float(nbr_tail_vals[kNbrCount - (kWidth - 1) + i]);
+            }
+            convert_to_float<input_t, kNElts>(x_vals_load[p], &x_vals[kWidth - 1]);
+
+            int const offset = (p * 32 + lane_id) * kNElts;
+            // Write the final conv_state from registers: exactly the lane whose
+            // vector contains the last token of the row holds all raw values
+            // x[seqlen-kWidth+1 .. seqlen-1] (plus the initial state for rows
+            // shorter than kWidth-1) in its x_vals window.
+            if (conv_states != nullptr && offset <= remaining - 1 && remaining - 1 < offset + kNElts)
+            {
+                int const e = remaining - 1 - offset; // 0..kNElts-1
+#pragma unroll
+                for (int i = 0; i < kNElts; ++i)
+                {
+                    if (i == e)
+                    {
+#pragma unroll
+                        for (int w = 0; w < kWidth - 1; ++w)
+                        {
+                            conv_states[w] = input_t(x_vals[i + 1 + w]);
+                        }
+                    }
+                }
+            }
+
+            float out_vals[kNElts];
+#pragma unroll
+            for (int i = 0; i < kNElts; ++i)
+            {
+                float acc = bias_val;
+#pragma unroll
+                for (int w = 0; w < kWidth; ++w)
+                {
+                    acc = __fmaf_rn(weight_vals[w], x_vals[i + w], acc);
+                }
+                out_vals[i] = acc;
+            }
+            if constexpr (kSiluActivation)
+            {
+                bool useExact = !Ktraits::kUseTanhSilu;
+                if constexpr (Ktraits::kUseTanhSilu)
+                {
+                    // The tanh approximation is only trusted for
+                    // pre-activations above kTanhSiluCutoff (see the traits
+                    // comment). The pass loop is warp-uniform (one warp owns
+                    // the whole (seq, channel) row), so a full-mask vote picks
+                    // one non-divergent path per pass; deep-negative
+                    // pre-activations are rare, so the exact path almost never
+                    // runs. Elements past the row end are zero-padded (their
+                    // pre-activation is exactly bias_val) and can only force
+                    // the exact path, which is valid everywhere.
+                    bool tail = false;
+#pragma unroll
+                    for (int i = 0; i < kNElts; ++i)
+                    {
+                        tail |= out_vals[i] <= kTanhSiluCutoff;
+                    }
+                    useExact = __any_sync(0xffffffffu, tail);
+                }
+                if (useExact)
+                {
+#pragma unroll
+                    for (int i = 0; i < kNElts; ++i)
+                    {
+                        out_vals[i] = silu_fast<false>(out_vals[i]);
+                    }
+                }
+                else
+                {
+#pragma unroll
+                    for (int i = 0; i < kNElts; ++i)
+                    {
+                        out_vals[i] = silu_fast<true>(out_vals[i]);
+                    }
+                }
+            }
+
+            vec_t out_vec;
+            input_t* out_vals_store = reinterpret_cast<input_t*>(&out_vec);
+            convert_from_float<input_t, kNElts>(out_vals, out_vals_store);
+            if (out_vec_ok && offset + kNElts <= remaining)
+            {
+                *reinterpret_cast<vec_t*>(out + offset) = out_vec;
+            }
+            else
+            {
+#pragma unroll
+                for (int i = 0; i < kNElts; ++i)
+                {
+                    if (offset + i < remaining)
+                    {
+                        out[(offset + i) * params.out_l_stride] = out_vals_store[i];
+                    }
+                }
+            }
+        }
+
+        // Keep the raw carry for the next chunk (x_vals_load is not modified
+        // by the pass loop).
 #pragma unroll
         for (int i = 0; i < kNElts; ++i)
         {
-            out_vals_store[i] = out_vals[i];
+            carry_vals[i] = x_vals_load[kNPasses - 1][i];
         }
-        if constexpr (kIsVecLoad)
-        {
-            typename Ktraits::BlockStoreVecT(smem_store_vec)
-                .Store(reinterpret_cast<vec_t*>(out), reinterpret_cast<vec_t(&)[1]>(out_vals_store),
-                    (seqlen - chunk * kChunkSize) / kNElts);
-        }
-        else
-        {
-            typename Ktraits::BlockStoreT(smem_store).Store(out, out_vals_store, seqlen - chunk * kChunkSize);
-        }
+        x += kChunkSize;
         out += kChunkSize;
     }
 }
 
-template <int kNThreads, int kWidth, typename input_t, typename weight_t>
+template <int kNThreads, int kNPasses, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_fwd_launch(ConvParamsBase& params, cudaStream_t stream)
 {
-    static constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
-    bool const kVarlen = params.query_start_loc_ptr != nullptr;
-    // Enable vectorized 128-bit loads when total tokens are aligned. For varlen with
-    // batch==1 (common prefill), seq_start is always 0 so alignment is guaranteed.
-    bool const canVecLoad = params.seqlen % kNElts == 0 && (!kVarlen || params.batch == 1);
-    BOOL_SWITCH(canVecLoad, kIsVecLoad,
+    using Ktraits = Causal_conv1d_fwd_kernel_traits<kNThreads, kNPasses, kWidth, input_t, weight_t>;
+    dim3 grid(params.batch, (params.dim + Ktraits::kNWarps - 1) / Ktraits::kNWarps);
+    bool const hasConvStateIdx = params.cache_indices_ptr != nullptr;
+    BOOL_SWITCH(hasConvStateIdx, kHasCSI,
         [&]
         {
-            using Ktraits = Causal_conv1d_fwd_kernel_traits<kNThreads, kWidth, kIsVecLoad, input_t, weight_t>;
-            constexpr int kSmemSize = Ktraits::kSmemSize;
-            dim3 grid(params.batch, params.dim);
-            bool const hasConvStateIdx = params.cache_indices_ptr != nullptr;
-            BOOL_SWITCH(hasConvStateIdx, kHasCSI,
+            BOOL_SWITCH(params.silu_activation, kSilu,
                 [&]
                 {
-                    BOOL_SWITCH(params.silu_activation, kSilu,
-                        [&]
-                        {
-                            auto kernel = &causal_conv1d_fwd_kernel<Ktraits, kHasCSI, kSilu>;
-                            if (kSmemSize >= 48 * 1024)
-                            {
-                                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-                                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                            }
-                            kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-                        });
+                    auto kernel = &causal_conv1d_fwd_kernel<Ktraits, kHasCSI, kSilu>;
+                    kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
                 });
-            TLLM_CUDA_KERNEL_LAUNCH_CHECK();
         });
+    TLLM_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_fwd_dispatch(ConvParamsBase& params, cudaStream_t stream)
 {
-    bool const isVarlen = params.query_start_loc_ptr != nullptr;
-    constexpr int kNarrowThreads = 64;
-    constexpr int kWideThreads = 128;
-    constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
-    constexpr int kShortSeqThreshold = kNarrowThreads * kNElts;
-    // Pick the wider 128-thread kernel when the average per-sequence length exceeds
-    // one chunk; otherwise the narrower 64-thread kernel avoids overprovisioning.
-    int const avgSeqlen = isVarlen ? (params.seqlen / max(params.batch, 1)) : params.seqlen;
-    bool const preferNarrowKernel = avgSeqlen <= kShortSeqThreshold;
-
-    if (preferNarrowKernel)
-    {
-        causal_conv1d_fwd_launch<kNarrowThreads, kWidth, input_t, weight_t>(params, stream);
-    }
-    else
-    {
-        causal_conv1d_fwd_launch<kWideThreads, kWidth, input_t, weight_t>(params, stream);
-    }
+    // 4 warps per block, 4 passes (128-bit vectors in flight per thread).
+    causal_conv1d_fwd_launch<128, 4, kWidth, input_t, weight_t>(params, stream);
 }
 
 template <typename input_t, typename weight_t>
