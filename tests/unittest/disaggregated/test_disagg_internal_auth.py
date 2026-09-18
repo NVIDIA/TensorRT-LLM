@@ -12,21 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve.conversation_id import SUBAGENT_AFFINITY_HEADER
 from tensorrt_llm.serve.disagg_auth import (
     INTERNAL_DISAGG_AUTH_HEADER,
+    SUBAGENT_AFFINITY_AUTH_HEADER,
     build_internal_disagg_auth_headers,
+    build_subagent_affinity_headers,
     get_internal_disagg_auth_fields,
     request_requires_internal_disagg_auth,
     validate_internal_disagg_request,
+    validate_subagent_affinity,
 )
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     CompletionRequest,
     ConversationParams,
     DisaggregatedParams,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_request(
@@ -204,3 +214,116 @@ def test_worker_rejects_protected_fields_without_cache_transceiver_config():
 
     with pytest.raises(ValueError, match="cache_transceiver_config"):
         server._validate_internal_disagg_request(request, raw_request=None)
+
+
+def _make_affinity_request(role: ServerRole) -> ChatCompletionRequest:
+    return ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hello"}],
+        conversation_params=ConversationParams(
+            conversation_id="child", subagent_affinity_id="parent"
+        ),
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only" if role == ServerRole.CONTEXT else "generation_only",
+            disagg_request_id=42,
+        ),
+    )
+
+
+@pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+def test_worker_affinity_survives_wire_roundtrip(role: ServerRole) -> None:
+    request = _make_affinity_request(role)
+    headers = build_subagent_affinity_headers("secret", request, role)
+    wire_request = ChatCompletionRequest.model_validate_json(
+        request.model_dump_json(exclude_unset=True)
+    )
+    assert wire_request.conversation_params.subagent_affinity_id is None
+    server = object.__new__(OpenAIServer)
+    server.server_role = role
+    server._internal_disagg_auth_key = "secret"
+
+    scheduling = server._get_scheduling_params(wire_request, SimpleNamespace(headers=headers))
+
+    assert scheduling.subagent_affinity_id == "parent"
+    assert wire_request.conversation_params.conversation_id == "child"
+
+
+@pytest.mark.parametrize("key", [None, "secret"])
+def test_aggregated_worker_ignores_affinity_header(key: str | None) -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT)
+    headers = build_subagent_affinity_headers("secret", request, ServerRole.CONTEXT)
+    request.disaggregated_params = None
+    server = object.__new__(OpenAIServer)
+    server.server_role = None
+    server._internal_disagg_auth_key = key
+
+    scheduling = server._get_scheduling_params(request, SimpleNamespace(headers=headers))
+
+    assert scheduling.subagent_affinity_id is None
+    assert request.conversation_params.conversation_id == "child"
+
+
+@pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+@pytest.mark.parametrize("key", [None, "secret"])
+def test_worker_rejects_unsigned_affinity(role: ServerRole, key: str | None) -> None:
+    request = _make_affinity_request(role)
+    with pytest.raises(ValueError, match="auth"):
+        validate_subagent_affinity(key, request, role, {SUBAGENT_AFFINITY_HEADER: "parent"})
+
+
+@pytest.mark.parametrize(
+    "tamper", ["parent", "child", "role", "model", "request_type", "request_id", "signature", "key"]
+)
+def test_affinity_signature_rejects_tampering(tamper: str) -> None:
+    role = ServerRole.CONTEXT
+    request = _make_affinity_request(role)
+    headers = build_subagent_affinity_headers("secret", request, role)
+    key = "secret"
+    if tamper == "parent":
+        headers[SUBAGENT_AFFINITY_HEADER] = "other-parent"
+    elif tamper == "child":
+        request.conversation_params.conversation_id = "other-child"
+    elif tamper == "role":
+        role = ServerRole.GENERATION
+    elif tamper == "model":
+        request.model = "other-model"
+    elif tamper == "request_type":
+        request.disaggregated_params.request_type = "generation_only"
+    elif tamper == "request_id":
+        request.disaggregated_params.disagg_request_id = 43
+    elif tamper == "signature":
+        headers[SUBAGENT_AFFINITY_AUTH_HEADER] = "\xff"
+    elif tamper == "key":
+        key = "wrong-secret"
+
+    with pytest.raises(ValueError, match="Invalid internal subagent"):
+        validate_subagent_affinity(key, request, role, headers)
+
+
+def test_affinity_auth_requires_key_only_when_forwarding_affinity() -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT)
+    with pytest.raises(ValueError, match="internal_request_auth_key"):
+        build_subagent_affinity_headers(None, request, ServerRole.CONTEXT)
+    request.conversation_params.subagent_affinity_id = None
+    assert build_subagent_affinity_headers(None, request, ServerRole.CONTEXT) == {}
+    assert validate_subagent_affinity(None, request, ServerRole.CONTEXT, {}) is None
+
+
+def test_affinity_signature_does_not_change_legacy_transfer_signature() -> None:
+    request = _make_request(encoded_opaque_state="b3BhcXVl")
+    legacy_headers = build_internal_disagg_auth_headers("secret", request)
+    request.conversation_params = ConversationParams(
+        conversation_id="child", subagent_affinity_id="parent"
+    )
+    headers = legacy_headers | build_subagent_affinity_headers(
+        "secret", request, ServerRole.GENERATION
+    )
+    wire_request = CompletionRequest.model_validate_json(
+        request.model_dump_json(exclude_unset=True)
+    )
+    validate_internal_disagg_request("secret", wire_request, headers)
+    assert build_internal_disagg_auth_headers("secret", request) == legacy_headers
+    assert (
+        validate_subagent_affinity("secret", wire_request, ServerRole.GENERATION, headers)
+        == "parent"
+    )
