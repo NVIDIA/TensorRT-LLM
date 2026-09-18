@@ -21,8 +21,8 @@ included and residency is capped at ``max_batch_size * pp_size`` however many
 seats exist. It stays off for V1 (the V1 capacity schedulers hardcode
 ``GENERATION_COMPLETE``) and for hybrid models (SSM state is sized from
 ``max_batch_size``). "V1" there is the manager the creator *selects*, not the
-``use_kv_cache_manager_v2`` request: a plain model with ``max_beam_width > 1`` is
-demoted to V1 after the request is honoured, so the gate reads
+``use_kv_cache_manager_v2`` request: a plain Python-backend model with
+``max_beam_width > 1`` is demoted to V1, so the gate reads
 ``resolved_kv_cache_manager_is_v2``. It also stays off for the Qwen-VL models that
 keep an MRoPE delta cache, which is sized ``max_num_tokens * pp_size + 1`` yet
 indexed by ``py_seq_slot``.
@@ -279,26 +279,15 @@ def test_resolve_mrope_delta_cache_finds_the_model_and_draft_buffers():
     )
 
 
-@pytest.mark.parametrize("max_beam_width,expected_factor", [(1, 2), (2, 1), (4, 1)])
-def test_v2_requested_but_beam_search_selects_v1_keeps_b_slots(max_beam_width, expected_factor):
-    """``use_kv_cache_manager_v2=True`` is a request, not the manager selected.
-
-    ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
-    V2 manager to ``KVCacheManager`` when ``max_beam_width > 1``, so gating the
-    seat pool on the *configured* preference left V2 geometry -- ``2B`` seats,
-    plus ``ADPRouter.exclude_retiring_requests`` admitting a replacement cohort
-    on top of a retiring one -- on a V1 executor whose capacity scheduler
-    hardcodes ``GENERATION_COMPLETE`` and never releases the retirees early. The
-    seats would be unusable and the sampler/spec-dec state sized for them
-    wasted, so the request must be resolved through
-    ``resolved_kv_cache_manager_is_v2`` before it reaches the gate.
-    """
+@pytest.mark.parametrize("max_beam_width", [1, 2, 4])
+def test_v2_beam_search_keeps_overlap_headroom(max_beam_width: int) -> None:
+    """Beam search retains V2 admission and sequence-slot geometry."""
     max_batch_size = 8
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
 
     is_v2 = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width)
-    assert is_v2 is (max_beam_width == 1)
+    assert is_v2 is True
 
     seats = compute_max_num_sequences(
         mapping,
@@ -308,7 +297,7 @@ def test_v2_requested_but_beam_search_selects_v1_keeps_b_slots(max_beam_width, e
             mapping, False, kv_cache_manager_is_v2=is_v2
         ),
     )
-    assert seats == expected_factor * max_batch_size
+    assert seats == 2 * max_batch_size
 
 
 @pytest.mark.parametrize(
@@ -330,7 +319,7 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(max_beam_width,
     """
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
     # A plain model: not Gemma4 hybrid (no per-layer head_dim) and not hybrid
-    # linear, so the creator falls back rather than raising.
+    # linear, so C++ V2 supports beam search without a fallback.
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"], num_hidden_layers=2),
         sparse_attention_config=None,
@@ -358,11 +347,9 @@ def test_resolved_v2_respects_an_explicit_v1_request():
     )
 
 
-def test_v2_incompatible_features_reports_every_trigger():
-    """The strings reach the creator's user-facing fallback/rejection message."""
-    assert kv_cache_manager_v2_incompatible_features(1) == []
-    assert kv_cache_manager_v2_incompatible_features(None) == []
-    assert kv_cache_manager_v2_incompatible_features(2) == ["max_beam_width > 1"]
+@pytest.mark.parametrize("max_beam_width", [None, 1, 2, 4])
+def test_v2_incompatible_features_allow_beam_search(max_beam_width: int | None) -> None:
+    assert kv_cache_manager_v2_incompatible_features(max_beam_width) == []
 
 
 def test_v2_incompatibility_does_not_depend_on_the_kv_connector():
