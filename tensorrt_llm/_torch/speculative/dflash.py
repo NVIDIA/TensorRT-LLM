@@ -334,6 +334,13 @@ class DFlashWorker(SpecWorkerBase):
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
+        # The DFlash 2 selector indexes full-vocab codebooks by draft-token
+        # id, so a d2t-remapped draft vocab would score the wrong tokens.
+        if self._d2t is not None and getattr(draft_model, "is_dflash2", False):
+            raise NotImplementedError(
+                "DFlash 2 candidate selection requires a shared draft/target vocab "
+                "(d2t vocab mapping is not supported)."
+            )
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype):
         """Fail with the arithmetic before allocating the drafter context arena.
@@ -612,6 +619,9 @@ class DFlashWorker(SpecWorkerBase):
             page_size = self._ctx_page_size if pool is None else pool[0].size(-2)
             self._ctx_page_size = page_size
             if self._dflash_attention_backend == "TRTLLM":
+                # TRTLLM-Gen has no non-causal sliding window; fail here
+                # rather than inside the first draft forward.
+                draft_model.validate_block_attention_windows()
                 has_context_attention = any(
                     not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
                 )
@@ -1188,6 +1198,8 @@ class DFlashWorker(SpecWorkerBase):
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
 
+        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
+
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,
             next_draft_tokens,
@@ -1269,11 +1281,6 @@ class DFlashWorker(SpecWorkerBase):
         scored under. That costs acceptance rate, not correctness — same
         trade-off as ``_apply_dspark_markov_bias``.
         """
-        if self._d2t is not None:
-            raise NotImplementedError(
-                "DFlash 2 candidate selection requires a shared draft/target "
-                "vocab (d2t vocab mapping is not supported)."
-            )
         selector = draft_model.candidate_selector
         candidate_ids, unary_logits, block_logits = self._dflash2_global_top_k(
             gen_logits,

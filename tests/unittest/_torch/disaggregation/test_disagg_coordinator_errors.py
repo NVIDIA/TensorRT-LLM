@@ -58,7 +58,7 @@ def test_rank_local_check_fails_failed_requests_and_names_the_kind() -> None:
     failed, running = _failed_gen(1), _running_gen(2)
     h.active.extend([failed, running])
 
-    h.coordinator.check_transfer_errors("generation requests")
+    h.coordinator._check_transfer_errors("generation requests")
 
     assert h.effects.failed == [
         ("Error in kv cache transfer for generation requests", [failed], False)
@@ -72,7 +72,7 @@ def test_rank_local_check_defers_to_the_vote_under_multi_rank_adp() -> None:
     h = _single_rank(world_size=2, enable_attention_dp=True)
     h.active.append(_failed_gen(1))
 
-    h.coordinator.check_transfer_errors("context requests")
+    h.coordinator._check_transfer_errors("context requests")
 
     assert h.effects.failed == []
     assert h.dist.calls == []
@@ -83,7 +83,7 @@ def test_rank_local_check_handles_errors_on_a_single_adp_rank() -> None:
     failed = _failed_gen(1)
     h.active.append(failed)
 
-    h.coordinator.check_transfer_errors("generation requests")
+    h.coordinator._check_transfer_errors("generation requests")
 
     assert [requests for _, requests, _ in h.effects.failed] == [[failed]]
 
@@ -93,7 +93,7 @@ def test_user_cancelled_failed_requests_are_left_to_the_cancel_path() -> None:
     h.active.append(_failed_gen(1))
     h.registry.canceled = [1]
 
-    h.coordinator.check_transfer_errors("generation requests")
+    h.coordinator._check_transfer_errors("generation requests")
 
     assert h.effects.failed == []
 
@@ -118,7 +118,7 @@ def test_failed_context_send_waits_until_every_transfer_owner_released_it() -> N
     assert h.effects.failed == []
 
     h.coordinator.release_transfer(failed)  # the connector lets go
-    h.coordinator.check_transfer_errors("context requests")
+    h.coordinator._check_transfer_errors("context requests")
 
     assert not h.in_transfer(failed)
     assert h.effects.failed == [

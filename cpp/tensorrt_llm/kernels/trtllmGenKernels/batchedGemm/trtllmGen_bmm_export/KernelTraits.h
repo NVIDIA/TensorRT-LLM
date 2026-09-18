@@ -185,8 +185,11 @@ inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind, int mmaK, 
     }
     if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
     {
-        (void) mmaK;
-        (void) isSparseA;
+        // SM107 2x-mmaK kernels keep MxE2m1 unpadded in smem.
+        if ((!isSparseA && mmaK >= 64) || (isSparseA && mmaK >= 128))
+        {
+            return tg::dtypeGetNumBits(dtype);
+        }
         return 8;
     }
     else

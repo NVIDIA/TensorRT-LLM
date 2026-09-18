@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from qualname_map import (
+from python_change_analysis import (
     closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,

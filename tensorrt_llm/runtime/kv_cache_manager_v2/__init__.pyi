@@ -36,6 +36,21 @@ from typing import (
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
 
+class CorruptedError(Exception):
+    """Raised by every public entry point once a broken invariant has been recorded.
+
+    Only the C++ backend has the latch that raises this; the pure-Python backend never does.
+    """
+
+def poison_reason() -> str | None:
+    """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
+
+def take_poison() -> str | None:
+    """Report the recorded violation and clear it, but only once no manager is alive."""
+
+def num_live_managers() -> int:
+    """Number of constructed, not-yet-destroyed managers."""
+
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
@@ -57,7 +72,6 @@ class PlannedDropHandle:
 class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
-    def to_bytes(self) -> bytes: ...
 
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
@@ -66,6 +80,23 @@ MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
+
+# From _storage_manager.py
+class StorageStatistics:
+    """Independent per-pool storage counts returned by the manager."""
+
+    @property
+    def slot_sizes(self) -> list[int]: ...
+    @property
+    def total(self) -> int: ...
+    @property
+    def free(self) -> int: ...
+    @property
+    def evictable(self) -> int: ...
+    @property
+    def available(self) -> int: ...
+    @property
+    def unavailable(self) -> int: ...
 
 # From _stats.py
 @dataclass(slots=True)
@@ -94,6 +125,15 @@ class KVCacheIterationStatsDelta:
     iter_host_dropped_bytes: int = 0
 
 @dataclass(slots=True)
+class ReusedBlocksByLevel:
+    """Reuse block counts split by the cache level the reused pages were resident on.
+
+    Indices are CacheLevel values, so entry i is the i-th configured tier.
+    """
+
+    full: list[int]
+    partial: list[int]
+
 class SsmSnapshotIterationStatsDelta:
     iter_snapshot_lookups: int = 0
     iter_snapshot_hits: int = 0
@@ -373,6 +413,9 @@ class _KVCache:
     @property
     def num_committed_tokens(self) -> int: ...
     @property
+    def cached_tokens_by_level(self) -> list[int]: ...
+    def _get_last_cached_token_level(self) -> int | None: ...
+    @property
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property
     def reuse_scope(self) -> ReuseScope: ...
@@ -459,9 +502,19 @@ class PoolGroupDesc:
     pools: Sequence[PoolDesc]
 
 # From _core/_kv_cache_manager.py
+class HalfOpenRange:
+    def __init__(self, beg: int, end: int) -> None: ...
+    @property
+    def beg(self) -> int: ...
+    @property
+    def end(self) -> int: ...
+    def __bool__(self) -> bool: ...
+    def __len__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
+
 @dataclass(slots=True, frozen=True)
 class ScratchDesc:
-    range: tuple[int, int]
+    range: HalfOpenRange
     slot_ids: Sequence[int]
     def __bool__(self) -> bool: ...
 
@@ -494,6 +547,7 @@ class KVCacheManager:
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
+        # C++ backend only; the pure-Python backend does not accept this parameter.
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
@@ -525,6 +579,10 @@ class KVCacheManager:
     ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
+    def get_storage_statistics(self, cache_level: CacheLevel = ...) -> list[StorageStatistics]: ...
+    def get_life_cycle_pool_group_indices(
+        self, cache_level: CacheLevel = ...
+    ) -> list[PoolGroupIndex]: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
     def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
     def get_and_reset_ssm_snapshot_iteration_stats(
@@ -533,9 +591,17 @@ class KVCacheManager:
     def record_request_suspended(self) -> None: ...
     def record_request_resumed(self) -> None: ...
     def get_and_reset_iteration_suspend_resume_stats(self) -> tuple[int, int]: ...
+    def get_and_reset_iteration_disk_prefetch_blocks(self) -> int: ...
+    def get_and_reset_iteration_cached_tokens_by_level(self) -> list[int]: ...
+    def get_and_reset_iteration_reused_blocks_by_level(
+        self,
+    ) -> dict[LifeCycleId, ReusedBlocksByLevel]: ...
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
     ) -> Sequence[PoolGroupPeakBlockStats]: ...
+    def get_and_reset_iteration_peak_block_stats_by_level(
+        self,
+    ) -> Sequence[Sequence[PoolGroupPeakBlockStats]]: ...
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...

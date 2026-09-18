@@ -299,18 +299,22 @@ class TransformersTokenizer(TokenizerBase):
             tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                       **kwargs)
         except Exception as e:
-            # Two transformers 5.x regressions for model_types not registered
-            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
-            # tokenizer.json directly and skips AutoConfig, so it sidesteps
-            # both:
+            # Three transformers 5.x regressions for model_types not
+            # registered in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps all
+            # three:
             #  - deepseek_v32: bare PreTrainedConfig fallback hits
             #    modeling_rope_utils → self.max_position_embeddings →
             #    AttributeError (PreTrainedConfig is now a dataclass with
             #    declared fields). See deepseek-ai/DeepSeek-V3#1207.
             #  - glm_moe_dsa: layer_types=['deepseek_sparse_attention', ...] is
             #    rejected by validate_layer_type (not in ALLOWED_LAYER_TYPES).
+            #  - nemotron_h: layers_block_type carries the transformers 5.13
+            #    vocabulary, rejected by validate_layers_block_type.
             msg = str(e)
-            if "max_position_embeddings" not in msg and "layer_types" not in msg:
+            if ("max_position_embeddings" not in msg
+                    and "layer_types" not in msg
+                    and "layers_block_type" not in msg):
                 raise
             tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
                                                     **kwargs)
