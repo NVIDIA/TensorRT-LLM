@@ -686,3 +686,34 @@ def test_verify_intermediate_state_indices_reuses_buffers():
     assert widened.shape[0] == 5
     assert torch.equal(widened, torch.arange(5, dtype=torch.int32, device=device))
     assert widened.data_ptr() != short_owned.data_ptr()
+
+
+@skip_no_cuda
+def test_fused_gdn_post_conv_linear_gate():
+    """``g_linear=True`` emits alpha = exp(g_log) (the FlashInfer prefill convention); everything else is unchanged."""
+    from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import fused_gdn_post_conv
+
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim = 2, 8, 128, 128
+    num_prefill_tokens, num_decode_tokens = 77, 5
+    qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+    num_tokens = num_prefill_tokens + num_decode_tokens
+    prefill = torch.randn(qkv_dim, num_prefill_tokens, dtype=dtype, device=device)
+    decode = torch.randn(num_decode_tokens, qkv_dim, dtype=dtype, device=device)
+    a = torch.randn(num_tokens, num_v_heads, dtype=dtype, device=device)
+    b = torch.randn(num_tokens, num_v_heads, dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) - 2.0
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    args = (prefill, decode, a, b, A_log, dt_bias, num_k_heads, head_k_dim, num_v_heads, head_v_dim)
+
+    log_out = fused_gdn_post_conv(*args)
+    lin_out = fused_gdn_post_conv(*args, g_linear=True)
+    for x, y in zip(log_out[:3] + (log_out[4],), lin_out[:3] + (lin_out[4],)):
+        assert torch.equal(x, y)
+    g_log, g_lin = log_out[3], lin_out[3]
+    assert g_lin.dtype == torch.float32 and g_lin.is_contiguous()
+    torch.testing.assert_close(g_lin, torch.exp(g_log), rtol=1e-6, atol=1e-7)
+    assert bool((g_log <= 0).all())
+    assert bool((g_lin > 0).all()) and bool((g_lin <= 1.0).all())

@@ -40,6 +40,7 @@ from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
+from .fold_support import mark_fold_unsupported
 from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
@@ -180,6 +181,8 @@ class Mamba2Mixer(nn.Module):
         use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
+        # The folded save-last prefill is only implemented for the GDN mixer.
+        mark_fold_unsupported("the model has Mamba2 mixer layers")
 
         # Register into the model's extra attrs so the mamba2 boundary custom
         # op can recover this module (and the live metadata) from just a
@@ -500,6 +503,10 @@ class Mamba2Mixer(nn.Module):
         num_actual_tokens = attn_metadata.num_tokens
         batch_split_size = [num_prefills, num_decodes]
 
+        if getattr(mamba_metadata, "fold_count", 0) > 0:
+            raise RuntimeError(
+                "TLLM_MAMBA_FOLD_SAVE_LAST=1 (folded save-last prefill) is only "
+                "implemented for the gated-delta-net (GDN) mixer, not Mamba2")
         state_indices = mamba_metadata.state_indices[:num_prefills +
                                                      num_decodes]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(

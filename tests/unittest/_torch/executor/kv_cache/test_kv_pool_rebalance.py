@@ -1089,3 +1089,62 @@ class TestPpLoopDrainWiring:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Token-budget trim -> recurrent-state re-plan (ResourceManager.prepare_resources)
+# ---------------------------------------------------------------------------
+
+
+def _trim_batch(chunk_sizes):
+    from types import SimpleNamespace
+    return SimpleNamespace(context_requests=[
+        SimpleNamespace(context_chunk_size=size) for size in chunk_sizes
+    ],
+                           generation_requests=[])
+
+
+def _trim_resource_manager(kv_cache_manager):
+    from tensorrt_llm._torch.pyexecutor.resource_manager import (
+        ResourceManager, ResourceManagerType)
+    manager = object.__new__(ResourceManager)
+    manager.resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
+    }
+    return manager
+
+
+def test_prepare_resources_replans_recurrent_state_only_when_a_chunk_shrinks():
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+
+    batch = _trim_batch([16384, 4096])
+    kv = Mock(spec=[
+        "prepare_resources", "maybe_fit_token_budget",
+        "prepare_resources_after_token_budget_trim"
+    ])
+
+    def trim(scheduled_batch):
+        scheduled_batch.context_requests[0].context_chunk_size = 3008
+
+    kv.maybe_fit_token_budget.side_effect = trim
+    ResourceManager.prepare_resources(_trim_resource_manager(kv), batch)
+    kv.prepare_resources.assert_called_once_with(batch)
+    kv.prepare_resources_after_token_budget_trim.assert_called_once_with(batch)
+
+    # No trim -> no re-plan.
+    kv = Mock(spec=[
+        "prepare_resources", "maybe_fit_token_budget",
+        "prepare_resources_after_token_budget_trim"
+    ])
+    ResourceManager.prepare_resources(_trim_resource_manager(kv),
+                                      _trim_batch([16384, 4096]))
+    kv.prepare_resources_after_token_budget_trim.assert_not_called()
+
+    # Managers without the hook (non-hybrid models) are left alone.
+    kv = Mock(spec=["prepare_resources", "maybe_fit_token_budget"])
+    kv.maybe_fit_token_budget.side_effect = trim
+    ResourceManager.prepare_resources(_trim_resource_manager(kv),
+                                      _trim_batch([16384, 4096]))
+    kv.prepare_resources.assert_called_once()

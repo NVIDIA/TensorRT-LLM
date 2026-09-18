@@ -27,11 +27,20 @@ def _extract_transpose_prefill_kernel(
     src_stride_seq,
     d_inner,
     conv_dim,
+    tail_ptr,
+    conv_tok_ptr,
+    num_folds,
+    tail_stride_f,
+    tail_stride_c,
     BLOCK_SEQ: tl.constexpr,
     BLOCK_CONV: tl.constexpr,
+    HAS_TAIL: tl.constexpr,
+    TAIL_W: tl.constexpr,
 ):
     """Extract src[0:num_prefill_tokens, d_inner:d_inner+conv_dim] and
-    transpose to dst[conv_dim, num_prefill_tokens]."""
+    transpose to dst[conv_dim, num_prefill_tokens]. With HAS_TAIL the TAIL_W
+    tokens before each fold point conv_tok[f] are also written to tail[f, c, w]
+    (the fold-point conv state of the folded save-last prefill)."""
     pid_seq = tl.program_id(0)
     pid_conv = tl.program_id(1)
 
@@ -48,9 +57,21 @@ def _extract_transpose_prefill_kernel(
         seq_offsets[:, None].to(tl.int64) * src_stride_seq + d_inner + conv_offsets[None, :]
     )
     data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
+    data_t = tl.trans(data)
 
     dst_offsets = conv_offsets[:, None] * num_prefill_tokens + seq_offsets[None, :]
-    tl.store(dst_ptr + dst_offsets, tl.trans(data), mask=conv_mask[:, None] & seq_mask[None, :])
+    tl.store(dst_ptr + dst_offsets, data_t, mask=conv_mask[:, None] & seq_mask[None, :])
+    if HAS_TAIL:
+        for f in range(num_folds):
+            first = tl.load(conv_tok_ptr + f) - TAIL_W
+            w = seq_offsets - first
+            w_mask = (w >= 0) & (w < TAIL_W) & seq_mask
+            tail_offsets = (
+                f * tail_stride_f.to(tl.int64)
+                + conv_offsets[:, None].to(tl.int64) * tail_stride_c
+                + w[None, :]
+            )
+            tl.store(tail_ptr + tail_offsets, data_t, mask=conv_mask[:, None] & w_mask[None, :])
 
 
 def extract_transpose_prefill_slice(
@@ -58,20 +79,44 @@ def extract_transpose_prefill_slice(
     num_prefill_tokens: int,
     start_col: int,
     width: int,
+    out: torch.Tensor | None = None,
+    tail: torch.Tensor | None = None,
+    conv_tok: torch.Tensor | None = None,
+    check: bool = True,
 ) -> torch.Tensor:
     """
     Extract and transpose a prefill slice for causal_conv1d_fn.
 
     Input:  src[num_tokens, num_cols], rows contiguous (arbitrary row stride,
             so column-slice views of a wider tensor work in place)
-    Output: [width, num_prefill_tokens]
+    Output: [width, num_prefill_tokens]; written into ``out`` when given (a
+            contiguous [width, num_prefill_tokens] buffer of src's dtype, e.g.
+            a per-iteration scratch shared by the layers).
+    Tail:   with ``tail`` [num_folds, width, tail_w] and ``conv_tok``
+            [num_folds] (int64 token index of every fold point) the tail_w
+            tokens before each fold point are written to ``tail[f]`` in the
+            same launch: the fold-point conv state of the folded save-last
+            prefill, which used to be an index_select over the transposed
+            buffer afterwards.
     """
-    assert src.stride(1) == 1
-    out = torch.empty(width, num_prefill_tokens, dtype=src.dtype, device=src.device)
-
+    if out is None:
+        assert src.stride(1) == 1
+        out = torch.empty(width, num_prefill_tokens, dtype=src.dtype, device=src.device)
+    elif check:
+        assert src.stride(1) == 1
+        assert out.shape == (width, num_prefill_tokens) and out.is_contiguous()
+        assert out.dtype == src.dtype
+    has_tail = tail is not None
+    if has_tail:
+        if check:
+            assert conv_tok is not None and tail.dim() == 3 and tail.shape[0] == conv_tok.shape[0]
+            assert tail.shape[1] == width and tail.stride(2) == 1 and tail.dtype == src.dtype
+        num_folds, tail_w = tail.shape[0], tail.shape[2]
+        tail_stride_f, tail_stride_c = tail.stride(0), tail.stride(1)
+    else:
+        tail, conv_tok, num_folds, tail_w, tail_stride_f, tail_stride_c = src, src, 0, 1, 0, 0
     BLOCK_SEQ, BLOCK_CONV = 32, 128
     grid = (triton.cdiv(num_prefill_tokens, BLOCK_SEQ), triton.cdiv(width, BLOCK_CONV))
-
     _extract_transpose_prefill_kernel[grid](
         src,
         out,
@@ -79,8 +124,15 @@ def extract_transpose_prefill_slice(
         src.stride(0),
         start_col,
         width,
+        tail,
+        conv_tok,
+        num_folds,
+        tail_stride_f,
+        tail_stride_c,
         BLOCK_SEQ,
         BLOCK_CONV,
+        has_tail,
+        tail_w,
     )
     return out
 
@@ -227,18 +279,57 @@ def _fused_gdn_post_conv_kernel(
     b_stride_head,
     l2_norm_eps,
     softplus_threshold,
+    x_ptr,
+    conv_states_ptr,
+    fold_s1_ptr,
+    fold_s2_ptr,
+    fold_conv_tok_ptr,
+    x_stride_token,
+    conv_state_stride,
     NUM_K_HEADS: tl.constexpr,
     NUM_V_HEADS: tl.constexpr,
     HEAD_K_DIM: tl.constexpr,
     HEAD_V_DIM: tl.constexpr,
     HAS_DECODE: tl.constexpr,
+    G_LINEAR: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    FOLD_CONV: tl.constexpr = False,
+    WIDTH: tl.constexpr = 1,
+    CONV_STATE_SIZE: tl.constexpr = 1,
+    CONV_BLOCK: tl.constexpr = 1,
+    CONV_PROGRAMS: tl.constexpr = 1,
 ):
-    """Prepare contiguous Q/K/V and GDN gates from causal-conv output."""
+    """Prepare contiguous Q/K/V and GDN gates from causal-conv output.
+
+    With FOLD_CONV the launch also commits the conv states of the folded
+    save-last requests (the work of gdn_mixer.fold_seed_terminal_slots without
+    the SSM copy): programs with ``head_idx >= NUM_K_HEADS + NUM_V_HEADS`` and
+    ``token_block == 0`` copy conv_states[S2] <- conv_states[S1] (the chunk-end
+    state the conv kernel left in S1) and write conv_states[S1] <- the WIDTH
+    token rows of the pre-conv input ``x`` before the fold point, for fold
+    ``r = (head_idx - heads) // CONV_PROGRAMS``, block ``j = ... % CONV_PROGRAMS``.
+    """
     token_block = tl.program_id(0)
     head_idx = tl.program_id(1)
+    if FOLD_CONV:
+        if head_idx >= NUM_K_HEADS + NUM_V_HEADS:
+            if token_block == 0:
+                r = (head_idx - (NUM_K_HEADS + NUM_V_HEADS)) // CONV_PROGRAMS
+                j = (head_idx - (NUM_K_HEADS + NUM_V_HEADS)) % CONV_PROGRAMS
+                slot1 = tl.load(fold_s1_ptr + r).to(tl.int64)
+                slot2 = tl.load(fold_s2_ptr + r).to(tl.int64)
+                coffs = j * CONV_BLOCK + tl.arange(0, CONV_BLOCK)
+                cmask = coffs < CONV_STATE_SIZE
+                src = tl.load(conv_states_ptr + slot1 * conv_state_stride.to(tl.int64) + coffs, mask=cmask)
+                tl.store(conv_states_ptr + slot2 * conv_state_stride.to(tl.int64) + coffs, src, mask=cmask)
+                c = coffs // WIDTH
+                w = coffs - c * WIDTH
+                base = (tl.load(fold_conv_tok_ptr + r) - WIDTH).to(tl.int64) * x_stride_token
+                t = tl.load(x_ptr + base + w.to(tl.int64) * x_stride_token + c, mask=cmask)
+                tl.store(conv_states_ptr + slot1 * conv_state_stride.to(tl.int64) + coffs, t.to(src.dtype), mask=cmask)
+            return
 
     token_offsets = token_block * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     total_tokens = num_prefill_tokens + num_decode_tokens
@@ -338,6 +429,10 @@ def _fused_gdn_post_conv_kernel(
             gate_input,
         )
         g_values = -tl.exp(A_log) * softplus
+        if G_LINEAR:
+            # The FlashInfer prefill kernel consumes the decay as alpha =
+            # exp(g): emit it here instead of a torch.exp launch per call.
+            g_values = tl.exp(g_values)
         beta_values = tl.sigmoid(b_values)
         gate_offsets = token_offsets.to(tl.int64) * NUM_V_HEADS + value_head_idx
         tl.store(g_ptr + gate_offsets, g_values, mask=token_mask)
@@ -358,6 +453,10 @@ def fused_gdn_post_conv(
     l2_norm_eps: float = 1e-6,
     softplus_threshold: float = 20.0,
     beta_dtype: torch.dtype = torch.float32,
+    g_linear: bool = False,
+    out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    check: bool = True,
+    fold_conv: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse GDN post-conv split, Q/K normalization, and gate preparation.
 
@@ -375,8 +474,22 @@ def fused_gdn_post_conv(
         l2_norm_eps: Epsilon added to the Q/K squared norm.
         softplus_threshold: Linear fallback threshold for the decay gate softplus.
         beta_dtype: Output dtype for beta. Target verification uses the input dtype for parity.
+        g_linear: Emit the decay gate in linear space (``alpha = exp(g)``), the
+            convention of the FlashInfer prefill kernel, instead of log space.
+        out: Optional pre-allocated ``(q, k, v, g, beta)`` of the shapes and
+            dtypes below (contiguous), e.g. views of a scratch shared by the
+            layers of one iteration; skips the five allocations per call.
+        check: Verify the shapes / dtypes / contiguity of ``out`` (callers that
+            built ``out`` for these very arguments may pass False).
+        fold_conv: ``(x, conv_states, fold_s1, fold_s2, fold_conv_tok)`` to also
+            commit the conv states of the folded save-last requests in this
+            launch (see the kernel): ``x`` the token-major pre-conv input rows
+            of the prefill tokens, ``conv_states`` the ``[slots, conv_dim,
+            width]`` pool (the conv kernel has left the chunk-end state in the
+            S1 slots), ``fold_s1`` / ``fold_s2`` int32 slots and
+            ``fold_conv_tok`` int64 fold points, one per fold.
     Returns:
-        Contiguous Q, K, V, log-space G, and beta tensors with shapes
+        Contiguous Q, K, V, G (log space, or linear space with ``g_linear``), and beta tensors with shapes
         ``[1, num_tokens, num_k_heads, head_k_dim]``,
         ``[1, num_tokens, num_k_heads, head_k_dim]``,
         ``[1, num_tokens, num_v_heads, head_v_dim]``, and twice
@@ -385,16 +498,25 @@ def fused_gdn_post_conv(
     num_prefill_tokens = prefill.shape[1]
     num_decode_tokens = 0 if decode is None else decode.shape[0]
     num_tokens = num_prefill_tokens + num_decode_tokens
-
-    q = torch.empty(
-        (1, num_tokens, num_k_heads, head_k_dim), dtype=prefill.dtype, device=prefill.device
-    )
-    k = torch.empty_like(q)
-    v = torch.empty(
-        (1, num_tokens, num_v_heads, head_v_dim), dtype=prefill.dtype, device=prefill.device
-    )
-    g = torch.empty((1, num_tokens, num_v_heads), dtype=torch.float32, device=prefill.device)
-    beta = torch.empty((1, num_tokens, num_v_heads), dtype=beta_dtype, device=prefill.device)
+    if out is not None:
+        q, k, v, g, beta = out
+        if check:
+            assert q.shape == (1, num_tokens, num_k_heads, head_k_dim) and q.dtype == prefill.dtype
+            assert k.shape == q.shape and k.dtype == prefill.dtype
+            assert v.shape == (1, num_tokens, num_v_heads, head_v_dim) and v.dtype == prefill.dtype
+            assert g.shape == (1, num_tokens, num_v_heads) and g.dtype == torch.float32
+            assert beta.shape == (1, num_tokens, num_v_heads) and beta.dtype == beta_dtype
+            assert all(t.is_contiguous() for t in out)
+    else:
+        q = torch.empty(
+            (1, num_tokens, num_k_heads, head_k_dim), dtype=prefill.dtype, device=prefill.device
+        )
+        k = torch.empty_like(q)
+        v = torch.empty(
+            (1, num_tokens, num_v_heads, head_v_dim), dtype=prefill.dtype, device=prefill.device
+        )
+        g = torch.empty((1, num_tokens, num_v_heads), dtype=torch.float32, device=prefill.device)
+        beta = torch.empty((1, num_tokens, num_v_heads), dtype=beta_dtype, device=prefill.device)
     if num_tokens == 0:
         return q, k, v, g, beta
 
@@ -406,7 +528,26 @@ def fused_gdn_post_conv(
     block_tokens = 16
     block_k = triton.next_power_of_2(head_k_dim)
     block_v = triton.next_power_of_2(head_v_dim)
-    grid = (triton.cdiv(num_tokens, block_tokens), num_k_heads + num_v_heads)
+    num_heads = num_k_heads + num_v_heads
+    if fold_conv is not None:
+        x, conv_states, fold_s1, fold_s2, fold_conv_tok = fold_conv
+        n_folds = fold_s1.shape[0]
+        width = conv_states.shape[2]
+        conv_state_size = conv_states.shape[1] * width
+        conv_block = 1024
+        conv_programs = triton.cdiv(conv_state_size, conv_block)
+        if check:
+            assert x.dim() == 2 and x.stride(1) == 1 and x.shape[1] == conv_states.shape[1]
+            assert conv_states.stride(2) == 1 and conv_states.stride(1) == width
+            assert fold_s2.shape[0] == n_folds and fold_conv_tok.shape[0] == n_folds
+        x_stride_token, conv_state_stride = x.stride(0), conv_states.stride(0)
+        grid = (triton.cdiv(num_tokens, block_tokens), num_heads + n_folds * conv_programs)
+    else:
+        # placeholders (never dereferenced: FOLD_CONV=False)
+        x, conv_states, fold_s1, fold_s2, fold_conv_tok = prefill, prefill, prefill, prefill, prefill
+        width, conv_state_size, conv_block, conv_programs = 1, 1, 1, 1
+        x_stride_token, conv_state_stride = 0, 0
+        grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
     _fused_gdn_post_conv_kernel[grid](
         prefill,
         decode_input,
@@ -431,14 +572,27 @@ def fused_gdn_post_conv(
         b.stride(1),
         l2_norm_eps,
         softplus_threshold,
+        x,
+        conv_states,
+        fold_s1,
+        fold_s2,
+        fold_conv_tok,
+        x_stride_token,
+        conv_state_stride,
         num_k_heads,
         num_v_heads,
         head_k_dim,
         head_v_dim,
         has_decode,
+        g_linear,
         block_tokens,
         block_k,
         block_v,
+        FOLD_CONV=fold_conv is not None,
+        WIDTH=width,
+        CONV_STATE_SIZE=conv_state_size,
+        CONV_BLOCK=conv_block,
+        CONV_PROGRAMS=conv_programs,
         num_warps=4,
         num_stages=2,
     )

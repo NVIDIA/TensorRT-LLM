@@ -136,6 +136,8 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
+    use_cp="auto",  # accepted for call-site parity with the FlashInfer adapter; the Triton path has no CP variant
+    g_is_linear: bool = False,  # call-site parity: the Triton kernels want log space, so convert back
 ):
     r"""
     Args:
@@ -208,6 +210,8 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
+    if g_is_linear:
+        g = torch.log(g)
     assert q.dtype == k.dtype == v.dtype
     assert (
         q.dtype != torch.float32

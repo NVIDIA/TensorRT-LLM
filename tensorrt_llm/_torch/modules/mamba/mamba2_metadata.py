@@ -15,13 +15,15 @@
 
 import contextlib
 import math
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.modules.fla.flashinfer_chunk import \
+    invalidate_int32_cu_seqlens_cache
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
@@ -319,6 +321,81 @@ def cu_seqlens_to_chunk_indices_offsets(
     return chunk_indices, chunk_offsets
 
 
+def build_fold_segments(
+    ctx_seq_lens: List[int],
+    ctx_state_indices: List[int],
+    folds: List[Optional[Tuple[int, int]]],
+    decode_state_indices: List[int],
+) -> Tuple[List[int], List[int], List[int], List[int], List[int], List[int],
+           List[int]]:
+    """Segment layout of one batch for the linear-attention scan when some
+    context chunks fold the save-last snapshot point into a single chunk.
+
+    Returns ``(scan_cu_seqlens, scan_state_indices, s1, s2, conv_tok, b_rows,
+    b_cu_seqlens)``:
+
+    * ``scan_cu_seqlens`` / ``scan_state_indices``: the scan's first launch.
+      Every context request contributes one segment with its own slot, except
+      a folded one, which contributes segment A ``[pos, pos+off)`` on its
+      primary slot S1 (the snapshot block; final state = the snapshot) and
+      segment B ``[pos+off, end)`` on the terminal slot S2 whose result is
+      discarded (overwritten by the second launch). Decode requests follow
+      with one token each, as in the unfolded layout.
+    * ``s1`` / ``s2``: the two slots of every folded request, in batch order.
+    * ``conv_tok``: token index (into the packed prefill tokens) of the fold
+      point, i.e. the first token of segment B; the conv state of S1 is the
+      ``d_conv - 1`` raw inputs right before it.
+    * ``b_rows`` / ``b_cu_seqlens``: the packed token rows of all B segments
+      and their cumulative lengths, for the second launch (initial state from
+      S1, final state into S2).
+    """
+    scan_cu = [0]
+    scan_idx: List[int] = []
+    s1: List[int] = []
+    s2: List[int] = []
+    conv_tok: List[int] = []
+    b_rows: List[int] = []
+    b_cu = [0]
+    start = 0
+    for length, slot, fold in zip(ctx_seq_lens, ctx_state_indices, folds):
+        if fold is None:
+            scan_cu.append(start + length)
+            scan_idx.append(slot)
+        else:
+            off, terminal = fold
+            if not (0 < off < length):
+                raise ValueError(
+                    f"fold offset {off} must lie strictly inside the chunk "
+                    f"(length {length})")
+            scan_cu.append(start + off)
+            scan_idx.append(slot)
+            scan_cu.append(start + length)
+            scan_idx.append(terminal)
+            s1.append(slot)
+            s2.append(terminal)
+            conv_tok.append(start + off)
+            b_rows.extend(range(start + off, start + length))
+            b_cu.append(b_cu[-1] + (length - off))
+        start += length
+    for slot in decode_state_indices:
+        start += 1
+        scan_cu.append(start)
+        scan_idx.append(slot)
+    return scan_cu, scan_idx, s1, s2, conv_tok, b_rows, b_cu
+
+
+def fold_b_ranges(b_rows: List[int], b_cu: List[int]) -> List[Tuple[int, int]]:
+    """``(first row, length)`` of every folded tail in the packed token space.
+
+    Each tail [fold point, chunk end) is a contiguous row range of the packed
+    prefill tokens; ``b_rows`` lists them back to back and ``b_cu`` delimits
+    the folds. The fused single-fold path slices q/k/v/g/beta and the output
+    with these instead of gathering rows.
+    """
+    return [(b_rows[b_cu[i]], b_cu[i + 1] - b_cu[i])
+            for i in range(len(b_cu) - 1)]
+
+
 class Mamba2Metadata:
 
     # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
@@ -364,6 +441,12 @@ class Mamba2Metadata:
                                               dtype=torch.bool,
                                               device="cuda")
         self.use_initial_states = False
+        # Host gate for the GDN state reset (see gdn_mixer._reset_prefill_states):
+        # True when a context request of this iteration starts without a
+        # recurrent state; state_reset_done flips once the first GDN layer has
+        # cleared those slots for every layer.
+        self.prefill_needs_state_reset = True
+        self.state_reset_done = False
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
@@ -373,10 +456,25 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        # The decode requests' slots of a mixed iteration in their own buffer:
+        # the FlashInfer decode kernel wants an aligned base pointer, which the
+        # tail slice ``state_indices[num_contexts:]`` only has when the number
+        # of context requests is a multiple of 4 (see _mixed_decode_recurrent).
+        self.state_indices_decode = torch.zeros(max_batch_size,
+                                                dtype=torch.int32,
+                                                device="cuda")
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
+        # Per-iteration GDN call context (Qwen3NextGatedDeltaNet.forward_core):
+        # the first GDN layer of an iteration builds the metadata-derived
+        # kwargs (batch split, slot / initial-state views, scan layout) once and
+        # the other layers reuse them. Cleared by prepare().
+        self.gdn_iteration_kwargs = None
+        # True when state_indices_cpu mirrors state_indices for the current
+        # batch (list / CPU-tensor sources); the fold layout needs host values.
+        self._state_indices_host_valid = False
 
         self.replay_work_items = torch.zeros(max_batch_size,
                                              REPLAY_WORK_ITEM_WIDTH,
@@ -393,6 +491,158 @@ class Mamba2Metadata:
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
+
+        # Folded save-last prefill (see build_fold_segments). ``fold_count``
+        # is 0 on every iteration without a folded chunk, in which case the
+        # scan_* views alias the unfolded layout above.
+        self.fold_count = 0
+        self.scan_cu_seqlens_long: torch.Tensor = None
+        self.scan_state_indices: torch.Tensor = None
+        self.fold_s1: torch.Tensor = None
+        self.fold_s2: torch.Tensor = None
+        self.fold_conv_tok: torch.Tensor = None
+        self.fold_b_rows: torch.Tensor = None
+        self.fold_b_cu_seqlens_long: torch.Tensor = None
+        self._scan_cu_seqlens_long_buf = torch.zeros(2 * max_batch_size + 1,
+                                                     dtype=torch.long,
+                                                     device="cuda")
+        self._scan_state_indices_buf = torch.zeros(2 * max_batch_size,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
+        self._fold_s1_buf = torch.zeros(max_batch_size,
+                                        dtype=torch.int32,
+                                        device="cuda")
+        self._fold_s2_buf = torch.zeros(max_batch_size,
+                                        dtype=torch.int32,
+                                        device="cuda")
+        self._fold_conv_tok_buf = torch.zeros(max_batch_size,
+                                              dtype=torch.long,
+                                              device="cuda")
+        self._fold_b_cu_seqlens_long_buf = torch.zeros(max_batch_size + 1,
+                                                       dtype=torch.long,
+                                                       device="cuda")
+        self._fold_b_rows_buf: torch.Tensor = None  # grown on demand
+        # ``[0, len_i]`` pairs, one per folded tail: the cu_seqlens of the
+        # per-fold tail scan launches (fold_scan_tails), staged once per
+        # iteration.
+        self._fold_tail_cu_buf = torch.zeros(2 * max_batch_size,
+                                             dtype=torch.long,
+                                             device="cuda")
+        # S1 / S2 slot of every fold as its own 32-byte aligned int32 element
+        # (row stride 8): the FlashInfer recurrent tail kernel takes one slot
+        # per launch and requires an aligned index pointer, which a
+        # ``fold_s1[i:i + 1]`` slice only has for i == 0.
+        self._fold_slot_aligned_buf = torch.zeros(2,
+                                                  max_batch_size,
+                                                  8,
+                                                  dtype=torch.int32,
+                                                  device="cuda")
+        # Per-iteration constants of the fused fold bookkeeping (gdn_mixer
+        # fold_conv_tail / fold_commit_conv_states / fold_scan_tails): the
+        # per-layer path used to rebuild them with 5 launches per GDN layer.
+        self.fold_b_ranges_host: List[Tuple[int, int]] = []
+        self._fold_s1_host: List[int] = []
+        self._fold_s2_host: List[int] = []
+        self._fold_conv_tok_host: List[int] = []
+        self._fold_s1_long: torch.Tensor = None
+        self._fold_s2_long: torch.Tensor = None
+        self._fold_conv_tail_idx: torch.Tensor = None
+        self._fold_conv_tail_width = 0
+        self._fold_s1_long_buf = torch.zeros(max_batch_size,
+                                             dtype=torch.long,
+                                             device="cuda")
+        self._fold_s2_long_buf = torch.zeros(max_batch_size,
+                                             dtype=torch.long,
+                                             device="cuda")
+        self._fold_conv_tail_idx_buf: torch.Tensor = None  # grown on demand
+
+    def arange_long(self, n: int) -> torch.Tensor:
+        """``[0, 1, ..., n]`` as int64 on the device: the cu_seqlens of ``n`` one-token sequences."""
+        return self._arange_buffer_long[:n + 1]
+
+    def fold_tail_cu_seqlens_long(self, i: int) -> torch.Tensor:
+        """``[0, len_i]`` (int64, device): cu_seqlens of the ``i``-th folded tail scanned alone."""
+        return self._fold_tail_cu_buf[2 * i:2 * i + 2]
+
+    def fold_s1_aligned(self, i: int) -> torch.Tensor:
+        """``[S1_i]`` (int32, device, 32-byte aligned): the snapshot slot of the ``i``-th fold."""
+        return self._fold_slot_aligned_buf[0, i, :1]
+
+    def fold_s2_aligned(self, i: int) -> torch.Tensor:
+        """``[S2_i]`` (int32, device, 32-byte aligned): the terminal slot of the ``i``-th fold."""
+        return self._fold_slot_aligned_buf[1, i, :1]
+
+    @property
+    def fold_s1_long(self) -> torch.Tensor:
+        """``fold_s1`` as int64 (one H2D copy per iteration instead of a
+        ``.long()`` launch per GDN layer)."""
+        if self._fold_s1_long is None:
+            n = self.fold_count
+            self._fold_s1_long_buf[:n].copy_(torch.tensor(self._fold_s1_host,
+                                                          dtype=torch.long),
+                                             non_blocking=True)
+            self._fold_s1_long = self._fold_s1_long_buf[:n]
+        return self._fold_s1_long
+
+    @property
+    def fold_s2_long(self) -> torch.Tensor:
+        if self._fold_s2_long is None:
+            n = self.fold_count
+            self._fold_s2_long_buf[:n].copy_(torch.tensor(self._fold_s2_host,
+                                                          dtype=torch.long),
+                                             non_blocking=True)
+            self._fold_s2_long = self._fold_s2_long_buf[:n]
+        return self._fold_s2_long
+
+    def conv_tail_index(self, width: int) -> torch.Tensor:
+        """Packed-token indices of the ``width`` pre-conv inputs before each
+        fold point, flat ``[fold_count * width]`` int64 on the device.
+
+        Built on the host once per iteration (the fold points are host
+        values) and shared by every GDN layer; the per-layer path spent an
+        arange + sub + add launch per layer on the same tensor.
+        """
+        if (self._fold_conv_tail_idx is None
+                or self._fold_conv_tail_width != width):
+            need = self.fold_count * width
+            if (self._fold_conv_tail_idx_buf is None
+                    or self._fold_conv_tail_idx_buf.numel() < need):
+                self._fold_conv_tail_idx_buf = torch.zeros(
+                    max(need, self.max_batch_size * max(width, 1)),
+                    dtype=torch.long,
+                    device=self._fold_conv_tok_buf.device)
+            host = torch.tensor([
+                tok - width + j for tok in self._fold_conv_tok_host
+                for j in range(width)
+            ],
+                                dtype=torch.long)
+            self._fold_conv_tail_idx_buf[:need].copy_(host, non_blocking=True)
+            self._fold_conv_tail_idx = self._fold_conv_tail_idx_buf[:need]
+            self._fold_conv_tail_width = width
+        return self._fold_conv_tail_idx
+
+    def prepare_steady_gen_step(self, attn_metadata: AttentionMetadata):
+        """``prepare()`` for a decode-only batch whose request layout (ids,
+        order, state slots, padding rows) is unchanged since the last
+        ``prepare()``: the state indices and the dummy-request mask are still
+        in place, so their host walk and H2D copies are skipped; only the
+        per-step bookkeeping is refreshed."""
+        self.prefill_needs_state_reset = False
+        self.state_reset_done = False
+        self.gdn_iteration_kwargs = None
+        batch_size = attn_metadata.seq_lens.shape[0]
+        kv_cache_manager = attn_metadata.kv_cache_manager
+
+        self._prepare_replay_work_items(kv_cache_manager, batch_size, 0)
+        self._prepare_fold_segments(kv_cache_manager, attn_metadata,
+                                    batch_size, 0)
+
+        self.query_start_loc = None
+        self.query_start_loc_long = self._arange_buffer_long[:batch_size + 1]
+
+        flush = getattr(kv_cache_manager, "flush_state_transfers", None)
+        if flush is not None:
+            flush()
 
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
@@ -446,7 +696,104 @@ class Mamba2Metadata:
             replay_history_size,
         )
 
+    def _prepare_fold_segments(self, kv_cache_manager, attn_metadata,
+                               batch_size: int, num_contexts: int) -> None:
+        """Layout for the folded save-last prefill (see build_fold_segments).
+
+        Cheap no-op (``fold_count = 0``) unless the cache manager reports a
+        context chunk that carries its save-last snapshot point.
+        """
+        self.fold_count = 0
+        self.scan_cu_seqlens_long = None
+        self.scan_state_indices = None
+        self.fold_b_ranges_host = []
+        self._fold_s1_host = []
+        self._fold_s2_host = []
+        self._fold_conv_tok_host = []
+        self._fold_s1_long = None
+        self._fold_s2_long = None
+        self._fold_conv_tail_idx = None
+        get_fold_info = getattr(kv_cache_manager, "get_fold_info", None)
+        if get_fold_info is None or num_contexts == 0:
+            return
+        request_ids = attn_metadata.request_ids
+        if request_ids is None or not self._state_indices_host_valid:
+            # The cache manager may have chosen the snapshot slot as a folded
+            # chunk's primary slot; running such a chunk unfolded would leave
+            # the terminal slot unwritten. Fail loudly instead.
+            if getattr(kv_cache_manager, "_request_id_to_fold", None):
+                raise RuntimeError(
+                    "folded save-last chunks are pending but the mamba metadata "
+                    "cannot build their layout (request_ids or host state "
+                    "indices unavailable)")
+            return
+        folds = get_fold_info(list(request_ids[:num_contexts]))
+        if not any(f is not None for f in folds):
+            return
+        seq_lens = attn_metadata.seq_lens[:batch_size].tolist()
+        state_indices = self.state_indices_cpu[:batch_size].tolist()
+        (scan_cu, scan_idx, s1, s2, conv_tok, b_rows,
+         b_cu) = build_fold_segments(seq_lens[:num_contexts],
+                                     state_indices[:num_contexts], folds,
+                                     state_indices[num_contexts:])
+        n = len(s1)
+        nseg = len(scan_idx)
+        dev = self._scan_cu_seqlens_long_buf.device
+        self._scan_cu_seqlens_long_buf[:nseg + 1].copy_(torch.tensor(
+            scan_cu, dtype=torch.long),
+                                                        non_blocking=True)
+        self._scan_state_indices_buf[:nseg].copy_(torch.tensor(
+            scan_idx, dtype=torch.int32),
+                                                  non_blocking=True)
+        self._fold_s1_buf[:n].copy_(torch.tensor(s1, dtype=torch.int32),
+                                    non_blocking=True)
+        self._fold_s2_buf[:n].copy_(torch.tensor(s2, dtype=torch.int32),
+                                    non_blocking=True)
+        self._fold_conv_tok_buf[:n].copy_(torch.tensor(conv_tok,
+                                                       dtype=torch.long),
+                                          non_blocking=True)
+        self._fold_b_cu_seqlens_long_buf[:n + 1].copy_(torch.tensor(
+            b_cu, dtype=torch.long),
+                                                       non_blocking=True)
+        nb = len(b_rows)
+        if self._fold_b_rows_buf is None or self._fold_b_rows_buf.numel() < nb:
+            self._fold_b_rows_buf = torch.zeros(max(nb,
+                                                    32 * self.max_batch_size),
+                                                dtype=torch.long,
+                                                device=dev)
+        self._fold_b_rows_buf[:nb].copy_(torch.tensor(b_rows, dtype=torch.long),
+                                         non_blocking=True)
+        tail_cu = []
+        for i in range(n):
+            tail_cu += (0, b_cu[i + 1] - b_cu[i])
+        self._fold_tail_cu_buf[:2 * n].copy_(torch.tensor(tail_cu,
+                                                          dtype=torch.long),
+                                             non_blocking=True)
+        self.fold_count = n
+        self.scan_cu_seqlens_long = self._scan_cu_seqlens_long_buf[:nseg + 1]
+        self.scan_state_indices = self._scan_state_indices_buf[:nseg]
+        self.fold_s1 = self._fold_s1_buf[:n]
+        self.fold_s2 = self._fold_s2_buf[:n]
+        self._fold_slot_aligned_buf[0, :n, 0].copy_(self.fold_s1)
+        self._fold_slot_aligned_buf[1, :n, 0].copy_(self.fold_s2)
+        self.fold_conv_tok = self._fold_conv_tok_buf[:n]
+        self.fold_b_rows = self._fold_b_rows_buf[:nb]
+        self.fold_b_cu_seqlens_long = self._fold_b_cu_seqlens_long_buf[:n + 1]
+        # Host copies for the fused bookkeeping (see the lazy properties).
+        self._fold_s1_host = s1
+        self._fold_s2_host = s2
+        self._fold_conv_tok_host = conv_tok
+        self.fold_b_ranges_host = fold_b_ranges(b_rows, b_cu)
+
     def prepare(self, attn_metadata: AttentionMetadata):
+        # The cu_seqlens buffers below are rewritten in place: drop the GDN
+        # launch path's per-iteration int32 casts of them first.
+        invalidate_int32_cu_seqlens_cache()
+        # Every iteration starts with the reset undone; the context branch below
+        # decides whether any request needs it at all.
+        self.prefill_needs_state_reset = False
+        self.state_reset_done = False
+        self.gdn_iteration_kwargs = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
@@ -489,11 +836,13 @@ class Mamba2Metadata:
                         "are used; got a different address than the first "
                         "call.")
                 self.state_indices = indices
+                self._state_indices_host_valid = False
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._state_indices_host_valid = True
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
@@ -506,9 +855,19 @@ class Mamba2Metadata:
                                     dtype=self.state_indices_cpu.dtype))
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._state_indices_host_valid = True
+
+        num_decodes = batch_size - num_contexts
+        if num_contexts > 0 and num_decodes > 0:
+            self.state_indices_decode[:num_decodes].copy_(
+                self.state_indices[num_contexts:batch_size],
+                non_blocking=True)
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
+
+        self._prepare_fold_segments(kv_cache_manager, attn_metadata, batch_size,
+                                    num_contexts)
 
         if num_contexts > 0:
             torch.cumsum(context_lens,
@@ -561,6 +920,13 @@ class Mamba2Metadata:
             # Keep a host boolean gate for chunk metadata construction.
             self.use_initial_states = bool(
                 self.has_initial_states_cpu[:num_contexts].any())
+            # Only context requests without a state need their slots zeroed;
+            # continuation chunks (the common case under prefix reuse) skip the
+            # reset launches in every GDN layer. Warmup forces the flag on so the
+            # reset kernel is compiled before the first real iteration.
+            self.prefill_needs_state_reset = bool(
+                Mamba2Metadata._warmup_force_initial_states
+                or not self.has_initial_states_cpu[:num_contexts].all())
 
             if self.use_initial_states:
                 _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,

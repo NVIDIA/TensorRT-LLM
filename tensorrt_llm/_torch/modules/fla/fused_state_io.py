@@ -11,6 +11,7 @@ intermediate buffers:
 
 - ``gather_cast_vk_to_fp32_vk``: gather pool slots by index + cast bf16->fp32.
 - ``cast_scatter_fp32_vk_to_vk``: cast fp32->bf16 + scatter back to pool slots.
+- ``copy_pool_rows``: pool[dst[i]] <- pool[src[i]] (slot-to-slot copy, one launch).
 """
 
 from typing import Optional
@@ -237,6 +238,74 @@ def cast_scatter_fp32_vk_to_vk(
         dst_stride_h=dst.stride(1),
         dst_stride_v=dst.stride(2),
         dst_stride_k=dst.stride(3),
+        BLOCK_V=block_v,
+        BLOCK_K=block_k,
+    )
+
+
+@triton.jit
+def _copy_pool_rows_kernel(
+    pool_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    stride_n,
+    stride_h,
+    stride_v,
+    stride_k,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_seq = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_vk = tl.program_id(2)
+    num_k_blocks: tl.constexpr = (K + BLOCK_K - 1) // BLOCK_K
+    pid_vb = pid_vk // num_k_blocks
+    pid_kb = pid_vk % num_k_blocks
+    src_seq = tl.load(src_indices_ptr + pid_seq).to(tl.int64)
+    dst_seq = tl.load(dst_indices_ptr + pid_seq).to(tl.int64)
+    v_offs = pid_vb * BLOCK_V + tl.arange(0, BLOCK_V)
+    k_offs = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = (v_offs < V)[:, None] & (k_offs < K)[None, :]
+    offs = pid_h * stride_h + v_offs[:, None] * stride_v + k_offs[None, :] * stride_k
+    data = tl.load(pool_ptr + src_seq * stride_n + offs, mask=mask, other=0.0)
+    tl.store(pool_ptr + dst_seq * stride_n + offs, data, mask=mask)
+
+
+def copy_pool_rows(pool: torch.Tensor, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+    """``pool[dst_indices[i]] = pool[src_indices[i]]`` for every ``i`` in one launch.
+
+    ``pool`` is the ``[slots, H, V, K]`` recurrent-state pool; the two index
+    tensors are int32/int64 of equal length and must not name the same slot as
+    both a source and a destination of different pairs. Used by the folded
+    save-last prefill to seed the terminal slot S2 with the snapshot in S1 so
+    the tail scan can run on S2 in place (indexed pool I/O, one launch) instead
+    of gathering S1 and scattering into S2 around the kernel.
+    """
+    assert pool.dim() == 4, f"pool must be 4D, got {pool.shape}"
+    assert src_indices.shape == dst_indices.shape and src_indices.dim() == 1, (
+        f"index shapes {tuple(src_indices.shape)} vs {tuple(dst_indices.shape)}"
+    )
+    n = src_indices.shape[0]
+    if n == 0:
+        return
+    _, h, v, k = pool.shape
+    block_v = min(v, 128)
+    block_k = min(k, 128)
+    grid = (n, h, triton.cdiv(v, block_v) * triton.cdiv(k, block_k))
+    _copy_pool_rows_kernel[grid](
+        pool,
+        src_indices,
+        dst_indices,
+        H=h,
+        V=v,
+        K=k,
+        stride_n=pool.stride(0),
+        stride_h=pool.stride(1),
+        stride_v=pool.stride(2),
+        stride_k=pool.stride(3),
         BLOCK_V=block_v,
         BLOCK_K=block_k,
     )
