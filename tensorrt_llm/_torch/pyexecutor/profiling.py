@@ -705,6 +705,16 @@ class PyExecutorProfileManager:
         # method-name lookup per iteration.
         activities_from_names = self._activities_from_names
 
+        _kv_stats_every = max(1, int(os.environ.get("TLLM_ITER_LOG_KV_STATS_EVERY", "1") or 1))
+        _kv_stats_cache = {"iter": -1, "stats": None}
+
+        def _iteration_kv_stats(executor):
+            it = executor.iter_counter
+            if _kv_stats_cache["stats"] is None or it - _kv_stats_cache["iter"] >= _kv_stats_every:
+                _kv_stats_cache["stats"] = executor.kv_cache_manager.get_kv_cache_stats()
+                _kv_stats_cache["iter"] = it
+            return _kv_stats_cache["stats"]
+
         def profile_step_fn():
             nonlocal it, enabled, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
@@ -791,7 +801,11 @@ class PyExecutorProfileManager:
                     kv_util_str = "N/A"
                     kv_reuse_str = ""
                     if executor.kv_cache_manager is not None:
-                        kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
+                        # The v2 manager assembles these stats in Python (per pool group); at
+                        # one call per iteration that is measurable host time on the executor
+                        # thread, so TLLM_ITER_LOG_KV_STATS_EVERY=N refreshes them every N
+                        # iterations and repeats the last value in between (default 1).
+                        kv_stats = _iteration_kv_stats(executor)
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = (
                                 f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"

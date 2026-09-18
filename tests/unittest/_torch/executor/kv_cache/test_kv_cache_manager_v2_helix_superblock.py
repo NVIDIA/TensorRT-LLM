@@ -240,6 +240,65 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
     assert resizes == [(100, 54)]
 
 
+def test_update_resources_lazy_history_waits_for_a_block_boundary() -> None:
+    """With TRTLLM_KV_V2_LAZY_HISTORY_RESIZE the per-step resize that only moves the history
+    within its current block is skipped; a block crossing, a capacity change, or a finishing
+    request still goes through, and the first step after a capacity-setting path always does."""
+    resizes = []
+
+    def resize(cap, hist):
+        resizes.append((cap, hist))
+        return True
+
+    kv = SimpleNamespace(is_active=True, capacity=4096, resize=resize)
+    req = SimpleNamespace(
+        py_request_id=7,
+        py_rewind_len=0,
+        py_num_accepted_draft_tokens=0,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        max_beam_num_tokens=100,
+    )
+    mgr = SimpleNamespace(
+        is_draft=True,
+        _kv_reserve_draft_tokens=0,
+        _allocated_draft_lens={},
+        kv_cache_map={7: kv},
+        kv_compression_manages_history=False,
+        _has_cp_helix=False,
+        _lazy_history_resize=True,
+        _last_history_resize={},
+        tokens_per_block=32,
+        _history_resize_can_wait=lambda *a: KVCacheManagerV2._history_resize_can_wait(mgr, *a),
+    )
+    batch = SimpleNamespace(generation_requests=[req])
+
+    KVCacheManagerV2.update_resources(mgr, batch)  # first step: no record yet -> resize
+    assert resizes == [(4096, 99)]
+    for tokens in (101, 102, 128):  # history 100..127 stays in block 3 (96..127)
+        req.max_beam_num_tokens = tokens
+        KVCacheManagerV2.update_resources(mgr, batch)
+    assert resizes == [(4096, 99)]
+    req.max_beam_num_tokens = 129  # history 128 opens block 4 -> resize
+    KVCacheManagerV2.update_resources(mgr, batch)
+    assert resizes == [(4096, 99), (4096, 128)]
+    req.max_beam_num_tokens = 130
+    kv.capacity = 4128  # the scheduler grew the cache: a capacity change always goes through
+    req.py_rewind_len = 32
+    KVCacheManagerV2.update_resources(mgr, batch)
+    assert resizes[-1] == (4096, 129)
+    req.py_rewind_len = 0
+    req.max_beam_num_tokens = 131
+    req.state = LlmRequestState.GENERATION_COMPLETE  # finishing: history must be current
+    KVCacheManagerV2.update_resources(mgr, batch)
+    assert resizes[-1] == (None, 130)
+    # the knob off keeps every step's resize
+    mgr._lazy_history_resize = False
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.max_beam_num_tokens = 132
+    KVCacheManagerV2.update_resources(mgr, batch)
+    assert resizes[-1] == (4128, 131)
+
+
 def test_helix_quota_fallback_sets_rank_local_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fraction sizing must set max_gpu_total_bytes (rank-local byte cap),
     not max_tokens, which the manager inflates by 1/max_util_for_resume."""
