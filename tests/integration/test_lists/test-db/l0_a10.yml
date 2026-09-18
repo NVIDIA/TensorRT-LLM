@@ -43,6 +43,7 @@ l0_a10:
   - unittest/_torch/executor/test_kv_connector_v2_prefix_real_manager.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/executor/test_resource_manager.py
+  - unittest/_torch/executor/test_seq_slot_sizing.py
   - unittest/_torch/executor/test_profile_endpoints.py
   - unittest/_torch/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
@@ -133,6 +134,7 @@ l0_a10:
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
+  - unittest/_torch/visual_gen/test_qwen_image_pipeline_config.py
   # llmapi
   - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_llm_args.py
