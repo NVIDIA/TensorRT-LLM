@@ -389,8 +389,8 @@ static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThread
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 
 static constexpr int BlockKernelMaxNumTokens = 4;
-static constexpr int DynBlockKernelMaxNumTokens = 16;
-static constexpr int DynBlockKernelMaxNumExperts = 256;
+static constexpr int DynBlockKernelMaxNumTokens = 32;
+static constexpr int DynBlockKernelMaxNumExperts = 512;
 // For the Renormalize policy (None + Softmax) the classic block kernel is faster through
 // the 512-expert tier, so the cooperative kernel is only preferred from this tier up.
 // Every other policy is excluded from this bound; see prefersCoopBlockKernel().

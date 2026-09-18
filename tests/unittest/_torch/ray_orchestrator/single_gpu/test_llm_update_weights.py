@@ -227,24 +227,41 @@ def test_llm_update_weights(model_dir):
 
 @skip_pre_hopper
 @pytest.mark.parametrize(
-    "model_dir",
+    "model_dir,moe_backend",
     [
-        "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "Qwen3/Qwen3-0.6B",
-        "Qwen3/Qwen3-8B",
-        "Qwen3/Qwen3-30B-A3B",
-        "Qwen3/Qwen3-8B-FP8",
-        "Qwen3/Qwen3-30B-A3B-FP8",
+        pytest.param(
+            "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+            None,
+            id="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        ),
+        pytest.param("Qwen3/Qwen3-8B", None, id="Qwen3/Qwen3-8B"),
+        pytest.param("Qwen3/Qwen3-30B-A3B", None, id="Qwen3/Qwen3-30B-A3B"),
+        pytest.param("Qwen3/Qwen3-8B-FP8", None, id="Qwen3/Qwen3-8B-FP8"),
+        pytest.param("Qwen3/Qwen3-30B-A3B-FP8", None, id="Qwen3/Qwen3-30B-A3B-FP8"),
+        # Regression coverage for bucketed refit with the BF16 CuteDsl MoE quant
+        # method, whose FC1 gate/up interleave is deferred to finalize because it
+        # is not an involution (a down_proj-only bucket after the gate_up bucket
+        # used to re-interleave and scramble FC1). BF16 CuteDsl requires SM107.
+        pytest.param(
+            "Qwen3/Qwen3-30B-A3B",
+            "CUTEDSL",
+            id="Qwen3/Qwen3-30B-A3B-CUTEDSL",
+            marks=pytest.mark.skipif(
+                getSMVersion() != 107, reason="BF16 CuteDsl MoE requires SM107"
+            ),
+        ),
     ],
 )
 @pytest.mark.part1
-def test_llm_partial_update_weights(model_dir):
+def test_llm_partial_update_weights(model_dir, moe_backend):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
+    if moe_backend is None:
+        moe_backend = "DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS"
+    moe_config = MoeConfig(backend=moe_backend)
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",

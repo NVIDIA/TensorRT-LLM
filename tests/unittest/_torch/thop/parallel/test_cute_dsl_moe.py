@@ -2309,18 +2309,28 @@ def test_locality_domain_concurrent_tunable_runner_delegates_and_launches_all_pa
 
 
 @pytest.mark.parametrize(
-    "runner_name,num_inputs,output_idx,tile_sizes",
+    "runner_name,non_ugpu_num_inputs,ugpu_num_inputs,output_idx,tile_sizes",
     [
-        ("CuteDslFusedMoENvfp4Runner", 5, 4, [128, 256, 512]),
-        ("CuteDslFusedMoEBF16Runner", 4, 3, [64, 128, 256]),
+        ("CuteDslFusedMoENvfp4Runner", 6, 5, 4, [128, 256, 512]),
+        ("CuteDslFusedMoEBF16Runner", 4, 4, 3, [64, 128, 256]),
     ],
 )
-def test_locality_domain_outer_preparation_disables_memset_overlap(
+@pytest.mark.parametrize(
+    "workload_identity,expected_memset_overlap",
+    [
+        pytest.param(None, None, id="plain"),
+        pytest.param(("locality_domain",), False, id="locality-domain"),
+    ],
+)
+def test_outer_preparation_primes_all_tile_sizes(
     monkeypatch,
     runner_name: str,
-    num_inputs: int,
+    non_ugpu_num_inputs: int,
+    ugpu_num_inputs: int,
     output_idx: int,
     tile_sizes: list[int],
+    workload_identity: tuple[str, ...] | None,
+    expected_memset_overlap: bool | None,
 ):
     from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
 
@@ -2338,8 +2348,9 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         top_k=1,
         num_local_experts=1,
         local_expert_offset=0,
-        workload_identity=("locality_domain",),
+        workload_identity=workload_identity,
     )
+    num_inputs = non_ugpu_num_inputs if workload_identity is None else ugpu_num_inputs
     inputs = [torch.empty(0) for _ in range(num_inputs)]
 
     result = runner(inputs, tactic=-1, do_preparation=True)
@@ -2349,7 +2360,10 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
     for args, kwargs in preparation_calls:
         assert args == tuple(inputs)
         assert kwargs["enable_alltoall"] is False
-        assert kwargs["overlap_moe_output_memset"] is False
+        if expected_memset_overlap is None:
+            assert "overlap_moe_output_memset" not in kwargs
+        else:
+            assert kwargs["overlap_moe_output_memset"] is expected_memset_overlap
 
 
 def _cute_dsl_eligibility(**deployment_kwargs):

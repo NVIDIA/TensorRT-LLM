@@ -443,17 +443,17 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 tactic: Optional[int],
                 do_preparation: bool = False) -> torch.Tensor:
         if do_preparation:
-            if self.workload_identity is not None:
-                # Inner FC tuning cannot run from inside the CUDA graph used to
-                # profile an outer tile. Prime every tile's FC1/FC2 cache for
-                # this optimization profile before outer profiling starts.
-                for tile_size in self._tile_sizes():
-                    self.forward_impl(
-                        *inputs,
-                        enable_alltoall=self.enable_alltoall,
-                        tile_size=tile_size,
-                        overlap_moe_output_memset=False,
-                    )
+            # Inner FC tuning cannot run from inside the CUDA graph used to
+            # profile an outer tile. Prime every tile's FC1/FC2 cache for this
+            # optimization profile before outer profiling starts.
+            for tile_size in self._tile_sizes():
+                preparation_kwargs = {
+                    "enable_alltoall": self.enable_alltoall,
+                    "tile_size": tile_size,
+                }
+                if self.workload_identity is not None:
+                    preparation_kwargs["overlap_moe_output_memset"] = False
+                self.forward_impl(*inputs, **preparation_kwargs)
             return inputs[4]
 
         if isinstance(tactic, int) and tactic > 0:
@@ -585,6 +585,12 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
 
     @staticmethod
     def _tile_sizes() -> List[int]:
+        # tile_size=64 was temporarily excluded while the finalize kernel
+        # corrupted results at that tile; root cause (missing
+        # cp.async.bulk_commit_group/wait_group drain of the single-stage sC
+        # staging buffer before the next work unit's overwrite) is fixed in
+        # rubin_contiguous_grouped_gemm_finalize_fusion.py, so 64 is back:
+        # it is the fastest tile for small decode buckets.
         return [64, 128, 256]
 
     def get_tuning_config(self) -> TuningConfig:
@@ -615,16 +621,16 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
                 tactic: Optional[int],
                 do_preparation: bool = False) -> torch.Tensor:
         if do_preparation:
-            if self.workload_identity is not None:
-                # See the NVFP4 runner: nested FC tuning must complete before
-                # the outer tile is profiled under CUDA graph capture.
-                for tile_size in self._tile_sizes():
-                    self.forward_impl(
-                        *inputs,
-                        enable_alltoall=self.enable_alltoall,
-                        tile_size=tile_size,
-                        overlap_moe_output_memset=False,
-                    )
+            # See the NVFP4 runner: nested FC tuning must complete before the
+            # outer tile is profiled under CUDA graph capture.
+            for tile_size in self._tile_sizes():
+                preparation_kwargs = {
+                    "enable_alltoall": self.enable_alltoall,
+                    "tile_size": tile_size,
+                }
+                if self.workload_identity is not None:
+                    preparation_kwargs["overlap_moe_output_memset"] = False
+                self.forward_impl(*inputs, **preparation_kwargs)
             return inputs[3]
 
         if isinstance(tactic, int) and tactic > 0:
@@ -1514,6 +1520,24 @@ class CuteDslFusedMoE(MoEImplBase):
             )
         return moe_output
 
+    def _mxfp8_fused_fc12_swiglu_limit(self) -> float:
+        """SwiGLU clamp for the fused FC12 kernel: -1.0 (disabled) unless the
+        module carries an ``act_clamp`` activation constant. main stores the
+        constant as a tensor slot next to the weights (activation.py), so read
+        it once and cache the scalar instead of syncing on every call."""
+        cached = getattr(self, "_fc12_swiglu_limit_cache", None)
+        if cached is not None:
+            return cached
+        act_clamp = getattr(self, "act_clamp", None)
+        limit = -1.0
+        if act_clamp is not None:
+            value = float(act_clamp.reshape(-1)[0]) if torch.is_tensor(
+                act_clamp) else float(act_clamp)
+            if value != float("inf"):
+                limit = value
+        self._fc12_swiglu_limit_cache = limit
+        return limit
+
     def _mxfp8_fused_fc12_constants(
             self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the (per-expert alpha, FC1 norm const) inputs of the kernel.
@@ -1664,8 +1688,7 @@ class CuteDslFusedMoE(MoEImplBase):
             torch.uint8)
         fc2_weight_scale = self.quant_scales.fc2_weight_block_scale.view(
             torch.uint8)
-        swiglu_limit = (self.swiglu_limit_scalar
-                        if self.swiglu_limit_scalar != float("inf") else -1.0)
+        swiglu_limit = self._mxfp8_fused_fc12_swiglu_limit()
 
         torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
             input=x,

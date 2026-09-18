@@ -1004,6 +1004,10 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(384, 8, 7168, 2048),  # Kimi-K2
+    # Qwen3.5-397B expert count / top-k at a small hidden size: covers the
+    # 512-expert tier of the post-topK routing sort (single-block kernel
+    # for <= 16 tokens, cluster kernel above) used by the CuteDSL backend.
+    MoeModelConfig(512, 10, 512, 256),
     # === Boundary Tests: num_experts / top_k ===
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
     MoeModelConfig(7, 2, 256, 512),  # prime num_experts

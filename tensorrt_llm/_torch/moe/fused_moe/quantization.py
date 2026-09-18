@@ -825,7 +825,23 @@ class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
     for the fused gather + grouped GEMM + SwiGLU kernel. The SwiGLU fusion
     requires gate/up weights to be interleaved with granularity=32 along
     the intermediate dimension (dim=1).
+
+    The interleave is deferred to ``process_weights_after_loading`` (mirroring
+    ``BF16TRTLLMGenFusedMoEMethod``'s pending-flag pattern) instead of being
+    applied inside ``load_expert_w3_w1_weight``, because the interleave
+    permutation is NOT an involution and the loader may invoke
+    ``load_expert_w3_w1_weight`` multiple times per module: under partial
+    loading (e.g. the RLHF refit path, which streams weights bucket by
+    bucket) every bucket that touches the module calls it for every local
+    expert, so a down_proj-only bucket arriving after the gate_up bucket
+    would re-interleave the already-interleaved FC1 buffer and scramble it.
     """
+
+    def create_weights(self, module: torch.nn.Module):
+        super().create_weights(module)
+        # Armed only when FC1 bytes are actually staged; cleared once the
+        # interleave has been applied so repeated finalize calls are no-ops.
+        module._cute_dsl_interleave_pending = False
 
     def load_expert_w3_w1_weight(
         self,
@@ -835,6 +851,11 @@ class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
         dst_w3_w1_weight: torch.Tensor,
         allow_partial_loading: bool = False,
     ) -> None:
+        # Stage the plain [w3(up), w1(gate)] concat only; the gate/up
+        # interleave is deferred to process_weights_after_loading (see class
+        # docstring for why). Only arm the deferred transform when FC1 bytes
+        # actually arrive: a down_proj-only bucket passes w1=w3=None and must
+        # not trigger a re-interleave of previously finalized weights.
         super().load_expert_w3_w1_weight(
             module,
             w1_weight,
@@ -842,14 +863,59 @@ class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
             dst_w3_w1_weight,
             allow_partial_loading,
         )
-        # Interleave gate/up weights for GEMM + SwiGLU fusion.
-        # Per-expert weight layout after super(): [w3(up), w1(gate)] along dim=0.
-        # interleave produces [up_0:32, gate_0:32, up_32:64, gate_32:64, ...].
+        if w1_weight is not None or w3_weight is not None:
+            module._cute_dsl_interleave_pending = True
+
+    @staticmethod
+    def _interleave_w3_w1_weight(dst_w3_w1_weight: torch.Tensor):
+        """Interleave gate/up weights for GEMM + SwiGLU fusion.
+
+        Per-expert weight layout before: [w3(up), w1(gate)] along dim=0.
+        interleave produces [up_0:32, gate_0:32, up_32:64, gate_32:64, ...].
+        """
         w3_w1 = dst_w3_w1_weight.cuda()
         w3_w1_interleaved = interleave_linear_and_gate(w3_w1,
                                                        group_size=32,
                                                        dim=0)
         dst_w3_w1_weight.copy_(w3_w1_interleaved)
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        # Apply the deferred FC1 interleave exactly once per load/refit
+        # sequence. The pending flag both skips modules whose FC1 was never
+        # (re)staged and keeps repeated finalize calls (the RLHF finalize
+        # walk invokes process_weights_after_loading AND post_load_weights)
+        # from double-interleaving, which would scramble the weights since
+        # the permutation is not an involution.
+        if not getattr(module, "_cute_dsl_interleave_pending", False):
+            return
+        module._cute_dsl_interleave_pending = False
+        if module.w3_w1_weight.numel() == 0:
+            return
+        for expert_idx in range(module.w3_w1_weight.data.shape[0]):
+            self._interleave_w3_w1_weight(module.w3_w1_weight.data[expert_idx])
+
+    def _prepare_shared_weights_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        # The shared (host) w3_w1 tensors for online EPLB are staged plain by
+        # load_expert_w3_w1_weight as well. Interleave them here — exactly
+        # once, since the base finalization deletes the tensors afterwards —
+        # so experts migrated into a slot land in the layout the fused CuteDsl
+        # kernel expects (same rationale as NVFP4CuteDslFusedMoEMethod).
+        super()._prepare_shared_weights_for_finalization(module)
+        shared = getattr(module, 'local_shared_w3_w1_tensors', None)
+        if shared is None:
+            return
+        for expert_idx in range(shared.shape[0]):
+            self._interleave_w3_w1_weight(shared[expert_idx])
+
+    def transform_weights(self, module: torch.nn.Module) -> None:
+        # Partial-loading callers (e.g. RLHF refit) skip the eager
+        # process_weights_after_loading call in load_weights, so apply the
+        # deferred interleave here before the base class finalizes shared
+        # weights. Idempotent via the pending flag.
+        if getattr(module, "_cute_dsl_interleave_pending", False):
+            self.process_weights_after_loading(module)
+        super().transform_weights(module)
 
 
 class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):

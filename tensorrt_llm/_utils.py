@@ -753,10 +753,19 @@ def is_flashinfer_gdn_supported_arch(sm_version=None):
     for Hopper (SM90) and datacenter Blackwell (SM100/SM103). On consumer
     Blackwell (SM120) and other architectures the kernels abort at launch, so
     callers must fall back to the vendored Triton kernels.
+
+    Rubin (SM107) dispatches into FlashInfer's SM100 CuTe-DSL kernels
+    (arch_major == 10), validated on VR200 via micro-benchmarks (DSL compile,
+    numerics vs fp32 reference, latency): chunk-prefill 2.73x vs the vendored
+    Triton chain and bf16-state decode 1.19x, both at reference parity. The
+    MTP verify kernel is not yet benchmarked on SM107 — disable it via
+    TRTLLM_FLA_DISABLE_FLASHINFER_GDN_VERIFY=1 when enabling speculative
+    decoding on Rubin. Per-path opt-outs: TLLM_USE_FLASHINFER_GDN_PREFILL=0,
+    TRTLLM_FLA_DISABLE_FLASHINFER_GDN=1.
     """
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version in (90, 100, 103)
+    return sm_version in (90, 100, 103, 107)
 
 
 def print_all_stacks():

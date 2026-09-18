@@ -16550,16 +16550,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           device=fc1_sfa.device)
                     # Per-launch zeroed workspaces: FC1->FC2 readiness counters
                     # (one per 128-row M tile is an upper bound for every tile
-                    # geometry) and the two L2-atomic work-ID counters.
-                    fc1_ready = torch.zeros(m // 128,
+                    # geometry) and the two L2-atomic work-ID counters. One
+                    # allocation + one fill kernel for all three (they used to
+                    # be three fill launches on the MoE critical path); the
+                    # counters sit on their own 128 B lines so the hot atomics
+                    # do not share a line with the readiness flags.
+                    num_ready = m // 128
+                    ready_words = (num_ready + 31) // 32 * 32
+                    workspace = torch.zeros(ready_words + 64,
                                             dtype=torch.int32,
                                             device=fc1_a.device)
-                    fc1_scheduler_counter = torch.zeros(1,
-                                                        dtype=torch.int32,
-                                                        device=fc1_a.device)
-                    fc2_scheduler_counter = torch.zeros(1,
-                                                        dtype=torch.int32,
-                                                        device=fc1_a.device)
+                    fc1_ready = workspace[:num_ready]
+                    fc1_scheduler_counter = workspace[ready_words:ready_words +
+                                                      1]
+                    fc2_scheduler_counter = workspace[ready_words +
+                                                      32:ready_words + 33]
 
                     def _e4m3_ptr(t):
                         return make_ptr(cutlass.Float8E4M3FN,
@@ -17059,19 +17064,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_inst_k = 16
 
                 # BF16 (no B-reuse): CTA tile M must equal tile_size.
-                # cluster_shape_mn is always (max(1, tile_size//128), 1).
+                # cluster_m is fixed at max(1, tile_size//128): m-tiles of a
+                # grouped GEMM may belong to different experts, so B TMA
+                # multicast across additional cluster_m CTAs is invalid
+                # (verified numerically wrong). cluster_n > 1 is group-safe
+                # (the paired CTAs share the same m-tile/expert) and
+                # multicasts the A (fc1 activation) load, which pays off for
+                # the short-K FC2 GEMM: on Qwen3.5 CTX shapes
+                # (M~41k/N=4096/K=1024, SM107) cluster (1, 2) with mma_n=256
+                # is ~12% faster than cluster (1, 1).
                 mma_n_candidates = [128, 256]
                 raster_along_m_candidates = [False]
+                cluster_n_candidates = [1, 2]
 
                 mma_m = self.tile_size
-                cluster_shape_mn = (max(1, self.tile_size // 128), 1)
+                cluster_m = max(1, self.tile_size // 128)
 
                 valid_tactics = []
-                for mma_n, raster_along_m in (itertools.product(
-                        mma_n_candidates, raster_along_m_candidates)):
+                for mma_n, cluster_n, raster_along_m in (itertools.product(
+                        mma_n_candidates, cluster_n_candidates,
+                        raster_along_m_candidates)):
 
                     mma_tiler = (mma_m, mma_n, mma_tiler_k)
                     mma_inst_shape = (mma_m, mma_n, mma_inst_k)
+                    cluster_shape_mn = (cluster_m, cluster_n)
+
+                    # cluster_n multicast requires an even number of n-tiles
+                    # so that every cluster pair works on valid tiles.
+                    if cluster_n > 1 and (math.ceil(n / mma_n) % cluster_n
+                                          != 0):
+                        continue
 
                     if self.__class__.kernel_class.can_implement(
                             a_dtype=ab_dtype,

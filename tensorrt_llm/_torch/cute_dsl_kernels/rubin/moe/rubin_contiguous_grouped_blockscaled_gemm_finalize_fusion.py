@@ -1654,7 +1654,10 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                                 sC[sC_row, None, 0],
                                 cutlass.Int32(self.copy_size),
                             )
-
+                # The blk_reduce_* helpers issue cp.reduce.async.bulk (bulk_group)
+                # reads of sC. sC is single-stage and is overwritten by the next work
+                # unit's R2S stores right after this barrier. Drain the async
+                # bulk-group reads before releasing the threads.
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()
