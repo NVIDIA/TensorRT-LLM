@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for OpenSearchDB.queryFromOpenSearchDB resilience.
+"""Tests for OpenSearchDB query and post resilience.
 
 All HTTP requests are mocked — no real network calls are made.
 
@@ -47,6 +47,7 @@ class MockResponse:
 
 FAKE_URL = "https://fake-opensearch.example.com"
 VALID_PROJECT = open_search_db.JOB_PROJECT_NAME  # in READ_ACCESS list
+VALID_POST_PROJECT = open_search_db.PERF_SANITY_PROJECT_NAME
 SANDBOX_PROJECT = "sandbox-test-project"
 
 # Log tag used in structured log output
@@ -58,9 +59,168 @@ def _patch_env():
     """Ensure every test has a fake base URL and no real sleep."""
     with (
         patch.object(open_search_db, "OPEN_SEARCH_DB_BASE_URL", FAKE_URL),
+        patch.object(open_search_db, "OPEN_SEARCH_DB_USERNAME", "test-user"),
+        patch.object(open_search_db, "OPEN_SEARCH_DB_PASSWORD", "test-password"),
         patch("open_search_db.time.sleep"),
     ):
         yield
+
+
+# ---------------------------------------------------------------------------
+# POST resilience
+# ---------------------------------------------------------------------------
+class TestPostPreValidation:
+    @patch("open_search_db.requests.post")
+    def test_local_bypass_precedes_all_validation(self, mock_post):
+        unserializable = {"flat_payload": {"bad": object()}}
+        with (
+            patch.object(open_search_db, "DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST", True),
+            patch.object(open_search_db, "OPEN_SEARCH_DB_BASE_URL", ""),
+            patch.object(open_search_db, "OPEN_SEARCH_DB_USERNAME", ""),
+            patch.object(open_search_db, "OPEN_SEARCH_DB_PASSWORD", ""),
+        ):
+            result = OpenSearchDB.postToOpenSearchDB(unserializable, "not-writeable")
+        assert result is True
+        mock_post.assert_not_called()
+
+    @patch("open_search_db.requests.post")
+    @patch.object(open_search_db, "OPEN_SEARCH_DB_BASE_URL", "")
+    def test_empty_base_url_returns_false(self, mock_post):
+        result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
+        assert result is False
+        mock_post.assert_not_called()
+
+    @patch("open_search_db.requests.post")
+    @patch.object(open_search_db, "OPEN_SEARCH_DB_USERNAME", "")
+    def test_missing_credentials_returns_false(self, mock_post):
+        result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
+        assert result is False
+        mock_post.assert_not_called()
+
+    @patch("open_search_db.requests.post")
+    def test_project_without_write_access_returns_false(self, mock_post):
+        result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_PROJECT)
+        assert result is False
+        mock_post.assert_not_called()
+
+    @patch("open_search_db.requests.post")
+    def test_type_check_failure_returns_false(self, mock_post):
+        result = OpenSearchDB.postToOpenSearchDB({"unknown_key": "test"}, VALID_POST_PROJECT)
+        assert result is False
+        mock_post.assert_not_called()
+
+
+class TestPostSerializationAndSuccess:
+    @patch("open_search_db.requests.post")
+    def test_serialization_failure_returns_false(self, mock_post, caplog):
+        import logging
+
+        body = {"flat_payload": {"bad": object()}}
+        with caplog.at_level(logging.INFO):
+            result = OpenSearchDB.postToOpenSearchDB(body, VALID_POST_PROJECT)
+        assert result is False
+        mock_post.assert_not_called()
+        assert f"{_TAG}[ERROR]" in caplog.text
+        assert "cat=serialize" in caplog.text
+
+    @pytest.mark.parametrize("status_code", [200, 201, 202])
+    @patch("open_search_db.requests.post")
+    def test_success_serializes_payload_and_returns_true(self, mock_post, status_code):
+        mock_post.return_value = MockResponse(status_code)
+        body = {"s_name": "test", "l_count": 1}
+        result = OpenSearchDB.postToOpenSearchDB(body, VALID_POST_PROJECT)
+        assert result is True
+        mock_post.assert_called_once()
+        request = mock_post.call_args.kwargs
+        assert request["url"] == f"{FAKE_URL}/dataflow2/{VALID_POST_PROJECT}/posting"
+        assert json.loads(request["data"]) == body
+        assert request["headers"]["Content-Type"] == "application/json"
+        assert request["timeout"] == open_search_db.POST_TIMEOUT_SECONDS
+        assert "auth" in request
+
+
+class TestPostRetryBehavior:
+    @pytest.mark.parametrize("status_code", [400, 418])
+    @patch("open_search_db.requests.post")
+    def test_non_retryable_status_fails_immediately(self, mock_post, status_code, caplog):
+        import logging
+
+        mock_post.return_value = MockResponse(status_code, text="client error")
+        with caplog.at_level(logging.INFO):
+            result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
+        assert result is False
+        assert mock_post.call_count == 1
+        open_search_db.time.sleep.assert_not_called()
+        assert "cat=non_retryable" in caplog.text
+        assert f"status={status_code}" in caplog.text
+
+    @patch("open_search_db.requests.post")
+    def test_retryable_status_then_success(self, mock_post, caplog):
+        import logging
+
+        mock_post.side_effect = [
+            MockResponse(503, text="unavailable"),
+            MockResponse(200),
+        ]
+        with caplog.at_level(logging.INFO):
+            result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
+        assert result is True
+        assert mock_post.call_count == 2
+        open_search_db.time.sleep.assert_called_once_with(2)
+        assert "cat=transient" in caplog.text
+
+    @patch("open_search_db.requests.post")
+    def test_network_exception_then_success(self, mock_post, caplog):
+        import logging
+
+        import requests as req
+
+        mock_post.side_effect = [
+            req.exceptions.ConnectionError("connection refused"),
+            MockResponse(200),
+        ]
+        with caplog.at_level(logging.INFO):
+            result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
+        assert result is True
+        assert mock_post.call_count == 2
+        open_search_db.time.sleep.assert_called_once_with(2)
+        assert "cat=network" in caplog.text
+        assert "ConnectionError" in caplog.text
+
+    @patch("open_search_db.requests.post")
+    def test_retryable_status_exhaustion_returns_false(self, mock_post, caplog):
+        import logging
+
+        mock_post.return_value = MockResponse(503, text="unavailable")
+        with caplog.at_level(logging.INFO):
+            result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
+        assert result is False
+        assert mock_post.call_count == DEFAULT_RETRY_COUNT
+        assert open_search_db.time.sleep.call_args_list == [
+            call(2),
+            call(4),
+            call(6),
+            call(8),
+        ]
+        transient_records = [
+            record for record in caplog.records if "cat=transient" in record.getMessage()
+        ]
+        assert len(transient_records) == DEFAULT_RETRY_COUNT - 1
+        assert "cat=exhausted" in caplog.text
+
+    @patch("open_search_db.requests.post")
+    def test_network_exception_exhaustion_returns_false(self, mock_post, caplog):
+        import logging
+
+        import requests as req
+
+        mock_post.side_effect = req.exceptions.Timeout("timed out")
+        with caplog.at_level(logging.INFO):
+            result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
+        assert result is False
+        assert mock_post.call_count == DEFAULT_RETRY_COUNT
+        assert "cat=network" in caplog.text
+        assert "cat=exhausted" in caplog.text
 
 
 # ---------------------------------------------------------------------------
