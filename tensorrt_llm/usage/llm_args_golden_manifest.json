@@ -392,9 +392,7 @@
       "path": "enable_tokenization_cache"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "encode_only"
     },
