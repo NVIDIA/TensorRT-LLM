@@ -220,7 +220,11 @@ An absent/rejected AI reply remains without a verdict, never a semantic pass.
 The `Semantic conflict with target branch` Check starts neutral. Stale results
 become neutral when the PR event or hourly scan observes a version change.
 The verifier checks the bot identity, most recent trusted request, exact revision
-record, and GitHub merge base. PASS becomes success; FAIL makes the Check and
+record, and GitHub merge base. Publication and preview select the newest applicable
+reply after that request; delayed events cannot restore an older verdict, and
+pending manual retries cannot reuse an earlier PASS. Before deployment, the preview
+also accepts manual evaluations when no trusted request exists for the pair.
+PASS becomes success; FAIL makes the Check and
 publishing job red; Inconclusive remains neutral. A successful request job only
 means orchestration succeeded. Checks on the actual merge SHA use the distinct
 `Semantic conflict audit (post-merge)` name, with a receipt linking the analysis

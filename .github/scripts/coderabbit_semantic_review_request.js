@@ -87,7 +87,7 @@ async function requestOne({github, context, core, number, manual, now}) {
     if (!pair.merged || reusable.merged || !result || result.verdict !== 'INCONCLUSIVE') {
       await ensureCheck('This version already has an analysis request.');
       if (result) await publish({github, core, context: {...context, eventName: 'issue_comment',
-        payload: {issue: {number}, comment: {id: result.comment.id}}}});
+        payload: {issue: {number}}}});
       core.info(`PR #${number}: reusing the exact revision pair.`);
       return;
     }
