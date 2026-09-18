@@ -186,6 +186,17 @@ class CUDAGraphRunner:
         self._capture_allowed = False
         self.is_warmup_only = False
 
+        # Attention-DP padding hint: the per-rank ``(can_run_cuda_graph,
+        # batch_size, sample_tier)`` rows that ``_get_padded_batch`` otherwise
+        # gathers itself. The executor stashes them when its packed
+        # post-schedule exchange (TLLM_ADP_PACKED_SYNC) already carried the
+        # values; the next ``_get_padded_batch`` pops the hint instead of
+        # gathering. Set and cleared only by rank-uniform executor code, so on
+        # any rank the runner either has a hint or gathers -- never a mix.
+        # Callers outside the executor loop (warmup, KV-cache estimation,
+        # drafters) never see one and gather exactly as before.
+        self._adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
+
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
         runtime_draft_token_buffer_width = (
@@ -862,6 +873,19 @@ class CUDAGraphRunner:
         """
         return min(self.max_supported_batch_size, self.config.batch_size)
 
+    def set_adp_graph_batch_hint(self, hint: List[Tuple[bool, int,
+                                                        int]]) -> None:
+        """Stash the per-rank ``(can_run_cuda_graph, batch_size, tier)`` rows.
+
+        Overwrites any previous hint. Must be called identically on every
+        attention-DP rank (see ``_adp_graph_batch_hint``).
+        """
+        self._adp_graph_batch_hint = hint
+
+    def clear_adp_graph_batch_hint(self) -> None:
+        """Drop an unconsumed hint (no-op when none is set)."""
+        self._adp_graph_batch_hint = None
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
@@ -895,8 +919,14 @@ class CUDAGraphRunner:
             # is unused here. It is still sent so both per-iteration exchanges
             # share one fixed-size payload, and a constant keeps this path from
             # resolving a tier for a batch it is about to change.
-            graph_batch_info = self._gather_adp_graph_batch_info(
-                batch, can_run_cuda_graph, SampleType.FULL)
+            # Stash contract (TLLM_ADP_PACKED_SYNC): use the executor's hint if
+            # present, otherwise perform the gather. The hint is popped so it
+            # can never be reused by a later forward.
+            graph_batch_info = getattr(self, "_adp_graph_batch_hint", None)
+            self._adp_graph_batch_hint = None
+            if graph_batch_info is None:
+                graph_batch_info = self._gather_adp_graph_batch_info(
+                    batch, can_run_cuda_graph, SampleType.FULL)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             if all_can_run_cuda_graph:

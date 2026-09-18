@@ -24,6 +24,8 @@ from typing import Optional
 
 import torch
 
+from . import logprobs_triton
+
 
 @dataclass(kw_only=True)
 class StrategyMetadata:
@@ -198,53 +200,28 @@ def occurrence_penalized_logits(
 
 
 class Fusions:
-    @staticmethod
-    @torch.compile(dynamic=None, fullgraph=True)
-    def _determine_sampled_rank_impl(
-        group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
-    ) -> torch.Tensor:
-        sampled_rank_cuda = (
-            group_logprobs_cuda.greater(sampled_logprobs_cuda).count_nonzero(dim=-1).to(torch.int32)
-        )
-        return sampled_rank_cuda
+    # NB: determine_sampled_rank / gather_log_softmax_with_output used to be
+    #     Inductor-compiled (log_softmax with online_softmax=True,
+    #     split_reductions=False). Inductor emits one CTA per row for these
+    #     (rows, vocab) reductions and does not split them on sm100+ regardless
+    #     of split_reductions, which costs ~117 us (log_softmax) + 43-74 us
+    #     (rank) per iteration at vocab ~250k. The split-row Triton kernels in
+    #     logprobs_triton take ~10 us + ~4.5 us for the same shapes.
 
     @staticmethod
     def determine_sampled_rank(
         group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
     ) -> torch.Tensor:
-        torch._dynamo.mark_dynamic(group_logprobs_cuda, 0)
-        torch._dynamo.mark_dynamic(sampled_logprobs_cuda, 0)
-        return Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
-
-    @staticmethod
-    @torch.compile(
-        dynamic=None,
-        fullgraph=True,
-        options=dict(
-            online_softmax=True,
-            split_reductions=False,
-        ),
-    )
-    def _gather_log_softmax_impl(
-        inputs_cuda: torch.Tensor,
-        indices_cuda: torch.Tensor,
-        out: torch.Tensor,
-    ) -> None:
-        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
-        #     materializing the index select and output the results directly into the destination tensor.
-        out[...] = torch.nn.functional.log_softmax(
-            inputs_cuda[indices_cuda],
-            dim=-1,
-        )
+        return logprobs_triton.determine_sampled_rank(group_logprobs_cuda, sampled_logprobs_cuda)
 
     @staticmethod
     def gather_log_softmax_with_output(
         inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor, out: torch.Tensor
     ) -> None:
-        torch._dynamo.mark_dynamic(inputs_cuda, 0)
-        torch._dynamo.mark_dynamic(indices_cuda, 0)
-        torch._dynamo.mark_dynamic(out, 0)
-        Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda, out)
+        # NB: helper function for LogProbsHandler._process_logprobs; the kernel
+        #     writes log_softmax(inputs_cuda[indices_cuda]) straight into ``out``
+        #     (a row slice of the logprobs buffer).
+        logprobs_triton.gather_log_softmax(inputs_cuda, indices_cuda, out=out)
 
     # --- Top-P Decay ops ---------------------------------------------------
     # Host-launch-bound per-step ops (a few dozen elements per row), fused with
@@ -706,3 +683,45 @@ class Fusions:
             max_beam_width,
             fold_pending,
         )
+
+
+@torch.inference_mode()
+def warmup_compile_fusions(vocab_size: int, device: torch.device) -> None:
+    """Pre-compile every runtime dynamo variant of the logprobs-path Fusions ops.
+
+    The two logprobs-path ``Fusions`` ops (``gather_log_softmax_with_output``,
+    ``determine_sampled_rank``) are hand-written Triton kernels
+    (``logprobs_triton``): their row count only enters the launch grid, so each
+    compiles once per argument signature (dtypes, 16-byte alignment and the
+    engine-constant vocab/stride specialisations) and never re-specializes on
+    the batch composition. Left lazy, that JIT lands inside the first batch that
+    needs logprobs (seconds, lock-stepped across ranks under SPMD). This
+    function issues one call per kernel so the cost is paid once at engine-init
+    time instead; no dynamo graph is compiled here.
+
+    Signature-fidelity contract: Triton specializes each kernel on the argument
+    dtypes and on the 16-byte alignment / divisibility of its integer
+    arguments, so the warm-up uses fp32 logits, int64 indices (the runtime
+    raw-logprobs logit indices come from a ``_PackedStepIndexer`` whose request
+    offsets are ``torch.cumsum`` output, and integer ``cumsum`` promotes to
+    int64) and ``vocab_size`` equal to the exact runtime logits width (padded
+    vocab). Row counts only size the launch grid and never trigger a
+    recompile.
+
+    Intentionally NOT covered (each lazy-compiles once, iff the feature is
+    used): the top-p-decay and occurrence-penalty ops above (max-autotune,
+    feature-active workloads only) and the compiled spec-dec samplers in
+    ops.flashinfer. The flashinfer sampling module itself is built by
+    ``ops.flashinfer.warmup_sampling_module`` during model-engine warmup.
+    """
+
+    def fake_logits(num_rows: int) -> torch.Tensor:
+        return torch.zeros((num_rows, vocab_size), dtype=torch.float32, device=device)
+
+    # int64 indices, like the cumsum-derived _PackedStepIndexer output at
+    # runtime: Triton specializes on the index dtype.
+    indices = torch.arange(2, dtype=torch.int64, device=device)
+    Fusions.gather_log_softmax_with_output(fake_logits(4), indices, out=fake_logits(2))
+    Fusions.determine_sampled_rank(
+        fake_logits(2), torch.zeros((2, 1), dtype=torch.float32, device=device)
+    )

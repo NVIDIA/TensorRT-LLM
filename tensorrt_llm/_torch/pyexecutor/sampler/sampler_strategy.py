@@ -1499,6 +1499,45 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
             if not store.uses_beam_search[slot]:
                 store.slots_needing_recompute.discard(slot)
 
+        # One strategy for the whole batch (the common serving case: every
+        # request of a workload samples the same way): the group is the batch in
+        # order, so skip the per-strategy masks, the stable sort and the
+        # boundary scan below and emit it directly.
+        first_strategy = batch_strategies[0]
+        if all(strategy == first_strategy for strategy in batch_strategies):
+            needs_probs_list = [store.needs_probs[slot] for slot in seq_slots_list]
+            first_needs_probs = needs_probs_list[0]
+            if all(value == first_needs_probs for value in needs_probs_list):
+                indices_arr = torch.arange(num_requests, dtype=torch.int32)
+                spec_indices = indices_arr[
+                    torch.tensor(
+                        [store.speculation_needs_probs[slot] for slot in seq_slots_list],
+                        dtype=torch.bool,
+                    )
+                ]
+                processed_flags = torch.tensor(
+                    [store.need_processed_logprobs[slot] for slot in seq_slots_list],
+                    dtype=torch.bool,
+                )
+                raw_flags = torch.tensor(
+                    [store.need_raw_logprobs[slot] for slot in seq_slots_list], dtype=torch.bool
+                )
+                if pin_memory:
+                    indices_arr = maybe_pin_memory(indices_arr)
+                    spec_indices = maybe_pin_memory(spec_indices)
+                    processed_flags = maybe_pin_memory(processed_flags)
+                key = RequestGroupKey(
+                    strategy_key=strategy_to_key(first_strategy), needs_probs=first_needs_probs
+                )
+                return {
+                    key: RequestGroupValue(
+                        indices=indices_arr,
+                        strategies=batch_strategies,
+                        speculation_needs_probs_indices=spec_indices,
+                        need_processed_logprobs=processed_flags,
+                    )
+                }, raw_flags
+
         # Gather flags using list comprehension (faster than append in loop)
         needs_probs = torch.tensor(
             [store.needs_probs[slot] for slot in seq_slots_list], dtype=torch.bool, device="cpu"

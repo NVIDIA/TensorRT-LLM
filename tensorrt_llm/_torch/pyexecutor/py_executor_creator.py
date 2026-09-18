@@ -641,6 +641,32 @@ def _create_py_executor_impl(
             llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=getattr(model_engine,
                                             "_enable_overlap_headroom", False))
+    if (is_hybrid_linear(config)
+            and kv_cache_config.mamba_max_off_grid_snapshots_per_chain > 0
+            and cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
+        # Off-grid snapshot demotion changes how many materialized recurrent
+        # blocks a context chain carries over time. The C++ transceiver
+        # (RnnCacheFormatter) ships every materialized block of the ctx chain
+        # and expects the gen chain to hold the same count with no
+        # negotiation, so the knob is only safe with the Python transceiver
+        # (positional pairing by expect_snapshot_points). Hybrid reuse on the
+        # Python transceiver in turn needs TRTLLM_HYBRID_DISAGG_REUSE=1 so the
+        # CppMambaHybridCacheManager (the manager that owns the recurrent
+        # reuse tree) is selected by get_kv_cache_manager_cls; without it the
+        # V1 route rejects reuse + PYTHON and the knob would be dead anyway.
+        demotion_supported = (
+            cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and os.environ.get("TRTLLM_HYBRID_DISAGG_REUSE", "0") == "1"
+            and kv_cache_config.enable_block_reuse)
+        if not demotion_supported:
+            logger.warning(
+                "kv_cache_config.mamba_max_off_grid_snapshots_per_chain="
+                f"{kv_cache_config.mamba_max_off_grid_snapshots_per_chain} under "
+                "disaggregated serving requires transceiver_runtime='PYTHON', "
+                "TRTLLM_HYBRID_DISAGG_REUSE=1 and block reuse "
+                "(CppMambaHybridCacheManager); forcing it to 0.")
+            kv_cache_config.mamba_max_off_grid_snapshots_per_chain = 0
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64

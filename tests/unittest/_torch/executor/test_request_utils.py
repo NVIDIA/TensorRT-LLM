@@ -10,7 +10,7 @@ This module tests:
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -133,6 +133,194 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.draft_tokens == draft_tokens
     assert llm_request.py_draft_tokens == draft_tokens
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+
+def _make_broadcast_item(req_id):
+    return RequestQueueItem(
+        req_id,
+        SimpleNamespace(
+            py_logits_post_processors=None,
+            py_multimodal_data=None,
+            py_scheduling_params=None,
+            py_num_logprobs=None,
+            py_disaggregated_params=None,
+            py_conversation_params=None,
+            py_lora_path=None,
+        ),
+    )
+
+
+def test_request_broadcaster_known_nonempty_skips_count_probe():
+    """With known_nonempty (all ranks agree via the ADP allgather hint that
+    rank 0 holds requests), the count probe is skipped and the result is
+    identical to the probing path."""
+    dist = Mock()
+    dist.rank = 0
+    dist.world_size = 1
+    hang_detector = MagicMock()
+    broadcaster = RequestBroadcaster(dist, hang_detector)
+    probe = Mock(wraps=broadcaster._broadcast_request_count)
+    broadcaster._broadcast_request_count = probe
+    items = [_make_broadcast_item(1), _make_broadcast_item(2)]
+
+    probed_requests, probed_py_objects = broadcaster.broadcast(items)
+    assert probe.call_count == 1
+    assert probed_requests == items
+
+    hinted_requests, hinted_py_objects = broadcaster.broadcast(items, known_nonempty=True)
+    assert probe.call_count == 1  # probe skipped
+    assert hinted_requests == probed_requests
+    assert hinted_py_objects == probed_py_objects
+
+
+def test_request_broadcaster_empty_probing_path_unchanged():
+    dist = Mock()
+    dist.rank = 0
+    dist.world_size = 1
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+
+    new_requests, py_request_objects = broadcaster.broadcast([])
+
+    assert new_requests == []
+    assert py_request_objects is None
+
+
+class _SingleRoundDist:
+    """Fake transport recording the collectives RequestBroadcaster issues.
+
+    ``broadcast_or_none`` behaves like the real one: the root's object comes
+    back on the root, ``received`` stands for what a non-root rank gets.
+    """
+
+    def __init__(self, rank, *, world_size=2, has_pp=False, supports=True, received=None):
+        self.rank = rank
+        self.world_size = world_size
+        self.tp_size = world_size
+        self.cp_size = 1
+        self.has_pp = has_pp
+        # Single PP stage that is both first and last: the PP route then only
+        # runs its intra-stage tp_cp_broadcast (no send/recv chain).
+        self.pp_size = 2 if has_pp else 1
+        self.is_first_pp_rank = True
+        self.is_last_pp_rank = True
+        self.supports_single_round_broadcast = supports
+        self._received = received
+        self.calls = []
+
+    def tp_cp_broadcast(self, obj, root=0, **kwargs):
+        self.calls.append(("tp_cp_broadcast", obj))
+        return obj
+
+    # Resolved (not called) by the PP route on a first-and-last stage.
+    def send_object(self, *args, **kwargs):
+        raise AssertionError("no PP send expected on a first-and-last stage")
+
+    isend_object = recv_object = send_object
+
+    def broadcast_or_none(self, obj, root=0):
+        self.calls.append(("broadcast_or_none", obj))
+        return obj if self.rank == root else self._received
+
+    def broadcast(self, obj, root=0, prefer_cpu=False):
+        self.calls.append(("broadcast", obj, prefer_cpu))
+        return obj
+
+    # Scalar request-count collectives (main routes them through the int64
+    # helpers instead of the object broadcasts).
+    def broadcast_int64(self, values, root=0, prefer_cpu=False):
+        values = list(values)
+        self.calls.append(("broadcast_int64", values, prefer_cpu))
+        return values
+
+    def tp_cp_broadcast_int64(self, values, root=0, **kwargs):
+        values = list(values)
+        self.calls.append(("tp_cp_broadcast_int64", values))
+        return values
+
+
+def test_single_round_empty_iteration_is_one_collective():
+    dist = _SingleRoundDist(rank=0)
+    hang_detector = MagicMock()
+    broadcaster = RequestBroadcaster(dist, hang_detector)
+
+    new_requests, py_request_objects = broadcaster.broadcast([])
+
+    assert (new_requests, py_request_objects) == ([], None)
+    assert dist.calls == [("broadcast_or_none", None)]
+    hang_detector.pause.assert_called_once()
+
+
+def test_single_round_busy_iteration_sends_requests_and_py_objects_once():
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+    items = [_make_broadcast_item(1), _make_broadcast_item(2)]
+
+    new_requests, py_request_objects = broadcaster.broadcast(items)
+
+    assert new_requests == items
+    assert py_request_objects == broadcaster._collect_py_objects(items)
+    assert len(dist.calls) == 1
+    kind, payload = dist.calls[0]
+    assert kind == "broadcast_or_none"
+    assert payload == (items, py_request_objects)
+
+
+def test_single_round_non_root_receives_payload_or_nothing():
+    items = [_make_broadcast_item(7)]
+    py_objects = RequestBroadcaster(_SingleRoundDist(rank=0), MagicMock())._collect_py_objects(
+        items
+    )
+
+    dist = _SingleRoundDist(rank=1, received=(items, py_objects))
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == (items, py_objects)
+    assert dist.calls == [("broadcast_or_none", None)]
+
+    dist = _SingleRoundDist(rank=1, received=None)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == ([], None)
+
+
+@pytest.mark.parametrize(
+    "kwargs, reason",
+    [
+        ({"supports": False}, "transport without the single-round path"),
+        ({"has_pp": True}, "pipeline route keeps probe + send/recv chain"),
+        ({"world_size": 1}, "single rank never broadcasts"),
+    ],
+)
+def test_single_round_falls_back_to_probe_when_not_applicable(kwargs, reason):
+    dist = _SingleRoundDist(rank=0, **kwargs)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+    items = [_make_broadcast_item(1)]
+
+    new_requests, _ = broadcaster.broadcast(items)
+
+    assert new_requests == items, reason
+    assert all(kind != "broadcast_or_none" for kind, *_ in dist.calls), reason
+
+
+def test_single_round_idle_path_keeps_cpu_probe():
+    """prefer_cpu marks the idle path: non-root ranks may park in the probe for
+    minutes, so it must stay on the CPU transport (probe first, not the
+    GPU-staged single round)."""
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+
+    new_requests, py_request_objects = broadcaster.broadcast([], prefer_cpu=True)
+
+    assert (new_requests, py_request_objects) == ([], None)
+    assert dist.calls == [("broadcast_int64", [0], True)]
+
+
+def test_single_round_known_nonempty_still_skips_straight_to_payload():
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+    items = [_make_broadcast_item(1)]
+
+    new_requests, py_request_objects = broadcaster.broadcast(items, known_nonempty=True)
+
+    assert new_requests == items
+    assert [kind for kind, *_ in dist.calls] == ["broadcast"]
+    assert dist.calls[0][1] == (items, py_request_objects)
 
 
 def test_merge_helix_requests_with_padding():

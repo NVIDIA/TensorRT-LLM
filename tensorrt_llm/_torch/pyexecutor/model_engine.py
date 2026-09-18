@@ -20,8 +20,8 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
-                                 maybe_pin_memory, nvtx_range, prefer_pinned,
-                                 release_gc, trace_func)
+                                 maybe_pin_memory, mpi_disabled, nvtx_range,
+                                 prefer_pinned, release_gc, trace_func)
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
@@ -51,6 +51,7 @@ from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..distributed.ops import MNNVLAllReduce
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -645,6 +646,32 @@ class PyTorchModelEngine(ModelEngine):
                 and self._init_userbuffers(self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
+                if mpi_disabled() and self.mapping.world_size > 1:
+                    # Resolve the device-mesh dims the compiled forward reads
+                    # (mapping.tp_group & friends) while still eager: the
+                    # DeviceMesh resolver is compiler-disabled and must never
+                    # run under tracing; once memoized these reads trace as
+                    # constants.
+                    _ = self.mapping.tp_group
+                    _ = self.mapping.pp_group
+                    _ = self.mapping.cp_group
+                    if self.mapping.moe_ep_size > 1:
+                        _ = self.mapping.moe_tp_group
+                        _ = self.mapping.moe_ep_group
+                # torch.compile traces AllReduce.forward, whose lazy MNNVL
+                # workspace rescale cannot allocate inside the traced region -
+                # grow the workspaces to the engine maximum up front.
+                num_mnnvl_allreduces = 0
+                for module in self.model.modules():
+                    if isinstance(module, MNNVLAllReduce):
+                        module.prescale_workspace(self.max_num_tokens,
+                                                  self.model.config.hidden_size)
+                        num_mnnvl_allreduces += 1
+                if num_mnnvl_allreduces:
+                    logger.info(f"Pre-scaled the MNNVL allreduce workspace for "
+                                f"{num_mnnvl_allreduces} modules to cover "
+                                f"max_num_tokens={self.max_num_tokens} before "
+                                "torch.compile.")
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
@@ -2320,6 +2347,17 @@ class PyTorchModelEngine(ModelEngine):
            ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
            ``_chunk_state_varlen_kernel``.
 
+        Additionally (gated by ``TLLM_GDN_PREFILL_FAMILY_WARMUP``, default on),
+        covers the remaining Triton int-specialization families of the GDN
+        prefill elementwise kernels (``fuse_elementwise_ops.py``): Triton
+        specializes int args (packed prefill token count and the strides equal
+        to it) into ``==1`` / ``%16==0`` / other families, and
+        ``_fused_gdn_post_conv`` forks on the ``HAS_DECODE`` constexpr. The
+        two base shapes only ever compile the (``%16==0``,
+        ``HAS_DECODE=False``) family, so the first mixed ctx+gen batch or
+        non-16-aligned context length otherwise JIT-compiles mid-serving
+        (~0.2-1.5 s, lock-stepped across ranks under SPMD).
+
         Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
         the autotuner is enabled so op-level (M,N,K) caches also get primed
         for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
@@ -2370,6 +2408,55 @@ class PyTorchModelEngine(ModelEngine):
             (capped_num_tokens, 0, False, False),
             (capped_num_tokens, 0, False, True),
         ]
+
+        # Extra shapes covering the remaining GDN prefill Triton
+        # specialization families (see docstring). Context-token counts assume
+        # capped_num_tokens % 16 == 0 (WARMUP_TOKEN_CAP is 16-aligned; only a
+        # near-exhausted KV pool breaks this, degrading a missed family to
+        # lazy compilation, i.e. the pre-fix behavior). The mixed ctx+gen
+        # entries derive their context token count as
+        # num_tokens - num_gen_requests * (1 + max_total_draft_tokens); with
+        # speculative decoding the "%16!=0" entry may land on an aligned
+        # count for some draft lengths — acceptable, since the spec-dec
+        # target-verify kernel variants are not covered here anyway.
+        # Set TLLM_GDN_PREFILL_FAMILY_WARMUP=0 to disable.
+        if (os.environ.get("TLLM_GDN_PREFILL_FAMILY_WARMUP", "1") == "1"
+                and capped_num_tokens >= 32):
+            mamba_warmup_shapes += [
+                # Prefill %16!=0 family, HAS_DECODE=False.
+                (capped_num_tokens - 4, 0, False, False),
+                # Mixed ctx+gen (HAS_DECODE=True), ctx tokens %16==0.
+                (capped_num_tokens, 16, False, False),
+                # Mixed ctx+gen (HAS_DECODE=True), ctx tokens %16!=0.
+                (capped_num_tokens - 4, 2, False, False),
+                # ==1 specialization (1-token context chunk remainder).
+                (1, 0, False, False),
+            ]
+            # The two mixed entries above sample only the (%16==0, %16==0)
+            # and (other, other) diagonal of the Triton specialization key
+            # class(ctx_tokens) x class(gen_tokens), class in {==1, %16==0,
+            # other} — the first serving batch of each remaining combination
+            # JIT-compiles mid-serving (~230 ms, in rank lockstep). Cover the
+            # cross-terms, plus the 1-token context chunk remainder alongside
+            # gens (reachable with chunked prefill). Gen token count is
+            # num_gen_requests * t; with speculative decoding some classes
+            # shift or become unreachable — acceptable, as above.
+            t = 1 + self.max_total_draft_tokens
+            gen_odd = 2 if (2 * t) % 16 else 3
+            mamba_warmup_shapes += [
+                # ctx %16==0, single gen token (==1 specialization).
+                (capped_num_tokens - 16 + t, 1, False, False),
+                # ctx %16!=0, single gen token.
+                (capped_num_tokens - 5 + t, 1, False, False),
+                # ctx %16==0, gen tokens %16!=0.
+                (capped_num_tokens - 16 + gen_odd * t, gen_odd, False, False),
+                # ctx %16!=0, gen tokens %16==0.
+                (capped_num_tokens - 21 + 16 * t, 16, False, False),
+                # ctx==1 chunk remainder x each gen-token class.
+                (1 + t, 1, False, False),
+                (1 + gen_odd * t, gen_odd, False, False),
+                (1 + 16 * t, 16, False, False),
+            ]
 
         autotuner_enabled = self.llm_args.enable_autotuner
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
@@ -2456,6 +2543,26 @@ class PyTorchModelEngine(ModelEngine):
                         self._reset_moe_alltoall_state()
                         torch.cuda.empty_cache()
 
+        # The folded save-last prefill path (GDN) has Triton variants no warmup
+        # shape reaches (folds need a save-last snapshot inside the chunk); the
+        # first folded serving iteration compiled them in rank lockstep. One
+        # GDN layer's dummy-data warmup covers every layer (shared kernels).
+        if os.environ.get("TLLM_GDN_FOLD_KERNEL_WARMUP", "1") == "1":
+            # The layer's real state pools: FlashInfer's CuTe kernels are compiled
+            # per pool geometry (size and slot strides of a non-contiguous pool),
+            # so a dummy pool would compile variants serving never uses.
+            kv_cache_manager = resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            for module in self.model.modules():
+                warm = getattr(module, "warmup_fold_kernels", None)
+                if warm is None:
+                    continue
+                try:
+                    warm(kv_cache_manager)
+                except Exception as e:  # perf-only: fall back to lazy compilation
+                    logger.warning(
+                        f"GDN fold kernel warmup skipped: {type(e).__name__}: {e}")
+                break
         clear_memory_buffers()
         torch.cuda.empty_cache()
 
@@ -3832,7 +3939,6 @@ class PyTorchModelEngine(ModelEngine):
         self._remove_torch_compile()
 
     @with_warmup_flag
-    @warmup_with_kv_cache_cleanup
     def restore_compiled_model_after_refit(
             self, resource_manager: ResourceManager) -> None:
         """Re-install the torch.compile wrapper after refit.
@@ -3846,9 +3952,18 @@ class PyTorchModelEngine(ModelEngine):
         were still live afterwards, so the captures survive intact and PWCG
         stays hot.
 
-        ``resource_manager`` is unused here but is required by the
-        ``warmup_with_kv_cache_cleanup`` decorator, and is part of the signature
-        callers (including NeMo-RL) already pass.
+        Deliberately NOT decorated with ``warmup_with_kv_cache_cleanup``: that
+        decorator ends with ``check_invalid_values_in_kv_cache(fill_with_zero=
+        True)``, which zero-fills every attention KV pool whether or not it
+        found a NaN. It belongs after a capture warm-up that ran forwards on
+        placeholder inputs; this hook never runs a forward, and under an
+        in-flight weight update (``drain=False``) the zero-fill would wipe the
+        KV of every request kept across the refit. The wrapper also ran when
+        torch.compile is disabled, because the early return below happens
+        inside the wrapped method.
+
+        ``resource_manager`` is unused here; it stays in the signature because
+        callers (including NeMo-RL) already pass it.
         """
         if not self._torch_compile_enabled:
             return
@@ -4064,6 +4179,48 @@ class PyTorchModelEngine(ModelEngine):
         # key reads the flag next -- the stored override only takes effect on
         # the NEXT rescan (populate), which is after key selection.
         spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
+    def make_graph_batch(
+        self, scheduled_requests: ScheduledRequests
+    ) -> Tuple[ScheduledRequests, frozenset[int]]:
+        """The batch ``forward`` hands to the CUDA-graph runner.
+
+        Final one-token context requests are promoted into a decode-shaped
+        graph candidate when the engine configuration allows it; otherwise the
+        scheduled batch is returned as is with no promoted ids. A pure
+        function of the batch and config-derived engine state, so the executor
+        can evaluate it right after scheduling (TLLM_ADP_PACKED_SYNC packs the
+        runner's attention-DP padding vector into its post-schedule exchange)
+        and obtain exactly the rows the runner would gather in the forward.
+        """
+        graph_requests = scheduled_requests
+        promoted_context_request_ids: frozenset[int] = frozenset()
+        # Non-linear tree input preparation expands runtime_draft_len to the
+        # total tree width after graph selection. Only linear-tree zero-draft
+        # iterations can therefore safely reuse a zero-draft graph.
+        can_promote_spec_decode = (not self.enable_spec_decode
+                                   or (not self.is_draft_model
+                                       and self.runtime_draft_len == 0
+                                       and self.spec_config is not None
+                                       and self.spec_config.is_linear_tree))
+        # TODO: Generalize these conservative gates as actual-draft, beam, and
+        # context-parallel providers for decoder-only LLMs gain support for
+        # promoted final-context rows. Each relaxation must preserve whole-batch
+        # fallback on graph miss and prove parity with the provider's native
+        # q_len=1 path. Encoder-decoder and non-LLM engines remain out of scope.
+        if (scheduled_requests.num_context_requests > 0
+                and self.cuda_graph_runner.enabled and can_promote_spec_decode
+                and not self.use_beam_search
+                and not self._is_encoder_decoder_model()
+                # PLE owns recurrent n-gram and convolution state. Promoting a
+                # fresh final-context row would skip its cache-slot reset.
+                and not self._model_uses_ple_recurrent_state and
+                self.mapping.cp_size == 1):
+            graph_requests, promoted_context_request_ids = \
+                _make_single_token_context_graph_batch(
+                    scheduled_requests,
+                    self._is_final_multimodal_context_decode_compatible)
+        return graph_requests, promoted_context_request_ids
 
     def _is_final_multimodal_context_decode_compatible(
             self, request: LlmRequest) -> bool:
@@ -4502,10 +4659,11 @@ class PyTorchModelEngine(ModelEngine):
         """Check whether the cached steady-state generation prepare applies.
 
         The cache is only recorded by a full _prepare_tp_inputs pass whose
-        batch consisted purely of non-dummy generation requests that all had
-        a previous overlap-scheduler tensor (see the recording site), so the
-        per-step check only needs to confirm the dynamic conditions: still a
-        generation-only batch with the exact same requests in the same order.
+        batch consisted of generation requests that all had a previous
+        overlap-scheduler tensor, optionally followed by CUDA-graph padding
+        dummies (see the recording site), so the per-step check only needs
+        to confirm the dynamic conditions: still a generation-only batch
+        with the exact same requests (dummies included) in the same order.
         """
         cache = self._steady_gen_cache
         if cache is None or self.is_warmup:
@@ -4530,70 +4688,98 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager: Optional[ResourceManager]):
         """Prepare inputs for an unchanged generation-only batch.
 
-        Every request advanced by exactly one committed token since the last
-        prepare, so instead of re-walking the batch in Python this advances
-        the cached positions in place (device position buffer plus a pinned
-        host counter), reuses the seq-slot buffer already on device, and
-        refreshes only the per-step metadata. For mrope models (recorded only
-        for batches with no actual mrope work) the (3,1,N) broadcast buffer
-        the model reads is the one advanced.
+        Every real request advanced by exactly one committed token since the
+        last prepare, so instead of re-walking the batch in Python this
+        advances the cached positions in place (device position buffer plus a
+        pinned host counter), reuses the seq-slot buffer already on device,
+        and refreshes only the per-step metadata. CUDA-graph padding dummies
+        (the batch tail, ``[num_real:]``) keep their positions and input rows
+        untouched, exactly as the full pass leaves them. For mrope models
+        (recorded only for batches with no actual mrope work) the (3,1,N)
+        broadcast buffer the model reads is the one advanced.
+
+        When ``attn_metadata`` is the very object the recording pass
+        prepared, its state is advanced in place
+        (``prepare_steady_gen_step``): kv lengths +1, and the KV block table
+        re-staged only when a real request starts a new block this step.
+        Any other metadata object gets the full field assignment and
+        ``prepare()``.
         """
         cache = self._steady_gen_cache
         num_requests = cache['num_requests']
+        num_real = cache['num_real']
 
         # Positions and cached-token counts are the same values in this
-        # regime; advance both by one. The device-side position buffer is
-        # advanced in place: it still holds the previous step's positions
-        # because only _prepare_tp_inputs writes it and the cache validity
-        # invariant guarantees the previous pass wrote these same rows. This
-        # avoids reusing a mutated pinned buffer as the source of an async
-        # H2D whose previous-step copy may still be pending under the overlap
-        # scheduler (the nvbug 6293536 hazard class; see
-        # KVCacheManager._stage_block_offsets_for_copy). The pinned buffer is
-        # host-side bookkeeping only.
+        # regime; advance both by one for the real requests. The device-side
+        # position buffer is advanced in place: it still holds the previous
+        # step's positions because only _prepare_tp_inputs writes it and the
+        # cache validity invariant guarantees the previous pass wrote these
+        # same rows. This avoids reusing a mutated pinned buffer as the
+        # source of an async H2D whose previous-step copy may still be
+        # pending under the overlap scheduler (the nvbug 6293536 hazard
+        # class; see KVCacheManager._stage_block_offsets_for_copy). The
+        # pinned buffer is host-side bookkeeping only.
         use_mrope = cache['use_mrope']
         positions = self._steady_gen_positions_pinned[:num_requests]
-        positions.add_(1)
+        positions[:num_real].add_(1)
         if use_mrope:
             # Text-only batch on an mrope model: the recording pass broadcast
             # the scalar positions onto all three axes of the (3,1,N) buffer,
             # which is what the model (and any captured CUDA graph) reads, so
             # advance it in place. position_ids_cuda is reseeded by the next
             # full pass.
-            self.mrope_position_ids_cuda[:, :, :num_requests].add_(1)
+            self.mrope_position_ids_cuda[:, :, :num_real].add_(1)
         else:
-            self.position_ids_cuda[:num_requests].add_(1)
+            self.position_ids_cuda[:num_real].add_(1)
         num_cached_tokens_per_seq = positions.tolist()
 
         # Gather this step's input tokens from the previous iteration's device
         # sample buffer; the seq-slot indices in previous_batch_indices_cuda
-        # are unchanged since the last full pass.
-        previous_slots = self.previous_batch_indices_cuda[:num_requests]
+        # are unchanged since the last full pass. Dummy rows keep whatever the
+        # full pass left there (their outputs are discarded).
+        previous_slots = self.previous_batch_indices_cuda[:num_real]
         torch.index_select(
             new_tensors_device.new_tokens[0, :, :self.max_beam_width],
             0,
             previous_slots,
-            out=self.input_ids_cuda[:num_requests * self.max_beam_width].view(
-                num_requests, self.max_beam_width),
+            out=self.input_ids_cuda[:num_real * self.max_beam_width].view(
+                num_real, self.max_beam_width),
         )
 
-        if not attn_metadata.is_cuda_graph:
-            attn_metadata.seq_lens = cache['seq_lens_ones']
-        attn_metadata.beam_width = 1
-        attn_metadata.request_ids = cache['request_ids']
-        attn_metadata.prompt_lens = cache['prompt_lens']
-        attn_metadata.num_contexts = 0
-        attn_metadata.num_chunked_ctx_requests = 0
-        attn_metadata.kv_cache_params = KVCacheParams(
+        kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(None))
-        attn_metadata.kv_cache_manager = kv_cache_manager
-        if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
-            attn_metadata.mamba_chunk_size = \
-                self.model.model_config.pretrained_config.chunk_size
-        with nvtx_range("steady_gen_metadata_prepare"):
-            attn_metadata.prepare()
+        if attn_metadata is cache['attn_metadata']:
+            # Same object the recording pass prepared for this layout: the
+            # request ids, prompt lengths, seq lens, request types and block
+            # table are still in place; only the kv lengths move. A request
+            # whose new position is a block multiple starts a new KV block
+            # this step, so the block table must be re-staged then.
+            attn_metadata.kv_cache_params = kv_cache_params
+            tokens_per_block = cache['tokens_per_block']
+            refresh_block_offsets = tokens_per_block is None or any(
+                pos % tokens_per_block == 0
+                for pos in num_cached_tokens_per_seq[:num_real])
+            with nvtx_range("steady_gen_metadata_prepare"):
+                attn_metadata.prepare_steady_gen_step(
+                    num_real, refresh_block_offsets=refresh_block_offsets)
+        else:
+            if not attn_metadata.is_cuda_graph:
+                attn_metadata.seq_lens = cache['seq_lens_ones']
+            attn_metadata.beam_width = 1
+            attn_metadata.request_ids = cache['request_ids']
+            attn_metadata.prompt_lens = cache['prompt_lens']
+            attn_metadata.num_contexts = 0
+            attn_metadata.num_chunked_ctx_requests = 0
+            attn_metadata.kv_cache_params = kv_cache_params
+            attn_metadata.kv_cache_manager = kv_cache_manager
+            if hasattr(self.model.model_config.pretrained_config,
+                       'chunk_size'):
+                attn_metadata.mamba_chunk_size = \
+                    self.model.model_config.pretrained_config.chunk_size
+            with nvtx_range("steady_gen_metadata_prepare"):
+                attn_metadata.prepare()
 
         attn_all_rank_num_tokens = get_all_rank_num_tokens(
             attn_metadata,
@@ -4799,6 +4985,14 @@ class PyTorchModelEngine(ModelEngine):
             if context_prompt_lookahead is not None:
                 context_prompt_lookahead.append(
                     _get_context_prompt_lookahead_token(request, end_compute))
+            # Tokens this request actually pushes through the model across
+            # its chunks; compared against prompt_len - cached_tokens it
+            # exposes prefill work that prefix reuse did not save.
+            request.py_ctx_computed_tokens = getattr(
+                request, 'py_ctx_computed_tokens', 0) + (end_compute - begin_compute)
+            if getattr(request, 'py_ctx_num_chunks', 0) == 0:
+                request.py_ctx_first_begin = begin_compute
+            request.py_ctx_num_chunks = getattr(request, 'py_ctx_num_chunks', 0) + 1
             # Fetch only the current chunk. get_tokens(0) marshals the whole
             # O(seq_len) VecTokens into a Python list of boxed ints; chunked
             # prefill re-enters this loop for every chunk of the same prompt, so
@@ -5159,6 +5353,9 @@ class PyTorchModelEngine(ModelEngine):
         # Cache invariant method result to avoid repeated calls per-request
         _has_cp_helix = self.mapping.has_cp_helix()
         _n_gen = len(generation_requests)
+        # CUDA-graph padding dummies in this batch (they never carry a
+        # previous overlap-scheduler tensor and append no input_ids).
+        _n_cuda_graph_dummy = 0
         # One-shot batch-level flag — True iff any generation request actually
         # carries multimodal payload. Lets the strip_mm_data branch below
         # short-circuit on a LOAD_FAST rather than a per-request LOAD_ATTR
@@ -5231,6 +5428,8 @@ class PyTorchModelEngine(ModelEngine):
                 # (2) a dummy request; or
                 # (3) the first step in the generation server of disaggregated serving.
                 elif new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                    if request.is_cuda_graph_dummy:
+                        _n_cuda_graph_dummy += 1
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
@@ -5926,11 +6125,16 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_request_ids = all_gen_request_ids
 
             # Record the steady-state generation cache when this pass handled
-            # purely non-dummy generation requests that all carried a previous
-            # overlap-scheduler tensor (previous_batch_len == _n_gen implies
-            # every request took that branch and none appended input_ids).
-            # While the batch composition holds, the next passes only need to
-            # advance positions by one and refresh per-step metadata.
+            # generation requests that all carried a previous overlap-scheduler
+            # tensor, optionally followed by CUDA-graph padding dummies
+            # (previous_batch_len == _n_gen - _n_cuda_graph_dummy and
+            # num_tokens == 0 imply every real request took that branch, none
+            # appended input_ids, and the dummies form the batch tail: the
+            # full pass keeps them there and they never join
+            # previous_batch_indices). While the batch composition holds, the
+            # next passes only need to advance the real requests' positions
+            # by one and refresh per-step metadata; the dummies' rows stay
+            # constant.
             # MRoPE models are supported only for batches with no actual mrope
             # work (text-only requests, empty mrope lists below): the full
             # pass routes use_mrope models through the (3,1,N)
@@ -5948,7 +6152,11 @@ class PyTorchModelEngine(ModelEngine):
                     and not is_enc_dec and not _has_cp_helix
                     and num_ctx_requests == 0 and not extend_requests
                     and not first_draft_requests and _n_gen > 0
-                    and previous_batch_len == _n_gen and num_tokens == 0
+                    and previous_batch_len == _n_gen - _n_cuda_graph_dummy
+                    and previous_batch_len > 0 and num_tokens == 0
+                    and (_n_cuda_graph_dummy == 0 or all(
+                        r.is_cuda_graph_dummy
+                        for r in generation_requests[previous_batch_len:]))
                     and not _has_any_multimodal_request
                     and not multimodal_params_list and not lora_params
                     and attn_metadata.padded_num_tokens is None
@@ -5958,9 +6166,18 @@ class PyTorchModelEngine(ModelEngine):
                 self._steady_gen_positions_pinned[:_n_gen].copy_(
                     torch.as_tensor(num_cached_tokens_snapshot,
                                     dtype=torch.int))
+                # The attention metadata prepared by this pass can be advanced
+                # in place by the fast path (TrtllmAttentionMetadata only,
+                # plain decode features) instead of a full re-prepare.
+                incremental = hasattr(attn_metadata,
+                                      'supports_steady_gen_step') and \
+                    attn_metadata.supports_steady_gen_step()
                 self._steady_gen_cache = {
                     'num_requests':
                     _n_gen,
+                    # Real requests come first; [num_real:] are padding dummies.
+                    'num_real':
+                    previous_batch_len,
                     'request_ids':
                     all_gen_request_ids,
                     'prompt_lens':
@@ -5969,6 +6186,10 @@ class PyTorchModelEngine(ModelEngine):
                     maybe_pin_memory(torch.ones(_n_gen, dtype=torch.int)),
                     'use_mrope':
                     _use_mrope,
+                    'attn_metadata':
+                    attn_metadata if incremental else None,
+                    'tokens_per_block':
+                    getattr(kv_cache_manager, 'tokens_per_block', None),
                 }
 
         return inputs, self.gather_ids_cuda[:len(
@@ -6126,33 +6347,8 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = None
 
         moe_load_balancer = self.moe_load_balancer
-        graph_requests = scheduled_requests
-        promoted_context_request_ids: frozenset[int] = frozenset()
-        # Non-linear tree input preparation expands runtime_draft_len to the
-        # total tree width after graph selection. Only linear-tree zero-draft
-        # iterations can therefore safely reuse a zero-draft graph.
-        can_promote_spec_decode = (not self.enable_spec_decode
-                                   or (not self.is_draft_model
-                                       and self.runtime_draft_len == 0
-                                       and self.spec_config is not None
-                                       and self.spec_config.is_linear_tree))
-        # TODO: Generalize these conservative gates as actual-draft, beam, and
-        # context-parallel providers for decoder-only LLMs gain support for
-        # promoted final-context rows. Each relaxation must preserve whole-batch
-        # fallback on graph miss and prove parity with the provider's native
-        # q_len=1 path. Encoder-decoder and non-LLM engines remain out of scope.
-        if (scheduled_requests.num_context_requests > 0
-                and self.cuda_graph_runner.enabled and can_promote_spec_decode
-                and not self.use_beam_search
-                and not self._is_encoder_decoder_model()
-                # PLE owns recurrent n-gram and convolution state. Promoting a
-                # fresh final-context row would skip its cache-slot reset.
-                and not self._model_uses_ple_recurrent_state and
-                self.mapping.cp_size == 1):
-            graph_requests, promoted_context_request_ids = \
-                _make_single_token_context_graph_batch(
-                    scheduled_requests,
-                    self._is_final_multimodal_context_decode_compatible)
+        graph_requests, promoted_context_request_ids = self.make_graph_batch(
+            scheduled_requests)
 
         with self.cuda_graph_runner.pad_batch(
                 graph_requests, resource_manager,
@@ -6419,6 +6615,18 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
+            return False
+
+        # The userbuffers bootstrap exchanges CUDA memory handles over raw
+        # MPI_COMM_WORLD collectives (userbuffers-host.cpp). Under non-MPI
+        # orchestrators (Ray sets TLLM_DISABLE_MPI) every worker holds a
+        # 1-rank MPI world, so importer ranks would receive uninitialized
+        # bytes instead of peer handles and crash in
+        # cuMemImportFromShareableHandle with 'operation not supported'.
+        if mpi_disabled():
+            logger.info(
+                "Disabling userbuffers: its bootstrap requires MPI, which is "
+                "disabled under this orchestrator.")
             return False
 
         # Disable UB for unsupported platforms

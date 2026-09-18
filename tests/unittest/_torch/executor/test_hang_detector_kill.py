@@ -209,6 +209,9 @@ def test_control_request_wait_pauses_detector():
     executor.control_request_barrier = threading.Event()
     executor.control_action_done = threading.Event()
     executor.hang_detector = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
+    # The fire point retires the overlap loop's in-flight batch; none here.
+    executor.dist = SimpleNamespace(pp_size=1, world_size=1)
+    executor.disable_overlap_scheduler = True
 
     def complete_control_action():
         executor.control_request_barrier.wait()

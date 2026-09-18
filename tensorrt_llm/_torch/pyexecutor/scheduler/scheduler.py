@@ -178,7 +178,13 @@ def _get_forced_context_chunk_size(req: LlmRequest) -> int:
 
 def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
     next_position = req.context_current_position + chunk_size
-    return next_position >= req.prompt_len or next_position in req.expect_snapshot_points
+    return (
+        next_position >= req.prompt_len
+        or next_position in req.expect_snapshot_points
+        # The folded save-last point is a materialised snapshot boundary too
+        # (kept out of expect_snapshot_points so it does not end the chunk).
+        or next_position == getattr(req, "py_recurrent_fold_point", None)
+    )
 
 
 class ScheduledRequests:
@@ -1306,8 +1312,12 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         remaining snapshot point, they consume the full remaining context.
         Capacity-limited chunks are rounded down to a unit_size multiple.
 
-        This policy is designed for linear attention / Mamba2 state caching, which doesn't support
-        estimating reusable tokens, so we don't subtract them from the budget.
+        Budget accounting is reuse-aware for first chunks: admission shifts the
+        position to the reusable prefix and re-clips the chunk to end on the
+        next snapshot point, so the anticipated compute (that span, not the
+        face-value chunk size) is charged against the capacity. Face-value
+        charging reserved a full chunk unit per mostly-cached duplicate and
+        throttled admission to capacity // unit_size requests per pass.
         """
         if self.max_context_length is not None and self.max_context_length < unit_size:
             raise ValueError(
@@ -1320,11 +1330,36 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             chunk_size = _get_forced_context_chunk_size(req)
             if self.max_context_length is not None and chunk_size > self.max_context_length:
                 chunk_size = (self.max_context_length // unit_size) * unit_size
-            if capacity is not None and total_tokens + chunk_size > capacity:
-                remaining_capacity = max(0, capacity - total_tokens)
-                chunk_size = (min(chunk_size, remaining_capacity) // unit_size) * unit_size
+
+            remaining = req.context_remaining_length
+            reusable = (
+                min(req.estimated_reusable_tokens, remaining) if req.is_first_context_chunk else 0
+            )
+            cost = chunk_size
+            if reusable > 0:
+                points_after = [p for p in req.expect_snapshot_points if p > reusable]
+                if req.expect_snapshot_points:
+                    cost = (
+                        min(chunk_size, min(points_after) - reusable)
+                        if points_after
+                        else max(0, remaining - reusable)
+                    )
+                elif reusable + chunk_size >= remaining:
+                    cost = max(0, remaining - reusable)
+
+            if capacity is not None and total_tokens + cost > capacity:
+                if reusable > 0:
+                    # A reused first chunk's compute is small and indivisible;
+                    # defer it to the next pass instead of truncating the chunk
+                    # off the snapshot grid.
+                    chunk_size = 0
+                    cost = 0
+                else:
+                    remaining_capacity = max(0, capacity - total_tokens)
+                    chunk_size = (min(chunk_size, remaining_capacity) // unit_size) * unit_size
+                    cost = chunk_size
             req.context_chunk_size = int(chunk_size)
-            total_tokens += req.context_chunk_size
+            total_tokens += cost
         assert capacity is None or total_tokens <= capacity
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
@@ -1760,6 +1795,15 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                     logger.debug(
                         f"MaxUtilizationScheduler: request ID {paused_req.request_id} -> pause"
                     )
+                    # Pausing releases the paused sequence's scheduling
+                    # references, which invalidates the scheduling-view fields
+                    # of every cached summary (notably
+                    # recurrent_scheduling_free_off_grid_blocks: blocks the
+                    # paused sequence held are now scheduling-free, so a retry
+                    # that claims them must be surcharged). The C++ scheduler
+                    # recomputes the summary on every retry; mirror that by
+                    # dropping the cache so retries re-walk the tree.
+                    summary_by_req.clear()
                     req_it_end = last_started_idx
                 else:
                     break
@@ -1900,7 +1944,12 @@ class MaxUtilizationScheduledBlocksManager:
         """
         self.kv_cache_manager = kv_cache_manager
         self.two_steps_look_ahead = two_steps_look_ahead
-        window_sizes = set(kv_cache_manager.max_attention_window_vec)
+        # Sorted ascending to mirror the C++ std::map iteration: the recurrent
+        # pseudo-window's negative encoded size sorts FIRST, so the attention
+        # window's estimator call runs LAST and its estimated_reusable_tokens
+        # write survives (each call resets the estimate at entry). A plain set
+        # here iterates in hash order and can clobber the credit to 0.
+        window_sizes = sorted(set(kv_cache_manager.max_attention_window_vec))
         self.num_scheduled_blocks: dict[int, int] = {ws: 0 for ws in window_sizes}
 
     def prepare_blocks_if_schedulable(
@@ -2042,18 +2091,25 @@ class PyCapacityScheduler:
     def _is_skipping_relevant(self) -> bool:
         """
         Check if block reuse skip optimization is relevant.
-        Disabled for VSWA (Variable Sliding Window Attention).
-        C++ reference: capacityScheduler.cpp:207-208, 348
+        Disabled for VSWA (Variable Sliding Window Attention); a hybrid
+        model's extra recurrent-state window does not count as VSWA (its
+        single attention window still supports prefix analysis).
+        C++ reference: capacityScheduler.cpp skippingIsRelevant
         """
+
+        def variable_attention_window(manager) -> bool:
+            # Older bindings/mocks only expose is_variable_window.
+            attr = getattr(manager, "is_variable_attention_window", None)
+            return manager.is_variable_window if attr is None else attr
+
         if self.kv_cache_manager is None:
             return False
         if not self.enable_prefix_aware_scheduling:
             return False
-        if self.kv_cache_manager.is_variable_window:
+        if variable_attention_window(self.kv_cache_manager):
             return False
-        if (
-            self.cross_kv_cache_manager is not None
-            and self.cross_kv_cache_manager.is_variable_window
+        if self.cross_kv_cache_manager is not None and variable_attention_window(
+            self.cross_kv_cache_manager
         ):
             return False
         return True

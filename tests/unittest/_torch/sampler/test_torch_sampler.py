@@ -1042,8 +1042,15 @@ class TestFinishReasons:
             end_id: Optional[int] = None,
             num_draft_tokens: int | None = None,
             stop_words_list: Optional[list[list[int]]] = None,
+            seq_slot: Optional[int] = None,
         ):
-            seq_slot = self.seq_slots.pop()  # random seq slot in MAX_NUM_SEQUENCES
+            if seq_slot is not None:
+                # Explicit slot (e.g. to overlap the sampler warmup slots);
+                # reserve it so no other case pops it.
+                if seq_slot in self.seq_slots:
+                    self.seq_slots.remove(seq_slot)
+            else:
+                seq_slot = self.seq_slots.pop()  # random seq slot in MAX_NUM_SEQUENCES
             self.prompt = prompt
             if num_draft_tokens is None:
                 num_draft_tokens = len(new_tokens) - 1
@@ -1074,6 +1081,7 @@ class TestFinishReasons:
             check_no_cuda_sync: bool = True,
             extra_context: Callable[[], ContextManager[Any]] | None = None,
             expect_result: bool = True,
+            pre_uut: Callable[[TorchSampler], None] | None = None,
         ) -> UutProvider:
             @contextmanager
             def _uut_provider(is_warmup: bool) -> Generator[Callable[[], None], None, None]:
@@ -1091,6 +1099,10 @@ class TestFinishReasons:
                     disable_overlap_scheduler=False,
                 )
                 sampler = TorchSampler(args=sampler_args)
+                if pre_uut is not None:
+                    # E.g. the sampler stop-word kernel warmup, run before the
+                    # requests are set up — the production ordering.
+                    pre_uut(sampler)
                 finish_reasons_store = sampler._finish_reasons_handler.store
                 # setup the sampler store for the requests
                 scheduled_requests = ScheduledRequests()
@@ -1228,6 +1240,129 @@ class TestFinishReasons:
             ]
         )
 
+        run_test_with_warmup(uut_provider, max_sync_s=0.5)
+
+    @classmethod
+    def _stop_word_warmup_parity_case_batteries(
+        cls,
+    ) -> list[list["TestFinishReasons.RequestCase"]]:
+        """Case batteries pinning stop-word matching results on tricky inputs.
+
+        Slots 0 and 1 are the slots ``_warmup_stop_word_kernels`` occupies
+        with dummy stop words (slot 0: ``[3]`` and ``[3, 5]``; slot 1: ``[5]``
+        and ``[7]``); the cases deliberately generate exactly those token
+        patterns and expect NOT_FINISHED, proving the dummy words are inert.
+        The first battery mixes multi- and single-token stop words (routed to
+        the multi-token matching kernel); the second uses single-token words
+        only (single-token kernel).
+        """
+        multi_token_battery = [
+            # Warmup slot 0: the real stop word [12, 13] fires with prompt
+            # lookback; the trailing [3, 5] equals the slot-0 warmup dummy
+            # word and must not fire.
+            cls.RequestCase(
+                seq_slot=0,
+                prompt=[7, 12],
+                stop_words_list=[[12, 13]],
+                new_tokens=[13, 3, 5],
+                finish_reasons=[cls.STOP_WORDS, cls.NOT_FINISHED, cls.NOT_FINISHED],
+            ),
+            # Warmup slot 1, no stop words at all: the tokens equal the
+            # slot-1 warmup dummy words (5 and 7) and must not fire.
+            cls.RequestCase(
+                seq_slot=1,
+                prompt=[1, 2],
+                new_tokens=[5, 7, 3],
+                finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
+            ),
+            # Unicode stop string "。" as its UTF-8 byte-level BPE token
+            # sequence [227, 128, 130], matched across the prompt boundary.
+            cls.RequestCase(
+                prompt=[11, 227],
+                stop_words_list=[[227, 128, 130]],
+                new_tokens=[128, 130, 9],
+                finish_reasons=[cls.NOT_FINISHED, cls.STOP_WORDS, cls.NOT_FINISHED],
+            ),
+            # Unicode "🛑" as a single large token id.
+            cls.RequestCase(
+                prompt=[1],
+                stop_words_list=[[128721]],
+                new_tokens=[128721, 42, 43],
+                finish_reasons=[cls.STOP_WORDS, cls.NOT_FINISHED, cls.NOT_FINISHED],
+            ),
+        ]
+        single_token_battery = [
+            cls.RequestCase(
+                seq_slot=0,
+                prompt=[7, 12],
+                stop_words_list=[[13]],
+                new_tokens=[13, 3, 5],
+                finish_reasons=[cls.STOP_WORDS, cls.NOT_FINISHED, cls.NOT_FINISHED],
+            ),
+            cls.RequestCase(
+                seq_slot=1,
+                prompt=[1, 2],
+                stop_words_list=[[9]],
+                new_tokens=[5, 7, 9],
+                finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.STOP_WORDS],
+            ),
+        ]
+        return [multi_token_battery, single_token_battery]
+
+    @classmethod
+    def test_write_finish_reasons_stop_word_warmup_parity(cls):
+        """``_warmup_stop_word_kernels`` must not change stop-word matching.
+
+        Runs the tricky-case batteries (multi-token stop words, unicode-derived
+        token sequences, no stop words) twice — on a fresh sampler and on one
+        that ran the stop-word kernel warmup, reusing the warmup's sequence
+        slots — and expects identical finish reasons.
+        """
+        for pre_uut in (None, lambda sampler: sampler._warmup_stop_word_kernels()):
+            for battery in cls._stop_word_warmup_parity_case_batteries():
+                uut_provider = cls.RequestCase.build(battery, pre_uut=pre_uut)
+                run_test_with_warmup(uut_provider, max_sync_s=0.5)
+
+    @classmethod
+    def test_stop_word_warmup_leaves_no_stop_word_residue(cls, monkeypatch: pytest.MonkeyPatch):
+        """After the warmup, occupants of the warmup slots without stop words
+        must not trigger stop-word processing at all: the matching kernels are
+        gated per slot and the warmup resets that gate on its way out."""
+
+        def stop_words_that_raises(*args, **kwargs):
+            raise AssertionError
+
+        @contextmanager
+        def raising_stop_words_ctx() -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(
+                    FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
+                )
+                patch_ctx.setattr(
+                    FinishReasonsHandler,
+                    "_are_stop_words_single_token",
+                    stop_words_that_raises,
+                )
+                yield
+
+        uut_provider = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    seq_slot=0,
+                    prompt=[1, 2],
+                    new_tokens=[3, 5, 7],
+                    finish_reasons=[cls.NOT_FINISHED] * 3,
+                ),
+                cls.RequestCase(
+                    seq_slot=1,
+                    prompt=[1, 2],
+                    new_tokens=[5, 7, 3],
+                    finish_reasons=[cls.NOT_FINISHED] * 3,
+                ),
+            ],
+            pre_uut=lambda sampler: sampler._warmup_stop_word_kernels(),
+            extra_context=raising_stop_words_ctx,
+        )
         run_test_with_warmup(uut_provider, max_sync_s=0.5)
 
     @classmethod

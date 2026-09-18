@@ -31,7 +31,7 @@ and emits it at :func:`beam_search.finalize_beam`, sharing only the
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias, cast
+from typing import TYPE_CHECKING, Optional, TypeAlias, cast
 
 import torch
 
@@ -43,6 +43,7 @@ from ..llm_request import LlmRequest
 from .ops.vanilla import Fusions
 from .sampler_common import _BatchedSamplingResult
 from .sampler_features import _UnpackedStepIndexer
+from .steady_layout import _LogprobsIndexTensors, _SteadyDecodeLayout
 
 if TYPE_CHECKING:
     from .sampler import TorchSampler
@@ -328,6 +329,7 @@ class LogProbsHandler:
         seq_slots: torch.Tensor,
         requests: list[LlmRequest],
         req_num_generated_tokens: torch.Tensor,
+        layout: Optional[_SteadyDecodeLayout] = None,
     ) -> None:
         logprobs_cuda = batched_sampling_result.logprobs_cuda
         assert logprobs_cuda is not None  # _process_logprobs call is gated by return_log_probs
@@ -368,19 +370,44 @@ class LogProbsHandler:
         log_probs_store = self._sampler.store.log_probs_store
 
         if logprobs_reqs_indices:
-            logprobs_reqs_indices_1_beam = []
-            logprobs_reqs_indices_n_beam = []
-            for req_idx in logprobs_reqs_indices:
-                if requests[req_idx].py_beam_width == 1:
-                    logprobs_reqs_indices_1_beam.append(req_idx)
-                else:
-                    logprobs_reqs_indices_n_beam.append(req_idx)
+            # The request split and the gather / scatter indices depend on the batch
+            # layout only: an unchanged single-step decode batch records them once
+            # (TorchSampler._steady_layout_for) and reuses them every step.
+            lp = layout.logprobs_index if layout is not None else None
+            if lp is None:
+                logprobs_reqs_indices_1_beam: list[int] = []
+                logprobs_reqs_indices_n_beam: list[int] = []
+                for req_idx in logprobs_reqs_indices:
+                    if requests[req_idx].py_beam_width == 1:
+                        logprobs_reqs_indices_1_beam.append(req_idx)
+                    else:
+                        logprobs_reqs_indices_n_beam.append(req_idx)
+                lp = _LogprobsIndexTensors(
+                    reqs_indices_1_beam=logprobs_reqs_indices_1_beam,
+                    reqs_indices_n_beam=logprobs_reqs_indices_n_beam,
+                )
+                if layout is not None:
+                    layout.logprobs_index = lp
+            logprobs_reqs_indices_1_beam = lp.reqs_indices_1_beam
+            logprobs_reqs_indices_n_beam = lp.reqs_indices_n_beam
 
             slot_and_step_size = new_tokens_cuda.size(0) * new_tokens_cuda.size(1)
+            # One token per request in a one-step buffer: the step-major (new_tokens)
+            # and the slot-major (logprobs store) linear index of a request are both
+            # its sequence slot, so the two index maps below collapse to a gather.
+            single_step = self._sampler._single_step_fastpath and new_tokens_cuda.size(0) == 1
 
             def _gather_src_dst_indices(
-                reqs_indices_tensor: torch.Tensor,
+                reqs_indices: list[int],
             ) -> tuple[torch.Tensor, torch.Tensor]:
+                reqs_indices_tensor = torch.tensor(reqs_indices, dtype=torch.int32)
+                if single_step:
+                    slots = seq_slots[reqs_indices_tensor]
+                    src_indices_cuda = slots.to(device=logits_cuda.device, non_blocking=True)
+                    dst_indices_cuda = slots.to(dtype=torch.int64).to(
+                        device=logits_cuda.device, non_blocking=True
+                    )
+                    return src_indices_cuda, dst_indices_cuda
                 # Gather indices for new_tokens_cuda
                 # NB: Not reusing indexer from _unbatch_sampling_results in order to not add work
                 #     in case logprobs are not requested.
@@ -413,13 +440,13 @@ class LogProbsHandler:
                 return src_indices_cuda, dst_indices_cuda
 
             if logprobs_reqs_indices_1_beam:
-                logprobs_reqs_indices_1_beam_tensor = torch.tensor(
-                    logprobs_reqs_indices_1_beam, dtype=torch.int32
-                )
-
-                src_indices_cuda, dst_indices_cuda = _gather_src_dst_indices(
-                    logprobs_reqs_indices_1_beam_tensor
-                )
+                if lp.src_indices_1_beam_cuda is None:
+                    lp.src_indices_1_beam_cuda, lp.dst_indices_1_beam_cuda = (
+                        _gather_src_dst_indices(logprobs_reqs_indices_1_beam)
+                    )
+                src_indices_cuda = lp.src_indices_1_beam_cuda
+                dst_indices_cuda = lp.dst_indices_1_beam_cuda
+                assert src_indices_cuda is not None and dst_indices_cuda is not None
 
                 # Squash beams dimension
                 sampled_log_prob_indices = log_probs_store.sampled_log_prob_indices[:, 0, :]
@@ -496,13 +523,13 @@ class LogProbsHandler:
             # log_probs_store.sampled_log_probs. Therefore, neither sampled ranks nor sampled logprobs
             # are handled here.
             if logprobs_reqs_indices_n_beam:
-                logprobs_reqs_indices_n_beam_tensor = torch.tensor(
-                    logprobs_reqs_indices_n_beam, dtype=torch.int32
-                )
-
-                src_indices_cuda, dst_indices_cuda = _gather_src_dst_indices(
-                    logprobs_reqs_indices_n_beam_tensor
-                )
+                if lp.src_indices_n_beam_cuda is None:
+                    lp.src_indices_n_beam_cuda, lp.dst_indices_n_beam_cuda = (
+                        _gather_src_dst_indices(logprobs_reqs_indices_n_beam)
+                    )
+                src_indices_cuda = lp.src_indices_n_beam_cuda
+                dst_indices_cuda = lp.dst_indices_n_beam_cuda
+                assert src_indices_cuda is not None and dst_indices_cuda is not None
 
                 # NB: The transpose only works (yields contiguous tensors) if self._sampler.max_tokens=1 and would
                 #     not be necessary, if the code was refactored such that

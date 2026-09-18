@@ -222,6 +222,10 @@ class TopPDecayHandler:
             slot = request.py_seq_slot
             assert slot is not None
             self._slots.discard(slot)
+            # No decay configured (the common case): nothing to admit, and no
+            # UtilsSamplingParams to build (~10 us per request otherwise).
+            if not request.sampling_config.top_p_decay:
+                continue
             sampling_params = _request_get_sampling_params(request)
             if not top_p_decay_active(sampling_params):
                 continue

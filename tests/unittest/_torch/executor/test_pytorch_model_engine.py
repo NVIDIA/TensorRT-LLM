@@ -1336,32 +1336,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(engine.is_multimodal)
         engine._validate_breakable_cuda_graph_compatibility()
 
-<<<<<<< HEAD
-    def test_piecewise_refit_recapture_preserves_padding_dummy_requests(
-            self) -> None:
-        padding_dummy = object()
-        padding_dummy_requests = {0: padding_dummy}
-=======
-    def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
-
-    def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
-
     def test_restore_after_refit_rewraps_without_recapture(self) -> None:
         """Restore re-wraps torch.compile and does nothing else.
 
@@ -1373,7 +1347,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         Replaces test_piecewise_refit_recapture_preserves_padding_dummy_requests,
         which asserted the refit path recaptures. That path no longer exists.
         """
->>>>>>> ec0cd91d12 ([None][fix] Unwrap torch.compile before refit, and Rubin PCG fixes)
         cuda_graph_runner = SimpleNamespace(
             padding_dummy_requests={0: object()},
             allow_capture=lambda: nullcontext(),
@@ -1387,9 +1360,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             _apply_torch_compile=Mock(),
             _capture_piecewise_cuda_graphs=Mock(),
         )
-        # Strip the warmup/kv-cleanup decorators; they need a real engine.
-        restore_core = (PyTorchModelEngine.restore_compiled_model_after_refit.
-                        __wrapped__.__wrapped__)
+        # Strip the warmup-flag decorator; it needs a real engine.
+        restore_core = (
+            PyTorchModelEngine.restore_compiled_model_after_refit.__wrapped__)
 
         with patch("torch.compiler.reset") as reset, patch("gc.collect"):
             restore_core(model_engine, resource_manager=object())
@@ -1404,12 +1377,44 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             _torch_compile_enabled=False,
             _apply_torch_compile=Mock(),
         )
-        restore_core = (PyTorchModelEngine.restore_compiled_model_after_refit.
-                        __wrapped__.__wrapped__)
+        restore_core = (
+            PyTorchModelEngine.restore_compiled_model_after_refit.__wrapped__)
         restore_core(model_engine, resource_manager=object())
         model_engine._apply_torch_compile.assert_not_called()
 
-    def test_unwrap_for_refit_gates_on_torch_compile_not_piecewise(self) -> None:
+    def test_restore_after_refit_never_touches_the_kv_cache(self) -> None:
+        """The re-wrap hook must not run the warm-up KV-cache cleanup.
+
+        ``warmup_with_kv_cache_cleanup`` ends with
+        ``check_invalid_values_in_kv_cache(fill_with_zero=True)``, which
+        zero-fills every attention KV pool whether or not it found a NaN. That
+        is right after a capture warm-up that ran forwards on placeholder
+        inputs; restore never runs a forward, and under an in-flight weight
+        update the zero-fill would wipe the KV of the requests kept across the
+        refit. So the fully decorated hook must never even look up the KV cache
+        manager -- with torch.compile on or off.
+        """
+        for compile_enabled in (True, False):
+            with self.subTest(compile_enabled=compile_enabled):
+                resource_manager = Mock()
+                model_engine = SimpleNamespace(
+                    set_warmup_flag=nullcontext,
+                    _torch_compile_enabled=compile_enabled,
+                    _torch_compile_backend=Mock(),
+                    torch_compile_config=SimpleNamespace(
+                        enable_fullgraph=False),
+                    _apply_torch_compile=Mock(),
+                    kv_cache_manager_key="kv_cache_manager",
+                )
+                with patch("gc.collect"):
+                    PyTorchModelEngine.restore_compiled_model_after_refit(
+                        model_engine, resource_manager)
+                resource_manager.get_resource_manager.assert_not_called()
+                self.assertEqual(model_engine._apply_torch_compile.call_count,
+                                 1 if compile_enabled else 0)
+
+    def test_unwrap_for_refit_gates_on_torch_compile_not_piecewise(
+            self) -> None:
         """Compile-on/piecewise-off must still unwrap.
 
         This is the original defect: the hook was gated on the piecewise flag,
@@ -1450,8 +1455,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         Dropping an alias would therefore not raise -- it would silently skip
         the unwrap and reintroduce the refit corruption.
         """
-        self.assertIs(PyTorchModelEngine.release_piecewise_cuda_graphs_for_refit,
-                      PyTorchModelEngine.unwrap_compiled_model_for_refit)
+        self.assertIs(
+            PyTorchModelEngine.release_piecewise_cuda_graphs_for_refit,
+            PyTorchModelEngine.unwrap_compiled_model_for_refit)
         self.assertIs(
             PyTorchModelEngine.recapture_piecewise_cuda_graphs_after_refit,
             PyTorchModelEngine.restore_compiled_model_after_refit)

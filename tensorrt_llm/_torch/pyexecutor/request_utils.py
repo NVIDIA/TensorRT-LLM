@@ -378,16 +378,43 @@ class RequestBroadcaster:
         self.hang_detector = hang_detector
         self.send_requests_handler = None
 
-    def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
-        """Broadcast requests and Python objects across ranks."""
-        request_count = len(new_requests) if self.dist.rank == 0 else 0
-        # Idle non-root ranks can wait here while rank 0 blocks in the
-        # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
-        with self.hang_detector.pause():
-            request_count = self._broadcast_request_count(request_count)
+    def broadcast(
+        self,
+        new_requests: List,
+        *,
+        known_nonempty: bool = False,
+        prefer_cpu: bool = False,
+    ) -> Tuple[List, Optional[Tuple]]:
+        """Broadcast requests and Python objects across ranks.
 
-        if request_count == 0:
-            return [], None
+        Args:
+            new_requests: Requests fetched on rank 0 (ignored on other ranks).
+            prefer_cpu: Keep the request-count probe on the CPU transport.
+                Pass True from the IDLE fetch path, where non-root ranks park
+                in the probe while rank 0 blocks on the request queue (up to
+                20 min): a GPU-staged probe holds a spinning NCCL kernel on
+                the device for the whole park and puts the wait under the
+                NCCL watchdog, which killed idle context engines after 600 s
+                (Qwen3.5-397B disagg incidents, 2026-08-31). Must be
+                rank-consistent, like known_nonempty.
+            known_nonempty: All ranks already agree out-of-band (e.g. via the
+                pending-count hint piggybacked on the ADP rank-state allgather)
+                that rank 0 holds at least one request, so the request-count
+                probe broadcast is skipped and every rank enters the payload
+                broadcast directly. Must be passed with the same value on all
+                ranks.
+        """
+        if not known_nonempty:
+            if self._single_round(prefer_cpu):
+                return self._broadcast_single_round(new_requests)
+            request_count = len(new_requests) if self.dist.rank == 0 else 0
+            # Idle non-root ranks can wait here while rank 0 blocks in the
+            # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
+            with self.hang_detector.pause():
+                request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
+
+            if request_count == 0:
+                return [], None
 
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
@@ -405,13 +432,55 @@ class RequestBroadcaster:
 
         return new_requests, py_request_objects
 
-    def _broadcast_request_count(self, request_count: int) -> int:
+    def _single_round(self, prefer_cpu: bool) -> bool:
+        """Whether the count probe + payload pair collapses into one collective.
+
+        Rank-consistent: ``prefer_cpu`` is so by the caller's contract, the
+        rest is static topology / transport state shared by every rank. The
+        PP route keeps its probe + send/recv chain, and the idle path
+        (``prefer_cpu``) keeps the CPU-transport probe as its wake mechanism.
+        """
+        return (
+            not prefer_cpu
+            and self.dist.world_size > 1
+            and not self.dist.has_pp
+            and bool(getattr(self.dist, "supports_single_round_broadcast", False))
+        )
+
+    @nvtx_range("broadcast_requests")
+    def _broadcast_single_round(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
+        """One collective: rank 0 sends (requests, py objects) or "nothing".
+
+        Empty iterations cost one size exchange instead of the count probe's
+        two collectives; iterations with new requests cost two collectives
+        instead of four. Rank 0 stages the payload asynchronously and is not
+        held on this call (``TorchDist._cuda_broadcast_object``: it can run
+        one call ahead of the slowest peer, no further); non-root ranks wait
+        here for rank 0 exactly as they did in the probe. The hang-detector
+        pause covers both the non-root wait and the root's bounded fence.
+        """
+        payloads = None
+        if self.dist.rank == 0 and new_requests:
+            payloads = (new_requests, self._collect_py_objects(new_requests))
+        with self.hang_detector.pause():
+            received = self.dist.broadcast_or_none(payloads, root=0)
+        if received is None:
+            return [], None
+        if self.dist.rank == 0:
+            # Preserve the original objects on rank 0.
+            return new_requests, payloads[1]
+        return received
+
+    def _broadcast_request_count(self, request_count: int, prefer_cpu: bool = False) -> int:
         """Broadcast rank 0's request count using the same PP route as requests."""
         if self.dist.world_size == 1:
             return request_count
 
         if not self.dist.has_pp:
-            return int(self.dist.broadcast_int64([request_count], root=0)[0])
+            return int(
+                self.dist.broadcast_int64([request_count],
+                                          root=0,
+                                          prefer_cpu=prefer_cpu)[0])
 
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_request_count"):

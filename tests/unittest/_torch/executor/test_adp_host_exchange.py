@@ -234,7 +234,7 @@ class _ObjectPathDist(Distributed):
     def tp_barrier(self):
         pass
 
-    def broadcast(self, obj, root=0):
+    def broadcast(self, obj, root=0, **kwargs):
         return obj
 
     def allgather(self, obj, root=0):

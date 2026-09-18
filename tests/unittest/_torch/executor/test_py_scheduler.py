@@ -2114,6 +2114,57 @@ class TestPyCapacitySchedulerMaxUtilization:
         # MaxUtilization pauses gen_0 to make room for context_1.
         assert len(fitting) + len(paused) >= 1
 
+    def test_pause_rewalks_prefix_summary_before_retry(self):
+        """Pausing changes scheduling refs, so a retry must refresh prefix reuse."""
+
+        class PauseAwareKVCacheManager(MockKVCacheManager):
+            def __init__(self):
+                super().__init__(num_free_blocks=4, blocks_per_request=5, enable_block_reuse=True)
+                self.summary_walks: dict[int, int] = {}
+                self.removed_request_ids: list[int] = []
+
+            def analyze_prefix_reuse(self, unique_tokens, req):
+                request_id = int(req.py_request_id)
+                self.summary_walks[request_id] = self.summary_walks.get(request_id, 0) + 1
+                # Keep first_new_block unset so this test isolates summary-cache
+                # invalidation from beneficial-to-skip contribution tracking.
+                return MockPrefixReuseSummary()
+
+            def get_needed_blocks_one_step(
+                self,
+                req,
+                two_step_lookahead: bool,
+                window_size: int,
+                cached_summary=None,
+            ) -> int:
+                assert cached_summary is not None
+                return self._blocks_per_request
+
+            def scheduling_remove_sequence(self, req_id: int):
+                self.removed_request_ids.append(int(req_id))
+                self._num_free_blocks = 5
+
+        kv = PauseAwareKVCacheManager()
+        scheduler = PyCapacityScheduler(
+            max_num_requests=2,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            enable_prefix_aware_scheduling=True,
+        )
+        context = make_context_request(1)
+        active_generation = make_generation_request(2)
+
+        fitting, disagg, paused = scheduler.schedule_request([context, active_generation])
+
+        assert disagg == []
+        assert [req.request_id for req in fitting] == [context.request_id]
+        assert [req.request_id for req in paused] == [active_generation.request_id]
+        assert kv.removed_request_ids == [active_generation.py_request_id]
+        # First walk populates the cache before the failed fit. After pausing
+        # changes scheduling refs, retrying must walk again rather than consume
+        # stale scheduling-view recurrent off-grid counts.
+        assert kv.summary_walks == {context.py_request_id: 2}
+
     def test_no_requests_to_pause(self):
         """If no started requests to pause, scheduling stops."""
         kv = MockKVCacheManager(num_free_blocks=3, blocks_per_request=5)

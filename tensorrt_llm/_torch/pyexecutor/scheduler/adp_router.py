@@ -40,6 +40,8 @@ from collections import OrderedDict, namedtuple
 from dataclasses import MISSING, astuple, dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+import torch
+
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequestState
@@ -132,6 +134,11 @@ class RankState:
     num_active_requests: int = 0
     num_active_tokens: int = 0
     num_retiring_requests: int = 0
+    num_pending_new_requests: int = 0
+    """Rank 0's snapshot of not-yet-fetched requests (request queue +
+    accumulated), piggybacked on the allgather so every rank can skip the
+    request-count probe broadcast (or the whole fetch) on the busy path.
+    Always 0 on non-zero ranks and when the fetch hint is disabled."""
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
@@ -146,6 +153,7 @@ class RankState:
             self.num_active_requests,
             self.num_active_tokens,
             self.num_retiring_requests,
+            self.num_pending_new_requests,
             *self.iter_stats.serialize(),
         ]
 
@@ -153,7 +161,7 @@ class RankState:
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        rank_state_prefix_field_count = 4
+        rank_state_prefix_field_count = 5
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
         max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
         if len(values) < 1:
@@ -175,6 +183,7 @@ class RankState:
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
             num_retiring_requests=rank_values[3],
+            num_pending_new_requests=rank_values[4],
             iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
         )
 
@@ -286,6 +295,7 @@ class ADPRouter(ABC):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
+        num_pending_new_requests: int = 0,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -296,7 +306,58 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
+            num_pending_new_requests: Snapshot of this rank's not-yet-fetched
+                request count to piggyback on this allgather. Only rank 0
+                feeds the request queue, so callers pass a non-zero value
+                there exclusively (see RankState.num_pending_new_requests).
         """
+        local_state = self._build_local_rank_state(
+            active_requests, new_requests, iter_stats_payload, num_pending_new_requests
+        )
+        # The serialized RankState is a fixed-size flat int list, so ship it
+        # as a CPU int64 tensor: a tensor allgather is a single host
+        # collective, while an object allgather adds a size-exchange round
+        # plus pickling. This exchange runs on the executor's per-iteration
+        # hot host path, where one extra collective round is measurable.
+        payload = torch.tensor(local_state.serialize(), dtype=torch.int64)
+        responses = self.dist.tp_allgather(payload)
+        return [RankState.deserialize(data=resp.tolist()) for resp in responses]
+
+    def gather_all_rank_states_with_extras(
+        self,
+        active_requests: list[LlmRequest],
+        extra_ints: list[int],
+        *,
+        iter_stats_payload: RankIterStatsPayload | None = None,
+        num_pending_new_requests: int = 0,
+    ) -> tuple[list[RankState], list[list[int]]]:
+        """``gather_all_rank_states`` with extra per-rank ints on the same allgather.
+
+        The executor uses this to fold its other fixed-width per-iteration
+        votes (TLLM_ADP_PACKED_SYNC) into the RankState exchange: ``extra_ints``
+        is appended to the serialized RankState, the vector rides the same
+        int64 tensor transport (``Distributed.allgather_ints``), and the extras
+        are stripped again on receipt. Every rank must pass the same number of
+        extras. Returns ``(states, extras_per_rank)``, both indexed by TP rank.
+        The router's own state construction and routing logic are untouched.
+        """
+        local_state = self._build_local_rank_state(
+            active_requests, None, iter_stats_payload, num_pending_new_requests
+        )
+        state_ints = local_state.serialize()
+        width = len(state_ints)
+        rows = self.dist.allgather_ints([*state_ints, *extra_ints])
+        states = [RankState.deserialize(data=row[:width]) for row in rows]
+        extras = [list(row[width:]) for row in rows]
+        return states, extras
+
+    def _build_local_rank_state(
+        self,
+        active_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem] | None,
+        iter_stats_payload: RankIterStatsPayload | None,
+        num_pending_new_requests: int,
+    ) -> RankState:
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
             num_retiring_requests = len(active_requests) - len(active_requests_for_overlap)
@@ -306,8 +367,8 @@ class ADPRouter(ABC):
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
         local_state.num_retiring_requests = num_retiring_requests
         local_state.copy_iter_stats_from(iter_stats_payload)
-        responses = self.dist.tp_allgather(local_state.serialize())
-        return [RankState.deserialize(data=resp) for resp in responses]
+        local_state.num_pending_new_requests = num_pending_new_requests
+        return local_state
 
     @staticmethod
     def _assign_explicit_dp_ranks(
