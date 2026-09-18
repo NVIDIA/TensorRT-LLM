@@ -16,18 +16,20 @@ for the overall CBTS architecture.
 | `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
 | `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
-| `docs_rule.py` | `DocsRule` | `docsonly` | `docs/**`, `**/*.md`, `**/*.rst` → the dedicated `CPU-Build_Docs` stage |
+| `docs_rule.py` | `DocsRule` | `docsonly` | `docs/**`, `**/*.md`, `**/*.rst` → the dedicated `CPU-Build_Docs` stage plus the complete `l0_cpu` suite |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
 
 ## DocsRule
 
 Claims every file under `docs/` plus Markdown and reStructuredText files
-anywhere in the repository. It contributes the literal `CPU-Build_Docs`
-stage, which runs Doxygen and Sphinx `make html`; the stage is not backed by a
-test-db YAML. Documentation files inside another rule's source prefix remain
-excluded from that source rule, so a README-only edit runs docs rather than a
-backend test suite. Mixed documentation and targeted-test changes combine by
-unioning their stages.
+anywhere in the repository. It contributes the literal `CPU-Build_Docs` stage,
+which runs Doxygen and Sphinx `make html`, and keeps every block and entry in
+`l0_cpu.yml` so the matching `CPU-Generic-*` stages run their complete CPU
+suite. If the CPU test-db blocks or stages cannot be resolved, the rule forces
+fallback instead of silently running docs alone. Documentation files inside
+another rule's source prefix remain excluded from that source rule, so a
+README-only edit runs docs and CPU validation rather than a backend GPU suite.
+Mixed documentation and targeted-test changes combine by unioning their stages.
 
 ## WaivesRule
 
@@ -170,23 +172,23 @@ Outcomes:
 ## AutoDeployRule
 
 Path-only rule. Claims source files under `examples/auto_deploy/` and
-`tensorrt_llm/_torch/auto_deploy/` (excluding `.md`, which
-`OutOfScopeRule` claims as noop). Other suffixes — including images —
-are NOT excluded: a binary asset under an AD path could be a test
-fixture, so the rule keeps claiming them and forces AD stages to
-re-run.
+`tensorrt_llm/_torch/auto_deploy/` (excluding documentation, which
+`DocsRule` sends to the docs build). Other suffixes — including images —
+are NOT excluded: a binary asset under an AD path could be a test fixture,
+so the rule keeps claiming them and forces AD stages to re-run.
 
 Block selection — entry-based, two cases:
 - **Primary**: blocks where `condition.terms.backend == 'autodeploy'`.
   Covers the 9 AD-conditioned blocks across all yamls.
 - **Supplementary**: blocks containing entries with
   `test_llm_api_autodeploy.py` in the path or `_autodeploy-` in the
-  parametrize id. Covers 3 entries that live in `backend: pytorch`
-  blocks (l0_l40s, l0_perf) because Jenkins has no `L40S-AutoDeploy-*`
-  / `H100-Perf-AutoDeploy-*` stage to consume a proper AD-conditioned
-  block. The two patterns are stable conventions
+  parametrize id, plus tests under `unittest/auto_deploy/standalone/`.
+  These entries live in non-AD blocks because Jenkins has no matching
+  AutoDeploy stage to consume a proper AD-conditioned block. The patterns
+  are stable conventions
   (`test_llm_api_autodeploy.py` is the AD accuracy filename;
-  `_autodeploy-` is the cross-codebase backend parametrize value).
+  `_autodeploy-` is the cross-codebase backend parametrize value; the
+  standalone directory validates the packaged AutoDeploy installation).
 
 For each matched block, `block_filters` keeps only the AD entries
 (every entry for AD-conditioned blocks; only entries matching the

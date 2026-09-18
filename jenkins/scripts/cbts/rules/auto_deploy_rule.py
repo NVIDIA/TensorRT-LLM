@@ -22,9 +22,9 @@ enforces AD's outbound import discipline.
 Block selection (see RULES_BACKLOG.md P1 Output):
 - Primary: `condition.terms.backend == 'autodeploy'`.
 - Supplementary: blocks containing entries with `test_llm_api_autodeploy.py`
-  in the path or `_autodeploy-` in the parametrize id. These cover the
-  3 entries that live in `backend: pytorch` blocks because Jenkins has
-  no `L40S-AutoDeploy-*` / `H100-Perf-AutoDeploy-*` stage.
+  in the path, `_autodeploy-` in the parametrize id, or tests under
+  `unittest/auto_deploy/standalone/`. These cover AD tests that live in
+  non-AD blocks because Jenkins has no matching AutoDeploy stage for them.
 """
 
 from __future__ import annotations
@@ -51,10 +51,12 @@ _AD_SRC_PREFIXES: tuple[str, ...] = (
 # - `_autodeploy-`: cross-codebase parametrize id used by trtllm-bench
 #   and the literal trigger string for AD's lazy imports in
 #   `commands/serve.py`.
-# Audit (2026-05): exactly 3 entries in 2 blocks rely on this match.
+# - `unittest/auto_deploy/standalone/`: standalone-package validation lives
+#   in a generic PyTorch block but directly consumes the AutoDeploy package.
 _AD_LEAKER_PATTERNS: tuple[str, ...] = (
     "test_llm_api_autodeploy.py",
     "_autodeploy-",
+    "unittest/auto_deploy/standalone/",
 )
 
 
