@@ -27,7 +27,6 @@
       "layers": 21,
       "latency_relative_to_v2": {
         "gvr_v2": 1.0,
-        "temporal_r0": 2.08799443828557,
         "temporal_tiered": 1.5270656764856136,
         "radix_cuda": 4.875738163985888
       }
@@ -37,7 +36,6 @@
       "layers": 30,
       "latency_relative_to_v2": {
         "gvr_v2": 1.0,
-        "temporal_r0": 2.155315379850125,
         "temporal_tiered": 1.54320332519381,
         "radix_cuda": 4.871976103268161
       }
@@ -47,7 +45,6 @@
       "layers": 61,
       "latency_relative_to_v2": {
         "gvr_v2": 1.0,
-        "temporal_r0": 1.7817473025441366,
         "temporal_tiered": 1.3723454906900026,
         "radix_cuda": 5.250852136354158
       }
@@ -95,17 +92,6 @@
     }
   },
   "temporal_vs_v2": {
-    "temporal_r0": {
-      "cases": 9746,
-      "geomean": 1.9531313079318369,
-      "minimum": 0.9991411021654637,
-      "p5": 1.3488066063428978,
-      "p95": 2.9248310667525446,
-      "wins": 9745,
-      "win_percent": 99.98973938025857,
-      "baseline_median_us": 16.9455,
-      "gvr_median_us": 9.6435
-    },
     "temporal_tiered": {
       "cases": 9746,
       "geomean": 1.4550894088383663,
@@ -129,11 +115,6 @@
           "average_percent": 41.56601571959186,
           "peak_percent": 77.81571160254971
         },
-        "temporal_r0": {
-          "points": 9,
-          "average_percent": 20.189567701246013,
-          "peak_percent": 40.6975234111354
-        },
         "temporal_tiered": {
           "points": 9,
           "average_percent": 26.123944119758303,
@@ -150,11 +131,6 @@
           "points": 9,
           "average_percent": 39.00405637364329,
           "peak_percent": 68.39789370398464
-        },
-        "temporal_r0": {
-          "points": 9,
-          "average_percent": 19.692718835069805,
-          "peak_percent": 36.52586883421088
         },
         "temporal_tiered": {
           "points": 9,
@@ -173,11 +149,6 @@
           "average_percent": 41.47747500688756,
           "peak_percent": 66.53750601976955
         },
-        "temporal_r0": {
-          "points": 7,
-          "average_percent": 22.1752578474719,
-          "peak_percent": 34.125595313436996
-        },
         "temporal_tiered": {
           "points": 7,
           "average_percent": 27.779057298223755,
@@ -192,10 +163,6 @@
     }
   },
   "evolution_vs_radix": {
-    "temporal_r0": {
-      "geomean": 2.5865458712068374,
-      "wins_percent": 88.7235789041658
-    },
     "temporal_tiered": {
       "geomean": 3.4718579420414657,
       "wins_percent": 98.38908270059513

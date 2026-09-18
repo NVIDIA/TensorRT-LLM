@@ -33,18 +33,16 @@ MODELS = {
 }
 LABELS = {
     "gvr_v2": "GVR V2",
-    "temporal_r0": "GVR V1 · R0",
-    "temporal_tiered": "GVR V1 · tiered",
+    "temporal_tiered": "GVR V1",
     "radix_cuda": "TensorRT-LLM radix CUDA",
 }
 COLORS = {
     "gvr_v2": "#579600",
-    "temporal_r0": "#7395ab",
     "temporal_tiered": "#386781",
     "radix_cuda": "#64748b",
 }
 REACHABLE_BW = 6.912116
-TEMPORAL = ["temporal_r0", "temporal_tiered"]
+TEMPORAL = ["temporal_tiered"]
 CROSS_CAMPAIGN = set(TEMPORAL + ARMS)
 COMPARISON_ARMS = ["gvr_v2", *TEMPORAL, *ARMS]
 
@@ -120,18 +118,17 @@ def _comparison(rows: list[dict]) -> dict:
 
 def _overview(rows: list[dict]) -> None:
     data = _comparison(rows)
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5.2), sharey=True)
-    fig.subplots_adjust(left=0.185, right=0.97, bottom=0.23, top=0.73, wspace=0.14)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.7), sharey=True)
+    fig.subplots_adjust(left=0.185, right=0.97, bottom=0.25, top=0.70, wspace=0.14)
     labels = [
         "GVR V2",
-        "GVR V1 · R0",
-        "GVR V1 · tiered",
+        "GVR V1",
         "TRT-LLM radix CUDA",
     ]
-    positions = [3.8, 2.6, 1.6, 0.4]
+    positions = [2.8, 1.6, 0.4]
     for ax, (model, title) in zip(axes, MODELS.items()):
         panel = data[model]
-        ax.axhspan(3.3, 4.3, color="#edf5df", zorder=0)
+        ax.axhspan(2.3, 3.3, color="#edf5df", zorder=0)
         ax.axvline(1, color="#579600", alpha=0.55, linewidth=1, linestyle=(0, (2, 3)))
         for y, arm in zip(positions, COMPARISON_ARMS):
             value = panel["latency_relative_to_v2"][arm]
@@ -155,7 +152,7 @@ def _overview(rows: list[dict]) -> None:
             fontsize=9.5,
             color="#52616f",
         )
-        ax.set(xlim=(0, 5.95), ylim=(-0.15, 4.35), xticks=[0, 1, 2, 3, 4, 5])
+        ax.set(xlim=(0, 5.95), ylim=(-0.15, 3.35), xticks=[0, 1, 2, 3, 4, 5])
         ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}×"))
         ax.set_yticks(positions, labels, fontsize=10.5)
         ax.tick_params(axis="both", length=0, pad=8)
@@ -189,7 +186,7 @@ def _overview(rows: list[dict]) -> None:
     fig.text(
         0.035,
         0.067,
-        "GVR V1: R0 threshold ladder and tiered execution. V2: current-row self-sampling.",
+        "GVR V1: temporal hint calibration. GVR V2: current-row self-sampling.",
         fontsize=9,
         color="#52616f",
     )
@@ -234,17 +231,17 @@ def _evolution(rows: list[dict]) -> None:
     ax.text(
         0.2,
         5.55,
-        "Later temporal V1: hint calibration + multi-thresholding",
+        "GVR V1 (temporal hint): calibration + multi-thresholding",
         fontsize=11,
         weight="bold",
-        color="#7557a6",
+        color=COLORS["temporal_tiered"],
     )
     for x, label in [
         (0.2, "Previous indices\n→ current-score gather"),
         (3.6, "Hint-derived thresholds\n→ multiple exact counts"),
         (7.0, "Collect candidates\n→ exact refinement"),
     ]:
-        _box(ax, (x, 3.8), (2.8, 1.2), label, "#f2eef9", 10)
+        _box(ax, (x, 3.8), (2.8, 1.2), label, "#eef3f7", 10)
     ax.text(
         0.2,
         3.25,
@@ -282,16 +279,16 @@ def _evolution(rows: list[dict]) -> None:
         fontsize=9.5,
         color="#447a00",
     )
-    bars = fig.add_axes((0.76, 0.25, 0.21, 0.5))
+    bars = fig.add_axes((0.76, 0.30, 0.21, 0.4))
     arms = [*TEMPORAL, "gvr_v2"]
     for i, arm in enumerate(arms):
         ratios = [r["radix_cuda_us"] / r[arm + "_us"] for r in rows]
         value = geometric_mean(ratios)
-        bars.barh(i, value, height=0.52, color=["#baa6d3", "#7557a6", "#579600"][i])
+        bars.barh(i, value, height=0.52, color=COLORS[arm])
         bars.text(value + 0.1, i, f"{value:.2f}×", va="center", weight="bold", fontsize=12)
     bars.set_yticks(
-        range(3),
-        ["Temporal R0", "Temporal tiered", "GVR V2"],
+        range(len(arms)),
+        [LABELS[arm] for arm in arms],
         fontsize=10,
     )
     bars.invert_yaxis()
@@ -320,7 +317,7 @@ def _evolution(rows: list[dict]) -> None:
     fig.text(
         0.035,
         0.005,
-        "Flows show streaming paths; bars compare complete R0, tiered temporal, and V2 implementations.",
+        "Flows show streaming paths; bars compare complete GVR V1 and GVR V2 implementations.",
         fontsize=9,
         color="#475569",
     )
@@ -852,7 +849,7 @@ def _legend(fig: plt.Figure) -> None:
     fig.legend(
         handles=handles,
         loc="lower center",
-        ncol=4,
+        ncol=3,
         frameon=False,
         bbox_to_anchor=(0.5, 0.01),
         fontsize=10,
@@ -1068,7 +1065,7 @@ def _roofline(rows: list[dict]) -> None:
     fig.legend(
         handles=handles,
         loc="lower center",
-        ncol=4,
+        ncol=3,
         frameon=False,
         bbox_to_anchor=(0.53, 0.077),
         fontsize=10,

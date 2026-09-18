@@ -13,11 +13,11 @@ Selecting 1,024 INT32 indices from 131,072 FP32 scores writes just **4 KiB of ou
 
 GVR V2 makes each full-row pass more useful without depending on the previous decode step to predict the current one. **Self-sampling estimates where the current row's Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.** Together, they concentrate exact refinement on the small group of scores still competing for the final slots. Removing the Top-K prior also lets prefill and decode share a streaming selection core, with phase differences handled by row adapters.
 
-On B200, this design delivers **5.05× geometric-mean speedup over TensorRT-LLM radix CUDA**, with **1.95× over GVR V1 R0 and 1.46× over tiered GVR V1**. All comparisons use the same 9,746 workloads spanning DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers.
+On B200, this design delivers **5.05× geometric-mean speedup over TensorRT-LLM radix CUDA**, with **1.46× over GVR V1**. Both comparisons use the same 9,746 workloads spanning DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers.
 
-![Three horizontal bar-chart panels compare GVR V2, GVR V1 R0, tiered GVR V1, and TensorRT-LLM radix CUDA on the same cases per model. GVR V2 is 1.00; shorter bars mean less kernel time.](../media/gvr_v2/speedup.svg)
+![Three horizontal bar-chart panels compare GVR V2, GVR V1, and TensorRT-LLM radix CUDA on the same cases per model. GVR V2 is 1.00; shorter bars mean less kernel time.](../media/gvr_v2/speedup.svg)
 
-*Figure 1. Kernel time relative to GVR V2, geometrically averaged over the same workloads within each model; shorter is faster. The temporal bars show the R0 and tiered GVR V1 implementations. All four implementations cover the full 9,746-case grid.*
+*Figure 1. Kernel time relative to GVR V2, geometrically averaged over the same workloads within each model; shorter is faster. GVR V1 uses a temporal hint. All three implementations cover the full 9,746-case grid.*
 
 **The operator contract.** Given FP32 indexer scores and valid-row metadata, Top-K returns unordered INT32 positions for sparse attention's KV selection. With finite scores and at least $K$ entries, it selects an exact value multiset through $K$ distinct indices; ties can choose different positions. [Enablement](#enable-gvr-v2) lists hardware, shape, and configuration requirements.
 
@@ -45,9 +45,9 @@ On B200, this design delivers **5.05× geometric-mean speedup over TensorRT-LLM 
 
 ### From GVR V1 to V2: Why Move Beyond Temporal Hints?
 
-Temporal GVR V1 gathers current scores at the previous step's Top-K indices to predict admission thresholds. **Later V1 already uses multi-thresholding.** Its [R0 path](https://github.com/NVIDIA/TensorRT-LLM/pull/16457) builds a histogram over those gathered scores, proposes a threshold ladder, and counts its rungs together in one full-row pass. The [tiered streaming path](https://github.com/NVIDIA/TensorRT-LLM/pull/16877) also uses multiple thresholds, including exact counts at a pivot and a rescue rung. These are the temporal implementations compared with V2 below.
+GVR V1 gathers current scores at the previous step's Top-K indices to predict admission thresholds. **The GVR V1 baseline already uses multi-thresholding.** Its [streaming implementation](https://github.com/NVIDIA/TensorRT-LLM/pull/16877) uses sampled ladder counts to choose a pivot and a rescue rung, then verifies both exactly in a fused count/collect pass. This is the temporal-hint implementation compared with V2 below.
 
-Their admission objective is expressed through the monotone count function
+Its admission objective is expressed through the monotone count function
 
 $$
 C(T)=\sum_{i=0}^{N-1}\mathbf{1}[x_i\ge T].
@@ -80,35 +80,34 @@ V4 Pro's mean changes from **71.5% to 57.9%** between these inputs, and its rand
 
 A row's true hit rate is known only after the current selection is established. Verification can expose a poor threshold, but the hint gather and initial work have already been paid for. Conservative admission, repeated counts, capacity checks, and exact recovery keep weak hints safe; their overhead and extra reads reduce average speedup and make latency less predictable.
 
-V2 calibrates from the **current row**, removing dependence on temporal overlap and the read through old indices. It combines this calibration with histogram-based multi-threshold verification and crossing-bin refinement. **The defining change from later V1 is the source of the guess and the removal of temporal state; multi-thresholding is part of the design continuity.** These choices target a stronger practical performance floor and better average latency, without a fixed worst-case latency guarantee.
+V2 calibrates from the **current row**, removing dependence on temporal overlap and the read through old indices. It combines this calibration with histogram-based multi-threshold verification and crossing-bin refinement. **The defining change from GVR V1 is the source of the guess and the removal of temporal state; multi-thresholding is part of the design continuity.** These choices target a stronger practical performance floor and better average latency, without a fixed worst-case latency guarantee.
 
 #### A Hint That Crosses Framework Boundaries
 
-V1's prior also has a lifecycle outside the kernel. Temporal V1 has no prefill engine: TensorRT-LLM uses radix for prefill and can seed the decode prior from each request's last prefill selection. That phase-dependent history complicates a common selection architecture. V2's current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The [integration section](#decode-and-prefill-in-tensorrt-llm) traces the consequences for CUDA Graph preparation and disaggregated serving.
+V1's prior also has a lifecycle outside the kernel. GVR V1 has no prefill engine: TensorRT-LLM uses radix for prefill and can seed the decode prior from each request's last prefill selection. That phase-dependent history complicates a common selection architecture. V2's current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The [integration section](#decode-and-prefill-in-tensorrt-llm) traces the consequences for CUDA Graph preparation and disaggregated serving.
 
-| Algorithm question | Later temporal V1: R0 / tiered streaming | Streaming GVR V2 |
+| Algorithm question | GVR V1 (temporal hint) | Streaming GVR V2 |
 | :--- | :--- | :--- |
 | Where does the guess come from? | Current scores gathered through previous-step indices | Packed sample windows spread across the current row |
 | What makes the guess useful? | High, stable overlap with previous winners | Coverage of the current row's score distribution |
-| What guides admission? | A hint-derived ladder, with path-specific pivot and rescue choices | Sample-derived primary threshold, lower safety floor, and upper anchor |
+| What guides admission? | A hint-derived pivot and rescue rung | Sample-derived primary threshold, lower safety floor, and upper anchor |
 | What does verification learn? | Exact counts at multiple admission thresholds | Exact bin populations and counts at many boundaries |
 | Where does exact refinement start? | The admitted candidate set, with path-specific local refinement | The crossing bin containing rank $K$ |
 | What state crosses decode steps? | Per-layer prior indices | No Top-K prior |
 | How do prefill and decode relate? | Radix prefill; its last selection can seed temporal decode | Shared streaming selection with phase-specific row adapters |
 | How does a bad guess affect the result? | More admission/refinement work or recovery; membership remains exact | Lower admission or exact recovery; membership remains exact |
 
-![Later temporal V1 and streaming V2 both use multi-thresholding. V1 calibrates through previous winners; V2 samples the current row without a temporal prior. Measured bars compare temporal R0, tiered temporal GVR, and V2.](../media/gvr_v2/evolution.svg)
+![GVR V1 and streaming V2 both use multi-thresholding. V1 calibrates through previous winners; V2 samples the current row without a temporal prior. Measured bars compare GVR V1 and V2.](../media/gvr_v2/evolution.svg)
 
-*Figure 3. Multi-thresholding is shared by later temporal V1 and V2. The flows emphasize their calibration and refinement choices on streaming paths; the bars compare complete R0, tiered temporal, and V2 implementations over radix CUDA. V2 removes the temporal-overlap dependency and prior-state lifecycle.*
+*Figure 3. Multi-thresholding is shared by GVR V1 and V2. The flows emphasize their calibration and refinement choices on streaming paths; the bars compare complete GVR V1 and V2 implementations over radix CUDA. V2 removes the temporal-overlap dependency and prior-state lifecycle.*
 
-Temporal R0 and tiered GVR achieve **2.59× and 3.47×** speedup over radix CUDA; V2 reaches **5.05×**. V2 is **1.95× faster than temporal R0** and **1.46× faster than tiered temporal GVR**. These gains compare complete implementations, including their calibration, verification, refinement, and execution paths.
+GVR V1 achieves **3.47×** speedup over radix CUDA; V2 reaches **5.05×**. V2 is **1.46× faster than GVR V1**. These gains compare complete implementations, including their calibration, verification, refinement, and execution paths.
 
 The improvement also extends to the lower end of the measured speedup distribution:
 
-| Temporal V1 baseline | Geomean speedup | P5 speedup | Minimum speedup | V2 faster |
+| Baseline | Geomean speedup | P5 speedup | Minimum speedup | V2 faster |
 | :--- | ---: | ---: | ---: | ---: |
-| R0 | **1.95×** | **1.35×** | 0.999× | 99.99% |
-| Tiered streaming | **1.46×** | **1.10×** | 0.689× | 99.57% |
+| GVR V1 | **1.46×** | **1.10×** | 0.689× | 99.57% |
 
 P5 is the fifth percentile across workload-level speedups, each computed from mean kernel times. These results support broad improvement across tested workloads while retaining local regressions. Runtime P95/P99 latency and a fixed worst-case bound require different evidence; the stronger performance floor remains a design objective.
 
@@ -217,7 +216,7 @@ In the variable-length `main` route, warp 0 prepares sampling geometry while oth
 
 ### Multi-Thresholding: Make Each Full-Row Pass Count
 
-A scalar verification pass answers one question: how many scores exceed $T$? Later V1 already amortizes row reads across several admission thresholds. V2's streaming path uses a verification histogram to obtain a dense family of counts from the same classification work and locate the boundary for exact refinement.
+A scalar verification pass answers one question: how many scores exceed $T$? GVR V1 already amortizes row reads across several admission thresholds. V2's streaming path uses a verification histogram to obtain a dense family of counts from the same classification work and locate the boundary for exact refinement.
 
 Conceptually, divide the bracket $[T,H]$ into $M$ ordered bins, with boundaries $t_0,\ldots,t_M$, and let $h_j$ be the exact population of bin $j$. A descending cumulative scan yields
 
@@ -297,11 +296,10 @@ The benchmarks use FP32 indexer scores from the three models below on NVIDIA B20
 
 | Baseline | Geomean speedup | Minimum speedup | GVR V2 faster |
 | :--- | ---: | ---: | ---: |
-| GVR V1 R0 | **1.95×** | 0.999× | 99.99% |
-| GVR V1 tiered streaming | **1.46×** | 0.689× | 99.57% |
+| GVR V1 | **1.46×** | 0.689× | 99.57% |
 | TensorRT-LLM radix CUDA dispatch | **5.05×** | 1.34× | 100.00% |
 
-All three comparisons use the same 9,746 cases. The minimum column retains individual regressions, including the temporal V1 cases where V2 is slower. Figure 1 shows the model-level comparison over this same workload grid.
+Both comparisons use the same 9,746 cases. The minimum column retains individual regressions, including the GVR V1 cases where V2 is slower. Figure 1 shows the model-level comparison over this same workload grid.
 
 #### The Gains Extend Beyond an Average
 
@@ -319,11 +317,11 @@ The advantage extends across all 275 plotted shapes. The smallest shape-average 
 
 **TensorRT-LLM radix CUDA.** The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2's **5.05×** advantage is consistent with reducing full-row selection passes and matching execution to the workload.
 
-**Temporal GVR V1.** Both R0 and tiered streaming already combine multiple admission thresholds. V2 replaces the temporal prior with current-row calibration and couples exact bin counts to crossing-bin refinement. Its **1.95× and 1.46×** gains compare complete implementations, including their execution policies; they do not isolate the contribution of self-sampling alone.
+**GVR V1 (temporal hint).** V1 already combines multiple admission thresholds through pivot/rescue verification. V2 replaces the temporal prior with current-row calibration and couples exact bin counts to crossing-bin refinement. Its **1.46×** gain compares complete implementations, including their execution policies; it does not isolate the contribution of self-sampling alone.
 
 #### Latency Across Row Length and Batch Size
 
-![Cold kernel latency for GVR V2, GVR V1 R0, tiered GVR V1, and TensorRT-LLM radix CUDA versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
+![Cold kernel latency for GVR V2, GVR V1, and TensorRT-LLM radix CUDA versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
 *Figure 8. Mean cold kernel time across all captured layers: 21 for Flash, 30 for Pro, and 61 for V3.2. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
 
@@ -353,7 +351,7 @@ $$
 
 The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. Their **5.36 compare/byte** intersection exceeds the maximum ideal Top-K intensity by over 21×, placing the workload band on Figure 9A's bandwidth slope.
 
-![A two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2, GVR V1 R0, tiered GVR V1, and TensorRT-LLM radix CUDA at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
+![A two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2, GVR V1, and TensorRT-LLM radix CUDA at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
 *Figure 9.* A: theoretical and calibrated roofs. B: Pareto curves at $B=1024$, plotting useful throughput $P=BN/t$ against ideal intensity $I=N/[4(N+K)]$. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share $Q_{\min}$; extra work remains in measured time. This measures useful work relative to ideal traffic, not actual DRAM utilization.
 
@@ -373,13 +371,12 @@ It measures efficiency relative to the ideal traffic bound. The table compares *
 | Operator | V4 Flash | V4 Pro | V3.2 |
 | :--- | ---: | ---: | ---: |
 | **GVR V2** | **41.6% / 77.8%** | **39.0% / 68.4%** | **41.5% / 66.5%** |
-| GVR V1 R0 | 20.2% / 40.7% | 19.7% / 36.5% | 22.2% / 34.1% |
-| GVR V1 tiered streaming | 26.1% / 63.3% | 25.4% / 58.9% | 27.8% / 51.1% |
+| GVR V1 | 26.1% / 63.3% | 25.4% / 58.9% | 27.8% / 51.1% |
 | TensorRT-LLM radix CUDA | 7.7% / 16.9% | 7.8% / 16.4% | 8.3% / 17.8% |
 
 *Each cell shows average / peak.*
 
-GVR V2 leads both measures on all three models: its average reachable rate is **39.0–41.6%**, with peaks of **66.5–77.8%**. Tiered GVR V1 is the strongest baseline by both measures, averaging **25.4–27.8%**, with peaks of **51.1–63.3%**. On V3.2, it reaches **27.8% / 51.1%**, compared with V2's **41.5% / 66.5%**. Reporting both measures captures the best operating point and the performance sustained across the curve.
+GVR V2 leads both measures on all three models: its average reachable rate is **39.0–41.6%**, with peaks of **66.5–77.8%**. GVR V1 is the stronger baseline by both measures, averaging **25.4–27.8%**, with peaks of **51.1–63.3%**. On V3.2, it reaches **27.8% / 51.1%**, compared with V2's **41.5% / 66.5%**. Reporting both measures captures the best operating point and the performance sustained across the curve.
 
 #### Interpret the Remaining Gap
 
@@ -447,7 +444,7 @@ trtllm-bench --model deepseek-ai/DeepSeek-V4-Flash throughput \
   --tp 8 --ep 8
 ```
 
-`enable_heuristic_topk` defaults to `false`. Once it is enabled, `use_self_sampling_topk` defaults to `true`; the second field is explicit here for clarity. Supported prefill layers follow the same V2 selection. Setting `use_self_sampling_topk: false` selects temporal GVR for decode, whose prefill path remains radix.
+`enable_heuristic_topk` defaults to `false`. Once it is enabled, `use_self_sampling_topk` defaults to `true`; the second field is explicit here for clarity. Supported prefill layers follow the same V2 selection. Setting `use_self_sampling_topk: false` selects the temporal-hint decode dispatcher, which chooses among temporal kernel routes; prefill remains radix.
 
 The fast path expects FP32 scores with unit inner stride, a row stride divisible by four floats, and a 16-byte-aligned base. A single-row decode input also needs its physical width divisible by four; its valid prefix may be shorter. The retired `TRTLLM_GVR_SELF_SAMPLING` environment variable is no longer the enablement mechanism, and `use_cute_dsl_topk` is not required to select V2.
 
@@ -455,7 +452,7 @@ The fast path expects FP32 scores with unit inner stride, a row stride divisible
 
 GVR V2 follows from a practical limit of temporal prediction: a biased hint can be excellent when overlap is high, yet expensive to rely on when quality fluctuates. **Self-sampling calibrates from the current row; multi-threshold counts locate the crossing; exact refinement resolves the remaining membership.** Together, they target both difficult-input performance and average latency while preserving exactness.
 
-The performance maps show the gains across shapes, and the Pareto curves relate them to the bandwidth roof. Removing the temporal prior also removes its framework lifecycle: a shared streaming implementation serves prefill and decode through phase-specific row interfaces. The result is one algorithmic core whose calibration depends on the input it is selecting now.
+The performance map shows the gains across shapes, and the Pareto curves relate them to the bandwidth roof. Removing the temporal prior also removes its framework lifecycle: a shared streaming implementation serves prefill and decode through phase-specific row interfaces. The result is one algorithmic core whose calibration depends on the input it is selecting now.
 
 ### Further Reading
 

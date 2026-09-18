@@ -86,7 +86,7 @@ These percentages preserve the supplied summaries' precision. They are independe
 | [flash_timings.csv.gz](flash_timings.csv.gz) | 2,079 DeepSeek-V4 Flash cases |
 | [pro_timings.csv.gz](pro_timings.csv.gz) | 2,970 DeepSeek-V4 Pro cases |
 | [v32_timings.csv.gz](v32_timings.csv.gz) | 4,697 DeepSeek-V3.2 cases |
-| [temporal_comparison.csv.gz](temporal_comparison.csv.gz) | Two temporal GVR observations for each of the same 9,746 cases |
+| [temporal_comparison.csv.gz](temporal_comparison.csv.gz) | One GVR V1 observation for each of the same 9,746 cases |
 | [provenance.json](provenance.json) | Published-file checksums, implementation labels, pairing, and roofline constants |
 | [summary.json](summary.json) | Recomputed statistics |
 | [plot_results.py](plot_results.py) | Figure generation |
@@ -101,7 +101,7 @@ Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,0
 
 Each workload/batch case repeats one captured layer/step score row into distinct batch rows. This controls the input distribution and valid width while measuring batch scaling; it is not a heterogeneous batch of independent serving requests. GVR uses `next_n=1` and sets `max_seq_len` to that case's valid row length times its compression ratio. A serving graph may use a larger stable envelope and choose a different execution plan. The bundled grid does not independently benchmark ragged mixed-length batches, MTP, or prefill.
 
-The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). Its FP32 comparisons with GVR V1 R0, tiered GVR V1, and TensorRT-LLM radix CUDA match observations from separate runs by workload identity and batch size, with shape metadata checked where available. All four implementations cover the same 9,746 cases. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled kernel implementations and workloads, rather than the performance of entire serving frameworks.
+The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). Its FP32 comparisons with GVR V1 and TensorRT-LLM radix CUDA match observations from separate runs by workload identity and batch size, with shape metadata checked where available. All three implementations cover the same 9,746 cases. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled kernel implementations and workloads, rather than the performance of entire serving frameworks.
 
 The device kernel and host dispatcher at the [main revision audited on September 17, 2026](https://github.com/NVIDIA/TensorRT-LLM/commit/73c70633b2547eedf0c91f85e760aec534f6af84) are byte-identical to those measured for the reference. This establishes source continuity for those files, not a new whole-framework performance measurement.
 
@@ -110,34 +110,32 @@ Figures 1, 3, and 7–9 and their numerical summaries all use this PR #19076 ref
 | Implementation | Relevant comparison contract |
 | :--- | :--- |
 | GVR V2 | FP32 scores, valid row lengths, unordered INT32 indices |
-| GVR V1 R0 | Temporal-prior threshold ladder; complete implementation paired by workload and batch |
-| GVR V1 tiered streaming | Temporal-prior pivot/rescue admission; complete implementation paired by workload and batch |
+| GVR V1 | Temporal-prior pivot/rescue admission; complete implementation paired by workload and batch |
 | TensorRT-LLM radix CUDA | Production dispatcher, including short-row insertion and long-row split-work paths |
 
-The temporal implementation references appear below. Complete build revisions for the historical radix observations are unavailable in the timing export.
+The GVR V1 implementation reference appears below. Complete build revisions for the historical radix observations are unavailable in the timing export.
 
-## Temporal GVR and Algorithm Evolution
+## GVR V1 and Algorithm Evolution
 
-The temporal R0 and tiered implementations correspond to public [PR #16457](https://github.com/NVIDIA/TensorRT-LLM/pull/16457) and [PR #16877](https://github.com/NVIDIA/TensorRT-LLM/pull/16877). Both belong to later temporal V1, which already uses multi-threshold admission. R0 builds a histogram over hint-gathered scores, proposes a rung ladder, and obtains exact counts for multiple rungs in one row scan. Tiered streaming uses sampled ladder counts to choose a pivot and rescue rung, then verifies both exactly in a fused count/collect pass. Its short-row and register routes have different execution strategies; Figure 3 sketches the streaming comparison, while its bars measure complete implementations.
+The GVR V1 baseline is the tiered temporal implementation from public [PR #16877](https://github.com/NVIDIA/TensorRT-LLM/pull/16877), recorded in the `temporal_tiered_us` column. It already uses multi-threshold admission: sampled ladder counts choose a pivot and rescue rung, then a fused count/collect pass verifies both exactly. Its short-row and register routes have different execution strategies; Figure 3 sketches the streaming comparison, while its bars measure complete implementations.
 
-The original scalar/secant search is historical context, not the algorithm represented by the temporal bars. V2 changes calibration to packed/vectorized current-row windows and couples it to dense verification-bin counts and crossing-bin refinement; multi-thresholding itself is not a V2-only contribution. The temporal comparisons span full implementations, including scheduling and integration; they are not an isolated self-sampling ablation. The public temporal sources at the article's implementation reference are [the R0 kernel](https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode.py) and [tiered streaming](https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_tp.py).
+V2 changes calibration to packed/vectorized current-row windows and couples it to dense verification-bin counts and crossing-bin refinement; multi-thresholding itself is not a V2-only contribution. The GVR V1 comparison spans full implementations, including scheduling and integration; it is not an isolated self-sampling ablation. The public source at the article's implementation reference is [the GVR V1 kernel](https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_tp.py).
 
-Figure 3 computes each implementation's speedup directly from its paired radix times. The geometric means are 2.586546× for temporal R0, 3.471858× for tiered temporal GVR, and 5.051864× for V2. Direct temporal/V2 time ratios are 1.953131× and 1.455089×. `summary.json` records these under `evolution_vs_radix` and `temporal_vs_v2`. Historical R0 observations for V3.2 lack explicit N/K metadata; workload identity supplies the join for those records.
+Figure 3 computes each implementation's speedup directly from its paired radix times. The geometric means are 3.471858× for GVR V1 and 5.051864× for V2. The direct GVR V1/V2 time ratio is 1.455089×. `summary.json` records these under `evolution_vs_radix` and `temporal_vs_v2`.
 
 The direct V2 comparison also exposes the lower end of the measured speedup distribution:
 
-| Temporal baseline | V2 speedup, geometric mean | V2 speedup, P5 | V2 wins / cases | V2 win rate |
+| Baseline | V2 speedup, geometric mean | V2 speedup, P5 | V2 wins / cases | V2 win rate |
 | :--- | ---: | ---: | ---: | ---: |
-| R0 | 1.953131× | 1.348807× | 9,745 / 9,746 | 99.989739% |
-| Tiered | 1.455089× | 1.095922× | 9,704 / 9,746 | 99.569054% |
+| GVR V1 | 1.455089× | 1.095922× | 9,704 / 9,746 | 99.569054% |
 
-These P5 values are percentiles across per-case `temporal_us / gvr_v2_us` mean-time ratios, not runtime tail latencies or percentiles of individual timing repetitions. They describe the bundled case distribution and do not establish a worst-case latency guarantee.
+The P5 value is the fifth percentile across per-case `temporal_tiered_us / gvr_v2_us` mean-time ratios, not a runtime tail latency or a percentile of individual timing repetitions. It describes the bundled case distribution and does not establish a worst-case latency guarantee.
 
 ## Aggregation and Coverage
 
 Speedup is the geometric mean of per-case `baseline_us / gvr_v2_us` ratios. Every case has equal weight. A win is a ratio strictly above one; minima and percentiles also use individual ratios of case-level mean durations. `_stats` in `plot_results.py` calls `numpy.percentile` without a method override, using its default linear interpolation between adjacent sorted ratios at fractional index `(cases - 1)*p/100` for percentile `p`. No slower case is discarded.
 
-Figure 1 uses the same cases for all four implementations within each model: 2,079 Flash, 2,970 Pro, and 4,697 V3.2 cases, totaling 9,746. V2 is fixed at 1.00; shorter bars mean less time. These values are recorded under `comparison_common_cases`. The article's overall and per-model tables use this same full paired coverage.
+Figure 1 uses the same cases for all three implementations within each model: 2,079 Flash, 2,970 Pro, and 4,697 V3.2 cases, totaling 9,746. V2 is fixed at 1.00; shorter bars mean less time. These values are recorded under `comparison_common_cases`. The article's overall and per-model tables use this same full paired coverage.
 
 The latency and roofline curves use arithmetic-mean durations over all captured layers at each row-length/batch point: 21 layers for Flash, 30 for Pro, and 61 for V3.2. All layers at each plotted point have the same valid width. The radix CUDA comparison heatmap (Figure 7) instead geometrically averages per-layer `radix_cuda_us / gvr_v2_us` ratios at each shape, using the same layers. It contains 275 cells: 99 each for Flash and Pro, and 77 for V3.2, covering all 11 batch sizes. The panels share a 1–21× color scale with parity at 1.0, and cell labels round to one decimal place. The cell values range from 1.522571× to 20.182551×, with no clipping by the color scale. A shape average can hide variation among individual cases.
 
@@ -149,19 +147,18 @@ The article uses Figure 1 for the model-level comparison. The following table us
 
 | Baseline | V4 Flash, $K=512$ | V4 Pro, $K=1024$ | V3.2, $K=2048$ |
 | :--- | ---: | ---: | ---: |
-| GVR V1 R0 | 2.09× | 2.16× | 1.78× |
-| GVR V1 tiered streaming | 1.53× | 1.54× | 1.37× |
+| GVR V1 | 1.53× | 1.54× | 1.37× |
 | TensorRT-LLM radix CUDA | 4.88× | 4.87× | 5.25× |
 
-*Each model column uses the same workloads for all three baselines.*
+*Each model column uses the same workloads for both baselines.*
 
 For a concrete large-batch slice, the following times are at $B=1024$ and $N\approx131{,}072$, averaged over the same layers as Figure 8:
 
-| Model | GVR V2 | GVR V1 R0 | GVR V1 tiered | Radix CUDA |
-| :--- | ---: | ---: | ---: | ---: |
-| V4 Flash | **113.1 µs** | 269.3 µs | 138.4 µs | 461.3 µs |
-| V4 Pro | **132.8 µs** | 233.4 µs | 146.1 µs | 477.7 µs |
-| V3.2 | **123.9 µs** | 243.7 µs | 166.0 µs | 496.7 µs |
+| Model | GVR V2 | GVR V1 | Radix CUDA |
+| :--- | ---: | ---: | ---: |
+| V4 Flash | **113.1 µs** | 138.4 µs | 461.3 µs |
+| V4 Pro | **132.8 µs** | 146.1 µs | 477.7 µs |
+| V3.2 | **123.9 µs** | 166.0 µs | 496.7 µs |
 
 
 ## Roofline Definitions
