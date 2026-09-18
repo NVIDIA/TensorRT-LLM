@@ -912,11 +912,65 @@ def test_lazy_init_publishes_the_runtime_position_ceiling():
 
     worker._lazy_init(dm, _make_metadata(max_num_requests=2), attn_metadata)
 
-    # A full target verification accepts K+1 tokens, then DSpark indexes K
-    # block positions from that new start. The table length is max index + 1.
-    expected = 4096 + 5 + 1 + 5 + 1
+    # start_pos is a frame index (position + 1); a full verification then accepts
+    # K+1 tokens and DSpark indexes K block positions from that start. Length is
+    # max index + 1.
+    expected = 4096 + 1 + 5 + 1 + 5 + 1
     assert dm._runtime_position_ceiling == expected
     assert dm.dspark_model._runtime_position_ceiling == expected
+
+
+def test_position_ceiling_covers_the_config_cap_and_grows_after_kv_estimation():
+    """Publishing once, from one bound, undersizes the table for the rest of the run.
+
+    KV-cache estimation drives drafter forwards against a probe manager whose
+    max_seq_len is below the real one, and _create_cuda_graph_warmup_request puts
+    its dummy request at max_seq_len - 1 -- within one block of the table's end.
+    """
+    worker = _make_worker()
+    dm = _fake_draft_model()
+    dm.dspark_model = types.SimpleNamespace(_freqs_cap=9000)
+    meta = _make_metadata(max_num_requests=2)
+
+    # The probe manager's bound is below the config cap: cover both, not one.
+    # _freqs_cap 9000 encodes max_seq_len 9000 - block_size - 2.
+    worker._lazy_init(dm, meta, types.SimpleNamespace(max_seq_len=512))
+    assert dm.dspark_model._runtime_position_ceiling == (9000 - 5 - 2) + 1 + 5 + 1 + 5 + 1
+
+    # The real manager arrives after _win_inited is already set.
+    worker._lazy_init(dm, meta, types.SimpleNamespace(max_seq_len=16384))
+    assert dm.dspark_model._runtime_position_ceiling == 16384 + 1 + 5 + 1 + 5 + 1
+
+
+def test_position_bound_holds_across_cuda_graph_replays():
+    """The bound has to be an in-graph tensor op, not a host-side guard.
+
+    Warmup reaches this through ``cuda_graph_runner.replay``, which runs no Python,
+    so a captured graph keeps advancing a slot that no completion ever frees. Left
+    unbounded it ran 53 entries past the RoPE table [measured job 3097207]; the cap
+    itself sits at what a full-length real request reaches, so serving is untouched.
+    """
+    worker = _make_worker()
+    dm = _fake_draft_model(window_size=8)
+    worker._lazy_init(dm, _make_metadata(max_num_requests=2), types.SimpleNamespace(max_seq_len=64))
+    cap = worker._position_cap
+    assert cap == 64 + 1 + 5 + 1  # max_ctx + frame + K + bonus
+    assert cap == (64 + 5 + 5 + 3) - 1 - 5  # == table length - 1 - block_size
+
+    slots = torch.tensor([0], device="cuda", dtype=torch.long)
+    num_accepted = torch.tensor([6], device="cuda", dtype=torch.long)
+    input_positions = torch.tensor([cap - 3], device="cuda", dtype=torch.long)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        worker._advance_generation_state(slots, num_accepted, input_positions)
+
+    worker._ctx_len[slots] = 0
+    worker._position_initialized[slots] = False
+    for _ in range(5):
+        graph.replay()
+        assert worker._ctx_len[0].item() <= cap
+    assert worker._ctx_len[0].item() == cap
 
 
 def test_freqs_table_prefers_the_runtime_ceiling_over_the_config_cap(mocker):

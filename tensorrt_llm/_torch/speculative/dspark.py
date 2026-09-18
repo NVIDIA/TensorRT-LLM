@@ -40,13 +40,17 @@ if TYPE_CHECKING:
 def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
     """Return the number of RoPE entries needed by the DSv4 block drafter.
 
-    A target verification can accept the target token plus every draft token,
-    so ``start_pos`` advances by ``max_draft_len + 1``. The block drafter then
-    indexes ``block_size`` positions beginning at that start. With ``old``
-    bounded by ``max_ctx``, the largest index is
-    ``max_ctx + max_draft_len + 1 + block_size``; the length is one greater.
+    ``start_pos`` is a FRAME index, one above the absolute token position: the
+    prompt token at position p occupies frame p+1 (``_seed_context_windows``), so a
+    request served to ``max_ctx`` bootstraps at ``max_ctx + 1``. A verification then
+    accepts up to ``max_draft_len + 1`` tokens and the block drafter indexes
+    ``block_size`` further positions, making the largest index
+    ``max_ctx + 1 + max_draft_len + 1 + block_size``; the length is one greater.
+
+    The frame +1 is load-bearing: without it the drafter reached start_pos 4112 at
+    max_ctx 4105 and max_draft_len 5, one past the table [measured job 3097207].
     """
-    return int(max_ctx) + int(max_draft_len) + int(block_size) + 2
+    return int(max_ctx) + int(max_draft_len) + int(block_size) + 3
 
 
 @dataclass
@@ -262,6 +266,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
         self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
+        # Set in _lazy_init from the RoPE table the drafter will build; None
+        # leaves positions unbounded (direct construction in tests).
+        self._position_cap: Optional[int] = None
 
         # Slot management. ``_req_to_slot`` (python dict) + ``_free_slots`` are the
         # source of truth, updated in prepare()/forward(); ``_batch_to_slot`` is the
@@ -292,6 +299,42 @@ class DSv4DSparkWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def _publish_position_ceiling(self, draft_model, attn_metadata, block_size: int) -> None:
+        """Size the drafter's RoPE table from the runtime bound, and bound positions by it.
+
+        Runs on EVERY forward, not once behind ``_win_inited``. The first forward can
+        land on a KV-estimation probe manager whose ``max_seq_len`` is below the real
+        one, and a table pinned to that probe would index out of range for the rest
+        of the process; ``DFlashWorker._lazy_init_ctx_buffers`` re-publishes for that
+        reason. Grows only, and the table cache is keyed on the cap.
+
+        Two bounds exist and neither dominates: ``attn_metadata`` carries the KV
+        manager's ``max_seq_len`` while ``_freqs_cap`` carries the user's, and
+        ``_create_cuda_graph_warmup_request`` sizes its dummy request at whichever is
+        larger. Covering both is what keeps warmup off the end of the table.
+        """
+        inner_model = getattr(draft_model, "dspark_model", None) or draft_model
+        config_cap = int(getattr(inner_model, "_freqs_cap", 0) or 0)
+        # _freqs_cap is max_seq_len + block_size + 2; undo that so the config
+        # bound and the KV manager's go through one formula.
+        config_ctx = max(0, config_cap - block_size - 2)
+        max_ctx = getattr(attn_metadata, "max_seq_len", None)
+        if max_ctx is not None:
+            ceiling = max(
+                _dspark_position_ceiling(
+                    max(int(max_ctx), config_ctx), block_size, self.max_draft_len
+                ),
+                int(getattr(inner_model, "_runtime_position_ceiling", 0) or 0),
+            )
+            draft_model._runtime_position_ceiling = ceiling
+            if inner_model is not draft_model:
+                inner_model._runtime_position_ceiling = ceiling
+        # Largest absolute position the block drafter may hold: forward_batched
+        # gathers ``freqs[start_pos + block_size]`` and the interim back-fill
+        # ``freqs[old + block_size]``, so keep one block of headroom.
+        table_len = int(getattr(inner_model, "_runtime_position_ceiling", 0) or config_cap)
+        self._position_cap = (table_len - 1 - block_size) if table_len else None
+
     def _lazy_init(self, draft_model, spec_metadata, attn_metadata=None) -> None:
         block_size = int(draft_model.block_size)
         if block_size != self.max_draft_len:
@@ -300,21 +343,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 f"got block_size={block_size} and max_draft_len={self.max_draft_len}"
             )
 
+        self._publish_position_ceiling(draft_model, attn_metadata, block_size)
+
         if not self._win_inited:
-            # Published before the RoPE table is built (lazily, on first forward). The
-            # engine's max_seq_len is what positions reach and exceeds model_config's
-            # whenever spec decoding is on, so the config cap undersizes the table.
-            max_ctx = getattr(attn_metadata, "max_seq_len", None)
-            if max_ctx is not None:
-                ceiling = _dspark_position_ceiling(max_ctx, block_size, self.max_draft_len)
-                draft_model._runtime_position_ceiling = ceiling
-                # The worker owns the DSv4 wrapper, while the RoPE-table cache
-                # lives on its inner ``dspark_model``. Publish to both so the
-                # value that sizes the table is the runtime bound rather than
-                # the construction fallback.
-                inner_model = getattr(draft_model, "dspark_model", None)
-                if inner_model is not None:
-                    inner_model._runtime_position_ceiling = ceiling
             max_batch = spec_metadata.max_num_requests
             num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
@@ -472,6 +503,14 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._position_initialized[scratch].zero_()
         old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
         start_pos = old + num_accepted_tokens
+        # Bound both positions by the RoPE table they index. Warmup reaches this
+        # through a captured graph replay, which runs no Python, so only an in-graph
+        # tensor op can hold the line. _position_cap sits exactly at what a real
+        # request reaches, and only a warmup row -- whose draft is discarded --
+        # climbs past it, because no completion ever frees its slot.
+        if self._position_cap is not None:
+            old = torch.clamp(old, max=self._position_cap)
+            start_pos = torch.clamp(start_pos, max=self._position_cap)
         self._ctx_len[slots] = start_pos
         self._valid_len[slots] = torch.clamp(
             self._valid_len[slots] + num_accepted_tokens, max=self._win
@@ -517,6 +556,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # the gen tokens after the context tokens.
         gen_start = attn_metadata.num_ctx_tokens
         slots = self._batch_to_slot[num_contexts:batch_size]  # [G]
+        # Bootstrap iterations can process one target token per request, while
+        # normal speculative verification processes K+1. Use the actual accepted
+        # row width to index both captured hidden states and position IDs.
+        target_width = accepted_tokens.shape[1]
         nacc = num_accepted_tokens[num_contexts:batch_size].long()  # [G]
         gidx = nacc - 1  # [G] index of the bonus within each verified prefix
 
@@ -525,10 +568,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
             accepted_tokens[num_contexts:batch_size].gather(1, gidx.unsqueeze(1)).squeeze(1).long()
         )  # [G]
 
-        # Bootstrap iterations can process one target token per request, while
-        # normal speculative verification processes K+1. Use the actual accepted
-        # row width to index both captured hidden states and position IDs.
-        target_width = accepted_tokens.shape[1]
         arange_g = torch.arange(num_gens, device=device)
         base = gen_start + arange_g * target_width  # [G]
         main_hidden = captured[base + gidx]  # [G, ncap*hidden]
