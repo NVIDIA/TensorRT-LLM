@@ -254,6 +254,13 @@ class CuteDslMlaFmha(PhasedFmha):
             (128, 2): 32,
         }
         min_batch = _PERF_MIN_BATCH_FP8.get((num_heads, seq_len_q))
+        if min_batch is None and num_heads == 96:
+            # For H=96 this table is a correctness constraint, not a perf
+            # tradeoff: TRTLLM-Gen rejects 64 < num_heads_q < 128 outright, so
+            # falling through does not reach a faster kernel, it reaches an
+            # executor-init failure. Admit every seq_len_q, which is what
+            # speculative decode (1 + draft_len) needs.
+            min_batch = 1
         if min_batch is None:
             return False, (
                 f"CuTe DSL MLA decode is not a perf win for "
