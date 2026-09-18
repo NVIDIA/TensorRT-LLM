@@ -17,6 +17,7 @@ virtual attention-op pool rooted at its K page inside the mega-slot.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -274,6 +275,39 @@ def test_hybrid_view_rejects_non_p32_draft_pages():
         assert "physical dense-cache page size P32" in str(error)
     else:
         raise AssertionError("expected NVFP4 Eagle draft view to require P32 pages")
+
+
+@pytest.mark.parametrize("local_draft_layers", [[], [60], [61], [60, 61]])
+@pytest.mark.parametrize("swa_scratch_reuse", [False, True])
+def test_draft_subpage_accessor_respects_local_layers(
+    monkeypatch: pytest.MonkeyPatch, local_draft_layers: list[int], swa_scratch_reuse: bool
+) -> None:
+    """Only local draft layers may create a view; scratch reuse is unsupported on every rank."""
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = DataType.NVFP4
+    manager.is_draft = False
+    manager._shared_draft_layer_ids = [60, 61]
+    manager.layer_offsets = {layer: local for local, layer in enumerate([30, *local_draft_layers])}
+    manager.enable_swa_scratch_reuse = swa_scratch_reuse
+    manager._draft_subpage_view_obj = None
+    view = SimpleNamespace(tokens_per_block=32, blocks_in_primary_pool=1024)
+    create_view = Mock(return_value=view)
+    monkeypatch.setattr(m3_cache_manager, "MiniMaxM3DraftSubpageView", create_view)
+
+    if swa_scratch_reuse:
+        with pytest.raises(NotImplementedError, match="SWA scratch reuse"):
+            manager.get_draft_subpage_view()
+        create_view.assert_not_called()
+        assert manager._draft_subpage_view_obj is None
+    elif not local_draft_layers:
+        assert manager.get_draft_subpage_view() is None
+        create_view.assert_not_called()
+        assert manager._draft_subpage_view_obj is None
+    else:
+        assert manager.get_draft_subpage_view() is view
+        assert manager.get_draft_subpage_view() is view
+        create_view.assert_called_once_with(manager, local_draft_layers, 32)
+    assert manager._shared_draft_layer_ids == [60, 61]
 
 
 def test_nvfp4_manager_rejects_dynamic_tree_eagle_before_allocation():

@@ -625,11 +625,23 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """
         if self.dtype != DataType.NVFP4 or self.is_draft or not self._shared_draft_layer_ids:
             return None
+        if self.enable_swa_scratch_reuse:
+            raise NotImplementedError(
+                "MiniMax-M3 shared Eagle3 draft layers do not support SWA scratch reuse."
+            )
+        # Shared IDs are global, but only the last pipeline rank owns draft layers.
+        draft_layers = [
+            layer_idx
+            for layer_idx in self._shared_draft_layer_ids
+            if layer_idx in self.layer_offsets
+        ]
+        if not draft_layers:
+            return None
         if self._draft_subpage_view_obj is None:
             subpage_tokens = self.draft_manager_tokens_per_block
             self._draft_subpage_view_obj = MiniMaxM3DraftSubpageView(
                 self,
-                self._shared_draft_layer_ids,
+                draft_layers,
                 subpage_tokens,
             )
             logger.info(
