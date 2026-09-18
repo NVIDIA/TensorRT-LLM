@@ -46,6 +46,9 @@ class EvictablePage(Protocol):
     @property
     def status(self) -> PageStatus: ...
 
+    @property
+    def locality_domain_id(self) -> int | None: ...
+
     def is_committed(self) -> bool: ...
 
     node_ref: "NodeRef | None"
@@ -192,7 +195,9 @@ class PerLevelEvictionController:  # for one cache level
     # them makes the remaining blocks useless.
     # Raise if no enough pages to evict. In this case, pages are returned to the eviction queue.
     def evict(
-        self, min_num_pages: TypedIndexList[PoolGroupIndex, int]
+        self,
+        min_num_pages: TypedIndexList[PoolGroupIndex, int],
+        page_filter: Callable[[EvictablePage], bool] | None = None,
     ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
         assert NDEBUG or len(min_num_pages) == self.num_pool_groups
         ret = make_typed(lambda _: list[EvictablePage](), self.num_pool_groups)
@@ -201,11 +206,17 @@ class PerLevelEvictionController:  # for one cache level
                 if count < 0:
                     raise ValueError("Eviction count must be non-negative")
                 policy = self._policies[pg_idx]
-                if (len(policy) + len(ret[pg_idx])) < count:
+                if page_filter is None and (len(policy) + len(ret[pg_idx])) < count:
                     raise OutOfPagesError(f"Not enough pages to evict in group {pg_idx}")
                 while len(ret[pg_idx]) < count:
-                    page = policy.pop()
-                    page.node_ref = None
+                    if page_filter is None:
+                        page = policy.pop()
+                        page.node_ref = None
+                    else:
+                        page = next((p for p in policy if page_filter(p)), None)
+                        if page is None:
+                            raise OutOfPagesError(f"Not enough pages to evict in group {pg_idx}")
+                        self.remove(unwrap_optional(page.node_ref))
                     ret[pg_idx].append(page)
                     for a, b in zip(ret, self._evict_dependencies(page)):
                         a.extend(b)
@@ -231,8 +242,15 @@ class PerLevelEvictionController:  # for one cache level
     ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
         return make_typed(lambda _: list[EvictablePage](), self.num_pool_groups)
 
-    def num_evictable_pages(self, pg_idx: PoolGroupIndex) -> int:
-        return len(self._policies[pg_idx])
+    def num_evictable_pages(
+        self,
+        pg_idx: PoolGroupIndex,
+        page_filter: Callable[[EvictablePage], bool] | None = None,
+    ) -> int:
+        policy = self._policies[pg_idx]
+        if page_filter is None:
+            return len(policy)
+        return sum(1 for page in policy if page_filter(page))
 
     @property
     def num_pool_groups(self) -> PoolGroupIndex:

@@ -1623,6 +1623,7 @@ class KvCacheCreator:
             enable_kv_cache_stats=self._enable_kv_cache_stats()
             and not estimating_kv_cache,
             execution_stream=self._execution_stream,
+            enable_locality_domains=self._llm_args.enable_locality_domains,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
             disable_overlap_scheduler=self._disable_overlap_scheduler,
@@ -1851,6 +1852,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
+            enable_locality_domains=self._llm_args.enable_locality_domains,
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
@@ -2543,6 +2545,7 @@ def _create_kv_cache_manager(
         estimating_kv_cache: bool = False,
         enable_kv_cache_stats: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        enable_locality_domains: bool = False,
         # Optional overrides for one-model draft case (when model_engine is None)
         model_config: Optional[ModelConfig] = None,
         dtype: Optional[torch.dtype] = None,
@@ -2724,6 +2727,8 @@ def _create_kv_cache_manager(
             draft_config_for_kv)
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+        manager_extra_kwargs[
+            "enable_locality_domains"] = enable_locality_domains
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
             model_engine._max_cuda_graph_batch_size
             if model_engine is not None else max_cuda_graph_batch_size)

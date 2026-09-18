@@ -921,8 +921,9 @@ class _KVCache:
                 try:
                     new_slots = storage.new_gpu_slots(
                         make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles),
-                        self._record_migrated_slots,
-                        self._record_dropped_pages,
+                        locality_domain_id=self.locality_domain_id,
+                        migration_recorder=self._record_migrated_slots,
+                        drop_recorder=self._record_dropped_pages,
                     )
                 except OutOfPagesError:
                     self._recover_excess_scratch_slots(excess_scratch_slots)
@@ -1325,7 +1326,10 @@ class _KVCache:
         if any(c > 0 for c in num_slots):
             try:
                 tmp_slots = storage.new_gpu_slots(
-                    num_slots, self._record_migrated_slots, self._record_dropped_pages
+                    num_slots,
+                    locality_domain_id=self.locality_domain_id,
+                    migration_recorder=self._record_migrated_slots,
+                    drop_recorder=self._record_dropped_pages,
                 )
             except OutOfPagesError:
                 return False
@@ -1523,7 +1527,9 @@ class _KVCache:
             # StorageManager reports what it actually migrated. Blocks, the unit
             # iter_offload_blocks and iter_onboard_blocks use: one page per block per life cycle.
             # Unrelated to _cached_tokens_by_level, which answers where matched tokens lived.
-            disk_blocks_migrated = storage.prefetch(target, all_pages)
+            disk_blocks_migrated = storage.prefetch(
+                target, all_pages, locality_domain_id=self.locality_domain_id
+            )
             if disk_blocks_migrated > 0 and self._should_record_manager_stats():
                 manager.record_disk_prefetch_blocks(disk_blocks_migrated)
         except OutOfPagesError:
@@ -1570,6 +1576,11 @@ class _KVCache:
     def tokens_per_block(self) -> int:
         return self._tokens_per_block
 
+    @property
+    def locality_domain_id(self) -> int | None:
+        """The locality domain this KV cache is pinned to, or None if non-localized."""
+        return self._reuse_scope.locality_domain_id
+
     def _page(
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex, life_cycle: LifeCycleId
     ) -> BlockPage:
@@ -1607,7 +1618,9 @@ class _KVCache:
         pg_idx = storage.get_pool_group_index(lc_idx)
         for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
             try:
-                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
+                new_slot = storage.new_slots_for_pool_group(
+                    lvl, pg_idx, 1, locality_domain_id=self.locality_domain_id
+                )[0]
             except OutOfPagesError:
                 continue
             cuda_stream = self.cuda_stream

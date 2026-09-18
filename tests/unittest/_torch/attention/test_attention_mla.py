@@ -1373,6 +1373,11 @@ class _Prefixes:
                                                 device=device)
         # `enable_flash_mla` is the only other attribute the two hooks read.
         self.enable_flash_mla = False
+        # _invalidate_mla_scheduler_buffers consults these before recomputing
+        # the per-locality-domain splits; False short-circuits that branch.
+        self.locality_domain_enabled = False
+        self.kv_cache_manager = None
+        self.request_ids = None
         self._invalidate_mla_scheduler_buffers()
 
     def rebuild(self):

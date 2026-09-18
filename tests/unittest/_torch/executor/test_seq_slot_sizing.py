@@ -713,6 +713,7 @@ def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) 
     c._disable_overlap_scheduler = disable_overlap_scheduler
     c._llm_args = SimpleNamespace(
         kv_cache_config=SimpleNamespace(kv_events_config=None),
+        enable_locality_domains=False,
     )
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True

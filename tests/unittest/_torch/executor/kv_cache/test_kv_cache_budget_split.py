@@ -69,7 +69,7 @@ def _make_creator(
     c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
-    c._llm_args = SimpleNamespace(kv_cache_compression_config=None)
+    c._llm_args = SimpleNamespace(kv_cache_compression_config=None, enable_locality_domains=False)
     c._disable_overlap_scheduler = False
 
     c._kv_cache_manager_cls = Mock()
@@ -357,6 +357,8 @@ class TestSplitGpuBudgetForDraft:
         creator._draft_config = draft_model_config
         creator._kv_cache_manager_cls = RecordingKVCacheManager
         creator._is_disagg = False
+        creator._cache_transceiver_config = None
+        creator._llm_args = SimpleNamespace(enable_locality_domains=False)
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)

@@ -353,6 +353,23 @@ kv_cache_config:
 
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
 
+    def test_from_yaml_enable_locality_domains(self, tmp_path):
+        assert TorchLlmArgs(
+            model=llama_model_path).enable_locality_domains is False
+
+        yaml_path = tmp_path / "locality_domains.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump({
+                "model": str(llama_model_path),
+                "enable_locality_domains": True,
+            }),
+            encoding="utf-8",
+        )
+
+        llm_args = TorchLlmArgs.from_yaml(yaml_path)
+
+        assert llm_args.enable_locality_domains is True
+
     def test_from_yaml_empty_file_reports_missing_model(self, tmp_path):
         yaml_path = tmp_path / "empty.yaml"
         yaml_path.write_text("", encoding="utf-8")
