@@ -1,0 +1,248 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Build the pinned control once and record provenance for both A/B arms."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONTROL = "0f2c3a95f9415045bdf06a7230759475692483b6"
+
+
+def _git(source: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def runtime_identity(python: Path) -> dict:
+    """Inspect one interpreter without user-site, PYTHONPATH, or working-directory overlays."""
+    code = """
+import importlib.metadata, json, os, re, sys
+packages = []
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata.get('Name')
+    if not name or not distribution.version:
+        raise ValueError('installed distribution has incomplete metadata')
+    packages.append({'name': re.sub(r'[-_.]+', '-', name).lower(),
+                     'version': distribution.version,
+                     'location': os.path.abspath(distribution.locate_file(''))})
+packages.sort(key=lambda item: (item['name'], item['version'], item['location']))
+print(json.dumps({'runtime_python': os.path.abspath(sys.executable),
+                  'runtime_prefix': os.path.abspath(sys.prefix),
+                  'runtime_python_version': sys.version,
+                  'runtime_sys_path': sys.path,
+                  'runtime_distributions': packages}))
+"""
+    return json.loads(
+        subprocess.check_output([str(python), "-I", "-c", code], text=True, timeout=120)
+    )
+
+
+def _prepare_cli_wrappers(python: Path) -> dict:
+    code = """
+import importlib.metadata, json
+result = {}
+for name, package, version in (('aiperf', 'aiperf', '0.8.0'), ('lm_eval', 'lm_eval', '0.4.10')):
+    distribution = importlib.metadata.distribution(package)
+    if distribution.version != version:
+        raise ValueError(f'{package} must be {version}, got {distribution.version}')
+    entries = [entry for entry in distribution.entry_points
+               if entry.group == 'console_scripts' and entry.name == name]
+    if len(entries) != 1:
+        raise ValueError(f'{package} has no unique {name} console entry point')
+    result[name] = {'distribution': package, 'version': version, 'entrypoint': entries[0].value}
+print(json.dumps(result))
+"""
+    entries = json.loads(
+        subprocess.check_output([str(python), "-I", "-c", code], text=True, timeout=120)
+    )
+    for name, metadata in entries.items():
+        script = python.parent / name
+        created = not script.exists()
+        if created:
+            script.write_text(
+                f"#!{python}\n"
+                "from importlib.metadata import distribution\n"
+                f"entry = next(item for item in distribution({metadata['distribution']!r}).entry_points\n"
+                f"             if item.group == 'console_scripts' and item.name == {name!r}\n"
+                f"             and item.value == {metadata['entrypoint']!r})\n"
+                "raise SystemExit(entry.load()())\n"
+            )
+            script.chmod(0o755)
+        first_line = script.read_text().splitlines()[0]
+        if not first_line.startswith("#!") or Path(first_line[2:]).parent != python.parent:
+            raise ValueError(f"{script} is not bound to the baseline venv interpreter")
+        if not os.access(script, os.X_OK):
+            raise ValueError(f"baseline CLI is not executable: {script}")
+        metadata.update(path=str(script), sha256=_sha256(script), generated=created)
+    return entries
+
+
+def main() -> int:
+    """Build in an approved compute allocation, never on a login frontend."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--build-root", type=Path, required=True)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--image-digest", required=True)
+    parser.add_argument("--jobs", type=int, default=16)
+    parser.add_argument("--timeout", type=int, default=21600)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if sys.prefix != sys.base_prefix:
+        parser.error("invoke the builder with container system Python, outside an existing venv")
+    source = args.source.resolve()
+    output = args.output.resolve()
+    build_root = args.build_root.resolve()
+    if args.jobs < 1 or args.timeout < 1:
+        parser.error("jobs and timeout must be positive")
+    if _git(source, "rev-parse", "HEAD") != CONTROL:
+        parser.error(f"source must be the exact control commit {CONTROL}")
+    if _git(source, "status", "--porcelain", "--untracked-files=all"):
+        parser.error("control source must be clean, including untracked files")
+    submodules = _git(source, "submodule", "status", "--recursive")
+    if any(line.startswith(("-", "+", "U")) for line in submodules.splitlines()):
+        parser.error("initialize all pinned submodules before building")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.image_digest):
+        parser.error("resolve and record the actual registry image digest first")
+    if output == build_root or source in output.parents or source in build_root.parents:
+        parser.error("output and build-root must be distinct and outside the source checkout")
+    if output.exists() or build_root.exists():
+        parser.error("output and build-root must be new paths; existing runs are never overwritten")
+    command = [
+        sys.executable,
+        str(source / "scripts/build_wheel.py"),
+        "--clean",
+        "--out-of-tree",
+        "--build_root",
+        str(build_root),
+        "--dist_dir",
+        str(output / "wheels"),
+        "--job_count",
+        str(args.jobs),
+        "--cuda_architectures",
+        "100-real",
+        "--yes",
+    ]
+    if args.dry_run:
+        print(json.dumps({"source_sha": CONTROL, "build_command": command}, indent=2))
+        return 0
+    if not os.environ.get("SLURM_JOB_ID"):
+        parser.error("build in an approved Slurm compute allocation, not a frontend")
+    if (
+        os.environ.get("TLLM_AB_IMAGE") != args.image
+        or os.environ.get("TLLM_AB_IMAGE_DIGEST") != args.image_digest
+    ):
+        parser.error("container launcher must set matching TLLM_AB_IMAGE and TLLM_AB_IMAGE_DIGEST")
+    output.mkdir(parents=True)
+    build_root.mkdir(parents=True)
+    # CONTROL's out-of-tree staging omits this setup.py dependency. Keep source immutable.
+    extra_requirement = source / "requirements-grpc-smg.txt"
+    staged_requirement = build_root / "package/requirements-grpc-smg.txt"
+    staged_requirement.parent.mkdir()
+    shutil.copy2(extra_requirement, staged_requirement)
+    build_log = output / "build.log"
+    manifest = {
+        "schema_version": 1,
+        "source_sha": CONTROL,
+        "clean_source": True,
+        "submodules": submodules.splitlines(),
+        "image": args.image,
+        "image_digest": args.image_digest,
+        "build_command": command,
+        "build_log": str(build_log),
+        "staging_addition": {
+            "source": str(extra_requirement),
+            "destination": str(staged_requirement),
+            "sha256": _sha256(extra_requirement),
+        },
+        "slurm_job_id": os.environ["SLURM_JOB_ID"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "status": "building",
+    }
+    manifest_path = output / "build-status.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    with build_log.open("w") as stream:
+        process = subprocess.Popen(
+            command, cwd=source, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            returncode = process.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            returncode = 124
+    manifest["returncode"] = returncode
+    manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+    wheels = list((output / "wheels").glob("tensorrt_llm-*.whl"))
+    source_unchanged = not _git(source, "status", "--porcelain", "--untracked-files=all")
+    manifest["source_unchanged_after_build"] = source_unchanged
+    if returncode != 0 or len(wheels) != 1 or not source_unchanged:
+        manifest["status"] = "invalid"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"Build invalid; inspect {manifest_path} and {build_log}", file=sys.stderr)
+        return returncode if 0 < returncode < 256 else 2
+    # Preserve the venv path rather than resolving its symlink to the system interpreter.
+    runtime_prefix = build_root / f"venv-{sys.version_info.major}.{sys.version_info.minor}"
+    runtime_python = runtime_prefix / "bin/python3"
+    try:
+        entrypoints = _prepare_cli_wrappers(runtime_python)
+        identity = runtime_identity(runtime_python)
+        if identity["runtime_python"] != str(runtime_python) or identity["runtime_prefix"] != str(
+            runtime_prefix
+        ):
+            raise ValueError("built runtime interpreter does not belong to the expected venv")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        manifest.update(
+            status="invalid", reason=f"runtime environment verification failed: {error}"
+        )
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"Build invalid; inspect {manifest_path}", file=sys.stderr)
+        return 2
+    manifest.update(
+        status="built",
+        wheel=wheels[0].name,
+        wheel_sha256=_sha256(wheels[0]),
+        runtime_entrypoints=entrypoints,
+        **identity,
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    (output / "provenance.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"Wheel: {wheels[0]}\nProvenance: {output / 'provenance.json'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

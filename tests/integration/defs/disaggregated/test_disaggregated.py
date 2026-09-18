@@ -2801,7 +2801,10 @@ def run_disaggregated_aiperf(config_file,
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if os.environ.get("TLLM_DISAGG_STRESS_KEEP_LOGS") == "1":
+            logger.info(f"Preserving disaggregated stress logs: {work_dir}")
+        else:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
