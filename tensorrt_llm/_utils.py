@@ -1235,8 +1235,9 @@ def set_prometheus_multiproc_dir() -> object:
     global prometheus_multiproc_dir
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+        # Reuse the directory initialized before executor workers were spawned.
+        # Replacing its owner here could delete the workers' metric files.
+        return
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
