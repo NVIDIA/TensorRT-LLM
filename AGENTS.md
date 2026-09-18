@@ -225,6 +225,13 @@ publishing job red; Inconclusive remains neutral. A successful request job only
 means orchestration succeeded. Checks on the actual merge SHA use the distinct
 `Semantic conflict audit (post-merge)` name, with a receipt linking the analysis
 on the original PR. Evidence includes code locations and regression scenarios.
+The instructions first discover cross-branch interactions, then verify their
+contracts, including test replacements and the production paths they exercise.
+Explanations precede the machine record and must cite immutable source links
+with full SHAs and line numbers from both head and target. A PASS/FAIL without
+those citations becomes Inconclusive, including in the preview; an older PASS
+cannot substitute for that incomplete reply. Citation presence does not prove
+the AI's reasoning or the cited code is correct.
 
 CodeRabbit can make mistakes, including false positives. Keep these checks and
 workflows non-required: their failures then do not block merging. No required

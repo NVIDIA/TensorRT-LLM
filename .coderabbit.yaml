@@ -84,43 +84,35 @@ reviews:
       - name: "Semantic conflict with target branch"
         mode: "off"
         instructions: |
-          Detect behavioral incompatibilities when this PR is combined with its
-          requested target revision, even when Git can merge without text conflicts.
-          Use repository and Git evidence, not claims in the PR description.
-          Resolve and report the requested PR head SHA, target SHA, and
-          merge-base SHA. Independently verify these fixed revisions; do not
-          substitute newer live refs or revisions from an earlier review. If these
-          revisions or necessary code/history are unavailable, return Inconclusive
-          and explain the missing evidence. Never invent a SHA or claim freshness.
+          Verify the requested head, target and merge base with Git. Compare both
+          diffs from the merge base and inspect the combined code. Use only those
+          revisions and source evidence; do not infer compatibility from earlier
+          reviews.
 
-          Compare merge-base..PR-head and merge-base..target, then inspect their
-          combined behavior. Follow affected callers, callees, configuration,
-          bindings, and tests across files, including unchanged dependencies.
-          Prioritize API/return-value contracts, changed defaults, tensor shapes
-          and dtypes, resource lifetimes, and distributed synchronization.
-          Example: the target changes a function's return units while this PR
-          adds a caller expecting the old units in another file.
+          First audit the tests: trace new or modified fixtures, fakes, mocks,
+          subclasses and monkeypatch replacements to the production functions they
+          exercise, in both directions across the two diffs. For each affected path,
+          compare actual call arguments, keywords and required attributes with the
+          replacement implementation. Report test-only incompatibilities too. Example:
+          run(x, trace=None) is incompatible with a replacement run(x); accepting
+          trace or a verified adapter resolves it.
 
-          Fail only for a concrete incompatibility between the PR changes and
-          the target code. Cite both relevant code locations, the violated
-          contract, a triggering scenario, confidence, and a minimal regression
-          test. Exclude unrelated pre-existing bugs and style suggestions.
-          Do not execute repository code or claim tests were run.
-          Pass only if the required context was inspected and no supported
-          conflict was found; this is not proof of semantic compatibility.
-          Analyze the requested historical pair even if live refs advance.
-          State that the result applies only to the reported SHA pair and must
-          be rerun after either branch changes.
-          Explain that CodeRabbit can make mistakes, including false positives.
-          This is an advisory check: a failure does not block merging while the
-          check remains non-required. Other merge requirements still apply.
+          Then audit other affected contracts: return units, defaults, tensor
+          shapes/dtypes, resource lifetimes and synchronization. Exclude unrelated
+          pre-existing defects and style. Do not stop after a different unsupported
+          feature combination.
 
-          Begin the explanation with exactly one machine-readable result line:
-          SEMANTIC_RESULT head=<SHA> target=<SHA> merge_base=<SHA> verdict=<VERDICT>
-          Replace each SHA with the inspected full lowercase 40-character SHA;
-          VERDICT must be PASS, FAIL, or INCONCLUSIVE. Do not emit this line if
-          any SHA cannot be verified; explain the missing evidence instead.
-          This line is used to publish the advisory GitHub Check for this pair.
+          FAIL if combining the branches breaks a concrete contract. Give the
+          triggering call/input and cite both sides. PASS requires a coverage summary
+          identifying inspected test and production paths and why they remain
+          compatible. Return INCONCLUSIVE for missing necessary evidence. Do not run
+          repository code.
+
+          Put the evidence first, using immutable GitHub blob links with full SHAs and
+          line numbers from head and target. End with one record: SEMANTIC_RESULT
+          head=<SHA> target=<SHA> merge_base=<SHA> verdict=<PASS|FAIL|INCONCLUSIVE>
+          Use verified full lowercase SHAs; omit the record if unavailable. A record
+          alone is insufficient.
 
   path_filters:
     # Vendored/adapted FlashInfer kernels; excluded from review.
