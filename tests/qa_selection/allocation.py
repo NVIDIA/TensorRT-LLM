@@ -20,10 +20,63 @@ Reads marks only, never a `MachineProfile`: a test's demand is the same on every
 machine and at every rung. Whether it can run there is `selector.py`'s question.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Iterable, Optional, Tuple
 
 from .selector import CollectedTest, Decision
+
+
+class Ladder(Sequence):
+    """The allocation sizes a run may be scheduled at.
+
+    The rungs come from the caller; this class reads and checks their shape and
+    answers which of them is smallest, largest, or present.
+    """
+
+    SEPARATOR = ","
+
+    def __init__(self, rungs: Iterable[int]) -> None:
+        self._rungs = tuple(rungs)
+
+    @classmethod
+    def parse(cls, text: str) -> "Ladder":
+        """Read a ladder written as `1,4,8`.
+
+        Raises ValueError unless every rung is a positive integer and the rungs
+        ascend without repeating.
+        """
+        rungs = []
+        for field in text.split(cls.SEPARATOR):
+            rung = field.strip()
+            if not rung.isdigit() or int(rung) < 1:
+                raise ValueError(f"{rung!r} is not a positive integer")
+            rungs.append(int(rung))
+        if rungs != sorted(set(rungs)):
+            raise ValueError(f"rungs must ascend without repeating, got {text!r}")
+        return cls(rungs)
+
+    def __getitem__(self, index):
+        return self._rungs[index]
+
+    def __len__(self) -> int:
+        return len(self._rungs)
+
+    def __str__(self) -> str:
+        return self.SEPARATOR.join(str(rung) for rung in self._rungs)
+
+    def __repr__(self) -> str:
+        return f"Ladder({self})"
+
+    @property
+    def smallest(self) -> int:
+        """The cheapest allocation on this ladder."""
+        return min(self._rungs)
+
+    @property
+    def largest(self) -> int:
+        """The largest allocation; a demand above it fits no rung."""
+        return max(self._rungs)
 
 
 @dataclass(frozen=True)
