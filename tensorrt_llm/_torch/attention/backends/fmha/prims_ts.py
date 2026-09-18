@@ -102,6 +102,8 @@ def get_paged_kv_storage_unsupported_reason(
 def get_paged_kv_policy_unsupported_reason(
     attn: "TrtllmAttention",
     metadata: "TrtllmAttentionMetadata",
+    *,
+    allow_fp8_kv_cache: bool = False,
 ) -> Optional[str]:
     """Return why the request's decoding policy is outside the fixed page-table envelope."""
     if metadata.beam_width != 1:
@@ -120,13 +122,15 @@ def get_paged_kv_policy_unsupported_reason(
         quant_mode = QuantMode(attn.quant_mode)
     except (TypeError, ValueError):
         return "invalid KV-cache quantization mode."
-    is_fp8_mla = (
-        attn.is_mla_enable
+    is_supported_fp8 = (
+        (attn.is_mla_enable or allow_fp8_kv_cache)
         and quant_mode.has_fp8_kv_cache()
         and not quant_mode.has_int8_kv_cache()
         and not quant_mode.has_fp4_kv_cache()
     )
-    if quant_mode.has_kv_cache_quant() and not is_fp8_mla:
+    if quant_mode.has_kv_cache_quant() and not is_supported_fp8:
+        if allow_fp8_kv_cache:
+            return "only FP8 E4M3 KV-cache quantization is supported."
         return "quantized KV cache is supported only for FP8 MLA decode."
     return None
 
@@ -156,7 +160,12 @@ def get_attention_feature_unsupported_reason(
 
 
 class PrimsTSFmha(PhasedFmha):
-    """Blackwell task-scheduled paged context and decode FMHA library."""
+    """Blackwell task-scheduled paged context and decode FMHA library.
+
+    Standard FP8 KV cache uses fused preprocessing to quantize Q with the
+    shared Q/K/V scale. Kernels consume FP8 Q/K/V and write the model's FP16
+    or BF16 output directly, using preprocessing-produced device scales.
+    """
 
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
@@ -325,11 +334,12 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the attention mask is not causal or dense."
         if mask_type not in (AttentionMaskType.causal, AttentionMaskType.padding):
             return False, f"attention mask type {mask_type} is not supported."
-        policy_reason = get_paged_kv_policy_unsupported_reason(attn, meta)
+        policy_reason = get_paged_kv_policy_unsupported_reason(attn, meta, allow_fp8_kv_cache=True)
         if policy_reason is not None:
             return False, policy_reason
         is_mla = attn.is_mla_enable
-        is_fp8_mla = is_mla and QuantMode(attn.quant_mode).has_fp8_kv_cache()
+        is_fp8_kv = QuantMode(attn.quant_mode).has_fp8_kv_cache()
+        is_fp8_mla = is_mla and is_fp8_kv
 
         input_type = fwd.attention_input_type
         if input_type not in (
@@ -369,9 +379,9 @@ class PrimsTSFmha(PhasedFmha):
         if q.dtype not in self.SUPPORTED_DTYPES:
             return False, f"query dtype {q.dtype} is unsupported."
         cache_dtype = binding_to_torch_dtype(meta.kv_cache_manager.dtype)
-        if is_fp8_mla and cache_dtype != torch.float8_e4m3fn:
-            return False, "FP8 MLA decode requires an FP8 E4M3 KV cache."
-        if not is_fp8_mla and cache_dtype != q.dtype:
+        if is_fp8_kv and cache_dtype != torch.float8_e4m3fn:
+            return False, "FP8 attention requires an FP8 E4M3 KV cache."
+        if not is_fp8_kv and cache_dtype != q.dtype:
             return False, f"query and KV-cache dtypes must match, got {q.dtype} and {cache_dtype}."
         if output.dtype != q.dtype:
             return False, f"output dtype must match query dtype, got {output.dtype} and {q.dtype}."
@@ -402,6 +412,22 @@ class PrimsTSFmha(PhasedFmha):
                 if error is not None:
                     return False, error
         else:
+            if is_fp8_kv:
+                for name, scale in (
+                    ("kv_scale_orig_quant", fwd.kv_scale_orig_quant),
+                    ("kv_scale_quant_orig", fwd.kv_scale_quant_orig),
+                ):
+                    if (
+                        scale is None
+                        or scale.dtype != torch.float32
+                        or scale.device != q.device
+                        or not scale.is_contiguous()
+                        or scale.numel() != 1
+                    ):
+                        return (
+                            False,
+                            f"FP8 attention requires scalar float32 {name} on the query device.",
+                        )
             expected_width = (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim
             if q.shape[1] != expected_width:
                 return False, f"fused QKV width must be {expected_width}, got {q.shape[1]}."
@@ -678,6 +704,7 @@ class PrimsTSFmha(PhasedFmha):
             mask_type=mask_type,
             window_left=window_left,
             workspace_buffer=workspace_buffer,
+            use_device_scales=QuantMode(self.attn.quant_mode).has_fp8_kv_cache(),
         )
         self._decode_wrappers[batch_size] = wrapper
         return wrapper
@@ -761,7 +788,7 @@ class PrimsTSFmha(PhasedFmha):
                 self.attn.head_dim,
                 self.attn.rope_dim,
                 True,
-                False,
+                QuantMode(self.attn.quant_mode).has_fp8_kv_cache(),
                 skip_fmha_workspace=True,
             )
             required_preprocess_bytes = max(
@@ -808,16 +835,14 @@ class PrimsTSFmha(PhasedFmha):
         # sizing key aligned with the non-windowed plan selected at runtime.
         window_left = -1
 
+        kernel_dtype = (
+            torch.float8_e4m3fn if QuantMode(self.attn.quant_mode).has_fp8_kv_cache() else q.dtype
+        )
         if self.attn.is_mla_enable:
             from tensorrt_llm._torch.attention.backends.prims_ts import (
                 get_prims_ts_batch_mla_decode_workspace_size,
             )
 
-            kernel_dtype = (
-                torch.float8_e4m3fn
-                if QuantMode(self.attn.quant_mode).has_fp8_kv_cache()
-                else q.dtype
-            )
             required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
                 batch_size,
                 self.attn.num_heads,
@@ -845,8 +870,8 @@ class PrimsTSFmha(PhasedFmha):
                 int(metadata.tokens_per_block),
                 max_seq_len,
                 seq_len_q=seq_len_q,
-                q_dtype=q.dtype,
-                kv_dtype=q.dtype,
+                q_dtype=kernel_dtype,
+                kv_dtype=kernel_dtype,
                 out_dtype=forward_args.output.dtype,
                 mask_type=mask_type,
                 window_left=window_left,
@@ -933,8 +958,8 @@ class PrimsTSFmha(PhasedFmha):
             kv_pool,
             block_tables,
             _kv_scale_pool,
-            _bmm1_scale,
-            _bmm2_scale,
+            bmm1_scale,
+            bmm2_scale,
             fmha_workspace,
             cu_q_seqlens,
             _cu_kv_seqlens,
@@ -977,7 +1002,7 @@ class PrimsTSFmha(PhasedFmha):
             self._get_bmm1_scale(attn),
             1.0,
             attention_chunk_size,
-            False,
+            QuantMode(attn.quant_mode).has_fp8_kv_cache(),
             True,
             False,
             self._multi_processor_count,
@@ -1009,6 +1034,9 @@ class PrimsTSFmha(PhasedFmha):
             params.sequence_lengths,
             params.batch_size,
         )
+        use_fp8 = QuantMode(attn.quant_mode).has_fp8_kv_cache()
+        if use_fp8:
+            q_processed = self._view_fp8_query(q_processed, params.num_tokens)
         mask_type = self._get_prims_mask_type(fwd)
         wrapper = self._get_or_plan_context_wrapper(
             q_processed,
@@ -1030,6 +1058,8 @@ class PrimsTSFmha(PhasedFmha):
             cu_q_seqlens,
             block_tables=fixed_block_tables,
             seq_lens_kv=seq_lens_kv,
+            scale_softmax_log2=bmm1_scale.reshape(-1)[1:2] if use_fp8 else None,
+            output_scale=bmm2_scale.reshape(-1)[:1] if use_fp8 else None,
             out=params.context_buf,
             validate=False,
         )
@@ -1067,7 +1097,7 @@ class PrimsTSFmha(PhasedFmha):
             rope_params.max_positions,
             attn.position_embedding_type,
             self._get_bmm1_scale(attn),
-            False,
+            QuantMode(attn.quant_mode).has_fp8_kv_cache(),
             True,
             False,
             attention_chunk_size,
@@ -1121,7 +1151,7 @@ class PrimsTSFmha(PhasedFmha):
             attn.position_embedding_type,
             self._get_bmm1_scale(attn),
             1.0,
-            False,
+            QuantMode(attn.quant_mode).has_fp8_kv_cache(),
             attn.predicted_tokens_per_seq,
             attention_chunk_size,
             self._multi_processor_count,
@@ -1149,8 +1179,8 @@ class PrimsTSFmha(PhasedFmha):
             kv_pool,
             block_tables,
             _kv_scale_pool,
-            _bmm1_scale,
-            _bmm2_scale,
+            bmm1_scale,
+            bmm2_scale,
             fmha_workspace,
             _cu_seqlens,
             _max_q_len,
@@ -1177,6 +1207,9 @@ class PrimsTSFmha(PhasedFmha):
         fixed_block_tables = self._get_fixed_block_tables(block_tables, batch_size)
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
         seq_lens = self._get_sequence_lengths(params.sequence_lengths, batch_size)
+        use_fp8 = QuantMode(attn.quant_mode).has_fp8_kv_cache()
+        if use_fp8:
+            q_processed = self._view_fp8_query(q_processed, params.num_tokens)
         query = q_processed.view(
             batch_size,
             params.input_seq_length,
@@ -1223,8 +1256,24 @@ class PrimsTSFmha(PhasedFmha):
             block_tables=fixed_block_tables,
             bmm1_scale=self._get_bmm1_scale(attn),
             bmm2_scale=1.0,
+            bmm1_scale_device=bmm1_scale.reshape(-1)[:1] if use_fp8 else None,
+            bmm2_scale_device=bmm2_scale.reshape(-1)[:1] if use_fp8 else None,
             out=output,
             validate=False,
+        )
+
+    def _view_fp8_query(self, q_processed: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """View the packed FP8 prefix written by fused QKV preprocessing.
+
+        Generation reserves a model-dtype Q buffer, but writes one byte per
+        element when FP8 is enabled. Its unused trailing bytes are not queries.
+        """
+        numel = num_tokens * self.attn.num_heads * self.attn.head_dim
+        return (
+            q_processed.view(torch.uint8)
+            .reshape(-1)[:numel]
+            .view(torch.float8_e4m3fn)
+            .view(num_tokens, self.attn.num_heads, self.attn.head_dim)
         )
 
     def _get_decode_workspace(

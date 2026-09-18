@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -911,7 +912,8 @@ class FmhaDecodeConfig:
             self.q_dtype in (Float16, BFloat16)
             and self.out_dtype in (Float16, BFloat16)
         ) or (
-            self.q_dtype == Float8E4M3FN and self.out_dtype in (Float16, Float8E4M3FN)
+            self.q_dtype == Float8E4M3FN
+            and self.out_dtype in (Float16, BFloat16, Float8E4M3FN)
         )
 
     # ------------------------------------------------------------------
@@ -3658,10 +3660,11 @@ def _validate_profile_support(
             )
         if cfg.q_dtype == Float8E4M3FN and cfg.out_dtype not in (
             Float16,
+            BFloat16,
             Float8E4M3FN,
         ):
             raise ValueError(
-                "fmha_decode keepsMmaAb fp8 qkv path supports fp16 or fp8 output"
+                "fmha_decode keepsMmaAb fp8 qkv path supports fp16, bf16, or fp8 output"
             )
         use_split_kv = split_kv_mode != "disabled" or cfg.use_split_kv
         if use_split_kv:
@@ -3749,7 +3752,7 @@ def _validate_profile_support(
                 "{64,128,256}, TileSizeQ in {8,16,32}, "
                 "either ungrouped single-token or complete-token grouped Q, "
                 "at least two split CTAs, "
-                "and fp16/bf16 or fp8 qkv with fp16/fp8 output"
+                "and fp16/bf16 or fp8 qkv with fp16/bf16/fp8 output"
             )
         cluster_reason = cluster_smem_reduction_unsupported_reason(
             max_splits_kv=cfg.max_splits_kv,

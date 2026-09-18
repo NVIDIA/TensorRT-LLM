@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1958,8 +1959,8 @@ def _run_decode_gen_active(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    g_scale_s_log2_e: Float32 | cute.Pointer,
+    g_output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
@@ -2001,6 +2002,15 @@ def _run_decode_gen_active(
     overlaunched packed-Q tile without threading TaskManager state through a
     dynamic branch.
     """
+
+    # Host scales arrive in log2 form; device scales are produced in regular
+    # form by QKV preprocessing and must be loaded by the GPU on every launch.
+    if cutlass.const_expr(isinstance(g_scale_s_log2_e, cute.Pointer)):
+        g_scale_s_log2_e = cute.make_tensor(g_scale_s_log2_e, cute.make_layout(1))[
+            0
+        ] * Float32(math.log2(math.e))
+    if cutlass.const_expr(isinstance(g_output_scale, cute.Pointer)):
+        g_output_scale = cute.make_tensor(g_output_scale, cute.make_layout(1))[0]
 
     WARP_SIZE = 32
 
@@ -2286,8 +2296,8 @@ def _run_decode_gen_runtime_prefix(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    g_scale_s_log2_e: Float32 | cute.Pointer,
+    g_output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
@@ -2449,8 +2459,8 @@ def decode_gen_kernel(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    g_scale_s_log2_e: Float32 | cute.Pointer,
+    g_output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
@@ -2607,8 +2617,8 @@ def fmha_decode_launch(
     partial_stats_iter: cute.Pointer,
     split_kv_counter_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    scale_s: Float32,
-    output_scale: Float32,
+    scale_s: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     kv_b_stride: Int32,
     max_active_clusters: Int32,
     stream: cuda_drv.CUstream,
@@ -2825,6 +2835,9 @@ def fmha_decode_launch(
         0,
         mem_space=cutlass.AddressSpace.gmem,
     )
+    scale_log2 = scale_s
+    if cutlass.const_expr(not isinstance(scale_s, cute.Pointer)):
+        scale_log2 = Float32(scale_s * log2_e)
     decode_gen_kernel(
         tma_desc_q,
         tma_desc_k,
@@ -2834,7 +2847,7 @@ def fmha_decode_launch(
         o_iter,
         s_k,
         h_k,
-        Float32(scale_s * log2_e),
+        scale_log2,
         output_scale,
         seqlens_kv_iter,
         cu_seqlens_q_iter,

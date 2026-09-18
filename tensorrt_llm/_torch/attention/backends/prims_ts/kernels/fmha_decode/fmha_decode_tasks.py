@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -745,12 +746,14 @@ class DecodeGenTask(Task):
         self,
         work_tile: cute.Coord,
         skip_work_tile: Any = None,
+        context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
         Task._run_task_body_impl(
             self,
             work_tile,
             skip_work_tile,
+            context=context,
         )
         if cutlass.const_expr(
             self.cfg is not None
