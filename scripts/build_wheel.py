@@ -1076,8 +1076,12 @@ def main(*,
             conan_extra_args = (
                 " -c tools.cmake.cmaketoolchain:user_presets=False"
                 if build_root is not None else "")
+            # Pin the standard Conan builds against: the profile it detects
+            # follows the compiler default, which lags behind what cpp/
+            # CMakeLists.txt asks for. Extensions are off there, hence "20"
+            # rather than "gnu20".
             build_run(
-                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}'{conan_extra_args} {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' -s:a compiler.cppstd=20{conan_extra_args} {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
