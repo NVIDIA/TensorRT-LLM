@@ -79,6 +79,7 @@ def test_attach_routes_propagates_errors_and_attaches_once():
     class _Req:
         def __init__(self, rid):
             self.py_request_id = rid
+            self.py_return_routed_experts = True
             self.py_result = _Result()
 
     rc = RouteCapture(rank=0)
@@ -230,3 +231,196 @@ def test_completion_output_routed_experts_property():
     assert out.routed_experts is not None
     assert out.routed_experts.shape == (5, _L, _K)
     assert torch.equal(out.routed_experts, routes)
+
+
+# ---- SharedRouteCache bound + per-request gating -------------------------------
+
+
+class _FakeResult:
+    def __init__(self):
+        self._additional_generation_outputs = None
+        self.appended = []
+
+    def append_additional_generation_outputs(self, name, value):
+        self.appended.append((name, value))
+
+
+class _FakeReq:
+    """A finished request as attach_routes sees it."""
+
+    def __init__(self, rid, flag=True):
+        self.py_request_id = rid
+        self.py_return_routed_experts = flag
+        self.py_result = _FakeResult()
+
+
+class _CtxReq(_FakeReq):
+    """A scheduled context request whose first ``prepop`` prompt tokens hit the
+    KV prefix cache (so only [prepop, len) run through the model)."""
+
+    def __init__(self, rid, toks, prepop=0, flag=True):
+        super().__init__(rid, flag)
+        self.is_dummy = False
+        self._toks = list(toks)
+        self.py_prompt_len = len(toks)
+        self.prepopulated_prompt_len = prepop
+        self.context_current_position = prepop
+        self.context_chunk_size = len(toks) - prepop
+
+    def get_tokens(self, beam):
+        return list(self._toks)
+
+
+class _Batch:
+    def __init__(self, ctx=(), gen=()):
+        self.context_requests = list(ctx)
+        self.generation_requests = list(gen)
+
+
+def _publish(rc, rid, toks):
+    """Owner ``rid`` captured every prompt position and publishes them."""
+    rc._store[rid] = {p: _row(p) for p in range(len(toks))}
+    rc._req_toks[rid] = list(toks)
+    rc._req_plen[rid] = len(toks)
+    hashes = rc._hashes_for(rid, list(toks), len(toks))
+    rc._store_positions(rid, hashes)
+    return hashes
+
+
+def test_shared_cache_bounded_with_lru_eviction():
+    from tensorrt_llm._torch.route_capture import _DEFAULT_SHARED_CAPACITY
+
+    rc = RouteCapture(rank=0)
+    assert rc._shared_cap == _DEFAULT_SHARED_CAPACITY
+    rc.prepare(_Batch(), 32, shared_capacity=4)
+    toks = list(range(100, 108))
+    hashes = _publish(rc, 1, toks)
+    assert len(rc._shared) == 4 and list(rc._shared) == hashes[4:]
+    assert rc._pfx_evicted == 4
+    # A read-back hit refreshes the entry: the next insert evicts the oldest
+    # untouched key (hashes[5]), not the touched one (hashes[4]).
+    assert rc._shared_get(hashes[4]) is not None
+    _publish(rc, 9, [1])
+    assert hashes[4] in rc._shared and hashes[5] not in rc._shared
+    assert rc._shared_get(12345) is None
+    # prepare() without a capacity keeps the current one; shrinking evicts at
+    # once; a negative capacity is a programming error.
+    rc.prepare(_Batch(), 32)
+    assert rc._shared_cap == 4
+    rc.prepare(_Batch(), 32, shared_capacity=2)
+    assert len(rc._shared) == 2
+    with pytest.raises(ValueError):
+        rc.prepare(_Batch(), 32, shared_capacity=-1)
+
+
+def test_shared_cache_zero_capacity_publishes_nothing():
+    rc = RouteCapture(rank=0)
+    rc.prepare(_Batch(), 32, shared_capacity=0)  # block reuse off
+    _publish(rc, 1, list(range(8)))
+    assert len(rc._shared) == 0
+
+
+def test_prefix_hit_after_eviction_fills_missing_with_sentinel_not_gap():
+    rc = RouteCapture(rank=0)
+    rc.prepare(_Batch(), 32, shared_capacity=4)
+    toks = list(range(100, 108))
+    _publish(rc, 1, toks)  # positions 0..3 evicted, 4..7 still cached
+    sib = _CtxReq(2, toks, prepop=6)  # KV prefix hit on the first 6 tokens
+    rc.prepare(_Batch(ctx=[sib]), 32)
+    assert rc._req_reused[2] == 6
+    assert set(rc._store[2]) == {4, 5} and 2 not in rc._readback_done
+    rc._store[2][6] = _row(6)  # this request's own captured rows
+    rc._store[2][7] = _row(7)
+    rc.attach_routes(sib)
+    ((_, routes),) = sib.py_result.appended
+    assert routes.shape == (8, _L, _K)
+    assert bool((routes[:4] == -1).all())  # evicted reused positions -> sentinel
+    assert torch.equal(routes[4], _row(4)) and torch.equal(routes[7], _row(7))
+    assert rc._pfx_misses == 4
+    # The sentinel is never published under the evicted keys.
+    assert all(v is not rc._missing_row for v in rc._shared.values())
+    assert 2 not in rc._store and 2 not in rc._req_reused
+
+
+def test_attach_final_readback_fills_late_owner_without_sentinel():
+    rc = RouteCapture(rank=0)
+    rc.prepare(_Batch(), 32, shared_capacity=64)
+    toks = list(range(200, 206))
+    sib = _CtxReq(2, toks, prepop=4)
+    rc.prepare(_Batch(ctx=[sib]), 32)  # owner has not published yet -> misses
+    assert 2 not in rc._readback_done and not rc._store.get(2)
+    _publish(rc, 1, toks)  # owner publishes later
+    rc._store[2][4] = _row(4)
+    rc._store[2][5] = _row(5)
+    rc.attach_routes(sib)
+    ((_, routes),) = sib.py_result.appended
+    assert routes.shape == (6, _L, _K) and int(routes.min()) >= 0
+    assert rc._pfx_misses == 0
+
+
+def test_internal_gap_at_or_above_reused_prefix_still_raises():
+    rc = RouteCapture(rank=0)
+    rc._store[3] = {0: _row(1), 1: _row(2), 3: _row(4)}
+    rc._req_reused[3] = 2  # positions >= 2 were scheduled for capture
+    with pytest.raises(ValueError):
+        rc.attach_routes(_FakeReq(3))
+
+
+def test_evicted_entry_survives_for_in_flight_reader():
+    rc = RouteCapture(rank=0)
+    rc.prepare(_Batch(), 32, shared_capacity=4)
+    toks = list(range(100, 108))
+    _publish(rc, 1, toks)
+    sib = _CtxReq(2, toks, prepop=6)
+    rc.prepare(_Batch(ctx=[sib]), 32)  # reads back positions 4, 5 by reference
+    _publish(rc, 5, list(range(500, 504)))  # evicts the owner's remaining keys
+    assert torch.equal(rc._store[2][4], _row(4)) and torch.equal(rc._store[2][5], _row(5))
+
+
+def test_clear_shared_resets_bounded_cache_but_keeps_capacity():
+    rc = RouteCapture(rank=0)
+    rc.prepare(_Batch(), 32, shared_capacity=4)
+    _publish(rc, 1, list(range(8)))
+    rc.clear_shared()
+    assert len(rc._shared) == 0 and rc._shared_cap == 4 and rc._pfx_evicted == 4
+    _publish(rc, 2, list(range(3)))
+    assert len(rc._shared) == 3
+
+
+def test_attach_routes_opt_out_frees_store_and_feeds_shared_cache():
+    rc = RouteCapture(rank=0)
+    rc.prepare(_Batch(), 32, shared_capacity=64)
+    toks = list(range(300, 304))
+    rc._store[8] = {p: _row(p) for p in range(4)}
+    rc._req_toks[8] = list(toks)
+    rc._req_plen[8] = 4
+    rc._gen_count[8] = 0
+    req = _FakeReq(8, flag=False)
+    rc.attach_routes(req)
+    assert req.py_result.appended == []
+    assert 8 not in rc._store and 8 not in rc._req_toks
+    assert 8 not in rc._gen_count and 8 not in rc._attached
+    hashes = rc._hashes_for(99, toks, 4)
+    assert all(h in rc._shared for h in hashes)  # prompt rows published for reuse
+    rc.attach_routes(req)  # revisit after the release is a no-op
+    assert req.py_result.appended == []
+
+
+def test_opt_out_owner_feeds_opt_in_prefix_hit():
+    rc = RouteCapture(rank=0)
+    rc.prepare(_Batch(), 32, shared_capacity=64)
+    toks = list(range(300, 304))
+    rc._store[8] = {p: _row(p) for p in range(4)}
+    rc._req_toks[8] = list(toks)
+    rc._req_plen[8] = 4
+    rc.attach_routes(_FakeReq(8, flag=False))
+    # An opted-in sibling reuses the whole prompt (+1 new token): every reused
+    # position comes from the cache the opted-out owner filled.
+    sib = _CtxReq(2, toks + [999], prepop=4)
+    rc.prepare(_Batch(ctx=[sib]), 32)
+    assert set(rc._store[2]) == {0, 1, 2, 3} and 2 in rc._readback_done
+    rc._store[2][4] = _row(4)
+    rc.attach_routes(sib)
+    ((_, routes),) = sib.py_result.appended
+    assert routes.shape == (5, _L, _K) and int(routes.min()) >= 0
+    assert rc._pfx_misses == 0

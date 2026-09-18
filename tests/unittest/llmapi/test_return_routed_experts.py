@@ -16,8 +16,9 @@
 """End-to-end test for Router Replay (R3).
 
 Runs enable_return_routed_experts on a real (small) MoE model and asserts the
-per-token routing is returned with the right shape, including concurrent requests
-(mirrors the vLLM / SGLang feature tests).
+per-token routing is returned with the right shape for the requests that ask
+for it (SamplingParams.return_routed_experts=True) and not for the others,
+including concurrent requests (mirrors the vLLM / SGLang feature tests).
 """
 
 import os
@@ -56,21 +57,25 @@ def _check_routes(routes, prompt_len, gen_len):
 def test_return_routed_experts_shape_and_concurrency():
     llm = LLM(model=_model_dir(), enable_return_routed_experts=True)
     try:
-        sp = SamplingParams(max_tokens=16, temperature=0.0, return_routed_experts=True)
         prompts = ["The capital of France is", "1 + 1 =", "Hello, my name is"]
-        outputs = llm.generate(prompts, sp)
+        # Mixed batch: the engine captures for every request, but only the
+        # requests that opt in get routed_experts on their output.
+        flags = [True, False, True]
+        sps = [
+            SamplingParams(max_tokens=16, temperature=0.0, return_routed_experts=f) for f in flags
+        ]
+        outputs = llm.generate(prompts, sps)
         assert len(outputs) == len(prompts)
-        for req in outputs:
+        for req, flag in zip(outputs, flags):
             out = req.outputs[0]
-            _check_routes(
-                out.routed_experts, prompt_len=len(req.prompt_token_ids), gen_len=len(out.token_ids)
-            )
+            if flag:
+                _check_routes(
+                    out.routed_experts,
+                    prompt_len=len(req.prompt_token_ids),
+                    gen_len=len(out.token_ids),
+                )
+            else:
+                assert out.routed_experts is None
+                assert "routed_experts" not in (out.additional_generation_outputs or {})
     finally:
         llm.shutdown()
-
-
-# NOTE: per-request gating (returning routes only for requests whose
-# SamplingParams.return_routed_experts is True) is a follow-up: it needs the flag
-# plumbed onto the C++ executor OutputConfig / request. The engine-level
-# enable_return_routed_experts currently returns routes for all requests, which
-# is what the MoE-RL rollout use case wants.

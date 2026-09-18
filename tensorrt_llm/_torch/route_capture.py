@@ -43,14 +43,20 @@ Design:
   3. SharedRouteCache — cross-request prefix reuse: on a prefix-cache hit the
      hit tokens are not recomputed (no MoE, no capture), so their routes are read
      back from a position-keyed cache; invalidated with the KV on
-     ``reset_prefix_cache``.
+     ``reset_prefix_cache``. Bounded LRU sized to the KV pool's token capacity;
+     a reused position whose route was evicted is emitted as -1 (the consumer
+     sentinel below), never as an error.
 
-Enable: ``LlmArgs.enable_return_routed_experts`` (engine) +
-``SamplingParams.return_routed_experts`` (per request). Correct with CUDA graphs,
+Enable: ``LlmArgs.enable_return_routed_experts`` (engine: turns capture on) +
+``SamplingParams.return_routed_experts`` (per request: attaches the routes to
+that request's output; every request is still captured so the SharedRouteCache
+stays complete for opted-in requests that prefix-hit other requests' KV blocks).
+Correct with CUDA graphs,
 prefix caching, and the overlap scheduler all ON. CUTLASS / DeepGemm separated
 routing only; fused backends fail closed (``assert_capturable``).
 """
 
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -63,6 +69,10 @@ from tensorrt_llm.logger import logger
 # (fail-closed). Final/padding positions are filled by the consumer's own
 # pad-and-align step; this module never emits a dummy expert id for them.
 _MISSING = -1
+
+# SharedRouteCache bound used only when the executor cannot report the KV pool
+# token capacity (normal path: max_num_blocks * tokens_per_block via prepare()).
+_DEFAULT_SHARED_CAPACITY = 1 << 18
 
 # FNV-1a cumulative rolling hash for prefix-cache keys (position-granular): the
 # key for position p is a hash of tokens[:p+1], computed incrementally in O(len).
@@ -234,12 +244,19 @@ class RouteCapture:
         ``_layout`` only gates the later per-row commit."""
         self._capture(int(layer_id), token_selected_experts, int(row_offset))
 
-    def prepare(self, scheduled_batch, tokens_per_block: int = 0) -> None:
+    def prepare(
+        self,
+        scheduled_batch,
+        tokens_per_block: int = 0,
+        shared_capacity: Optional[int] = None,
+    ) -> None:
         if tokens_per_block and tokens_per_block > 0:
             self._tpb = int(tokens_per_block)
+        if shared_capacity is not None:
+            self._set_shared_cap(int(shared_capacity))
         if not getattr(self, "_tpb_warned", False):
             self._tpb_warned = True
-            logger.debug(f"[R3][pfx] prepare tpb={self._tpb}")
+            logger.debug(f"[R3][pfx] prepare tpb={self._tpb} shared_cap={self._shared_cap}")
         # _prepare first (records per-request prompt tokens/hashes), then
         # readback (uses them to fill hit prefixes from the cache).
         self._prepare(scheduled_batch)
@@ -248,7 +265,7 @@ class RouteCapture:
     def clear_shared(self) -> None:
         """Hook from py_executor.reset_prefix_cache: route validity == KV
         validity, so when the KV reuse state is reset the cached routes must be
-        dropped too."""
+        dropped too (the capacity and the diagnostic counters persist)."""
         self._shared.clear()
         self._readback_done.clear()
         self._prefix_populated.clear()
@@ -282,6 +299,17 @@ class RouteCapture:
         (``assemble`` returns None); ``_attached`` only guards the window
         between attaching and freeing.
 
+        KV-reused prompt positions (below ``prepopulated_prompt_len``) are never
+        run through MoE here; whatever the SharedRouteCache cannot provide for
+        them by now (evicted, or KV that this engine never routed) is emitted as
+        the documented -1 sentinel. A missing position at or above that length
+        was scheduled for capture and is still an internal gap (``assemble``
+        raises).
+
+        Requests with ``SamplingParams.return_routed_experts=False`` get nothing
+        attached; their prompt rows are still published to the SharedRouteCache
+        and their store is freed here.
+
         Errors are NOT swallowed here: an internal gap in the store (assemble
         raises ValueError) or a failed copy drain means the routes would be
         wrong, so the exception propagates to the executor instead of the
@@ -290,10 +318,23 @@ class RouteCapture:
             return
         if self._copier is not None:
             self._copier.drain(self.commit, force=True)
+        rid = request.py_request_id
+        if not request.py_return_routed_experts:
+            # Opted out (SamplingParams.return_routed_experts=False): nothing is
+            # attached, but the captured prompt rows still feed the
+            # SharedRouteCache (a later opted-in request may prefix-hit this
+            # request's KV blocks) and the store is released. Revisits after the
+            # release are no-ops.
+            if rid not in self._store and rid not in self._req_toks:
+                return
+            self._populate_prefix(request, rid)
+            self.free(rid)
+            return
         pyr = getattr(request, "py_result", None)
         if pyr is None:
             return
-        rid = request.py_request_id
+        self._final_readback(rid)
+        self._fill_prefix_misses(rid)
         routes = self.assemble(rid)
         if routes is None:
             return  # incomplete store: keep it and retry on a later call
@@ -317,15 +358,26 @@ class RouteCapture:
         self._attached: set = set()
 
         # PR2 prefix-cache: SharedRouteCache — routes keyed by a self-computed
-        # hash of the prefix token ids at block boundaries, so a prefix-cache hit
-        # (whose tokens are NOT recomputed -> no capture) can copy the routes back
-        # into its store. Lives on this capturer (which persists across
-        # requests); cleared on reset_prefix_cache. key = hash(tuple(tokens[:end]))
-        # -> int16 [tokens_per_block, L, K].
-        self._shared: Dict[int, torch.Tensor] = {}
+        # cumulative hash of the prefix token ids (one key per prompt position),
+        # so a prefix-cache hit (whose tokens are NOT recomputed -> no capture)
+        # can copy the routes back into its store. Lives on this capturer (which
+        # persists across requests); cleared on reset_prefix_cache.
+        # key = hash(tokens[:pos+1]) -> int16 [L, K] (reference to a store row).
+        # Bounded LRU: capacity = KV pool token capacity (an entry beyond that can
+        # never be read back, its KV is gone too); 0 = block reuse off, nothing is
+        # published. Insertion appends, a read-back hit refreshes the entry.
+        self._shared: "OrderedDict[int, torch.Tensor]" = OrderedDict()
+        self._shared_cap: int = _DEFAULT_SHARED_CAPACITY
         self._tpb: int = 0  # tokens_per_block (from V2 kv mgr)
         self._readback_done: set = set()  # rids fully read back (once each)
-        self._pfx_hits: int = 0  # diagnostics: blocks filled from cache
+        self._pfx_hits: int = 0  # diagnostics: positions filled from cache
+        self._pfx_evicted: int = 0  # diagnostics: entries evicted by the bound
+        self._pfx_misses: int = 0  # diagnostics: reused positions emitted as -1
+        # rid -> prepopulated_prompt_len seen at read-back: positions below it
+        # were never in a forward layout, so a miss there is a cache miss (-> -1
+        # sentinel), not an internal gap.
+        self._req_reused: Dict[int, int] = {}
+        self._missing_row: Optional[torch.Tensor] = None  # shared -1 sentinel row
         # incremental populate: a request's prompt-region blocks are pushed to the
         # SharedRouteCache as soon as they land in the store (finish_forward,
         # after drain) — NOT at request finish, which is too late for concurrent
@@ -551,6 +603,7 @@ class RouteCapture:
         self._req_plen.pop(req_id, None)
         self._req_hashes.pop(req_id, None)
         self._pop_cursor.pop(req_id, None)
+        self._req_reused.pop(req_id, None)
         self._prefix_populated.discard(req_id)
         self._readback_done.discard(req_id)
         # Release the attach marker too: request ids can be reused by a later
@@ -603,8 +656,12 @@ class RouteCapture:
                         f"cache_size={len(self._shared)}"
                     )
                 if C <= 0:
+                    # (KV manager v2 can rewind a reused prefix to 0: those
+                    # positions are then recomputed and captured normally.)
+                    self._req_reused.pop(rid, None)
                     self._readback_done.add(rid)
                     continue
+                self._req_reused[rid] = C
                 hashes = self._hashes_for(
                     rid,
                     self._req_toks.get(rid) or self._safe_tokens(req),
@@ -612,27 +669,99 @@ class RouteCapture:
                 )
                 if not hashes:
                     continue
-                per_req = self._store.setdefault(rid, {})
-                missing = 0
-                for p in range(min(C, len(hashes))):
-                    if p in per_req:
-                        continue
-                    row = self._shared.get(hashes[p])
-                    if row is None:
-                        missing += 1  # not populated yet — retry
-                        continue
-                    per_req[p] = row  # reference, no copy
-                    self._pfx_hits += 1
-                    if not getattr(self, "_pfx_warned", False):
-                        self._pfx_warned = True
-                        logger.debug(
-                            "[R3] prefix-cache readback active: filled position "
-                            "from SharedRouteCache"
-                        )
-                if missing == 0:
+                if self._fill_from_shared(rid, C, hashes) == 0:
                     self._readback_done.add(rid)
             except Exception:
                 continue
+
+    def _fill_from_shared(self, rid: int, C: int, hashes: list) -> int:
+        """Copy cached rows for rid's KV-reused prompt positions [0, C) that are
+        not in its store yet (reference, no copy; a hit refreshes the LRU order).
+        Returns how many of those positions are still missing."""
+        per_req = self._store.setdefault(rid, {})
+        missing = 0
+        for p in range(min(C, len(hashes))):
+            if p in per_req:
+                continue
+            row = self._shared_get(hashes[p])
+            if row is None:
+                missing += 1  # not published (yet) -- retried while in context
+                continue
+            per_req[p] = row
+            self._pfx_hits += 1
+            if not getattr(self, "_pfx_warned", False):
+                self._pfx_warned = True
+                logger.debug(
+                    "[R3] prefix-cache readback active: filled position from SharedRouteCache"
+                )
+        return missing
+
+    def _final_readback(self, rid: int) -> None:
+        """Last read-back at attach time, for a reader that left the context
+        phase before its owner published: take whatever the cache has now."""
+        C = self._req_reused.get(rid, 0)
+        if C <= 0 or rid in self._readback_done:
+            return
+        hashes = self._req_hashes.get(rid)
+        if hashes and self._fill_from_shared(rid, C, hashes) == 0:
+            self._readback_done.add(rid)
+
+    def _fill_prefix_misses(self, rid: int) -> int:
+        """Emit the -1 sentinel for KV-reused prompt positions [0, C) that are
+        still missing after the final read-back. Those positions were never in a
+        forward layout (the KV hit skipped them), so this is a cache miss --
+        evicted, or KV this engine never routed -- not an internal gap; positions
+        at or above C stay subject to assemble()'s gap check."""
+        C = self._req_reused.get(rid, 0)
+        pos_map = self._store.get(rid)
+        if C <= 0 or not pos_map:
+            return 0
+        filled = 0
+        for p in range(C):
+            if p in pos_map:
+                continue
+            if self._missing_row is None:
+                self._missing_row = torch.full_like(next(iter(pos_map.values())), _MISSING)
+            pos_map[p] = self._missing_row
+            filled += 1
+        if filled:
+            self._pfx_misses += filled
+            if not getattr(self, "_miss_warned", False):
+                self._miss_warned = True
+                logger.warning(
+                    f"[R3] rank {self.rank}: request {rid}: {filled} KV-reused prompt "
+                    f"position(s) had no cached route (SharedRouteCache eviction, "
+                    f"cap={self._shared_cap}, evicted so far={self._pfx_evicted}; or KV "
+                    "not routed by this engine); emitted as -1. Further misses are "
+                    "counted only."
+                )
+        return filled
+
+    def _set_shared_cap(self, cap: int) -> None:
+        if cap < 0:
+            raise ValueError(f"[R3] SharedRouteCache capacity must be >= 0, got {cap}")
+        if cap != self._shared_cap:
+            self._shared_cap = cap
+            self._evict_shared()  # a shrink takes effect immediately
+
+    def _evict_shared(self) -> None:
+        while len(self._shared) > self._shared_cap:
+            self._shared.popitem(last=False)  # oldest entry not refreshed by a hit
+            self._pfx_evicted += 1
+            if not getattr(self, "_evict_logged", False):
+                self._evict_logged = True
+                logger.debug(
+                    f"[R3][pfx] SharedRouteCache reached its bound (cap={self._shared_cap}); "
+                    "evicting least recently used entries"
+                )
+
+    def _shared_get(self, key: int) -> Optional[torch.Tensor]:
+        row = self._shared.get(key)
+        if row is not None:
+            # LRU touch: hit positions are never recomputed, so a FIFO cap would
+            # evict a hot shared prefix and never re-learn it.
+            self._shared.move_to_end(key)
+        return row
 
     def _store_positions(self, rid: int, hashes: list) -> None:
         """Store rid's captured PROMPT-region positions into the SharedRouteCache
@@ -643,15 +772,21 @@ class RouteCapture:
         pos_map = self._store.get(rid)
         if not pos_map:
             return
+        if self._shared_cap <= 0:
+            return  # block reuse is off: nothing could ever read these back
         cur = self._pop_cursor.get(rid, 0)
         n = len(hashes)
         while cur < n:
             row = pos_map.get(cur)
             if row is None:
                 break  # not captured yet — resume next step
+            if row is self._missing_row:
+                cur += 1  # never publish the sentinel under an evicted key
+                continue
             key = hashes[cur]
             if key not in self._shared:  # write-once
                 self._shared[key] = row
+                self._evict_shared()
                 if not getattr(self, "_pop_warned", False):
                     self._pop_warned = True
                     logger.debug(

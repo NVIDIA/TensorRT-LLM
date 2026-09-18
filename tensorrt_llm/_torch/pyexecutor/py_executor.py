@@ -639,6 +639,10 @@ class PyExecutor:
             self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
                 self.kv_cache_manager, "streaming_kv_events_enabled", False))
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        # Router Replay (R3): SharedRouteCache bound, derived once from the KV
+        # pool token capacity on the first non-warmup step (0 = block reuse off,
+        # -1 = capacity unknown -> the capturer keeps its own fallback bound).
+        self._route_cache_capacity: Optional[int] = None
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
@@ -7532,10 +7536,19 @@ class PyExecutor:
         if route_capture is not None:
             route_capture.set_iter(self.iter_counter)
             if not self.model_engine.is_warmup:
-                route_capture.prepare(
-                    scheduled_requests,
-                    getattr(getattr(self, 'kv_cache_manager', None),
-                            'tokens_per_block', 0))
+                if self._route_cache_capacity is None:
+                    if self.enable_kv_cache_reuse:
+                        self._route_cache_capacity = int(
+                            self.get_kv_cache_capacity().get("maxNumTokens",
+                                                             0)) or -1
+                    else:
+                        self._route_cache_capacity = 0
+                cap = self._route_cache_capacity
+                route_capture.prepare(scheduled_requests,
+                                      getattr(
+                                          getattr(self, 'kv_cache_manager',
+                                                  None), 'tokens_per_block', 0),
+                                      shared_capacity=None if cap < 0 else cap)
 
         num_ctx_tokens = sum(req.context_chunk_size
                              for req in scheduled_requests.context_requests)
