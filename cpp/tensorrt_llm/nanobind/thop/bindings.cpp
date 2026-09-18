@@ -125,7 +125,11 @@ bool fusedContextFmhaKernelExists(
 {
     using tensorrt_llm::kernels::Data_type;
 
-    if (headSize <= 0 || tokensPerBlock <= 0)
+    // A fused kernel exists only for a power-of-two page size; the kernel
+    // lookup asserts on other values, so reject them here rather than let that
+    // assertion escape this diagnostic query. tokensPerBlock > 0 is guaranteed
+    // before the bit test.
+    if (headSize <= 0 || tokensPerBlock <= 0 || (tokensPerBlock & (tokensPerBlock - 1)) != 0)
     {
         return false;
     }
