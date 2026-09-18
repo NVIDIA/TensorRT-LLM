@@ -49,11 +49,10 @@ from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.metrics.batch_metrics import BatchMetrics
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
-
-from tensorrt_llm.metrics.batch_metrics import BatchMetrics
 
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
@@ -2025,8 +2024,8 @@ class PyExecutor:
 
     def _update_batch_metrics(self, scheduled_batch: ScheduledRequests) -> None:
         if self._batch_metrics is not None:
-            self._batch_metrics.update(
-                scheduled_batch, filter_dummies=self.enable_attention_dp)
+            self._batch_metrics.update(scheduled_batch,
+                                       filter_dummies=self.enable_attention_dp)
 
     @staticmethod
     def _is_stats_dummy_request(req) -> bool:
