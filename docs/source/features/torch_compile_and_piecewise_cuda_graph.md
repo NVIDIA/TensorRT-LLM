@@ -79,19 +79,6 @@ validated before use.
 
 ### Piecewise CUDA Graph & Generation Only CUDA Graph
 
-For decoder models, piecewise mode compiles capture-eligible context and mixed
-batches. Generation-only batches and context batches above the capture ceiling
-use the eager model, including any speculative-decoding epilogue. With attention
-DP, eligibility is shared across ranks, including ranks without local context
-requests. Torch compile without piecewise graphs retains its all-batch behavior.
-
-MiniMax-M3 with MSA supports FP8 KV and index-K caches in piecewise mode. With
-`sparse_attention_config.fuse_qkv_index_projection: true`, projection, norm,
-RoPE, FP8 conversion and cache insertion are captured together; sparse attention
-remains in the eager boundary. Padded rows do not write to the caches. Automatic
-MXFP8 dispatch uses the native backend for compiled context while preserving
-decode-graph backend tuning.
-
 Piecewise CUDA Graph only handles context-only and mixed context+generation iterations, while the generation-only CUDA Graph only handles pure generation iterations. Users need to specify the number of tokens to capture for each type of CUDA Graph separately in the extra config. Currently, the default value for `capture_num_tokens` is `[2**i for i in range(8)] + [i for i in range(256, 3073, 256)]`. However, this configuration should be tuned based on specific hardware, model, and parallel strategy. For guidance on tuning these values, see the [Performance Tuning](#performance-tuning) section below.
 
 ```yaml
