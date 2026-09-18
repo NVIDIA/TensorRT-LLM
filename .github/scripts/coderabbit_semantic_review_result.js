@@ -52,12 +52,18 @@ function parseResult(comment) {
   const matches = [...new Map([...result.toLowerCase().matchAll(pattern)].map(m => [m[0], m])).values()];
   if (matches.length !== 1) return;
   const [, head, target, mergeBase, rawVerdict] = matches[0];
-  const verdict = rawVerdict.toUpperCase();
+  let verdict = rawVerdict.toUpperCase();
   const status = {PASS: /Passed/i, FAIL: /Warning|Error/i, INCONCLUSIVE: /Inconclusive/i};
   if (!status[verdict].test(row[2])) return;
   const merged = [...new Set([...result.toLowerCase().matchAll(/semantic_merged sha=([a-f0-9]{40})\b/g)].map(m => m[1]))];
   if (merged.length > 1) return;
-  return {head, target, mergeBase, verdict, merged: merged[0], comment};
+  // This checks citation presence, not the correctness of the AI's reasoning.
+  const repository = comment.html_url?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\//i)?.[1].toLowerCase();
+  const citations = [...result.matchAll(/https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/blob\/([a-f0-9]{40})\/[^\s<>)|]+#L[1-9]\d*/gi)]
+    .filter(m => m[1].toLowerCase() === repository).map(m => m[2].toLowerCase());
+  const missingEvidence = verdict !== 'INCONCLUSIVE' && ![head, target].every(sha => citations.includes(sha));
+  if (missingEvidence) verdict = 'INCONCLUSIVE';
+  return {head, target, mergeBase, verdict, missingEvidence, merged: merged[0], comment};
 }
 
 const matches = (result, request) => result && result.head === request.head &&
@@ -169,6 +175,8 @@ async function publish({github, context, core}) {
     INCONCLUSIVE: 'Semantic analysis inconclusive'}[result.verdict];
   const summary = `${pair.merged ? `Post-merge audit of ${pair.merged}. ` : ''}` +
     `Verified head ${pair.head}, target ${pair.target}, merge base ${pair.mergeBase}.\n\n` +
+    (result.missingEvidence ? 'CodeRabbit did not provide source links with full SHAs and line numbers for both revisions; ' +
+      'its reported verdict is treated as inconclusive.\n\n' : '') +
     `[CodeRabbit analysis](${result.comment.html_url})\n\n${NOTICE}`;
   if (!preview) {
     const checks = await github.paginate(github.rest.checks.listForRef, {

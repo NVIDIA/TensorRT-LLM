@@ -34,6 +34,8 @@ function resultBody(verdict, pair) {
     '<details>\n<summary>Full details: Semantic Conflict With Target Branch</summary>\n' +
     `SEMANTIC_RESULT head=${pair.head} target=${pair.target} merge_base=${pair.mergeBase} verdict=${verdict}\n` +
     (pair.merged ? `SEMANTIC_MERGED sha=${pair.merged}\n` : '') +
+    `Caller: https://github.com/example/repo/blob/${pair.head}/caller.py#L12\n` +
+    `Implementation: https://github.com/example/repo/blob/${pair.target}/callee.py#L25\n` +
     'Code evidence and a minimal regression input.\n</details>';
 }
 
@@ -277,6 +279,34 @@ test('malformed, contradictory, stale and untrusted results never publish a pass
   }
   const h = harness(); await h.run(); const reply = h.reply(); h.comments.shift();
   await h.publish(reply); assert.equal(h.checks[0].conclusion, 'neutral');
+});
+
+test('unsupported PASS/FAIL becomes inconclusive instead of reusing an older verdict', async () => {
+  for (const verdict of ['PASS', 'FAIL']) {
+    for (const removeEvidence of [
+      body => body.replace(/https:\/\/github\.com\/example\/repo\/blob\/\S+/g, ''),
+      body => body.replace(`/blob/${BASE}/`, `/blob/${NEW_BASE}/`),
+      body => body.replaceAll('/example/repo/blob/', '/unrelated/repo/blob/'),
+      body => body.replace(/#L\d+/g, ''),
+    ]) {
+      const h = harness(); await h.run(); await h.publish(h.reply('PASS'));
+      const reply = h.reply(verdict); reply.body = removeEvidence(reply.body);
+      await h.publish(reply);
+      assert.equal(h.checks[0].conclusion, 'neutral');
+      assert.match(h.checks[0].output.summary, /source links.*both revisions/);
+      assert.equal(h.failures.length, 0);
+      await h.publish(null, true);
+      assert.equal(h.outputs.verdict, 'INCONCLUSIVE');
+    }
+  }
+});
+
+test('a result after its explanation is accepted with immutable citations', async () => {
+  const h = harness(); await h.run(); const reply = h.reply('FAIL');
+  const record = reply.body.match(/SEMANTIC_RESULT[^\n]+\n/)[0];
+  reply.body = reply.body.replace(record, '').replace('</details>', `${record}</details>`);
+  await h.publish(reply);
+  assert.equal(h.checks[0].conclusion, 'failure');
 });
 
 test('live ref changes during verification cannot publish a current pass', async () => {
