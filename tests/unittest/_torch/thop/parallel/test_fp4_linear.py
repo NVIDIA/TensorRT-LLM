@@ -1022,7 +1022,8 @@ def test_fp4_linear_locality_domain_correctness(mnk, tmp_path):
 
     tuner = AutoTuner.get()
     old_settings = (tuner.warmup, tuner.repeat, tuner.stream_delay_micro_secs)
-    tuner.warmup = 0
+    # Compile each tactic before the autotuner captures its CUDA graph.
+    tuner.warmup = 1
     tuner.repeat = 1
     tuner.stream_delay_micro_secs = 10
     try:
@@ -1044,49 +1045,50 @@ def test_fp4_linear_locality_domain_correctness(mnk, tmp_path):
             output_locality_domain = locality_domain_linear.forward(
                 input_tensor)
 
-        if seq_len in (1, 256):
-            op_name = (
-                "trtllm::cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin"
-                "::locality_domain_concurrent")
-            assert tuner.stats.tuned_op_profiled_configs.get(
-                op_name, 0) > 0, str(tuner.stats)
-            assert not tuner.stats.failed_profiling_count.get(op_name, set())
+        assert seq_len in (1, 256), (
+            f"tactic expectations are only defined for seq_len 1 and 256, got {seq_len}"
+        )
+        op_name = ("trtllm::cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin"
+                   "::locality_domain_concurrent")
+        assert tuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0, str(
+            tuner.stats)
+        assert not tuner.stats.failed_profiling_count.get(op_name, set())
 
-            with tuner.capture() as tactics_capture, torch.inference_mode():
-                output_locality_domain = locality_domain_linear.forward(
-                    input_tensor)
+        with tuner.capture() as tactics_capture, torch.inference_mode():
+            output_locality_domain = locality_domain_linear.forward(
+                input_tensor)
 
-            assert len(tactics_capture._captured_contexts) == 1
-            context = tactics_capture._captured_contexts[0]
-            assert context["custom_op"] == op_name
-            concurrent_runner = context["runners"][0]
-            tactics = concurrent_runner.get_valid_tactics(
-                context["inputs"], OptimizationProfile())
-            base_tactics = [tactic for tactic in tactics if tactic[0] == "base"]
-            mixed_tactics = [
-                tactic for tactic in tactics if tactic[0] == "mixed_clusters"
-            ]
+        assert len(tactics_capture._captured_contexts) == 1
+        context = tactics_capture._captured_contexts[0]
+        assert context["custom_op"] == op_name
+        concurrent_runner = context["runners"][0]
+        tactics = concurrent_runner.get_valid_tactics(context["inputs"],
+                                                      OptimizationProfile())
+        base_tactics = [tactic for tactic in tactics if tactic[0] == "base"]
+        mixed_tactics = [
+            tactic for tactic in tactics if tactic[0] == "mixed_clusters"
+        ]
 
-            if seq_len == 1:
-                assert {tactic[4] for tactic in base_tactics} == {True}
-                assert not mixed_tactics
-                replay_tactics = [base_tactics[0]]
-            else:
-                assert {tactic[4] for tactic in base_tactics} == {False}
-                assert {tactic[5] for tactic in mixed_tactics} == {True}
-                replay_tactics = [base_tactics[0], mixed_tactics[0]]
+        if seq_len == 1:
+            assert {tactic[4] for tactic in base_tactics} == {True}
+            assert not mixed_tactics
+            replay_tactics = [base_tactics[0]]
+        else:
+            assert {tactic[4] for tactic in base_tactics} == {False}
+            assert {tactic[5] for tactic in mixed_tactics} == {True}
+            replay_tactics = [base_tactics[0], mixed_tactics[0]]
 
-            for tactic in replay_tactics:
-                with torch.inference_mode():
-                    context["inputs"][-1].zero_()
-                    concurrent_runner(context["inputs"], tactic=tactic)
-                torch.cuda.synchronize()
-                torch.testing.assert_close(
-                    output_base,
-                    context["inputs"][-1][:, :output_size],
-                    rtol=1e-2,
-                    atol=0.15,
-                )
+        for tactic in replay_tactics:
+            with torch.inference_mode():
+                context["inputs"][-1].zero_()
+                concurrent_runner(context["inputs"], tactic=tactic)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output_base,
+                context["inputs"][-1][:, :output_size],
+                rtol=1e-2,
+                atol=0.15,
+            )
     finally:
         tuner.warmup, tuner.repeat, tuner.stream_delay_micro_secs = old_settings
 

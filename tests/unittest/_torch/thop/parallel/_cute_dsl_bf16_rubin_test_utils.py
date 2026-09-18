@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Sequence
 from typing import Literal
 
@@ -122,6 +123,15 @@ def select_captured_locality_domain_tactic(
     return concurrent_runner, tactic, tactics
 
 
+def bf16_matmul_atol(k: int) -> float:
+    """Return the absolute tolerance for BF16 matmuls with unit-variance inputs.
+
+    Args:
+        k: Reduction dimension of the GEMM or BMM.
+    """
+    return 4e-3 * math.sqrt(k)
+
+
 def run_locality_domain_composite(
     op_name: str,
     args: tuple[torch.Tensor, ...],
@@ -131,6 +141,7 @@ def run_locality_domain_composite(
     *,
     split_k_slices: int | None = None,
     capture_graph: bool = True,
+    atol: float | None = None,
 ) -> list[Tactic]:
     op = getattr(torch.ops.trtllm, op_name)
     output = args[-1]
@@ -163,6 +174,9 @@ def run_locality_domain_composite(
         concurrent_runner(context["inputs"], tactic=tactic)
     torch.cuda.synchronize()
 
+    # Scale the absolute allowance with K for these unit-variance inputs.
+    if atol is None:
+        atol = bf16_matmul_atol(args[0].shape[-1])
     output_partitions = output.chunk(len(expected_partitions), dim=partition_dim)
     assert len(output_partitions) == len(expected_partitions)
     for output_partition, expected in zip(
@@ -170,6 +184,11 @@ def run_locality_domain_composite(
         expected_partitions,
         strict=True,
     ):
-        torch.testing.assert_close(output_partition.float(), expected.float(), rtol=1e-2, atol=1.0)
+        torch.testing.assert_close(
+            output_partition.float(),
+            expected.float(),
+            rtol=1e-2,
+            atol=atol,
+        )
 
     return tactics

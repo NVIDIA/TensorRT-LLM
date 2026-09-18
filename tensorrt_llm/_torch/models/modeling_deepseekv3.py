@@ -747,10 +747,8 @@ class DeepseekV3Linear(Linear):
             return super().apply_linear(input, bias, lora_params, layer_idx)
         num_tokens = input.shape[0]
         has_any_quant = self.has_any_quant
-        use_cute_dsl_bf16_gemm = (self.use_cute_dsl_bf16_gemm
-                                  and not has_any_quant and is_sm_100f()
-                                  and self.weight.dtype == torch.bfloat16)
-        if (not use_cute_dsl_bf16_gemm and not has_any_quant
+        # The fused op has no LoRA inputs; let Linear merge active adapters.
+        if (not has_any_quant and (self.lora is None or not lora_params)
                 and 1 <= num_tokens <= 16
                 and get_sm_version() not in [120, 121]):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
@@ -1044,10 +1042,15 @@ class Deepseekv3MoE(nn.Module):
 
         shared_quant_config = self._get_shared_experts_quant_config(
             model_config, layer_idx)
-        shared_model_config = model_config
-        if shared_quant_config is not model_config.quant_config:
-            shared_model_config = copy.copy(model_config)
-            shared_model_config.quant_config = shared_quant_config
+        # Shared experts overlap routed MoE on another stream. Disable locality
+        # domains for every precision so both paths do not contend for the same
+        # global partition streams. Only thaw the private copy of ModelConfig.
+        shared_model_config = copy.copy(model_config)
+        shared_model_config._frozen = False
+        shared_model_config.quant_config = shared_quant_config
+        shared_model_config.locality_domain_policy = LocalityDomainPolicy(
+            enabled=False)
+        shared_model_config._frozen = model_config._frozen
 
         # For shared experts, use the block size implied by their quant config.
         block_size = 1
@@ -1059,9 +1062,6 @@ class Deepseekv3MoE(nn.Module):
         self.shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size)
 
-        # Shared experts overlap routed MoE on another stream. Keep BF16 locality domain
-        # localization disabled here so both paths do not contend for the same
-        # global partition streams.
         self.shared_experts = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,

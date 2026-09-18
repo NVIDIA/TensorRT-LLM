@@ -2206,6 +2206,9 @@ class MLA(nn.Module):
         if plan.enabled and plan.op_kind == "bf16_linear":
             weight = weight.clone(memory_format=torch.contiguous_format)
         self.v_b_proj = nn.Parameter(weight, requires_grad=False)
+        self._locality_domain_k_b_proj_trans_shards = None
+        self._locality_domain_v_b_proj_shards = None
+        self._weights_transformed = False
 
     def _has_full_absorption_weights(self) -> bool:
         if getattr(self, "kv_lora_rank", None) != 512 or getattr(self, "v_head_dim", None) != 128:
