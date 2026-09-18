@@ -19,7 +19,7 @@
   "diffusers_version": "0.39.0",
   "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
   "tensorrt_llm_version": "1.3.0rc25",
-  "tensorrt_llm_commit": "14ad9b524dd98dd514dd265601ac9c993b2d093b",
+  "tensorrt_llm_commit": "6b45d09c0fe5fd25cad046eb45bb175e025a5399",
   "container_image": "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-skip-tritondevel-202607311529-16970",
   "sha256": "8af11b535da4786fc4195a8d3778d8a132ed7016e50fd1f0c081a9f3055e03f4"
 }
