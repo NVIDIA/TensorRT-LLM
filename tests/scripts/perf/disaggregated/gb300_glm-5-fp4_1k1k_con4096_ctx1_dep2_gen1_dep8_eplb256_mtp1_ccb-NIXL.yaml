@@ -39,17 +39,6 @@ environment:
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
-  env_var:
-    HF_HOME: <hf_home_path>
-  tasks:
-    gsm8k_local:
-      model: local-completions
-      model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
-      extra_kwargs:
-        trust_remote_code: true
-        custom_config: tests/integration/lm_eval_configs/gsm8k_local.yaml
 worker_config:
   gen:
     print_iter_log: true
@@ -77,7 +66,8 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: MTP
       num_nextn_predict_layers: 1
@@ -104,5 +94,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     speculative_config: *id001

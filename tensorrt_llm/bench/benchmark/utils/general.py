@@ -9,14 +9,15 @@ import yaml
 
 from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
-from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
-                                            get_model_config)
-from tensorrt_llm.bench.build.dataclasses import (NemotronHybridConfig,
-                                                  Qwen3HybridConfig)
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
+from tensorrt_llm.bench.tuning.dataclasses import (NemotronHybridConfig,
+                                                   Qwen3HybridConfig)
+from tensorrt_llm.bench.tuning.settings import (get_benchmark_engine_settings,
+                                                get_model_config)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.version import __version__
 
 _KV_CACHE_MAP = {
     QuantAlgo.FP8.value: "fp8",
@@ -192,7 +193,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     backend = params.get("backend", "pytorch")
     return {
-        "sw_version": "1.2",
+        "sw_version": __version__,
         "model_path": model_path,
         "settings_config": {
             "max_batch_size": int(max_batch_size),

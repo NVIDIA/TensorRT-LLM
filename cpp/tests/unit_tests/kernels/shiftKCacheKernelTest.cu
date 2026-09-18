@@ -2,13 +2,13 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <numeric>
 #include <random>
 #include <type_traits>
@@ -17,7 +17,6 @@ using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
 
 namespace tc = tensorrt_llm::common;
-namespace trk = tensorrt_llm::runtime::kernels;
 
 namespace
 {
@@ -197,37 +196,37 @@ public:
         std::vector<int32_t> const& tokenSeqIdxs)
     {
         // allocate buffer
-        mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
-        mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+        mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
 
-        mInputLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
-        mInputLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        mInputLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+        mInputLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
 
-        mKScaleQuantOrigDevice = mBufferManager->gpu(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
+        mKScaleQuantOrigDevice = mBufferManager->gpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
 
         mTokenReadIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), tensorrt_llm::DataType::kINT32);
         mTokenReadIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), tensorrt_llm::DataType::kINT32);
 
         mTokenWriteIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), tensorrt_llm::DataType::kINT32);
         mTokenWriteIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), tensorrt_llm::DataType::kINT32);
 
         mTokenPosIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), tensorrt_llm::DataType::kINT32);
         mTokenPosIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), tensorrt_llm::DataType::kINT32);
 
         mTokenSeqIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), tensorrt_llm::DataType::kINT32);
         mTokenSeqIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), tensorrt_llm::DataType::kINT32);
 
-        // nvinfer1::DataType dataType = nvinfer1::DataType::kHALF
-        // nvinfer1::DataType::kHALF
-        // nvinfer1::DataType::kBF16
+        // tensorrt_llm::DataType dataType = tensorrt_llm::DataType::kHALF
+        // tensorrt_llm::DataType::kHALF
+        // tensorrt_llm::DataType::kBF16
         int32_t batchBeam = batchSize * beamWidth;
         if (pagedKvCache)
         {
@@ -265,7 +264,10 @@ public:
         // init data
         auto inputDataHostPtr = bufferCast<T>(*mInputDataHost);
         initRandom(inputDataHostPtr, batchSize * beamWidth * 2 * numHeads * maxAttentionWindow * headSize, -3.0f, 3.0f);
-        trk::invokeFill(*mKScaleQuantOrigDevice, float{1.0f}, *mStream);
+        // Single-element scale buffer initialised to 1.0f via a host round-trip.
+        auto kScaleQuantOrigHost = mBufferManager->pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
+        bufferCast<float>(*kScaleQuantOrigHost)[0] = 1.0f;
+        mBufferManager->copy(*kScaleQuantOrigHost, *mKScaleQuantOrigDevice);
 
         auto seqLengthsHostPtr = bufferCast<int32_t>(*mSeqLengthsHost);
         auto inputLengthsHostPtr = bufferCast<int32_t>(*mInputLengthsHost);

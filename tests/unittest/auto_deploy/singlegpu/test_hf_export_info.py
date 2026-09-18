@@ -3,11 +3,14 @@
 
 import operator
 
+import pytest
 import torch
 from torch import nn
 from torch.fx import symbolic_trace
 
 from tensorrt_llm._torch.auto_deploy.models.hf import TextModelExportInfo
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _DummyTextModel(nn.Module):

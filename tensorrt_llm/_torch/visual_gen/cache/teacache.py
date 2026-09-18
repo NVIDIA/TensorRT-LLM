@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -71,6 +74,7 @@ class ExtractorConfig:
         guidance_param_name: Parameter name for guidance if used (default: None)
         forward_params: List of parameter names (None = auto-introspect from forward signature)
         return_dict_default: Default value for return_dict parameter (default: True)
+        return_tuple_when_return_dict_false: Whether return_dict=False uses a one-element tuple
         output_model_class: Output class name for return type (default: "Transformer2DModelOutput")
     """
 
@@ -80,6 +84,7 @@ class ExtractorConfig:
     guidance_param_name: Optional[str] = None
     forward_params: Optional[List[str]] = None
     return_dict_default: bool = True
+    return_tuple_when_return_dict_false: bool = False
     output_model_class: str = "Transformer2DModelOutput"
 
 
@@ -154,10 +159,8 @@ class GenericExtractor:
                 if isinstance(output, tuple):
                     return output
                 return Transformer2DModelOutput(sample=output)
-            # For return_dict=False, unwrap single-element tuple to raw tensor
-            if isinstance(output, tuple) and len(output) == 1:
-                return output[0]
-            # Return raw tensor as-is (TeaCacheHook always passes tensors to postprocess)
+            if self.config.return_tuple_when_return_dict_false:
+                return (output,)
             return output
 
         return CacheContext(

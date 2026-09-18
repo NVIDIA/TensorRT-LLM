@@ -13,32 +13,32 @@ Both TRTLLM and HF pipelines read boundary_ratio from the checkpoint model_index
 Model tested:
   - Wan2.2-T2V-A14B-Diffusers   (480x832, 33 frames)
 
+Also covers offloading vs HuggingFace. Offload-specific baseline and CUDA graph
+incompatibility tests are in test_wan22_t2v_offload.py.
+
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py -v -s
-
-Override checkpoint path:
-    DIFFUSION_MODEL_PATH_WAN22_T2V=/path/to/wan22 \\
-        pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py -v -s
 """
 
-import importlib
 import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
+from utils.llm_data import get_checkpoint
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
+    CpuOffloadConfig,
     TorchCompileConfig,
     VisualGenArgs,
 )
@@ -50,29 +50,7 @@ def _cleanup_mpi_env():
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
-# ============================================================================
-# Path helpers
-# ============================================================================
-
-
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path if set in env, assert when it's set but not a valid path."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-WAN22_A14B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN22_T2V", "Wan2.2-T2V-A14B-Diffusers")
+WAN22_A14B_SUBDIR = "Wan2.2-T2V-A14B-Diffusers"
 
 # ============================================================================
 # Test constants
@@ -90,15 +68,18 @@ COS_SIM_THRESHOLD = 0.99
 # ============================================================================
 
 
-def _load_trtllm_pipeline(checkpoint_path: str):
+def _load_trtllm_pipeline(
+    checkpoint_path: str,
+    *,
+    enable_offload: bool = False,
+):
     """Load TRTLLM WanPipeline (two-stage) without torch.compile or warmup."""
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
-    args = VisualGenArgs(
+    kwargs = dict(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
+        cpu_offload_config=CpuOffloadConfig(enable=enable_offload),
     )
-    return PipelineLoader(args).load(skip_warmup=True)
+    return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True)
 
 
 def _load_hf_pipeline(checkpoint_path: str):
@@ -183,10 +164,18 @@ def _assert_pipeline_matches_hf(
     num_frames: int,
     guidance_scale: float,
     model_label: str,
+    *,
+    enable_offload: bool = False,
 ) -> None:
     """Run TRTLLM and HF pipelines sequentially, compare decoded video output."""
     # --- TRTLLM ---
-    trtllm_pipe = _load_trtllm_pipeline(checkpoint_path)
+    trtllm_pipe = _load_trtllm_pipeline(
+        checkpoint_path,
+        enable_offload=enable_offload,
+    )
+    if enable_offload:
+        assert trtllm_pipe.offloader.stages(), f"{model_label}: offload stages must be configured"
+        assert trtllm_pipe.offloader.offload_pipeline is not None
 
     # Confirm two-stage denoising is active (Wan 2.2 specific sanity check)
     assert trtllm_pipe.transformer_2 is not None, (
@@ -251,6 +240,7 @@ def _assert_pipeline_matches_hf(
 # ============================================================================
 
 
+@skip_pre_blackwell
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 class TestWan22_A14B_PipelineCorrectness:
@@ -263,7 +253,7 @@ class TestWan22_A14B_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_pipeline_matches_hf(
-            checkpoint_path=WAN22_A14B_PATH,
+            checkpoint_path=get_checkpoint(WAN22_A14B_SUBDIR),
             height=480,
             width=832,
             num_frames=9,
@@ -271,9 +261,20 @@ class TestWan22_A14B_PipelineCorrectness:
             model_label="Wan2.2-T2V-A14B",
         )
 
+    def test_cosine_similarity_with_offload(self):
+        _assert_pipeline_matches_hf(
+            checkpoint_path=get_checkpoint(WAN22_A14B_SUBDIR),
+            height=480,
+            width=832,
+            num_frames=9,
+            guidance_scale=4.0,
+            model_label="Wan2.2-T2V-A14B (offload)",
+            enable_offload=True,
+        )
+
 
 # ============================================================================
-# Two-stage feature fixtures (loaded once per module)
+# Two-stage feature fixtures (class-scoped: each A14B pipeline pins tens of GB)
 # ============================================================================
 
 
@@ -286,10 +287,8 @@ _SKIP_AUX = [
 
 
 def _make_wan22_t2v(quant_config=None, attention_config=None):
-    if not os.path.exists(WAN22_A14B_PATH):
-        pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
     kwargs = dict(
-        model=WAN22_A14B_PATH,
+        model=get_checkpoint(WAN22_A14B_SUBDIR),
         torch_compile_config=TorchCompileConfig(enable=False),
     )
     if quant_config is not None:
@@ -299,7 +298,7 @@ def _make_wan22_t2v(quant_config=None, attention_config=None):
     return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True, skip_components=_SKIP_AUX)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def wan22_t2v_fp8():
     pipeline = _make_wan22_t2v(quant_config={"quant_algo": "FP8", "dynamic": True})
     yield pipeline
@@ -308,7 +307,7 @@ def wan22_t2v_fp8():
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def wan22_t2v_trtllm():
     pipeline = _make_wan22_t2v(attention_config=AttentionConfig(backend="TRTLLM"))
     yield pipeline
@@ -330,7 +329,7 @@ class TestWan22TwoStageFeatures:
     def test_fp8_on_both_stages(self, wan22_t2v_fp8):
         """FP8 quantization is applied to both transformer and transformer_2."""
         if wan22_t2v_fp8.transformer_2 is None:
-            pytest.skip("Not a two-stage checkpoint")
+            pytest.fail("Not a two-stage checkpoint")
 
         def _has_fp8(module):
             return any(
@@ -345,7 +344,7 @@ class TestWan22TwoStageFeatures:
     def test_trtllm_attention_both_stages(self, wan22_t2v_trtllm):
         """TRTLLM self-attention and VANILLA cross-attention on both stages."""
         if wan22_t2v_trtllm.transformer_2 is None:
-            pytest.skip("Not a two-stage checkpoint")
+            pytest.fail("Not a two-stage checkpoint")
 
         for stage_name, transformer in [
             ("transformer", wan22_t2v_trtllm.transformer),
@@ -365,6 +364,7 @@ class TestWan22TwoStageFeatures:
 # =============================================================================
 
 
+@skip_pre_blackwell
 class TestWan22T2VBatchGeneration:
     """Batch generation tests for Wan 2.2 T2V pipeline.
 
@@ -375,11 +375,8 @@ class TestWan22T2VBatchGeneration:
     @pytest.fixture(scope="class")
     def wan22_t2v_full_pipeline(self):
         """Load full Wan 2.2 T2V pipeline (all components) for batch tests."""
-        if not WAN22_A14B_PATH or not os.path.exists(WAN22_A14B_PATH):
-            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH_WAN22_T2V.")
-
         args = VisualGenArgs(
-            model=WAN22_A14B_PATH,
+            model=get_checkpoint(WAN22_A14B_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
@@ -427,18 +424,16 @@ class TestWan22T2VBatchGeneration:
 # =============================================================================
 
 
+@skip_pre_blackwell
 @pytest.mark.integration
 @pytest.mark.wan_t2v
-@pytest.mark.skipif(importlib.util.find_spec("cache_dit") is None, reason="cache_dit not installed")
 class TestWan22T2VCombinedOptimizations:
     """FP8 + CacheDiT + TRTLLM attention combined on Wan 2.2 T2V (480x832)."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_fp8_cache_dit_trtllm(self):
-        if not os.path.exists(WAN22_A14B_PATH):
-            pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
         args = VisualGenArgs(
-            model=WAN22_A14B_PATH,
+            model=get_checkpoint(WAN22_A14B_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
             attention_config=AttentionConfig(backend="TRTLLM"),
@@ -464,6 +459,9 @@ class TestWan22T2VCombinedOptimizations:
             assert pipeline.cache_accelerator is not None
             assert pipeline.cache_accelerator.is_enabled()
         finally:
+            acc = getattr(pipeline, "cache_accelerator", None)
+            if acc is not None:
+                acc.unwrap()
             del pipeline
             gc.collect()
             torch.cuda.empty_cache()

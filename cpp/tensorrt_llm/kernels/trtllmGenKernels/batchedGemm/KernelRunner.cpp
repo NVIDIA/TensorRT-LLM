@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <optional>
 #include <set>
 #include <unistd.h>
 #include <vector>
@@ -44,13 +45,30 @@ using tensorrt_llm::common::fmtstr;
 
 constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 {
-    if (gpuSM == 103)
+    // Blackwell family. Family-compatible (sm_100f) cubins load on any SM in
+    // [100, 110); arch-specific ones are locked to the SM they were built for.
+    // The batchedGemm drop ships Sm100f, Sm100a, Sm103a and Sm107a.
+    // Range kept in sync with tensorrt_llm::common::isSM100Family (cudaUtils.h),
+    // which is not constexpr and so cannot be reused here.
+    if (gpuSM >= 100 && gpuSM < 110)
     {
-        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
-    }
-    else if (gpuSM == 100)
-    {
-        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm100a;
+        if (kernelSM == SmVersion::Sm100f)
+        {
+            return true;
+        }
+        if (gpuSM == 100)
+        {
+            return kernelSM == SmVersion::Sm100a;
+        }
+        if (gpuSM == 103)
+        {
+            return kernelSM == SmVersion::Sm103a;
+        }
+        if (gpuSM == 107)
+        {
+            return kernelSM == SmVersion::Sm107a;
+        }
+        return false;
     }
     else if (gpuSM == 90)
     {
@@ -59,6 +77,22 @@ constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 
     TLLM_THROW("Unexpected gpuSM %d", gpuSM);
     return false;
+}
+
+// Maps the runner-local gated ActType to the generated batchedGemm::gemmGatedAct::ActType.
+// The two enums evolve independently (the generator inserted SiTuGlu before None, shifting
+// values), so a value-preserving cast is not safe. Relu2/Silu are element-wise activations
+// (EltwiseActType) with no fused gated kernel counterpart and must never reach this mapping.
+static batchedGemm::gemmGatedAct::ActType toGemmGatedActType(ActType actType)
+{
+    switch (actType)
+    {
+    case ActType::SwiGlu: return batchedGemm::gemmGatedAct::ActType::SwiGlu;
+    case ActType::SiTu: return batchedGemm::gemmGatedAct::ActType::SiTuGlu;
+    case ActType::Relu2:
+    case ActType::Silu: break;
+    }
+    TLLM_THROW("ActType %d has no fused gated kernel mapping", static_cast<int>(actType));
 }
 
 static inline bool skipQuirks(BatchedGemmConfig const& config)
@@ -117,6 +151,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         rejectReason.resize(bmm.getNumBatchedGemmConfigs());
     }
 
+    // Only fused gated kernels compare the gated ActType; resolve the mapping once so a
+    // misconfigured runner (element-wise ActType + fusedAct) fails loudly at construction.
+    std::optional<batchedGemm::gemmGatedAct::ActType> gatedActType;
+    if (mOptions.fusedAct)
+    {
+        gatedActType = toGemmGatedActType(mOptions.actType);
+    }
+
     int gpuSM = tensorrt_llm::common::getSMVersion();
     for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i)
     {
@@ -145,6 +187,13 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             : (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB);
 
         if (!acceptIf(!skipQuirks(config), "skipQuirks: known hanging kernel"))
+        {
+            continue;
+        }
+
+        // The host runner does not wire the multicast completion barrier pointers; reject any
+        // future metadata that enables C multicast instead of launching with null barriers.
+        if (!acceptIf(!options.mUseCMultiCast, "mUseCMultiCast is not supported by the host runner"))
         {
             continue;
         }
@@ -203,31 +252,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             continue;
         }
 
-        auto sm = configs[i].mSm;
-        if (sm != SmVersion::Sm100f)
-        {
-            int smVersion = tensorrt_llm::common::getSMVersion();
-            if (smVersion == 100)
-            {
-                if (!acceptIf(sm == SmVersion::Sm100a,
-                        fmtstr("SM version 100 requires Sm100a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-            else if (smVersion == 103)
-            {
-                if (!acceptIf(sm == SmVersion::Sm103a,
-                        fmtstr("SM version 103 requires Sm103a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-        }
-
         if (options.mUseDeepSeekFp8)
         {
-            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
+            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrix should be false for DeepSeek Fp8"))
             {
                 continue;
             }
@@ -235,9 +262,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
         if (options.mFusedAct)
         {
-            if (!acceptIf(options.mActType == static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType),
+            if (!acceptIf(options.mActType == *gatedActType,
                     fmtstr("actType mismatch (kernel: %d, expected: %d)", static_cast<int>(options.mActType),
-                        static_cast<int>(mOptions.actType))))
+                        static_cast<int>(*gatedActType))))
             {
                 continue;
             }
@@ -252,6 +279,31 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         if (!acceptIf(options.mEpilogueTileM == mOptions.epilogueTileM,
                 fmtstr("epilogueTileM mismatch (kernel: %d, expected: %d)", options.mEpilogueTileM,
                     mOptions.epilogueTileM)))
+        {
+            continue;
+        }
+
+        if (!acceptIf(options.mFineGrainedConsumerA == mOptions.fineGrainedConsumerA,
+                fmtstr("fineGrainedConsumerA mismatch (kernel: %d, expected: %d)", options.mFineGrainedConsumerA,
+                    mOptions.fineGrainedConsumerA)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mFineGrainedConsumerB == mOptions.fineGrainedConsumerB,
+                fmtstr("fineGrainedConsumerB mismatch (kernel: %d, expected: %d)", options.mFineGrainedConsumerB,
+                    mOptions.fineGrainedConsumerB)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mFineGrainedForceValid == mOptions.fineGrainedForceValid,
+                fmtstr("fineGrainedForceValid mismatch (kernel: %d, expected: %d)", options.mFineGrainedForceValid,
+                    mOptions.fineGrainedForceValid)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mFineGrainedProducer == mOptions.fineGrainedProducer,
+                fmtstr("fineGrainedProducer mismatch (kernel: %d, expected: %d)", options.mFineGrainedProducer,
+                    mOptions.fineGrainedProducer)))
         {
             continue;
         }
@@ -305,7 +357,7 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
     int32_t configIndex) const
 {
-    BatchedGemmData gemmData;
+    BatchedGemmData gemmData{};
 
     auto bmm = BatchedGemmInterface();
 
@@ -330,7 +382,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
 {
     auto bmm = BatchedGemmInterface();
 
-    BatchedGemmData gemmData;
+    BatchedGemmData gemmData{};
 
     auto const configs = bmm.getBatchedGemmConfigs();
 
@@ -413,7 +465,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL(), nullptr, globalTrtllmGenBatchedGemmModuleCache);
+        tensorrt_llm::common::getEnvEnablePDL(), nullptr, std::ref(globalTrtllmGenBatchedGemmModuleCache));
 
     CUresult cuErr = static_cast<CUresult>(err);
     char const* cuErrStr = nullptr;
@@ -489,7 +541,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
 
     int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    BatchedGemmData gemmData;
+    BatchedGemmData gemmData{};
 
     // Sanitize optional valid dimensions
     validM = validM <= 0 ? m : validM;
@@ -549,7 +601,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
         // prefer persistent tile scheduler.
         if (optionsA.mTileScheduler != optionsB.mTileScheduler)
         {
-            BatchedGemmData gemmData;
+            BatchedGemmData gemmData{};
             setProblemDimensions(gemmData, optionsA.mTransposeMmaOutput, m, n, k, batchedTokens, numTokens, numBatches,
                 maxNumCtasInBatchDim, validM, validN, validK);
             auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
@@ -608,7 +660,7 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
     auto const bmm = BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
 
-    BatchedGemmData gemmData;
+    BatchedGemmData gemmData{};
 
     // Sanitize optional valid dimensions
     validM = validM <= 0 ? m : validM;

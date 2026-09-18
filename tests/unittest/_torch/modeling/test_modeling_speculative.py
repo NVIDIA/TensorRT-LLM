@@ -13,14 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Eagle3ForCausalLM.apply_eagle3_fc fc_norm branch."""
+"""Unit tests for speculative modeling classes."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch, sentinel
 
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
+from tensorrt_llm._torch.attention.backends.interface import RopeParams
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+from tensorrt_llm._torch.models.modeling_speculative import (
+    Eagle3ForCausalLM,
+    SpecDecOneEngineForCausalLM,
+    _build_mtp_one_model_draft,
+    _copy_model_config_with_moe_backend,
+    external_drafter_config_kwargs,
+)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 class _FakeDraftModel(nn.Module):
@@ -144,3 +160,427 @@ def test_apply_eagle3_fc_with_fc_norm(num_capture_layers):
         "fc_norm should apply per-chunk normalization which differs from "
         "whole-tensor normalization"
     )
+
+
+# ---------------------------------------------------------------------------
+# SpecDecOneEngineForCausalLM: optional hidden_size / vocab_size
+# ---------------------------------------------------------------------------
+
+_BASE_CLS = "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM"
+
+
+def _init_specdec_with_mocked_base(model_config, **kwargs):
+    """Instantiate SpecDecOneEngineForCausalLM with the base class stubbed out.
+
+    DecoderModelForCausalLM is built on the PostInitCaller metaclass, which
+    invokes __post_init__/__pp_init__ right after __init__ returns. Those
+    hooks must be stubbed too: the mocked __init__ never sets the attributes
+    (model_config, lm_head, ...) they rely on.
+
+    Returns the kwargs captured by the mocked base __init__.
+    """
+    with (
+        patch(f"{_BASE_CLS}.__init__", return_value=None) as mock_init,
+        patch(f"{_BASE_CLS}.__post_init__"),
+        patch(f"{_BASE_CLS}.__pp_init__"),
+    ):
+        SpecDecOneEngineForCausalLM(MagicMock(), model_config, **kwargs)
+    _, captured_kwargs = mock_init.call_args
+    return captured_kwargs
+
+
+def test_specdec_one_engine_reads_from_pretrained_config() -> None:
+    """Default path: hidden_size/vocab_size come from pretrained_config."""
+    hidden_size = 4096
+    vocab_size = 32000
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=hidden_size, vocab_size=vocab_size)
+    )
+
+    kwargs = _init_specdec_with_mocked_base(model_config)
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def test_specdec_one_engine_accepts_explicit_sizes() -> None:
+    """Composite configs (e.g. VL wrappers) can pass sizes explicitly."""
+    hidden_size = 8192
+    vocab_size = 128256
+    # Bare PretrainedConfig lacks hidden_size/vocab_size; the caller
+    # supplies them instead.
+    model_config = ModelConfig(pretrained_config=PretrainedConfig())
+
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def test_specdec_one_engine_explicit_overrides_pretrained_config() -> None:
+    """Explicit args take precedence over pretrained_config when both present."""
+    hidden_size = 2048
+    vocab_size = 64000
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=4096, vocab_size=32000)
+    )
+
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def _fake_dflash_attention(rope_params, source):
+    if source == "rotary_emb":
+        return SimpleNamespace(
+            rotary_emb=SimpleNamespace(
+                rope_params=rope_params,
+                head_dim=128,
+                is_neox=True,
+            ),
+            pos_embd_params=None,
+        )
+    return SimpleNamespace(
+        rotary_emb=None,
+        pos_embd_params=SimpleNamespace(rope=rope_params, is_neox=True),
+        head_dim=128,
+    )
+
+
+def _fake_dflash_wrapper(rope_params, source):
+    layers = [
+        SimpleNamespace(self_attn=_fake_dflash_attention(params, source)) for params in rope_params
+    ]
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.model = SimpleNamespace(layers=layers)
+    wrapper.config = SimpleNamespace(layer_types=["sliding_attention", "full_attention"])
+    return wrapper
+
+
+@pytest.mark.parametrize("source", ["rotary_emb", "pos_embd_params"])
+def test_dflash_allows_mixed_layer_types_with_uniform_rope(source):
+    rope_params = RopeParams(dim=128, theta=1_000_000.0, max_positions=4096)
+    wrapper = _fake_dflash_wrapper([rope_params, rope_params], source)
+
+    DFlashForCausalLM._validate_uniform_rope(wrapper)
+
+
+@pytest.mark.parametrize("source", ["rotary_emb", "pos_embd_params"])
+def test_dflash_rejects_different_effective_rope(source):
+    wrapper = _fake_dflash_wrapper(
+        [
+            RopeParams(dim=128, theta=1_000_000.0, max_positions=4096),
+            RopeParams(dim=128, theta=10_000_000.0, max_positions=4096),
+        ],
+        source,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"layers \[1\] have a different effective RoPE configuration",
+    ):
+        DFlashForCausalLM._validate_uniform_rope(wrapper)
+
+
+def _fake_dflash_mask_wrapper(config, is_dflash2=False, sliding_layers_causal=False):
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.config = config
+    wrapper._is_dflash2 = is_dflash2
+    wrapper._sliding_layers_causal = sliding_layers_causal
+    return wrapper
+
+
+def test_dflash_attention_mask_args():
+    wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=4,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=4096,
+            use_sliding_window=True,
+        )
+    )
+
+    assert wrapper._get_attention_mask_args(0) == (True, (4095, 0))
+    assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
+    assert wrapper._get_attention_mask_args(2) == (True, (4095, 0))
+
+    with patch("tensorrt_llm._torch.models.modeling_dflash.logger.warning") as warning:
+        wrapper._warn_inferred_attention_windows()
+    warning.assert_not_called()
+
+    disabled_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=4096,
+            use_sliding_window=False,
+        )
+    )
+
+    assert disabled_wrapper._get_attention_mask_args(0) == (False, (-1, -1))
+
+    missing_window_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=1,
+            layer_types=["sliding_attention"],
+            use_sliding_window=True,
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="use_sliding_window=True requires a positive integer sliding_window",
+    ):
+        missing_window_wrapper._get_attention_mask_args(0)
+
+    laguna_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            model_type="laguna",
+            architectures=["DFlashLagunaForCausalLM"],
+            num_hidden_layers=5,
+            layer_types=["sliding_attention"] * 5,
+            sliding_window=512,
+        ),
+        sliding_layers_causal=True,
+    )
+
+    for layer_idx in range(5):
+        assert laguna_wrapper._get_attention_mask_args(layer_idx) == (True, (511, 0))
+
+    with patch("tensorrt_llm._torch.models.modeling_dflash.logger.warning") as warning:
+        laguna_wrapper._warn_inferred_attention_windows()
+    warning.assert_called_once_with(
+        "DFlash inferred pooled-context sliding-window attention from checkpoint "
+        "config for draft layers [0, 1, 2, 3, 4]: window=512. Context attention "
+        "is truncated to 512 tokens for these layers; if the drafter expects full "
+        "context, acceptance rate may drop. Set use_sliding_window explicitly to "
+        "confirm or disable windowing."
+    )
+
+
+def _fake_dflash_buffer_wrapper():
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper._dflash_trtllm_gen_ops = SimpleNamespace(
+        get_workspace_size=MagicMock(side_effect=lambda **kwargs: kwargs["max_num_requests"] * 16),
+        get_multi_ctas_kv_counter_size=MagicMock(
+            side_effect=lambda _num_heads, max_batch_size, _sm_count: max_batch_size * 8
+        ),
+    )
+    wrapper._dflash_trtllm_gen_workspace = None
+    wrapper._dflash_trtllm_gen_counters = None
+    wrapper.register_buffer("_dflash_batch_indices", None, persistent=False)
+    wrapper.register_buffer("_dflash_block_offsets", None, persistent=False)
+    wrapper._dflash_trtllm_gen_device = None
+    wrapper._dflash_trtllm_gen_sm_count = None
+    return wrapper
+
+
+def _prepare_dflash_buffers(wrapper, max_batch_size):
+    wrapper._prepare_dflash_trtllm_gen_buffers(
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        max_batch_size=max_batch_size,
+        block_size=4,
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+    )
+
+
+def test_dflash_trtllm_gen_buffers_reuse_and_grow():
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties) as get_props,
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, 2)
+        workspace = wrapper._dflash_trtllm_gen_workspace
+        counters = wrapper._dflash_trtllm_gen_counters
+
+        _prepare_dflash_buffers(wrapper, 2)
+        assert wrapper._dflash_trtllm_gen_workspace is workspace
+        assert wrapper._dflash_trtllm_gen_counters is counters
+
+        _prepare_dflash_buffers(wrapper, 4)
+        assert wrapper._dflash_trtllm_gen_workspace.numel() >= 64
+        assert wrapper._dflash_trtllm_gen_counters.numel() >= 32
+        get_props.assert_called_once_with(torch.device("cpu"))
+
+
+def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, 2)
+
+    with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+        with pytest.raises(RuntimeError, match="workspace.*before CUDA graph capture"):
+            _prepare_dflash_buffers(wrapper, 4)
+
+        wrapper._dflash_trtllm_gen_counters = torch.empty(16, dtype=torch.uint8, device="meta")
+        with pytest.raises(RuntimeError, match="counter buffer.*before CUDA graph capture"):
+            _prepare_dflash_buffers(wrapper, 2)
+
+
+# ---------------------------------------------------------------------------
+# One-engine draft MoE backend selection
+# ---------------------------------------------------------------------------
+
+
+def _draft_backend_test_model_config(moe_backend: str = "CUTLASS") -> ModelConfig:
+    return ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=["DraftBackendTestForCausalLM"],
+            hidden_size=64,
+            vocab_size=128,
+            num_hidden_layers=2,
+        ),
+        moe_backend=moe_backend,
+    )
+
+
+def _external_spec_config(moe_backend: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.PARD,
+        moe_backend=moe_backend,
+    )
+
+
+def test_external_draft_moe_backend_none_inherits_target() -> None:
+    """None preserves the existing target-backend inheritance behavior."""
+    model_config = _draft_backend_test_model_config("CUTLASS")
+
+    kwargs = external_drafter_config_kwargs(model_config, _external_spec_config(None))
+
+    assert kwargs["moe_backend"] == "CUTLASS"
+
+
+def test_external_draft_moe_backend_auto_reaches_draft_loader() -> None:
+    """AUTO remains unresolved until the draft checkpoint quant config is read."""
+    model_config = _draft_backend_test_model_config("TRTLLM")
+
+    kwargs = external_drafter_config_kwargs(model_config, _external_spec_config("AUTO"))
+
+    assert kwargs["moe_backend"] == "AUTO"
+
+
+def test_loaded_draft_moe_backend_uses_isolated_model_config() -> None:
+    """Resolving a loaded draft config does not modify another config."""
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    with patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve_backend:
+        draft_config = _copy_model_config_with_moe_backend(target_config, "AUTO")
+
+    assert draft_config is not target_config
+    assert draft_config.moe_backend == "TRTLLM"
+    assert target_config.moe_backend == "CUTLASS"
+    resolve_backend.assert_called_once_with(
+        "AUTO", "DraftBackendTestForCausalLM", quant_config=target_config.quant_config
+    )
+
+
+def test_internal_mtp_without_override_reuses_target_model_config() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend=None)
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+        return_value=sentinel.draft_model,
+    ) as mtp_cls:
+        draft_model = _build_mtp_one_model_draft(
+            target_config, None, sentinel.lm_head, target_model
+        )
+
+    assert draft_model is sentinel.draft_model
+    assert mtp_cls.call_args.args[0] is target_config
+    assert target_model.preload_weight_modules == []
+
+
+@pytest.mark.parametrize("requested_backend", ["TRTLLM", "AUTO"])
+@pytest.mark.parametrize(
+    "quant_config_key",
+    ["model.layers.2.mlp.experts", "mtp.layers.0.mlp.experts"],
+)
+def test_internal_mtp_moe_backend_uses_isolated_layer_config(
+    requested_backend: str,
+    quant_config_key: str,
+) -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend=requested_backend)
+    mtp_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    target_config.quant_config_dict = {
+        quant_config_key: mtp_quant_config,
+    }
+    target_config._frozen = True
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with (
+        patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve_backend,
+        patch(
+            "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+            return_value=sentinel.draft_model,
+        ) as mtp_cls,
+    ):
+        draft_model = _build_mtp_one_model_draft(
+            target_config, None, sentinel.lm_head, target_model
+        )
+
+    mtp_model_config = mtp_cls.call_args.args[0]
+    assert draft_model is sentinel.draft_model
+    assert mtp_model_config is not target_config
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert mtp_model_config.quant_config_dict is target_config.quant_config_dict
+    assert mtp_model_config.extra_attrs is target_config.extra_attrs
+    assert target_config.moe_backend == "CUTEDSL"
+    assert target_config._frozen
+    assert target_model.preload_weight_modules == ["experts", "routing_method", "all_reduce"]
+    resolve_backend.assert_called_once_with(
+        requested_backend,
+        "DraftBackendTestForCausalLM",
+        quant_config=mtp_quant_config,
+    )
+
+
+def test_internal_mtp_auto_resolves_from_layer_quantization() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend="AUTO")
+    target_config.quant_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    target_config.quant_config_dict = {
+        "model.layers.2.mlp.experts": QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    }
+    target_config._frozen = True
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with (
+        patch("tensorrt_llm._torch.model_config.is_sm_100f", return_value=True),
+        patch(
+            "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+            return_value=sentinel.draft_model,
+        ) as mtp_cls,
+    ):
+        _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)
+
+    mtp_model_config = mtp_cls.call_args.args[0]
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert target_config.moe_backend == "CUTEDSL"
+
+
+def test_internal_mtp_rejects_nemotron_backend_mismatch() -> None:
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    target_config.pretrained_config.model_type = "nemotron_h"
+    target_config.spec_config = SimpleNamespace(moe_backend="VANILLA")
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with pytest.raises(ValueError, match="Nemotron-H embedded MTP layers"):
+        _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)

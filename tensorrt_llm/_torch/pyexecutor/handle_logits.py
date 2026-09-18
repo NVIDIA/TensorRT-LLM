@@ -46,7 +46,7 @@ class HandleLogits:
                 llm_req.py_result.append_context_logits(logits_temp)
             return
 
-        # Copy logits into decoderBuffers.logits
+        # Copy logits into the per-request logits buffers
         for batch_index, llm_req in enumerate(context_requests):
             logits_begin = num_context_logits_prefix_sum[batch_index]
             logits_end = num_context_logits_prefix_sum[batch_index + 1]

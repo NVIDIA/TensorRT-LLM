@@ -34,6 +34,81 @@ class AuxBufferMeta:
         )
 
 
+@dataclass(frozen=True)
+class AuxTransferLayout:
+    """Static auxiliary memory layout shared by all transfers to one peer."""
+
+    src_base_ptrs: np.ndarray
+    dst_base_ptrs: np.ndarray
+    src_item_sizes: np.ndarray
+    dst_item_sizes: np.ndarray
+
+
+def _readonly(array: np.ndarray) -> np.ndarray:
+    """Return an array protected from accidental in-place updates."""
+    array.flags.writeable = False
+    return array
+
+
+def get_non_empty_aux_indices(ptrs: np.ndarray, sizes: np.ndarray, context: str) -> np.ndarray:
+    """Validate auxiliary memory descriptors and return their non-empty indices."""
+    if ptrs.shape != sizes.shape:
+        raise ValueError(f"{context}: pointer/size count mismatch: {ptrs.shape=} != {sizes.shape=}")
+
+    negative_sizes = sizes < 0
+    if negative_sizes.any():
+        indices = np.flatnonzero(negative_sizes).tolist()
+        raise ValueError(f"{context}: negative sizes at indices {indices}")
+
+    null_non_empty = (ptrs == 0) & (sizes > 0)
+    if null_non_empty.any():
+        indices = np.flatnonzero(null_non_empty).tolist()
+        raise ValueError(f"{context}: null pointers with non-zero sizes at indices {indices}")
+
+    return np.flatnonzero(sizes > 0)
+
+
+def build_aux_transfer_layout(
+    src_meta: AuxBufferMeta, dst_meta: AuxBufferMeta
+) -> AuxTransferLayout:
+    """Validate and build the static auxiliary transfer layout for one peer."""
+    src_item_sizes = src_meta.item_sizes.astype(np.int64, copy=False)
+    dst_item_sizes = dst_meta.item_sizes.astype(np.int64, copy=False)
+    src_indices = get_non_empty_aux_indices(
+        src_meta.ptrs, src_item_sizes, "source auxiliary transfer"
+    )
+    dst_indices = get_non_empty_aux_indices(
+        dst_meta.ptrs, dst_item_sizes, "destination auxiliary transfer"
+    )
+    if src_meta.ptrs.shape != dst_meta.ptrs.shape:
+        raise ValueError(
+            "Source and destination auxiliary layouts do not match: "
+            f"{src_meta.ptrs.shape=} != {dst_meta.ptrs.shape=}"
+        )
+
+    dst_non_empty = np.zeros(dst_meta.ptrs.shape, dtype=bool)
+    dst_non_empty[dst_indices] = True
+    missing_dst = src_indices[~dst_non_empty[src_indices]]
+    if missing_dst.size > 0:
+        raise ValueError(
+            "Destination auxiliary buffers are empty for non-empty source "
+            f"indices {missing_dst.tolist()}"
+        )
+
+    too_small = src_indices[dst_item_sizes[src_indices] < src_item_sizes[src_indices]]
+    if too_small.size > 0:
+        raise ValueError(
+            f"Destination auxiliary buffers are too small at indices {too_small.tolist()}"
+        )
+
+    return AuxTransferLayout(
+        src_base_ptrs=_readonly(src_meta.ptrs[src_indices]),
+        dst_base_ptrs=_readonly(dst_meta.ptrs[src_indices]),
+        src_item_sizes=_readonly(src_item_sizes[src_indices]),
+        dst_item_sizes=_readonly(dst_item_sizes[src_indices]),
+    )
+
+
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
 

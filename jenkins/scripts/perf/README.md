@@ -147,15 +147,25 @@ wins when set.
 Test-ID format:
 
 ```
-perf/test_perf_sanity.py::test_e2e[<runtime>-<mode>-<yaml-stem>[-<server-cfg>]]
+perf/test_perf_sanity.py::test_e2e[<runtime>-<mode>[-<modifier>]-<yaml-stem>[-<server-cfg>]]
 ```
 
 - `<runtime>` = `disagg` | `aggr`
-- `<mode>` (disagg) = `e2e` | `gen_only` | `ctx_only`
+- `<mode>` = `e2e` | `gen_only` with `disagg`, or `ctx_only` with `aggr`.
+  `ctx_only` reads a disaggregated YAML but runs its ctx worker as a single
+  aggregated server, so it is spelled `aggr-ctx_only-<yaml-stem>`
+- `<modifier>` — optional instrumentation flag, orthogonal to `<mode>`; the only
+  one today is `time_breakdown`, which additionally uploads the per-request
+  lifecycle spans as `d_tb_<span>_<stat>`. It changes what the run *records*,
+  never the workload or the launch topology, so `--benchmark-mode` is still
+  handed the bare `<mode>`. Supported for `disagg-e2e` and `aggr-ctx_only`
 - `<yaml-stem>` matches a YAML file in `tests/scripts/perf-sanity/disaggregated/`
   (or `aggregated/`)
 - `<server-cfg>` — only for normal aggregated tests — the `name:` field of one of
   the YAML's `server_configs` entries
+
+A disagg `<yaml-stem>` may itself contain `-` (`..._ccb-NIXL`), so the stem is
+everything after the mode and the optional modifier, not a fixed segment count.
 
 `run_disagg.sh` errors out if any entry still contains the literal placeholder
 `CHANGE_ME`.
@@ -324,7 +334,7 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
 
 When adding a test, either increment `testCount` on an existing entry or add a new `buildStageConfigs` block. Stages are grouped by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
 
-For the full step-by-step guide including how to derive test-db filenames and GPU/node counts from disaggregated config YAMLs, see [`tests/scripts/perf-sanity/README.md`](../../tests/scripts/perf-sanity/README.md) ("Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests").
+For the full step-by-step guide including how to derive test-db filenames and GPU/node counts from disaggregated config YAMLs, see [`tests/integration/defs/perf/README_test_perf_sanity.md`](../../../tests/integration/defs/perf/README_test_perf_sanity.md) ("Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests").
 
 ## Post-Processing and Triage
 

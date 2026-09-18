@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,6 +72,12 @@ public:
     [[nodiscard]] KVCacheManager::BaseKVCacheManager* getCacheManager() const noexcept
     {
         return mCacheManager;
+    }
+
+    /// @brief Get the data type used by KV cache transfer buffers.
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const noexcept
+    {
+        return mDataType;
     }
 
     [[nodiscard]] BufferKind getBufferKind() const override

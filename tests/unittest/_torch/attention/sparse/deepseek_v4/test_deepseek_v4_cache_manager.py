@@ -15,13 +15,14 @@
 
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
+from unittest.mock import patch
 
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -33,19 +34,28 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
+    Nvfp4ColdPageQuantizationCompression,
+)
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
+from tensorrt_llm.bindings.internal import kv_cache_compression as native_kvcc
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    ColdPageQuantizationCompressionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    DraftTargetDecodingConfig,
+    KvCacheConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    GpuCacheTierConfig,
-    KVCacheManagerConfig,
+    BatchDesc,
+    KVCacheDesc,
     PageIndexMode,
+    _introspection,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
@@ -53,6 +63,16 @@ _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
     Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
 ]
+
+
+@pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
+def test_typical_seq_len_preserves_deepseek_v4_fallback(
+    avg_seq_len: int | None, expected: int
+) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.max_seq_len = 1024
+
+    assert manager._get_typical_seq_len(KvCacheConfig(avg_seq_len=avg_seq_len)) == expected
 
 
 def test_cache_size_estimation_uses_model_attention_layer_count():
@@ -89,9 +109,11 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
     manager.dtype = DataType.BF16
+    manager._use_nvfp4_compress = False
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager._max_draft_len = 0
     manager._max_num_tokens = 1024
@@ -123,9 +145,11 @@ def test_needed_resource_uses_context_swa_scratch_slope():
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
     manager.dtype = DataType.BF16
+    manager._use_nvfp4_compress = False
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager.tokens_per_block = 128
     manager.num_extra_kv_tokens = 0
@@ -185,117 +209,6 @@ def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
     if buffer.dtype == torch.float8_e4m3fn:
         return buffer.view(torch.uint8)
     return buffer
-
-
-def _build_deepseek_v4_cache_config_for_test(
-    kv_cache_config: KvCacheConfig,
-    *,
-    max_batch_size: int = 4,
-    max_seq_len: int = 1024,
-    max_num_tokens: int | None = 2048,
-    max_draft_len: int = 0,
-    is_draft: bool = False,
-) -> KVCacheManagerConfig:
-    cache_manager = object.__new__(DeepseekV4CacheManager)
-    cache_manager.pp_layers = [0, 1, 2]
-    cache_manager._compress_ratios = [1, 4, 128]
-    cache_manager._swa_window_size = 128
-    cache_manager._max_draft_len = max_draft_len
-    cache_manager._max_num_tokens = max_num_tokens
-    cache_manager.compressed_block_sizes = [128, 32, 1]
-    cache_manager.index_head_dim = 128
-    cache_manager.head_dim = 512
-    cache_manager.tokens_per_block = 128
-    cache_manager.dtype = DataType.BF16
-    cache_manager._indexer_k_dtype = "fp8"
-    cache_manager.max_batch_size = max_batch_size
-    cache_manager.max_seq_len = max_seq_len
-    cache_manager.enable_stats = False
-    cache_manager.enable_swa_scratch_reuse = False
-    cache_manager.num_extra_kv_tokens = 0
-    cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
-    cache_manager.is_draft = is_draft
-
-    return cache_manager._build_cache_config(
-        kv_cache_config,
-        tokens_per_block=128,
-        vocab_size=129280,
-        cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
-    )
-
-
-def test_deepseek_v4_pool_ratio_overrides_typical_step_and_constraints():
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(pool_ratio=[0.2, 0.3, 0.5], avg_seq_len=256)
-    )
-
-    assert config.initial_pool_ratio == [0.2, 0.3, 0.5]
-    assert config.typical_step is None
-    assert config.constraints == []
-
-
-def test_deepseek_v4_avg_seq_len_updates_typical_step():
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(avg_seq_len=256),
-        max_batch_size=3,
-        max_seq_len=1024,
-        max_num_tokens=2048,
-        max_draft_len=2,
-    )
-
-    assert config.initial_pool_ratio is None
-    assert config.typical_step is not None
-    assert config.typical_step.kv_caches[0].capacity == 2048
-    assert config.typical_step.kv_caches[0].history_length == 0
-    assert [kv.capacity for kv in config.typical_step.kv_caches[1:]] == [256, 256]
-    assert [kv.history_length for kv in config.typical_step.kv_caches[1:]] == [253, 253]
-    assert config.constraints[0].kv_caches[0].capacity == 1024
-    assert config.constraints[0].kv_caches[0].history_length == 1023
-
-
-def test_deepseek_v4_avg_seq_len_must_not_exceed_max_seq_len():
-    with pytest.raises(ValueError, match="avg_seq_len"):
-        _build_deepseek_v4_cache_config_for_test(
-            KvCacheConfig(avg_seq_len=2048),
-            max_seq_len=1024,
-        )
-
-
-@pytest.mark.parametrize(
-    ("enable_block_reuse", "block_reuse_policy", "is_draft", "commit_min_snapshot"),
-    [
-        (True, "all_reusable", False, False),
-        (True, "per_request", False, True),
-        (False, "per_request", False, False),
-        (True, "per_request", True, True),
-    ],
-)
-def test_deepseek_v4_commit_min_snapshot_follows_block_reuse_policy(
-    enable_block_reuse: bool,
-    block_reuse_policy: str,
-    is_draft: bool,
-    commit_min_snapshot: bool,
-) -> None:
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(
-            enable_block_reuse=enable_block_reuse,
-            block_reuse_policy=block_reuse_policy,
-            enable_partial_reuse=True,
-        ),
-        is_draft=is_draft,
-    )
-
-    assert config.commit_min_snapshot is commit_min_snapshot
-    assert config.enable_partial_reuse
-
-
-@pytest.mark.parametrize("enable_partial_reuse", [False, True])
-def test_deepseek_v4_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(enable_partial_reuse=enable_partial_reuse)
-    )
-
-    assert config.enable_partial_reuse is enable_partial_reuse
 
 
 @pytest.fixture(params=[False, True], ids=["scratch_reuse_disabled", "scratch_reuse_enabled"])
@@ -417,6 +330,8 @@ class TestDeepseekV4CacheManager:
         spec_config: object | None = None,
         indexer_k_dtype: str | None = None,
         enable_swa_scratch_reuse: bool = True,
+        cold_page_codec_provider: object | None = None,
+        host_cache_size: int | None = None,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -439,6 +354,7 @@ class TestDeepseekV4CacheManager:
             max_tokens=max_seq_len * max_batch_size,
             event_buffer_max_size=0,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            host_cache_size=host_cache_size,
         )
 
         # Create mapping (single GPU, no parallelism)
@@ -469,9 +385,197 @@ class TestDeepseekV4CacheManager:
             sparse_attn_config=sparse_attn_config,
             is_draft=is_draft,
             spec_config=spec_config,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
         return cache_manager, sparse_attn_config
+
+    def test_nvfp4_cold_page_codec_accepts_real_csa_hca_lifecycle(self):
+        provider = Nvfp4ColdPageQuantizationCompression(
+            ColdPageQuantizationCompressionConfig(),
+            pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+        )
+        with patch.object(
+            native_kvcc,
+            "create_python_cold_page_codec",
+            wraps=native_kvcc.create_python_cold_page_codec,
+        ) as create_codec:
+            cache_manager, _ = self._create_deepseek_v4_cache_manager(
+                tokens_per_block=256,
+                max_batch_size=1,
+                max_seq_len=256,
+                compress_ratios=[4, 128],
+                dtype=DataType.BF16,
+                compressor_dtype=DataType.FLOAT,
+                indexer_k_dtype="fp4",
+                cold_page_codec_provider=provider,
+                host_cache_size=64 << 20,
+            )
+
+        try:
+            assert create_codec.call_count == 1
+            csa_layer_id = cache_manager._layer_attn_to_layer_id[
+                0, DeepseekV4AttentionType.COMPRESS
+            ]
+            hca_layer_id = cache_manager._layer_attn_to_layer_id[
+                1, DeepseekV4AttentionType.COMPRESS
+            ]
+            assert cache_manager.impl.get_layer_group_id(
+                csa_layer_id
+            ) == cache_manager.impl.get_layer_group_id(hca_layer_id)
+
+            codec_state = create_codec.call_args.args[1]
+            assert set(codec_state.layer_ids) == {int(csa_layer_id), int(hca_layer_id)}
+            assert len(codec_state.lifecycle_metadata) == 1
+            metadata = codec_state.lifecycle_metadata[0]
+            assert metadata.num_buffers == 3
+            assert metadata.integers[:3, 1].tolist() == [0, 1, 1]
+            assert metadata.cold_page_bytes == 30720
+        finally:
+            cache_manager.shutdown()
+
+    @pytest.mark.parametrize(
+        ("dtype", "cold_page_bytes"),
+        [(DataType.BF16, 15360), (DataType.FP8, 12800)],
+    )
+    def test_nvfp4_cold_page_codec_migrates_real_csa_hca_through_host(
+        self, dtype: DataType, cold_page_bytes: int
+    ) -> None:
+        prompt_len = 64 * self.tokens_per_block
+        pressure_len = 65 * self.tokens_per_block
+        compress_ratios = [4, 128]
+        provider = Nvfp4ColdPageQuantizationCompression(
+            ColdPageQuantizationCompressionConfig(),
+            pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+        )
+        requests: list[LlmRequest] = []
+
+        with (
+            patch.object(
+                native_kvcc,
+                "create_python_cold_page_codec",
+                wraps=native_kvcc.create_python_cold_page_codec,
+            ) as create_codec,
+            patch.object(
+                native_kvcc,
+                "nvfp4_cold_page_encode",
+                wraps=native_kvcc.nvfp4_cold_page_encode,
+            ) as encode,
+            patch.object(
+                native_kvcc,
+                "nvfp4_cold_page_decode",
+                wraps=native_kvcc.nvfp4_cold_page_decode,
+            ) as decode,
+        ):
+            cache_manager, sparse_attn_config = self._create_deepseek_v4_cache_manager(
+                tokens_per_block=self.tokens_per_block,
+                max_batch_size=1,
+                max_seq_len=pressure_len,
+                compress_ratios=compress_ratios,
+                dtype=dtype,
+                compressor_dtype=DataType.FLOAT,
+                indexer_k_dtype="fp4",
+                enable_swa_scratch_reuse=False,
+                cold_page_codec_provider=provider,
+                host_cache_size=64 << 20,
+            )
+
+            try:
+                assert create_codec.call_count == 1
+                first = self._create_request(request_id=0, prompt_len=prompt_len)
+                requests.append(first)
+                expected = self._create_random_cache(
+                    seq_len=prompt_len,
+                    head_dim=self.head_dim,
+                    sparse_attn_config=sparse_attn_config,
+                    dtype=binding_to_torch_dtype(dtype),
+                    compressor_dtype=binding_to_torch_dtype(DataType.FLOAT),
+                )
+                expected_csa, _ = expected[0, DeepseekV4AttentionType.COMPRESS]
+                nope_values = torch.linspace(
+                    -1.0,
+                    1.0,
+                    448,
+                    dtype=torch.float32,
+                    device=expected_csa.device,
+                ).expand(expected_csa.size(0), -1)
+                if dtype == DataType.FP8:
+                    nope_values = nope_values.to(torch.float8_e4m3fn).view(torch.uint8)
+                else:
+                    nope_values = nope_values.to(expected_csa.dtype)
+                expected_csa[:, :448] = nope_values
+                assert cache_manager.prepare_context(first)
+                assert cache_manager.resize_context(first, first.context_chunk_size)
+                self._write_request_prefill(first, prompt_len, cache_manager, expected)
+
+                scheduled_batch = ScheduledRequests()
+                scheduled_batch.context_requests_last_chunk = [first]
+                first.context_current_position = prompt_len
+                first.add_new_token(prompt_len, 0)
+                cache_manager.update_context_resources(scheduled_batch)
+                cache_manager.update_resources(scheduled_batch)
+                torch.cuda.synchronize()
+
+                first_cache = cache_manager.kv_cache_map[first.py_request_id]
+                cache_manager.suspend_request(first)
+
+                pressure = self._create_request(request_id=1, prompt_len=pressure_len)
+                requests.append(pressure)
+                assert cache_manager.prepare_context(pressure)
+                assert cache_manager.resize_context(pressure, pressure.context_chunk_size)
+                torch.cuda.synchronize()
+
+                cold_counts = _introspection.active_page_stats(first_cache)[0]
+                assert cold_counts[1] > 0
+                assert encode.call_count > 0
+                encoded_pages = sum(call.args[1] for call in encode.call_args_list)
+                assert encoded_pages > 0
+                assert all(call.args[5] == 3 for call in encode.call_args_list)
+                assert all(call.args[7] == cold_page_bytes for call in encode.call_args_list)
+
+                cache_manager.free_resources(pressure)
+                assert cache_manager.resume_request(first)
+                torch.cuda.synchronize()
+
+                assert _introspection.active_page_stats(first_cache)[0][1] == 0
+                assert decode.call_count > 0
+                assert sum(call.args[1] for call in decode.call_args_list) == encoded_pages
+
+                actual = self._read_request(
+                    first,
+                    prompt_len,
+                    cache_manager,
+                    compress_ratios,
+                )
+                expected_csa, _ = expected[0, DeepseekV4AttentionType.COMPRESS]
+                actual_csa, _ = actual[0, DeepseekV4AttentionType.COMPRESS]
+                expected_nope = expected_csa[:, :448]
+                actual_nope = actual_csa[:, :448]
+                assert not torch.equal(actual_nope, expected_nope)
+                if dtype == DataType.FP8:
+                    expected_nope = expected_nope.view(torch.float8_e4m3fn)
+                    actual_nope = actual_nope.view(torch.float8_e4m3fn)
+                torch.testing.assert_close(
+                    actual_nope.float(),
+                    expected_nope.float(),
+                    rtol=0.25,
+                    atol=0.02,
+                )
+                assert torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
+
+                expected_indexer = expected[0, DeepseekV4AttentionType.INDEXER_COMPRESS]
+                actual_indexer = actual[0, DeepseekV4AttentionType.INDEXER_COMPRESS]
+                assert torch.equal(actual_indexer[0], expected_indexer[0])
+                assert torch.equal(actual_indexer[1], expected_indexer[1])
+
+                expected_hca, _ = expected[1, DeepseekV4AttentionType.COMPRESS]
+                actual_hca, _ = actual[1, DeepseekV4AttentionType.COMPRESS]
+                assert torch.equal(actual_hca, expected_hca)
+            finally:
+                for request in requests:
+                    if request.py_request_id in cache_manager.kv_cache_map:
+                        cache_manager.free_resources(request)
+                cache_manager.shutdown()
 
     def _create_request(self, request_id: int, prompt_len: int) -> LlmRequest:
         """Helper to create a test LlmRequest.
@@ -1098,6 +1202,28 @@ class TestDeepseekV4CacheManager:
                     atol=1e-5,
                     msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.name} (scales)",
                 )
+
+    def test_max_num_tokens_is_used_by_base_config(self):
+        max_batch_size = 2
+        max_seq_len = 1024
+        max_input_len = 127
+        max_num_tokens = max_batch_size * (max_input_len + 1)
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            max_input_len=max_input_len,
+            compress_ratios=[1, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        assert cache_manager.kv_cache_manager_py_config.typical_step == BatchDesc(
+            [
+                KVCacheDesc(capacity=max_num_tokens, history_length=0),
+                KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1),
+            ]
+        )
 
     def test_indexer_cache_layout_default(self):
         """DeepSeek-V4 defaults to FP4 indexer K cache on Blackwell+."""
@@ -1811,17 +1937,7 @@ class TestDeepseekV4CacheManager:
             cache_manager.shutdown()
 
     def test_swa_scratch_reuse_uses_extra_kv_tokens_for_rewind(self):
-        spec_config = SimpleNamespace(
-            max_draft_len=7,
-            max_total_draft_tokens=7,
-            spec_dec_mode=SimpleNamespace(
-                is_eagle3_one_model=lambda: False,
-                is_mtp_eagle_one_model=lambda: False,
-                is_mtp_one_model=lambda: False,
-                is_mtp_vanilla=lambda: False,
-                use_one_engine=lambda: True,
-            ),
-        )
+        spec_config = DraftTargetDecodingConfig(max_draft_len=7, speculative_model="draft")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,

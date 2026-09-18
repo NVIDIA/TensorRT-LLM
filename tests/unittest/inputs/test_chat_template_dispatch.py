@@ -5,6 +5,7 @@
 import threading
 
 import pytest
+from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import (
@@ -17,9 +18,13 @@ from tensorrt_llm.inputs.utils import (
     _build_openai_content,
     _resolve_content_format,
     add_multimodal_placeholders,
+    apply_chat_template,
     async_apply_chat_template,
     interleave_mm_placeholders,
 )
+from tensorrt_llm.tokenizer import TransformersTokenizer
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -197,7 +202,7 @@ class TestInterleaveMmPlaceholders:
         assert result == "<image>\nDescribe the image and video\n<video>"
 
     def test_numbered_placeholders(self):
-        """Models like Phi4MM use unique per-item placeholders."""
+        """Some multimodal models use unique per-item placeholders."""
         content_parts = [
             {"type": "image", "media_index": 0},
             "Compare these two images:",
@@ -359,6 +364,102 @@ class TestAsyncApplyChatTemplate:
         assert tokenizer.worker_thread_id != event_loop_thread_id
 
 
+class TestPythonChatTemplate:
+    @pytest.mark.parametrize(
+        ("enable_tokenize", "expected"),
+        [(False, "native-rendered"), (True, [1, 2, 3])],
+    )
+    def test_uses_native_renderer_without_jinja_template(self, enable_tokenize, expected):
+        class NativeTokenizer:
+            chat_template = None
+
+            def __init__(self):
+                self.captured = None
+
+            def get_chat_template(self, *_args, **_kwargs):
+                raise AssertionError("Jinja resolution should be bypassed")
+
+            def apply_chat_template(self, conversation, **kwargs):
+                self.captured = (conversation, kwargs)
+                return [1, 2, 3] if kwargs["tokenize"] else "native-rendered"
+
+        class Processor:
+            chat_template = None
+
+        conversation = [ConversationMessage(role="user", content="hello", media=[])]
+        tools = [{"type": "function", "function": {"name": "echo"}}]
+        inner_tokenizer = NativeTokenizer()
+
+        result = apply_chat_template(
+            model_type="kimi_linear",
+            tokenizer=TransformersTokenizer(inner_tokenizer),
+            processor=Processor(),
+            conversation=conversation,
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            tools=tools,
+            chat_template_kwargs={"thinking_effort": "high"},
+            enable_tokenize=enable_tokenize,
+        )
+
+        assert result == expected
+        captured_conversation, captured_kwargs = inner_tokenizer.captured
+        assert captured_conversation == conversation
+        assert captured_kwargs == {
+            "tools": tools,
+            "tokenize": enable_tokenize,
+            "add_generation_prompt": True,
+            "thinking_effort": "high",
+        }
+
+    def test_explicit_jinja_template_takes_precedence(self):
+        class NativeTokenizer:
+            chat_template = None
+
+            def __init__(self):
+                self.captured = None
+
+            def apply_chat_template(self, conversation, **kwargs):
+                self.captured = (conversation, kwargs)
+                return "jinja-rendered"
+
+        conversation = [ConversationMessage(role="user", content="hello", media=[])]
+        inner_tokenizer = NativeTokenizer()
+        template = "{{ messages }}"
+
+        result = apply_chat_template(
+            model_type="kimi_linear",
+            tokenizer=TransformersTokenizer(inner_tokenizer),
+            processor=None,
+            conversation=conversation,
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            chat_template=template,
+        )
+
+        assert result == "jinja-rendered"
+        _, captured_kwargs = inner_tokenizer.captured
+        assert captured_kwargs["chat_template"] == template
+
+    def test_missing_template_still_errors_without_native_override(self):
+        class DefaultTokenizer:
+            chat_template = None
+            apply_chat_template = PreTrainedTokenizerBase.apply_chat_template
+
+            def get_chat_template(self, *_args, **_kwargs):
+                return None
+
+        with pytest.raises(ValueError, match="No chat template found"):
+            apply_chat_template(
+                model_type="test_string_model",
+                tokenizer=DefaultTokenizer(),
+                processor=None,
+                conversation=[ConversationMessage(role="user", content="hello", media=[])],
+                add_generation_prompt=True,
+                mm_placeholder_counts=[{}],
+            )
+
+
 class TestServingChatTemplateGather:
     """Cover the asyncio.gather integration in the serving chat-template paths."""
 
@@ -381,7 +482,7 @@ class TestServingChatTemplateGather:
         monkeypatch.setattr(
             rg,
             "parse_chat_messages_coroutines",
-            lambda messages, model_config, _: ([], fake_mm_coroutine(), [{}]),
+            lambda messages, model_config, _: ([], fake_mm_coroutine(), [{}], None),
         )
         # Must resolve the top-level model type, matching the serving call
         # sites (not the raw model_config.model_type).
@@ -427,7 +528,7 @@ class TestServingChatTemplateGather:
         monkeypatch.setattr(
             ru,
             "parse_chat_messages_coroutines",
-            lambda messages, model_config: ([], fake_mm_coroutine(), [{}]),
+            lambda messages, model_config: ([], fake_mm_coroutine(), [{}], None),
         )
         monkeypatch.setattr(ru, "resolve_top_level_model_type", lambda cfg: "resolved-model-type")
         monkeypatch.setattr(ru, "_get_chat_completion_function_tools", lambda tools: [])

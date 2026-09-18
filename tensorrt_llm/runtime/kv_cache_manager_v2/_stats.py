@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from dataclasses import dataclass, fields
+
+from ._common import CacheLevel
+from ._utils import TypedIndexList
 
 
 class _StatsDeltaMixin:
@@ -76,3 +80,63 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
         if self.iter_reused_blocks == 0 or total == 0:
             return 0.0
         return self.iter_reused_blocks / total
+
+
+CountsByLevel = TypedIndexList[CacheLevel, int]
+"""Counters indexed by CacheLevel: entry ``i`` belongs to the i-th configured cache tier.
+
+The length follows the configured tier list instead of a hard-coded gpu/host/disk split, which
+is what lets a deployment with a hot and a cold GPU level report them as two distinct entries.
+"""
+
+
+def add_counts_by_level(dst: CountsByLevel, src: CountsByLevel) -> CountsByLevel:
+    """Element-wise accumulate, widening ``dst`` when ``src`` covers more levels."""
+    if len(dst) < len(src):
+        dst = list(dst) + [0] * (len(src) - len(dst))
+    for level, value in enumerate(src):
+        dst[level] += value
+    return dst
+
+
+@dataclass(slots=True)
+class ReusedBlocksByLevel:
+    """Reuse block counts split by the cache level the reused pages were resident on.
+
+    Kept outside ``KVCacheIterationStatsDelta`` on purpose: the level count is a runtime
+    quantity, while that dataclass is a fixed-field record whose field-wise add/subtract
+    helpers assume scalar members.
+    """
+
+    full: CountsByLevel = dataclasses.field(default_factory=list)
+    partial: CountsByLevel = dataclasses.field(default_factory=list)
+
+    def add(self, other: "ReusedBlocksByLevel") -> None:
+        self.full = add_counts_by_level(self.full, other.full)
+        self.partial = add_counts_by_level(self.partial, other.partial)
+
+    @property
+    def empty(self) -> bool:
+        return not any(self.full) and not any(self.partial)
+
+
+@dataclass(slots=True)
+class SsmSnapshotIterationStatsDelta(_StatsDeltaMixin):
+    iter_snapshot_lookups: int = 0
+    iter_snapshot_hits: int = 0
+    iter_snapshot_misses: int = 0
+    iter_reused_tokens: int = 0
+    iter_unreused_tokens: int = 0
+    iter_aligned_snapshot_hits: int = 0
+    iter_unaligned_snapshot_hits: int = 0
+
+    @property
+    def iter_snapshot_hit_rate(self) -> float:
+        if self.iter_snapshot_hits == 0 or self.iter_snapshot_lookups == 0:
+            return 0.0
+        return self.iter_snapshot_hits / self.iter_snapshot_lookups
+
+
+_KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
+    field.name for field in fields(KVCacheIterationStatsDelta)
+)

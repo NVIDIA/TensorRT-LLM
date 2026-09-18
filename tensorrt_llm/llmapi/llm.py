@@ -1,13 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import atexit
 import json
 import os
 import socket
+import threading
 import time
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Tuple, Union, cast
+from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
+                    cast)
 
 import torch
 import transformers
@@ -40,7 +57,9 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
+from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+                       TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
+                       validate_token_encoder_bucket_config)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -121,21 +140,86 @@ class EncoderOutput:
     prompt: Optional[str] = None
 
 
-class _BartForcedTokensLogitsProcessor(LogitsProcessor):
-    """Apply BART forced BOS/EOS tokens from Hugging Face generation config."""
+class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
+    """Apply Whisper suppress-token lists from the HF generation config.
 
-    _DECODER_PROMPT_LEN = 1
+    ``suppress_token_ids`` are masked at every generation step;
+    ``begin_suppress_token_ids`` only when sampling the first token after the
+    decoder prompt. The prompt length is captured from the first callback
+    (which runs before the first sampled token, when ``token_ids`` holds
+    exactly the prompt) so variable-length decoder prompts need no plumbing.
+    """
 
-    def __init__(
-        self,
-        *,
-        forced_bos_token_id: Optional[int],
-        forced_eos_token_id: Optional[int],
-        max_tokens: int,
-    ) -> None:
-        self.forced_bos_token_id = forced_bos_token_id
-        self.forced_eos_token_id = forced_eos_token_id
-        self.max_tokens = max_tokens
+    # Cap on tracked request ids so a SamplingParams object reused across many
+    # generate() calls does not grow the map unboundedly. Far above any
+    # realistic number of in-flight requests, so pruning (oldest closed-window
+    # entries first) never touches an active sequence in practice.
+    _MAX_TRACKED_REQUESTS = 16384
+
+    def __init__(self, *, suppress_token_ids: List[int],
+                 begin_suppress_token_ids: List[int]) -> None:
+        # Read-only tuples: the device index caches below are keyed on device
+        # alone, which is only sound if the ids they were built from cannot
+        # change. Exposing them through properties with no setter makes both
+        # in-place mutation and rebinding fail loudly instead of silently
+        # leaving the caches masking a stale set of tokens.
+        self._suppress_token_ids = tuple(
+            int(t) for t in suppress_token_ids or [])
+        self._begin_suppress_token_ids = tuple(
+            int(t) for t in begin_suppress_token_ids or [])
+        # req_id -> prompt length while the begin-suppress window is open, then
+        # None once it closes. Don't delete the entry: a missing key would be
+        # re-captured at the current length, re-arming begin-suppression
+        # mid-sequence.
+        self._prompt_len_by_req: Dict[int, Optional[int]] = {}
+        self._reset_index_caches()
+
+    @property
+    def suppress_token_ids(self) -> Tuple[int, ...]:
+        """Tokens masked at every generation step."""
+        return self._suppress_token_ids
+
+    @property
+    def begin_suppress_token_ids(self) -> Tuple[int, ...]:
+        """Tokens masked only when sampling the first token after the prompt."""
+        return self._begin_suppress_token_ids
+
+    def _reset_index_caches(self) -> None:
+        # Indexing logits with a Python sequence rebuilds a CPU index tensor and
+        # blocking-copies it to the device on every call - once per request per
+        # decode step - which serializes the decode loop. Cache the index as a
+        # device tensor instead; one entry per device the processor is used on.
+        self._suppress_idx: Dict[torch.device, torch.Tensor] = {}
+        self._begin_suppress_idx: Dict[torch.device, torch.Tensor] = {}
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # The index caches are derived device state, not configuration. This
+        # object is reachable from SamplingParams.logits_processor, which callers
+        # deep-copy per request (evaluate/interface.py), so carrying them along
+        # would give every copy its own device allocation and make a warmed
+        # processor expensive to copy and impossible to unpickle off-device.
+        state = self.__dict__.copy()
+        state.pop("_suppress_idx", None)
+        state.pop("_begin_suppress_idx", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._reset_index_caches()
+
+    @staticmethod
+    def _cached_index(cache: Dict[torch.device,
+                                  torch.Tensor], token_ids: Tuple[int, ...],
+                      device: torch.device) -> torch.Tensor:
+        index = cache.get(device)
+        if index is None:
+            # setdefault publishes atomically: tensor construction releases the
+            # GIL, so two threads can race here, and the loser must go on to use
+            # the same tensor the winner stored rather than its own copy.
+            index = cache.setdefault(
+                device, torch.tensor(token_ids, dtype=torch.long,
+                                     device=device))
+        return index
 
     def __call__(
         self,
@@ -145,56 +229,102 @@ class _BartForcedTokensLogitsProcessor(LogitsProcessor):
         stream_ptr: Optional[int],
         client_id: Optional[int],
     ) -> None:
-        del req_id, client_id
+        del client_id
         if stream_ptr is None:
-            self._apply(token_ids, logits)
+            self._apply(req_id, token_ids, logits)
             return
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
-            self._apply(token_ids, logits)
+            self._apply(req_id, token_ids, logits)
 
-    def _apply(self, token_ids: List[List[int]], logits: torch.Tensor) -> None:
+    def _apply(self, req_id: int, token_ids: List[List[int]],
+               logits: torch.Tensor) -> None:
+        if req_id not in self._prompt_len_by_req:
+            self._prune_closed_entries()
+            # First callback runs before the first sampled token, when the
+            # sequence holds exactly the decoder prompt.
+            self._prompt_len_by_req[req_id] = len(token_ids[0])
+        prompt_len = self._prompt_len_by_req[req_id]
         for beam_idx, beam_token_ids in enumerate(token_ids):
-            forced_token_id = self._forced_token_id(beam_token_ids)
-            if forced_token_id is not None:
-                self._force_token(logits, beam_idx, len(token_ids),
-                                  forced_token_id)
+            target = logits
+            if logits.dim() > 1 and logits.shape[0] == len(token_ids):
+                target = logits[beam_idx]
+            if self.suppress_token_ids:
+                target.index_fill_(
+                    -1,
+                    self._cached_index(self._suppress_idx,
+                                       self.suppress_token_ids, target.device),
+                    float("-inf"))
+            if (prompt_len is not None and self.begin_suppress_token_ids
+                    and len(beam_token_ids) == prompt_len):
+                target.index_fill_(
+                    -1,
+                    self._cached_index(self._begin_suppress_idx,
+                                       self.begin_suppress_token_ids,
+                                       target.device), float("-inf"))
+        if prompt_len is not None and len(token_ids[0]) > prompt_len:
+            # Begin-suppress window closed; keep the entry as a tombstone.
+            self._prompt_len_by_req[req_id] = None
 
-    def _forced_token_id(self, token_ids: List[int]) -> Optional[int]:
-        generated_len = max(len(token_ids) - self._DECODER_PROMPT_LEN, 0)
-        if generated_len == 0:
-            return self.forced_bos_token_id
-        if (self.max_tokens > 0 and generated_len == self.max_tokens - 1):
-            return self.forced_eos_token_id
-        return None
+    def _prune_closed_entries(self) -> None:
+        """Evict the oldest closed-window entries once the map is at capacity.
 
-    @staticmethod
-    def _force_token(logits: torch.Tensor, beam_idx: int, beam_count: int,
-                     token_id: int) -> None:
-        if token_id < 0 or token_id >= logits.shape[-1]:
-            raise ValueError(
-                f"Forced BART token id {token_id} is outside the logits "
-                f"vocabulary dimension {logits.shape[-1]}")
-
-        target = logits
-        if logits.dim() > 1 and logits.shape[0] == beam_count:
-            target = logits[beam_idx]
-        target[:] = float("-inf")
-        target[..., token_id] = 0
+        Only ``None`` tombstones are eligible: evicting an entry whose window
+        is still open (or a tombstone of a still-active request) would let the
+        next callback re-capture the prompt length mid-sequence and re-arm
+        begin-suppression at the wrong position.
+        """
+        if len(self._prompt_len_by_req) < self._MAX_TRACKED_REQUESTS:
+            return
+        excess = len(self._prompt_len_by_req) - self._MAX_TRACKED_REQUESTS + 1
+        stale = [
+            rid for rid, prompt_len in self._prompt_len_by_req.items()
+            if prompt_len is None
+        ]
+        for rid in stale[:excess]:
+            del self._prompt_len_by_req[rid]
 
 
-def _contains_bart_forced_tokens_logits_processor(processor: Any) -> bool:
-    if isinstance(processor, _BartForcedTokensLogitsProcessor):
+def _contains_whisper_suppress_tokens_logits_processor(processor: Any) -> bool:
+    if isinstance(processor, _WhisperSuppressTokensLogitsProcessor):
         return True
     if isinstance(processor, list):
         return any(
-            _contains_bart_forced_tokens_logits_processor(item)
+            _contains_whisper_suppress_tokens_logits_processor(item)
             for item in processor)
     processors = getattr(processor, "processors", None)
     if isinstance(processors, list):
         return any(
-            _contains_bart_forced_tokens_logits_processor(item)
+            _contains_whisper_suppress_tokens_logits_processor(item)
             for item in processors)
     return False
+
+
+def _append_logits_processor(sampling_params: SamplingParams,
+                             processor: LogitsProcessor) -> None:
+    """Attach a logits processor without clobbering user-provided ones."""
+    existing = sampling_params.logits_processor
+    if existing is None:
+        sampling_params.logits_processor = processor
+    elif isinstance(existing, list):
+        existing.append(processor)
+    else:
+        sampling_params.logits_processor = [existing, processor]
+
+
+def _multimodal_params_have_encoder_features(
+        multimodal_params: Optional["MultimodalParams"]) -> bool:
+    """True when multimodal data carries an encoder feature tensor.
+
+    Audio encoder-decoder models (e.g. Whisper) feed the encoder a feature
+    tensor instead of token ids; its presence switches the prompt handling in
+    ``_preprocess``. Keyed on the purpose-specific ``encoder_input_features``,
+    not the generic HF ``input_features`` that decoder-only audio models emit.
+    """
+    if multimodal_params is None or multimodal_params.multimodal_data is None:
+        return False
+    audio_data = multimodal_params.multimodal_data.get("audio")
+    return isinstance(audio_data,
+                      dict) and "encoder_input_features" in audio_data
 
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -203,6 +333,7 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         llm_id (str): The unique ID of the LLM instance.
         disaggregated_params (dict): The disaggregated parameters of the LLM instance.
+        startup_metrics (dict): The startup metrics reported by worker rank 0.
 """
 
 
@@ -214,7 +345,6 @@ class PreprocessedInputs:
     """
 
     prompt_token_ids: List[int]
-    query_token_ids: Optional[List[int]] = None
     multimodal_params: Optional[MultimodalParams] = None
     encoder_input_token_ids: Optional[List[int]] = None
 
@@ -239,7 +369,9 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
-        self._disaggregated_params: Optional[dict] = None
+        self._disaggregated_params: dict | None = None
+        # dict containing startup metrics like weight loading time
+        self._startup_metrics: dict | None = None
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
@@ -272,6 +404,9 @@ class BaseLLM:
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
                 ['_mpi_session', 'backend'])
+            if issubclass(llm_args_cls, TorchLlmArgs):
+                # Values are vetted by TorchLlmArgs._drop_removed_args.
+                valid_keys |= TORCH_LLMARGS_REMOVED_ARGS
             for key in kwargs:
                 if key not in valid_keys:
                     raise ValueError(
@@ -313,7 +448,11 @@ class BaseLLM:
             load_post_processor_hook(_post_processor_path)
             if _post_processor_path else None)
 
-        if self.args.parallel_config.is_multi_gpu:
+        # Attached serving frontends connect to an already-running worker:
+        # they must not spawn an MPI session (see GenerationExecutor.create).
+        is_attached_frontend = os.getenv(
+            "TLLM_EXECUTOR_ATTACH_INFO") is not None
+        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
@@ -347,6 +486,8 @@ class BaseLLM:
             self._hf_model_dir: Optional[Path] = None
             self._hf_model_config = None
             self._generation_config = None
+            # Raw JSON preserves explicit keys; GenerationConfig fills defaults.
+            self._generation_config_explicit_values: dict[str, Any] = {}
 
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
@@ -357,25 +498,6 @@ class BaseLLM:
             if self.mpi_session is not None and self._owns_mpi_session:
                 self.mpi_session.shutdown()
             raise
-
-        # --- Usage telemetry (fail-silent) ---
-        try:
-            import tensorrt_llm.usage as _usage
-            telemetry_config = getattr(self.args, 'telemetry_config', None)
-            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
-            # CLI commands set their specific context before LLM construction,
-            # so this only fires for users calling LLM() directly.
-            if telemetry_config is not None:
-                if telemetry_config.usage_context == _usage.UsageContext.UNKNOWN:
-                    telemetry_config = telemetry_config.model_copy(
-                        update={"usage_context": _usage.UsageContext.LLM_CLASS})
-            _usage.report_usage(
-                llm_args=self.args,
-                pretrained_config=self._hf_model_config,
-                telemetry_config=telemetry_config,
-            )
-        except Exception as exc:
-            logger.debug("Usage telemetry setup failed: %s", exc)
 
         try:
             if self.args.otlp_traces_endpoint:
@@ -389,6 +511,27 @@ class BaseLLM:
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
+    def _start_usage_reporting(self) -> None:
+        """Start the success-only initial report and heartbeat stream."""
+        try:
+            import tensorrt_llm.usage as _usage
+
+            telemetry_config = getattr(self.args, 'telemetry_config', None)
+            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
+            # CLI commands set their specific context before LLM construction,
+            # so this only fires for users calling LLM() directly.
+            if (telemetry_config is not None and telemetry_config.usage_context
+                    == _usage.UsageContext.UNKNOWN):
+                telemetry_config = telemetry_config.model_copy(
+                    update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            _usage.report_usage(
+                llm_args=self.args,
+                pretrained_config=self._hf_model_config,
+                telemetry_config=telemetry_config,
+            )
+        except Exception as exc:
+            logger.debug("Usage telemetry setup failed: %s", exc)
+
     @property
     @set_api_status("beta")
     def llm_id(self) -> str:
@@ -400,6 +543,17 @@ class BaseLLM:
 
         return self._llm_id
 
+    @set_api_status("prototype")
+    def get_data_transceiver_state(self) -> bytes:
+        """Get the serialized DataTransceiverState for arbitrary KV cache transfer.
+
+        Returns:
+            bytes: Serialized DataTransceiverState, or empty bytes if no transceiver is configured.
+        """
+        if self._executor is None:
+            return b""
+        return self._executor.get_data_transceiver_state()
+
     @property
     @set_api_status("beta")
     def disaggregated_params(self) -> dict:
@@ -407,6 +561,22 @@ class BaseLLM:
             self._disaggregated_params = self._executor.get_disaggregated_params(
             ) if self._executor else {}
         return self._disaggregated_params
+
+    @property
+    @set_api_status("beta")
+    def startup_metrics(self) -> dict:
+        """Cache and return rank-0 startup metrics.
+
+        Returns:
+            dict: The cached metrics, or an empty dict when metrics retrieval fails.
+        """
+        if self._startup_metrics is None:
+            startup_metrics = self._executor.get_startup_metrics(
+            ) if self._executor else {}
+            if startup_metrics is None:
+                return {}
+            self._startup_metrics = startup_metrics
+        return self._startup_metrics
 
     @staticmethod
     def _is_token_id_list(value: Any) -> bool:
@@ -638,11 +808,11 @@ class BaseLLM:
 
         if is_ctx_only:
             sampling_params.max_tokens = 1
+            self._configure_bart_decoder_prefix(sampling_params)
 
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
-            query_token_ids = inputs.query_token_ids
             multimodal_params = inputs.multimodal_params
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
@@ -650,8 +820,12 @@ class BaseLLM:
                     preprocessed_encoder_input_token_ids,
                     "inputs.encoder_input_token_ids")
             encoder_input_token_ids = preprocessed_encoder_input_token_ids
+            if (encoder_input_token_ids is not None
+                    and self._is_encoder_decoder_model()):
+                prompt_token_ids = self._get_decoder_prompt_token_ids(
+                    sampling_params)
         else:
-            (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+            (prompt_token_ids, prompt, multimodal_params,
              encoder_input_token_ids) = self._preprocess(
                  inputs,
                  sampling_params,
@@ -661,17 +835,14 @@ class BaseLLM:
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
 
-        self._check_arguments(
-            len(prompt_token_ids),
-            len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params,
-            is_gen_only=is_gen_only)
+        self._check_arguments(len(prompt_token_ids),
+                              sampling_params,
+                              is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
         result = self._executor.generate_async(
             prompt_token_ids,
-            query_token_ids=query_token_ids,
             sampling_params=sampling_params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
@@ -704,15 +875,15 @@ class BaseLLM:
         inputs: Optional[PromptInputs],
         sampling_params: SamplingParams,
         disaggregated_params: Optional[DisaggregatedParams] = None,
-    ) -> Tuple[List[int], Optional[str], Optional[List[int]],
-               Optional[MultimodalParams], Optional[List[int]]]:
+    ) -> Tuple[List[int], Optional[str], Optional[MultimodalParams],
+               Optional[List[int]]]:
         """Preprocess raw prompts into token IDs and multimodal params.
 
         This is the CPU-heavy portion of generate_async (tokenization,
         multimodal processing, hash computation).
 
         Returns:
-            `(prompt_token_ids, prompt, query_token_ids, multimodal_params, encoder_input_token_ids)`
+            `(prompt_token_ids, prompt, multimodal_params, encoder_input_token_ids)`
         """
         if isinstance(inputs, dict):
             inputs = self._copy_prompt_inputs(inputs)
@@ -753,7 +924,6 @@ class BaseLLM:
         is_gen_only = (disaggregated_params is not None and
                        disaggregated_params.request_type == "generation_only")
 
-        query_token_ids = None
         multimodal_params = None
         prompt = None
 
@@ -784,7 +954,6 @@ class BaseLLM:
                     "DisaggPrefillMultimodalInputs")
             prompt_token_ids = disagg_mm_inputs.prompt_token_ids
             prompt = inputs.get("prompt", None)
-            query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
                 raise ValueError(
                     "Generation-only mode should not need multimodal parameters"
@@ -834,7 +1003,6 @@ class BaseLLM:
               and inputs.get("multi_modal_data") is None
               and inputs.get("multi_modal_embeddings") is None):
             prompt_token_ids = inputs['prompt_token_ids']
-            query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
@@ -864,7 +1032,12 @@ class BaseLLM:
                 # 1. Extend support for more modalities and models
                 # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
                 input_processor_with_hash = create_input_processor_with_hash(
-                    self.input_processor)
+                    self.input_processor,
+                    encoder_cache_enabled=(
+                        self.args.multimodal_config is not None
+                        and self.args.multimodal_config.encoder_cache_max_bytes
+                        > 0),
+                )
                 with nvtx_range_debug("input_processor_with_hash"):
                     prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
                         inputs, sampling_params)
@@ -884,13 +1057,13 @@ class BaseLLM:
             prompt = inputs.get(
                 "prompt")  # This is the text prompt, if present.
             if extra_processed_inputs is not None:
-                query_token_ids = extra_processed_inputs.get('query_token_ids')
-                # Create unified MultimodalParams
+                # Create unified MultimodalParams.
                 multimodal_params = MultimodalParams(
                     multimodal_input=extra_processed_inputs.get(
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
-                        'multimodal_data'))
+                        'multimodal_data'),
+                    mm_item_order=inputs.get("mm_item_order"))
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
@@ -921,10 +1094,29 @@ class BaseLLM:
 
         normalized_encoder_input_token_ids = None
         if self._is_encoder_decoder_model():
-            normalized_encoder_input_token_ids = prompt_token_ids
-            prompt_token_ids = [self._get_decoder_start_token_id()]
+            if _multimodal_params_have_encoder_features(multimodal_params):
+                # Audio encoder-decoder models (e.g. Whisper): the encoder reads
+                # the feature tensor from multimodal data and the processor's
+                # token ids are already the decoder prompt — leave both as-is.
+                pass
+            elif getattr(self.input_processor, "requires_encoder_features",
+                         False):
+                # Feature-driven encoder but no features: reject now, before the
+                # request reaches the encoder step where feeding tokens as
+                # encoder input would fail the whole co-scheduled batch.
+                raise ValueError(
+                    "This encoder-decoder model takes its encoder input from "
+                    "multi_modal_data (e.g. audio), not from prompt tokens; "
+                    "token-only prompts are not supported.")
+            else:
+                # Text encoder-decoder models (BART/T5): the tokenized prompt
+                # feeds the encoder; the decoder starts from its start token
+                # plus any forced decoder prefix (e.g. BART forced BOS).
+                normalized_encoder_input_token_ids = prompt_token_ids
+                prompt_token_ids = self._get_decoder_prompt_token_ids(
+                    sampling_params)
 
-        return (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+        return (prompt_token_ids, prompt, multimodal_params,
                 normalized_encoder_input_token_ids)
 
     @set_api_status("prototype")
@@ -947,7 +1139,7 @@ class BaseLLM:
                 passed directly to :meth:`generate_async` as `inputs`.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
-        (prompt_token_ids, _prompt, query_token_ids, multimodal_params,
+        (prompt_token_ids, _prompt, multimodal_params,
          encoder_input_token_ids) = self._preprocess(
              inputs,
              sampling_params,
@@ -956,7 +1148,6 @@ class BaseLLM:
 
         return PreprocessedInputs(
             prompt_token_ids=prompt_token_ids,
-            query_token_ids=query_token_ids,
             multimodal_params=multimodal_params,
             encoder_input_token_ids=encoder_input_token_ids,
         )
@@ -1070,11 +1261,12 @@ class BaseLLM:
         flat_token_ids = [tid for tids in token_ids_list for tid in tids]
 
         # Build inputs dict — common + model-specific kwargs.
-        # Filter keys that are set internally by _prepare_encoder_inputs or
-        # _forward_step to avoid "multiple values for keyword argument" errors.
+        # Filter keys that are supplied by EncoderRunner itself to avoid
+        # "multiple values for keyword argument" errors.
         _RESERVED_KEYS = {
             'input_ids',
             'seq_lens',
+            'multi_item_part_lens',
             'attn_metadata',
             'return_context_logits',
         }
@@ -1082,12 +1274,6 @@ class BaseLLM:
             k: v
             for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
         }
-
-        if filtered_kwargs and engine.encoder_cuda_graph_runner.enabled:
-            raise NotImplementedError(
-                "LLM.encode(..., **model_kwargs) is not supported when encoder CUDA "
-                "graphs are enabled. Disable encoder CUDA graphs or omit model_kwargs. "
-                f"Unsupported keys: {sorted(filtered_kwargs)}")
 
         forward_inputs = {
             'input_ids': flat_token_ids,
@@ -1269,12 +1455,20 @@ class BaseLLM:
                 os.environ[key] = str_value
                 logger.info(f"Setting {key}='{str_value}'")
 
+    def _apply_generation_config_sampling_defaults(
+            self, sampling_params: SamplingParams) -> None:
+        if (self.args.backend == "pytorch"
+                and self.args.generation_config == "auto"):
+            sampling_params._apply_generation_config_defaults(
+                self._generation_config_explicit_values)
+
     def _prepare_sampling_params(
             self,
             sampling_params: Optional[SamplingParams] = None) -> SamplingParams:
         if sampling_params is None:
             sampling_params = SamplingParams()
         if isinstance(sampling_params, SamplingParams):
+            self._apply_generation_config_sampling_defaults(sampling_params)
             if sampling_params.end_id is None:
                 if self.tokenizer is None:
                     raise ValueError(
@@ -1282,7 +1476,8 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
-            self._add_bart_forced_tokens_logits_processor(sampling_params)
+            self._configure_bart_decoder_prefix(sampling_params)
+            self._add_whisper_suppress_tokens_logits_processor(sampling_params)
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
@@ -1308,51 +1503,106 @@ class BaseLLM:
         sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
 
-    def _add_bart_forced_tokens_logits_processor(
-            self, sampling_params: SamplingParams) -> None:
+    def _get_decoder_prompt_token_ids(
+            self, sampling_params: SamplingParams) -> List[int]:
+        return [
+            self._get_decoder_start_token_id(),
+            *sampling_params._decoder_output_token_prefix,
+        ]
+
+    def _configure_bart_decoder_prefix(self,
+                                       sampling_params: SamplingParams) -> None:
+        sampling_params._decoder_output_token_prefix = ()
+
         if self.args.backend != "pytorch":
             return
-        if getattr(self._hf_model_config, "model_type", None) != "bart":
+        if getattr(self._hf_model_config, "model_type",
+                   None) not in ("bart", "mbart"):
             return
         if self._generation_config is None:
             return
 
         forced_bos_token_id = getattr(self._generation_config,
                                       "forced_bos_token_id", None)
-        forced_eos_token_id = getattr(self._generation_config,
-                                      "forced_eos_token_id", None)
-        if forced_bos_token_id is None and forced_eos_token_id is None:
+        if forced_bos_token_id is None:
+            return
+
+        if (sampling_params.max_tokens is not None
+                and sampling_params.max_tokens <= 1):
+            raise ValueError(
+                "BART requires max_tokens >= 2 because its forced BOS token "
+                "counts against the output token limit.")
+
+        sampling_params._decoder_output_token_prefix = (forced_bos_token_id, )
+
+    def _add_whisper_suppress_tokens_logits_processor(
+            self, sampling_params: SamplingParams) -> None:
+        if self.args.backend != "pytorch":
+            return
+        if getattr(self._hf_model_config, "model_type", None) != "whisper":
+            return
+        if self._generation_config is None:
+            return
+
+        suppress_token_ids = getattr(self._generation_config, "suppress_tokens",
+                                     None) or []
+        begin_suppress_token_ids = getattr(self._generation_config,
+                                           "begin_suppress_tokens", None) or []
+        if not suppress_token_ids and not begin_suppress_token_ids:
             return
 
         existing = sampling_params.logits_processor
-        if _contains_bart_forced_tokens_logits_processor(existing):
+        if _contains_whisper_suppress_tokens_logits_processor(existing):
             return
 
-        processor = _BartForcedTokensLogitsProcessor(
-            forced_bos_token_id=forced_bos_token_id,
-            forced_eos_token_id=forced_eos_token_id,
-            max_tokens=sampling_params.max_tokens,
+        processor = _WhisperSuppressTokensLogitsProcessor(
+            suppress_token_ids=suppress_token_ids,
+            begin_suppress_token_ids=begin_suppress_token_ids,
         )
-        if existing is None:
-            sampling_params.logits_processor = processor
-        elif isinstance(existing, list):
-            existing.append(processor)
-        else:
-            sampling_params.logits_processor = [existing, processor]
+        _append_logits_processor(sampling_params, processor)
 
-    def _check_arguments(self, prompt_len: int, query_len: int,
-                         sampling_params: SamplingParams,
+    def _check_one_model_speculative_sampling(
+            self, sampling_params: SamplingParams) -> None:
+        """Reject one-model-speculative-unsupported sampling before submission.
+
+        SpecSampler.validate_request rejects these too, but it runs on the
+        executor's admission path -- after the OpenAI frontend has answered 200
+        and opened the response stream. The client then sees a broken stream
+        instead of a status code, which it cannot tell apart from a network
+        fault. Raising here, while generate_async is still synchronous, gets the
+        request a structured 4xx with the same message.
+        """
+        spec_dec_mode = getattr(self.args.speculative_config, "spec_dec_mode",
+                                None)
+        # use_one_engine() is exactly the set of modes get_spec_decoder hands to
+        # SpecSampler; the two-model modes keep TorchSampler, which implements
+        # all of these.
+        if spec_dec_mode is None or not spec_dec_mode.use_one_engine():
+            return
+        # The module rather than the symbol: the fully-qualified import runs to
+        # 94 columns here, which isort (line_length 80) wraps with a backslash
+        # and ruff (line-length 100) then reports as I001. Importing the module
+        # is short enough that both leave it alone.
+        from .._torch.speculative import spec_sampler_base
+
+        reason = spec_sampler_base.one_model_sampling_rejection_reason(
+            sampling_params)
+        if reason is not None:
+            raise RequestError(reason)
+
+    def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
-            # Check prompt length and query length against max_num_tokens to filter illegal requests.
+            # Check prompt length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
                 max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
                     raise RequestError(
-                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
+                        f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
                         f"max_num_tokens ({max_num_tokens})")
+            self._check_one_model_speculative_sampling(sampling_params)
             return
 
         build_config = self.args.build_config
@@ -1365,10 +1615,10 @@ class BaseLLM:
         # TODO: Remove this check and left the request verification to cpp runtime
 
         if (not self.args.enable_chunked_prefill) and (
-                prompt_len / self.args.parallel_config.cp_size + query_len +
+                prompt_len / self.args.parallel_config.cp_size +
             (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
-                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
+                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({max_seq_len})")
 
         if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
@@ -1465,13 +1715,77 @@ class BaseLLM:
             self) -> Optional[transformers.GenerationConfig]:
         return ModelLoader.load_hf_generation_config(self.args.model)
 
+    def _try_load_generation_config_explicit_values(self) -> dict[str, Any]:
+        if self.args.backend != "pytorch" or self.args.generation_config != "auto":
+            return {}
+        model_dir = self._hf_model_dir or self.args.model
+        return ModelLoader.load_hf_generation_config_dict(model_dir)
+
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
         return ModelLoader.load_hf_model_config(
             self.args.model, trust_remote_code=self.args.trust_remote_code)
 
+    @set_api_status("prototype")
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start iteration-scoped profiling of the backend engine.
+
+        Mirrors the ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``
+        environment-variable behaviour but can be triggered at runtime (for
+        example via the ``trtllm-serve`` ``/start_profile`` HTTP endpoint).
+        Only supported when running the PyTorch / AutoDeploy backend; on the
+        TensorRT backend this is a no-op.
+
+        See ``PyExecutor.start_profile`` for full argument semantics.
+
+        Args:
+            output_dir (str, optional): Directory where chrome traces are
+                written. If ``None``, falls back to the
+                ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
+                to ``/tmp``. Defaults to None.
+            num_steps (int, optional): Number of engine iterations to
+                capture. When set, the engine stops the window automatically
+                and ``stop_profile`` does not need to be called. When
+                ``None``, profiling runs until ``stop_profile`` is called.
+                Defaults to None.
+            start_step (int): Additional iterations to skip before profiling actually begins, relative to the current iteration counter. Defaults to 0.
+            activities (List[str], optional): Subset of
+                ``["CPU", "GPU", "CUDA_PROFILER"]`` selecting which profiler
+                activities to record. When ``CUDA_PROFILER`` is the only
+                entry, ``torch.profiler`` is not started so only
+                ``cudaProfilerStart``/``cudaProfilerStop`` brackets run,
+                which is suitable for nsys capture. Defaults to None, which
+                resolves to ``["CPU", "GPU"]``.
+        """
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot start profiling.")
+        return self._executor.start_profile(output_dir=output_dir,
+                                            num_steps=num_steps,
+                                            start_step=start_step,
+                                            activities=activities)
+
+    @set_api_status("prototype")
+    def stop_profile(self) -> None:
+        """Stop any in-progress runtime profiling."""
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot stop profiling.")
+        return self._executor.stop_profile()
+
     @set_api_status("beta")
     def shutdown(self) -> None:
+        try:
+            self._shutdown_resources()
+        finally:
+            self._record_usage_shutdown()
+
+    def _shutdown_resources(self) -> None:
+        """Release executors and any LLM-owned MPI session."""
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
@@ -1485,6 +1799,23 @@ class BaseLLM:
                 and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
+
+    def _record_usage_shutdown(self) -> None:
+        """Update the process counter at most once for this LLM object."""
+        lifecycle_lock = getattr(self, "_usage_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            return
+        with lifecycle_lock:
+            if not getattr(self, "_usage_lifecycle_active", False):
+                return
+            self._usage_lifecycle_active = False
+
+        try:
+            import tensorrt_llm.usage as _usage
+
+            _usage.record_llm_shutdown()
+        except Exception as exc:
+            logger.debug(f"Usage telemetry shutdown tracking failed: {exc}")
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
@@ -1545,22 +1876,58 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        self._usage_lifecycle_active = False
+        self._usage_lifecycle_lock = threading.Lock()
+        telemetry_config = kwargs.get("telemetry_config")
+        usage_attempt_tracked = False
+        _usage = None
+        # Telemetry: Track before construction so initialization failures are visible.
+        try:
+            import tensorrt_llm.usage as _usage
+
+            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                telemetry_config,
+                default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+            )
+        except Exception as exc:
+            logger.debug(
+                f"Usage telemetry initialization tracking failed: {exc}")
+
         backend = kwargs.pop("backend", "pytorch")
 
-        # Validate that only arguments supported by the PyTorch backend are passed.
-        self._validate_args_for_torch_backend(kwargs)
+        try:
+            # Validate that only arguments supported by the PyTorch backend are passed.
+            self._validate_args_for_torch_backend(kwargs)
 
-        super().__init__(model,
-                         tokenizer,
-                         tokenizer_mode,
-                         skip_tokenizer_init,
-                         trust_remote_code,
-                         tensor_parallel_size,
-                         dtype,
-                         revision,
-                         tokenizer_revision,
-                         backend=backend,
-                         **kwargs)
+            super().__init__(model,
+                             tokenizer,
+                             tokenizer_mode,
+                             skip_tokenizer_init,
+                             trust_remote_code,
+                             tensor_parallel_size,
+                             dtype,
+                             revision,
+                             tokenizer_revision,
+                             backend=backend,
+                             **kwargs)
+        except Exception:
+            if usage_attempt_tracked:
+                _usage.record_llm_initialization_failure()
+            raise
+
+        try:
+            if not usage_attempt_tracked and _usage is not None:
+                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                    getattr(self.args, 'telemetry_config', None),
+                    default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+                )
+
+            if usage_attempt_tracked:
+                self._usage_lifecycle_active = _usage.record_llm_initialized()
+        except Exception as exc:
+            logger.debug(f"Usage telemetry completion tracking failed: {exc}")
+
+        self._start_usage_reporting()
 
     @set_api_status("prototype")
     def _collective_rpc(
@@ -1598,6 +1965,45 @@ class _TorchLLM(BaseLLM):
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
 
+    def _reject_token_encoder_config_without_buckets(self) -> None:
+        """Reject a bucket-less token-encoder config before weights load.
+
+        `PyTorchModelEngine.__init__` asks the instantiated model and keeps the
+        last word; this asks the class its architecture resolves to. It defers
+        wherever that class might not be the one the engine builds, so it can
+        only reject earlier, never differently. A model that installs
+        `encoder_graph_spec` at construction instead of declaring it on the
+        class would be misjudged here; no in-tree model does.
+        """
+        config = self.args.encoder_cuda_graph_config
+        # `checkpoint_loader`, a non-HF `checkpoint_format` and `model_kwargs`
+        # all feed `checkpoint_loader.load_config()`, which is where the engine
+        # gets its class from, so the on-disk architecture may not be the one
+        # it builds. Decoder-only models are left to the engine too: its
+        # "consumes packed tokens" wording would only confuse there.
+        if (config is None or not self._is_encoder_decoder_model()
+                or self.args.model_kwargs is not None
+                or self.args.checkpoint_loader is not None
+                or self.args.checkpoint_format not in (None, "HF")):
+            return
+        bucket_config_error = validate_token_encoder_bucket_config(
+            config.num_tokens, config.seq_lens)
+        if bucket_config_error is None:
+            return
+        architectures = getattr(self._hf_model_config, "architectures",
+                                None) if self._hf_model_config else None
+        if not architectures:
+            return
+        # Local: resolving an architecture imports its model module, which the
+        # client process otherwise never loads.
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+        model_cls = get_registered_model_class(architectures[0])
+        # Unresolved, or a feature encoder that derives both dimensions itself.
+        if model_cls is None or hasattr(model_cls, "encoder_graph_spec"):
+            return
+        raise ValueError(bucket_config_error)
+
     def _build_model(self):
         super()._build_model()
         assert self._engine_dir is None
@@ -1606,7 +2012,10 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
+        self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
+        )
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
@@ -1659,7 +2068,6 @@ class _TorchLLM(BaseLLM):
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
             self._engine_dir,
-            executor_config=None,
             batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
@@ -1679,14 +2087,13 @@ class _TorchLLM(BaseLLM):
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that only arguments supported by the PyTorch backend are passed.
         """
-        torchllm_fields = set(TorchLlmArgs.model_fields.keys())
+        # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
+        accepted_keys = (set(TorchLlmArgs.model_fields.keys())
+                         | TORCH_LLMARGS_REMOVED_ARGS
+                         | {'_mpi_session', 'backend'})
 
         # Check if any arguments not supported by the PyTorch backend are passed.
-        unsupported_args = [
-            key for key in kwargs
-            if key not in torchllm_fields and key not in ('_mpi_session',
-                                                          'backend')
-        ]
+        unsupported_args = [key for key in kwargs if key not in accepted_keys]
 
         if unsupported_args:
             raise ValueError(

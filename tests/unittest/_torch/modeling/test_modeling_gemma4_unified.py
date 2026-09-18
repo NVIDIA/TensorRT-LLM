@@ -26,6 +26,7 @@ smoke on the real 12B checkpoint.)
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from tensorrt_llm._torch.configs import (
@@ -43,6 +44,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     _GEMMA4_ARCHITECTURES,
     MODEL_CLASS_MAPPER_MAPPING,
     MODEL_CLASS_MAPPING,
+    ModelConfig,
     get_model_architecture,
 )
 
@@ -203,6 +205,14 @@ def test_get_model_architecture_resolves_wrapper():
     cls, arch = get_model_architecture(config)
     assert cls is Gemma4UnifiedForConditionalGeneration
     assert arch == _UNIFIED_ARCH
+
+
+def test_wrapper_rejects_missing_image_token_id():
+    config = Gemma4UnifiedConfig(image_token_id=None)
+    model_config = ModelConfig(pretrained_config=config)
+
+    with pytest.raises(ValueError, match="requires config.image_token_id"):
+        Gemma4UnifiedForConditionalGeneration(model_config)
 
 
 def test_weight_mapper_registered():

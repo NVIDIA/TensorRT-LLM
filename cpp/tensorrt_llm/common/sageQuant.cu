@@ -38,9 +38,14 @@ namespace tensorrt_llm::common
 // 2. [Optional when gridDim.z>=2] Performs either per-channel Sfs gathering or per-channel quantization for V.
 //
 // NOTE: all tensors in this file are treated as column-major: [D, H, S].
+//
+// Q/K Sfs layout, matching the FMHA kernel: head stride is ceil(sumSeqLensQk / TokenPerScale) + batchSize - 1 and the
+// local token `t` of sequence `b` uses `cumSeqLens[b] / TokenPerScale + b + t / TokenPerScale`, the `+ b` padding
+// keeping a trailing partial block from being shared with the next sequence.
 template <typename Element, typename ElementQuantized, int TokenPerScale, int HeadDim, bool KSmooth, int VStage>
-__global__ void sageQuantQkvKernel(int sumSeqLensQk, void const* ptrQk, void* ptrQkQuant, float* ptrQkScale,
-    float* ptrKMean, int sumSeqLensV, int numHeadsV, void const* ptrV, void* ptrVQuant, float* ptrVScale)
+__global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* ptrCuSeqLensQk, void const* ptrQk,
+    void* ptrQkQuant, float* ptrQkScale, float* ptrKMean, int sumSeqLensV, int numHeadsV, void const* ptrV,
+    void* ptrVQuant, float* ptrVScale)
 {
     using namespace cute;
     using namespace cutlass;
@@ -60,8 +65,6 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, void const* ptrQk, void* pt
     // Silence currently-unused argument until K-smoothing support is added.
     (void) ptrKMean;
 
-    int const numHeads = gridDim.y;
-    int const headIdx = blockIdx.y;
     int const numWarpsPerCta = blockDim.x / 32;
     int const numWarps = gridDim.x * numWarpsPerCta;
     int const warpId = blockIdx.x * numWarpsPerCta + threadIdx.x / 32;
@@ -69,105 +72,90 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, void const* ptrQk, void* pt
 
     if (blockIdx.z == 0)
     {
-        // Qk task -- one-off per-token-block quantization.
+        // Qk task -- per-token-block quantization. blockIdx.y maps to (headIdx * batchSize + seqIdx).
+        int const numHeads = gridDim.y / batchSize;
+        int const headIdx = blockIdx.y / batchSize;
+        int const seqIdx = blockIdx.y % batchSize;
 
-        // IO tensors
-        Tensor gQk
-            = make_tensor(reinterpret_cast<Element const*>(ptrQk), make_shape(Int<HeadDim>{}, numHeads, sumSeqLensQk));
-        Tensor gQkQuant = make_tensor(
-            reinterpret_cast<ElementQuantized*>(ptrQkQuant), make_shape(Int<HeadDim>{}, numHeads, sumSeqLensQk));
-        Tensor gQkScale = make_tensor(ptrQkScale, make_shape(ceil_div(sumSeqLensQk, TokenPerScale), numHeads));
+        // Threads count per token block
+        constexpr int threadsPerScale = HeadDim / BestVL;
+        static_assert(HeadDim % BestVL == 0, "VL must divide HeadDim");
+        static_assert(threadsPerScale <= 32, "One token block should never exceed warp scope");
+        int const numScalesPerWarp = 32 / threadsPerScale;
+        int const numScalesPerWave = numWarps * numScalesPerWarp;
 
-        // This head
-        Tensor gQkSeq = gQk(_, headIdx, _);
-        Tensor gQkSeqQuant = gQkQuant(_, headIdx, _);
-        Tensor gQkSeqScale = gQkScale(_, headIdx);
+        // Thread coordinates
+        int const tokBlkIdxInWave = warpId * numScalesPerWarp + thrId / threadsPerScale;
+        int const threadInScaleIdx = thrId % threadsPerScale;
+        // Lanes of this token block: a trailing block is taken by one group only, so never reduce over the warp.
+        constexpr uint32_t scaleMask = threadsPerScale == 32 ? ~0u : ((1u << threadsPerScale) - 1u);
+        uint32_t const laneMask = scaleMask << (thrId / threadsPerScale * threadsPerScale);
+
+        // This head and this sequence
+        int const seqBegin = ptrCuSeqLensQk[seqIdx];
+        int const seqLen = ptrCuSeqLensQk[seqIdx + 1] - seqBegin;
+        if (seqLen <= 0)
+        {
+            return;
+        }
+
+        // Sfs of this head, see the layout note above.
+        float* ptrQkScaleHead
+            = ptrQkScale + static_cast<int64_t>(headIdx) * (ceil_div(sumSeqLensQk, TokenPerScale) + batchSize - 1);
+        int const tokenStride = numHeads * HeadDim;
+
+        // IO tensors of this sequence and head
+        int64_t const seqHeadOffset = static_cast<int64_t>(seqBegin) * tokenStride + headIdx * HeadDim;
+        Tensor gQkSeq = make_tensor(reinterpret_cast<Element const*>(ptrQk) + seqHeadOffset,
+            make_shape(Int<HeadDim>{}, seqLen), make_stride(_1{}, tokenStride));
+        Tensor gQkSeqQuant = make_tensor(reinterpret_cast<ElementQuantized*>(ptrQkQuant) + seqHeadOffset,
+            make_shape(Int<HeadDim>{}, seqLen), make_stride(_1{}, tokenStride));
+        Tensor gQkSeqScale = make_tensor(
+            ptrQkScaleHead + seqBegin / TokenPerScale + seqIdx, make_shape(ceil_div(seqLen, TokenPerScale)));
 
         // Tiling
         Tensor gQkVecs = tiled_divide(gQkSeq, Shape<VL, Int<TokenPerScale>>{});
         Tensor gQkVecsQuant = tiled_divide(gQkSeqQuant, Shape<VL, Int<TokenPerScale>>{});
 
-        // Register buffers
-        Tensor rQk = make_tensor<Element>(Shape<VL, Int<TokenPerScale>>{});
-        Tensor rQkQuant = make_tensor<ElementQuantized>(Shape<VL, Int<TokenPerScale>>{});
-        Tensor rQkCompute = make_tensor<float>(Shape<VL, Int<TokenPerScale>>{});
-
-        // Compute tensors
-        Tensor rQk_x2 = recast<Array<Element, 2>>(rQk);
-        Tensor rQkCompute_x2 = recast<Array<float, 2>>(rQkCompute);
-        // Conversion tensors
-        Tensor rQk_x4 = recast<Array<Element, 4>>(rQk);
-        Tensor rQkQuant_x4 = recast<Array<ElementQuantized, 4>>(rQkQuant);
-
-        // Threads count per token block
-        constexpr int threadsPerScale = size<1>(gQkVecs);
-        static_assert(threadsPerScale <= 32, "One token block should never exceed warp scope");
-        int const numScalesPerWarp = 32 / threadsPerScale;
-        int const numScalesPerWave = numWarps * numScalesPerWarp;
-        int const numWholeScales = sumSeqLensQk / TokenPerScale;
-
-        // Thread coordinates
-        int tokBlkIdx = warpId * numScalesPerWarp + thrId / threadsPerScale;
-        int threadInScaleIdx = thrId % threadsPerScale;
-
-        // Unpredicated iterations
-        for (; tokBlkIdx < numWholeScales; tokBlkIdx += numScalesPerWave)
+        // Quantize one token block. A partial trailing block is zero-filled so it does not affect the Sfs.
+        auto quantizeTokBlk = [&](auto isFullBlk, int tokBlkIdx, int numValidTokens)
         {
+            constexpr bool IsFullBlk = decltype(isFullBlk)::value;
+
+            // Register buffers
+            Tensor rQk = make_tensor<Element>(Shape<VL, Int<TokenPerScale>>{});
+            Tensor rQkQuant = make_tensor<ElementQuantized>(Shape<VL, Int<TokenPerScale>>{});
+            Tensor rQkCompute = make_tensor<float>(Shape<VL, Int<TokenPerScale>>{});
+
+            // Compute tensors
+            Tensor rQk_x2 = recast<Array<Element, 2>>(rQk);
+            Tensor rQkCompute_x2 = recast<Array<float, 2>>(rQkCompute);
+            // Conversion tensors
+            Tensor rQk_x4 = recast<Array<Element, 4>>(rQk);
+            Tensor rQkQuant_x4 = recast<Array<ElementQuantized, 4>>(rQkQuant);
+
             // Load input
-            cute::copy(AutoVectorizingCopy{}, gQkVecs(_, threadInScaleIdx, tokBlkIdx), rQk);
-            cute::transform(rQk_x2, rQkCompute_x2, NumericArrayConverter<float, Element, 2>::convert);
-
-            // Intra-thread reduction
-            float maxScale = 1e-3f;
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < size(rQk); ++i)
+            if constexpr (IsFullBlk)
             {
-                maxScale = ::fmaxf(maxScale, ::fabsf(rQkCompute(i)));
+                cute::copy(AutoVectorizingCopy{}, gQkVecs(_, threadInScaleIdx, tokBlkIdx), rQk);
             }
-            // Intra-warp reduction
-            CUTLASS_PRAGMA_UNROLL
-            for (int delta = 1; delta < threadsPerScale; delta <<= 1)
+            else
             {
-                maxScale = ::fmaxf(maxScale, __shfl_xor_sync(0xffffffffu, maxScale, delta));
-            }
-
-            // Rescale to TypeMax
-            maxScale = maxScale / TypeMax;
-            // Store maxScale
-            gQkSeqScale(tokBlkIdx) = maxScale;
-
-            // 1/maxScale
-            Array<Element, 2> scaleQuant
-                = NumericArrayConverter<Element, float, 2>::convert(Array<float, 2>{maxScale, maxScale});
-            scaleQuant = cutlass::reciprocal_approximate<Array<Element, 2>>{}(scaleQuant);
-            cutlass::multiplies<Array<Element, 2>> scaleQuantOp;
-            // Qk /= maxScale
-            cute::transform(rQk_x2, rQk_x2, [&](auto& x) { return scaleQuantOp(x, scaleQuant); });
-            // Convert to target quant type
-            cute::transform(rQk_x4, rQkQuant_x4, NumericArrayConverter<ElementQuantized, Element, 4>::convert);
-            // Store quantized output
-            cute::copy(AutoVectorizingCopy{}, rQkQuant, gQkVecsQuant(_, threadInScaleIdx, tokBlkIdx));
-        }
-
-        // Predicated iteration
-        int const lastIterTokenIdx = tokBlkIdx * TokenPerScale;
-        if (lastIterTokenIdx < sumSeqLensQk)
-        {
-            // Load input
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < size<1>(rQk); ++i)
-            {
-                if (lastIterTokenIdx + i < sumSeqLensQk)
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size<1>(rQk); ++i)
                 {
-                    cute::copy(
-                        AutoVectorizingCopy{}, gQkVecs(make_tuple(_, i), threadInScaleIdx, tokBlkIdx), rQk(_, i));
-                }
-                else
-                {
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int j = 0; j < BestVL; ++j)
+                    if (i < numValidTokens)
                     {
-                        rQk(j, i) = static_cast<Element>(0);
+                        cute::copy(
+                            AutoVectorizingCopy{}, gQkVecs(make_tuple(_, i), threadInScaleIdx, tokBlkIdx), rQk(_, i));
+                    }
+                    else
+                    {
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int j = 0; j < BestVL; ++j)
+                        {
+                            rQk(j, i) = static_cast<Element>(0);
+                        }
                     }
                 }
             }
@@ -184,7 +172,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, void const* ptrQk, void* pt
             CUTLASS_PRAGMA_UNROLL
             for (int delta = 1; delta < threadsPerScale; delta <<= 1)
             {
-                maxScale = ::fmaxf(maxScale, __shfl_xor_sync(0xffffffffu, maxScale, delta));
+                maxScale = ::fmaxf(maxScale, __shfl_xor_sync(laneMask, maxScale, delta));
             }
 
             // Rescale to TypeMax
@@ -203,20 +191,43 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, void const* ptrQk, void* pt
             cute::transform(rQk_x4, rQkQuant_x4, NumericArrayConverter<ElementQuantized, Element, 4>::convert);
 
             // Store quantized output
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < size<1>(rQk); ++i)
+            if constexpr (IsFullBlk)
             {
-                if (lastIterTokenIdx + i < sumSeqLensQk)
+                cute::copy(AutoVectorizingCopy{}, rQkQuant, gQkVecsQuant(_, threadInScaleIdx, tokBlkIdx));
+            }
+            else
+            {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size<1>(rQk); ++i)
                 {
-                    cute::copy(AutoVectorizingCopy{}, rQkQuant(_, i),
-                        gQkVecsQuant(make_tuple(_, i), threadInScaleIdx, tokBlkIdx));
+                    if (i < numValidTokens)
+                    {
+                        cute::copy(AutoVectorizingCopy{}, rQkQuant(_, i),
+                            gQkVecsQuant(make_tuple(_, i), threadInScaleIdx, tokBlkIdx));
+                    }
                 }
             }
+        };
+
+        int const numWholeScales = seqLen / TokenPerScale;
+
+        // Unpredicated iterations
+        for (int tokBlkIdx = tokBlkIdxInWave; tokBlkIdx < numWholeScales; tokBlkIdx += numScalesPerWave)
+        {
+            quantizeTokBlk(cute::true_type{}, tokBlkIdx, TokenPerScale);
+        }
+
+        // Predicated iteration, taken by the group owning the trailing block
+        int const numTailTokens = seqLen - numWholeScales * TokenPerScale;
+        if (numTailTokens > 0 && tokBlkIdxInWave == numWholeScales % numScalesPerWave)
+        {
+            quantizeTokBlk(cute::false_type{}, numWholeScales, numTailTokens);
         }
     }
     else if (blockIdx.z == 1)
     {
-        // V task -- per-channel (all tokens) 2-stage task
+        // V task -- per-channel (all tokens) 2-stage task. blockIdx.y maps to headIdx.
+        int const headIdx = blockIdx.y;
         using ElementQuantizedV = cutlass::float_e4m3_t;
 
         // IO tensors
@@ -347,9 +358,9 @@ template <typename Element>
 void invokeSageQuantQkvImpl(SageQuantParams const& params)
 {
     using namespace cute;
-    TLLM_CHECK_WITH_INFO(params.sumSeqLensQk > 0 && params.numHeads > 0 && params.headDim > 0
-            && params.tokenBlockSize > 0 && params.ptrQk != nullptr && params.ptrQkQuant != nullptr
-            && params.ptrQkScale != nullptr && params.smCount > 0,
+    TLLM_CHECK_WITH_INFO(params.sumSeqLensQk > 0 && params.batchSize > 0 && params.ptrCuSeqLensQk != nullptr
+            && params.numHeads > 0 && params.headDim > 0 && params.tokenBlockSize > 0 && params.ptrQk != nullptr
+            && params.ptrQkQuant != nullptr && params.ptrQkScale != nullptr && params.smCount > 0,
         "Invalid SageQuantQk parameters.");
     TLLM_CHECK_WITH_INFO(params.vStage == 0
             || (params.sumSeqLensV > 0 && params.numHeadsV > 0 && params.ptrV != nullptr && params.ptrVQuant != nullptr
@@ -363,9 +374,10 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
         constexpr int TokenBlockSize_ = tokenBlockSizeStatic;
 
         SageQuantParams kernelParams = params;
-        void* kernelArgs[] = {&kernelParams.sumSeqLensQk, &kernelParams.ptrQk, &kernelParams.ptrQkQuant,
-            &kernelParams.ptrQkScale, &kernelParams.ptrKMean, &kernelParams.sumSeqLensV, &kernelParams.numHeadsV,
-            &kernelParams.ptrV, &kernelParams.ptrVQuant, &kernelParams.ptrVScale};
+        void* kernelArgs[]
+            = {&kernelParams.sumSeqLensQk, &kernelParams.batchSize, &kernelParams.ptrCuSeqLensQk, &kernelParams.ptrQk,
+                &kernelParams.ptrQkQuant, &kernelParams.ptrQkScale, &kernelParams.ptrKMean, &kernelParams.sumSeqLensV,
+                &kernelParams.numHeadsV, &kernelParams.ptrV, &kernelParams.ptrVQuant, &kernelParams.ptrVScale};
 
         auto launchWithVStage = [&](auto vStageStatic)
         {
@@ -390,8 +402,10 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
                 TLLM_THROW("Unsupported SageQuantQk quantType: %d.", static_cast<int>(params.quantType));
             }
 
-            uint32_t const gridX = static_cast<uint32_t>(std::max(1, (params.smCount * 32) / params.numHeads));
-            uint32_t const gridY = static_cast<uint32_t>(params.numHeads);
+            // One block of the y dimension per (head, sequence) for Qk, per head for V.
+            int const numHeadSeqs = params.numHeads * params.batchSize;
+            uint32_t const gridX = static_cast<uint32_t>(std::max(1, (params.smCount * 32) / numHeadSeqs));
+            uint32_t const gridY = static_cast<uint32_t>(numHeadSeqs);
             uint32_t const gridZ = VStage_ > 0 ? 2U : 1U;
             dim3 const launchGrid{gridX, gridY, gridZ};
             check_cuda_error(cudaLaunchKernel(kernelFunc, launchGrid, dim3{64U, 1U, 1U}, kernelArgs, 0, params.stream));

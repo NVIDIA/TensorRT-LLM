@@ -176,7 +176,7 @@ def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")
 
 
-@pytest.mark.parametrize("model", ["Qwen2-0.5B"])
+@pytest.mark.parametrize("model", ["Qwen3/Qwen3-0.6B"])
 def test_llmapi_kv_cache_connector(llm_root, llm_venv, model):
     script_path = Path(
         llm_root) / "examples" / "llm-api" / "llm_kv_cache_connector.py"

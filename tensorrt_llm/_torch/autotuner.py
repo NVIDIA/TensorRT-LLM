@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import ast
 import contextlib
 import copy
@@ -261,7 +275,8 @@ class TunableRunner(ABC):
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True,
              cache_path: str = None,
-             skip_dynamic_tuning_buckets: bool = False):
+             skip_dynamic_tuning_buckets: bool = False,
+             post_tune_merge_dist: Optional[Distributed] = None):
     """Context manager for autotuning with distributed support.
 
     Args:
@@ -271,8 +286,21 @@ def autotune(tune_mode: bool = True,
             _optimization_profiles() so only actual input shapes from warmup
             are profiled. Useful for workloads (e.g. diffusion) where the
             LLM-oriented M-bucket sweep is unnecessary.
+        post_tune_merge_dist: Optional ``Distributed``. When set, tactics are
+            tuned per-rank independently and merged across ranks in one
+            collective at context exit (before the cache is saved) — for
+            pipelines whose warmup is not SPMD and so cannot use the per-op
+            distributed strategies.
     """
     autotuner = AutoTuner.get()
+    if post_tune_merge_dist is not None:
+        # Save the singleton's prior state: the full-world dist attached for the
+        # merge is temporary and must not leak into later sessions. Attach the
+        # real (world-sized) mapping now for a correct rank, but with no dist
+        # yet: _is_distributed() stays False so per-op sync is skipped while a
+        # non-SPMD pipeline tunes; the dist is attached at exit to merge.
+        prev_mapping, prev_dist = autotuner.mapping, autotuner._dist
+        autotuner.setup_distributed_state(post_tune_merge_dist.mapping, None)
     rank = autotuner.mapping.rank
 
     # if cache_path is provided, use the rank-specific file
@@ -290,23 +318,48 @@ def autotune(tune_mode: bool = True,
     old_skip = autotuner.skip_dynamic_tuning_buckets
     autotuner.is_tuning_mode = tune_required
     autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
+    # Avoid making compiled AllReduce paths initialize or inspect AutoTuner.
+    from tensorrt_llm._torch.distributed.ops import \
+        set_allreduce_autotuner_tuning_mode
+    set_allreduce_autotuner_tuning_mode(tune_required)
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
         logger.info("[Autotuner] Autotuning process starts ...")
+
+    # Fine-grained sync kernels deadlock when profiled, so force them off for the duration via the
+    # C++ override rather than mutating os.environ. TODO: remove once autotuning handles them.
+    if autotune_enabled:
+        torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
     try:
         yield
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
+        set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
+            torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
             logger.info("[Autotuner] Autotuning process ends")
 
-        # save cache
-        if cache_path is not None:
-            logger.info(f"[Autotuner] Saving cache to {cache_path}")
-            autotuner.profiling_cache.save_cache(cache_path, rank)
+        try:
+            # Merge tactics across ranks in one collective before the cache is
+            # saved, so non-SPMD pipelines can tune independently and still agree.
+            if post_tune_merge_dist is not None:
+                autotuner.setup_distributed_state(post_tune_merge_dist.mapping,
+                                                  post_tune_merge_dist)
+                autotuner.post_tune_merge_tactics()
+
+            # save cache
+            if cache_path is not None:
+                logger.info(f"[Autotuner] Saving cache to {cache_path}")
+                autotuner.profiling_cache.save_cache(cache_path, rank)
+        finally:
+            # Restore the singleton's prior distributed state (see enter) so the
+            # temporary full-world state does not persist past this context.
+            if post_tune_merge_dist is not None:
+                autotuner.mapping = prev_mapping
+                autotuner._dist = prev_dist
 
 
 @dataclass
@@ -760,9 +813,17 @@ class AutoTunerProfilingCache:
             # Convert any simple object to string for JSON compatibility
             key_str = str(key)
             runner_id, tactic, min_time = value
-            tactic_str = repr(tactic)
+            # Enum tactics (e.g. Fp4QuantTactic) repr as "<Fp4QuantTactic.TRTLLM: -1>",
+            # which ast.literal_eval can't parse back -> load_cache crash. Serialize
+            # the underlying value (reload yields that value; an IntEnum compares
+            # equal to it and kernels take the int).
+            is_enum = isinstance(tactic, enum.Enum)
+            tactic_check = tactic.value if is_enum else tactic
+            tactic_str = repr(tactic_check)
             try:
-                assert tactic == ast.literal_eval(
+                # Verify the serialized value round-trips (compare against the
+                # value we store, not the enum member — else non-IntEnum fails).
+                assert tactic_check == ast.literal_eval(
                     tactic_str
                 ), f"Tactic is not compatible with json.dumps/json.loads"
             except Exception as e:
@@ -804,10 +865,16 @@ class AutoTunerProfilingCache:
                 continue
             try:
                 tactic = ast.literal_eval(value["tactic"])
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, SyntaxError):
+                # Skip any tactic whose repr is not a Python literal so one bad
+                # entry can't crash the whole load; the op just re-profiles.
+                # (#16782 removes the current enum trigger at the serialize side.)
+                # SyntaxError is caught too; `continue` is required, else the
+                # entry reuses the previous tactic.
                 logger.warning_once(
-                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}",
+                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}; skipping entry.",
                     key=value["tactic"])
+                continue
 
             runner_id = value["runner_id"]
             min_time = value["min_time"]
@@ -871,6 +938,7 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
+        self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1104,11 +1172,19 @@ class AutoTuner:
                 logger.warning_once(
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
-
+            if logger.level == 'debug':
+                fine_grained_on = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC",
+                                                 "0") == "1"
+                logger.debug_once(
+                    f"[Autotuner] Inference dispatch: custom_op={custom_op}, runner={best_runner}, "
+                    f"tactic={best_tactic}, fine_grained={'ON' if fine_grained_on else 'OFF'}",
+                    key=(custom_op, "inference_dispatch_fine_grained"))
             return (best_runner, best_tactic)
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
+            self._prime_cached_tactics(custom_op, runners, tuning_config,
+                                       inputs, **kwargs)
             return (runners[best_runner_id], best_tactic)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
@@ -1155,6 +1231,8 @@ class AutoTuner:
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
+        self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
+                                   **kwargs)
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occurred:
@@ -1177,6 +1255,68 @@ class AutoTuner:
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    def _prime_cached_tactics(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: List[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        """Compile cached winners in this process during tuning, not inference."""
+        if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+            return
+        # Cache hits may differ across ranks; collective runners must stay
+        # inside lockstep profiling, including profiling scratch allocation.
+        if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
+            return
+        jit_classes = {
+            type(r)
+            for r in runners
+            if isinstance(getattr(type(r), "kernel_cache", None), dict)
+        }
+        if not jit_classes:
+            return
+        for profile in self._optimization_profiles(tuning_config, inputs):
+            hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                profile.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            if not hit:
+                continue
+            runner = runners[runner_id]
+            if type(runner) not in jit_classes:
+                continue
+            key = (custom_op, type(runner).__name__, str(runner.unique_id()),
+                   str(tactic))
+            if key in self._primed_cached_tactics:
+                continue
+            tensors = self._prepare_input_tensors(profile, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = tuning_config.inputs_pre_hook(tensors)
+            try:
+                with nvtx_range(f"{custom_op} prime tactic {tactic}"):
+                    if "do_preparation" in inspect.signature(
+                            runner.forward).parameters:
+                        runner(tensors,
+                               tactic=-1,
+                               do_preparation=True,
+                               **kwargs)
+                    runner(tensors, tactic=tactic, **kwargs)
+                self._primed_cached_tactics.add(key)
+            except Exception as e:
+                try:
+                    torch.cuda.synchronize()
+                except RuntimeError:
+                    pass
+                logger.warning(
+                    f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
+                    f"runner={type(runner).__name__}, tactic={tactic}, "
+                    f"shapes={profile.get_opt_shapes()}. Error: {e}")
 
     def _profile_runners(
         self,
@@ -1333,6 +1473,10 @@ class AutoTuner:
 
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
+            )
+            logger.debug(
+                f"[Autotuner] Selected: custom_op={custom_op}, runner={runners[best_runner_id]}, "
+                f"tactic={best_tactic}, time={min_time:.3f}ms, fine_grained=OFF (disabled during tuning)"
             )
             # inspect call stack
             # TODO: use named tuple to make it more readable
@@ -1742,6 +1886,8 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
+            torch.ops.trtllm.clear_allreduce_tactic_cache()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
@@ -1953,6 +2099,19 @@ class AutoTuner:
                     merged_cache_data[key] = value
 
         self.profiling_cache.merge_cache_data(merged_cache_data)
+
+    def post_tune_merge_tactics(self) -> None:
+        """Merge tactics across ranks after tuning: all-gather every rank's whole
+        profiling cache and keep the fastest tactic per key. One-shot
+        (session-level, not per-op). Collective — all ranks must call it."""
+        if not self._is_distributed():
+            return
+        merged = dict()
+        for data in self._dist.tp_cp_allgather(obj=self.profiling_cache.cache):
+            for key, value in data.items():
+                if value[-1] < merged.get(key, [float('inf')])[-1]:
+                    merged[key] = value
+        self.profiling_cache.merge_cache_data(merged)
 
     def _broadcast_cache_data(
         self,

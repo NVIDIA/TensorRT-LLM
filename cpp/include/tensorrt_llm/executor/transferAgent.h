@@ -216,12 +216,20 @@ struct VmmDescSplitter
     /// For non-VRAM or addresses not in the map, descs pass through unchanged.
     [[nodiscard]] static MemoryDescs splitDescsWithRegionMap(MemoryDescs const& descs, VramRegionMap const& regionMap);
 
-    /// @brief Split paired src/dst descs using local and remote region maps.
-    /// src is split by localRegionMap, dst is split by remoteRegionMap.
-    /// The final piece size is min(srcPiece, dstPiece, remaining).
-    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitTransferDescsWithRegionMaps(
-        MemoryDescs const& srcDescs, MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap,
-        VramRegionMap const& remoteRegionMap);
+    /// @brief Split paired src/dst descs at chunk boundaries, then coalesce contiguous pieces.
+    /// src is split by localRegionMap, dst is split by remoteRegionMap; each piece size is
+    /// min(srcPiece, dstPiece, remaining). Pairs are sorted by src address, and adjacent pieces
+    /// whose src AND dst are both contiguous (same deviceId) are merged — but a merged desc never
+    /// crosses a chunk boundary on either side, and never spans two distinct regions, so every
+    /// output desc stays within a single registered memory region. Merging requires region
+    /// metadata: a piece whose address misses the region map on either side is never merged,
+    /// because two unknown regions are indistinguishable and a merge could cross a chunk or
+    /// registration boundary. With no region metadata the result is split-only. Non-kVRAM descs
+    /// pass through unchanged (no region info is available to bound the merge).
+    /// @param enableCoalesce When false, only split at chunk boundaries without merging pieces.
+    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitAndCoalesceTransferDescs(MemoryDescs const& srcDescs,
+        MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap, VramRegionMap const& remoteRegionMap,
+        bool enableCoalesce = true);
 
     /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
     /// For cudaMalloc memory (single allocation), descs pass through unchanged.
@@ -243,9 +251,8 @@ struct VramRegionMeta
     size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
 };
 
-// `AgentDesc` represents the unique identifier for reading and writing to the agent.
-// By accessing this identifier, the backend can establish the correct connection.
-// It also carries VMM region metadata so that remote agents can split at chunk boundaries.
+// `AgentDesc` carries the backend metadata needed to connect to an agent, plus optional
+// backend-independent metadata used by higher-level transfer paths.
 class AgentDesc final
 {
 public:
@@ -254,9 +261,10 @@ public:
     {
     }
 
-    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions)
+    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions, std::string bounceHandshake = {})
         : mBackendAgentDesc{std::move(backendAgentDesc)}
         , mVramRegions{std::move(vramRegions)}
+        , mBounceHandshake{std::move(bounceHandshake)}
     {
     }
 
@@ -270,7 +278,18 @@ public:
         return mVramRegions;
     }
 
-    /// Serialize the entire AgentDesc (backend blob + VMM regions) into an opaque string.
+    /// Optional NIXL-bounce capability handshake advertised by this agent.
+    /// An opaque blob encoded/decoded by bounce::encodeHandshake/decodeHandshake: wire version,
+    /// control-channel kind + endpoint, and effective region-size limits. It is empty when bounce is
+    /// disabled. A caller must exchange the complete serialized AgentDesc, rather than only
+    /// getBackendAgentDesc(), for the peer to receive this handshake.
+    [[nodiscard]] std::string const& getBounceHandshake() const noexcept
+    {
+        return mBounceHandshake;
+    }
+
+    /// Serialize the entire AgentDesc (backend blob + VMM regions + bounce handshake) into an
+    /// opaque string.
     [[nodiscard]] std::string serialize() const;
 
     /// Deserialize an opaque string back into an AgentDesc.
@@ -279,6 +298,7 @@ public:
 private:
     std::string mBackendAgentDesc;
     std::vector<VramRegionMeta> mVramRegions;
+    std::string mBounceHandshake;
 };
 
 // `TransferOp` is an enumeration that represents the types of transfer operations.
@@ -354,6 +374,9 @@ class TransferStatus
 {
 public:
     virtual ~TransferStatus() = default;
+    /// NIXL and bounce statuses return true only on success; backends that cannot distinguish
+    /// failure from completion (mooncake) return true on any terminal state — use
+    /// wait()/getLastStatus for the outcome.
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
 
@@ -362,6 +385,13 @@ public:
     [[nodiscard]] virtual bool release()
     {
         return false;
+    }
+
+    /// Human-readable detail for the most recent terminal state (empty when unavailable). Backends
+    /// override this so a kFAILURE from wait() can carry its cause to the caller.
+    [[nodiscard]] virtual std::string getLastStatusStr() const
+    {
+        return {};
     }
 };
 
@@ -373,6 +403,22 @@ struct BaseAgentConfig
     bool useListenThread;
     bool enableTelemetry;
     std::unordered_map<std::string, std::string> backendParams;
+    std::optional<int> rank;
+    std::optional<int> worldSize;
+    /// Size in MiB of the agent's staging (bounce) buffer, currently implemented by the
+    /// NIXL agent. 0 (default) disables the fast path; >0 enables it at that capacity.
+    /// Ignored by agents without bounce support (e.g. mooncake). Routing is decided per request
+    /// by the agent from descriptor shape and peer capability; callers cannot request the bounce
+    /// path per transfer.
+    size_t agentBufferSizeMb{0};
+    /// Expert tuning knobs for the bounce pipeline, keyed by the TRTLLM_NIXL_BOUNCE_*
+    /// environment-variable names without the prefix and the trailing _BYTES, lowercased (e.g.
+    /// TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES -> "max_chunk_size").
+    /// Kept SEPARATE from backendParams on purpose: backendParams is forwarded verbatim to the
+    /// backend plugin (e.g. NIXL createBackend), so bounce keys must not leak into it.
+    /// Precedence: this map > environment variable > built-in default. Ignored when
+    /// agentBufferSizeMb == 0.
+    std::unordered_map<std::string, std::string> bounceParams;
 };
 
 class BaseTransferAgent
@@ -406,8 +452,8 @@ public:
     /// @return The descriptor of the local agent.
     virtual AgentDesc getLocalAgentDesc() = 0;
 
-    /// @brief Fetch the descriptor of the local agent.
-    /// @return The descriptor of the local agent.
+    /// @brief Fetch the backend-specific connection information for the local agent.
+    /// @return The local connection information. Optional AgentDesc metadata is not included.
     virtual ConnectionInfoType getLocalConnectionInfo() = 0;
 
     /// @brief Initiate the transfer by submitting the request.
@@ -435,6 +481,14 @@ public:
     virtual ~BaseLoopbackAgent() = default;
     virtual void executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) = 0;
 };
+
+/// @brief Promote the shared library containing this code (libtensorrt_llm.so) to the
+/// process's global symbol scope. The KV cache transfer-agent wrapper libraries
+/// (libtensorrt_llm_{nixl,ucx,mooncake}_wrapper.so) intentionally carry no DT_NEEDED on
+/// libtensorrt_llm.so (the dependency would be circular) and resolve its symbols from the
+/// global symbol table, while Python extension modules and their dependencies load with
+/// RTLD_LOCAL. Idempotent; a no-op when the code is statically linked (e.g. unit tests).
+void promoteHostLibraryToGlobalScope();
 
 class DynLibLoader final
 {

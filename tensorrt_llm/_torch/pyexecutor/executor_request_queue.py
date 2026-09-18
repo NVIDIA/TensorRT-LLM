@@ -1,10 +1,10 @@
 import dataclasses
 import datetime
+import enum
 import queue
 import threading
 import time
-from itertools import repeat
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -14,6 +14,21 @@ from .request_utils import get_num_child_requests
 
 SHUTDOWN_REQUEST_ID = -1
 CONTROL_REQUEST_ID = -2
+# Sentinel request ids for profiling control. Rank 0 enqueues these
+# items; ``RequestBroadcaster`` copies them to every TP/PP rank so the
+# profile window applies on every PyExecutor, not just the leader.
+PROFILE_START_REQUEST_ID = -3
+PROFILE_STOP_REQUEST_ID = -4
+
+
+class RequestAdmissionState(enum.Enum):
+    """Persistent request-admission state across engine sleep and wakeup."""
+
+    RUNNING = "running"
+    PARKING = "parking"
+    PARKED = "parked"
+    WAKING = "waking"
+    FAILED = "failed"
 
 
 @dataclasses.dataclass
@@ -23,13 +38,17 @@ class RequestQueueItem:
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
-    query: Optional[list] = None  # only used in `StarAttention`
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
     # See ``PyExecutor.control_action``.
     control_requires_drain: bool = True
     control_id: Optional[str] = None
+    # Payload for profile-control items. Populated only when
+    # ``is_profile_start_request`` is true; contains the ``output_dir``,
+    # ``num_steps``, ``start_step``, and ``activities`` that every rank
+    # applies when the broadcast reaches them.
+    profile_config: Optional[dict] = None
 
     @property
     def is_shutdown_request(self):
@@ -38,11 +57,20 @@ class RequestQueueItem:
     @property
     def is_normal_request(self):
         return not (self.is_shutdown_request or self.is_canceled_request
-                    or self.is_control_request)
+                    or self.is_control_request or self.is_profile_start_request
+                    or self.is_profile_stop_request)
 
     @property
     def is_control_request(self):
         return self.id == CONTROL_REQUEST_ID
+
+    @property
+    def is_profile_start_request(self):
+        return self.id == PROFILE_START_REQUEST_ID
+
+    @property
+    def is_profile_stop_request(self):
+        return self.id == PROFILE_STOP_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -63,7 +91,96 @@ class ExecutorRequestQueue:
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
+        self.admission_state = RequestAdmissionState.RUNNING
+        self._pending_sleep_tags: frozenset[str] = frozenset()
+        self._parked_tags: frozenset[str] = frozenset()
+        self._pending_wakeup_tags: frozenset[str] = frozenset()
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+
+    def _transition_admission_state(
+        self,
+        expected: RequestAdmissionState,
+        target: RequestAdmissionState,
+    ) -> None:
+        if self.admission_state is not expected:
+            raise RuntimeError(
+                "Invalid executor admission transition: "
+                f"{self.admission_state.value} -> {target.value}; "
+                f"expected {expected.value}")
+        self.admission_state = target
+
+    def begin_sleep_transition(self, tags: Iterable[str]) -> None:
+        """Close admission before the executor starts draining for sleep."""
+        with self.enqueue_lock:
+            sleep_tags = frozenset(tags)
+            self._transition_admission_state(
+                RequestAdmissionState.RUNNING,
+                RequestAdmissionState.PARKING,
+            )
+            self._pending_sleep_tags = sleep_tags
+
+    def complete_sleep_transition(self) -> None:
+        """Publish PARKED only after every rank has completed sleep."""
+        with self.enqueue_lock:
+            self._transition_admission_state(
+                RequestAdmissionState.PARKING,
+                RequestAdmissionState.PARKED,
+            )
+            self._parked_tags = self._pending_sleep_tags
+            self._pending_sleep_tags = frozenset()
+
+    def abort_sleep_transition(self) -> None:
+        """Reopen admission after a recoverable pre-mutation sleep failure."""
+        with self.enqueue_lock:
+            if self.admission_state is RequestAdmissionState.FAILED:
+                return
+            self._transition_admission_state(
+                RequestAdmissionState.PARKING,
+                RequestAdmissionState.RUNNING,
+            )
+            self._pending_sleep_tags = frozenset()
+
+    def begin_wakeup_transition(self, tags: Iterable[str]) -> None:
+        """Keep admission closed while parked resources are restored."""
+        with self.enqueue_lock:
+            wakeup_tags = frozenset(tags)
+            self._transition_admission_state(
+                RequestAdmissionState.PARKED,
+                RequestAdmissionState.WAKING,
+            )
+            self._pending_wakeup_tags = wakeup_tags
+
+    def complete_wakeup_transition(self) -> None:
+        """Reopen admission only after all originally parked tags are restored."""
+        with self.enqueue_lock:
+            remaining_tags = self._parked_tags - self._pending_wakeup_tags
+            target = RequestAdmissionState.PARKED
+            if not remaining_tags:
+                target = RequestAdmissionState.RUNNING
+            self._transition_admission_state(RequestAdmissionState.WAKING,
+                                             target)
+            self._parked_tags = remaining_tags
+            self._pending_wakeup_tags = frozenset()
+
+    def abort_wakeup_transition(self) -> None:
+        """Return to PARKED after a recoverable pre-mutation wakeup failure."""
+        with self.enqueue_lock:
+            if self.admission_state is RequestAdmissionState.FAILED:
+                return
+            self._transition_admission_state(
+                RequestAdmissionState.WAKING,
+                RequestAdmissionState.PARKED,
+            )
+            self._pending_wakeup_tags = frozenset()
+
+    def fail_sleep_wakeup_transition(self) -> None:
+        """Permanently close admission after sleep/wakeup may have mutated state."""
+        with self.enqueue_lock:
+            self.admission_state = RequestAdmissionState.FAILED
+
+    def get_admission_state(self) -> RequestAdmissionState:
+        with self.enqueue_lock:
+            return self.admission_state
 
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
         # if request has a disagg_request_id, use it as request id so that
@@ -91,15 +208,16 @@ class ExecutorRequestQueue:
 
         return child_req_ids
 
-    def _enqueue_impl(
-        self, requests_and_queries: Iterable[Tuple[ExecutorRequest,
-                                                   Optional[List]]]
-    ) -> List[int]:
+    def _enqueue_impl(self, requests: Iterable[ExecutorRequest]) -> List[int]:
         req_ids = []
         with self.enqueue_lock:
             assert self.active, "PyExecutor has already been shutdown."
+            if self.admission_state is not RequestAdmissionState.RUNNING:
+                raise RuntimeError(
+                    "Cannot enqueue requests while executor admission is "
+                    f"{self.admission_state.value}")
             start_time = time.time()
-            for request, query in requests_and_queries:
+            for request in requests:
                 req_id = self._get_request_id(request)
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
@@ -108,8 +226,7 @@ class ExecutorRequestQueue:
                 self.request_queue.put(
                     RequestQueueItem(req_id,
                                      request,
-                                     child_req_ids=child_req_ids,
-                                     query=query))
+                                     child_req_ids=child_req_ids))
                 req_ids.append(req_id)
         return req_ids
 
@@ -117,15 +234,13 @@ class ExecutorRequestQueue:
         """
         Enqueue new requests
         """
-        return self._enqueue_impl(zip(requests, repeat(None)))
+        return self._enqueue_impl(requests)
 
-    def enqueue_request(self,
-                        request: ExecutorRequest,
-                        query: Optional[List] = None) -> int:
+    def enqueue_request(self, request: ExecutorRequest) -> int:
         """
-        Enqueue a new request, query is only used in `StarAttention`.
+        Enqueue a new request.
         """
-        return self._enqueue_impl([(request, query)])[0]
+        return self._enqueue_impl([request])[0]
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:
@@ -142,12 +257,32 @@ class ExecutorRequestQueue:
                                  control_requires_drain=drain,
                                  control_id=control_id))
 
+    def enqueue_profile_start_request(self, profile_config: dict):
+        """Enqueue a profile-start control item that is broadcasted to
+        every TP/PP rank via ``RequestBroadcaster`` so all PyExecutor
+        instances apply the window in lockstep (not just the leader)."""
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(id=PROFILE_START_REQUEST_ID,
+                                 profile_config=profile_config))
+
+    def enqueue_profile_stop_request(self):
+        """Enqueue a profile-stop control item. Broadcasted to every rank."""
+        with self.enqueue_lock:
+            self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
+
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
             self.active = False
 
     def can_enqueue_request(self) -> bool:
+        with self.enqueue_lock:
+            return (self.active and self.dist.rank == 0
+                    and self.admission_state is RequestAdmissionState.RUNNING)
+
+    def can_enqueue_control_request(self) -> bool:
+        """Return whether rank zero can enqueue shutdown/control sentinels."""
         with self.enqueue_lock:
             return self.active and self.dist.rank == 0
 

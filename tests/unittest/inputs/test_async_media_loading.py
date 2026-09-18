@@ -27,6 +27,9 @@ import tensorrt_llm.inputs.utils as utils_module
 from tensorrt_llm.inputs.media_io import _get_aiohttp_session
 from tensorrt_llm.inputs.utils import MultimodalDataTracker, async_load_audio, async_load_image
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ──────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────

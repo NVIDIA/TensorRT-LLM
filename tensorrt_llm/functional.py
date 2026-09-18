@@ -64,7 +64,8 @@ class PositionEmbeddingType(IntEnum):
 
     def is_rope(self) -> bool:
         return self in [
-            self.rope_gptj, self.rope_gpt_neox, self.long_rope, self.mrope
+            self.rope_gptj, self.rope_gpt_neox, self.long_rope, self.mrope,
+            self.yarn
         ]
 
     def is_mrope(self) -> bool:
@@ -263,8 +264,16 @@ class RopeEmbeddingUtils:
         # Other scaling configs that only used by certain scaling types.
         rope_scaling_config: dict = None,
         duplicate_data: bool = False,
-        dtype=np.float32,
     ):
+        # The rotary table dtype is pinned to fp32 and is intentionally not a caller
+        # argument. inv_freq and the positions are built at this dtype, so the stored
+        # angle (position * inv_freq) accumulates the fp32 rounding of inv_freq -- an
+        # error that is invisible in short contexts but grows ~linearly with position
+        # (about a milliradian at 32k). Reference implementations also round inv_freq
+        # to fp32, and building in fp64 was measured and deliberately not adopted (it
+        # removes one side of a two-sided rounding difference rather than improving
+        # agreement). Change this only with a re-measurement.
+        dtype = np.float32
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
         if scale_type == RotaryScalingType.llama3:

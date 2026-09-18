@@ -239,6 +239,7 @@ def test_kimi_k2_text_model_can_be_exported():
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_config_registration():
     """Test that configs are properly instantiated with correct model_type."""
     text_config = _create_small_text_config()
@@ -254,6 +255,7 @@ def test_kimi_k2_config_registration():
     assert isinstance(vlm_config.text_config, KimiK2Config)
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_layer_types():
     """Test that layer 0 uses dense MLP and later layers use MoE."""
     config = _create_small_text_config()
@@ -271,6 +273,7 @@ def test_kimi_k2_layer_types():
         )
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_expert_structure():
     """Test that experts have correct structure for checkpoint loading."""
     config = _create_small_text_config()
@@ -298,6 +301,7 @@ def test_kimi_k2_expert_structure():
         )
 
 
+@pytest.mark.cpu_only
 def test_kimi_k25_weight_layout():
     """Test that VLM wrapper has correct weight prefix for checkpoint compatibility."""
     config = _create_small_vlm_config()
@@ -313,6 +317,7 @@ def test_kimi_k25_weight_layout():
     )
 
 
+@pytest.mark.cpu_only
 def test_kimi_k2_shared_experts():
     """Test that shared experts are present when n_shared_experts > 0."""
     config = _create_small_text_config()

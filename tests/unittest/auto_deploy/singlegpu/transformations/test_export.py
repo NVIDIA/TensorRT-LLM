@@ -54,6 +54,7 @@ class ModuleForExport(ABC, nn.Module):
         pass
 
 
+@pytest.mark.cpu_only
 def test_torch_export_to_gm_strips_input_constraint_pre_hook():
     gm = torch_export_to_gm(AddOne(), args=(torch.ones(2, 4),))
 
@@ -231,6 +232,7 @@ def test_module_export(f_export, mod_cls, device, use_dynamic_shape):
     print(ep.graph)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("model_cls", [MLPDuplicate])
 @pytest.mark.parametrize("device_export", ["cpu"])  # TODO: investigate meta device error
 def test_deduplicate_during_export(model_cls: Type[nn.Module], device_export: str):

@@ -93,6 +93,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
 
+    @field_validator("generation_config", mode="after")
+    @classmethod
+    def ensure_no_generation_config_defaults(cls, value: str) -> str:
+        if value != "trtllm":
+            raise ValueError("AutoDeploy does not support generation_config='auto'; use 'trtllm'.")
+        return value
+
     @field_validator(
         "tensor_parallel_size",
         "pipeline_parallel_size",
@@ -115,25 +122,22 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if spec_config is None:
             return self
 
+        if spec_config.moe_backend is not None:
+            raise ValueError(
+                "AutoDeploy does not support speculative_config.moe_backend. "
+                "This draft-model override is available only with the PyTorch backend."
+            )
+
         if isinstance(spec_config, MTPDecodingConfig):
-            if not spec_config.mtp_eagle_one_model or spec_config.use_mtp_vanilla:
+            if spec_config.use_mtp_vanilla:
                 raise ValueError(
                     "AutoDeploy only supports MTP speculative decoding with "
-                    "mtp_eagle_one_model=True and use_mtp_vanilla=False "
-                    f"(got mtp_eagle_one_model={spec_config.mtp_eagle_one_model}, "
-                    f"use_mtp_vanilla={spec_config.use_mtp_vanilla})."
+                    f"use_mtp_vanilla=False (got {spec_config.use_mtp_vanilla})."
                 )
-        elif isinstance(spec_config, EagleDecodingConfig):
-            if not spec_config.eagle3_one_model:
-                raise ValueError(
-                    "AutoDeploy only supports Eagle speculative decoding with "
-                    f"eagle3_one_model=True (got eagle3_one_model={spec_config.eagle3_one_model})."
-                )
-        else:
+        elif not isinstance(spec_config, EagleDecodingConfig):
             raise ValueError(
                 "AutoDeploy only supports speculative decoding via "
-                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
-                "EagleDecodingConfig(eagle3_one_model=True)."
+                "MTPDecodingConfig or EagleDecodingConfig."
             )
 
         self.model_factory = "eagle_one_model"
@@ -148,8 +152,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if isinstance(spec_config, MTPDecodingConfig):
             if spec_config.max_draft_len is None:
                 raise ValueError(
-                    "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
-                    "enabled. Ensure num_nextn_predict_layers is set in the model config."
+                    "MTPDecodingConfig.max_draft_len must not be None. Ensure "
+                    "num_nextn_predict_layers is set in the model config."
                 )
             capture_layers = {-1}
         else:

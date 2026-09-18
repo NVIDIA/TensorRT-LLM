@@ -14,10 +14,14 @@
 # limitations under the License.
 """Tests for ``create_derived_custom_op`` in ``_graph.py``."""
 
+import pytest
 import torch
 from torch._subclasses import FakeTensorMode
 
 from tensorrt_llm._torch.auto_deploy.utils._graph import create_derived_custom_op
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # Helpers – tiny custom ops used as base ops for the tests

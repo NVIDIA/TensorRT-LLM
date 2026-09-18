@@ -18,7 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -56,7 +56,7 @@ struct MoeLoraGroupedGemmModule;
 //   stream:              CUDA stream to launch onto.
 using MoeLoraGroupedGemmRunFn = void (*)(MoeLoraGroupedGemmModule const& mod, int64_t num_permuted_tokens,
     int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, void const* input_base,
-    void* output_base, nvinfer1::DataType data_type, cudaStream_t stream);
+    void* output_base, tensorrt_llm::DataType data_type, cudaStream_t stream);
 
 // Per-module device-resident scratch for the MoE LoRA capture-safe path.
 // Pointers refer to device memory unless noted.
@@ -72,7 +72,7 @@ using MoeLoraGroupedGemmRunFn = void (*)(MoeLoraGroupedGemmModule const& mod, in
 //   lda/ldb/ldd_*    -> int64_t*                  (device, [P_max])
 //   splitk_offsets   -> int64_t*                  (device, [P_max + 1])
 //   lowrank_ws_dev   -> void*                     (device, [P_max, max_lora_rank, dtype_bytes])
-//   host_max_*       -> cutlass::gemm::GemmCoord* (pinned host, [1])
+//   host_max_*       -> cutlass::gemm::GemmCoord* (pinned host, [P_max])
 //
 // The split-K in-GEMM's partial-sum scratch is allocated internally by the
 // cuda_graph_split_k_grouped_gemm wrapper (sized from the host max-problem

@@ -35,25 +35,14 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from .tp_shard_utils import copy_tp_parameter
 
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
@@ -107,11 +96,13 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True, **kwargs):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
@@ -158,8 +149,8 @@ SEED_INPUT = 100
 ATOL = 1e-2
 RTOL = 1e-3
 
-# All valid 8-GPU combinations of (ulysses, ring, attn2d):
-# world_size = (ring or attn2d_row*attn2d_col or 1) * ulysses = 8
+# All valid 8-GPU combinations of (tp, ulysses, ring, attn2d):
+# world_size = tp * (ring or attn2d_row*attn2d_col or 1) * ulysses = 8
 _WAN_8GPU_PARALLEL_COMBINATIONS = [
     # Ulysses-only family (no ring / no attn2d)
     ("ulysses_only_ul8", dict(dit_ulysses_size=8)),
@@ -170,6 +161,15 @@ _WAN_8GPU_PARALLEL_COMBINATIONS = [
     # Attention2D/Ulysses family
     ("attn2d_1x8_ul1", dict(dit_attn2d_row_size=1, dit_attn2d_col_size=8, dit_ulysses_size=1)),
     ("attn2d_2x4_ul1", dict(dit_attn2d_row_size=2, dit_attn2d_col_size=4, dit_ulysses_size=1)),
+    # TP + Attention2D (guard removed in mapping.py — commit 084755212d)
+    (
+        "tp2_attn2d_2x1_ul2",
+        dict(dit_tp_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=1, dit_ulysses_size=2),
+    ),
+    (
+        "tp2_attn2d_2x2_ul1",
+        dict(dit_tp_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2),
+    ),
 ]
 
 
@@ -194,6 +194,7 @@ def _make_model_config(
     pretrained_dict,
     *,
     cfg_size=1,
+    tp_size=1,
     ulysses_size=1,
     ring_size=1,
     attn2d_row_size=1,
@@ -204,6 +205,7 @@ def _make_model_config(
     # Accept both shorthand names (cfg_size, ...) and VisualGen-style names
     # (dit_cfg_size, ...), since tests pass the latter.
     cfg_size = parallel_kwargs.pop("dit_cfg_size", cfg_size)
+    tp_size = parallel_kwargs.pop("dit_tp_size", tp_size)
     ulysses_size = parallel_kwargs.pop("dit_ulysses_size", ulysses_size)
     ring_size = parallel_kwargs.pop("dit_ring_size", ring_size)
     attn2d_row_size = parallel_kwargs.pop("dit_attn2d_row_size", attn2d_row_size)
@@ -213,7 +215,11 @@ def _make_model_config(
 
     pretrained_config = SimpleNamespace(**pretrained_dict)
     use_dist = (
-        cfg_size > 1 or ulysses_size > 1 or ring_size > 1 or attn2d_row_size * attn2d_col_size > 1
+        cfg_size > 1
+        or tp_size > 1
+        or ulysses_size > 1
+        or ring_size > 1
+        or attn2d_row_size * attn2d_col_size > 1
     ) and dist.is_initialized()
     if use_dist:
         ws = dist.get_world_size()
@@ -225,6 +231,7 @@ def _make_model_config(
         world_size=ws,
         rank=rk,
         cfg_size=cfg_size,
+        tp_size=tp_size,
         ulysses_size=ulysses_size,
         ring_size=ring_size,
         attn2d_row_size=attn2d_row_size,
@@ -246,6 +253,27 @@ def _free(*objs) -> None:
         del o
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def _copy_ref_weights_to_tp(ref_model, tp_model, pretrained_config) -> None:
+    """Copy reference weights into a TP model using its local parameter layouts."""
+    ref_params = dict(ref_model.named_parameters())
+    vgm = tp_model.model_config.visual_gen_mapping
+    num_heads = int(pretrained_config["num_attention_heads"])
+    head_dim = int(pretrained_config["attention_head_dim"])
+
+    with torch.no_grad():
+        for tp_name, tp_param in tp_model.named_parameters():
+            copy_tp_parameter(
+                tp_name,
+                ref_params[tp_name],
+                tp_param,
+                vgm.tp_rank,
+                vgm.tp_size,
+                num_heads,
+                head_dim,
+                ulysses_size=vgm.ulysses_size,
+            )
 
 
 # =============================================================================
@@ -277,12 +305,12 @@ def _logic_wan_transformer_parallel_vs_single_gpu(
 
     torch.manual_seed(SEED_WEIGHTS)
     dist_config = _make_model_config(pretrained_cfg, backend="FA4", **parallel_cfg_kwargs)
-    try:
-        dist_model = WanTransformer3DModel(dist_config).to(device).to(dtype)
-    except (ImportError, ValueError, NotImplementedError) as e:
-        pytest.skip(f"[{label}] Parallel backend unavailable: {e}")
+    dist_model = WanTransformer3DModel(dist_config).to(device).to(dtype)
 
-    dist_model.load_state_dict(ref_state)
+    if dist_config.visual_gen_mapping.tp_size > 1:
+        _copy_ref_weights_to_tp(ref_model, dist_model, pretrained_cfg)
+    else:
+        dist_model.load_state_dict(ref_state)
 
     torch.manual_seed(SEED_INPUT)
     hidden_states = torch.randn((B, C, T, H, W), device=device, dtype=dtype) * 0.1
@@ -341,10 +369,7 @@ def _logic_wan_transformer_parallel_forward_sanity(
 
     torch.manual_seed(SEED_WEIGHTS)
     config = _make_model_config(pretrained_cfg, backend="FA4", **parallel_cfg_kwargs)
-    try:
-        model = WanTransformer3DModel(config).to(device).to(dtype)
-    except (ImportError, ValueError, NotImplementedError) as e:
-        pytest.skip(f"[{label}] Parallel backend unavailable: {e}")
+    model = WanTransformer3DModel(config).to(device).to(dtype)
     _stabilize_model_weights(model)
 
     torch.manual_seed(SEED_INPUT)
@@ -378,11 +403,10 @@ def _logic_wan_transformer_parallel_forward_sanity(
 class TestWanTransformerParallel:
     """Transformer-only WAN correctness across parallel topologies."""
 
-    def _skip_if_unavailable(self):
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
-        if not _flash_attn4_available:
-            pytest.skip("FlashAttn4 JIT kernels not available")
+    def _require_flash_attn4(self) -> None:
+        assert _flash_attn4_available, (
+            "FlashAttn4 JIT kernels not available; expected on the Blackwell CI runner"
+        )
 
     @pytest.mark.parametrize(
         "label,parallel_cfg_kwargs",
@@ -390,7 +414,7 @@ class TestWanTransformerParallel:
         ids=[name for name, _ in _WAN_8GPU_PARALLEL_COMBINATIONS],
     )
     def test_parallel_all_combinations_vs_single_gpu_8gpu(self, label, parallel_cfg_kwargs):
-        self._skip_if_unavailable()
+        self._require_flash_attn4()
         run_test_in_distributed(
             world_size=8,
             test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
@@ -399,7 +423,7 @@ class TestWanTransformerParallel:
         )
 
     def test_parallel_attn2d_2x2_forward_sanity_4gpu(self):
-        self._skip_if_unavailable()
+        self._require_flash_attn4()
         run_test_in_distributed(
             world_size=4,
             test_fn=_logic_wan_transformer_parallel_forward_sanity,
@@ -408,7 +432,7 @@ class TestWanTransformerParallel:
         )
 
     def test_parallel_attn2d_2x2_vs_single_gpu_4gpu(self):
-        self._skip_if_unavailable()
+        self._require_flash_attn4()
         run_test_in_distributed(
             world_size=4,
             test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
@@ -418,9 +442,10 @@ class TestWanTransformerParallel:
 
     def test_parallel_attn2d_2x2_ulysses2_vs_single_gpu_8gpu(self):
         """world=8, attn2d=2×2, ulysses=2 vs single-GPU FA4 reference."""
-        self._skip_if_unavailable()
-        if not _attn2d_available:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        self._require_flash_attn4()
+        assert _attn2d_available, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(
             world_size=8,
             test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
@@ -433,7 +458,7 @@ class TestWanTransformerParallel:
         )
 
     def test_parallel_ring4_vs_single_gpu_4gpu(self):
-        self._skip_if_unavailable()
+        self._require_flash_attn4()
         run_test_in_distributed(
             world_size=4,
             test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
@@ -442,7 +467,7 @@ class TestWanTransformerParallel:
         )
 
     def test_parallel_ring2_ul2_vs_single_gpu_4gpu(self):
-        self._skip_if_unavailable()
+        self._require_flash_attn4()
         run_test_in_distributed(
             world_size=4,
             test_fn=_logic_wan_transformer_parallel_vs_single_gpu,

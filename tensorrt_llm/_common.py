@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,104 +12,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Compatibility shim for ``tensorrt_llm._common``.
 
-import ctypes
-import os
-import platform
-import threading
-import time
-from functools import wraps
-from pathlib import Path
+The implementation moved to ``tensorrt_llm._bootstrap`` in T01 (TRTLLM-14831)
+under Epic TRTLLM-14558.
 
-import torch
+This module re-exports the implementation unchanged and defines nothing of its
+own, so the objects reachable here are the *same* objects as at the canonical
+path: ``isinstance`` still matches and pre-migration pickles still load.
 
-from ._utils import print_all_stacks
-from .bindings import MpiComm
-from .logger import logger
+Removal is tracked by the removal ticket T25 (TRTLLM-14855) delivers; the compatibility window spans at least
+one release (Epic decision D4 (b)).  Do not add definitions, do not rewrite
+``__module__``, and do not replace the explicit list below with ``import *`` --
+Epic §0.4 and §6.1 explain why each of those quietly breaks the backstop.
+"""
 
-_inited = False
+import warnings
 
+from tensorrt_llm._bootstrap import _init  # noqa: F401
 
-def _init(log_level: object = None) -> None:
-    global _inited
-    if _inited:
-        return
-    _inited = True
-    if log_level is not None:
-        logger.set_level(log_level)
+warnings.warn(
+    "tensorrt_llm._common has moved to tensorrt_llm._bootstrap. The old "
+    "path still works during the compatibility window and will be removed "
+    "by the removal ticket T25 (TRTLLM-14855) delivers.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
-    if os.getenv("TRT_LLM_NO_LIB_INIT", "0") == "1":
-        logger.info("Skipping TensorRT LLM init.")
-        return
-
-    logger.info("Starting TensorRT LLM init.")
-
-    project_dir = str(Path(__file__).parent.absolute())
-
-    # Promote libtensorrt_llm.so symbols to the process's global scope. The KV
-    # cache transfer agent wrappers (libtensorrt_llm_nixl_wrapper.so,
-    # libtensorrt_llm_ucx_wrapper.so) are dlopen'ed at runtime without linking
-    # against libtensorrt_llm.so and resolve its symbols from the global symbol
-    # table, while Python extension modules and their dependencies load with
-    # RTLD_LOCAL. This promotion was previously a side effect of loading the
-    # TensorRT plugin library with RTLD_GLOBAL.
-    if platform.system() != "Windows":
-        ctypes.CDLL(project_dir + "/libs/libtensorrt_llm.so", mode=ctypes.RTLD_GLOBAL)
-
-    # Load FT decoder layer and torch custom ops.
-    if platform.system() == "Windows":
-        ft_decoder_lib = project_dir + "/libs/th_common.dll"
-    else:
-        ft_decoder_lib = project_dir + "/libs/libth_common.so"
-    try:
-        torch.classes.load_library(ft_decoder_lib)
-        from ._torch.custom_ops import _register_fake
-
-        _register_fake()
-    except Exception as e:
-        msg = (
-            "\nFATAL: Decoding operators failed to load. This may be caused by an incompatibility "
-            "between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM."
-        )
-        raise ImportError(str(e) + msg)
-
-    MpiComm.local_init()
-
-    def _print_stacks():
-        counter = 0
-        while True:
-            time.sleep(print_stacks_period)
-            counter += 1
-            logger.error(f"Printing stacks {counter} times")
-            print_all_stacks()
-
-    print_stacks_period = int(os.getenv("TRTLLM_PRINT_STACKS_PERIOD", "-1"))
-    if print_stacks_period > 0:
-        print_stacks_thread = threading.Thread(target=_print_stacks, daemon=True)
-        print_stacks_thread.start()
-
-    logger.info("TensorRT LLM inited.")
-
-
-# TODO: dead on the Python side (no remaining @_is_building users); the IS_BUILDING
-# env var is only read by the C++ isBuilding() in the TensorRT plugins. Remove this
-# together with that C++ half in the C++ decouple step.
-class _BuildingFlag:
-    def __enter__(self):
-        os.environ["IS_BUILDING"] = "1"
-
-    def __exit__(self, type, value, tb):
-        del os.environ["IS_BUILDING"]
-
-
-def _is_building(f):
-    """Use this to decorate functions which are called during engine building/refitting process,
-    otherwise, the plugin registration will fail.
-    """
-
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        with _BuildingFlag():
-            return f(*args, **kwargs)
-
-    return decorated
+__all__ = [
+    "_init",
+]

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -57,9 +58,10 @@ public:
 
 private:
     void send(
-        void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
+        void const* sendbuff, size_t count, tensorrt_llm::DataType dataType, int peer, CudaStream const& stream) const;
 
-    void receive(void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
+    void receive(
+        void* sendbuff, size_t count, tensorrt_llm::DataType dataType, int peer, CudaStream const& stream) const;
 
     static ncclComm_t createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm);
 

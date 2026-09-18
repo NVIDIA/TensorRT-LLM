@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
@@ -50,10 +51,11 @@ public:
     };
 
     CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableBlockReuse = false,
         bool enablePartialReuse = false, bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0,
-        SizeType32 indexerKCacheQuantBlockSize = 128, bool indexerKCacheUseFp4 = false)
+        SizeType32 indexerKCacheQuantBlockSize = 128, bool indexerKCacheUseFp4 = false,
+        std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig(std::move(modelConfig))
         , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
               worldConfig.getContextParallelism(), worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(),
@@ -67,15 +69,16 @@ public:
         mIndexerDimPerHead = indexerDimPerHead;
         mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
         mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
-        bool indexerKCacheUseFp4 = false)
+        bool indexerKCacheUseFp4 = false, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
         , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
               attentionLayerNumPerPP}
@@ -88,15 +91,16 @@ public:
         mIndexerDimPerHead = indexerDimPerHead;
         mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
         mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
-        bool indexerKCacheUseFp4 = false)
+        bool indexerKCacheUseFp4 = false, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig{std::vector(nbAttentionLayers, nbKvHeads), sizePerHead, tokensPerBlock}
         , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
               attentionLayerNumPerPP}
@@ -109,6 +113,7 @@ public:
         mIndexerDimPerHead = indexerDimPerHead;
         mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
         mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     [[nodiscard]] bool operator==(kv_cache::CacheState const& other) const noexcept
@@ -119,7 +124,8 @@ public:
             && mEnablePartialReuse == other.mEnablePartialReuse && mHasIndexerKCache == other.mHasIndexerKCache
             && mIndexerDimPerHead == other.mIndexerDimPerHead
             && mIndexerKCacheQuantBlockSize == other.mIndexerKCacheQuantBlockSize
-            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4;
+            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4
+            && mIndexerLayerNumPerPP == other.mIndexerLayerNumPerPP;
     }
 
     struct ModelConfig
@@ -238,8 +244,8 @@ public:
         RnnModelConfig mModelConfig;
         /// Number of RNN layers per pipeline parallelism rank.
         std::vector<SizeType32> mLayerNumPerPP;
-        nvinfer1::DataType mConvStateDataType;
-        nvinfer1::DataType mSsmStateDataType;
+        tensorrt_llm::DataType mConvStateDataType;
+        tensorrt_llm::DataType mSsmStateDataType;
 
         [[nodiscard]] bool operator==(RnnCacheState const& other) const noexcept
         {
@@ -263,7 +269,7 @@ public:
         return mAttentionConfig;
     }
 
-    [[nodiscard]] nvinfer1::DataType const& getDataType() const
+    [[nodiscard]] tensorrt_llm::DataType const& getDataType() const
     {
         return mDataType;
     }
@@ -298,6 +304,15 @@ public:
         return mIndexerKCacheUseFp4;
     }
 
+    //! \brief Per-PP-rank indexer K cache layer counts. With a masked indexer pool (per-layer
+    //! indexer mask, e.g. GLM 5.2 cross-layer indexer sharing) only full-indexer layers own a
+    //! pool row, so these counts can be smaller than the attention layer counts. Falls back to
+    //! the attention layer counts when unset (dense legacy layout).
+    [[nodiscard]] std::vector<SizeType32> const& getIndexerLayerNumPerPP() const
+    {
+        return mIndexerLayerNumPerPP.empty() ? mParallelConfig.mAttentionLayerNumPerPP : mIndexerLayerNumPerPP;
+    }
+
     // =========================================================================
     // RNN/Mamba cache state (optional, present only for hybrid models)
     // =========================================================================
@@ -308,7 +323,7 @@ public:
     }
 
     void setRnnConfig(RnnModelConfig rnnModelConfig, std::vector<SizeType32> rnnLayerNumPerPP,
-        nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
+        tensorrt_llm::DataType convStateDataType, tensorrt_llm::DataType ssmStateDataType)
     {
         mRnnCacheState = RnnCacheState{
             std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType};
@@ -325,12 +340,12 @@ public:
         return getRnnCacheState().mModelConfig;
     }
 
-    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const
+    [[nodiscard]] tensorrt_llm::DataType getConvStateDataType() const
     {
         return getRnnCacheState().mConvStateDataType;
     }
 
-    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const
+    [[nodiscard]] tensorrt_llm::DataType getSsmStateDataType() const
     {
         return getRnnCacheState().mSsmStateDataType;
     }
@@ -360,6 +375,12 @@ public:
         sstring << "indexerDimPerHead:" << mIndexerDimPerHead << "\n";
         sstring << "indexerKCacheQuantBlockSize:" << mIndexerKCacheQuantBlockSize << "\n";
         sstring << "indexerKCacheUseFp4:" << mIndexerKCacheUseFp4 << "\n";
+        sstring << "indexerLayerNumPerPP:";
+        for (auto layerNum : mIndexerLayerNumPerPP)
+        {
+            sstring << layerNum << ",";
+        }
+        sstring << "\n";
         if (mRnnCacheState.has_value())
         {
             auto const& rnn = mRnnCacheState.value();
@@ -395,7 +416,7 @@ private:
     friend class tensorrt_llm::executor::Serialization;
     ModelConfig mModelConfig;
     ParallelConfig mParallelConfig;
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
     AttentionConfig mAttentionConfig;
     bool mEnableBlockReuse{false};
     bool mEnablePartialReuse{false};
@@ -403,6 +424,9 @@ private:
     SizeType32 mIndexerDimPerHead{0};
     SizeType32 mIndexerKCacheQuantBlockSize{128};
     bool mIndexerKCacheUseFp4{false};
+    // Per-PP-rank indexer K cache layer counts (masked indexer pool). Empty = every attention
+    // layer owns an indexer K cache row (dense legacy layout); see getIndexerLayerNumPerPP().
+    std::vector<SizeType32> mIndexerLayerNumPerPP;
     // RNN/Mamba cache state (optional, for hybrid models)
     std::optional<RnnCacheState> mRnnCacheState;
 };
@@ -618,9 +642,22 @@ public:
         return mCacheState.has_value() && mCacheState->hasRnnConfig();
     }
 
+    /// @brief Set only when exported via CacheTransceiver::getSerializedDataTransceiverState:
+    /// transfers driven by such a state have no LlmRequest on the sender.
+    [[nodiscard]] bool isArbitraryTransferState() const noexcept
+    {
+        return mIsArbitraryTransferState;
+    }
+
+    void setIsArbitraryTransferState(bool isArbitraryTransferState) noexcept
+    {
+        mIsArbitraryTransferState = isArbitraryTransferState;
+    }
+
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
-        return mCacheState == other.mCacheState && mCommState == other.mCommState;
+        return mCacheState == other.mCacheState && mCommState == other.mCommState
+            && mIsArbitraryTransferState == other.mIsArbitraryTransferState;
     }
 
     [[nodiscard]] std::string toString() const
@@ -641,6 +678,7 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
+    bool mIsArbitraryTransferState{false};
 };
 
 } // namespace tensorrt_llm::executor

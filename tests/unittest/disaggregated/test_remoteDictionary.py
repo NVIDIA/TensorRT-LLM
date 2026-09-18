@@ -5,7 +5,11 @@ import subprocess
 import time
 import unittest
 
+import pytest
+
 from tensorrt_llm.serve.metadata_server import EtcdDictionary, etcd3
+
+pytestmark = pytest.mark.cpu_only
 
 
 def wait_for_port(host, port, timeout=15):

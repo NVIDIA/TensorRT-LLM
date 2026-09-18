@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import os
 import tempfile
@@ -11,8 +14,7 @@ import transformers
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, ExecutorConfig,
-                                 KvCacheRetentionConfig)
+                                 ContextChunkingPolicy, KvCacheRetentionConfig)
 # yapf: enable
 from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
@@ -25,10 +27,9 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
 from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
                        DraftTargetDecodingConfig, Eagle3DecodingConfig,
                        EagleDecodingConfig, EncodeCudaGraphConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MTPDecodingConfig,
-                       NGramDecodingConfig, SchedulerConfig, TorchLlmArgs,
-                       UserProvidedDecodingConfig, _ModelWrapper,
+                       KvCacheConfig, KVEventsConfig, LlmArgs,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchLlmArgs, UserProvidedDecodingConfig, _ModelWrapper,
                        _ParallelConfig, update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 # yapf: enable
@@ -143,6 +144,7 @@ class ModelLoader:
         kv_cache_dtype = self.llm_args.kv_cache_config.dtype
         explicit_kv_cache_quant_algo = {
             "fp8": QuantAlgo.FP8,
+            "fp8_ds_mla": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
         requires_global_quant_config_fallback = False
@@ -308,6 +310,29 @@ class ModelLoader:
             return None
 
     @staticmethod
+    def load_hf_generation_config_dict(
+            model_dir: Union[str, Path]) -> Dict[str, Any]:
+        """Load only values explicitly present in generation_config.json."""
+        generation_config_path = Path(model_dir) / "generation_config.json"
+        try:
+            with open(generation_config_path, "r") as config_file:
+                generation_config = json.load(config_file)
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                f"Failed to load generation config values from {generation_config_path}, encountered error: {e}"
+            )
+            return {}
+
+        if not isinstance(generation_config, dict):
+            logger.warning(
+                f"Ignoring generation config from {generation_config_path}: expected a JSON object."
+            )
+            return {}
+        return generation_config
+
+    @staticmethod
     def load_hf_model_config(
             model_dir,
             trust_remote_code: bool = True,
@@ -394,8 +419,19 @@ class CachedModelLoader:
                 self.llm_args.speculative_config.speculative_model is not None):
             spec_model_obj = _ModelWrapper(
                 self.llm_args.speculative_config.speculative_model)
+            was_hub_model = spec_model_obj.is_hub_model
             spec_model_dir = self._download_hf_model_if_needed(spec_model_obj)
             self.llm_args.speculative_config.speculative_model = spec_model_dir
+            # Some speculative configs read defaults out of the draft
+            # checkpoint's config.json (e.g. DFlash's target_layer_ids). A hub
+            # repo id had no readable config.json at validation time; a local
+            # path was already resolved back then.
+            if was_hub_model:
+                resolve_from_checkpoint = getattr(
+                    self.llm_args.speculative_config, 'resolve_from_checkpoint',
+                    None)
+                if resolve_from_checkpoint is not None:
+                    resolve_from_checkpoint()
 
         # AutoDeploy doesn't use ModelLoader
         if self.llm_args.backend == "_autodeploy":
@@ -458,11 +494,8 @@ __all__ = [
     '_ParallelConfig',
     '_ModelWrapper',
     'BatchingType',
-    'ExecutorConfig',
     'SchedulerConfig',
     'KvCacheRetentionConfig',
-    'LookaheadDecodingConfig',
-    'MedusaDecodingConfig',
     'MTPDecodingConfig',
     'NGramDecodingConfig',
     'DraftTargetDecodingConfig',
@@ -475,6 +508,7 @@ __all__ = [
     'DecodeCudaGraphConfig',
     'EncodeCudaGraphConfig',
     'KvCacheConfig',
+    'KVEventsConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',
     'Eagle3DecodingConfig',
@@ -513,13 +547,23 @@ def apply_model_defaults_to_llm_args(
     if not model_defaults_dict:
         return {}
 
+    # Key-presence check: any value form (dict, pydantic object, None) is
+    # rejected — the deep-merge could materialize a transceiver config in
+    # aggregated mode or silently enable a disabled one.
+    if "cache_transceiver_config" in model_defaults_dict:
+        raise ValueError(
+            "Model defaults must not contain 'cache_transceiver_config': the "
+            "deep-merge could materialize or silently enable a transceiver "
+            "config the user did not turn on. Declare a runtime preference "
+            "via get_preferred_transceiver_runtime() instead.")
+
     user_overrides = llm_args.model_dump(exclude_unset=True)
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
 
     new_args = llm_args.__class__(**merged_state)
 
-    for field_name in llm_args.model_fields:
+    for field_name in type(llm_args).model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))
 
     def _compute_applied(defaults: Dict[str, Any],
@@ -544,22 +588,143 @@ def apply_model_defaults_to_llm_args(
     return _compute_applied(model_defaults_dict, user_overrides)
 
 
-def _resolve_kv_cache_manager_v2_auto(
-        llm_args: 'TorchLlmArgs', model_defaults_dict: Dict[str, Any]) -> bool:
-    """Resolve the KV cache manager auto setting after model defaults are applied."""
+def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
+                                      model_cls: Optional[type] = None,
+                                      pretrained_config: Any = None) -> bool:
+    """Resolve the KV cache manager auto setting from the model preference.
+
+    A model preference for V2 is demoted to V1 for routes V2 cannot serve; an
+    explicit user value otherwise wins. The compatibility arms are:
+
+    - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
+      with NIXL, so any other route falls back to V1. The transceiver runtime
+      auto setting must be resolved first.
+    - Two-model speculative decoding: the draft model runs in a separate engine
+      with its own KV cache manager. ``build_managers`` hands that manager the
+      target's ``kv_cache_config`` unsplit, and V2 capacity is governed solely
+      by ``max_gpu_total_bytes``, so both managers size their pools from the
+      full budget. The model preference falls back to V1, and an explicit
+      ``True`` is rejected rather than deferred to that allocation.
+
+    The fallback only reaches models whose manager class is selected by
+    ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
+    -- sparse attention picks its class from the algorithm alone -- keep a V2
+    manager after the demotion, so the arm does not protect them.
+    """
     setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
     if setting != "auto":
         return setting
 
-    kv_cache_defaults = model_defaults_dict.get("kv_cache_config", {})
-    model_default = (kv_cache_defaults.get("use_kv_cache_manager_v2", False)
-                     if isinstance(kv_cache_defaults, dict) else False)
-    if model_default == "auto":
-        model_default = False
-    if not isinstance(model_default, bool):
+    preferred_version = None
+    if model_cls is not None:
+        get_preferred = getattr(model_cls,
+                                'get_preferred_kv_cache_manager_version', None)
+        if get_preferred is not None:
+            preferred_version = get_preferred(pretrained_config)
+    if preferred_version not in (None, "V1", "V2"):
         raise ValueError(
-            "Model default kv_cache_config.use_kv_cache_manager_v2 must be "
-            f"True, False, or 'auto', got {model_default!r}.")
+            f"{model_cls.__name__}.get_preferred_kv_cache_manager_version() "
+            f"must return 'V1', 'V2', or None, got {preferred_version!r}.")
 
-    llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
-    return model_default
+    use_v2 = preferred_version == "V2"
+
+    transceiver_config = llm_args.cache_transceiver_config
+    if (use_v2 and transceiver_config is not None
+            and transceiver_config.backend is not None):
+        effective_backend, _ = transceiver_config._resolve_default_backend()
+        runtime = transceiver_config.transceiver_runtime
+        if effective_backend != "NIXL" or runtime != "PYTHON":
+            logger.info(
+                "KV cache manager V2 is the model preference, but disaggregated "
+                "serving uses transceiver_runtime=%r with backend=%r; "
+                "falling back to V1.", runtime, effective_backend)
+            use_v2 = False
+
+    llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2
+    return use_v2
+
+
+def _transceiver_python_fallback_reason(
+        llm_args: 'TorchLlmArgs') -> Optional[str]:
+    """Why 'auto' should not default to the Python transceiver, or None.
+
+    Checks only the constraints that are decidable from
+    ``cache_transceiver_config`` itself (backend and timeout). Any other
+    incompatibility (e.g. non-helix context parallelism) is NOT resolved
+    here and fails loudly at transceiver creation instead. Only consulted
+    when the model expressed no runtime preference: a model preferring
+    'PYTHON' may genuinely require it (e.g. recurrent-state transfer), so it
+    is never silently rerouted — transceiver creation raises with an
+    actionable message instead.
+    """
+    cfg = llm_args.cache_transceiver_config
+    effective_backend, _ = cfg._resolve_default_backend()
+    if effective_backend != "NIXL":
+        return (f"backend {effective_backend!r} (the Python transceiver "
+                "requires NIXL)")
+    if cfg.kv_transfer_timeout_ms is None:
+        return ("kv_transfer_timeout_ms=None (the Python transceiver "
+                "requires a finite timeout)")
+    # Deliberately reads only cache_transceiver_config: external callers
+    # (e.g. the perf-sanity cache-transceiver precheck) invoke the resolver
+    # with a lightweight stand-in object, and per-server fields beyond this
+    # config could resolve differently on ctx and gen servers (e.g. context
+    # parallelism, where only the gen side runs helix). Conditions the
+    # Python transceiver cannot serve (such as non-helix CP) fail loudly at
+    # transceiver creation instead.
+    return None
+
+
+def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',
+                                      model_cls: Optional[type] = None,
+                                      pretrained_config: Any = None) -> None:
+    """Resolve the 'auto' sentinel in cache_transceiver_config.transceiver_runtime.
+
+    Semantics:
+    - Disagg disabled (config is None or backend is None): no-op. Resolution
+      must never materialize or alter a transceiver config that the user did
+      not enable.
+    - Explicit user value ('CPP'/'PYTHON'/None): left untouched.
+    - 'auto': a model preference from
+      ``model_cls.get_preferred_transceiver_runtime()`` ('CPP' or 'PYTHON')
+      is adopted verbatim — never rerouted, so unsupported configurations
+      surface as transceiver-creation errors. Without a preference, default
+      to the Python (V2) transceiver, falling back to None (C++ transceiver)
+      for configurations it does not support (non-NIXL backend or an
+      infinite kv_transfer_timeout_ms).
+
+    ``pretrained_config`` is forwarded to the hook so implementation classes
+    shared by several architectures can differentiate per checkpoint.
+    """
+    cfg = llm_args.cache_transceiver_config
+    if cfg is None or cfg.backend is None:
+        return
+    if cfg.transceiver_runtime != "auto":
+        return
+
+    preferred = None
+    if model_cls is not None:
+        get_preferred = getattr(model_cls, 'get_preferred_transceiver_runtime',
+                                None)
+        if get_preferred is not None:
+            preferred = get_preferred(pretrained_config)
+    if preferred not in (None, "CPP", "PYTHON"):
+        raise ValueError(
+            f"{model_cls.__name__}.get_preferred_transceiver_runtime() must "
+            f"return 'CPP', 'PYTHON', or None, got {preferred!r}.")
+
+    resolved = preferred if preferred is not None else "PYTHON"
+
+    # Fallbacks apply only to the no-preference default: an explicit model
+    # preference is adopted verbatim (see _transceiver_python_fallback_reason).
+    if preferred is None:
+        fallback_reason = _transceiver_python_fallback_reason(llm_args)
+        if fallback_reason is not None:
+            logger.info(
+                f"Falling back to the C++ transceiver: {fallback_reason}.")
+            resolved = None
+
+    cfg.transceiver_runtime = resolved
+    logger.info(
+        f"Resolved transceiver_runtime='auto' to {resolved!r} for "
+        f"{model_cls.__name__ if model_cls is not None else 'unknown model'}.")

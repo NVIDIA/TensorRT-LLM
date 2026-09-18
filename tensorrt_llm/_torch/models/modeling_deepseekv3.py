@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # --------------------------------------------------
 # Portions of this code were derived from DeepSeek‑V3:
 #   https://github.com/deepseek-ai/DeepSeek-V3
@@ -28,7 +31,7 @@
 import copy
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -48,22 +51,21 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import (maybe_allgather_for_helix_cp,
+                                   maybe_slice_for_helix_cp)
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.mla import MLA
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (maybe_allgather_for_helix_cp,
-                                 maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
-                                 MoEWeightLoadingMode, create_moe)
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
-from ..modules.mla import MLA
+from ..moe.fused_moe import (DeepSeekV3MoeRoutingMethod, MoEWeightLoadingMode,
+                             create_moe, is_moe_weight_owner)
 
 # isort: off
-from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
+from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightsLoadingConfig,
@@ -601,7 +603,7 @@ class DeepseekV3WeightLoader:
                     # Mark consumed experts weights
                     if mark_consumed:
                         weights.mark_consumed(name)
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -752,7 +754,8 @@ class DeepseekV3Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -777,7 +780,7 @@ class DeepseekV3Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream,
+                         aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
@@ -801,7 +804,8 @@ class DeepseekV32Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -827,11 +831,9 @@ class DeepseekV32Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream,
+                         aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
-
-        self.indexer = self.mqa.indexer
 
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
@@ -894,8 +896,10 @@ class DeepseekV3Gate(nn.Module):
                                  n,
                                  dtype=torch.float32,
                                  device=hidden_states.device)
-            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
-                input_2d.contiguous(), self.weight, output)
+            bf16_gemm_op = (torch.ops.trtllm.cute_dsl_bf16_gemm_rubin
+                            if get_sm_version() == 107 else
+                            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
+            bf16_gemm_op(input_2d.contiguous(), self.weight, output)
             logits = output.view(*hidden_states.shape[:-1], n)
         else:
             logits = torch.ops.trtllm.dsv3_router_gemm_op(
@@ -978,6 +982,16 @@ class Deepseekv3MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
             use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
+        # For MIXED_PRECISION, resolve the per-expert quant config (e.g. W4A8_AWQ)
+        # instead of using the ambiguous global MIXED_PRECISION config.
+        # For other cases (e.g. nvfp4, unquantized MTP layers), use
+        # override_quant_config as-is — it already encodes exclusions like MTP.
+        if (override_quant_config is not None and
+                override_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION):
+            expert_quant_config = self._get_experts_quant_config(
+                model_config, layer_idx)
+        else:
+            expert_quant_config = override_quant_config
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -987,17 +1001,13 @@ class Deepseekv3MoE(nn.Module):
             reduce_results=
             False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
-            override_quant_config=override_quant_config,
+            override_quant_config=expert_quant_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
             # DS-R1 W4A8 is only supported through custom quantization script from
             # examples/quantization/quantize_mixed_precision_moe.py
-            weight_loading_mode=(
-                MoEWeightLoadingMode.W4A8_CUSTOM
-                if self._get_experts_quant_config(
-                    model_config,
-                    layer_idx).layer_quant_mode.is_int4_weight_only_per_group()
-                else MoEWeightLoadingMode.VANILLA),
+            weight_loading_mode=self._expert_weight_loading_mode(
+                expert_quant_config),
         )
 
         self.mapping = model_config.mapping
@@ -1016,7 +1026,7 @@ class Deepseekv3MoE(nn.Module):
                 and shared_quant_config.group_size is not None):
             block_size = shared_quant_config.group_size
 
-        shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
+        self.shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size)
 
         self.shared_experts = GatedMLP(
@@ -1025,7 +1035,7 @@ class Deepseekv3MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=shared_model_config,
-            overridden_tp_size=shared_tp_size,
+            overridden_tp_size=self.shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
         )
@@ -1069,6 +1079,9 @@ class Deepseekv3MoE(nn.Module):
         if self.use_dp:
             # If using attention DP, the shared experts also use DP instead of TP.
             shared_tp_size = 1
+        elif hasattr(self.experts, 'num_fused_shared_expert'
+                     ) and self.experts.num_fused_shared_expert > 0:
+            shared_tp_size = self.mapping.moe_tp_size
         else:
             # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
             # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
@@ -1088,6 +1101,19 @@ class Deepseekv3MoE(nn.Module):
             return model_config.quant_config
         return model_config.quant_config_dict.get(
             f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config)
+
+    @staticmethod
+    def _expert_weight_loading_mode(
+            expert_quant_config: Optional[QuantConfig]) -> MoEWeightLoadingMode:
+        # W4A8_CUSTOM only for the int4-weight-per-group experts produced by
+        # examples/quantization/quantize_mixed_precision_moe.py; everything else
+        # (including the unquantized case, where there is no expert quant config)
+        # uses VANILLA. Guard None: override_quant_config is Optional, so the
+        # resolved expert config can be None on an unquantized layer.
+        if (expert_quant_config is not None and expert_quant_config.
+                layer_quant_mode.is_int4_weight_only_per_group()):
+            return MoEWeightLoadingMode.W4A8_CUSTOM
+        return MoEWeightLoadingMode.VANILLA
 
     @staticmethod
     def _get_shared_experts_quant_config(model_config,
@@ -1144,9 +1170,6 @@ class Deepseekv3MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({
-                "alltoall_result_do_sum": False
-            } if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output
@@ -1181,53 +1204,61 @@ class Deepseekv3MoE(nn.Module):
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
-        routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output,
-            _compute_shared_output,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-            disable_on_compile=True)
+        if self.shared_experts is not None:
+            routed_output, shared_output = maybe_execute_in_parallel(
+                _compute_routed_output,
+                _compute_shared_output,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                disable_on_compile=True)
+        else:
+            # Shared experts have been fused into the routed experts (see post_load_weights);
+            # routed_output already contains the shared expert contribution.
+            shared_output = None
+            routed_output = _compute_routed_output()
 
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
-            if not isinstance(shared_output, torch.Tensor):
+            if shared_output is None:
+                final_hidden_states = routed_output
+            elif not isinstance(shared_output, torch.Tensor):
                 final_hidden_states = shared_output + routed_output
                 if not self.use_dp and self.mapping.tp_size > 1:
                     final_hidden_states = self.allreduce(
                         final_hidden_states,
                         all_reduce_params=final_all_reduce_params)
                 return final_hidden_states
-            output_tensor = None
-            if not self.use_dp and self.mapping.tp_size > 1:
-                w, actual_kind = torch.ops.trtllm.allocate_output(
-                    shared_output, self.allreduce.output_buffer_kind,
-                    self.mapping.tp_group)
-                if actual_kind == int(BufferKind.NCCL_WINDOW):
-                    output_tensor = w
-            if routed_output.dim() == 3:
-                assert shared_output.numel(
-                ) * self.top_k == routed_output.numel(
-                ), 'unmatched tensor shape'
-                final_hidden_states = moe_reduce_add_shared_output(
-                    routed_output, shared_output, out=output_tensor)
             else:
-                assert shared_output.size() == routed_output.size(
-                ), 'unmatched tensor shape'
-                if output_tensor is not None:
-                    final_hidden_states = torch.add(shared_output,
-                                                    routed_output,
-                                                    out=output_tensor)
+                output_tensor = None
+                if not self.use_dp and self.mapping.tp_size > 1:
+                    w, actual_kind = torch.ops.trtllm.allocate_output(
+                        shared_output, self.allreduce.output_buffer_kind,
+                        self.mapping.tp_group)
+                    if actual_kind == int(BufferKind.NCCL_WINDOW):
+                        output_tensor = w
+                if routed_output.dim() == 3:
+                    assert shared_output.numel(
+                    ) * self.top_k == routed_output.numel(
+                    ), 'unmatched tensor shape'
+                    final_hidden_states = moe_reduce_add_shared_output(
+                        routed_output, shared_output, out=output_tensor)
                 else:
-                    # In-place add to avoid allocating a temporary tensor, reducing peak memory
-                    final_hidden_states = shared_output.add_(routed_output)
+                    assert shared_output.size() == routed_output.size(
+                    ), 'unmatched tensor shape'
+                    if output_tensor is not None:
+                        final_hidden_states = torch.add(shared_output,
+                                                        routed_output,
+                                                        out=output_tensor)
+                    else:
+                        # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                        final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
                     final_hidden_states,
                     all_reduce_params=final_all_reduce_params)
-
             return final_hidden_states
 
 
@@ -1274,14 +1305,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.self_attn = DeepseekV32Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
-                aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                aux_stream_dict=aux_stream_dict,
                 mapping_with_cp=mapping_with_cp,
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
         else:
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
-                aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                aux_stream_dict=aux_stream_dict,
                 mapping_with_cp=mapping_with_cp,
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
 
@@ -1290,13 +1321,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(
             model_config, layer_idx)
-        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
-        assert (
-            quant_config.quant_algo
-            is not QuantAlgo.MIXED_PRECISION), "MIXED_PRECISION is ambiguous"
+        # For MIXED_PRECISION, the global quant_algo doesn't map to a single
+        # QuantMode.  Per-module configs (e.g. expert W4A8_AWQ vs attention
+        # FP8_BLOCK_SCALES) are resolved individually where needed, so we
+        # conservatively set layer-level flags here.
+        self.is_nvfp4 = (quant_config.quant_algo != QuantAlgo.MIXED_PRECISION
+                         and quant_config.layer_quant_mode.has_nvfp4())
 
         self.allreduce = None
         self.moe_allreduce = None
@@ -1887,11 +1919,32 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for this model implementation."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+            cls,
+            pretrained_config: Any = None
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Preferred KV-cache transceiver runtime.
+
+        ``DeepseekV3ForCausalLM`` and ``DeepseekV32ForCausalLM`` use MLA
+        attention, which transfers a large latent KV that the Python (v2)
+        transceiver handles better in disaggregated serving. Applied only when
+        ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
+        is always respected.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
@@ -2035,3 +2088,37 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 layer.post_attention_layernorm.nvfp4_scale = (
                     _static_nvfp4_input_scale(getattr(mlp, "gate_up_proj",
                                                       None)))
+
+            # Note: merge shared expert into FusedMoe module
+            if idx >= self.config.first_k_dense_replace and idx % self.config.moe_layer_freq == 0:
+                if hasattr(layer.mlp.experts, 'num_fused_shared_expert'
+                           ) and layer.mlp.experts.num_fused_shared_expert > 0:
+                    layer.mlp.experts.fuse_shared_expert(
+                        layer.mlp.shared_experts)
+                    layer.mlp.shared_experts = None
+
+        # Also process MTP layers if present
+        if self.draft_model is not None and hasattr(self.draft_model,
+                                                    'mtp_layers'):
+            for layer in self.model.layers[self.config.num_hidden_layers:]:
+                # MTP layers also have MoE, need to fuse shared experts
+                if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                    if hasattr(
+                            layer.mlp.experts, 'num_fused_shared_expert'
+                    ) and layer.mlp.experts.num_fused_shared_expert > 0:
+                        layer.mlp.experts.fuse_shared_expert(
+                            layer.mlp.shared_experts)
+                        layer.mlp.shared_experts = None
+
+
+@register_auto_model("GlmMoeDsaForCausalLM")
+class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
+    """GLM 5.2 model flavor with an independent transceiver preference."""
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer Python for GLM 5.2's masked DSA indexer K-cache transfer."""
+        return "PYTHON"

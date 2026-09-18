@@ -147,11 +147,12 @@ def test_fp8_bmm(input_dtype, mat2_dtype):
     assert cos_sim_unquantized > 0.99
 
 
-@pytest.mark.parametrize("bias", [torch.rand(32, device="cuda") * 10, None])
+@pytest.mark.parametrize("use_bias", [True, False])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_quant_linear_fp8_matches_fused_op(bias):
+def test_quant_linear_fp8_matches_fused_op(use_bias):
     input = torch.rand(3, 16, device="cuda")
     weight = torch.rand(32, 16, device="cuda")
+    bias = torch.rand(32, device="cuda") * 10 if use_bias else None
 
     weight_scale = (torch.max(torch.abs(weight)) / 448).to("cuda")
     weight_fp8 = (weight / weight_scale).to(torch.float8_e4m3fn)
@@ -179,19 +180,17 @@ def test_quant_linear_fp8_matches_fused_op(bias):
 
 
 @pytest.mark.parametrize(
-    "bias",
-    [
-        (torch.rand(32, device="cuda") * 10).to(torch.float16),
-        None,
-    ],
+    "use_bias",
+    [True, False],
 )
 @pytest.mark.skipif(
     not (fp4_compatible() and trtllm_ops_available()),
     reason="Requires NVFP4 and TRT-LLM ops",
 )
-def test_quant_linear_nvfp4_matches_fused_op(bias):
+def test_quant_linear_nvfp4_matches_fused_op(use_bias):
     x = torch.rand(3, 32, device="cuda", dtype=torch.half)  # [..., K]
     W = torch.rand(32, 32, device="cuda", dtype=torch.half)  # [N, K]
+    bias = (torch.rand(32, device="cuda") * 10).to(torch.float16) if use_bias else None
     N, K = W.shape
     assert K % SCALING_VECTOR_SIZE == 0
 
@@ -507,6 +506,7 @@ def _fg_reference_128_block(weight, scale):
         (256, 256),  # fully aligned (must stay correct)
     ],
 )
+@pytest.mark.cpu_only
 def test_finegrained_fp8_dequant_coarse_block_uses_canonical_128(n, k):
     """A coarse 128-block scale must dequant exactly, even when N/K aren't 128-multiples."""
     weight, scale = _fg_make_block_scaled_weight(n, k)
@@ -514,6 +514,7 @@ def test_finegrained_fp8_dequant_coarse_block_uses_canonical_128(n, k):
     torch.testing.assert_close(out, _fg_reference_128_block(weight, scale), atol=0.0, rtol=0.0)
 
 
+@pytest.mark.cpu_only
 def test_finegrained_fp8_dequant_differs_from_buggy_ceil_expansion():
     """Lock in the fix: canonical-128 expansion must differ from the old ceil(N/scale_n) one."""
     n, k = 576, 256  # ceil(576/5) = 116 != 128 -> old behavior was wrong
@@ -527,6 +528,7 @@ def test_finegrained_fp8_dequant_differs_from_buggy_ceil_expansion():
     assert not torch.allclose(correct, buggy), "fix must not reproduce the misaligned expansion"
 
 
+@pytest.mark.cpu_only
 def test_finegrained_fp8_dequant_per_row_scale_expands_by_one():
     """A per-row scale (scale_n == N) keeps the ceil path -> block_n == 1 (each row its own scale)."""
     n, k = 72, 256

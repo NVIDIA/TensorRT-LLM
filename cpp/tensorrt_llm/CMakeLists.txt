@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -142,10 +142,7 @@ endif()
 
 add_subdirectory(common)
 add_subdirectory(kernels)
-add_subdirectory(layers)
 add_subdirectory(runtime)
-add_subdirectory(testing)
-add_subdirectory(executor_worker)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
@@ -176,7 +173,6 @@ set(TRTLLM_LINK_LIBS
     ${CUBLASLT_LIB}
     ${CURAND_LIB}
     ${CMAKE_DL_LIBS}
-    ${TRT_LIB}
     common_src
     kernels_src
     flash_mla_src
@@ -184,11 +180,14 @@ set(TRTLLM_LINK_LIBS
     decoder_attention_src
     trtllm_gen_fmha
     trtllm_gen_fp8_block_scale_moe
+    trtllm_gen_fp8_block_scale_moe_routing
     trtllm_gen_gemm
     trtllm_gen_gemm_gated_act
     trtllm_gen_batched_gemm
     selective_scan_src
     mamba2_mtp_ssm_cache_src
+    kda_decode_src
+    kimi_k3_attn_res_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src
@@ -197,9 +196,7 @@ set(TRTLLM_LINK_LIBS
     gemm_swiglu_sm90_src
     cutlass_src
     cute_dsl_src
-    layers_src
     runtime_src
-    testing_src
     compressorKernels_src
     mhcKernels_src
     userbuffers_src
@@ -310,5 +307,3 @@ endif()
 if(BUILD_FLASH_MLA)
   add_subdirectory(flash_mla)
 endif()
-
-add_subdirectory(plugins)

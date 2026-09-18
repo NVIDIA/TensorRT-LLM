@@ -41,13 +41,17 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
     _ITERATION_STATS_OPTIONAL_FIELDS,
     _ITERATION_STATS_SCALAR_FIELDS,
     ADPIterStatsBuffer,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
-from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
+from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, SpecDecodingStats
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _StubRequest:
@@ -73,6 +77,9 @@ class _StubRequest:
         is_attention_dp_dummy: bool = False,
         is_cuda_graph_dummy: bool = False,
         is_dummy_request: bool = False,
+        num_draft_tokens: int = 0,
+        py_draft_tokens=None,
+        py_num_accepted_draft_tokens=None,
     ):
         self.context_current_position = context_current_position
         # py_last_context_chunk = (begin_compute, end_compute). For a fresh
@@ -88,6 +95,14 @@ class _StubRequest:
         self.is_attention_dp_dummy = is_attention_dp_dummy
         self.is_cuda_graph_dummy = is_cuda_graph_dummy
         self.is_dummy_request = is_dummy_request
+        # Speculative-decoding accessors read by the specdec-stats aggregation
+        # branch of ``_update_iter_stats``. Defaults match a non-drafted request
+        # (draft_len resolves to 0, so it is skipped by the ``draft_len > 0``
+        # gate). A dummy gen request mirrors resource_manager.add_dummy_requests'
+        # is_gen branch: py_draft_tokens = [1] * k plus an accepted count.
+        self.num_draft_tokens = num_draft_tokens
+        self.py_draft_tokens = py_draft_tokens
+        self.py_num_accepted_draft_tokens = py_num_accepted_draft_tokens
 
     @property
     def is_dummy(self) -> bool:
@@ -98,10 +113,17 @@ class _StubRequest:
 
 
 class _StubScheduledBatch:
-    def __init__(self, context_reqs=None, gen_reqs=None, paused_reqs=None):
+    def __init__(
+        self,
+        context_reqs=None,
+        gen_reqs=None,
+        paused_reqs=None,
+        recompute_paused_reqs=None,
+    ):
         self.context_requests = list(context_reqs or [])
         self.generation_requests = list(gen_reqs or [])
         self.paused_requests = list(paused_reqs or [])
+        self.recompute_paused_requests = list(recompute_paused_reqs or [])
 
     @property
     def num_context_requests(self):
@@ -189,6 +211,7 @@ def _invoke_update_iter_stats(
     num_ctx_tokens,
     enable_attention_dp=False,
     scheduled_batch_stats=None,
+    specdec=False,
 ):
     """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
 
@@ -207,6 +230,11 @@ def _invoke_update_iter_stats(
         Explicit scheduled-batch counters passed to ``_update_iter_stats``.
         When None, defaults to the same partial ``num_ctx_tokens`` payload used
         by older tests.
+    specdec : bool
+        Allocate ``stats.specdec_stats`` so the speculative-decoding
+        aggregation branch runs. On a fresh ``IterationStats`` this member is
+        None (production sets it in ``_get_init_iter_stats`` only when spec
+        decode is enabled), and the branch is skipped otherwise.
     """
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, ScheduledBatchStats
 
@@ -226,6 +254,8 @@ def _invoke_update_iter_stats(
     # The method reads ``stats.inflight_batching_stats.*`` unconditionally;
     # the default on a fresh IterationStats is None, so we allocate one.
     stats.inflight_batching_stats = InflightBatchingStats()
+    if specdec:
+        stats.specdec_stats = SpecDecodingStats()
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
@@ -406,10 +436,15 @@ def test_paused_decode_requests():
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
     ]
-    stats = _invoke_update_iter_stats(_StubScheduledBatch(paused_reqs=paused), [], num_ctx_tokens=0)
+    recompute_paused = [_StubRequest(num_tokens=700)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(paused_reqs=paused, recompute_paused_reqs=recompute_paused),
+        [],
+        num_ctx_tokens=0,
+    )
     ifb = stats.inflight_batching_stats
-    assert ifb.num_paused_requests == 2
-    assert ifb.num_paused_kv_tokens == 1100
+    assert ifb.num_paused_requests == 3
+    assert ifb.num_paused_kv_tokens == 1800
 
 
 def test_dummy_filtering_on_kv_token_fields():
@@ -585,6 +620,96 @@ def test_num_gen_kv_tokens_uses_scheduled_batch_stats():
 
     ifb = stats.inflight_batching_stats
     assert ifb.num_gen_kv_tokens == 1024
+
+
+# ---------------------------------------------------------------------------
+# Speculative-decoding aggregation tests: the specdec branch of
+# ``_update_iter_stats`` sums draft/accepted tokens across generation
+# requests and derives the acceptance length. Attention-DP / CUDA-graph
+# padding adds *generation* dummies carrying synthetic
+# ``py_draft_tokens = [1] * k`` and a spec-sampler accepted count
+# (resource_manager.add_dummy_requests is_gen branch); they must not enter
+# the aggregate or they depress the reported acceptance rate/length. This
+# path is distinct from the KV-token dummy filtering above and is only
+# reached when ``stats.specdec_stats`` is allocated (spec decode enabled).
+# ---------------------------------------------------------------------------
+
+
+def test_specdec_excludes_dummy_generation_requests():
+    """Regression guard: dummy gen requests must not pollute specdec AR/AL.
+
+    One real drafted request (k=4, 3 accepted) alongside an attention-DP
+    dummy and a CUDA-graph dummy, each mirroring the is_gen dummy branch
+    (``num_draft_tokens == 0`` with ``py_draft_tokens = [1] * 4``). The
+    aggregate must reflect only the real request: 4 draft tokens, 3
+    accepted, one drafted request, and acceptance_length = (3 + 1) / 1.
+
+    Without the ``is_dummy`` filter each dummy would contribute draft_len=4
+    (counted from the non-zero ``py_draft_tokens``) and 0 accepted, giving
+    num_requests_with_draft=3 and a depressed acceptance_length of
+    (3 + 3) / 3 = 2.0 instead of 4.0.
+    """
+    real = _StubRequest(num_draft_tokens=4, py_num_accepted_draft_tokens=3)
+    adp_dummy = _StubRequest(
+        py_draft_tokens=[1, 1, 1, 1],
+        py_num_accepted_draft_tokens=0,
+        is_attention_dp_dummy=True,
+    )
+    cuda_graph_dummy = _StubRequest(
+        py_draft_tokens=[1, 1, 1, 1],
+        py_num_accepted_draft_tokens=0,
+        is_cuda_graph_dummy=True,
+    )
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=[real, adp_dummy, cuda_graph_dummy]),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    sd = stats.specdec_stats
+    assert sd.num_draft_tokens == 4
+    assert sd.num_accepted_tokens == 3
+    assert sd.num_requests_with_draft_tokens == 1
+    assert sd.acceptance_length == 4.0
+
+
+def test_specdec_all_dummy_generation_requests_yield_zero():
+    """An iteration of only dummy gen requests reports no drafted work."""
+    dummies = [
+        _StubRequest(py_draft_tokens=[1, 1, 1, 1], is_attention_dp_dummy=True),
+        _StubRequest(py_draft_tokens=[1, 1, 1, 1], is_cuda_graph_dummy=True),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=dummies),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    sd = stats.specdec_stats
+    assert sd.num_draft_tokens == 0
+    assert sd.num_accepted_tokens == 0
+    assert sd.num_requests_with_draft_tokens == 0
+    assert sd.acceptance_length == 0.0
+
+
+def test_specdec_aggregates_multiple_real_requests():
+    """Baseline: with no dummies, every real drafted request is aggregated."""
+    reqs = [
+        _StubRequest(num_draft_tokens=4, py_num_accepted_draft_tokens=3),
+        _StubRequest(num_draft_tokens=4, py_num_accepted_draft_tokens=1),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=reqs),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    sd = stats.specdec_stats
+    assert sd.num_draft_tokens == 8
+    assert sd.num_accepted_tokens == 4
+    assert sd.num_requests_with_draft_tokens == 2
+    # (total_accepted + num_requests_with_draft) / num_requests_with_draft
+    assert sd.acceptance_length == (4 + 2) / 2
 
 
 # ---------------------------------------------------------------------------

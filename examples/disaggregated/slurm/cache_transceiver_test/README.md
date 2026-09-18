@@ -55,7 +55,9 @@ itself flows over UCX/NIXL.
 - Every rank prints `UCX_TLS` and `UCX_NET_DEVICES`; `UCX_PROTO_INFO=used` is set
   so UCX >= 1.21 captures the selected GPU↔GPU transport in the stderr logs.
 - Failing transfers are reported per cell as `TRANSFER_ERROR` / `MISMATCH` /
-  `TIMEOUT` (the run continues — a single bad case never aborts the sweep).
+  `TIMEOUT`. A verification mismatch is safe to continue; a result that does
+  not prove transfer quiescence hard-aborts only the current UCX sweep so its
+  cache manager cannot recycle or deregister pages still owned by transport.
 
 ## Outputs (under `environment.work_dir`)
 
@@ -64,7 +66,7 @@ resolved_config.json            # the validated config the job ran with
 logs/ctt-<jobid>.log            # batch-level log (stdout+stderr merged)
 logs/install.log                # TensorRT-LLM install log
 logs/sweep<i>_<role>_rank*.log  # per-rank logs: transfer START/DONE+verify, UCX_PROTO_INFO
-csv/<i>/ctx|gen/rank_*_{send,recv}.csv # C++ transceiver timing (Bandwidth(Gbps))
+csv/<i>/ctx|gen/<instanceId>_*_{send,recv}.csv # C++ transceiver timing (Bandwidth(Gbps)); renamed to <instanceId>_*_{send,recv}__c<i>.csv per combination
 csv/<i>/ctx/py_*_*.csv                 # Python transceiver perf log (throughput_mbs)
 status/sweep<i>_<role>.jsonl           # PASS / MISMATCH / TRANSFER_ERROR / TIMEOUT
 results.json                    # full results, grouped per combination (longest req_len)
@@ -96,7 +98,7 @@ deliverable for tuning your cluster.
 
 | Transceiver | Env enabling timing | File | Column (native) |
 |---|---|---|---|
-| C++ (UCX/NIXL) | `TRTLLM_KVCACHE_TIME_OUTPUT_PATH` (set by the driver) | `rank_*_recv.csv` | `Bandwidth(Gbps)` |
+| C++ (UCX/NIXL) | `TRTLLM_KVCACHE_TIME_OUTPUT_PATH` (set by the driver) | `<instanceId>_*_recv.csv` (renamed `<instanceId>_*_recv__c<i>.csv` per combination) | `Bandwidth(Gbps)` |
 | Python (NIXL) | `TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1`, `TLLM_KV_TRANSFER_PERF_LOG_FILE` (set by the driver) | `py_*_*.csv` | `throughput_mbs` (MiB/s) |
 
 `report.py` normalizes both to **per-GPU GB/s** (bytes, ÷1e9): C++
@@ -112,10 +114,16 @@ within a `(combination)` across UCX sweeps.
   so no cross-node gather is needed.
 - A bad `UCX_NET_DEVICES`/`UCX_TLS` can hang a transfer. Hangs are handled at
   three layers so one stuck sweep never blocks the others:
-  1. **`signal.alarm`** (per cell, `timeout_per_cell_s`) recovers Python-level
-     stalls and continues within the sweep.
-  2. **Watchdog thread** (per cell) records `TIMEOUT` and `SIGKILL`s the process
-     for hangs inside a *GIL-released* native call (e.g.
+  1. **The Python sender deadline plus `signal.alarm`** bounds Python-level
+     stalls. `timeout_per_cell_s` must be greater than five seconds. The Python
+     sender deadline is five seconds lower, leaving time for CTX and GEN to
+     exchange a final ownership decision. The alarm is the per-cell bound for
+     the C++ path and for later requests after the shared cell budget is spent.
+     A timeout or any other result without explicit completion retains the
+     pages and hard-aborts the current sweep; the harness never rebuilds a
+     cache manager over possibly active transfer memory.
+  2. **Watchdog thread** (per cell) best-effort records `TIMEOUT` and `SIGKILL`s
+     the process for hangs inside a *GIL-released* native call (e.g.
      `check_*_transfer_status`); `srun --kill-on-bad-exit` then tears down the
      sweep. This is **best-effort**: it cannot fire if the hang is in a native
      call that *holds* the GIL (e.g. the UCX connection handshake inside

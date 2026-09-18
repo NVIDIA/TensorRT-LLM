@@ -231,6 +231,90 @@ def test_fi_mtp_verify_misaligned_index_slice():
 
 
 @skip_unsupported
+def test_fi_mtp_verify_misaligned_ab_slices():
+    """Non-32B-aligned ``a``/``b`` column slices must be realigned.
+
+    ``gdn_mixer._compute_tokenwise_inputs`` splits the fused ``in_proj_ba``
+    projection into ``b = projected_states_ba[:, :num_v_heads_per_tp]`` and
+    ``a = projected_states_ba[:, num_v_heads_per_tp:]``. ``a`` therefore starts
+    ``num_v_heads_per_tp`` elements in, and that byte offset is not a multiple
+    of 32 for many TP splits (in bf16, whenever the per-rank v-head count is not
+    a multiple of 16). The FI kernel then asserts ``Misaligned Tensor data on
+    argument``. Attention-DP hides this because v-heads are not sharded there.
+
+    The gating inputs are fp32, matching the other tests in this file. ``HV=4``
+    gives the requested 16-byte offset. Two fused buffers exercise each guard:
+    the ordinary split misaligns ``a``; shifting the fused buffer misaligns
+    ``b`` instead.
+
+    ``.contiguous()`` is not a fix: at ``draft_token_num == 1`` the token dim is
+    size 1, so the offset view already reports as contiguous.
+    """
+    from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+        _flashinfer_gdn_verify,
+    )
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    N, T, H, HV, K, V = 2, 3, 4, 4, 128, 128
+    q = (torch.randn(N, T, H, K, device=dev) * 0.1).to(torch.bfloat16)
+    k = (torch.randn(N, T, H, K, device=dev) * 0.1).to(torch.bfloat16)
+    v = (torch.randn(N, T, HV, V, device=dev) * 0.1).to(torch.bfloat16)
+    A_log = torch.empty(HV, device=dev).uniform_(1.0, 16.0).log()
+    dt_bias = torch.randn(HV, device=dev) * 0.1
+    state_pool = (torch.randn(N, HV, V, K, device=dev) * 0.1).to(torch.bfloat16)
+    idx = torch.arange(N, device=dev, dtype=torch.int32)
+
+    # Same column split gdn_mixer performs on the fused in_proj_ba output:
+    # the base is aligned, while a starts 16 bytes into each row.
+    ba = torch.randn(N * T, 2 * HV, device=dev) * 0.1
+    b_aligned = ba[:, :HV].view(N, T, HV)
+    a_misaligned = ba[:, HV:].view(N, T, HV)
+    assert b_aligned.data_ptr() % 32 == 0
+    assert a_misaligned.data_ptr() % 32 == 16
+
+    # Shift a second fused buffer by 16 bytes so b is misaligned and a is
+    # aligned after the additional 16-byte column offset.
+    shifted_storage = torch.randn(N * T * 2 * HV + HV, device=dev) * 0.1
+    shifted_ba = shifted_storage[HV:].view(N * T, 2 * HV)
+    b_misaligned = shifted_ba[:, :HV].view(N, T, HV)
+    a_aligned = shifted_ba[:, HV:].view(N, T, HV)
+    assert b_misaligned.data_ptr() % 32 == 16
+    assert a_aligned.data_ptr() % 32 == 0
+
+    def _run(a_in, b_in):
+        return _flashinfer_gdn_verify(
+            A_log=A_log,
+            a=a_in,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b_in,
+            initial_state_source=state_pool,
+            initial_state_indices=idx,
+            intermediate_states_buffer=torch.zeros(
+                N, T, HV, V, K, device=dev, dtype=torch.bfloat16
+            ),
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    for a, b in [
+        (a_misaligned, b_aligned),
+        (a_aligned, b_misaligned),
+    ]:
+        out_misaligned = _run(a, b)
+        out_aligned = _run(
+            a.clone(memory_format=torch.contiguous_format),
+            b.clone(memory_format=torch.contiguous_format),
+        )
+        torch.testing.assert_close(out_misaligned.float(), out_aligned.float())
+
+
+@skip_unsupported
 def test_fi_verify_gate_env_killswitch(monkeypatch):
     """The dispatch gate honors the disable env vars and shape constraints."""
     import tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent as fsg

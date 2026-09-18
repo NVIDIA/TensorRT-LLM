@@ -34,6 +34,22 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
+// Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890 && __CUDA_ARCH__ < 1000)
+#define MARLIN_NVFP4_DEVICE_SUPPORTED 1
+#else
+#define MARLIN_NVFP4_DEVICE_SUPPORTED 0
+#endif
+
+// Dense Marlin also supports Blackwell GeForce (SM120/121). Keep this
+// separate from MARLIN_NVFP4_DEVICE_SUPPORTED because Marlin MoE does not.
+#if defined(__CUDA_ARCH__)                                                                                             \
+    && ((__CUDA_ARCH__ >= 890 && __CUDA_ARCH__ < 1000) || (__CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300))
+#define MARLIN_NVFP4_DENSE_DEVICE_SUPPORTED 1
+#else
+#define MARLIN_NVFP4_DENSE_DEVICE_SUPPORTED 0
+#endif
+
 namespace MARLIN_NAMESPACE_NAME
 {
 

@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/ipUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -28,7 +29,7 @@
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <ifaddrs.h>
+#include <limits>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -42,8 +43,415 @@
 #include <unistd.h>
 #include <vector>
 
+#ifdef TLLM_BOUNCE_V2
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceArena.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ZmqControlChannel.h"
+#include <cuda_runtime_api.h>
+#include <future>
+#endif
+
 namespace tensorrt_llm::executor::kv_cache
 {
+
+// ============================================================================
+// Bounce v2 integration (opt-in via CacheTransceiverConfig: agent_bounce_buffer_enable +
+// kv_cache_bounce_size_mb). When disabled, transfers remain on the standard NIXL path.
+// ============================================================================
+#ifdef TLLM_BOUNCE_V2
+namespace bounce
+{
+struct NixlBounceState
+{
+    BounceConfig cfg;
+    int deviceId{};
+    NixlTransferAgent* owner{nullptr};       // the agent this state belongs to (owns this state)
+    bool arenaRegistered{false};             // arena was NIXL-registered -> dtor must deregister it
+    std::unique_ptr<ControlChannel> channel; // ZmqControlChannel
+    std::unique_ptr<BounceArena> arena;      // ONE shared buffer: receiver targets + local gather staging
+    std::unique_ptr<ExecPool> exec;          // gather/scatter exec contexts (streams/scratch)
+    // Declared last -> destroyed first: BounceTransport::~ joins its threads (which use the
+    // agent/channel/arena/exec) before those are torn down.
+    std::unique_ptr<BounceTransport> transport;
+
+    ~NixlBounceState()
+    {
+        transport.reset(); // join the IO/worker threads before anything they use goes away
+        if (owner != nullptr && arenaRegistered && arena)
+        {
+            // Deregister the arena from NIXL while its memory is still alive (cudaFree follows).
+            owner->deregisterRegionImpl(arena->base(), arena->bytes(), deviceId);
+        }
+    }
+};
+} // namespace bounce
+
+namespace
+{
+/// TransferStatus over the bounce transport's completion future (the value Python's wait() reads).
+class BounceTransferStatus final : public TransferStatus
+{
+public:
+    explicit BounceTransferStatus(std::shared_future<bounce::BounceResult> fut)
+        : mFut(std::move(fut))
+    {
+    }
+
+    [[nodiscard]] bool isCompleted() const override
+    {
+        // Success only (TransferStatus contract, mirrors NixlTransferStatus): a failed transfer never
+        // reports completed; callers poll wait()/getLastStatusStr for the outcome. get() cannot throw:
+        // the promise is only ever resolved with set_value, and every erase/shutdown path resolves it
+        // first, so broken_promise is unreachable.
+        return mFut.valid() && mFut.wait_for(std::chrono::seconds(0)) == std::future_status::ready
+            && mFut.get().state == TransferState::kSUCCESS;
+    }
+
+    [[nodiscard]] TransferState wait(int64_t timeoutMs) const override
+    {
+        if (!mFut.valid())
+        {
+            return TransferState::kFAILURE;
+        }
+        if (timeoutMs < 0)
+        {
+            return mFut.get().state;
+        }
+        if (mFut.wait_for(std::chrono::milliseconds(timeoutMs)) == std::future_status::ready)
+        {
+            return mFut.get().state;
+        }
+        return TransferState::kIN_PROGRESS;
+    }
+
+    /// Failure cause recorded by the bounce transport (empty while in flight / on success).
+    [[nodiscard]] std::string getLastStatusStr() const override
+    {
+        if (!mFut.valid() || mFut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            return {};
+        }
+        auto const& result = mFut.get();
+        return result.reason == bounce::BounceFailReason::kNone ? std::string{} : bounce::toString(result.reason);
+    }
+
+private:
+    std::shared_future<bounce::BounceResult> mFut;
+};
+} // namespace
+
+void NixlTransferAgent::maybeInitBounce(
+    std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams)
+{
+    // The size doubles as the on/off switch (CacheTransceiverConfig.kv_cache_bounce_size_mb when
+    // agent_bounce_buffer_enable is set, 0 otherwise): 0 keeps
+    // bounce disabled, >0 enables it at that arena capacity. The expert knobs resolve as
+    // agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_* env var > built-in default.
+    if (agentBufferSizeMb == 0)
+    {
+        if (!bounceParams.empty())
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
+                "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
+                "disabled and the params are ignored",
+                mName.c_str());
+        }
+        return;
+    }
+    auto cfg = bounce::BounceConfig::fromParams(bounceParams, bounce::BounceConfig::fromEnv());
+    cfg.arenaSizeBytes = agentBufferSizeMb << 20;
+    // A single chunk must fit a fresh arena; otherwise its request cannot make progress before
+    // requestTimeoutMs. Clamp the per-chunk cap to the configured arena size first. BounceTransport
+    // applies a second clamp to the buddy allocator's smaller usable capacity when necessary.
+    if (cfg.maxChunkSizeBytes > cfg.arenaSizeBytes)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): maxChunkSizeBytes (%zu) > arenaSizeBytes (%zu) -> clamping to arena",
+            mName.c_str(), cfg.maxChunkSizeBytes, cfg.arenaSizeBytes);
+        cfg.maxChunkSizeBytes = cfg.arenaSizeBytes;
+    }
+    // A chunk's packed size travels in 32-bit wire fields, so it must fit in 32 bits even though the
+    // arena (and thus region offsets) may exceed 4 GiB. Clamp rather than abort on a large config.
+    if (cfg.maxChunkSizeBytes > std::numeric_limits<std::uint32_t>::max())
+    {
+        TLLM_LOG_WARNING(
+            "NixlTransferAgent(%s): maxChunkSizeBytes (%zu) > 4 GiB -> clamping "
+            "(chunk size is 32-bit)",
+            mName.c_str(), cfg.maxChunkSizeBytes);
+        cfg.maxChunkSizeBytes = std::numeric_limits<std::uint32_t>::max();
+    }
+    // Contract: an explicit opt-in on a build without libzmq fails at agent construction (see the
+    // !TLLM_BOUNCE_V2 stub); runtime setup failures (cudaMalloc / registerMem / ZMQ bind) on a bounce
+    // build degrade to standard NIXL with a WARNING. So catch here, warn, and leave mBounce null so the
+    // agent runs the standard per-desc NIXL path unchanged.
+    try
+    {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess)
+        {
+            // Don't silently bind the arena/exec to device 0 on a multi-GPU host — warn and clear the
+            // sticky error; the enclosing try still proceeds (best-effort) with dev=0.
+            (void) cudaGetLastError();
+            TLLM_LOG_WARNING("NixlTransferAgent(%s): cudaGetDevice failed; bounce assuming device 0", mName.c_str());
+        }
+        auto st = std::make_unique<bounce::NixlBounceState>();
+        st->cfg = cfg;
+        st->deviceId = dev;
+        // Bind the control channel to a ROUTABLE interface (not loopback) so peers on OTHER nodes can
+        // reach it — the bounce endpoint is advertised cross-node via AgentDesc and the receiver
+        // self-bootstraps a DEALER to it from WANT. Pick the IP the same way the NIXL agent does
+        // (TRTLLM_NIXL_INTERFACE NIC if set, else auto-detect via outbound route / hostname; the
+        // shared common::getLocalIp util). IPv6 needs brackets in a zmq tcp endpoint.
+        std::string const localIp = common::getLocalIp(common::getEnvNixlInterface(), mpi::MpiComm::world().getRank());
+        std::string const bindAddr
+            = (localIp.find(':') != std::string::npos) ? "tcp://[" + localIp + "]:*" : "tcp://" + localIp + ":*";
+        std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+        // ROUTER frame cap: the largest legitimate DATA carries up to maxDescs scatter runs (+ header);
+        // 2x headroom, never below 64 MiB. A cap below a real DATA would silently disconnect the peer.
+        std::size_t const maxMsgBytes
+            = std::max<std::size_t>(64ULL << 20, 2 * maxDescs * sizeof(bounce::BounceScatterRun) + 4096);
+        st->channel = std::make_unique<bounce::ZmqControlChannel>(mName, bindAddr, maxMsgBytes);
+        std::string const controlDesc = st->channel->localEndpoint();
+        st->owner = this;
+        // ONE shared arena for both roles (receiver RDMA-write targets + local gather staging),
+        // carved into variable-size regions by the scheduler. Register it ONCE NOW (before any
+        // metadata exchange) so peers' loaded MD includes it. Exec contexts (streams/scratch) are a
+        // separate small pool borrowed per gather/scatter kernel.
+        st->arena = std::make_unique<bounce::BounceArena>(cfg.arenaSizeBytes, dev, !cfg.disableFabricMemory);
+        if (!registerRegionImpl(st->arena->base(), st->arena->bytes(), dev))
+        {
+            // Arena couldn't be NIXL-registered -> bounce can't move data. Leave mBounce null so the
+            // agent falls back transparently to the standard per-desc NIXL path (no partial enable).
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): bounce arena registerMem failed -> bounce disabled "
+                "(NIXL fallback)",
+                mName.c_str());
+            return;
+        }
+        st->arenaRegistered = true;
+        st->exec = std::make_unique<bounce::ExecPool>(cfg.copyStreamCount, maxDescs, dev, cfg.useZeroCopyArguments);
+        st->transport = std::make_unique<bounce::BounceTransport>(
+            mName, cfg, dev, st->channel.get(), *this, st->arena.get(), st->exec.get());
+        // Log EVERY resolved knob so a mis-tuned deployment can tell which of dict/env/default won. The
+        // chunk cap is printed as the transport's EFFECTIVE value (after its clamp to the usable arena
+        // capacity — the one advertised in the handshake) next to the configured one.
+        TLLM_LOG_INFO(
+            "NixlTransferAgent(%s): bounce v2 enabled (arenaSizeBytes=%zu arenaAllocationGranularityBytes=%zu "
+            "maxChunkSizeBytes(effective)=%zu (before the buddy usable-capacity clamp: %zu) "
+            "maxInflightChunksPerRequest=%u "
+            "copyStreamCount=%u scatterWorkerCount=%u minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu "
+            "requestTimeoutMs=%d receiverFlowTimeoutMs=%d quarantineMs=%d disableFabricMemory=%d "
+            "enableEagerGather=%d useZeroCopyArguments=%d control=%s)",
+            mName.c_str(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes, st->transport->maxChunkSizeBytes(),
+            cfg.maxChunkSizeBytes, static_cast<unsigned>(cfg.maxInflightChunksPerRequest),
+            static_cast<unsigned>(cfg.copyStreamCount), static_cast<unsigned>(cfg.scatterWorkerCount),
+            cfg.minDescriptorCount, cfg.maxAverageDescriptorSizeBytes, cfg.requestTimeoutMs, cfg.receiverFlowTimeoutMs,
+            cfg.quarantineMs, static_cast<int>(cfg.disableFabricMemory), static_cast<int>(cfg.enableEagerGather),
+            static_cast<int>(cfg.useZeroCopyArguments), controlDesc.c_str());
+        if (cfg.maxAverageDescriptorSizeBytes == 0)
+        {
+            // Make "enabled but nothing routed" visible once; the per-rejection log stays DEBUG-only.
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): bounce gate disabled by max_average_descriptor_size=0: no outbound write "
+                "will use bounce; arena/handshake still active",
+                mName.c_str());
+        }
+        mBounce = std::move(st);
+    }
+    catch (std::exception const& e)
+    {
+        mBounce.reset();
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): bounce init failed (%s) -> bounce disabled (NIXL fallback)",
+            mName.c_str(), e.what());
+    }
+}
+
+std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(TransferRequest const& request) const
+{
+    using bounce::BounceRejectReason;
+    auto const& cfg = mBounce->cfg;
+    if (request.getOp() != TransferOp::kWRITE)
+    {
+        return BounceRejectReason::kNotWrite;
+    }
+    if (request.getSrcDescs().getType() != MemoryType::kVRAM || request.getDstDescs().getType() != MemoryType::kVRAM)
+    {
+        return BounceRejectReason::kNotVram;
+    }
+    if (request.getSyncMessage().has_value())
+    {
+        return BounceRejectReason::kSyncMessage; // sync message rides the standard notif path
+    }
+    if (!mBounce->transport->hasPeerHandshake(request.getRemoteName()))
+    {
+        // The peer did not advertise a compatible bounce handshake (bounce disabled, missing or
+        // malformed handshake, or version/control-kind/chunk-size/timeout mismatch). Without a
+        // compatible receiver, WANT would remain unanswered until requestTimeoutMs, so use standard NIXL.
+        return BounceRejectReason::kNoPeerHandshake;
+    }
+    auto const& srcs = request.getSrcDescs().getDescs();
+    auto const& dsts = request.getDstDescs().getDescs();
+    if (srcs.empty() || srcs.size() != dsts.size() || srcs.size() < cfg.minDescriptorCount)
+    {
+        return BounceRejectReason::kDescriptorCount;
+    }
+    auto const sourceDeviceId = srcs.front().getDeviceId();
+    auto const destinationDeviceId = dsts.front().getDeviceId();
+    if (sourceDeviceId != static_cast<std::uint32_t>(mBounce->deviceId))
+    {
+        return BounceRejectReason::kSourceDevice;
+    }
+    // Screen every precondition BounceTransferPlan::build enforces with TLLM_CHECK: an admitted
+    // request must never throw out of submitTransferRequests — it either runs on bounce or is
+    // routed to the standard per-descriptor NIXL path.
+    std::uint64_t totalBytes = 0;
+    // BounceTransport may clamp the configured cap further to the buddy allocator's usable capacity.
+    auto const maxChunkSizeBytes = mBounce->transport->maxChunkSizeBytes();
+    for (std::size_t i = 0; i < srcs.size(); ++i)
+    {
+        auto const len = srcs[i].getLen();
+        if (len != dsts[i].getLen() || len > maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
+            || dsts[i].getDeviceId() != destinationDeviceId)
+        {
+            return BounceRejectReason::kDescriptorShape;
+        }
+        totalBytes += len;
+    }
+    // max_average_descriptor_size = 0 disables outbound routing (gate off): reject unconditionally (an all-zero-length
+    // request would otherwise pass "avg > 0").
+    std::uint64_t const avg = totalBytes / srcs.size();
+    if (cfg.maxAverageDescriptorSizeBytes == 0 || avg > cfg.maxAverageDescriptorSizeBytes)
+    {
+        return BounceRejectReason::kAverageDescriptorSize;
+    }
+    return std::nullopt;
+}
+
+bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
+{
+    if (!mBounce)
+    {
+        return false; // disabled, not a rejection
+    }
+    auto const reason = bounceRejectReason(request);
+    if (!reason.has_value())
+    {
+        return true;
+    }
+    auto const idx = static_cast<std::size_t>(*reason);
+    mBounceRejectCounts[idx].fetch_add(1, std::memory_order_relaxed);
+    auto const& srcs = request.getSrcDescs().getDescs();
+    // Structural reasons (not a VRAM write, sync message) or ones already warned about at
+    // loadRemoteAgent (no peer handshake) never deserve a WARNING here — DEBUG only. Likewise every
+    // rejection while the operator has disabled the gate (max_average_descriptor_size = 0, the kill
+    // switch), whichever reason happened to fire first.
+    bool const killSwitch = mBounce->cfg.maxAverageDescriptorSizeBytes == 0;
+    bool const quiet = killSwitch || *reason == bounce::BounceRejectReason::kNotWrite
+        || *reason == bounce::BounceRejectReason::kNotVram || *reason == bounce::BounceRejectReason::kSyncMessage
+        || *reason == bounce::BounceRejectReason::kNoPeerHandshake;
+    // First occurrence per reason is a WARNING (a silently-bypassed bounce is the most common
+    // deployment surprise); later ones are DEBUG. Programmatic view: getBounceRejectCounts().
+    // Rejection is the steady state for many layouts, so only the one-shot WARNING pays for the
+    // descriptor sweep that computes the average size. Quiet reasons never consume the warned flag.
+    bool const firstOccurrence = !quiet && !mBounceRejectWarned[idx].exchange(true, std::memory_order_relaxed);
+    if (firstOccurrence)
+    {
+        std::uint64_t totalBytes = 0;
+        for (auto const& d : srcs)
+        {
+            totalBytes += d.getLen();
+        }
+        std::uint64_t const avg = srcs.empty() ? 0 : totalBytes / srcs.size();
+        // The tuning hint only makes sense for the two configurable gates.
+        bool const tunable = *reason == bounce::BounceRejectReason::kDescriptorCount
+            || *reason == bounce::BounceRejectReason::kAverageDescriptorSize;
+        if (tunable)
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): bounce declined a write to %s (reason=%s, descs=%zu, avgDescBytes=%llu; gate: "
+                "min_descriptor_count=%zu, max_average_descriptor_size=%zu) -> standard NIXL path. Further rejections "
+                "for this reason are logged at DEBUG; tune agent_bounce_params min_descriptor_count / "
+                "max_average_descriptor_size if bounce was expected to engage",
+                mName.c_str(), request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size(),
+                static_cast<unsigned long long>(avg), mBounce->cfg.minDescriptorCount,
+                mBounce->cfg.maxAverageDescriptorSizeBytes);
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): bounce declined a write to %s (reason=%s, descs=%zu, "
+                "avgDescBytes=%llu) -> standard NIXL path. Further rejections for this reason are "
+                "logged at DEBUG",
+                mName.c_str(), request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size(),
+                static_cast<unsigned long long>(avg));
+        }
+    }
+    else
+    {
+        TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce declined request to %s (reason=%s, descs=%zu)", mName.c_str(),
+            request.getRemoteName().c_str(), bounceRejectReasonName(*reason), srcs.size());
+    }
+    return false;
+}
+#else  // !TLLM_BOUNCE_V2 — bounce not built; the member stays null; the stubs warn or throw as documented.
+namespace bounce
+{
+struct NixlBounceState
+{
+};
+} // namespace bounce
+
+void NixlTransferAgent::maybeInitBounce(
+    std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams)
+{
+    // Contract: an explicit opt-in on a build without libzmq fails at agent construction; only runtime
+    // setup failures (cudaMalloc / registerMem / ZMQ bind) on a BOUNCE build degrade to standard NIXL
+    // with a WARNING.
+    if (agentBufferSizeMb > 0)
+    {
+        TLLM_THROW("agent_bounce_buffer_enable requires a build with libzmq; this build has no bounce support");
+    }
+    // Same diagnostic as the bounce build for params without an arena.
+    if (!bounceParams.empty())
+    {
+        TLLM_LOG_WARNING(
+            "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
+            "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
+            "disabled and the params are ignored",
+            mName.c_str());
+    }
+}
+
+std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(TransferRequest const&) const
+{
+    return std::nullopt;
+}
+
+bool NixlTransferAgent::shouldUseBounce(TransferRequest const&) const
+{
+    return false;
+}
+#endif // TLLM_BOUNCE_V2
+
+char const* NixlTransferAgent::bounceRejectReasonName(bounce::BounceRejectReason reason) noexcept
+{
+    using bounce::BounceRejectReason;
+    switch (reason)
+    {
+    case BounceRejectReason::kNotWrite: return "not_write";
+    case BounceRejectReason::kNotVram: return "not_vram";
+    case BounceRejectReason::kSyncMessage: return "sync_message";
+    case BounceRejectReason::kNoPeerHandshake: return "no_peer_handshake";
+    case BounceRejectReason::kDescriptorCount: return "descriptor_count";
+    case BounceRejectReason::kSourceDevice: return "source_device";
+    case BounceRejectReason::kDescriptorShape: return "descriptor_shape";
+    case BounceRejectReason::kAverageDescriptorSize: return "average_descriptor_size";
+    case BounceRejectReason::kCount: break;
+    }
+    return "unknown";
+}
 
 class FileLock
 {
@@ -108,62 +516,6 @@ public:
     }
 };
 
-static std::string getAvailableIP()
-{
-    struct ifaddrs *ifaddr, *ifa;
-    void* addr_ptr;
-    std::string ip("UNKNOWN IP");
-
-    // Get the list of network interfaces
-    if (getifaddrs(&ifaddr) == -1)
-    {
-        perror("getifaddrs");
-        return ip;
-    }
-
-    // Loop through the linked list of interfaces
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
-    {
-        // Check if the interface is an IP interface
-        if (ifa->ifa_addr == nullptr)
-            continue;
-
-        std::string nixlInterface = common::getEnvNixlInterface();
-        if (!nixlInterface.empty() && strcmp(ifa->ifa_name, nixlInterface.c_str()) != 0)
-        {
-            continue;
-        }
-
-        // Skip the loopback interface
-        if (nixlInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
-        {
-            continue;
-        }
-
-        // Check if the address family is AF_INET (IPv4)
-        // TODO: USER CAN SPECIFY THE IP ADDRESS
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        {
-            addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
-            char address_buffer[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
-
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** NIXL    Interface: %s IP Address: %s",
-                ifa->ifa_name, address_buffer);
-            ip = address_buffer;
-            break;
-        }
-    }
-    if (ifa == nullptr)
-    {
-        TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-            "UCX   No valid IP address found please set correct NIXL interface with env variable TRTLLM_UCX_INTERFACE");
-    }
-
-    freeifaddrs(ifaddr);
-    return ip;
-}
-
 uint16_t getAvailablePort(std::string const& ip = "0.0.0.0")
 {
     struct addrinfo hints
@@ -195,13 +547,6 @@ uint16_t getAvailablePort(std::string const& ip = "0.0.0.0")
     freeaddrinfo(res);
 
     return port;
-}
-
-uint16_t getIncrmentPort(uint16_t basePort)
-{
-    static uint16_t times = 0;
-    return basePort + mpi::MpiComm::world().getRank() + (times++) * mpi::MpiComm::world().getSize();
-    // just for test
 }
 
 [[nodiscard]] nixl_mem_t NixlHelper::convert(MemoryType type)
@@ -347,164 +692,6 @@ NixlTransferStatus::~NixlTransferStatus() noexcept
     }
 }
 
-[[nodiscard]] MemoryDescs NixlHelper::coalesceMemoryDescs(MemoryDescs const& descs)
-{
-    auto const& descVec = descs.getDescs();
-
-    // If empty or single element, return as-is
-    if (descVec.size() <= 1)
-    {
-        return descs;
-    }
-
-    size_t const numDescs = descVec.size();
-
-    // Create index array and sort by address
-    std::vector<size_t> sortedIndices(numDescs);
-    std::iota(sortedIndices.begin(), sortedIndices.end(), 0);
-
-    std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&descVec](size_t lhs, size_t rhs)
-        {
-            // Sort by deviceId first, then by address
-            if (descVec[lhs].getDeviceId() != descVec[rhs].getDeviceId())
-            {
-                return descVec[lhs].getDeviceId() < descVec[rhs].getDeviceId();
-            }
-            return descVec[lhs].getAddr() < descVec[rhs].getAddr();
-        });
-
-    std::vector<MemoryDesc> coalesced;
-    coalesced.reserve(numDescs);
-
-    // Start with the first entry
-    size_t firstIdx = sortedIndices[0];
-    uintptr_t currentAddr = descVec[firstIdx].getAddr();
-    size_t currentLen = descVec[firstIdx].getLen();
-    uint32_t currentDeviceId = descVec[firstIdx].getDeviceId();
-
-    for (size_t idx = 1; idx < numDescs; ++idx)
-    {
-        size_t sortedIdx = sortedIndices[idx];
-        auto const& desc = descVec[sortedIdx];
-
-        // Check if current can be coalesced with previous
-        bool isContiguous = (currentAddr + currentLen == desc.getAddr()) && (currentDeviceId == desc.getDeviceId());
-
-        if (isContiguous)
-        {
-            // Coalesce: extend the current region
-            currentLen += desc.getLen();
-        }
-        else
-        {
-            // Cannot coalesce: save the current region and start a new one
-            coalesced.emplace_back(currentAddr, currentLen, currentDeviceId);
-
-            currentAddr = desc.getAddr();
-            currentLen = desc.getLen();
-            currentDeviceId = desc.getDeviceId();
-        }
-    }
-
-    // Add the last region
-    coalesced.emplace_back(currentAddr, currentLen, currentDeviceId);
-
-    TLLM_LOG_DEBUG("NixlHelper::coalesceMemoryDescs: coalesced %zu -> %zu entries", descVec.size(), coalesced.size());
-
-    return MemoryDescs{descs.getType(), std::move(coalesced)};
-}
-
-[[nodiscard]] std::pair<MemoryDescs, MemoryDescs> NixlHelper::coalesceTransferDescs(
-    TransferDescs const& srcDescs, TransferDescs const& dstDescs)
-{
-    auto const& srcVec = srcDescs.getDescs();
-    auto const& dstVec = dstDescs.getDescs();
-
-    // If sizes don't match or empty, return as-is
-    if (srcVec.size() != dstVec.size() || srcVec.empty())
-    {
-        return {srcDescs, dstDescs};
-    }
-
-    size_t const numDescs = srcVec.size();
-
-    // Create index array and sort by src address
-    // This allows us to find contiguous regions even if the original order is scattered
-    std::vector<size_t> sortedIndices(numDescs);
-    std::iota(sortedIndices.begin(), sortedIndices.end(), 0);
-
-    std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&srcVec](size_t lhs, size_t rhs)
-        {
-            // Sort by deviceId first, then by address
-            if (srcVec[lhs].getDeviceId() != srcVec[rhs].getDeviceId())
-            {
-                return srcVec[lhs].getDeviceId() < srcVec[rhs].getDeviceId();
-            }
-            return srcVec[lhs].getAddr() < srcVec[rhs].getAddr();
-        });
-
-    std::vector<MemoryDesc> coalescedSrc;
-    std::vector<MemoryDesc> coalescedDst;
-    coalescedSrc.reserve(numDescs);
-    coalescedDst.reserve(numDescs);
-
-    // Start with the first entry (using sorted order)
-    size_t firstIdx = sortedIndices[0];
-    uintptr_t currentSrcAddr = srcVec[firstIdx].getAddr();
-    size_t currentSrcLen = srcVec[firstIdx].getLen();
-    uint32_t currentSrcDeviceId = srcVec[firstIdx].getDeviceId();
-
-    uintptr_t currentDstAddr = dstVec[firstIdx].getAddr();
-    size_t currentDstLen = dstVec[firstIdx].getLen();
-    uint32_t currentDstDeviceId = dstVec[firstIdx].getDeviceId();
-
-    for (size_t idx = 1; idx < numDescs; ++idx)
-    {
-        size_t sortedIdx = sortedIndices[idx];
-        auto const& src = srcVec[sortedIdx];
-        auto const& dst = dstVec[sortedIdx];
-
-        // Check if current src and dst can be coalesced with previous
-        bool srcContiguous
-            = (currentSrcAddr + currentSrcLen == src.getAddr()) && (currentSrcDeviceId == src.getDeviceId());
-        bool dstContiguous
-            = (currentDstAddr + currentDstLen == dst.getAddr()) && (currentDstDeviceId == dst.getDeviceId());
-
-        if (srcContiguous && dstContiguous)
-        {
-            // Coalesce: extend the current region
-            currentSrcLen += src.getLen();
-            currentDstLen += dst.getLen();
-        }
-        else
-        {
-            // Cannot coalesce: save the current region and start a new one
-            coalescedSrc.emplace_back(currentSrcAddr, currentSrcLen, currentSrcDeviceId);
-            coalescedDst.emplace_back(currentDstAddr, currentDstLen, currentDstDeviceId);
-
-            currentSrcAddr = src.getAddr();
-            currentSrcLen = src.getLen();
-            currentSrcDeviceId = src.getDeviceId();
-
-            currentDstAddr = dst.getAddr();
-            currentDstLen = dst.getLen();
-            currentDstDeviceId = dst.getDeviceId();
-        }
-    }
-
-    // Don't forget to add the last region
-    coalescedSrc.emplace_back(currentSrcAddr, currentSrcLen, currentSrcDeviceId);
-    coalescedDst.emplace_back(currentDstAddr, currentDstLen, currentDstDeviceId);
-
-    TLLM_LOG_DEBUG(
-        "NixlHelper::coalesceTransferDescs: coalesced %zu -> %zu transfer entries", srcVec.size(), coalescedSrc.size());
-
-    return {MemoryDescs{srcDescs.getType(), std::move(coalescedSrc)},
-        MemoryDescs{dstDescs.getType(), std::move(coalescedDst)}};
-}
-
 TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 {
     auto startTime = std::chrono::steady_clock::now();
@@ -616,6 +803,28 @@ nixl_status_t NixlTransferStatus::queryStatus() const
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
+    bool const mpiEnabled = !common::getBoolEnv("TLLM_DISABLE_MPI");
+    TLLM_CHECK_WITH_INFO(config.rank.has_value() == config.worldSize.has_value(),
+        "NIXL agent config fields 'rank' and 'worldSize' must be specified together");
+
+    if (config.rank.has_value())
+    {
+        mRank = config.rank.value();
+        mWorldSize = config.worldSize.value();
+        TLLM_CHECK_WITH_INFO(mWorldSize > 0, "NIXL world size must be positive, got %d", mWorldSize);
+        TLLM_CHECK_WITH_INFO(
+            mRank >= 0 && mRank < mWorldSize, "NIXL rank must be in [0, %d), got %d", mWorldSize, mRank);
+    }
+    else if (config.useListenThread && mpiEnabled)
+    {
+        mRank = mpi::MpiComm::session().getRank();
+        mWorldSize = mpi::MpiComm::session().getSize();
+    }
+    else if (config.useListenThread)
+    {
+        TLLM_LOG_WARNING("NIXL rank parameters are not configured; defaulting to one process");
+    }
+
     nixl_status_t status;
     if (config.useListenThread)
     {
@@ -624,14 +833,20 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         {
             TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
         }
-        auto envPort = common::getEnvNixlPort();
-        uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
+        uint16_t port = getAvailablePort();
         uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
-        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
-            numWorker, 0, 10000, config.enableTelemetry};
-        mAddress = getAvailableIP() + ":" + std::to_string(port);
+        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
+            0, 10000, config.enableTelemetry};
+        std::string localIp = common::getLocalIp(common::getEnvNixlInterface(), mRank);
+        // Bracket IPv6 literals (RFC 3986) so the last ':' always separates the port;
+        // IPv4 keeps the legacy "ip:port" format for cross-version compatibility.
+        if (localIp.find(':') != std::string::npos)
+        {
+            localIp = "[" + localIp + "]";
+        }
+        mAddress = localIp + ":" + std::to_string(port);
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
     else
@@ -640,8 +855,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
         mAddress.clear();
-        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
-            numWorker, 0, 10000, config.enableTelemetry};
+        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
+            0, 10000, config.enableTelemetry};
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
@@ -678,6 +893,10 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     }
     mExtraParams.backends.push_back(mRawBackend);
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
+
+    // Bring up bounce v2 now, if enabled, so its shared arena is registered before any peer fetches
+    // our metadata. This is a no-op when bounce is disabled or not built.
+    maybeInitBounce(config.agentBufferSizeMb, config.bounceParams);
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -693,12 +912,8 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     auto detectedRegionMap = VmmDescSplitter::detectVramRegionMap(descs);
     mLocalVramRegionInfo.merge(detectedRegionMap);
 
-    // Coalesce contiguous memory regions to reduce registration overhead (disabled by default)
-    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
-    auto coalescedDescs = common::getEnvNixlEnableCoalesce() ? NixlHelper::coalesceMemoryDescs(splitDescs) : splitDescs;
-
     nixl_status_t status;
-    status = mRawAgent->registerMem(NixlHelper::convertRegDlist(coalescedDescs), &mExtraParams);
+    status = mRawAgent->registerMem(NixlHelper::convertRegDlist(splitDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
     std::string localMD;
@@ -713,12 +928,8 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     // Split using per-region registry info to match what was registered
     auto splitDescs = VmmDescSplitter::splitDescsWithRegionMap(descs, mLocalVramRegionInfo);
 
-    // Coalesce contiguous memory regions to match what was registered (disabled by default)
-    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
-    auto coalescedDescs = common::getEnvNixlEnableCoalesce() ? NixlHelper::coalesceMemoryDescs(splitDescs) : splitDescs;
-
     nixl_status_t status;
-    status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(coalescedDescs), &mExtraParams);
+    status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(splitDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
     // Remove entries from registry
@@ -741,9 +952,18 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+#ifdef TLLM_BOUNCE_V2
+    // Validate the peer's bounce capability handshake from AgentDesc and register its control
+    // channel. Only peers with the same wire version, control kind, effective maxChunkSizeBytes and
+    // requestTimeoutMs pass; missing or incompatible handshakes leave the peer on standard NIXL.
+    if (mBounce)
+    {
+        mBounce->transport->registerPeerHandshake(name, agentDesc.getBounceHandshake());
+    }
+#endif
 
     // Store remote VMM region info for chunk boundary calculations in
-    // VmmDescSplitter::splitTransferDescsWithRegionMaps. Per-agent map because different remote agents may have
+    // VmmDescSplitter::splitAndCoalesceTransferDescs. Per-agent map because different remote agents may have
     // overlapping virtual addresses.
     auto const& regions = agentDesc.getVramRegions();
     if (!regions.empty())
@@ -764,17 +984,25 @@ AgentDesc NixlTransferAgent::getLocalAgentDesc()
     nixl_status_t status = mRawAgent->getLocalMD(nixlBlob);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
-    // Pack local VMM region info so remote agents can compute chunk boundaries.
+    // Pack ALL local region info (VMM multi-chunk and single-allocation alike) so remote agents can
+    // compute chunk boundaries and never coalesce transfer descs across separately registered regions.
     std::vector<VramRegionMeta> regions;
+    regions.reserve(mLocalVramRegionInfo.size());
     for (auto const& [base, info] : mLocalVramRegionInfo)
     {
-        if (info.chunkSize > 0)
-        {
-            regions.push_back({base, info.totalLen, info.chunkSize});
-        }
+        regions.push_back({base, info.totalLen, info.chunkSize});
     }
 
-    return AgentDesc{nixlBlob, std::move(regions)};
+    std::string bounceHandshake;
+#ifdef TLLM_BOUNCE_V2
+    // Include the capability handshake in the structured AgentDesc. Callers must exchange the full
+    // AgentDesc serialization for the peer to receive and validate it.
+    if (mBounce)
+    {
+        bounceHandshake = mBounce->transport->localHandshakeBlob();
+    }
+#endif
+    return AgentDesc{nixlBlob, std::move(regions), std::move(bounceHandshake)};
 }
 
 void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
@@ -787,6 +1015,15 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
     // Clean up remote VMM region info before invalidating the remote agent.
     mRemoteVramRegionInfo.erase(name);
+#ifdef TLLM_BOUNCE_V2
+    // Drop bounce credits and in-flight requests tied to this peer so it cannot retain receiver
+    // allocations or leave a sender request pending. forgetPeer also removes the handshake record;
+    // bounce re-engages only after a fresh loadRemoteAgent validates new metadata.
+    if (mBounce && mBounce->transport)
+    {
+        mBounce->transport->forgetPeer(name);
+    }
+#endif
     mRawAgent->invalidateRemoteMD(name);
 }
 
@@ -794,58 +1031,130 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::submitTransferRequests called after shutdown");
-    nixl_status_t status;
-    nixlXferReqH* handle;
 
-    // Local per-request copy: hasNotif / notifMsg vary per call; a shared mExtraParams
-    // would race between concurrent submits even under shared_lock.
-    nixl_opt_args_t reqParams = mExtraParams;
-    if (request.getSyncMessage().has_value())
+#ifdef TLLM_BOUNCE_V2
+    // Bounce fast path for many-small-desc VRAM writes (opt-in). Falls through to the standard
+    // NIXL path for everything else. The returned future resolves once every chunk is
+    // scattered+ACKed at the peer (or FAILURE) — never hangs. Admission is final: once a request
+    // enters bounce, a failure (peer loss / requestTimeoutMs) fails the transfer with no automatic
+    // fallback to the standard path — the dominant failure causes (dead peer, partition) would fail
+    // there too, and silent fallback would mask bounce-layer faults. Fallbacks happen only at
+    // admission time (this gate, unhandshaked peer, disabled/failed arena setup).
+    if (shouldUseBounce(request))
     {
-        reqParams.hasNotif = true;
-        reqParams.notifMsg = request.getSyncMessage().value();
+        mBounceSubmitCount.fetch_add(1, std::memory_order_relaxed);
+        // Debug-level so it's silent by default but lets ops confirm the bounce fast path actually
+        // engaged for a given write (enable via TLLM_LOG_LEVEL_BY_MODULE "debug:executor").
+        // Programmatic check: getBounceSubmitCount() / bounce_submit_count on the Python binding.
+        TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce path engaged for write to %s (%zu descs)", mName.c_str(),
+            request.getRemoteName().c_str(), request.getSrcDescs().getDescs().size());
+        auto fut = mBounce->transport->submit(request.getSrcDescs(), request.getDstDescs(), request.getRemoteName());
+        return std::make_unique<BounceTransferStatus>(std::move(fut));
     }
-    else
-    {
-        reqParams.hasNotif = false;
-    }
-    // Split transfer descriptors at VMM chunk boundaries to match registered memory.
-    // Both src and dst are split at chunk boundaries to ensure each descriptor
-    // falls within a single registered memory region on both local and remote sides.
-    // Find remote agent's VMM region map (empty map if not found).
+#endif
+
+    // Split transfer descriptors at VMM chunk boundaries to match registered memory, then coalesce
+    // contiguous pieces. A coalesced descriptor never crosses a chunk boundary or a registered
+    // region boundary on either side, so every descriptor still falls within a single registered
+    // memory region on both local and remote sides. Set TRTLLM_NIXL_DISABLE_COALESCE=1 to fall back
+    // to split-only descriptors. Find remote agent's region map (empty map if not found — e.g. the
+    // peer's AgentDesc carried no region info; addresses missing from a map are never coalesced,
+    // so an empty remote map degrades to split-only rather than risking merges across unknown
+    // remote chunk/registration boundaries).
     static VramRegionMap const kEmptyMap;
     auto remoteIt = mRemoteVramRegionInfo.find(request.getRemoteName());
     auto const& remoteRegionMap = (remoteIt != mRemoteVramRegionInfo.end()) ? remoteIt->second : kEmptyMap;
 
-    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
-        request.getSrcDescs(), request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap);
+    auto [xferSrc, xferDst] = VmmDescSplitter::splitAndCoalesceTransferDescs(request.getSrcDescs(),
+        request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap, !common::getEnvNixlDisableCoalesce());
 
-    // Coalesce contiguous memory regions to reduce transfer count (disabled by default)
-    // This matches the coalescing done during registerMemory()
-    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
-    if (common::getEnvNixlEnableCoalesce())
-    {
-        NVTX3_SCOPED_RANGE(coalesceTransferDescs_CreateXferReq);
-        auto [coalescedSrc, coalescedDst] = NixlHelper::coalesceTransferDescs(splitSrc, splitDst);
-        status
-            = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
-                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &reqParams);
-    }
-    else
-    {
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(splitSrc),
-            NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &reqParams);
-    }
-
-    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
-        " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s",
-        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(),
+    auto status = postXferRequest(request.getOp(), xferSrc, xferDst, request.getRemoteName(), request.getSyncMessage());
+    TLLM_CHECK_WITH_INFO(status != nullptr,
+        " rank: %d createXferReq failed (see warning above) selfname: %s remoteAgent name: %s", mRank, mName.c_str(),
         request.getRemoteName().c_str());
+    return status;
+}
+
+std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op, TransferDescs const& srcDescs,
+    TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage)
+{
+    // No mLock and no shutdown gate here: the public path already holds the shared lock, and the
+    // bounce IO thread (the other caller) is joined before agent teardown. mExtraParams is set once
+    // at construction and only read afterwards — its hasNotif is never set, so the no-notif case
+    // (every bounce chunk write, on the sub-ms pipeline) passes it directly without a copy. Only a
+    // notif-carrying call takes a local copy (hasNotif / notifMsg vary per call; mutating the shared
+    // mExtraParams would race between concurrent submits even under shared_lock).
+    nixl_opt_args_t notifParams;
+    nixl_opt_args_t const* reqParams = &mExtraParams;
+    if (syncMessage.has_value())
+    {
+        notifParams = mExtraParams;
+        notifParams.hasNotif = true;
+        notifParams.notifMsg = syncMessage.value();
+        reqParams = &notifParams;
+    }
+
+    nixl_status_t status;
+    nixlXferReqH* handle = nullptr;
+    {
+        NVTX3_SCOPED_RANGE(createXferReq);
+        status = mRawAgent->createXferReq(NixlHelper::convert(op), NixlHelper::convertXferDist(srcDescs),
+            NixlHelper::convertXferDist(dstDescs), remoteName, handle, reqParams);
+    }
+    if (status != NIXL_SUCCESS)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): createXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+            nixlEnumStrings::statusStr(status).c_str());
+        if (handle != nullptr)
+        {
+            (void) mRawAgent->releaseXferReq(handle);
+        }
+        return nullptr;
+    }
     {
         NVTX3_SCOPED_RANGE(postXferReq);
-        status = mRawAgent->postXferReq(handle, &reqParams);
+        status = mRawAgent->postXferReq(handle, reqParams);
+    }
+    if (status != NIXL_SUCCESS && status != NIXL_IN_PROG)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): postXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+            nixlEnumStrings::statusStr(status).c_str());
+        // The status object still owns the handle; its release()/dtor retries the backend release.
     }
     return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
+}
+
+bool NixlTransferAgent::registerRegionImpl(void* base, std::size_t bytes, int deviceId)
+{
+    nixl_reg_dlist_t list{VRAM_SEG};
+    list.addDesc(nixlBlobDesc{reinterpret_cast<uintptr_t>(base), bytes, static_cast<uint64_t>(deviceId)});
+    nixl_status_t const st = mRawAgent->registerMem(list);
+    if (st != NIXL_SUCCESS)
+    {
+        TLLM_LOG_WARNING(
+            "NixlTransferAgent(%s): registerMem failed: %s", mName.c_str(), nixlEnumStrings::statusStr(st).c_str());
+        return false;
+    }
+    return true;
+}
+
+void NixlTransferAgent::deregisterRegionImpl(void* base, std::size_t bytes, int deviceId)
+{
+    try
+    {
+        nixl_reg_dlist_t list{VRAM_SEG};
+        list.addDesc(nixlBlobDesc{reinterpret_cast<uintptr_t>(base), bytes, static_cast<uint64_t>(deviceId)});
+        nixl_status_t const st = mRawAgent->deregisterMem(list);
+        if (st != NIXL_SUCCESS)
+        {
+            TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem failed: %s", mName.c_str(),
+                nixlEnumStrings::statusStr(st).c_str());
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem threw: %s", mName.c_str(), e.what());
+    }
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
@@ -871,7 +1180,8 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
 
 ConnectionInfoType NixlTransferAgent::getLocalConnectionInfo()
 {
-    // mAddress is set in ctor and never mutated; no lock needed.
+    // mAddress is set in ctor and never mutated; no lock needed. This connection-info string does
+    // not contain the bounce handshake; callers that need bounce must also exchange AgentDesc.
     return mAddress;
 }
 
@@ -879,11 +1189,18 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
-    std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
-    std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
-        name.c_str());
+    // Bounce bootstrap is handled on the AgentDesc overload, which is the production path.
+    auto const separator = connectionInfo.rfind(':');
+    TLLM_CHECK_WITH_INFO(separator != std::string::npos,
+        "Invalid NIXL connection info, expected 'ip:port' or '[ipv6]:port': %s", connectionInfo.c_str());
+    std::string ip = connectionInfo.substr(0, separator);
+    std::string port = connectionInfo.substr(separator + 1);
+    if (ip.size() >= 2 && ip.front() == '[' && ip.back() == ']')
+    {
+        ip = ip.substr(1, ip.size() - 2);
+    }
+    TLLM_LOG_DEBUG(mRank, "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s",
+        connectionInfo.c_str(), name.c_str());
     TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
@@ -908,7 +1225,7 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mRank,
         "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s success status: %s",
         connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
@@ -933,6 +1250,17 @@ void NixlTransferAgent::shutdown() noexcept
         return;
     }
     TLLM_LOG_DEBUG("NixlTransferAgent::shutdown");
+
+#ifdef TLLM_BOUNCE_V2
+    // Stop the bounce transport first: its IO/scatter threads poll mRawAgent (getXferStatus),
+    // so they must be joined before the agent is torn down. Failing pending futures here means
+    // no submit() waiter hangs across shutdown.
+    if (mBounce && mBounce->transport)
+    {
+        mBounce->transport->shutdown();
+    }
+    mBounce.reset();
+#endif
 
     if (mRawAgent)
     {

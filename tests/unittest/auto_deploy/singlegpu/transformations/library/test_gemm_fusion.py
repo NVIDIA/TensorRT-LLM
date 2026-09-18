@@ -36,6 +36,7 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 torch.manual_seed(0)
 
 
+@pytest.mark.cpu_only
 def test_fuse_gemms_skips_linear_without_parameter_weight():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")

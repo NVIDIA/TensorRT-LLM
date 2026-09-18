@@ -1,12 +1,13 @@
 
 import java.lang.InterruptedException
 
-DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 def createKubernetesPodConfig(image, arch = "amd64")
 {
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     def podConfig = [
         cloud: "kubernetes-cpu",
@@ -19,6 +20,8 @@ def createKubernetesPodConfig(image, arch = "amd64")
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   - name: trt-llm
                     image: ${image}

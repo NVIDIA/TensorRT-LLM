@@ -266,6 +266,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         // For skip softmax
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
+        tllmRunnerParams.mSkipCorrThreshold = runnerParams.skipCorrectionThreshold;
 
         tllmRunnerParams.stream = runnerParams.stream;
         // Sparse context attention: reuse the generation-style kernel with per-token sparse indices.
@@ -273,11 +274,11 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // The kernel iterates over tokens via numCtasPerSeqQ when maxSeqLenQ > 1.
         if (mFixedParams.useTllmGenSparseAttention)
         {
-            bool const useDynamicSparseMLA = runnerParams.sparse_params.sparse_mla_topk_lens != nullptr;
+            bool const useDynamicSparseMLA = runnerParams.sparse_params.sparse_attn_kv_lens != nullptr;
             tllmRunnerParams.mSparseAttention
                 = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;
             tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.num_sparse_topk;
-            tllmRunnerParams.ptrSparseMlaTopKLens = runnerParams.sparse_params.sparse_mla_topk_lens;
+            tllmRunnerParams.ptrSparseMlaTopKLens = runnerParams.sparse_params.sparse_attn_kv_lens;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mUseGenKernelForPrefill = true;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;

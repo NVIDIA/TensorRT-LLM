@@ -26,6 +26,8 @@ from pydantic_settings import BaseSettings
 
 from tensorrt_llm._torch.auto_deploy.utils._config import DynamicYamlMixInForSettings
 
+pytestmark = pytest.mark.cpu_only
+
 
 class SimpleModel(BaseModel):
     """Simple model for testing."""

@@ -10,6 +10,7 @@ process groups.
 
 from __future__ import annotations
 
+import itertools
 import os
 from typing import Optional
 
@@ -18,6 +19,7 @@ from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl, SingleProcessGroup
+from tensorrt_llm._torch.distributed.communicator import Distributed, TorchDist
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -26,6 +28,29 @@ _DEVICE_MESH_DIM_ORDER_LEGACY = "cfg-tp-cp-ulysses"
 # Attention2D mesh: split CP into a 2D tile (cp_row × cp_col) so row/col
 # subgroups and seq flatten (cp_row, cp_col, ulysses) are well-defined.
 _DEVICE_MESH_DIM_ORDER_ATTN2D = "cfg-tp-cp_row-cp_col-ulysses"
+
+
+class _VisualGenAutotuneDist(TorchDist):
+    """Autotuner communicator whose collective spans the whole world.
+
+    VisualGen's device mesh has no TP axis over the tuned GEMMs (its parallelism
+    is on cfg/ulysses), so the mesh's tp group would gather a single rank. Gather
+    over the default world group instead, since every rank runs the transformer.
+    """
+
+    def __init__(self, mapping: Mapping):
+        # Skip TorchDist.__init__ on purpose: it registers a global comm
+        # singleton (set_torch_comm) and builds mesh/local subgroups via
+        # collectives — hijacking it here would clobber the real comm. The merge
+        # only needs a world-group all_gather (tp_cp_allgather below), which runs
+        # on the default group; Distributed.__init__ just records the mapping.
+        Distributed.__init__(self, mapping)
+        assert dist.is_initialized()
+
+    def tp_cp_allgather(self, obj: object) -> list[object]:
+        gathered: list[object] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, obj)
+        return gathered
 
 
 class VisualGenMapping(DeviceMeshTopologyImpl):
@@ -141,11 +166,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if self._use_attn2d_plane:
             cp_size = attn2d_size
-            if tp_size > 1:
-                raise NotImplementedError(
-                    "Combining Attention2D and TP is not yet supported. "
-                    "The row/col group construction does not account for TP ranks."
-                )
         else:
             cp_size = ring_size
 
@@ -393,6 +413,33 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         if self._rank in self._vae_ranks:
             self._vae_adj_groups = adj_groups
 
+    def flatten_cfg_ranks(self) -> list:
+        """Rank lists for the ulysses groups of a topology whose cfg dim is
+        flattened into ulysses.
+
+        One list per combined coordinate of every OTHER mesh dim (tp,
+        cp/cp_row/cp_col); within a list the cfg coordinate varies outermost and
+        ulysses innermost. Every non-(cfg, ulysses) group of the current mesh is
+        therefore preserved verbatim by a topology built from these lists.
+        Pure layout arithmetic — no process group is created, no state is held.
+        """
+        strides, acc = {}, 1
+        for d in reversed(self._dim_names):
+            strides[d] = acc
+            acc *= self._dim_sizes[d]
+        other_dims = [d for d in self._dim_names if d not in ("cfg", "ulysses")]
+        groups = []
+        for coords in itertools.product(*(range(self._dim_sizes[d]) for d in other_dims)):
+            base = sum(strides[d] * v for d, v in zip(other_dims, coords))
+            groups.append(
+                [
+                    base + strides["cfg"] * c + strides["ulysses"] * u
+                    for c in range(self._dim_sizes["cfg"])
+                    for u in range(self._dim_sizes["ulysses"])
+                ]
+            )
+        return groups
+
     # ------------------------------------------------------------------
     # Rank decomposition
     # ------------------------------------------------------------------
@@ -554,4 +601,13 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             world_size=self.tp_size,
             rank=self.tp_rank,
             tp_size=self.tp_size,
+        )
+
+    def to_autotuner_mapping(self) -> Mapping:
+        """Mapping that makes the autotuner treat all world ranks as one tuning
+        group (tp_size == world_size), so its post-tune cross-rank merge engages."""
+        return Mapping(
+            world_size=self.world_size,
+            rank=self._rank,
+            tp_size=self.world_size,
         )

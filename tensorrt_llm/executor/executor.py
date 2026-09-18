@@ -1,6 +1,8 @@
 import atexit
 import faulthandler
+import json
 import multiprocessing
+import os
 import platform
 import signal
 import traceback
@@ -19,7 +21,6 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
-from ..bindings import executor as tllm
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -41,6 +42,7 @@ from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
+    from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
     from .proxy import GenerationExecutorProxy
     from .worker import GenerationExecutorWorker
 
@@ -124,7 +126,6 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
@@ -156,7 +157,6 @@ class GenerationExecutor(ABC):
             prompt_token_ids,
             sampling_params=sampling_params,
             postproc_params=postproc_params,
-            query_token_ids=query_token_ids,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
@@ -180,7 +180,6 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: Union[List[int], List[List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]],
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[Union[LoRARequest, List[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
@@ -195,8 +194,6 @@ class GenerationExecutor(ABC):
 
         if unbatched:
             prompt_token_ids = [prompt_token_ids]
-            if query_token_ids:
-                query_token_ids = [query_token_ids]
 
         futures = []
         for i, p in enumerate(prompt_token_ids):
@@ -216,7 +213,6 @@ class GenerationExecutor(ABC):
             future = self.generate_async(
                 p,
                 sampling_params=sp,
-                query_token_ids=query_token_ids,
                 lora_request=lora_req,
                 prompt_adapter_request=pa_req,
                 streaming=False,
@@ -384,6 +380,28 @@ class GenerationExecutor(ABC):
     def shutdown(self):
         pass
 
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"start_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
+    def stop_profile(self) -> None:
+        """Stop runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"stop_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
     @property
     def resource_governor_queue(self):
         """Return the resource governor queue if this executor supports it."""
@@ -462,6 +480,16 @@ class GenerationExecutor(ABC):
     def get_disaggregated_params(self) -> dict:
         return {}
 
+    def get_cache_transceiver(self) -> Optional["KvCacheTransceiver"]:
+        return None
+
+    def get_data_transceiver_state(self) -> bytes:
+        return b""
+
+    def get_startup_metrics(self) -> dict | None:
+        """Return startup metrics, or ``None`` when temporarily unavailable."""
+        return {}
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,
@@ -471,7 +499,7 @@ class GenerationExecutor(ABC):
         tp_size: int,
     ):
         logger.warning(f"Orchestrator is creating Ray executor")
-        from .ray_executor import RayExecutor
+        from .ray.executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
                            model_world_size=model_world_size,
@@ -529,7 +557,6 @@ class GenerationExecutor(ABC):
     @staticmethod
     def create(
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
         world_size: int = 0,
@@ -560,9 +587,37 @@ class GenerationExecutor(ABC):
                 f"Using {postproc_worker_config.num_postprocess_workers} postprocess parallel processes.\n",
                 "green")
 
+        # Multi-frontend serving: attach to an already-running executor
+        # instead of launching one (set by trtllm-serve for attached
+        # frontend processes).
+        attach_env = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
+        if attach_env:
+            attach_info = json.loads(attach_env)
+            # Consumed: it carries the HMAC keys and must not leak into
+            # descendant processes.
+            os.environ.pop("TLLM_EXECUTOR_ATTACH_INFO", None)
+            if attach_info.get("mode") != "classic":
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO only supports the classic IPC "
+                    f"executor path, got mode={attach_info.get('mode')!r}")
+            from .proxy import GenerationExecutorFrontendProxy
+            frontend_id_env = os.getenv("TLLM_EXECUTOR_FRONTEND_ID")
+            if frontend_id_env is None:
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO is set but "
+                    "TLLM_EXECUTOR_FRONTEND_ID is not; both are set together "
+                    "by trtllm-serve when spawning attached frontends.")
+            frontend_id = int(frontend_id_env)
+            logger.info(f"Attaching executor frontend {frontend_id} to the "
+                        "running classic IPC worker")
+            return GenerationExecutorFrontendProxy(
+                attach_info,
+                frontend_id=frontend_id,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor)
+
         worker_kwargs = {
             "engine": engine,
-            "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
             "hf_model_dir": hf_model_dir,
             "tokenizer": tokenizer,

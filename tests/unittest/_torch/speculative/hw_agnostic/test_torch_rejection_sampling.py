@@ -2,10 +2,13 @@ import unittest
 from typing import cast
 
 import numpy as np
+import pytest
 import torch
 from scipy.stats import entropy
 
 from tensorrt_llm._torch.pyexecutor.sampler import get_rejected_indices, sample_rejected
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_get_rejected_indices():

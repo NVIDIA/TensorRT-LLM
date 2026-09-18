@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
@@ -102,19 +103,19 @@ void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int ran
     }
 }
 
-ncclDataType_t toNcclType(nvinfer1::DataType dataType)
+ncclDataType_t toNcclType(tensorrt_llm::DataType dataType)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT: return ncclFloat32;
-    case nvinfer1::DataType::kHALF: return ncclHalf;
-    case nvinfer1::DataType::kINT8: return ncclInt8;
-    case nvinfer1::DataType::kINT32: return ncclInt32;
-    case nvinfer1::DataType::kUINT8: return ncclUint8;
-    case nvinfer1::DataType::kINT64: return ncclInt64;
-    case nvinfer1::DataType::kFP8: return ncclUint8;
+    case tensorrt_llm::DataType::kFLOAT: return ncclFloat32;
+    case tensorrt_llm::DataType::kHALF: return ncclHalf;
+    case tensorrt_llm::DataType::kINT8: return ncclInt8;
+    case tensorrt_llm::DataType::kINT32: return ncclInt32;
+    case tensorrt_llm::DataType::kUINT8: return ncclUint8;
+    case tensorrt_llm::DataType::kINT64: return ncclInt64;
+    case tensorrt_llm::DataType::kFP8: return ncclUint8;
 #if ENABLE_BF16
-    case nvinfer1::DataType::kBF16: return ncclBfloat16;
+    case tensorrt_llm::DataType::kBF16: return ncclBfloat16;
 #endif // ENABLE_BF16
     default: TLLM_THROW("Unsupported data type: %d", static_cast<int>(dataType));
     }
@@ -123,7 +124,7 @@ ncclDataType_t toNcclType(nvinfer1::DataType dataType)
 } // namespace
 
 void NcclCommunicator::send(
-    void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
+    void const* sendbuff, size_t count, tensorrt_llm::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_NCCL_CHECK(ncclSend(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
@@ -133,7 +134,7 @@ void NcclCommunicator::send(
 }
 
 void NcclCommunicator::receive(
-    void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
+    void* sendbuff, size_t count, tensorrt_llm::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));

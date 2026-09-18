@@ -19,6 +19,18 @@ import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
 
+pytestmark = pytest.mark.cpu_only
+
+
+EMULATED_DEVICE_COUNT = 3
+
+
+@pytest.fixture
+def patch_device_count():
+    # Make the default value of LlmArgs.gpus_per_node solvable without probing hardware
+    with patch("tensorrt_llm.llmapi.llm.get_device_count", return_value=EMULATED_DEVICE_COUNT):
+        yield
+
 
 def test_custom_values():
     """Test that AutoDeploy LlmArgs correctly accepts custom values."""
@@ -121,7 +133,7 @@ def test_config_params():
         "skip_loading_weights": True,
         "max_seq_len": 19,
         "max_batch_size": 128,
-        "world_size": 3,
+        "world_size": EMULATED_DEVICE_COUNT,
         "transforms": {
             "detect_sharding": {
                 "stage": "sharding",
@@ -163,6 +175,7 @@ def test_config_flow(
     extra_kwargs,
     expected_executor_call,
     test_config_params,
+    patch_device_count,
 ):
     """Test that config flows correctly through both DemoLLM and LLM initialization."""
     # Mock the executor and its methods for DemoLLM
@@ -174,7 +187,7 @@ def test_config_flow(
     mock_seq_info.return_value = mock_seq_info_instance
 
     # Merge extra kwargs for the specific API
-    config_params = {**test_config_params, **extra_kwargs}
+    config_params = {**test_config_params, **extra_kwargs, "gpus_per_node": EMULATED_DEVICE_COUNT}
 
     # Create instance with appropriate mocking
     with patch.object(api_class, "_try_load_tokenizer", return_value=MagicMock()):
@@ -285,7 +298,6 @@ class TestSpeculativeConfigValidation:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model="some/model",
-            eagle3_one_model=True,
         )
         # Should not raise.
         args = LlmArgs(
@@ -300,7 +312,6 @@ class TestSpeculativeConfigValidation:
 
         spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         )
         # Should not raise.
         args = LlmArgs(
@@ -317,7 +328,6 @@ class TestSpeculativeConfigValidation:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model="some/model",
-            eagle3_one_model=True,
         )
 
         with pytest.raises(pydantic.ValidationError):
@@ -334,7 +344,6 @@ class TestSpeculativeConfigValidation:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model="some/model",
-            eagle3_one_model=True,
         )
 
         LlmArgs(
@@ -363,7 +372,7 @@ class TestSSMReplayValidation:
     def test_ssm_replay_with_spec_ok(self):
         from tensorrt_llm.llmapi import MTPDecodingConfig
 
-        spec_config = MTPDecodingConfig(num_nextn_predict_layers=3, mtp_eagle_one_model=True)
+        spec_config = MTPDecodingConfig(num_nextn_predict_layers=3)
         # Replay + spec is valid and must not raise.
         args = LlmArgs(
             model="test-model",

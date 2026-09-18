@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 from torch import nn
@@ -23,16 +23,16 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduce, MiniMaxAllReduceRMS
 from ..models.modeling_utils import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
@@ -104,6 +104,7 @@ class MiniMaxM2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         hidden_states_f32 = hidden_states.to(torch.float32)
@@ -113,6 +114,7 @@ class MiniMaxM2MoE(nn.Module):
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=False,
+            lora_params=lora_params,
         )
         return final_hidden_states
 
@@ -313,6 +315,7 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -326,12 +329,13 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
+        hidden_states = self.block_sparse_moe(hidden_states, attn_metadata, lora_params=lora_params)
         return hidden_states, residual
 
 
@@ -391,6 +395,7 @@ class MiniMaxM2Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                **kwargs,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -399,6 +404,13 @@ class MiniMaxM2Model(DecoderModel):
 
 @register_auto_model("MiniMaxM2ForCausalLM")
 class MiniMaxM2ForCausalLM(DecoderModelForCausalLM[MiniMaxM2Model, PretrainedConfig]):
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax M2."""
+        return "V2"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(
             MiniMaxM2Model(model_config),

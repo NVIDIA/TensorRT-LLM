@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -181,8 +182,11 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx
         = at::detail::empty_cuda({args.num_tokens * args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor permuted_idx_to_token_idx
-        = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt);
+    // Sized via getRouteMapAllocCount: the gemm1 cubins read one element past the end of the route
+    // map, see the comment on that helper.
+    at::Tensor permuted_idx_to_token_idx = at::detail::empty_cuda(
+        {tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getRouteMapAllocCount(max_num_padded_tokens)},
+        at::ScalarType::Int, routing_device, std::nullopt);
     // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
     // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
     // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
@@ -240,8 +244,9 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
         : btg::Dtype::Bfloat16;
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-        args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
-        expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
+        /* num_fused_shared_expert */ 0, args.n_group, args.topk_group, args.local_expert_offset,
+        args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
+        expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
         expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/,
         permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
         num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
@@ -307,13 +312,41 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     args.output = output.data_ptr();
     args.output_scale = nullptr;
 
-    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-        args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
+    // No autotuner: tile_tokens_dim selects the tile, then prefer the fine-grained runner when it has
+    // a valid config for this shape.
+    using MoeRunner = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
+    bool const useFineGrained = tensorrt_llm::common::getEnvUseFineGrainedSync();
 
-    auto const moeConfigIndex = moe_runner.getDefaultValidConfigIndex(
-        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
+    MoeRunner nlRunner(args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, /* useFineGrained */ false);
 
-    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
+    MoeRunner* moe_runner = nullptr;
+    int64_t moeConfigIndex = 0;
+    std::unique_ptr<MoeRunner> fineGrainedRunner;
+    if (useFineGrained)
+    {
+        try
+        {
+            fineGrainedRunner = std::make_unique<MoeRunner>(args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim,
+                /* useFineGrained */ true);
+            moeConfigIndex = fineGrainedRunner->getDefaultValidConfigIndex(
+                args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
+            moe_runner = fineGrainedRunner.get();
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_DEBUG(
+                "No valid FineGrained fp8 per-tensor config for tileN=%d: %s", (int) tile_tokens_dim, e.what());
+            moe_runner = nullptr;
+        }
+    }
+    if (moe_runner == nullptr)
+    {
+        moeConfigIndex = nlRunner.getDefaultValidConfigIndex(
+            args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
+        moe_runner = &nlRunner;
+    }
+
+    auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(args, moeConfigIndex);
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
         {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
     at::Tensor workspace_fc2 = at::detail::empty_cuda(
@@ -321,7 +354,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
+    moe_runner->run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
     return output;
 }
 } // namespace torch_ext

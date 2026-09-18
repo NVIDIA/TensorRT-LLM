@@ -1,6 +1,20 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -15,12 +29,12 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -29,19 +43,19 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
+                             MoEWeightLoadingMode, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
@@ -1134,6 +1148,21 @@ class LlamaModel(DecoderModel):
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Llama."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
+
     def __init__(
         self,
         model_config: ModelConfig[LlamaConfig],
@@ -1498,6 +1527,22 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Llama4."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver for Llama4 NIXL disaggregated serving."""
+        return "PYTHON"
+
     def __init__(
         self,
         model_config: ModelConfig[Llama4Config],
@@ -1517,7 +1562,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             self.mm_encoder = Llama4VisionEncoder(full_model_config)
 
         # Surface the in-vocab image placeholder to the model engine's
-        # ``_prepare_multimodal_indices`` so it selects the ``torch.isin``
+        # ``runners.prepare_multimodal_indices`` so it selects the ``torch.isin``
         # predicate. Read from ``full_model_config`` (the top-level Llama4Config
         # holds ``image_token_index``; the text-only swapped config above does
         # not).
@@ -1606,7 +1651,11 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
-@register_auto_model("MistralForCausalLM")
+# NOTE: deliberately NOT decorated with @register_auto_model: the
+# "MistralForCausalLM" architecture is owned by modeling_mistral (which, under
+# the previous eager import order, always overwrote this legacy registration).
+# With the model zoo imported lazily, a duplicate registration here would make
+# the resolved class depend on import order.
 class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
     def __init__(

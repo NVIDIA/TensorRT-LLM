@@ -26,6 +26,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cfloat>
 #include <string>
 
@@ -167,7 +168,7 @@ template <typename T>
 bool tensorHasInvalid(ITensor const& tensor, BufferManager const& manager, std::string const& infoStr)
 {
     printLogitsKeyInfo<T>(tensor, infoStr);
-    auto foundInvalid = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    auto foundInvalid = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
     auto foundInvalidPtr = bufferCast<int32_t>(*foundInvalid);
     foundInvalidPtr[0] = 0;
     auto const size = tensor.getSize();
@@ -184,24 +185,24 @@ template bool tensorHasInvalid<__nv_fp8_e4m3>(
     ITensor const& tensor, BufferManager const& manager, std::string const& infoStr);
 
 bool tensorHasInvalid(
-    size_t M, size_t K, nvinfer1::DataType type, void const* data, cudaStream_t stream, std::string const& infoStr)
+    size_t M, size_t K, tensorrt_llm::DataType type, void const* data, cudaStream_t stream, std::string const& infoStr)
 {
     auto tensorView = ITensor::wrap(
         const_cast<void*>(data), type, ITensor::makeShape({static_cast<int32_t>(M), static_cast<int32_t>(K)}));
     auto manager = BufferManager(std::make_shared<CudaStream>(stream));
-    if (type == nvinfer1::DataType::kFLOAT)
+    if (type == tensorrt_llm::DataType::kFLOAT)
     {
         return tensorHasInvalid<float>(*tensorView, manager, infoStr);
     }
-    else if (type == nvinfer1::DataType::kHALF)
+    else if (type == tensorrt_llm::DataType::kHALF)
     {
         return tensorHasInvalid<half>(*tensorView, manager, infoStr);
     }
-    else if (type == nvinfer1::DataType::kBF16)
+    else if (type == tensorrt_llm::DataType::kBF16)
     {
         return tensorHasInvalid<__nv_bfloat16>(*tensorView, manager, infoStr);
     }
-    else if (type == nvinfer1::DataType::kFP8)
+    else if (type == tensorrt_llm::DataType::kFP8)
     {
         return tensorHasInvalid<__nv_fp8_e4m3>(*tensorView, manager, infoStr);
     }

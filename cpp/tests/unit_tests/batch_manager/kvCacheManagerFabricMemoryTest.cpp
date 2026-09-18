@@ -20,8 +20,8 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <gtest/gtest.h>
@@ -108,7 +108,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsFallbackWhenFabricUnsupporte
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, 0);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, 0);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -147,7 +147,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsWithFabricMemory)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, 0);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, 0);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getMaxNumBlocks(), blocksInPrimaryPool);
@@ -191,7 +191,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, OffloadOnboardRoundTripWithFabricPrimary)
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
         blocksPerWindow, maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, 0);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, 0);
     blockManager.allocatePools(false);
 
     auto primaryPoolPtr = blockManager.getPrimaryPool(0);
@@ -207,7 +207,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, OffloadOnboardRoundTripWithFabricPrimary)
 
     // Drive the primary block allocator through addSequenceBatch.
     SizeType32 constexpr maxNewTokens{0};
-    tr::SamplingConfig const samplingConfig{beamWidth};
+    tensorrt_llm::executor::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
 
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
@@ -292,7 +292,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, ReleasePoolsClearsFabricMemory)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, 0);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, 0);
 
     size_t freeBefore = 0;
     size_t freeAfterAlloc = 0;

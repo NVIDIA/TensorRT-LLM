@@ -157,7 +157,10 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
             f"Cannot map {key} with shape {tuple(t.shape)} onto the dense "
             f"in_proj layout ({rows} rows expected)")
 
-    def preprocess_weights(self, weights: dict) -> dict:
+    def preprocess_weights(self,
+                           weights: dict,
+                           allow_partial_loading: bool = False) -> dict:
+        _ = allow_partial_loading
         config = self.config.pretrained_config
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank

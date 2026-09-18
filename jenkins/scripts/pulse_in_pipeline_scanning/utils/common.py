@@ -33,6 +33,7 @@ def is_permissive(licenses: list, license_check_token: str) -> dict:
             "https://nspect.nvidia.com/pm/api/v1.0/public/osrb/license/status",
             headers=headers,
             data=json.dumps({"licenses": licenses}),
+            timeout=180,
         )
         if response:
             resp = response.json()

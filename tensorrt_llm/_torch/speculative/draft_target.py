@@ -29,10 +29,8 @@ from torch import nn
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import TorchSampler
+from ..attention.backends import AttentionMetadata
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DraftTargetDecodingConfig
@@ -61,6 +59,9 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             device="cuda",
         )
 
+    def dp_num_tokens(self) -> int:
+        return self.num_tokens - self.num_generations * self.runtime_draft_len
+
     def prepare(self):
         """Prepare the metadata before model forward."""
         assert self.request_ids is not None
@@ -70,20 +71,9 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
-        self.num_tokens -= self.num_generations * self.runtime_draft_len
+        self.num_tokens = self.dp_num_tokens()
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
-
-
-class DraftTargetOneModelSampler(MTPSampler):
-    """
-    Sampler for DraftTarget one-model speculative decoding.
-
-    Inherits from MTPSampler to reuse the speculative decoding sampling logic.
-    """
-
-    def __init__(self, args: TorchSampler.Args):
-        super().__init__(args, nextn=args.max_draft_len)
 
 
 class DraftTargetOneModelWorker(SpecWorkerBase):
@@ -153,7 +143,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
 
         attn_metadata.update_for_spec_dec()
 
-    def forward(
+    def _forward_impl(
         self,
         input_ids,
         position_ids,
@@ -257,10 +247,14 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
                 )
                 if self.guided_decoder is not None:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    self.guided_decoder.execute_draft_batch(logits, d2t, draft_step=i)
+                    self.guided_decoder.execute_draft_batch(logits, self._d2t, draft_step=i)
 
-                new_draft_token = self.draft_decoder(logits, draft_model)
+                new_draft_token = self.sample_draft_tokens(
+                    logits,
+                    spec_metadata,
+                    batch_size,
+                    draft_step=i,
+                )
                 next_draft_tokens.append(new_draft_token)
 
                 # Update inputs and metadata for next draft step
@@ -313,36 +307,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
-
-    def sample_and_accept_draft_tokens(
-        self,
-        logits: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        spec_metadata: DraftTargetOneModelSpecMetadata,
-    ):
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
-        runtime_draft_len = spec_metadata.runtime_draft_len
-
-        if spec_metadata.draft_tokens is None:
-            draft_tokens = torch.zeros(
-                (num_gens, runtime_draft_len), dtype=torch.int, device=logits.device
-            )
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, runtime_draft_len)
-
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata
-        )
-
-    def draft_decoder(
-        self,
-        logits: torch.Tensor,
-        draft_model: nn.Module,
-    ):
-        d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
 
     def prepare_1st_drafter_inputs(
         self,

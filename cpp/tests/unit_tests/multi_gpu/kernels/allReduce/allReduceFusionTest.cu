@@ -25,6 +25,7 @@
 #include <random>
 #include <vector>
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/quantization.h"
@@ -235,28 +236,28 @@ template <>
 struct DTypeTraits<half>
 {
     static constexpr ncclDataType_t kNCCLDataType = ncclFloat16;
-    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kHALF;
+    static constexpr tensorrt_llm::DataType kTRTDataType = tensorrt_llm::DataType::kHALF;
 };
 
 template <>
 struct DTypeTraits<__nv_bfloat16>
 {
     static constexpr ncclDataType_t kNCCLDataType = ncclBfloat16;
-    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kBF16;
+    static constexpr tensorrt_llm::DataType kTRTDataType = tensorrt_llm::DataType::kBF16;
 };
 
 template <>
 struct DTypeTraits<float>
 {
     static constexpr ncclDataType_t kNCCLDataType = ncclFloat32;
-    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kFLOAT;
+    static constexpr tensorrt_llm::DataType kTRTDataType = tensorrt_llm::DataType::kFLOAT;
 };
 
 template <typename DType, ar_fusion::AllReduceFusionPattern Pattern>
 class TestRunner
 {
     static constexpr ncclDataType_t kNCCLDataType = DTypeTraits<DType>::kNCCLDataType;
-    static constexpr nvinfer1::DataType kTRTDataType = DTypeTraits<DType>::kTRTDataType;
+    static constexpr tensorrt_llm::DataType kTRTDataType = DTypeTraits<DType>::kTRTDataType;
     static constexpr bool kFP4QuantOutSupport = !std::is_same_v<DType, float>;
     static_assert(kFP4QuantOutSupport || Pattern != ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant,
         "kARResidualRMSNormFP4Quant is not supported for float dtype");

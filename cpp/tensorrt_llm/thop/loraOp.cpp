@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,9 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
+#include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/lora/loraGroupGEMMParamFillRowReorderFusion.h"
 #include "tensorrt_llm/kernels/selectiveScan/selectiveScan.h"
@@ -39,6 +41,11 @@ enum class RequestType : int32_t
     kCONTEXT = 0,
     kGENERATION = 1
 };
+
+bool loraGroupedGemmSupportsFp8(int64_t smVersion)
+{
+    return tk::supportsFp8GroupedGemm(static_cast<int>(smVersion));
+}
 
 int64_t getNumTokens(th::Tensor const& input)
 {
@@ -151,12 +158,15 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     {
         outHiddenSizes[i] = output_hidden_sizes[i];
     }
-    nvinfer1::DataType loraRuntimeDataType;
+    tensorrt_llm::DataType loraRuntimeDataType;
     switch (input.scalar_type())
     {
-    case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
-    case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
-    default: throw std::invalid_argument("Invalid dtype, only supports float16, bfloat16");
+    case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
+    case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
+#ifdef ENABLE_FP8
+    case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
+#endif
+    default: throw std::invalid_argument("Invalid dtype, only supports float16, bfloat16, float8_e4m3fn");
     }
 
     auto mLoraImpl = std::make_shared<tensorrt_llm::kernels::LoraImpl>(
@@ -221,12 +231,16 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     auto* splitk_offsets_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(splitk_offsets.data_ptr()));
 
     // Get data type
-    nvinfer1::DataType loraRuntimeDataType;
+    tensorrt_llm::DataType loraRuntimeDataType;
     switch (dtype)
     {
-    case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
-    case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
-    default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
+    case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
+    case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
+#ifdef ENABLE_FP8
+    case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
+#endif
+    default:
+        TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got ", c10::toString(dtype));
     }
 
     int const minKnInt = std::max(1, static_cast<int>(minKN));
@@ -301,12 +315,16 @@ void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, /
     int32_t const module_count = static_cast<int32_t>(in_sizes.size(0));
 
     // Get data type info
-    nvinfer1::DataType loraRuntimeDataType;
+    tensorrt_llm::DataType loraRuntimeDataType;
     switch (dtype)
     {
-    case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
-    case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
-    default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
+    case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
+    case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
+#ifdef ENABLE_FP8
+    case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
+#endif
+    default:
+        TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got ", c10::toString(dtype));
     }
 
     int64_t const dtype_element_size = input.element_size();
@@ -348,6 +366,8 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("lora_grouped_gemm_supports_fp8", &tensorrt_llm::torch_ext::loraGroupedGemmSupportsFp8);
+
     m.def(
         "lora_grouped_gemm(Tensor input, "
         "Tensor host_request_types, "

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, Literal, Optional, Set, Union
 
 from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
@@ -140,7 +140,6 @@ class PerformanceOptions:
 
 
 class DecodingConfig(BaseModel):
-    medusa_choices: Optional[List[List[int]]] = None
     decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
 
     @field_validator("decoding_mode")
@@ -150,23 +149,10 @@ class DecodingConfig(BaseModel):
                           SpeculativeDecodingMode]) -> SpeculativeDecodingMode:
         return SpeculativeDecodingMode(value)
 
-    @model_validator(mode="after")
-    def validate_speculative_decoding(self) -> DecodingConfig:
-        if self.medusa_choices and self.decoding_mode != SpeculativeDecodingMode.MEDUSA:
-            raise RuntimeError(
-                "Attempting to use set Medusa choices with a non-Medusa engine."
-                " Verify that you are using a Medusa engine.")
-
-        return self
-
     def get_decoding_config(self) -> trtllm.DecodingConfig:
         """Create a populated TRT-LLM DecodingConfig."""
-        kwargs = {"decoding_mode": SPECULATIVE_MAP[self.decoding_mode]()}
-
-        if self.medusa_choices is not None:
-            kwargs["medusa_choices"] = self.medusa_choices
-
-        return trtllm.DecodingConfig(**kwargs)
+        return trtllm.DecodingConfig(
+            decoding_mode=SPECULATIVE_MAP[self.decoding_mode]())
 
 
 class ExecutorSettingsConfig(BaseModel):

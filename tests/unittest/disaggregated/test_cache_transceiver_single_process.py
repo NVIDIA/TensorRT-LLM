@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Single-process test for KVCacheManager (V1/V2) + KvCacheTransceiverV2.
 
 Uses threading + ThreadSafeDistributed to create KvCacheTransceiverV2 instances
@@ -10,11 +25,17 @@ import threading
 import uuid
 from types import SimpleNamespace
 
+# Do not inherit a NIC pin from the host: the selected interface may not exist
+# in the test container and would prevent the NIXL agent from initializing.
+os.environ.pop("UCX_NET_DEVICES", None)
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
-from dataclasses import dataclass
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import pytest
@@ -28,7 +49,7 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
@@ -36,17 +57,15 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
-# Reduce NIXL threads for unit test: default 8 threads per agent causes heavy
-# contention when creating multiple agents on a single GPU in the same process.
-os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 NUM_LAYERS = 4
+INDEXER_HEAD_DIM = 128
 NUM_KV_HEADS = 4  # 1 for MLA
 HEAD_DIM = 128
 TOKENS_PER_BLOCK = 8
@@ -158,7 +177,7 @@ class KvCacheConfigV2:
     disk_prefetch_num_reqs: int = 4
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
-    block_reuse_policy: str = "all_reusable"
+    block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     max_util_for_resume: float = 0.95
 
@@ -235,9 +254,13 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._pp_size
             self._s[key][self._pp_rank] = obj
-        self._s["barrier"].wait()
+        # Sync only the PP group that shares this tp_rank. With attention data parallelism
+        # each tp_rank is an independent instance that may run a different number of
+        # collectives, so a single global barrier would deadlock; a per-group one does not.
+        pp_barrier = self._s["pp_barriers"][self._tp_rank]
+        pp_barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        pp_barrier.wait()
         return result
 
     def tp_allgather(self, obj):
@@ -248,9 +271,11 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._tp_size
             self._s[key][self._tp_rank] = obj
-        self._s["barrier"].wait()
+        # Sync only the TP group that shares this pp_rank (see pp_allgather).
+        tp_barrier = self._s["tp_barriers"][self._pp_rank]
+        tp_barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        tp_barrier.wait()
         return result
 
 
@@ -303,8 +328,11 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    enable_indexer_k_cache: bool = False,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
 ) -> "KVCacheManager | KVCacheManagerV2":
     """Create a KVCacheManager (V1) or KVCacheManagerV2 for the given mapping."""
+    assert not (enable_indexer_k_cache and use_v2), "DSA indexer K cache is V1-only"
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
 
@@ -371,6 +399,10 @@ def _create_cache_manager(
             mapping=mapping,
             dtype=DataType.FLOAT,
             model_config=model_config,
+            enable_indexer_k_cache=enable_indexer_k_cache,
+            indexer_k_cache_quant_block_size=128,
+            indexer_k_cache_index_head_dim=INDEXER_HEAD_DIM if enable_indexer_k_cache else 0,
+            indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
         )
 
 
@@ -383,7 +415,9 @@ def _create_managers_for_instance(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
-) -> List:
+    enable_indexer_k_cache: bool = False,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
+) -> list[KVCacheManager | KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance."""
     managers = []
     for pp_rank in range(pp):
@@ -398,7 +432,14 @@ def _create_managers_for_instance(
             )
             managers.append(
                 _create_cache_manager(
-                    mapping, is_mla, use_v2, max_attention_window_vec, num_layers, max_batch_size
+                    mapping,
+                    is_mla,
+                    use_v2,
+                    max_attention_window_vec,
+                    num_layers,
+                    max_batch_size,
+                    enable_indexer_k_cache,
+                    indexer_k_cache_layer_mask,
                 )
             )
     return managers
@@ -413,7 +454,7 @@ def _init_pool_data_v1(
     is_mla: bool,
     fill_random: bool = True,
     seed_base: int = 1000,
-):
+) -> None:
     """Initialize pool data for V1 managers."""
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     for rank, mgr in enumerate(managers):
@@ -432,6 +473,30 @@ def _init_pool_data_v1(
             pool_tensor.copy_(random_values)
         else:
             pool_tensor.zero_()
+
+        if getattr(mgr, "enable_indexer_k_cache", False):
+            local_mask = mgr.indexer_k_cache_local_layer_mask
+            if local_mask is not None and not any(local_mask):
+                continue
+            # DSA indexer K is TP-replicated: seed by PP stage only so every
+            # TP rank of a stage holds identical bytes.
+            indexer_pool = mgr.impl.get_indexer_k_cache_pool().view(torch.uint8)
+            if fill_random:
+                generator = torch.Generator(device=indexer_pool.device).manual_seed(
+                    seed_base + 7000 + pp_rank
+                )
+                indexer_pool.copy_(
+                    torch.randint(
+                        0,
+                        256,
+                        indexer_pool.shape,
+                        dtype=torch.uint8,
+                        device=indexer_pool.device,
+                        generator=generator,
+                    )
+                )
+            else:
+                indexer_pool.zero_()
 
 
 def _init_pool_data_v2(
@@ -551,7 +616,15 @@ def create_instance_transceivers(
 ) -> List[KvCacheTransceiverV2]:
     """Create KvCacheTransceiverV2 for all ranks via threaded init."""
     world_size = tp * pp
-    shared = {"barrier": threading.Barrier(world_size), "lock": threading.Lock()}
+    shared = {
+        "barrier": threading.Barrier(world_size),
+        # Per-group barriers for the grouped collectives, so attention-DP instances can
+        # diverge in how many collectives they issue: pp_allgather syncs the PP ranks that
+        # share a tp_rank, tp_allgather the TP ranks that share a pp_rank.
+        "pp_barriers": [threading.Barrier(pp) for _ in range(tp)],
+        "tp_barriers": [threading.Barrier(tp) for _ in range(pp)],
+        "lock": threading.Lock(),
+    }
     results = [None] * world_size
     errors = [None] * world_size
     threads = []
@@ -751,7 +824,7 @@ def verify_all_requests(
         for layer_idx in range(num_layers):
             # Compute expected_valid: the number of non-stale blocks that
             # were actually transferred, using the same eviction formula as
-            # _create_kv_slice.  Only compare these blocks in verification.
+            # _create_chunk.  Only compare these blocks in verification.
             expected_valid = None
             win = layer_to_window.get(layer_idx)
             if win is not None and win < MAX_SEQ_LEN:
@@ -802,6 +875,95 @@ def verify_all_requests(
             )
 
 
+def _get_indexer_block_data(
+    managers: list[KVCacheManager],
+    request_id: int,
+    layer_idx: int,
+    num_layers: int,
+    pp: int,
+    tp: int,
+    enable_dp: bool,
+    req_idx: int,
+) -> torch.Tensor | None:
+    """Per-request indexer-K bytes for one global layer on the owning rank.
+
+    Indexer K is TP-replicated, so any TP rank of the layer's PP stage works;
+    with attention DP only the request's DP group holds the request.
+    """
+    pp_rank = _pp_rank_of_layer(layer_idx, num_layers, pp)
+    tp_rank = req_idx % tp if enable_dp else 0
+    owner = managers[pp_rank * tp + tp_rank]
+    block_indices = owner.get_batch_cache_indices([request_id], layer_idx)[0]
+    valid = [idx for idx in block_indices if idx >= 0]
+    if not valid:
+        return None
+    local_layer = layer_idx - _pp_layer_start(pp_rank, num_layers, pp)
+    local_mask = owner.indexer_k_cache_local_layer_mask
+    if local_mask is not None and not local_mask[local_layer]:
+        return None
+    # Pool shape: (numBlocks, numLayers, kvFactor, blockSize), dtype uint8.
+    pool = owner.impl.get_indexer_k_cache_pool().view(torch.uint8)
+    pool_layer = owner.impl.get_indexer_k_cache_pool_layer_idx(local_layer)
+    assert pool_layer >= 0
+    return pool[valid, pool_layer]
+
+
+def _verify_indexer_k_all_requests(
+    request_lengths: List[int],
+    ctx_managers: list[KVCacheManager],
+    gen_managers: list[KVCacheManager],
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    ctx_enable_dp: bool,
+    gen_enable_dp: bool,
+    ctx_request_ids: List[int],
+    gen_request_ids: List[int],
+    num_layers: int,
+) -> None:
+    """Compare the transferred DSA indexer K bytes for every request/layer."""
+    for req_idx, _req_len in enumerate(request_lengths):
+        for layer_idx in range(num_layers):
+            ctx_data = _get_indexer_block_data(
+                ctx_managers,
+                ctx_request_ids[req_idx],
+                layer_idx,
+                num_layers,
+                ctx_pp,
+                ctx_tp,
+                ctx_enable_dp,
+                req_idx,
+            )
+            gen_data = _get_indexer_block_data(
+                gen_managers,
+                gen_request_ids[req_idx],
+                layer_idx,
+                num_layers,
+                gen_pp,
+                gen_tp,
+                gen_enable_dp,
+                req_idx,
+            )
+            assert (ctx_data is None) == (gen_data is None), (
+                f"Indexer ownership mismatch at req={req_idx} layer={layer_idx}: "
+                f"ctx_present={ctx_data is not None} gen_present={gen_data is not None}"
+            )
+            if ctx_data is None:
+                continue
+            assert ctx_data.shape == gen_data.shape, (
+                f"Indexer shape mismatch at req={req_idx} layer={layer_idx}: "
+                f"ctx={ctx_data.shape} gen={gen_data.shape}"
+            )
+            torch.testing.assert_close(
+                gen_data,
+                ctx_data,
+                rtol=0,
+                atol=0,
+                msg=lambda m: (f"Indexer data mismatch at req={req_idx} layer={layer_idx}: {m}"),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Main test orchestrator
 # ---------------------------------------------------------------------------
@@ -817,7 +979,10 @@ def run_transfer_test(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     request_lengths: Optional[List[int]] = None,
-):
+    enable_indexer_k_cache: bool = False,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
+    expect_cpp_bounce: bool = False,
+) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
         request_lengths = REQUEST_LENGTHS
@@ -835,6 +1000,8 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        enable_indexer_k_cache,
+        indexer_k_cache_layer_mask,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -845,6 +1012,8 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        enable_indexer_k_cache,
+        indexer_k_cache_layer_mask,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -856,6 +1025,18 @@ def run_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
+        # Keep the Python-native bounce layer disabled by default (size 0).
+        # Dedicated C++ bounce coverage enables the NIXL agent's bounce v2 via
+        # agent_bounce_buffer_enable + kv_cache_bounce_size_mb plus
+        # agent_bounce_params, which exercises the config plumbing end-to-end.
+        kv_cache_bounce_size_mb=64 if expect_cpp_bounce else 0,
+        agent_bounce_buffer_enable=expect_cpp_bounce,
+        agent_bounce_params={
+            "min_descriptor_count": "1",
+            "max_average_descriptor_size": "1MB",
+        }
+        if expect_cpp_bounce
+        else None,
     )
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
@@ -973,6 +1154,37 @@ def run_transfer_test(
             max_attention_window_vec=max_attention_window_vec,
             num_layers=num_layers,
         )
+        if enable_indexer_k_cache:
+            _verify_indexer_k_all_requests(
+                request_lengths=request_lengths,
+                ctx_managers=ctx_managers,
+                gen_managers=gen_managers,
+                ctx_tp=ctx_tp,
+                ctx_pp=ctx_pp,
+                gen_tp=gen_tp,
+                gen_pp=gen_pp,
+                ctx_enable_dp=ctx_enable_dp,
+                gen_enable_dp=gen_enable_dp,
+                ctx_request_ids=ctx_request_ids,
+                gen_request_ids=gen_request_ids,
+                num_layers=num_layers,
+            )
+
+        # Programmatic bounce check (no log parsing): every agent must have the C++
+        # bounce v2 transport active, and at least one transfer must have been routed
+        # through it (only KV senders submit WRITEs, so we assert on the total).
+        if expect_cpp_bounce:
+            # The shared capacity must be routed to exactly one implementation: with
+            # agent_bounce_buffer_enable the Python-native bounce stays off.
+            assert all(tc._transfer_worker._config.bounce is None for tc in ctx_tcs + gen_tcs), (
+                "Python-native bounce must stay disabled when the C++ agent bounce is selected"
+            )
+            agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
+            assert all(getattr(agent, "bounce_enabled", False) for agent in agents), (
+                "C++ bounce v2 transport is not active on every NIXL agent"
+            )
+            total_bounce_submits = sum(agent.bounce_submit_count for agent in agents)
+            assert total_bounce_submits > 0, "no transfer was routed through the bounce fast path"
 
         # 9. Cleanup
         if use_v2:
@@ -1295,6 +1507,128 @@ def test_cache_transceiver_boundary_lengths(
     )
 
     print("PASSED")
+
+
+# DSA (DeepSeek V3.2) indexer K cache: V1-only, MLA, TP-replicated single
+# index head. Covers the REPLICATED pool view end to end through the real
+# python transceiver: fan-in owner election, fan-out, and PP layer subsets
+# (layer-strided ReplicatedMapper offsets).
+DSA_INDEXER_CONFIGS = [
+    # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_dp, gen_dp, test_id)
+    (1, 1, 1, 1, False, False, "tp1_to_tp1"),
+    (2, 1, 1, 1, False, False, "tp2_to_tp1_fanin"),
+    (1, 1, 2, 1, False, False, "tp1_to_tp2_fanout"),
+    (1, 2, 1, 1, False, False, "pp2_to_pp1"),
+    (1, 1, 1, 2, False, False, "pp1_to_pp2"),
+    (2, 2, 1, 1, False, False, "tp2pp2_to_tp1"),
+    (2, 1, 2, 1, False, True, "tp2_to_dep2"),
+]
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp",
+    [c[:6] for c in DSA_INDEXER_CONFIGS],
+    ids=[c[6] for c in DSA_INDEXER_CONFIGS],
+)
+def test_cache_transceiver_v1_dsa_indexer(
+    ctx_tp,
+    ctx_pp,
+    gen_tp,
+    gen_pp,
+    ctx_enable_dp,
+    gen_enable_dp,
+):
+    """V1 KVCacheManager + DSA indexer K cache through KvCacheTransceiverV2."""
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=True,
+        use_v2=False,
+        enable_indexer_k_cache=True,
+    )
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
+    """Transfer a masked DSA indexer cache from CTX PP2 to GEN PP1.
+
+    CTX rank 0 is fully masked while rank 1 owns both indexer rows. This
+    exercises the real ``KvCacheTransceiverV2`` path where the representative
+    sender page table has no REPLICATED view but the receiver does.
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=2,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=False,
+        request_lengths=[30],
+        enable_indexer_k_cache=True,
+        indexer_k_cache_layer_mask=[False, False, True, True],
+    )
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    (
+        "ctx_tp",
+        "ctx_pp",
+        "gen_tp",
+        "gen_pp",
+        "is_mla",
+        "use_v2",
+        "enable_indexer_k_cache",
+    ),
+    [
+        pytest.param(1, 1, 1, 1, False, True, False, id="v2_mha"),
+        pytest.param(2, 1, 2, 1, True, True, False, id="v2_mla_tp2"),
+        pytest.param(1, 1, 1, 1, True, False, True, id="v1_dsa_indexer"),
+        pytest.param(2, 1, 1, 2, False, True, False, id="v2_ctx_tp2_gen_pp2"),
+    ],
+)
+def test_python_nixl_cache_transceiver_uses_cpp_bounce(
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    is_mla: bool,
+    use_v2: bool,
+    enable_indexer_k_cache: bool,
+) -> None:
+    """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
+
+    Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb) and tuned
+    (agent_bounce_params) via CacheTransceiverConfig inside run_transfer_test, covering
+    the config plumbing end-to-end; engagement is asserted programmatically there
+    (agent.bounce_enabled / bounce_submit_count).
+    """
+    # BindingsNixlTransferStatus.last_status_str() resolves this exact attribute on the C++
+    # status; if the binding name drifts, failure details silently degrade to "<unavailable>".
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus
+
+    assert hasattr(TransferStatus, "get_last_status_str")
+
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=is_mla,
+        use_v2=use_v2,
+        request_lengths=[30, 60],
+        enable_indexer_k_cache=enable_indexer_k_cache,
+        expect_cpp_bounce=True,
+    )
 
 
 if __name__ == "__main__":

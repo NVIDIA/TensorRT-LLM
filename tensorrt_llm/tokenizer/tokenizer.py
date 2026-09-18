@@ -40,8 +40,12 @@ except ImportError:
 
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
-    "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
-    "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "deepseek_v32":
+    "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4":
+    "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "mistral_common":
+    "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer.MistralTokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
@@ -60,6 +64,12 @@ except ImportError:
 
 class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
+
+    def __repr__(self) -> str:
+        # PreTrainedTokenizerBase.__repr__ reads properties (e.g.
+        # added_tokens_decoder) that TokenizerBase subclasses are not
+        # required to implement, so fall back to a class-name-only repr.
+        return f"{self.__class__.__name__}()"
 
 
 def _reconstruct_transformers_tokenizer(inner_bytes: bytes):
@@ -289,18 +299,22 @@ class TransformersTokenizer(TokenizerBase):
             tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                       **kwargs)
         except Exception as e:
-            # Two transformers 5.x regressions for model_types not registered
-            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
-            # tokenizer.json directly and skips AutoConfig, so it sidesteps
-            # both:
+            # Three transformers 5.x regressions for model_types not
+            # registered in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps all
+            # three:
             #  - deepseek_v32: bare PreTrainedConfig fallback hits
             #    modeling_rope_utils → self.max_position_embeddings →
             #    AttributeError (PreTrainedConfig is now a dataclass with
             #    declared fields). See deepseek-ai/DeepSeek-V3#1207.
             #  - glm_moe_dsa: layer_types=['deepseek_sparse_attention', ...] is
             #    rejected by validate_layer_type (not in ALLOWED_LAYER_TYPES).
+            #  - nemotron_h: layers_block_type carries the transformers 5.13
+            #    vocabulary, rejected by validate_layers_block_type.
             msg = str(e)
-            if "max_position_embeddings" not in msg and "layer_types" not in msg:
+            if ("max_position_embeddings" not in msg
+                    and "layer_types" not in msg
+                    and "layers_block_type" not in msg):
                 raise
             tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
                                                     **kwargs)
@@ -720,6 +734,7 @@ def load_custom_tokenizer(
     model_dir: Union[str, Path],
     trust_remote_code: bool = True,
     use_fast: bool = True,
+    **kwargs,
 ) -> TokenizerBase:
     """Load a custom tokenizer class by import path or alias.
 
@@ -730,14 +745,27 @@ def load_custom_tokenizer(
         model_dir: The model directory to load the tokenizer from.
         trust_remote_code: Whether to trust remote code.
         use_fast: Whether to use the fast tokenizer.
+        **kwargs: Forwarded to the tokenizer class's `from_pretrained`
+            (e.g. `padding_side`).
 
     Returns:
         An instance of the custom tokenizer class.
 
     Raises:
-        ValueError: If the tokenizer cannot be loaded due to invalid identifier,
-            import failure, or missing class.
+        ValueError: If the identifier is neither a registered alias nor a
+            dotted import path, or if the tokenizer cannot be loaded due to
+            an import failure or a missing class.
     """
+    # A dotless identifier that is not a registered alias would otherwise
+    # be split as an import path and fail inside `rsplit` with an unhelpful
+    # "not enough values to unpack"; name the actual problem instead.
+    if (tokenizer_identifier not in TOKENIZER_ALIASES
+            and '.' not in tokenizer_identifier):
+        raise ValueError(
+            f"Failed to load custom tokenizer '{tokenizer_identifier}': "
+            f"unknown alias. Known aliases: {sorted(TOKENIZER_ALIASES)}. "
+            "Expected format: 'module.path.ClassName' or a recognized alias.")
+
     # Resolve aliases to full import paths
     import_path = TOKENIZER_ALIASES.get(tokenizer_identifier,
                                         tokenizer_identifier)
@@ -747,7 +775,10 @@ def load_custom_tokenizer(
         module = importlib.import_module(module_path)
         tokenizer_class = getattr(module, class_name)
         return tokenizer_class.from_pretrained(
-            model_dir, trust_remote_code=trust_remote_code, use_fast=use_fast)
+            model_dir,
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
     except (ValueError, ImportError, AttributeError) as e:
         raise ValueError(
             f"Failed to load custom tokenizer '{tokenizer_identifier}': {e}. "

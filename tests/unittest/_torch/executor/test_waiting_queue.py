@@ -21,6 +21,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaiti
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
 
+pytestmark = pytest.mark.cpu_only
+
 
 def create_mock_request_item(request_id: int) -> RequestQueueItem:
     """Create a mock RequestQueueItem for testing."""

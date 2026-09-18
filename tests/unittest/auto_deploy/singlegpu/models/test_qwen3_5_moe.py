@@ -1685,6 +1685,7 @@ class _DummyQwenBaseProcessor:
         return self._token_ids, {}
 
 
+@pytest.mark.cpu_only
 def test_qwen_ad_input_processor_duplicates_video_hashes_per_frame_span():
     config = _make_small_composite_config()
     merge = config.vision_config.spatial_merge_size
@@ -1714,6 +1715,7 @@ def test_qwen_ad_input_processor_duplicates_video_hashes_per_frame_span():
     assert multimodal_input.multimodal_hashes[0] == multimodal_input.multimodal_hashes[1]
 
 
+@pytest.mark.cpu_only
 def test_qwen_ad_input_processor_preserves_video_item_order_across_frame_spans():
     config = _make_small_composite_config()
     merge = config.vision_config.spatial_merge_size

@@ -28,7 +28,7 @@
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <gmock/gmock-matchers.h>
 #include <gmock/gmock.h>
@@ -78,7 +78,7 @@ protected:
 
     void SetUp() override
     {
-        mModelConfig = std::make_unique<ModelConfig>(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+        mModelConfig = std::make_unique<ModelConfig>(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
         mModelConfig->setMlpHiddenSize(32);
         mWorldConfig = std::make_unique<WorldConfig>(2, 1, 1, 0);
         std::vector<LoraModule> modules{
@@ -101,7 +101,7 @@ protected:
         mManager = std::make_unique<BufferManager>(mStream);
 
         auto pageConfig = LoraCachePageManagerConfig(
-            runtime::MemoryType::kCPU, nvinfer1::DataType::kFLOAT, 2 * 8, 6, 64, 4 * 16, 1);
+            runtime::MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 2 * 8, 6, 64, 4 * 16, 1);
         pageConfig.setInitToZero(true);
         auto pageConfig2 = pageConfig;
         pageConfig2.setInitToZero(true);
@@ -125,7 +125,7 @@ TEST_F(LoraCacheTest, LoraCachePageManagerTest)
     auto pageShape = ITensor::makeShape({maxAdapterSize, maxAdapterWeights});
 
     LoraCachePageManagerConfig config(
-        runtime::MemoryType::kCPU, nvinfer1::DataType::kFLOAT, 8, 6, maxAdapterSize, maxAdapterWeights, 1);
+        runtime::MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 8, 6, maxAdapterSize, maxAdapterWeights, 1);
     LoraCachePageManager manager(config, *mManager);
 
     auto block0 = manager.blockPtr(0);
@@ -182,11 +182,11 @@ TEST_F(LoraCacheTest, LoraCachePageManagerTest)
 
 TEST_F(LoraCacheTest, determineNumPages)
 {
-    ModelConfig modelConfig(0, 2, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
+    ModelConfig modelConfig(0, 2, 2, 0, 1, 4, tensorrt_llm::DataType::kFLOAT);
     modelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2, 0));
     WorldConfig worldConfig(1, 1, 1, 0);
 
-    LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, nvinfer1::DataType::kFLOAT, 12393, 40, 80, 16, 1);
+    LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 12393, 40, 80, 16, 1);
 
     LoraCache cache(pageConfig, modelConfig, worldConfig, *mManager);
 
@@ -374,7 +374,7 @@ TEST_F(LoraCacheTest, basicPutGet)
 
 TEST_F(LoraCacheTest, splitTransposeCpu)
 {
-    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
     auto worldConfig = WorldConfig(2, 1, 1, 0);
 
     SizeType32 const split{2};
@@ -391,8 +391,8 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
         auto const outputShape = ITensor::makeShape({batchSize, inputLength / split});
 
         auto inputTensor = mManager->copyFrom(input, inputShape, MemoryType::kCPU);
-        auto outputTensorRank0 = mManager->cpu(outputShape, nvinfer1::DataType::kINT32);
-        auto outputTensorRank1 = mManager->cpu(outputShape, nvinfer1::DataType::kINT32);
+        auto outputTensorRank0 = mManager->cpu(outputShape, tensorrt_llm::DataType::kINT32);
+        auto outputTensorRank1 = mManager->cpu(outputShape, tensorrt_llm::DataType::kINT32);
         mManager->setZero(*outputTensorRank0);
         mManager->setZero(*outputTensorRank1);
 
@@ -416,8 +416,8 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
         auto const outputShape = ITensor::makeShape({batchSize, inputLength / split});
 
         auto inputTensor = mManager->copyFrom(input, inputShape, MemoryType::kCPU);
-        auto outputTensorRank0 = mManager->cpu(outputShape, nvinfer1::DataType::kINT32);
-        auto outputTensorRank1 = mManager->cpu(outputShape, nvinfer1::DataType::kINT32);
+        auto outputTensorRank0 = mManager->cpu(outputShape, tensorrt_llm::DataType::kINT32);
+        auto outputTensorRank1 = mManager->cpu(outputShape, tensorrt_llm::DataType::kINT32);
         mManager->setZero(*outputTensorRank0);
         mManager->setZero(*outputTensorRank1);
 
@@ -438,7 +438,7 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
 TEST_P(LoraCacheTest, copyToPages_tp1)
 {
     bool const isDora = GetParam();
-    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(1, 1, 1, 0);
     std::vector<LoraModule> modules{
@@ -501,7 +501,7 @@ TEST_P(LoraCacheTest, copyToPages_tp1)
 TEST_P(LoraCacheTest, copyToPages_tp2_rank0)
 {
     bool const isDora = GetParam();
-    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(2, 1, 1, 0);
     std::vector<LoraModule> modules{
@@ -562,7 +562,7 @@ TEST_P(LoraCacheTest, copyToPages_tp2_rank0)
 TEST_P(LoraCacheTest, copyToPages_tp2_rank1)
 {
     bool const isDora = GetParam();
-    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(2, 1, 1, 1);
     std::vector<LoraModule> modules{

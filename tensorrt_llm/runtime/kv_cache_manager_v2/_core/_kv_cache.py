@@ -16,7 +16,7 @@
 import array
 import enum
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -37,6 +37,7 @@ from .._common import (
     CudaStream,
     PageIndex,
     PageIndexMode,
+    PageStatus,
     Priority,
     TokenIdExt,
 )
@@ -56,13 +57,17 @@ from .._page import (
     CommittedPage,
     Page,
     ScratchSlotLock,
-    SsmCommittedPage,
     UncommittedPage,
     _PageHolder,
     _SharedPageLock,
     batched_lock_to_gpu,
 )
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
+from .._stats import (
+    CountsByLevel,
+    KVCacheIterationStatsDelta,
+    KVCacheStatsDelta,
+    ReusedBlocksByLevel,
+)
 from .._storage._core import Slot
 from .._storage_manager import StorageManager
 from .._utils import (
@@ -74,7 +79,6 @@ from .._utils import (
     filled_list,
     intersect,
     make_typed,
-    map_optional,
     stream_wait_events,
     to_typed,
     typed_enumerate,
@@ -82,7 +86,6 @@ from .._utils import (
     typed_map,
     typed_range,
     unwrap_optional,
-    unwrap_rawref,
     value_or,
 )
 from ._moving_average import Average
@@ -127,6 +130,58 @@ class SeqBlock:
     def __del__(self) -> None:
         self.tree_block = None
         self.pages.clear()
+
+
+class PlannedDropHandle:
+    """Track committed pages planned for dropping without owning them.
+
+    The handle stores weak references and does not keep pages alive. Dropping it
+    decrements each live page's planned-drop count and removes an already-droppable
+    page from eviction tracking when no plans remain.
+    """
+
+    __slots__ = ("_page_refs",)
+
+    _page_refs: tuple[rawref.ref[CommittedPage], ...] | None
+
+    def __init__(self, pages: Iterable[CommittedPage]) -> None:
+        planned_pages = tuple({id(page): page for page in pages}.values())
+        self._page_refs = tuple(rawref.ref(page) for page in planned_pages)
+        for page in planned_pages:
+            page.planned_drop_count += 1
+
+    def drop(self) -> None:
+        """Apply this drop plan and invalidate the handle.
+
+        A live page is removed from eviction tracking only when this is its final
+        plan and it is already droppable and queued for eviction. Calling this
+        method twice is invalid.
+        """
+        page_refs = self._page_refs
+        if page_refs is None:
+            raise RuntimeError("Planned drop handle has already been dropped")
+
+        pages = list[CommittedPage]()
+        for page_ref in page_refs:
+            page = page_ref()
+            if page is not None:
+                if page.planned_drop_count <= 0:
+                    raise RuntimeError("Committed page has no planned drop")
+                pages.append(page)
+
+        self._page_refs = None
+        for page in pages:
+            page.planned_drop_count -= 1
+            if (
+                page.planned_drop_count == 0
+                and page.status == PageStatus.DROPPABLE
+                and page.scheduled_for_eviction
+            ):
+                page.manager.exclude_from_eviction(page)
+
+    def __del__(self) -> None:
+        if self._page_refs is not None:
+            self.drop()
 
 
 class _Status(enum.Enum):
@@ -188,6 +243,10 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
+        "_cached_tokens_by_level",
+        "_last_cached_token_level",
+        "_num_reusable_tokens_before_hybrid_pruning",
+        "_num_reusable_tokens_before_pruning",
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
@@ -196,7 +255,9 @@ class _KVCache:
         "_ssm_blocks",
         "_never_resumed",
         "_enable_swa_scratch_reuse",
+        "_text_only",
         "_scratch_slots",
+        "_enable_request_stats",
         "_pending_stats",
         "__rawref__",
     )
@@ -222,6 +283,12 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
+    # Initial current-residency provenance, observed while the reused pages are held.
+    _cached_tokens_by_level: CountsByLevel
+    _last_cached_token_level: CacheLevel | None
+    # Internal diagnostic captured from the reuse match: see ReuseMatch.
+    _num_reusable_tokens_before_hybrid_pruning: int
+    _num_reusable_tokens_before_pruning: int
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
     # the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric
     # difference, 2. if our block is a partial block, we can't write to memory of the other blocks.
@@ -239,6 +306,7 @@ class _KVCache:
     _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]
     _never_resumed: bool
     _enable_swa_scratch_reuse: bool
+    _enable_request_stats: bool
     # Scratch slots for SWA prefill memory reuse, per life cycle. These hold coalesced slots
     # whose sub-pages are reinterpreted as per-block storage for the currently executing layer.
     # Number of scratch blocks depends on diff between history_length and capacity.
@@ -255,13 +323,17 @@ class _KVCache:
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
         expected_prompt_length: int | None = None,
-    ):
+        text_only: bool | None = None,
+        enable_request_stats: bool = False,
+    ) -> None:
+        # Keep a partially constructed cache inert if validation fails.
+        self.__rawref__ = rawref.NULL
+        self._status = self.Status.CLOSED
         self.id = id
         self._manager = manager
         self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
-        self._status = self.Status.SUSPENDED
         self._beam_width = BeamIndex(1)
         self._expected_prompt_length = (
             max(expected_prompt_length, 0) if expected_prompt_length is not None else None
@@ -276,6 +348,16 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        # Filled by _setup_for_reuse(), which observes the source levels in the same walk that
+        # holds the matched pages. Stays all-zero when there is no reuse match.
+        self._cached_tokens_by_level = filled_list(0, manager._storage.num_cache_levels)
+        self._last_cached_token_level = None
+        self._num_reusable_tokens_before_hybrid_pruning = (
+            reuse_match.num_reusable_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        )
+        self._num_reusable_tokens_before_pruning = (
+            reuse_match.num_reusable_tokens_before_pruning if reuse_match is not None else 0
+        )
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
@@ -285,11 +367,17 @@ class _KVCache:
         )
         self._never_resumed = True
         self._enable_swa_scratch_reuse = manager.enable_swa_scratch_reuse
+        if text_only is False and manager.text_only:
+            raise ValueError(
+                "text_only=False is not allowed when the manager is configured text_only=True"
+            )
+        self._text_only = manager.text_only if text_only is None else text_only
         self._scratch_slots = make_typed(
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
+        self._enable_request_stats = enable_request_stats
         self._pending_stats = _PendingStats()
-        self.__rawref__ = rawref.NULL
+        self._status = self.Status.SUSPENDED
         if reuse_match is not None:
             self._setup_for_reuse(reuse_match)
         self._refresh_generation_alloc_ready()
@@ -349,17 +437,43 @@ class _KVCache:
     def num_blocks(self) -> int:
         return len(self._blocks)
 
-    def _should_record_stats(self) -> bool:
-        return self.manager._stats_enabled and not self.manager.is_stats_excluded(self.id)
+    def _stats_excluded(self) -> bool:
+        return self.manager.is_stats_excluded(self.id)
+
+    def _should_record_manager_stats(self) -> bool:
+        return self.manager._stats_enabled and not self._stats_excluded()
+
+    def _should_record_request_stats(self) -> bool:
+        # Manager stats historically also produced the request delta returned by
+        # commit_pending_stats(). Preserve that contract while allowing callers
+        # to opt in to request-only accounting through _enable_request_stats.
+        return (
+            self.manager._stats_enabled or self._enable_request_stats
+        ) and not self._stats_excluded()
 
     def commit_pending_stats(self) -> KVCacheStatsDelta:
-        if not self._should_record_stats():
+        record_manager_stats = self._should_record_manager_stats()
+        record_request_stats = self._should_record_request_stats()
+        if not (record_manager_stats or record_request_stats):
             self.discard_pending_stats()
             return KVCacheStatsDelta()
-        self.manager.commit_stats(
-            self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
+        if record_manager_stats:
+            self.manager.commit_stats(
+                self._pending_stats.global_stats,
+                self._pending_stats.iteration_stats_by_life_cycle,
+            )
+            self.manager._commit_ssm_snapshot_iteration_stats(
+                self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
+            )
+            self.manager._commit_reused_blocks_by_level(
+                self._pending_stats.reused_blocks_by_level_by_life_cycle
+            )
+            self.manager._commit_cached_tokens_by_level(self._pending_stats.cached_tokens_by_level)
+        request_stats = (
+            self._pending_stats.request_stats.copy()
+            if record_request_stats
+            else KVCacheStatsDelta()
         )
-        request_stats = self._pending_stats.request_stats.copy()
         self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
         return request_stats
@@ -374,11 +488,12 @@ class _KVCache:
         else:
             self.manager.clear_stats_dirty(self.id)
 
+    def _is_attention_life_cycle(self, life_cycle: LifeCycleId) -> bool:
+        return isinstance(self.manager._life_cycles.get_life_cycle(life_cycle), AttnLifeCycle)
+
     def _stats_life_cycle_key(self, life_cycle: LifeCycleId) -> LifeCycleId | None:
-        life_cycle_obj = self.manager._life_cycles.get_life_cycle(life_cycle)
-        if isinstance(life_cycle_obj, AttnLifeCycle):
-            return life_cycle
-        return None
+        """Key for the attention-only block-reuse (hit/miss range) accounting."""
+        return life_cycle if self._is_attention_life_cycle(life_cycle) else None
 
     def _refresh_generation_alloc_ready(self) -> None:
         expected_prompt_length = self._expected_prompt_length
@@ -409,7 +524,9 @@ class _KVCache:
         excluded_ranges: TypedIndexList[LifeCycleId, HalfOpenRange[BlockOrdinal]],
         count_as_generation: bool,
     ) -> None:
-        if not self._should_record_stats() or block_begin >= block_end:
+        record_manager_stats = self._should_record_manager_stats()
+        record_request_stats = self._should_record_request_stats()
+        if not (record_manager_stats or record_request_stats) or block_begin >= block_end:
             return
         # V2 includes generation allocations in per-request alloc_total/new
         # metrics. This intentionally differs from the legacy V1 C++ manager,
@@ -426,6 +543,8 @@ class _KVCache:
                     beam_width=int(beam_width),
                     count_as_missed=not count_as_generation,
                     count_as_generation=count_as_generation,
+                    record_manager_stats=record_manager_stats,
+                    record_request_stats=record_request_stats,
                 )
         if changed:
             self.manager.mark_stats_dirty(self.id)
@@ -445,10 +564,12 @@ class _KVCache:
     def _record_direct_iteration_stats(
         self, life_cycle: LifeCycleId, iteration_stats: KVCacheIterationStatsDelta
     ) -> None:
-        life_cycle_key = self._stats_life_cycle_key(life_cycle)
-        if life_cycle_key is None or iteration_stats.empty or not self._should_record_stats():
+        # Every life cycle is reported, including SSM / recurrent ones: iteration
+        # statistics are keyed by life cycle, so recurrent page movement stays
+        # distinguishable from attention movement downstream.
+        if iteration_stats.empty or not self._should_record_manager_stats():
             return
-        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle: iteration_stats})
 
     def _record_migrated_slots(
         self,
@@ -457,33 +578,48 @@ class _KVCache:
         src_level: CacheLevel,
         dst_level: CacheLevel,
     ) -> None:
-        if not self._should_record_stats():
+        if not self._should_record_manager_stats():
             return
         assert len(pages) == len(slots)
+        # One migration batch moves every page between the same pair of cache levels and does
+        # not mutate the storage while we record, so the per-page contributions differ only by
+        # life cycle. Aggregate them and commit once: commit_stats() re-samples the peak block
+        # statistics on every call, which is O(cache levels x pool groups), so committing per
+        # page turns a long-sequence eviction into thousands of redundant full scans.
+        stats = KVCacheStatsDelta()
+        iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta] = {}
+        recorded = False
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
+            is_attention = self._is_attention_life_cycle(page.life_cycle)
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
-            stats = KVCacheStatsDelta()
-            iteration_stats = KVCacheIterationStatsDelta()
             if src_level == GPU_LEVEL and dst_level > GPU_LEVEL:
-                iteration_stats.iter_offload_blocks = 1
-                iteration_stats.iter_offload_bytes = page_size
+                iteration_stats = iteration_stats_by_life_cycle.setdefault(
+                    page.life_cycle, KVCacheIterationStatsDelta()
+                )
+                iteration_stats.iter_offload_blocks += 1
+                iteration_stats.iter_offload_bytes += page_size
+                recorded = True
             elif dst_level == GPU_LEVEL:
-                stats.alloc_total_blocks = 1
-                stats.alloc_new_blocks = 1
-                iteration_stats.iter_alloc_total_blocks = 1
-                iteration_stats.iter_alloc_new_blocks = 1
+                # Global cache-hit accounting is attention-only. SSM movement is
+                # reported by life-cycle/pool-group iteration statistics instead.
+                if is_attention:
+                    stats.alloc_total_blocks += 1
+                    stats.alloc_new_blocks += 1
+                iteration_stats = iteration_stats_by_life_cycle.setdefault(
+                    page.life_cycle, KVCacheIterationStatsDelta()
+                )
+                iteration_stats.iter_alloc_total_blocks += 1
+                iteration_stats.iter_alloc_new_blocks += 1
                 if src_level > GPU_LEVEL:
-                    iteration_stats.iter_onboard_blocks = 1
-                    iteration_stats.iter_onboard_bytes = page_size
+                    iteration_stats.iter_onboard_blocks += 1
+                    iteration_stats.iter_onboard_bytes += page_size
                 elif src_level == GPU_LEVEL:
-                    iteration_stats.iter_intra_device_copy_blocks = 1
-                    iteration_stats.iter_intra_device_copy_bytes = page_size
-            if not stats.empty or not iteration_stats.empty:
-                self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
+                    iteration_stats.iter_intra_device_copy_blocks += 1
+                    iteration_stats.iter_intra_device_copy_bytes += page_size
+                recorded = True
+        if recorded:
+            self.manager.commit_stats(stats, iteration_stats_by_life_cycle)
 
     def _record_dropped_pages(
         self,
@@ -493,23 +629,24 @@ class _KVCache:
         """Record host-tier LRU drops (pages released without onboarding back to GPU).
 
         Mirrors _record_migrated_slots in structure: per-life-cycle attribution,
-        gated on _should_record_stats(), per-page bytes computed from slot_size.
+        gated on manager statistics, per-page bytes computed from slot_size.
         cache_level is unused for now (we only have a 2-tier setup in practice;
         all last-level drops are host drops) but kept in the signature for future
         per-tier disambiguation.
         """
-        if not self._should_record_stats() or not pages:
+        if not self._should_record_manager_stats() or not pages:
             return
+        # Aggregate per life cycle and commit once -- see _record_migrated_slots for why.
+        iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta] = {}
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
-            iteration_stats = KVCacheIterationStatsDelta()
-            iteration_stats.iter_host_dropped_blocks = 1
-            iteration_stats.iter_host_dropped_bytes = page_size
-            self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+            iteration_stats = iteration_stats_by_life_cycle.setdefault(
+                page.life_cycle, KVCacheIterationStatsDelta()
+            )
+            iteration_stats.iter_host_dropped_blocks += 1
+            iteration_stats.iter_host_dropped_bytes += page_size
+        self.manager.commit_stats(KVCacheStatsDelta(), iteration_stats_by_life_cycle)
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.
@@ -521,7 +658,12 @@ class _KVCache:
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
         manager = self.manager
-        if self.capacity > 0:
+        # Dummy/warmup caches are reserved at the model's full declared context,
+        # not at a realistic sequence length, and _avg_sqr_capacity is an RMS --
+        # so a handful of them dominates the statistic outright and the tuner
+        # sizes pools for sequences that never arrive. They are already tracked
+        # as stats-excluded at creation; honour that here too.
+        if self.capacity > 0 and not manager.is_stats_excluded(self.id):
             self._avg_capacity.update(self.capacity)
             manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
@@ -643,6 +785,25 @@ class _KVCache:
             raise ValueError("Cannot disable SWA scratch reuse while scratch blocks are needed")
         assert not self.has_scratch_slots
         self._enable_swa_scratch_reuse = False
+
+    @property
+    def text_only(self) -> bool:
+        return self._text_only
+
+    @text_only.setter
+    def text_only(self, text_only: bool) -> None:
+        # A text-only deployment is a hard guarantee: a request may not opt out.
+        if not text_only and self.manager.text_only:
+            raise ValueError(
+                "Cannot set text_only=False for a request when the KV cache manager is "
+                "configured text_only=True"
+            )
+        # Claiming text-only is a fast-path claim; verify committed tokens are digest-free.
+        if text_only and any(isinstance(t, bytes) for t in self._committed_tokens):
+            raise ValueError(
+                "Cannot set text_only=True: this sequence has already committed digest tokens"
+            )
+        self._text_only = text_only
 
     def supports_index_mode(self, mode: PageIndexMode) -> bool:
         match mode:
@@ -964,7 +1125,12 @@ class _KVCache:
                         ),
                         move_ssm=is_end,
                     )
-                if has_partial_snapshot:
+                    # _commit_block transitions out of ALLOWED (to USER_STOP) when a
+                    # block cannot be committed (VIRTUAL_STOP). Stop here so we don't
+                    # re-enter _commit_block on an already-stopped cache.
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        break
+                if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
                     partial_ordinal = BlockOrdinal(new_num_full_blocks)
                     if is_end:
                         self._commit_block(
@@ -984,6 +1150,83 @@ class _KVCache:
     @property
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
+
+    @property
+    def cached_tokens_by_level(self) -> CountsByLevel:
+        """Reused-token counts indexed by each token's coldest required source cache level."""
+        return list(self._cached_tokens_by_level)
+
+    def _get_last_cached_token_level(self) -> int | None:
+        """Return the source cache level of the last initially reused logical block."""
+        return (
+            int(self._last_cached_token_level)
+            if self._last_cached_token_level is not None
+            else None
+        )
+
+    def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
+        """Return the pre-hybrid-pruning prefix for internal diagnostics."""
+        return self._num_reusable_tokens_before_hybrid_pruning
+
+    def _get_num_reusable_tokens_before_pruning(self) -> int:
+        """Return the raw token-path walk depth, before any pruning."""
+        return self._num_reusable_tokens_before_pruning
+
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]:
+        return list(self._committed_tokens)
+
+    @property
+    def reuse_scope(self) -> ReuseScope:
+        return self._reuse_scope
+
+    def plan_committed_block_drop(self) -> PlannedDropHandle | None:
+        """Plan dropping pages needed only by the next conversation turn.
+
+        The plan covers committed pages in each SWA life cycle's current
+        attention window and the exact SSM snapshot for the committed prefix.
+        Full-attention and attention-sink blocks are excluded because later
+        turns may still need them. This must be called after stop_committing().
+        Returns None without creating a plan if any required page is unavailable.
+        """
+        if self._commit_state != self.CommitState.USER_STOP:
+            raise LogicError("plan_committed_block_drop() requires stop_committing()")
+
+        if self.num_committed_tokens == 0:
+            return None
+
+        # Locate pages through the radix tree rather than
+        # SeqBlock.tree_block: the latter is not guaranteed to identify a
+        # partial snapshot after reuse. Requiring an exact match keeps the
+        # preceding conversation plan intact if this turn no longer has a
+        # complete reusable endpoint. All PP ranks use the same lookup so
+        # attention-only ranks include the final partial SWA block too.
+        match = self.manager._radix_tree.match(
+            self.reuse_scope,
+            self._committed_tokens,
+            self.manager.enable_partial_match,
+        )
+        if match.num_tokens != self.num_committed_tokens or not match.blocks:
+            return None
+
+        end = BlockOrdinal(len(match.blocks))
+        pages_to_drop: list[CommittedPage] = []
+        for lc_idx, lc in self.manager._life_cycles.items():
+            if isinstance(lc, AttnLifeCycle):
+                if lc.window_size is None:
+                    continue
+                stale_range = _KVCache._get_stale_range(
+                    self.tokens_per_block, self.num_committed_tokens, lc
+                )
+                window_start = min(stale_range.end, end)
+            else:
+                window_start = BlockOrdinal(end - 1)
+            for ordinal in typed_range(window_start, end):
+                page = match.blocks[ordinal].get_page(lc_idx)
+                if page is None:
+                    return None
+                pages_to_drop.append(page)
+        return PlannedDropHandle(pages_to_drop)
 
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
@@ -1033,6 +1276,13 @@ class _KVCache:
             # Free scratch slots on suspend since the data is ephemeral
             self._free_scratch_slots()
         self._status = self.Status.SUSPENDED
+        # Manager-level counter, so gate on the manager predicate: it also honours
+        # the per-cache stats exclusion (dummy / CUDA-graph caches). C++ spells the
+        # gate _shouldRecordStats() (manager OR request); the two are equivalent
+        # here because KVCacheManager.record_request_suspended already returns
+        # early when stats are disabled.
+        if self._should_record_manager_stats():
+            self.manager.record_request_suspended()
 
     # Resume, migrate buffers to GPU memory.
     def resume(self, cuda_stream: CudaStream | None = None) -> bool:
@@ -1086,7 +1336,7 @@ class _KVCache:
                 if self._never_resumed and (
                     type(life_cycles[lc_idx]) is SsmLifeCycle or has_partial
                 ):
-                    deferred_slots[lc_idx] = slot_lst.pop(0)
+                    deferred_slots[lc_idx] = slot_lst.pop()
                 scratch_slots_to_add[lc_idx] = slot_lst
 
             stream_wait_events(
@@ -1172,23 +1422,32 @@ class _KVCache:
                     )
                 if lc_idx != ssm_lc_id:
                     life_cycle_key = self._stats_life_cycle_key(lc_idx)
-                    if life_cycle_key is not None and self._should_record_stats():
+                    record_manager_stats = self._should_record_manager_stats()
+                    record_request_stats = self._should_record_request_stats()
+                    if life_cycle_key is not None and (
+                        record_manager_stats or record_request_stats
+                    ):
                         changed = self._pending_stats.record_allocation_range(
                             life_cycle_key,
                             last_ordinal,
                             BlockOrdinal(last_ordinal + 1),
                             beam_width=1,
                             count_as_missed=not has_partial_reuse_source,
+                            record_manager_stats=record_manager_stats,
+                            record_request_stats=record_request_stats,
                         )
                         if changed:
                             self.manager.mark_stats_dirty(self.id)
-                    self._record_direct_iteration_stats(
-                        lc_idx,
-                        KVCacheIterationStatsDelta(
-                            iter_intra_device_copy_blocks=1,
-                            iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
-                        ),
-                    )
+                # Block-reuse accounting above is attention-only, but the copy
+                # itself is reported for every life cycle, SSM included —
+                # matching the C++ backend's deferred-copy loop (kvCache.cpp).
+                self._record_direct_iteration_stats(
+                    lc_idx,
+                    KVCacheIterationStatsDelta(
+                        iter_intra_device_copy_blocks=1,
+                        iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
+                    ),
+                )
             # Unlock source pages — _record_event captures all prior cuda work
             # so the original pages know when we're done reading from them.
             if src_locks:
@@ -1213,8 +1472,15 @@ class _KVCache:
             # Clear tree_block for the partial block — it's now uncommitted.
             if self.num_committed_tokens % self.tokens_per_block != 0:
                 self._blocks[last_ordinal].tree_block = None
+        # A freshly-created cache starts SUSPENDED and is activated by this same
+        # resume() call, so gate the counter on _never_resumed: only a cache that
+        # was previously ACTIVE and got suspended counts as a preemption recovery.
+        # Without this, the counter would track request admissions, not preemption.
+        first_activation = self._never_resumed
         self._never_resumed = False
         self._status = self.Status.ACTIVE
+        if not first_activation and self._should_record_manager_stats():
+            self.manager.record_request_resumed()
         return True
 
     def prefetch(self, target: CacheLevel) -> bool:
@@ -1238,7 +1504,6 @@ class _KVCache:
 
         num_pool_groups = storage.num_pool_groups
         lc2pg = storage.get_pool_group_index
-
         all_pages = make_typed(
             lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
         )
@@ -1255,7 +1520,12 @@ class _KVCache:
             all_pages[pg_idx][lvl].append(page)
 
         try:
-            storage.prefetch(target, all_pages)
+            # StorageManager reports what it actually migrated. Blocks, the unit
+            # iter_offload_blocks and iter_onboard_blocks use: one page per block per life cycle.
+            # Unrelated to _cached_tokens_by_level, which answers where matched tokens lived.
+            disk_blocks_migrated = storage.prefetch(target, all_pages)
+            if disk_blocks_migrated > 0 and self._should_record_manager_stats():
+                manager.record_disk_prefetch_blocks(disk_blocks_migrated)
         except OutOfPagesError:
             return False
         return True
@@ -1328,13 +1598,10 @@ class _KVCache:
         tree_block: Block,
         lc_idx: LifeCycleId,
         src_page: Page,
-        ssm_num_tokens_in_block: int | None = None,
+        num_tokens_in_block: int,
     ) -> CommittedPage | None:
-        existing_page = map_optional(tree_block.storage[lc_idx], lambda p: p())
-        if existing_page is not None:
-            return existing_page
-        is_ssm = lc_idx == self.manager._life_cycles.ssm_life_cycle_id
-        assert is_ssm == (ssm_num_tokens_in_block is not None)
+        if not tree_block.can_replace_page(lc_idx, num_tokens_in_block):
+            return tree_block.get_page(lc_idx)
 
         storage = self.manager._storage
         pg_idx = storage.get_pool_group_index(lc_idx)
@@ -1358,19 +1625,12 @@ class _KVCache:
                 )
             new_slot.ready_event = CachedCudaEvent(cuda_stream)
             priority = self._get_priority(tree_block.ordinal, self.manager._life_cycles[lc_idx])
-            if ssm_num_tokens_in_block is None:
-                committed = CommittedPage(storage, tree_block, lc_idx, lvl, new_slot, priority)
-            else:
-                committed = SsmCommittedPage(
-                    storage,
-                    tree_block,
-                    lc_idx,
-                    lvl,
-                    new_slot,
-                    priority,
-                    ssm_num_tokens_in_block,
-                )
-            tree_block.storage[lc_idx] = rawref.ref(committed)
+            committed = CommittedPage(
+                storage, tree_block, lc_idx, lvl, new_slot, num_tokens_in_block, priority
+            )
+            # Drops the superseded page, deferred until the copy is issued: an
+            # OutOfPagesError above must not destroy a usable shorter snapshot.
+            tree_block.replace_page(lc_idx, committed)
             storage.schedule_for_eviction(committed)
             return committed
         return None
@@ -1382,17 +1642,8 @@ class _KVCache:
         tokens_per_block = self.tokens_per_block
         num_tokens_in_block = num_tokens - tree_block.ordinal * tokens_per_block
         assert 0 < num_tokens_in_block <= tokens_per_block
-        existing_page = map_optional(tree_block.storage[ssm_lc_id], lambda p: p())
-        existing_num_tokens = 0
-        if existing_page is not None:
-            existing_ssm_page = expect_type(SsmCommittedPage, existing_page)
-            existing_num_tokens = existing_ssm_page.num_tokens_in_block
-        if existing_num_tokens >= num_tokens_in_block:
+        if tree_block.page_coverage(ssm_lc_id) >= num_tokens_in_block:
             return
-        if existing_page is not None:
-            tree_block.storage[ssm_lc_id] = None
-            if existing_page.scheduled_for_eviction:
-                existing_page.manager.exclude_from_eviction(existing_page)
 
         ssm_block = self._ssm_blocks[DEFAULT_BEAM_INDEX]
         ssm_lock = expect_type(_SharedPageLock, ssm_block[ssm_lc_id])
@@ -1400,19 +1651,15 @@ class _KVCache:
         if move:
             src_page = expect_type(UncommittedPage, ssm_lock.unlock())
             ssm_block[ssm_lc_id] = None
-            committed = src_page.convert_to_ssm_committed(
+            # convert_to_committed() reserves the slot, dropping any shorter snapshot.
+            committed = src_page.convert_to_committed(
                 tree_block, self.finish_event, num_tokens_in_block
             )
             storage = self.manager._storage
             storage.schedule_for_eviction(committed)
             return
 
-        self._copy_page_to_tree_block(
-            tree_block,
-            ssm_lc_id,
-            src_page,
-            ssm_num_tokens_in_block=num_tokens_in_block,
-        )
+        self._copy_page_to_tree_block(tree_block, ssm_lc_id, src_page, num_tokens_in_block)
 
     def _snapshot_partial_block_to_tree(self, ordinal: BlockOrdinal, commit_ssm: bool) -> None:
         tokens_per_block = self.tokens_per_block
@@ -1436,23 +1683,33 @@ class _KVCache:
         beam_idx = DEFAULT_BEAM_INDEX
         beam_block = self._blocks[ordinal].pages[beam_idx]
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
-        # Only attach partial attention pages to a tree block whose token span is
-        # exactly the partial snapshot. A longer existing sibling may already
-        # have full attention pages; if not, a partial attention page would make
-        # that longer block look more reusable than it is.
-        if len(tree_block.tokens) == num_tokens:
-            for lc_idx, _ in self.manager._life_cycles.attention_life_cycles():
-                holder = beam_block[lc_idx]
-                if holder is None or tree_block.storage[lc_idx] is not None:
-                    continue
-                self._copy_page_to_tree_block(tree_block, lc_idx, holder.page)
+        # `tree_block` may be a longer existing sibling that covers these tokens. Attaching
+        # the partial attention pages to it is still correct because each page records the
+        # token span it covers, and prefix matching honours that span.
+        attached_lcs = list[LifeCycleId]()
+        for lc_idx, _ in self.manager._life_cycles.attention_life_cycles():
+            holder = beam_block[lc_idx]
+            if holder is None or tree_block.page_coverage(lc_idx) >= num_tokens:
+                continue
+            if (
+                self._copy_page_to_tree_block(tree_block, lc_idx, holder.page, num_tokens)
+                is not None
+            ):
+                attached_lcs.append(lc_idx)
         if commit_ssm:
             assert ssm_lc_id is not None
             self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, start + num_tokens)
-        if is_new:
-            event_manager = self.manager.event_manager
-            if event_manager is not None:
+        event_manager = self.manager.event_manager
+        if event_manager is not None:
+            if is_new:
                 event_manager.add_stored_block_event_from_block(tree_block)
+            else:
+                # The block was already announced, so report just the life cycles this
+                # snapshot added. The event manager itself drops the ones whose page does
+                # not span the whole block: the payload carries the block's full token
+                # list and cannot express a shorter valid prefix.
+                for lc_idx in attached_lcs:
+                    event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc_idx))
 
     def _commit_block(
         self,
@@ -1513,8 +1770,7 @@ class _KVCache:
             for lc, (page, locked) in typed_enumerate(uncommitted_pages):
                 if page is None:
                     continue
-                p = page.convert_to_committed(tree_block, self.finish_event)
-                tree_block.storage[lc] = rawref.ref(p)
+                p = page.convert_to_committed(tree_block, self.finish_event, num_tokens)
                 # The page comes from uncommitted page of self, so safe to skip wait.
                 beam_block[lc] = (
                     p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
@@ -1535,13 +1791,24 @@ class _KVCache:
                     continue  # SSM pages are not rebased
                 if beam_block[lc] is None:
                     continue
-                existing_page = map_optional(tree_block.storage[lc], lambda p: p())
+                # A page covering fewer tokens than this block spans (moved in from a
+                # shorter sibling) is NOT a substitute for our own full page: adopting it
+                # would feed uninitialized KV for the uncovered tail into a live request.
+                existing_page = tree_block.get_page(lc)
+                if existing_page is not None and existing_page.num_tokens_in_block < num_tokens:
+                    existing_page = None
                 locked = isinstance(beam_block[lc], _SharedPageLock)
                 if existing_page is None:
                     # The reusable page is gone. We put our own page into the tree block.
-                    page = cast(UncommittedPage, cast(_SharedPageLock, beam_block[lc]).page)
+                    # Keep this a single expression: a local holding the lock/holder would
+                    # keep it alive past `beam_block[lc] = None`, and convert_to_committed()
+                    # requires the page to be droppable by then.
+                    page = cast(
+                        UncommittedPage,
+                        cast("_SharedPageLock | _PageHolder", beam_block[lc]).page,
+                    )
                     beam_block[lc] = None
-                    p = page.convert_to_committed(tree_block, self.finish_event)
+                    p = page.convert_to_committed(tree_block, self.finish_event, num_tokens)
                     event_manager = self.manager.event_manager
                     if event_manager is not None:
                         event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc))
@@ -1727,7 +1994,9 @@ class _KVCache:
                 if lc == ssm_lc_id:
                     assert b is None  # SSM pages live in _ssm_blocks
                 elif b is not None:
-                    assert isinstance(b.page, CommittedPage) and b.page.block() is ret
+                    # b.page.block() may differ from `ret`: a page can be moved to a longer
+                    # sibling block, or replaced there by one with larger token coverage.
+                    assert isinstance(b.page, CommittedPage)
         return ret
 
     def _take_uncommitted_page(
@@ -1783,9 +2052,15 @@ class _KVCache:
                         assert holder is None
                         continue
                     start, end = stale_ranges[lc]
+                    lc_obj = self.manager._life_cycles[lc]
                     if start <= ordinal < end:
                         if is_committed or self._commit_state != self.CommitState.ALLOWED:
                             assert holder is None
+                        elif ordinal in self._get_scratch_range(lc_obj, 0):
+                            # It is uncertain whether this block should hold a page: it may
+                            # have been scratch-allocated by an earlier chunk, but the prior
+                            # history length and capacity are not retained.
+                            pass
                         else:
                             # For the decoder-side disagg case, for the first step, we will skip the
                             # out-of-window blocks.
@@ -1795,7 +2070,6 @@ class _KVCache:
                             )
                     else:
                         # Scratch blocks have None pages but valid base_page_indices
-                        lc_obj = self.manager._life_cycles[lc]
                         sr = self._get_scratch_range(lc_obj)
                         is_scratch = ordinal in sr
                         if is_scratch:
@@ -1891,6 +2165,80 @@ class _KVCache:
         assert remaining == 0
         return ret
 
+    def _finalize_cached_tokens_by_level(
+        self,
+        num_tokens: int,
+        attention_levels: TypedIndexList[BlockOrdinal, CacheLevel],
+        ssm_level: CacheLevel | None,
+    ) -> None:
+        """Turn the per-block cache levels collected while holding the matched pages into logical
+        token counts.
+
+        Cache levels are ordered hottest first, so the coldest level backing a block is simply the
+        largest one. Attention pages cover their block's matched token span; the final SSM
+        checkpoint summarizes the entire recurrent prefix, so it is merged into every block.
+        """
+        counts = filled_list(0, self.manager._storage.num_cache_levels)
+        self._cached_tokens_by_level = counts
+        self._last_cached_token_level = None
+        if num_tokens == 0:
+            return
+
+        tokens_per_block = self.manager.tokens_per_block
+        last_cached_token_level: CacheLevel | None = None
+        for ordinal, attention_level in enumerate(attention_levels):
+            block_start = ordinal * tokens_per_block
+            block_end = min(num_tokens, block_start + tokens_per_block)
+            if block_start >= block_end:
+                break
+            source_level = (
+                max(attention_level, ssm_level) if ssm_level is not None else attention_level
+            )
+            last_cached_token_level = source_level
+            counts[source_level] += block_end - block_start
+
+        self._last_cached_token_level = last_cached_token_level
+        assert NDEBUG or sum(counts) == num_tokens
+        assert NDEBUG or last_cached_token_level is not None
+
+        # Stage the attribution alongside the reuse counters derived from the same walk, so it is
+        # committed (or discarded) with them instead of being pushed back in through a public setter.
+        if (
+            self._should_record_manager_stats()
+            and self._pending_stats.record_cached_tokens_by_level(counts)
+        ):
+            self.manager.mark_stats_dirty(self.id)
+
+    def drop_cached_token_attribution(self) -> None:
+        """Drop this sequence's staged cached-token attribution so its reuse match is not reported
+        as a local cache hit.
+
+        For traffic that is not user-visible reuse at all (KV cache size estimation), and for a
+        disaggregated-serving generation request whose whole matched prefix the incoming transfer
+        overwrites (a recurrent state summarizes and replaces the entire local slot).
+        """
+        self._pending_stats.cached_tokens_by_level = []
+        self._refresh_stats_dirty_state()
+
+    def drop_partial_block_cached_token_attribution(self) -> None:
+        """Drop only the trailing partial block from the staged attribution.
+
+        A disaggregated-serving transfer overwrites the incomplete tail block of the local match
+        while complete blocks survive, so only the tail stops counting as a local hit.
+        """
+        partial_tokens = sum(self._cached_tokens_by_level) % self.manager.tokens_per_block
+        if partial_tokens == 0:
+            return
+        # A partial cached prefix always has a final block, so it always has a level to discount.
+        assert NDEBUG or self._last_cached_token_level is not None
+        if self._last_cached_token_level is None:
+            return
+        # Admission can retry the same cache after resume/resize fails. Cap against the initial
+        # match so repeated calls preserve full blocks on the same source level.
+        full_tokens = self._cached_tokens_by_level[self._last_cached_token_level] - partial_tokens
+        self._pending_stats.limit_cached_tokens_by_level(self._last_cached_token_level, full_tokens)
+        self._refresh_stats_dirty_state()
+
     def _setup_for_reuse(self, match: ReuseMatch) -> None:
         manager = self.manager
         matched = match.blocks
@@ -1920,47 +2268,110 @@ class _KVCache:
 
         beam_idx = DEFAULT_BEAM_INDEX
 
-        should_record_stats = self._should_record_stats()
+        record_manager_stats = self._should_record_manager_stats()
+        record_request_stats = self._should_record_request_stats()
+        record_shared_stats = record_manager_stats or record_request_stats
+        storage = manager._storage
+        num_cache_levels = storage.num_cache_levels
+        # Source-level attribution for the reused tokens, merged across attention life cycles at
+        # block granularity. It is observed in this same walk rather than in a separate pre-pass:
+        # hold() only takes a page holder and unschedules eviction, it never migrates data, so a
+        # page still reports the level it was matched on. Levels are ordered hottest first, so
+        # merging takes the max.
+        attention_levels = filled_list(CacheLevel(0), BlockOrdinal(len(matched)))
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
             stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
+            is_attention = isinstance(lc, AttnLifeCycle)
             full_reused_blocks = 0
             partial_reused_blocks = 0
+            # Indexed by CacheLevel, so entry i is the i-th configured tier rather than a fixed
+            # gpu/host/disk bucket; a deployment with two GPU levels gets two distinct entries.
+            by_level = (
+                ReusedBlocksByLevel(
+                    full=filled_list(0, num_cache_levels),
+                    partial=filled_list(0, num_cache_levels),
+                )
+                if record_shared_stats and is_attention
+                else None
+            )
+            life_cycle_levels: TypedIndexList[BlockOrdinal, CacheLevel | None] = (
+                filled_list(None, BlockOrdinal(len(matched))) if is_attention else []
+            )
             for ordinal in chain(
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
                 block = self._block(ordinal, beam_idx)
-                holder = unwrap_rawref(unwrap_optional(matched[ordinal].storage[lc_idx])).hold()
+                page = unwrap_optional(matched[ordinal].get_page(lc_idx))
+                level = page.cache_level
+                holder = page.hold()
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
-                if should_record_stats and isinstance(lc, AttnLifeCycle):
+                if not is_attention:
+                    continue
+                life_cycle_levels[ordinal] = level
+                if record_shared_stats:
+                    assert by_level is not None
                     if ordinal < full_reused_end:
                         full_reused_blocks += 1
+                        by_level.full[level] += 1
                     elif (
                         has_partial_match
                         and ordinal == full_reused_end
                         and self._has_reuse_source(holder)
                     ):
                         partial_reused_blocks = 1
-            if should_record_stats and isinstance(lc, AttnLifeCycle):
+                        by_level.partial[level] += 1
+            if is_attention:
+                # For SWA, only sink and live-window pages at the matched endpoint are
+                # materialized. Stale spans inherit the next live page's level, because that later
+                # anchor is what enables those logical tokens to be skipped.
+                next_anchor_level: CacheLevel | None = None
+                for ordinal in reversed(range(len(matched))):
+                    level = life_cycle_levels[ordinal]
+                    if level is not None:
+                        next_anchor_level = level
+                    else:
+                        level = next_anchor_level
+                    if level is not None and level > attention_levels[ordinal]:
+                        attention_levels[ordinal] = level
+            if record_shared_stats and is_attention:
                 changed = self._pending_stats.record_reuse(
                     lc_idx,
                     full_reused_blocks=full_reused_blocks,
                     partial_reused_blocks=partial_reused_blocks,
+                    by_level=by_level,
+                    record_manager_stats=record_manager_stats,
+                    record_request_stats=record_request_stats,
                 )
                 if changed:
                     self.manager.mark_stats_dirty(self.id)
-        # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
+        # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first
+        # resume(). Reuse onboards only this final recurrent checkpoint, and it summarizes the
+        # entire matched prefix, so its source tier applies to every logical reused token; older
+        # checkpoints are traversal history, not inputs.
+        ssm_level: CacheLevel | None = None
         if ssm_lc_id is not None and matched:
             snapshot_block = matched[-1]
-            snapshot_ref = snapshot_block.storage[ssm_lc_id]
-            assert snapshot_ref is not None, (
+            snapshot_page = snapshot_block.get_page(ssm_lc_id)
+            assert snapshot_page is not None, (
                 "Last matched block must have SSM snapshot after truncation"
             )
-            snapshot_holder = unwrap_rawref(snapshot_ref).hold()
+            ssm_level = snapshot_page.cache_level
+            snapshot_holder = snapshot_page.hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
+        self._finalize_cached_tokens_by_level(num_tokens, attention_levels, ssm_level)
+        if record_manager_stats and ssm_lc_id is not None:
+            changed = self._pending_stats.record_ssm_snapshot_lookup(
+                ssm_lc_id,
+                lookup_tokens=match.num_lookup_tokens,
+                reused_tokens=num_tokens,
+                tokens_per_block=tokens_per_block,
+            )
+            if changed:
+                self.manager.mark_stats_dirty(self.id)
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:

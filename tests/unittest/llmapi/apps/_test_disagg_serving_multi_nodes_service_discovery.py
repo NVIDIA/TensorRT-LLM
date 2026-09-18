@@ -6,7 +6,6 @@ import uuid
 
 import openai
 import pytest
-from test_common.perf_metrics_utils import get_timing_metrics, validate_timing_metrics
 
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
@@ -112,8 +111,6 @@ def worker(model_name: str, disagg_cluster_config: dict):
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
-        "return_perf_metrics": True,
-        "perf_metrics_max_requests": 1000,
     }
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server
@@ -165,7 +162,6 @@ def disagg_server(disagg_cluster_config: dict):
             "disagg_cluster": disagg_cluster_config,
             "port": DISAGG_SERVER_PORT,
             "hostname": "0.0.0.0",
-            "perf_metrics_max_requests": 1000,
         }
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
         # ctx/gen servers are unnecessary for service discovery test
@@ -216,9 +212,6 @@ def test_completion(
             assert completion.id is not None
             message = completion.choices[0].text
             assert message.startswith("2.")
-
-        perf_metrics = get_timing_metrics(disagg_server.url_root)
-        validate_timing_metrics(perf_metrics, "multinode test_completion")
 
         disagg_server.terminate()
 

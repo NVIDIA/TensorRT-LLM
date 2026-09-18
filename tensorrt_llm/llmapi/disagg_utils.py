@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 import uuid
@@ -28,6 +29,49 @@ def validate_config_bool(value: Any, field_name: str) -> bool:
         return value
     raise ValueError(
         f"{field_name} must be a boolean, got {type(value).__name__}")
+
+
+def validate_config_non_negative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{field_name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _validate_internal_request_auth_key(value: Optional[str]) -> Optional[str]:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError("internal_request_auth_key must be a non-empty string")
+    return value
+
+
+def _extract_internal_request_auth_key(
+        top_level_key: Optional[str], context_servers: dict,
+        generation_servers: dict) -> Optional[str]:
+    top_level_key = _validate_internal_request_auth_key(top_level_key)
+    section_keys = []
+    for server_type, servers in (("context_servers", context_servers),
+                                 ("generation_servers", generation_servers)):
+        section_key = servers.pop("internal_request_auth_key", None)
+        if section_key is None:
+            continue
+        section_keys.append(
+            (server_type, _validate_internal_request_auth_key(section_key)))
+
+    for server_type, section_key in section_keys:
+        if top_level_key is not None and section_key != top_level_key:
+            raise ValueError(
+                "internal_request_auth_key must match between the top-level "
+                f"config and {server_type}")
+
+    if top_level_key is None and section_keys:
+        unique_keys = {section_key for _, section_key in section_keys}
+        if len(unique_keys) != 1:
+            raise ValueError(
+                "internal_request_auth_key must match between context_servers "
+                "and generation_servers")
+        top_level_key = section_keys[0][1]
+
+    return top_level_key
 
 
 class ServerRole(IntEnum):
@@ -91,10 +135,12 @@ class DisaggServerConfig():
     otlp_config: Optional[OtlpConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
+    return_perf_metrics: bool = False
+    perf_metrics_output_dir: Optional[str] = None
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
     node_id: int = uuid.getnode(
-    ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
-    # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    ) % 256  # Assuming only one disagg-server is running on a machine, modulo 256.
+    # If this causes collisions, users can set node_id manually within range [0, 255] in config
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
     allow_request_chat_template: bool = False
@@ -106,6 +152,25 @@ class DisaggServerConfig():
     # the orchestrator relays a string instead of materializing the token-id list
     # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
     gen_tokids_ctxbytes: bool = False
+    # Number of uvicorn disagg-server worker processes to fork on the public port.
+    # >1 means a fleet of delegating servers behind one coordinator. Replaces the
+    # WEB_CONCURRENCY env var (explicit config over implicit env).
+    num_workers: int = 1
+    # URL of an already-running coordinator (e.g. "http://host:8332"). When set the
+    # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
+    # coordinator and num_workers==1 runs a single self-contained server.
+    disagg_coordinator_url: Optional[str] = None
+    # HTTP keep-alive timeout (seconds) of the uvicorn listeners: the
+    # client-facing one, plus the coordinator's when it runs in-process.
+    # Raise it (e.g. 3600) when clients hold large idle connection pools and hit
+    # "Connection reset by peer" on a reused connection.
+    server_keep_alive_timeout: int = 10
+    internal_request_auth_key: Optional[str] = None
+    # Parent-session header for sub-agent routing, e.g. "X-Dynamo-Parent-Session-ID".
+    # Requires conversation routing; see docs/source/features/subagent-routing.md.
+    conversation_affinity_header_for_subagents: Optional[str] = None
+    # Apply parent affinity to context only (default), or context and generation.
+    subagent_affinity_scope: Literal['context', 'both'] = 'context'
 
 
 @dataclass
@@ -170,36 +235,47 @@ def parse_disagg_config_file(yaml_config_file: str):
     with open(yaml_config_file, 'r') as file:
 
         config = yaml.safe_load(file)
-
         disagg_server_config = extract_disagg_cfg(**config)
 
         return disagg_server_config
 
 
-def extract_disagg_cfg(hostname: str = 'localhost',
-                       port: int = 8000,
-                       max_retries: int = 1,
-                       perf_metrics_max_requests: int = 0,
-                       context_servers: Optional[dict] = None,
-                       generation_servers: Optional[dict] = None,
-                       conditional_disagg_config: Optional[dict] = None,
-                       otlp_config: Optional[dict] = None,
-                       disagg_cluster: Optional[dict] = None,
-                       node_id: Optional[int] = None,
-                       schedule_style: Literal[
-                           'context_first',
-                           'generation_first'] = 'context_first',
-                       allow_request_chat_template: bool = False,
-                       gen_strip_message_history: bool = False,
-                       gen_tokids_ctxbytes: bool = False,
-                       **kwargs: Any) -> DisaggServerConfig:
+def extract_disagg_cfg(
+        hostname: str = 'localhost',
+        port: int = 8000,
+        max_retries: int = 1,
+        perf_metrics_max_requests: int = 0,
+        return_perf_metrics: bool = False,
+        perf_metrics_output_dir: Optional[str] = None,
+        context_servers: Optional[dict] = None,
+        generation_servers: Optional[dict] = None,
+        conditional_disagg_config: Optional[dict] = None,
+        otlp_config: Optional[dict] = None,
+        disagg_cluster: Optional[dict] = None,
+        node_id: Optional[int] = None,
+        schedule_style: Literal['context_first',
+                                'generation_first'] = 'context_first',
+        allow_request_chat_template: bool = False,
+        gen_strip_message_history: bool = False,
+        gen_tokids_ctxbytes: bool = False,
+        num_workers: int = 1,
+        disagg_coordinator_url: Optional[str] = None,
+        server_keep_alive_timeout: int = 10,
+        internal_request_auth_key: Optional[str] = None,
+        conversation_affinity_header_for_subagents: Optional[str] = None,
+        subagent_affinity_scope: Literal['context', 'both'] = 'context',
+        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
+    internal_request_auth_key = _extract_internal_request_auth_key(
+        internal_request_auth_key, context_servers, generation_servers)
+
+    inherited_args = dict(kwargs)
 
     # If parameters are specified outside the context_severs and generation_servers sections,
     # make sure they match
     # Also inherit the values from the top-level
-    for key, value in kwargs.items():
+    for key, value in inherited_args.items():
         for server_type, servers in [("context_servers", context_servers),
                                      ("generation_servers", generation_servers)
                                      ]:
@@ -230,12 +306,24 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     otlp_config = OtlpConfig(**otlp_config) if otlp_config else None
 
-    config = DisaggServerConfig(server_configs, hostname, port,
-                                ctx_router_config, gen_router_config,
-                                conditional_disagg_config, otlp_config,
-                                max_retries, perf_metrics_max_requests,
-                                disagg_cluster_config)
+    config = DisaggServerConfig(
+        server_configs=server_configs,
+        hostname=hostname,
+        port=port,
+        ctx_router_config=ctx_router_config,
+        gen_router_config=gen_router_config,
+        conditional_disagg_config=conditional_disagg_config,
+        otlp_config=otlp_config,
+        max_retries=max_retries,
+        perf_metrics_max_requests=perf_metrics_max_requests,
+        return_perf_metrics=return_perf_metrics,
+        perf_metrics_output_dir=perf_metrics_output_dir,
+        disagg_cluster_config=disagg_cluster_config)
     if node_id is not None:
+        node_id_space = 1 << DISAGG_NODE_ID_BITS
+        if not 0 <= node_id < node_id_space:
+            raise ValueError(
+                f"node_id must be in range [0, {node_id_space}), got {node_id}")
         config.node_id = node_id
     if schedule_style:
         config.schedule_style = schedule_style
@@ -243,7 +331,57 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         allow_request_chat_template, "allow_request_chat_template")
     config.gen_strip_message_history = gen_strip_message_history
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
+    config.num_workers = num_workers
+    config.disagg_coordinator_url = disagg_coordinator_url
+    config.server_keep_alive_timeout = validate_config_non_negative_int(
+        server_keep_alive_timeout, "server_keep_alive_timeout")
+    config.internal_request_auth_key = internal_request_auth_key
+    config.conversation_affinity_header_for_subagents = (
+        conversation_affinity_header_for_subagents)
+    if subagent_affinity_scope not in ('context', 'both'):
+        raise ValueError(
+            "subagent_affinity_scope must be 'context' or 'both', got "
+            f"{subagent_affinity_scope!r}")
+    config.subagent_affinity_scope = subagent_affinity_scope
+    _warn_if_subagent_affinity_inactive(config)
     return config
+
+
+def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
+    """Warn when the configured fleets do not support sub-agent affinity."""
+    if not config.conversation_affinity_header_for_subagents:
+        return
+
+    # Conditional disaggregation uses a KV-cache-aware generation router.
+    if (config.subagent_affinity_scope == 'both'
+            and config.conditional_disagg_config is not None):
+        logging.warning(
+            "subagent_affinity_scope='both' is unsupported with conditional "
+            "disaggregation: conditional disagg requires a KV-cache-aware "
+            "generation router, which conflicts with the 'conversation' router "
+            "that gen-side sub-agent affinity needs. Gen-side sub-agent affinity "
+            "will not take effect; use subagent_affinity_scope='context'.")
+
+    def _router_type(router_config: Optional[RouterConfig]) -> Optional[str]:
+        return router_config.type if router_config is not None else None
+
+    relevant = [("context", _router_type(config.ctx_router_config))]
+    if config.subagent_affinity_scope == 'both':
+        relevant.append(("generation", _router_type(config.gen_router_config)))
+
+    # Match create_router()'s case-insensitive type resolution.
+    non_conversation = [
+        fleet for fleet, rtype in relevant
+        if (rtype or "").lower() != "conversation"
+    ]
+    if non_conversation:
+        logging.warning(
+            "conversation_affinity_header_for_subagents="
+            f"{config.conversation_affinity_header_for_subagents!r} with "
+            f"subagent_affinity_scope={config.subagent_affinity_scope!r} requires "
+            "the 'conversation' router on the "
+            f"{', '.join(non_conversation)} fleet(s), but they use a different "
+            "router type; sub-agent instance affinity will be inactive there.")
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
@@ -293,6 +431,11 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
 
     args = server_cfg.pop("router", {})
     router_type = args.pop("type", "round_robin")
+
+    if router_type == "kv_cache_aware" and "model_path" not in args:
+        model_path = server_cfg.get("model")
+        if model_path is not None:
+            args["model_path"] = model_path
 
     # add fields that are not specific to router
     extract_keys = ["max_batch_size", "max_num_tokens"]
@@ -418,42 +561,59 @@ def parse_metadata_server_config_file(
         return MetadataServerConfig(**config)
 
 
-MIN_GLOBAL_ID = 1 << 42
+# Snowflake global disagg request id, 64-bit / positive int64 (MSB reserved 0):
+#   [ 0 (1) | timestamp_ms (39) | node_id (8) | process_id (6) | counter (10) ]
+# The (node_id, process_id) pair identifies a fleet worker process, so co-located
+# workers never emit the same id in the same millisecond. See docs/source/
+# advanced/disaggregated-service.md for the full disagg-request-id design.
+DISAGG_TIMESTAMP_BITS = 39
+DISAGG_NODE_ID_BITS = 8
+DISAGG_PROCESS_ID_BITS = 6
+DISAGG_COUNTER_BITS = 10
+
+# Local ids [0, MIN_GLOBAL_ID) and global disagg ids [MIN_GLOBAL_ID, 2^63) are
+# disjoint by construction so they never collide. Power of two (masked in
+# get_local_request_id).
+MIN_GLOBAL_ID = 1 << 40
 
 # Consider GIL being removed in the future, use a lock to protect the counter
 _global_disagg_request_id_lock = threading.Lock()
 _global_disagg_request_id_counter = 0
 
 
-def get_global_disagg_request_id(machine_id: int) -> int:
-    """
-    a snowflake global disagg request id that doesn't guarantee monotonicity
-    0: positive integer
-    1-41  41 bits: timestamp_ms
-    42-51 10 bits: machine_id
-    52-63 12 bits: counter
+def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
+    """A snowflake global disagg request id (does not guarantee monotonicity).
+
+    Layout: 0(1) | timestamp_ms(39) | node_id(8) | process_id(6) | counter(10).
+    node_id identifies the node, process_id the fleet worker process on it -- the
+    pair makes the id unique across co-located workers without any coordination.
     """
     global _global_disagg_request_id_lock
     global _global_disagg_request_id_counter
 
-    COUNTER_BITS = 12
-    MACHINE_ID_BITS = 10
-    COUNTER_MASK = (1 << COUNTER_BITS) - 1
+    NODE_ID_SPACE = 1 << DISAGG_NODE_ID_BITS
+    PROCESS_ID_SPACE = 1 << DISAGG_PROCESS_ID_BITS
+    COUNTER_MASK = (1 << DISAGG_COUNTER_BITS) - 1
+    TIMESTAMP_MASK = (1 << DISAGG_TIMESTAMP_BITS) - 1
     MAX_INT64 = (1 << 63) - 1
 
-    if machine_id not in range(0, (1 << MACHINE_ID_BITS) - 1):
-        raise ValueError(
-            f"machine_id must be in range [0, {(1 << MACHINE_ID_BITS) - 1})")
+    if node_id not in range(0, NODE_ID_SPACE):
+        raise ValueError(f"node_id must be in range [0, {NODE_ID_SPACE})")
+    if process_id not in range(0, PROCESS_ID_SPACE):
+        raise ValueError(f"process_id must be in range [0, {PROCESS_ID_SPACE})")
 
-    timestamp_ms = int(time.monotonic() * 1000)
+    timestamp_ms = int(time.monotonic() * 1000) & TIMESTAMP_MASK
     with _global_disagg_request_id_lock:
         counter = _global_disagg_request_id_counter & COUNTER_MASK
         _global_disagg_request_id_counter += 1
 
-    # Rotate in [MIN_GLOBAL_ID, MAX_INT64)
-    # [0, MIN_GLOBAL_ID) is reserved for local ids
-    global_id = (timestamp_ms << (MACHINE_ID_BITS + COUNTER_BITS)) | (
-        machine_id << COUNTER_BITS) | counter
+    global_id = (
+        (timestamp_ms <<
+         (DISAGG_NODE_ID_BITS + DISAGG_PROCESS_ID_BITS + DISAGG_COUNTER_BITS))
+        | (node_id << (DISAGG_PROCESS_ID_BITS + DISAGG_COUNTER_BITS))
+        | (process_id << DISAGG_COUNTER_BITS)
+        | counter)
+    # Rotate into [MIN_GLOBAL_ID, MAX_INT64); [0, MIN_GLOBAL_ID) is local-id space.
     global_id_int64 = global_id % (MAX_INT64 - MIN_GLOBAL_ID) + MIN_GLOBAL_ID
     return global_id_int64
 
@@ -461,3 +621,23 @@ def get_global_disagg_request_id(machine_id: int) -> int:
 def get_local_request_id(last_id: int) -> int:
     """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
     return (last_id + 1) & (MIN_GLOBAL_ID - 1)
+
+
+def disagg_process_id_space() -> int:
+    """Number of distinct process_id slots in the snowflake id (2^bits)."""
+    return 1 << DISAGG_PROCESS_ID_BITS
+
+
+def worker_local_process_id() -> int:
+    """Return this fleet worker's process index.
+
+    The fleet launcher sets ``TRTLLM_DISAGG_WORKER_PROCESS_ID`` to a distinct
+    value per process. A standalone disaggregated server defaults to 0.
+    """
+    process_id = int(os.environ.get("TRTLLM_DISAGG_WORKER_PROCESS_ID", "0"))
+    process_id_space = disagg_process_id_space()
+    if not 0 <= process_id < process_id_space:
+        raise ValueError(
+            "TRTLLM_DISAGG_WORKER_PROCESS_ID must be between 0 and "
+            f"{process_id_space - 1}, got {process_id}")
+    return process_id

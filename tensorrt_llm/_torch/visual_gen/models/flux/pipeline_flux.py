@@ -19,6 +19,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
 from .transformer_flux import FluxTransformer2DModel
@@ -239,12 +240,13 @@ class FluxPipeline(BasePipeline):
                         "return_dict",
                     ],
                     return_dict_default=False,
+                    return_tuple_when_return_dict_false=True,
                 )
             )
 
-            # TeaCache or Cache-DiT
+            # TeaCache or Cache-DiT: resolve coefficients here; the loader enables
+            # cache acceleration after torch.compile (see PipelineLoader.load).
             self._apply_teacache_coefficients(FLUX_TEACACHE_COEFFICIENTS)
-            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):
@@ -312,7 +314,7 @@ class FluxPipeline(BasePipeline):
             raise ValueError(f"num_images_per_prompt must be >= 1, got {num_images_per_prompt}")
         batch_size = len(prompt) * num_images_per_prompt
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # Encode prompt
         logger.info("Encoding prompt...")

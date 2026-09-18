@@ -6,9 +6,9 @@ from transformers.configuration_utils import PretrainedConfig
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import DefaultMoeRoutingMethod, create_moe
-from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.moe.fused_moe import DefaultMoeRoutingMethod, create_moe
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -135,7 +135,8 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
         routing_method=routing_method,
         reduce_results=False,
         model_config=model_config,
-    ).cuda()
+    )
+    moe = moe.cuda()
 
     # Set fc31_act_scale directly (simulating AWQ pre_quant_scale)
     if has_scale:

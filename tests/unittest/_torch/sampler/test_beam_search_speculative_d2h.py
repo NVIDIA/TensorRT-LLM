@@ -19,7 +19,7 @@ This file covers the code paths gated behind
 
 * parity vs the default (synchronous) beam-history D2H path,
 * the predictor-miss fallback in
-  `TorchSampler._prepare_beam_history._builder`
+  `BeamSearchHandler._prepare_beam_history._builder`
   (the synchronous `.cpu()` issued when the host-side predictor
   decided the step is non-terminal but the beam still finalizes),
 * the predictor-hit path that routes copies through the side stream.
@@ -30,19 +30,21 @@ real model weights.
 """
 
 import gc
+import os
 import pathlib as _pl
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from typing import Any, Iterable
+from typing import Any, Generator, Iterable
 
 import pytest
+import torch
 from pydantic import ValidationError
 from test_beam_search_util import DummyConfigLoader, DummyWeightLoader
-from utils.util import assert_no_cuda_sync
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTorch, TorchSampler
+from tensorrt_llm._torch.pyexecutor.sampler.beam_search import BeamSearchHandler
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi import KvCacheConfig
 
@@ -70,7 +72,6 @@ def _build_llm(
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type="TorchSampler",
         max_batch_size=fixed_params["max_beam_width"] * len(input_prompts),
         kv_cache_config=KvCacheConfig(max_tokens=10000),  # pyright: ignore
         max_seq_len=32,
@@ -157,7 +158,7 @@ def _run_with_env(
 
     Opt-in is via `TorchLlmArgs.enable_speculative_beam_history_d2h`.
     `predictor_override` patches
-    `TorchSampler._predict_beam_search_is_likely_finishing` and
+    `BeamSearchHandler.predict_is_likely_finishing` and
     `sampler_method_patches` patches arbitrary `TorchSampler` methods;
     either forces `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches
     reach the sampler. `sampler_force_async_worker` enables the
@@ -169,9 +170,7 @@ def _run_with_env(
         # sampler to run in-process so the patch is observed.
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     if predictor_override is not None:
-        monkeypatch.setattr(
-            TorchSampler, "_predict_beam_search_is_likely_finishing", predictor_override
-        )
+        monkeypatch.setattr(BeamSearchHandler, "predict_is_likely_finishing", predictor_override)
 
     gc.collect(2)
     llm = _build_llm(
@@ -337,6 +336,59 @@ def test_speculative_d2h_predictor_always_hit(
     _assert_outputs_equal(out_on, out_off)
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_speculative_d2h_skips_only_when_no_request_can_finish(
+    fixed_params: dict[str, Any],
+    input_prompts: list[list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skip decision is per group, not per request.
+
+    The snapshot is one batched copy for the whole group, so it cannot be
+    skipped for some requests and taken for others. A step is skipped only when
+    every request is predicted non-terminal; a single possible finisher makes
+    the group pay for the copy it would have cost anyway.
+
+    Pin the predictor to answer True for exactly one request and False for the
+    rest. The mixed verdict must land on "copy", and the outputs must still
+    match the feature-off run -- a per-request reading of the same verdict
+    would drop the histories of the requests that answered False.
+    """
+    seen_verdicts: list[bool] = []
+    first_slot: dict[str, int | None] = {"slot": None}
+
+    def _one_finisher(self, request, *, num_generated_tokens, num_tokens):
+        # Latch onto whichever request is seen first and only ever claim that
+        # one might finish.
+        if first_slot["slot"] is None:
+            first_slot["slot"] = request.py_seq_slot
+        verdict = request.py_seq_slot == first_slot["slot"]
+        seen_verdicts.append(verdict)
+        return verdict
+
+    with monkeypatch.context() as mp_off:
+        out_off = _run_with_env(
+            fixed_params, input_prompts, mp_off, speculative=False, stop_token_ids=None
+        )
+
+    with monkeypatch.context() as mp_on:
+        out_on = _run_with_env(
+            fixed_params,
+            input_prompts,
+            mp_on,
+            speculative=True,
+            stop_token_ids=None,
+            predictor_override=_one_finisher,
+        )
+
+    assert seen_verdicts, "predictor patch was never invoked; the speculative path did not run"
+    assert any(seen_verdicts) and not all(seen_verdicts), (
+        "the test needs a step where the verdicts disagree, so that the group "
+        f"decision is observable; got {set(seen_verdicts)}"
+    )
+    _assert_outputs_equal(out_on, out_off)
+
+
 # ---------------------------------------------------------------------------
 # Validator: speculative path must be rejected when sampler_force_async_worker
 # is also set, since the speculative path bypasses the async D2H worker.
@@ -369,6 +421,35 @@ def test_speculative_d2h_rejects_async_worker_combo(
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _assert_no_cuda_sync_locally() -> Generator[None, None, None]:
+    """Local stand-in for utils.util.assert_no_cuda_sync.
+
+    That helper parks a @hostfunc on the stream to block it, and only lowers
+    its cancel flag *after* the assertion. The hostfunc holds the GIL while it
+    spins, so anything that blocks before the cancel deadlocks the step: the
+    main thread waits on the stream, the stream waits on the hostfunc, and the
+    hostfunc waits for a cancel that the main thread never reaches. On the
+    speculative path -- side-stream copier plus the executor's own threads --
+    that race is live, and CI hangs here until the 3600s pytest timeout.
+
+    Detect the same thing without parking anything on the stream:
+    set_sync_debug_mode("error") makes torch raise on a synchronizing call,
+    which is the actual property under test. It misses syncs from non-torch
+    kernels, which the stream-blocking variant would catch; nothing in
+    sample_async/update_requests issues those today.
+    """
+    if int(os.environ.get("CUDA_LAUNCH_BLOCKING", 0)):
+        yield None
+        return
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield None
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+
 @pytest.mark.threadleak(enabled=False)
 def test_speculative_d2h_predictor_hit_is_sync_free(
     fixed_params: dict[str, Any],
@@ -379,7 +460,7 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
     inside `sample_async` or inside `update_requests` after the sampler
     event has been awaited.
 
-    Mirrors the `assert_no_cuda_sync()` hook used by
+    Mirrors the sync check used by
     `tests/unittest/_torch/sampler/test_beam_search.py::validate_outputs`,
     but pins the predictor to always-hit so every step routes through
     the side-stream copier and never reaches the `.cpu()` fallback.
@@ -392,17 +473,17 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
 
     def _sample_async_hook(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         hook_state["sample_async_called"] = True
-        with assert_no_cuda_sync():
+        with _assert_no_cuda_sync_locally():
             return sample_async_orig(self, *args, **kwargs)
 
     def _update_requests_hook(self, state: SampleStateTorch, *args, **kwargs):  # type: ignore[no-untyped-def]
         hook_state["update_requests_called"] = True
         # Sampler event awaits all device work (incl. side-stream copies)
-        # and is the one expected sync; do it outside assert_no_cuda_sync.
+        # and is the one expected sync; do it outside the guard below.
         sampler_event = state.sampler_event
         if sampler_event:
             sampler_event.synchronize()
-        with assert_no_cuda_sync():
+        with _assert_no_cuda_sync_locally():
             state.sampler_event = None
             try:
                 return update_requests_orig(self, state, *args, **kwargs)

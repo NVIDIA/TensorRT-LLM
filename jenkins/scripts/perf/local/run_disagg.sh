@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Generate slurm_launch.sh for a local disaggregated perf-sanity run
 # and submit it via sbatch. Run this on a SLURM login node.
 #
@@ -67,6 +69,7 @@ source "$config_file"
 : "${build_wheel_flag:=}"
 : "${capture_nsys_flag:=}"
 : "${time_limit:=02:00:00}"
+: "${cluster_name:=}"
 
 # Normalize test list: prefer 'test_ids' bash array if set, else fall back to
 # legacy single 'test_id'. Either declares a non-empty list at this point.
@@ -79,8 +82,11 @@ else
 fi
 
 # ---------------- Sanity checks ----------------
+# "unspecified" is allowed: same convention as L0_Test.groovy / submit.py —
+# omit #SBATCH --partition and let SLURM use the cluster default (e.g. oci-hsg).
 if [[ "$partition" == "CHANGE_ME" ]]; then
     echo "ERROR: please set 'partition' in $config_file." >&2
+    echo "       Use a real SLURM partition name, or 'unspecified' for the cluster default." >&2
     exit 1
 fi
 if [[ ${#test_ids[@]} -eq 0 ]]; then
@@ -142,7 +148,8 @@ else
     fi
     image_source="resolved from \$image_var=${image_var} via current_image_tags.properties"
 fi
-# urm.nvidia.com/ → urm.nvidia.com# (enroot URI form). No-op if user already passed enroot form.
+# host/ → host# (enroot URI form). No-op if user already passed enroot form.
+image=${image//artifactory.nvidia.com\//artifactory.nvidia.com#}
 image=${image//urm.nvidia.com\//urm.nvidia.com#}
 
 echo "=== Configuration ==="
@@ -231,6 +238,7 @@ for idx in "${!test_ids[@]}"; do
         --mounts "$mounts" \
         --llm-models-root "$llm_models_path" \
         --time "$time_limit" \
+        ${cluster_name:+--cluster-name "$cluster_name"} \
         "${install_args[@]}" \
         $build_wheel_flag \
         $capture_nsys_flag; then

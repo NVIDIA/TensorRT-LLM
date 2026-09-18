@@ -236,7 +236,9 @@ def reference_block_scale_moe_torch(
     return results.view_as(x)
 
 
-def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
+def create_mock_cuda_graph_runner(batch_size: int,
+                                  use_mrope: bool = False,
+                                  max_num_tokens: int = 1):
     config = CUDAGraphRunnerConfig(
         use_cuda_graph=True,
         cuda_graph_padding_enabled=False,
@@ -244,7 +246,7 @@ def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
         max_cuda_graph_batch_size=batch_size,
         batch_size=batch_size,
         max_beam_width=1,
-        max_num_tokens=1,
+        max_num_tokens=max_num_tokens,
         use_mrope=use_mrope,
         spec_config=None,
         cuda_graph_mem_pool=None,

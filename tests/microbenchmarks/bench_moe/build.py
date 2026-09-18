@@ -25,11 +25,20 @@ small set of introspection helpers (``actual_backend`` / ``scheduler_kind``
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    ACTIVATION_PAYLOAD,
+    MoEActivation,
+    SimpleActivation,
+    SiTuActivation,
+    SwigluBiasActivation,
+)
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEEnvFlag, collect_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -39,28 +48,22 @@ from .quantize import get_test_quant_params
 from .specs import ConfigSpec, ModelSpec
 from .utils import _ensure_dist_for_megamoe
 
-# Map concrete MoE module class names to short backend identifiers used in
-# results and the dashboard. Anything not in this table falls back to the
-# upper-case class name.
-_BACKEND_CLASS_TO_NAME: Dict[str, str] = {
-    "CutlassFusedMoE": "CUTLASS",
-    "TRTLLMGenFusedMoE": "TRTLLM",
-    "CuteDslFusedMoE": "CUTEDSL",
-    "DeepGemmFusedMoE": "DEEPGEMM",
-    "DenseGEMMFusedMoE": "DENSEGEMM",
-    "MegaMoEDeepGemm": "MEGAMOE_DEEPGEMM",
-    "VanillaMoE": "VANILLA",
-}
-
 
 def _backend_name_from_module(moe) -> str:
-    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules."""
+    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules.
+
+    Read off ``BACKEND_FAMILY``, which is the table resolution itself uses, so
+    a backend that gains or splits classes stays labelled without an edit
+    here. A hand-written class-name table used to do this and went stale the
+    moment TRTLLM-Gen split into one class per identity.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import backend_family_of
+
     backend_attr = getattr(moe, "backend", None)
-    if backend_attr is not None and backend_attr is not moe:
-        backend_cls = type(backend_attr).__name__
-    else:
-        backend_cls = type(moe).__name__
-    return _BACKEND_CLASS_TO_NAME.get(backend_cls, backend_cls.upper())
+    backend_cls = (
+        type(backend_attr) if backend_attr is not None and backend_attr is not moe else type(moe)
+    )
+    return backend_family_of(backend_cls) or backend_cls.__name__.upper()
 
 
 def _scheduler_kind_name(moe) -> Optional[str]:
@@ -82,6 +85,24 @@ def _comm_method_name(moe) -> str:
     return type(comm).__name__
 
 
+def _epilogue_activation_name(moe) -> str:
+    """Return the epilogue the built module actually runs: ``"situ"`` or ``"swiglu"``.
+
+    The SiTU request can be dropped for reasons the spec cannot see (wrong
+    backend, wrong quant, upstream fallback), so read it back rather than
+    reporting what was asked for. Every impl records the resolved kind in
+    ``activation_type``; TRTLLM-Gen additionally exposes a predicate, which is
+    checked first because SiTU shares its constant slots with SwiGLU there.
+    """
+    backend = getattr(moe, "backend", None) or moe
+    if getattr(backend, "is_situ_activation", False):
+        return "situ"
+    activation_type = getattr(backend, "activation_type", None)
+    if activation_type is not None and ActivationType(activation_type) == ActivationType.SiTu:
+        return "situ"
+    return "swiglu"
+
+
 def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[int]:
     """Best-effort lookup of ``num_chunks`` for the case we are about to time."""
     scheduler = getattr(moe, "scheduler", None)
@@ -96,11 +117,120 @@ def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[
         return None
 
 
+#: Backends whose kernels implement the SiTU epilogue, with the quant they
+#: implement it on. Not a capability check -- ``create_moe`` does that, and
+#: rejects rather than degrades; this is the bench choosing which cases are
+#: worth asking for.
+_SITU_PATHS = frozenset(
+    {
+        ("MEGAMOE_DEEPGEMM", QuantAlgo.W4A8_MXFP4_MXFP8),
+        ("MEGAMOE_CUTEDSL", QuantAlgo.NVFP4),
+        ("TRTLLM", QuantAlgo.W4A8_MXFP4_MXFP8),
+        ("CUTLASS", QuantAlgo.NVFP4),
+    }
+)
+
+
+def _situ_kwargs(
+    model: ModelSpec,
+    moe_backend: str,
+    quant_algo: Optional[QuantAlgo],
+) -> Dict:
+    """``create_moe`` kwargs that switch the epilogue to SiTU, or ``{}``.
+
+    A spec carrying SiTU constants falls back to the SwiGLU proxy on any other
+    backend/quant pair rather than failing the case -- SiTU is gated, so the
+    GEMM shapes and comm volume are the same either way.
+
+    The constants go out as scalars for every backend: each one's
+    ``activation_support`` decides whether its kernels read them as a baked
+    scalar or a per-expert ``float32`` buffer, so the bench no longer sizes
+    tensors against the EP partition to match a particular kernel ABI.
+    """
+    if model.situ_beta is None:
+        return {}
+    if (moe_backend.upper(), quant_algo) not in _SITU_PATHS:
+        return {}
+    return {
+        "activation": SiTuActivation(
+            gate_softcap=float(model.situ_beta),
+            linear_softcap=float(model.situ_linear_beta),
+        )
+    }
+
+
+def _plain_activation(kind: ActivationType) -> MoEActivation:
+    """The spec's ``activation_type`` as a carrier, for the no-constants case.
+
+    Reads ``ACTIVATION_PAYLOAD`` rather than naming the two kinds ``specs.py``
+    currently allows, so a third one added there needs no change here.
+    """
+    payload = ACTIVATION_PAYLOAD[ActivationType(kind)]
+    return SimpleActivation(kind) if payload is SimpleActivation else payload()
+
+
 def _create_moe_for_benchmark(**kwargs):
     ensure_cute_dsl_importable_for_benchmark()
-    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 
     return create_moe(**kwargs)
+
+
+class _UnfusedSharedMoE(torch.nn.Module):
+    """Pre-fusion baseline: routed MoE plus a separate shared-expert GatedMLP.
+
+    The routed MoE is built without fused shared experts; a standalone shared-expert
+    ``GatedMLP`` is summed onto its output, mirroring the pre-#11143 model path. The
+    routed MoE and the shared GatedMLP are run with ``maybe_execute_in_parallel`` on
+    a dedicated aux stream (same mechanism DeepseekV3MoE uses for the unfused path),
+    so the routed grouped GEMM and the shared MLP can overlap. Multi-stream is
+    enabled only under CUDA graph (``use_cuda_graph``), matching the real engine
+    (cuda_graph_runner sets with_multi_stream(True) during capture); in eager the
+    two run serially, since stream-switch host overhead makes overlap a net loss.
+    Exposes the same ``forward(x, router_logits, **kwargs)`` signature as the MoE;
+    introspection attributes (backend / routing_method / ...) delegate to the MoE.
+    """
+
+    def __init__(
+        self,
+        moe: torch.nn.Module,
+        shared_mlp: torch.nn.Module,
+        use_cuda_graph: bool = False,
+    ) -> None:
+        super().__init__()
+        self.moe = moe
+        self.shared_mlp = shared_mlp
+        # Overlap only when the case is timed under CUDA graph (mirrors the real
+        # model, which only enables multi-stream during graph capture).
+        self._multi_stream = bool(use_cuda_graph)
+        self.aux_stream = torch.cuda.Stream()
+        self.event_main = torch.cuda.Event()
+        self.event_shared = torch.cuda.Event()
+
+    def __getattr__(self, name: str) -> Any:
+        # nn.Module.__getattr__ resolves registered submodules/params/buffers
+        # (incl. ``moe``/``shared_mlp``); anything else (routing_method, backend,
+        # comm, scheduler, ...) is delegated to the wrapped MoE for introspection.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__("moe"), name)
+
+    def forward(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs) -> torch.Tensor:
+        from tensorrt_llm._torch.modules.multi_stream_utils import (
+            maybe_execute_in_parallel,
+            with_multi_stream,
+        )
+
+        with with_multi_stream(self._multi_stream):
+            routed, shared = maybe_execute_in_parallel(
+                lambda: self.moe.forward(x, router_logits, **kwargs),
+                lambda: self.shared_mlp(x),
+                self.event_main,
+                self.event_shared,
+                self.aux_stream,
+            )
+        return routed + shared
 
 
 def _build_moe_module(
@@ -121,13 +251,52 @@ def _build_moe_module(
 
     Returns ``(moe_module, routing_logits_dtype)``.
     """
+    # Shared-expert support (PR #11143) currently only works in TTP: attention TP
+    # (dp_size==1, so the fusion gate fires) + MoE TP (moe_ep_size==1; the EP fused
+    # path is unimplemented). Reject other multi-GPU layouts (DEP/TEP/DTP) up front
+    # instead of silently dropping the shared experts or hitting the dead EP path.
+    # (Single GPU resolves to dp_size==1/moe_ep_size==1 for every mode, so it passes.)
+    if model.n_shared_experts > 0 and (mapping.dp_size != 1 or mapping.moe_ep_size != 1):
+        raise NotImplementedError(
+            f"bench_moe shared-expert support (n_shared_experts={model.n_shared_experts}) "
+            f"only supports TTP (attention TP + MoE TP: dp_size==1 and moe_ep_size==1). "
+            f"Got parallel_mode={config.parallel_mode!r} -> dp_size={mapping.dp_size}, "
+            f"moe_ep_size={mapping.moe_ep_size}. Re-run with --parallel_mode TTP "
+            f"(or drop --n_shared_experts)."
+        )
+
+    # Fusion is TRTLLM-Gen specific and only activates for FP8_BLOCK_SCALES; any other
+    # backend/quant would silently drop the shared experts and mislabel the benchmark.
+    # Reject fused candidates up front (unfused runs a separate GatedMLP, so it is fine
+    # on any backend and preserved here).
+    if model.n_shared_experts > 0 and model.shared_expert_mode != "unfused":
+        if moe_backend.upper() != "TRTLLM" or model.quant_algo_enum != QuantAlgo.FP8_BLOCK_SCALES:
+            raise NotImplementedError(
+                f"bench_moe fused shared experts require --backend TRTLLM with "
+                f"--quant FP8_BLOCK_SCALES (fusion is TRTLLM-Gen specific). Got "
+                f"backend={moe_backend!r}, quant={model.quant_algo!r}. Use "
+                f"--shared_expert_mode unfused to benchmark other backends."
+            )
+
     if enable_perfect_router:
         os.environ["ENABLE_PERFECT_ROUTER"] = "1"
     else:
         os.environ.pop("ENABLE_PERFECT_ROUTER", None)
 
+    # Shared-expert fusion is opt-in in TRTLLMGenFusedMoE; "fused" cases must
+    # enable it explicitly or they would silently benchmark the unfused path.
+    # The flag is read through the cached selection environment, which
+    # ``expand_and_prune`` already collected, so the write has to be followed
+    # by a re-collect or it lands behind the snapshot and is read by nothing.
+    if model.n_shared_experts > 0 and model.shared_expert_mode != "unfused":
+        os.environ[MoEEnvFlag.SHARED_EXPERT_FUSION.value] = "1"
+    else:
+        os.environ.pop(MoEEnvFlag.SHARED_EXPERT_FUSION.value, None)
+    collect_moe_environment(force=True)
+
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
+    activation_type = model.activation_type_enum
 
     routing_method = _create_routing_method(
         model.routing_method_cls,
@@ -172,6 +341,7 @@ def _build_moe_module(
         swiglu_beta=model.swiglu_beta if swiglu_gptoss_style else None,
         swiglu_limit=model.swiglu_limit if swiglu_gptoss_style else None,
         num_local_experts=num_local_experts,
+        activation_type=activation_type,
     )
 
     weight_loading_mode = getattr(
@@ -180,7 +350,8 @@ def _build_moe_module(
 
     swiglu_tensors = quantize_util.get_swiglu_tensors()
 
-    moe = _create_moe_for_benchmark(
+    # Merge then unpack so SiTU can override activation_type / swiglu_alpha-beta.
+    moe_kwargs = dict(
         routing_method=routing_method,
         num_experts=mc.num_experts,
         hidden_size=mc.hidden_size,
@@ -190,10 +361,18 @@ def _build_moe_module(
         model_config=model_config,
         weight_loading_mode=weight_loading_mode,
         bias=swiglu_gptoss_style,
-        swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
-        swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
-        swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+        activation=(
+            SwigluBiasActivation(
+                gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
+                linear_offset=swiglu_tensors["swiglu_beta"],
+                clamp=swiglu_tensors["swiglu_limit"],
+            )
+            if swiglu_tensors
+            else _plain_activation(activation_type)
+        ),
     )
+    moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo))
+    moe = _create_moe_for_benchmark(**moe_kwargs)
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
         weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(
@@ -205,5 +384,29 @@ def _build_moe_module(
     moe.load_weights([weights])
     moe.post_load_weights()
     moe.cuda(f"cuda:{torch.cuda.current_device()}")
+
+    # "unfused" baseline: the routed MoE above was built without fused shared
+    # experts (mapping.py forces pretrained_config.n_shared_experts=0 in this mode);
+    # add a standalone shared-expert GatedMLP and sum it, mirroring the pre-fusion
+    # model path so the benchmark can compare against the fused path.
+    if model.n_shared_experts > 0 and model.shared_expert_mode == "unfused":
+        from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+        shared_mlp = GatedMLP(
+            hidden_size=mc.hidden_size,
+            intermediate_size=model.n_shared_experts * mc.intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=model_config,
+            reduce_output=False,
+            # Route the shared GatedMLP's FP8 block-scale GEMM through cute_dsl
+            # (cute_dsl_fp8_gemm_blackwell) instead of the SM100f default DeepGEMM
+            # `fp8_swap_ab_gemm`. The DeepGEMM path hits an intermittent
+            # cudaErrorIllegalAddress when the routed TRTLLM-Gen MoE and this shared
+            # GatedMLP run in the same process across growing token counts.
+            use_cute_dsl_blockscaling_mm=True,
+        )
+        shared_mlp.cuda(f"cuda:{torch.cuda.current_device()}")
+        moe = _UnfusedSharedMoE(moe, shared_mlp, use_cuda_graph=use_cuda_graph)
 
     return moe, routing_logits_dtype

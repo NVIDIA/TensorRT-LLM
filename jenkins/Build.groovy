@@ -16,7 +16,10 @@
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
+import java.lang.InterruptedException
 import groovy.transform.Field
+import trtllm.FailureClassifier
+import trtllm.exceptions.InfraFailure
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -33,9 +36,40 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 LLM_DOCKER_IMAGE = env.dockerImage
 
 // Always use x86_64 image for agent
-AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64")
+AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
+
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+
+// Infra-scoped fail-fast master switch (mirrors L0_Test.groovy). When true, a
+// build branch whose failure classifies as a positive K8s infra abort (via
+// FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its sibling
+// build branches keep running instead of being SIGTERMed by failFast -- and a
+// build job that saw only infra aborts (no genuine build failure) resolves to
+// UNSTABLE (infra-incomplete) instead of FAILURE, so the parent layer
+// (L0_MergeRequest.launchJob) can skip this arch's test consumers without
+// cancelling the healthy sibling architecture. When false, every failure
+// rethrows and the original bare-boolean fail-fast is fully restored. Build
+// stages run only on K8s builders, so K8s is the only infra scope deferred here.
+//
+// Overridable without a code change by setting the ENABLE_INFRA_SCOPED_FAILFAST
+// env var on the job. Env values are strings ("false" is truthy in Groovy), so
+// the override goes through toBoolean() rather than the bare elvis.
+ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INFRA_SCOPED_FAILFAST.toBoolean() : true
+
+// BOLT consume: re-BOLT the packed tarball in place with the branch's latest
+// promoted profile bundle, so the uploaded artifact (and every downstream test)
+// exercises the bolted binaries. Resolution order mirrors BuildDockerImage.groovy's
+// bolt toggles -- the `boltConsume` job parameter the parent pipeline
+// (L0_MergeRequest.groovy) passes down, then the `BOLT_CONSUME` env var this gate
+// was keyed on before it became a real parameter, so a job-level env override keeps
+// working. This job declares no `parameters {}` block (its inputs are defined on the
+// Jenkins job config and surface as both `params.X` and `env.X`), so `boltConsume`
+// must be declared there as a boolean parameter defaulting to false. Until it is,
+// the parameter is simply absent and this stays false.
+BOLT_CONSUME_ENABLED = (params.boltConsume ?: env.boltConsume ?: env.BOLT_CONSUME ?: "false").toString() == "true"
 
 // Literals for easier access.
 @Field
@@ -105,10 +139,19 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def BOLT_CONSUME_BUILD = "bolt_consume_build"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (TRTLLM_VERSION_OVERRIDE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent's globalVars:
+    // that helper only updates keys already present in the target map, so a key that
+    // is absent here (like this one previously) is silently dropped during the merge.
+    (BOLT_CONSUME_BUILD): false,
 ]
 
 // TODO: Move common variables to an unified location
@@ -135,7 +178,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     def nodeLabelPrefix = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -224,6 +267,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                     env:
@@ -259,44 +304,50 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def downloadArtifacts(stageName, reuseArtifactPath, artifacts, serverId = 'Artifactory')
+def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
 {
-    def reused = true
+    def reused = false
     stage(stageName) {
-        for (downit in artifacts) {
-            def uploadpath = downit.key
-            try {
-                rtDownload(
-                    failNoOp: true,
-                    serverId: serverId,
-                    spec: """{
-                        "files": [
-                            {
-                            "pattern": "${reuseArtifactPath}/${uploadpath}"
-                            }
-                        ]
-                    }""",
-                )
-            } catch (Exception e) {
-                echo "failed downloading ${reuseArtifactPath}/${uploadpath}, need rebuild."
-                reused = false
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { throw e }
+        // The copy API does not support virtual repositories. Both paths point
+        // at the default deployment repository behind sw-tensorrt-generic.
+        def sourceRoot = reuseArtifactPath.replaceFirst(
+            /^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+        def targetRoot = UPLOAD_PATH.replaceFirst(
+            /^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE',
+            catchInterruptions: false) {
+            withCredentials([usernamePassword(
+                    credentialsId: 'urm-artifactory-creds',
+                    usernameVariable: 'ART_USER',
+                    passwordVariable: 'ART_PASS')]) {
+                for (artifact in artifacts) {
+                    def artifactPath = artifact.key
+                    def sourcePath = "${sourceRoot}/${artifactPath}"
+                    def targetPath = "${targetRoot}/${artifactPath}"
+                    echo "Copying cached artifact ${sourcePath} to ${targetPath}"
+                    withEnv([
+                        "ARTIFACTORY_COPY_SOURCE=${sourcePath}",
+                        "ARTIFACTORY_COPY_TARGET=${targetPath}",
+                    ]) {
+                        sh(
+                            script: '''artifactory_url="https://urm.nvidia.com/artifactory"
+                                copy_url="${artifactory_url}/api/copy/$ARTIFACTORY_COPY_SOURCE"
+                                curl -fsSL --max-time 300 --user "$ART_USER:$ART_PASS" --request POST \
+                                    "${copy_url}?to=/$ARTIFACTORY_COPY_TARGET"'''
+                        )
+                    }
+                }
             }
+            reused = true
         }
-
         if (!reused) {
-            return null
+            echo "Failed to copy cached artifacts from ${sourceRoot}; need rebuild."
         }
-
-        reuseArtifactPath = reuseArtifactPath.substring(reuseArtifactPath.indexOf('/')+1)
-        def newArtifacts = [:]
-        for (reuseit in artifacts) {
-            def uploadpath = reuseit.key
-            newArtifacts[reuseit.key] = "${reuseArtifactPath}/${uploadpath}"
-        }
-
-        return newArtifacts
     }
+    return reused
 }
 
 def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
@@ -326,10 +377,7 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
 {
     if (reuseArtifactPath) {
         stage(key) {
-            def newArtifacts = downloadArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)
-            if (newArtifacts != null) {
-                uploadArtifacts(newArtifacts)
-            } else {
+            if (!copyCachedArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)) {
                 reuseArtifactPath = null
             }
         }
@@ -361,22 +409,27 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
     })
 }
 
-def prepareLLMBuild(pipeline, config)
+def prepareLLMBuild(pipeline, config, versionOverride)
 {
     def buildFlags = BUILD_CONFIGS[config]
     def tarName = buildFlags[TARNAME]
 
     def is_linux_x86_64 = config.contains("linux_x86_64")
+    // Type checking is a platform-independent static analysis, so run it once,
+    // on the x86_64 vanilla build only, rather than in every build config.
+    def typeCheck = (config == CONFIG_LINUX_X86_64_VANILLA)
     def artifacts = ["${tarName}": tarName]
     def runner = {
-        runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
+        runLLMBuild(
+            pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck, artifacts)
     }
 
     return [artifacts, runner]
 
 }
 
-def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
+def runLLMBuild(
+    pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false, artifacts=null)
 {
     // Step 1: cloning tekit source code
     sh "pwd && ls -alh"
@@ -384,7 +437,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "ccache -sv"
     sh "rm -rf **/*.xml *.tar.gz"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
     if (env.alternativeTRT) {
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -420,25 +473,35 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
 
     def buildJobs = buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS
 
-    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
-    }
-    if (is_linux_x86_64) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
+    withEnv([
+        "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
+        "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
+    ]) {
+        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+            sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        }
     }
 
+    // Type-check with the compiled bindings that build_wheel.py just produced in
+    // place. Runs mypy directly (not via pre-commit) so this step does zero
+    // network: the pre-commit orchestrator clones every remote hook repo from
+    // github up front, which flakes on nodes without github access. mypy and its
+    // config come from requirements-dev.txt (installed above) via the internal
+    // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
+    // bindings can't be imported, rather than silently degrading to the
+    // lightweight (no-bindings) check.
+    if (typeCheck) {
+        echo "-- Running mypy type check with compiled bindings..."
+        withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
+            sh "cd ${LLM_ROOT} && bash scripts/run_mypy.sh"
+        }
+    }
+
+    sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
-    // Step 4: packaging benchmark and required cpp dependencies into tarfile
-    sh "mkdir -p TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/bertBenchmark TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/disaggServerBenchmark TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
-
-    // Step 5: packaging attribution files into tarfile when they exist
+    // Step 4: packaging attribution files into tarfile when they exist
     sh "mkdir -p TensorRT-LLM/attribution"
     sh "cp ${LLM_ROOT}/cpp/build/attribution/missing_files.json TensorRT-LLM/attribution/ || true"
     sh "cp ${LLM_ROOT}/cpp/build/attribution/import_payload.json TensorRT-LLM/attribution/ || true"
@@ -459,6 +522,82 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     } else {
         sh "tar -czvf ${tarName} TensorRT-LLM/"
     }
+
+    // BOLT consume (premerge): opt-in via BOLT_CONSUME_ENABLED. Pull the branch's
+    // latest postmerge-promoted profile bundle and re-BOLT the just-packed
+    // tarball IN PLACE, so the artifact that gets uploaded (and every downstream
+    // test) exercises the bolted binaries. No-op unless the caller opted in, so
+    // normal builds are unaffected. STRICT by design: apply_latest.sh exits
+    // non-zero on any failure (missing bundle / apply error) and we do NOT catch
+    // it -- a build that asked to consume BOLT profiles fails loudly rather than
+    // silently shipping an un-BOLTed tarball that tests would wrongly bless. The
+    // parent restricts who may opt in (premerge only, main only); see
+    // resolveBoltConsume in L0_MergeRequest.groovy.
+    if (BOLT_CONSUME_ENABLED) {
+        applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts)
+    }
+}
+
+// Premerge consumption helper: stage llvm-bolt if needed, then run the OSS
+// engine's apply_latest.sh (pull-latest + apply_bolt) to replace <tarName> with
+// its bolted equivalent. Runs inside the build pod after packing.
+def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
+{
+    // Resolved here rather than passed down, so it must agree with the branch the
+    // parent vetted before setting boltConsume. It does today: getCommonParameters
+    // forwards neither of these, so a build launched by L0_MergeRequest.groovy lands
+    // on "main" -- the only branch with a promoted bundle. Revisit together with the
+    // parent's main-only gate if either name starts being forwarded.
+    def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
+    def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
+    def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
+    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
+    stage("BOLT consume") {
+        // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
+        // 2 = apply error, 0 = applied. Capture the code so a MISSING bundle (e.g.
+        // x86_64 before an x86 bundle is promoted) is a graceful SKIP rather than a
+        // hard build failure, while a real apply error still fails loudly.
+        def rc = sh(returnStatus: true, script: """
+            set -e
+            export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+            if ! command -v llvm-bolt >/dev/null 2>&1; then
+                echo '[bolt-consume] staging llvm-bolt ${llvmVer}'
+                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                mkdir -p .bolt-llvm
+                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
+                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
+                rm -f /tmp/\$tb
+            fi
+            bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
+                 ${branch} ${triple} ${tarName} bolted-${tarName}
+        """)
+        if (rc == 3) {
+            echo "[bolt-consume] no promoted bundle for ${branch}/${triple}; skipping (build stays un-BOLTed)"
+            return
+        }
+        if (rc != 0) {
+            error("[bolt-consume] apply_latest.sh failed (rc=${rc}) for ${branch}/${triple}")
+        }
+        // Applied: preserve the un-BOLTed original as unbolted-<tarName> and promote
+        // the BOLTed build to the canonical name. Matches the postmerge
+        // publishBoltedCanonical convention (canonical = BOLTed).
+        sh """
+            set -e
+            cp -f ${tarName} unbolted-${tarName}
+            mv -f bolted-${tarName} ${tarName}
+            echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
+        """
+        // Register the unbolted- variant for upload via the caller's artifacts map,
+        // so it is pushed by buildOrCache OUTSIDE the build container (where the
+        // JFrog 'Artifactory' server resolves). Uploading here with rtUpload fails
+        // with "Couldn't find JFrog Instance ID: Artifactory" -- the server is not
+        // available inside the container context. Added only on a successful apply,
+        // so a skipped arch never references a nonexistent file.
+        if (artifacts != null) {
+            artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+        }
+    }
 }
 
 def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="")
@@ -471,7 +610,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "cat ${CCACHE_DIR}/ccache.conf"
 
     // Step 1: cloning tekit source code
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
@@ -517,6 +656,16 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
         globalVars = trtllm_utils.initializeCiBudget(pipeline, globalVars, 24, 'HOURS', "Build-${cpu_arch}")
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
+        // BOLT consume flag: source it from globalVars (set by L0_MergeRequest as
+        // bolt_consume_build), which is reliably propagated. The standalone
+        // boltConsume job parameter is NOT registered on the remote build jobs, so
+        // the Parameterized Remote Trigger silently DROPS it -- reading globalVars
+        // avoids that per-instance registration dependency. The param/env resolution
+        // at the top of the file still applies when set directly on the job.
+        if (globalVars[BOLT_CONSUME_BUILD]?.toString() == "true") {
+            BOLT_CONSUME_ENABLED = true
+            echo "[bolt-consume] enabled via globalVars.bolt_consume_build"
+        }
     }
 
     def wheelDockerImage = env.wheelDockerImagePy310
@@ -524,17 +673,24 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         wheelDockerImage = env.dockerImage
     }
 
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     buildConfigs = [
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
+            pipeline,
+            cpu_arch == AARCH64_TRIPLE ?
+                CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA,
+            versionOverride),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
+            pipeline,
+            cpu_arch == AARCH64_TRIPLE ?
+                CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM,
+            versionOverride),
     ]
 
     if (cpu_arch == X86_64_TRIPLE) {
         buildConfigs += [
         "Build TRT-LLM SingleDevice": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, CONFIG_LINUX_X86_64_SINGLE_DEVICE),
+            pipeline, CONFIG_LINUX_X86_64_SINGLE_DEVICE, versionOverride),
         ]
     }
 
@@ -560,7 +716,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             buildOrCache(pipeline, key, reuseArtifactPath, values[1], values[0], k8s_cpu, values[2])
         }
     }]}
-    parallelJobs.failFast = enableFailFast
 
     if (cpu_arch == X86_64_TRIPLE && !reuseArtifactPath) {
         def key = "Build With Build Type Debug"
@@ -571,7 +726,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --benchmarks --micro_benchmarks")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks --extra-cmake-vars NVRTC_DYNAMIC_LINKING=ON")
                         }
                     }
                 })
@@ -580,7 +735,17 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     }
 
     stage("Build") {
-        pipeline.parallel parallelJobs
+        // Infra-scoped fail-fast: a build branch that dies on a positive K8s infra
+        // abort is deferred (its siblings keep running) and the job resolves
+        // UNSTABLE instead of FAILURE, so L0_MergeRequest.launchJob can skip this
+        // arch's tests without cancelling the healthy sibling arch. The shared
+        // helper owns the parallel/failFast/UNSTABLE orchestration; the closure
+        // supplies the scope policy (build pods are K8s-only today). Gated on
+        // ENABLE_INFRA_SCOPED_FAILFAST; off = plain failFast + parallel, as before.
+        trtllm_utils.runBranchesWithInfraDefer(pipeline, parallelJobs, enableFailFast,
+                ENABLE_INFRA_SCOPED_FAILFAST) { e, stageName ->
+            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)
+        }
     } // Build stage
 }
 

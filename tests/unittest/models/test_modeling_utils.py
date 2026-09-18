@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_quant_config_exclude_modules_regex_match():

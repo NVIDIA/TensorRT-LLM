@@ -35,7 +35,7 @@ async def _iter_sse_data(response_content):
                 continue
             payload = line.removeprefix("data:").lstrip()
             if payload == "[DONE]":
-                continue
+                return
             yield payload
 
 
@@ -421,30 +421,25 @@ def get_tokenizer(
     custom_tokenizer: str = None,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    # Registers TRT-LLM's out-of-tree configs into transformers' CONFIG_MAPPING;
+    # without it AutoTokenizer falls back to a bare PreTrainedConfig and dies in
+    # rope standardization on a missing max_position_embeddings.
+    import tensorrt_llm._torch.configs  # noqa: F401
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError(
                 "Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
     if custom_tokenizer:
-        from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
+        from tensorrt_llm.tokenizer import load_custom_tokenizer
 
-        tokenizer_path = TOKENIZER_ALIASES.get(custom_tokenizer,
-                                               custom_tokenizer)
-        from importlib import import_module
-        try:
-            module_path, class_name = tokenizer_path.rsplit('.', 1)
-            module = import_module(module_path)
-            tokenizer_class = getattr(module, class_name)
-            return tokenizer_class.from_pretrained(
-                pretrained_model_name_or_path,
-                trust_remote_code=trust_remote_code,
-                **kwargs,
-            )
-        except (ValueError, ImportError, AttributeError) as e:
-            raise ValueError(
-                f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
-                "Expected alias or 'module.path.ClassName'.") from e
+        return load_custom_tokenizer(
+            custom_tokenizer,
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
     return AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path,
         trust_remote_code=trust_remote_code,

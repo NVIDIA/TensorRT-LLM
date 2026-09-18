@@ -31,11 +31,13 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention.backends.interface import PredefinedAttentionMask
+from .flash_attn4 import _install_cutlass_dsl_compatibility
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_combine_import_error = None
 try:
+    _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
 except (ImportError, OSError) as e:
     _flash_attn_combine = None
@@ -118,6 +120,9 @@ class UlyssesAttention(AttentionBackend):
         # side stream so V/Q/K pushes FIFO together without intermediate
         # barrier kernels.
         self._pending_barriers: int = 0
+        # Symm-mem barrier timeout (ms) passed to ulysses_a2a_async_barrier.
+        # 60 s covers the one-time first-touch warmup stall on large multi-node runs.
+        self._barrier_timeout_ms = 60000
         if async_ulysses:
             device = torch.cuda.current_device()
             if device not in UlyssesAttention._side_stream_by_device:
@@ -285,7 +290,7 @@ class UlyssesAttention(AttentionBackend):
         semantics, so the default stream sees a fully-synced recv buffer."""
         with torch.cuda.stream(self._async_side_stream):
             for _ in range(self._pending_barriers):
-                torch.ops.trtllm.ulysses_a2a_async_barrier(self._pg_boxed)
+                torch.ops.trtllm.ulysses_a2a_async_barrier(self._pg_boxed, self._barrier_timeout_ms)
             ev_done = torch.cuda.Event()
             ev_done.record()
         self._pending_barriers = 0
@@ -855,6 +860,7 @@ def wrap_parallel_attention(
     enable_sequence_parallel: bool = True,
     use_ulysses: bool = True,
     async_ulysses: bool = False,
+    ulysses_group: Optional[dist.ProcessGroup] = None,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
 
@@ -888,7 +894,17 @@ def wrap_parallel_attention(
     elif ring_size > 1:
         attn = RingAttention(attn, process_group=vgm.ring_group)
 
-    if ulysses_size > 1 and use_ulysses:
+    if ulysses_group is not None:
+        # Explicit group override: wrap if the override group is non-trivial,
+        # independent of vgm.ulysses_size (the caller's group may be wider or
+        # narrower than the mapping's).
+        if use_ulysses and dist.get_world_size(group=ulysses_group) > 1:
+            attn = UlyssesAttention(
+                attn,
+                process_group=ulysses_group,
+                async_ulysses=async_ulysses,
+            )
+    elif ulysses_size > 1 and use_ulysses:
         attn = UlyssesAttention(
             attn,
             process_group=vgm.ulysses_group,

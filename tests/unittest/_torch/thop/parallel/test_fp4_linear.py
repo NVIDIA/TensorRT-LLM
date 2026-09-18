@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import sys
 
 import pytest
@@ -751,9 +766,10 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 
 @pytest.mark.skipif(
-    get_sm_version() < 90 or get_sm_version() >= 100,
-    reason="Marlin NVFP4 backend runs Hopper",
+    not (89 <= get_sm_version() < 100 or get_sm_version() in (120, 121)),
+    reason="Dense Marlin NVFP4 runs on SM89-99 and SM120/121",
 )
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "mnk",
@@ -775,7 +791,10 @@ def test_fp4_linear_cuda_core(dtype, mnk):
         (3, 176, 144),
         (128, 928, 1360),
     ])
-def test_fp4_linear_marlin(dtype, mnk):
+def test_fp4_linear_marlin(quant_algo, dtype, mnk):
+    if quant_algo == QuantAlgo.NVFP4 and get_sm_version() in (120, 121):
+        pytest.skip(
+            "Marlin backend shouldn't be used for NVFP4 quant on SM120/121")
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 
@@ -797,7 +816,7 @@ def test_fp4_linear_marlin(dtype, mnk):
             out_features=OUTPUT_SIZE,
             bias=False,
             dtype=dtype,
-            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            quant_config=QuantConfig(quant_algo=quant_algo),
             nvfp4_allowed_backends=['marlin'],  # key
         )
 
@@ -883,14 +902,20 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
         m, n, k)
     bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.5
 
+    # Request the unbiased GEMM in fp32 and add the bias in fp32 so the
+    # reference rounds to bf16 exactly once, like the fused epilogue does.
+    # A bf16 out_no_bias would round twice, and since 1 bf16 ULP is 2.0 once
+    # |out| reaches ~256, cancellation against the bias promotes that discarded
+    # remainder into a multi-ULP error that the fused (single-rounded) result
+    # does not have.
     out_no_bias = torch.ops.trtllm.nvfp4_gemm(act_fp4,
                                               w_fp4,
                                               act_sf,
                                               w_sf,
                                               alpha,
-                                              torch.bfloat16,
+                                              torch.float32,
                                               allowed_backends=backend)
-    ref = out_no_bias + bias
+    ref = (out_no_bias + bias.float()).to(torch.bfloat16)
 
     out_fused = torch.ops.trtllm.nvfp4_gemm(act_fp4,
                                             w_fp4,
@@ -901,5 +926,6 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
                                             allowed_backends=backend,
                                             bias=bias)
 
-    # bf16 1-ULP at cast boundary (~0.0039) — fused vs gemm+add differs by ULP-level rounding.
+    # Tolerance is kept because the biased and unbiased calls may pick
+    # different autotuner tactics, i.e. a different accumulation order.
     torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)

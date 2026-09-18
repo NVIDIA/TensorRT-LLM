@@ -16,8 +16,6 @@
 
 import torch
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import ExperimentConfig, main
-from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
@@ -27,6 +25,10 @@ from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
 )
 from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
 
 def get_extra_seq_len_for_kv_cache(llm_args) -> int:
@@ -67,7 +69,6 @@ def test_super_mtp_smoke():
     experiment_config["args"]["world_size"] = 1
     experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
         num_nextn_predict_layers=3,
-        mtp_eagle_one_model=True,
         speculative_model=model_path,
     )
     # Shrink the Eagle/MTP drafter model to match the target's reduced dimensions.
@@ -104,7 +105,7 @@ def test_super_mtp_ssm_replay_smoke():
 
     Verifies that the full pipeline — transforms, cache manager init with replay buffers,
     and MTP inference — completes without error. The AD SSM custom ops are not directly
-    invoked at runtime in this configuration (Eagle3OneModelSampler drives its own forward
+    invoked at runtime in this configuration (SpecSampler drives its own forward
     loop); the replay kernel path is covered by test_flashinfer_extend_replay_calls_replay_kernel.
     Uses mamba_head_dim=64 and ssm_state_size=64 to satisfy FlashInfer constraints on the
     decode path (which IS called in this config).
@@ -139,7 +140,6 @@ def test_super_mtp_ssm_replay_smoke():
     experiment_config["args"]["world_size"] = 1
     experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
         num_nextn_predict_layers=3,
-        mtp_eagle_one_model=True,
         speculative_model=model_path,
     )
     experiment_config["args"]["speculative_model_kwargs"] = experiment_config["args"][
@@ -188,7 +188,6 @@ def test_kv_cache_extra_seq_len_for_spec_dec():
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model="some/model",
-        eagle3_one_model=True,
     )
     args_eagle = LlmArgs(
         model="meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -221,7 +220,6 @@ def test_mtp_autodeploy_uses_eagle_one_model_capture():
         model=model,
         speculative_config=MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         ),
         transforms=piecewise_disabled_transforms(),
     )
@@ -244,7 +242,6 @@ def test_detect_hidden_states_capture_last_layer_for_mtp_eagle_one_model():
         **config["args"],
         speculative_config=MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
             speculative_model=config["args"]["model"],
         ),
     )

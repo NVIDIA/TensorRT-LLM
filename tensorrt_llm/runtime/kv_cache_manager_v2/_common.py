@@ -18,7 +18,7 @@ import os
 from dataclasses import dataclass
 from typing import Final, NewType
 
-NDEBUG: Final[int] = int(os.environ.get("TLLM_KV_CACHE_MANAGER_V2_DEBUG", "0")) == 0
+NDEBUG: Final[bool] = os.environ.get("TLLM_DEBUG_MODE", "")[0:1] != "1"
 
 
 class PageStatus(enum.IntEnum):

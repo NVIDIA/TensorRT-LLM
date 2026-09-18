@@ -20,13 +20,13 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/doraScaling.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <numeric>
 #include <vector>
 
 using tensorrt_llm::kernels::DoraImpl;
 
-DoraImpl::DoraImpl(std::vector<int> const& outHiddenSizes, nvinfer1::DataType type)
+DoraImpl::DoraImpl(std::vector<int> const& outHiddenSizes, tensorrt_llm::DataType type)
     : mType(type)
 {
     mCumModuleSizes.resize(outHiddenSizes.size());
@@ -73,14 +73,14 @@ int DoraImpl::run(int64_t numTokens, void const* input, void const* const* loraW
     auto const* deviceCumModuleSizes = reinterpret_cast<int64_t const*>(workspace);
     auto const* deviceScalePtrs = reinterpret_cast<void const* const*>((&deviceCumModuleSizes[numModules]));
 
-    if (mType == nvinfer1::DataType::kHALF)
+    if (mType == tensorrt_llm::DataType::kHALF)
     {
         tokenPerChannelScale<half>(numel, numModules, numTokens, deviceCumModuleSizes,
             reinterpret_cast<half const*>(input), reinterpret_cast<half const* const*>(deviceScalePtrs),
             reinterpret_cast<half*>(outputs[0]), stream);
     }
 #ifdef ENABLE_BF16
-    else if (mType == nvinfer1::DataType::kBF16)
+    else if (mType == tensorrt_llm::DataType::kBF16)
     {
         tokenPerChannelScale<nv_bfloat16>(numel, numModules, numTokens, deviceCumModuleSizes,
             reinterpret_cast<nv_bfloat16 const*>(input), reinterpret_cast<nv_bfloat16 const* const*>(deviceScalePtrs),

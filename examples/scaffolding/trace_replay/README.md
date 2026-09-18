@@ -31,7 +31,9 @@ endpoint/model configuration with comparable metrics.
 examples/scaffolding/trace_replay/
 ├── README.md                  -- this file
 ├── run_trace_replay.py        -- single-trace single-config replay driver
-├── metrics.py                 -- replay-result metrics (used by run_trace_replay)
+├── run_trace_replay_pareto.py -- concurrent replay driver (job-level Pareto point)
+├── aggregate_pareto.py        -- collect a sweep of Pareto runs into one CSV
+├── metrics.py                 -- replay-result metrics (used by both drivers)
 ├── trace_example/             -- one ready-to-run example trace
 │   └── matplotlib__matplotlib-23412/
 │       └── matplotlib__matplotlib-23412.trace.json   (compact)
@@ -42,11 +44,12 @@ examples/scaffolding/trace_replay/
     └── README.md
 ```
 
-Two workflows are covered:
+Three workflows are covered:
 
 | Goal | Entry point |
 |---|---|
 | Replay one trace once against one serving config | `run_trace_replay.py` |
+| Measure a job-level Pareto point at concurrency | `run_trace_replay_pareto.py` |
 | Offline upper bound on KV-cache hit rate (no GPU) | `analysis/compute_cache_hit_trace.py` |
 
 ## The Core Design in One Picture
@@ -163,8 +166,13 @@ You can see this in:
 - `run_trace_replay.py`: one trace, one config, one report — the simplest
   thing that works. Use this to sanity-check a trace, or to compare two
   serving configs on a fixed workload.
+- `run_trace_replay_pareto.py`: the same trace replayed by
+  `--total-sessions` concurrent sessions, at most `--concurrency` of them in
+  flight. This is what a job-level Pareto point measures; one run is one
+  point, and sweeping `--concurrency` against the server's `--max_batch_size`
+  traces the curve.
 
-Built on `ReplayEngine` + `TRTOpenaiWorker`.
+Both are built on `ReplayEngine` + `TRTOpenaiWorker`.
 
 Flow for `run_trace_replay.py`:
 
@@ -245,6 +253,66 @@ budgets as the envelope for generation.
 Output JSON also includes run schema, timestamps, host/runtime metadata,
 CLI argv, replay endpoint settings, and trace file metadata.
 
+### Job-level Pareto report (`run_trace_replay_pareto.py`)
+
+A *job* is one agent session: a multi-turn conversation with tool calls in
+between, lasting minutes. That is the unit an agent's user perceives, and it
+is not derivable from tokens/s — the two views can rank configurations in
+opposite orders.
+
+**The two job-level fields are the result this harness exists to produce.**
+Everything else in the report is either an input to them or context for
+interpreting them:
+
+| Axis | Field | |
+|---|---|---|
+| **jobs/h/user** | **`pareto.job_x_jobs_per_h_per_user`** | **the X axis of the job-level Pareto curve** |
+| **jobs/h/GPU** | **`pareto.job_y_jobs_per_h_per_gpu`** | **the Y axis of the job-level Pareto curve** |
+| tokens/s/user | `pareto.token_x_tps_per_user` | token-level comparison point |
+| tokens/s/GPU | `pareto.token_y_tps_per_gpu` | token-level comparison point |
+| tokens/s/GPU, output only | `pareto.token_y_tps_per_gpu_output_only` | reference, understates per-GPU throughput |
+
+`job_x` is `3600 / mean end-to-end job latency`, so it is how many agent tasks
+one user gets through per hour. `job_y` is completed jobs per hour per GPU
+inside the steady-state window, so it is deployment capacity. Plotting `job_x`
+against `job_y` across a sweep gives the curve a capacity plan should be built
+on: more concurrency buys `job_y` and costs `job_x`.
+
+The token-level pair is kept for comparison, not as the headline. It answers
+how fast tokens flow, which is a proxy; under heavy prefix reuse it is also
+ambiguous, since counting reused prefix tokens and counting only freshly
+computed ones differ several-fold.
+
+Two rules decide whether these numbers mean anything.
+
+**Steady state only.** A run ramps up to saturation, holds, then drains.
+`total_sessions / wall_clock_s` is not a throughput: it averages in the ramp
+and the drain. Metrics are measured only inside the saturated window, defined
+in `metrics.py` (`compute_steady_state_window`) in admission order:
+
+```
+window start = start of the excl-th admitted session   (concurrency reaches its cap)
+window end   = end of the (N-excl+1)-th admitted one    (the drain begins)
+excl         = max(1, min(concurrency, max_batch_size * attention_dp_size))
+```
+
+Job membership is completion-based: a session counts if it *completes* inside
+the window, whenever it was admitted. Requiring a session to be entirely
+inside drops the in-flight population at both edges while keeping the full
+window in the denominator, which undercounts jobs/h/GPU roughly twofold. LLM
+calls last seconds rather than minutes, so the token-level metrics can use the
+stricter fully-inside rule.
+
+**tokens/s/GPU counts prefill input plus decode output.** Multi-turn agent
+prompts dwarf their completions, so an output-only axis understates per-GPU
+throughput several-fold and can invert cross-config rankings. It is kept as
+`token_y_tps_per_gpu_output_only` for reference. `tokens/s/user` stays
+decode-only, since TPOT is a per-output-token latency.
+
+Runs with no steady-state window report `pareto.valid = false`, and
+`aggregate_pareto.py` skips them rather than substituting a wall-clock
+average. Give a run `total_sessions > 2 * concurrency` so a window exists.
+
 ### KV-cache hit-rate analysis (`analysis/`)
 
 `compute_cache_hit_trace.py` is a pure offline simulator: it assumes an
@@ -323,7 +391,103 @@ Default output filename:
 
 - `<trace_base>_<model>_replay_statistics_<YYYYMMDD_HHMMSS>.json`
 
-### 3) Compute KV-cache hit rates
+### 3) Measure job-level Pareto points
+
+A job-level Pareto point is one run of `run_trace_replay_pareto.py` against one
+serving configuration. The full loop is: start a server, replay the trace at a
+chosen concurrency, repeat per cell, aggregate.
+
+**Start the server.** The batch size is a *server* setting, so a sweep over it
+means restarting the server per value. Two limits must clear the trace, or
+requests are rejected with HTTP 400 and the sessions fail:
+
+- `--max_num_tokens` must exceed the trace's largest prompt (the shipped
+  example trace peaks at ~11.9k tokens, above the default 8192), or
+  `enable_chunked_prefill` must be on.
+- `--max_seq_len` must cover the largest prompt plus its completion.
+
+```bash
+cat > serve.yaml <<EOF
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: true          # prefix reuse is what agentic traces stress
+  free_gpu_memory_fraction: 0.7
+EOF
+
+trtllm-serve <model> --host 127.0.0.1 --port 8000 --backend pytorch \
+  --tp_size 4 --max_batch_size 64 --max_seq_len 32768 --max_num_tokens 32768 \
+  --config serve.yaml
+```
+
+**Replay one cell.** `--max-batch-size` is metadata: it must repeat whatever the
+server was started with, because it sizes the steady-state window and nothing
+validates it for you.
+
+```bash
+python examples/scaffolding/trace_replay/run_trace_replay_pareto.py \
+  examples/scaffolding/trace_replay/trace_example/matplotlib__matplotlib-23412/matplotlib__matplotlib-23412.trace.json \
+  --model <model> \
+  --openai-base-url http://127.0.0.1:8000/v1 \
+  --total-sessions 200 --concurrency 64 --max-batch-size 64 \
+  --tensor-parallel-size 4 --arrival-jitter-s 60 \
+  --output-json results/run_B64_C64.json
+```
+
+The run logs its four coordinates on completion and writes them to
+`results/run_B64_C64.json` under `pareto`, alongside the window, the per-session
+timings, and the per-call detail the metrics are derived from.
+
+**Size the run.** A window exists only when
+
+```
+total_sessions > 2 * excl,   excl = max(1, min(concurrency, max_batch_size * attention_dp_size))
+```
+
+because `excl` sessions are excluded at each end. Undersize the run and the
+driver warns, `pareto.valid` is `false`, and the aggregator skips the file. A
+few hundred sessions is a reasonable starting point; the run takes roughly
+`total_sessions / concurrency` times one trace's wall time.
+
+**Sweep and aggregate.** Rerun per `(max_batch_size, concurrency)` cell into one
+directory, then collect the points:
+
+```bash
+python examples/scaffolding/trace_replay/aggregate_pareto.py results/
+```
+
+This writes `results/pareto.csv`, one row per successful run, sorted by
+`(max_batch_size, concurrency)`. **The two columns to plot are
+`job_x_jobs_per_h_per_user` (X) and `job_y_jobs_per_h_per_gpu` (Y)** — that
+scatter is the job-level Pareto curve, and it is the deliverable. The
+`token_x_tps_per_user` / `token_y_tps_per_gpu` pair plots the token-level curve
+for comparison; the remaining columns identify the cell and let you check the
+run was well formed. The aggregator also prints the job-level coordinates of
+every point as it writes the file.
+
+**Options worth setting deliberately:**
+
+- `--arrival-jitter-s` staggers session starts. Without it, identical copies of
+  one trace stay phase-aligned, hit their tool-call sleeps together, and make
+  the decode batch oscillate between full and empty — an artifact of the
+  harness, not of the workload. One mean turn duration is a reasonable value.
+  Report what you used; it affects results.
+- `--attention-dp-size` must match the server's attention-DP size. It widens
+  the steady-state window (capacity is `max_batch_size * dp`) and makes the
+  warmup pin one request per rank, since a single prefill would otherwise prime
+  only one rank's prefix tree.
+- `--tensor-parallel-size` is the GPU count used for the per-GPU axes. It is
+  the world size only for single-node tensor/expert-parallel configurations.
+- `--no-warmup` skips the system-prompt preload, leaving the first call of
+  every session to miss the prefix cache.
+
+**Reading the result.** A run that loses sessions to server errors still
+reports: the failures are counted in `sessions_failed` and listed in
+`session_failures`, and the surviving sessions produce the metrics. Check those
+fields before trusting a point. And a single run of a cell is not a
+measurement — run-to-run spread on these workloads is wide enough that
+differences within it should not be read as real.
+
+### 4) Compute KV-cache hit rates
 
 Offline ideal upper bound from a trace (no GPU needed):
 
@@ -358,3 +522,10 @@ See `analysis/README.md` for flags and output schema.
 - `optimal_cache_hit` from `analysis/` is an offline upper bound on
   block-reuse; the engine-measured rate at runtime will be lower due to
   scheduling and eviction losses, not a bug.
+- `run_trace_replay_pareto.py` replays one trace per run; mixed-workload
+  replay of several traces at once is not included here.
+- Per-GPU rates divide by `--tensor-parallel-size`, which is the GPU count
+  only for single-node tensor/expert-parallel configurations. Multi-node
+  topologies need the world size instead.
+- Absolute Pareto numbers are not comparable across traces, jitter settings,
+  or session counts. Only cells swept under one configuration are.

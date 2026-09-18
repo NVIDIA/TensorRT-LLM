@@ -29,8 +29,6 @@ SM version mapping:
 - `sm100` = Blackwell (e.g., B100, B200)
 - `sm103` = Blackwell-Ultra (e.g., B300, GB300)
 
-- To run perf tests, you also need to first build the cpp benchmark by calling `build_wheel.py` with `--benchmarks` flag.
-
 ## Run perf tests
 
 All the perf test names are in the form of `perf/test_perf.py::test_perf[...]` where the `...` part is the test parameters.

@@ -1,3 +1,18 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import enum
 import itertools
 import json
 import math
@@ -27,7 +42,6 @@ from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
     cloudpickle.dumps,
@@ -132,6 +146,181 @@ class GemmRunner(TunableRunner):
                 **kwargs) -> torch.Tensor:
         assert tactic in [-1, 0, 1]
         return [gemm_0, gemm_1, gemm_fallback][tactic](*inputs)
+
+
+class JitGemmRunner(GemmRunner):
+    """GemmRunner that compiles per tactic, like the CuTe DSL runners."""
+    kernel_cache: dict[int, bool] = {}
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    def forward(self,
+                /,
+                inputs: list[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        type(self).kernel_cache.setdefault(tactic, True)
+        type(self).calls.append((tuple(inputs[0].shape), tactic))
+        return super().forward(inputs, tactic=tactic, **kwargs)
+
+
+@pytest.mark.parametrize("strategy", [
+    DistributedTuningStrategy.PARALLEL,
+    DistributedTuningStrategy.MERGE,
+])
+def test_prime_cached_tactics_on_cache_hit(monkeypatch, strategy) -> None:
+    """Prime local cached winners without starting collective profiling."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    w = torch.randn(64, 128)
+    x = torch.randn(3, 64)
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(input_idx=0,
+                              dim_idx=0,
+                              gen_tuning_buckets=(3, 4, 5),
+                              map_to_tuning_buckets=lambda value: value),
+            DynamicTensorSpec(input_idx=1,
+                              dim_idx=1,
+                              gen_tuning_buckets=(64, 128, 256, 512),
+                              map_to_tuning_buckets=lambda value: value),
+        ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    op = "test_prime_cached_tactics"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_path = os.path.join(temp_dir, "prime.json")
+        with autotune(cache_path=cache_path):
+            tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+        winners = {
+            value[1]
+            for value in tuner.profiling_cache.get_specific_custom_op(
+                op).values()
+        }
+        assert winners
+
+        # Simulate a fresh process that only has the persistent tactic cache.
+        tuning_config.distributed_tuning_strategy = strategy
+        tuner.profiling_cache.clear()
+        tuner._primed_cached_tactics.clear()
+        JitGemmRunner.kernel_cache.clear()
+        JitGemmRunner.calls.clear()
+        if strategy == DistributedTuningStrategy.MERGE:
+
+            def unexpected_prepare(*args, **kwargs) -> None:
+                pytest.fail("A collective cache hit must not prepare inputs")
+
+            monkeypatch.setattr(tuner, "_prepare_input_tensors",
+                                unexpected_prepare)
+        with autotune(cache_path=cache_path):
+            tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+        expected = winners if strategy != DistributedTuningStrategy.MERGE else set(
+        )
+        assert set(JitGemmRunner.kernel_cache) == expected
+        assert len(JitGemmRunner.calls) == len(expected)
+
+        with autotune(cache_path=cache_path):
+            tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+        assert len(JitGemmRunner.calls) == len(expected)
+
+        monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "0")
+        tuner._primed_cached_tactics.clear()
+        JitGemmRunner.calls.clear()
+        with autotune(cache_path=cache_path):
+            tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+        assert JitGemmRunner.calls == []
+
+
+def test_prime_cached_tactics_after_parallel_cache_merge(monkeypatch) -> None:
+    """Prime winners selected by another rank after a cold profile."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    x = torch.randn(20, 64)
+    w = torch.randn(64, 128)
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            input_idx=0,
+            dim_idx=0,
+            gen_tuning_buckets=(3, 20),
+            map_to_tuning_buckets=lambda value: value,
+        ), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+    )
+    op = "test_prime_cached_tactics_after_parallel_cache_merge"
+    tuner = AutoTuner.get()
+    runner = JitGemmRunner()
+    tuner.clear_cache()
+    tuner._primed_cached_tactics.clear()
+    JitGemmRunner.kernel_cache.clear()
+    JitGemmRunner.calls.clear()
+
+    def merge_remote_winners(strategy, custom_op) -> None:
+        assert strategy == DistributedTuningStrategy.PARALLEL
+        for m, tactic in ((3, 0), (20, 1)):
+            cache_key = tuner.profiling_cache.get_cache_key(
+                custom_op,
+                runner,
+                ((m, 64), (64, 128)),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            tuner.profiling_cache[cache_key] = (0, tactic, 0.5)
+
+    monkeypatch.setattr(tuner, "is_tuning_mode", True)
+    # Distributed synchronization is covered separately.
+    monkeypatch.setattr(tuner, "_should_current_rank_tune", lambda _: False)
+    monkeypatch.setattr(tuner, "cache_pp_recv", lambda: None)
+    monkeypatch.setattr(tuner, "_maybe_sync_cache_data", merge_remote_winners)
+
+    selected_runner, tactic = tuner.choose_one(op, [runner], tuning_config,
+                                               [x, w])
+
+    assert selected_runner is runner
+    assert tactic == 1
+    assert set(JitGemmRunner.kernel_cache) == {0, 1}
+    assert JitGemmRunner.calls == [((3, 64), 0), ((20, 64), 1)]
+
+
+def test_failed_cached_tactic_prime_is_retried(monkeypatch) -> None:
+    """Do not memoize a cached winner until its prime launch succeeds."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    x = torch.randn(3, 64)
+    w = torch.randn(64, 128)
+    tuning_config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    op = "test_failed_cached_tactic_prime_is_retried"
+    tuner = AutoTuner.get()
+    runner = JitGemmRunner()
+    tuner.clear_cache()
+    tuner._primed_cached_tactics.clear()
+    JitGemmRunner.kernel_cache.clear()
+    JitGemmRunner.calls.clear()
+    profile = tuner._optimization_profiles(tuning_config, [x, w])[0]
+    cache_key = tuner.profiling_cache.get_cache_key(
+        op,
+        runner,
+        profile.get_opt_shapes(),
+        tuning_config,
+        apply_map_to_tuning_buckets=False,
+    )
+    tuner.profiling_cache[cache_key] = (0, 0, 1.0)
+
+    original_forward = runner.forward
+    attempts = 0
+
+    def fail_once(self, inputs, *, tactic=-1, **kwargs) -> torch.Tensor:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected prime failure")
+        return original_forward(inputs, tactic=tactic, **kwargs)
+
+    monkeypatch.setattr(JitGemmRunner, "forward", fail_once)
+    tuner._prime_cached_tactics(op, [runner], tuning_config, [x, w])
+    tuner._prime_cached_tactics(op, [runner], tuning_config, [x, w])
+
+    assert attempts == 2
+    assert set(JitGemmRunner.kernel_cache) == {0}
+    assert JitGemmRunner.calls == [((3, 64), 0)]
 
 
 @torch.library.custom_op("autotuner_test::get_best_gemm_tactic",
@@ -522,6 +711,63 @@ def test_autotuner_tuning_configs():
     assert best_tactic == deserialized_tactic, "Tactic should be the same after deserialization"
 
     runner_0([x, w], tactic=deserialized_tactic)
+
+
+def test_load_cache_skips_non_literal_tactic():
+    """Regression: a non-literal tactic repr must be skipped on load, not crash it.
+
+    ``_deserialize_cache_data`` reconstructs tactics with ``ast.literal_eval``,
+    which raises ``SyntaxError`` on non-literal reprs (e.g. enum tactic reprs,
+    until #16782 serializes enums by value). It must skip such entries -- once
+    ``SyntaxError`` was uncaught and had no ``continue``, crashing the load.
+    """
+    import ast
+
+    class _NonLiteralTactic:
+
+        def __repr__(self):
+            return "<_NonLiteralTactic object nvfp4>"
+
+    poisoned_repr = repr(_NonLiteralTactic())  # non-literal object repr
+    # Precondition: confirm this repr really does raise SyntaxError.
+    with pytest.raises(SyntaxError):
+        ast.literal_eval(poisoned_repr)
+
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    good_key = "('op_good', 'R', '0', ((1, 128),))"
+    bad_key = "('op_bad', 'R', '0', ((2, 128),))"
+    doc = {
+        "metadata": cache._serialize_metadata(),
+        "shared": {},
+        "rank_0": {
+            good_key: {
+                "runner_id": 0,
+                "tactic": "7",
+                "min_time": 0.001
+            },
+            bad_key: {
+                "runner_id": 1,
+                "tactic": poisoned_repr,
+                "min_time": 0.002
+            },
+        },
+    }
+    temp_dir = tempfile.TemporaryDirectory()
+    cache_path = os.path.join(temp_dir.name, "poisoned_cache.json")
+    with open(cache_path, "w") as f:
+        json.dump(doc, f)
+
+    # Must not raise (previously raised SyntaxError out of load_cache).
+    cache.load_cache(cache_path, rank=0)
+
+    # The literal-safe entry survived with its exact tactic ...
+    good = ("op_good", "R", "0", ((1, 128), ))
+    assert good in cache.cache
+    assert cache.cache[good][1] == 7
+    # ... and the non-literal entry was skipped, not silently mis-decoded.
+    bad = ("op_bad", "R", "0", ((2, 128), ))
+    assert bad not in cache.cache
 
 
 def test_kernel_testing_single_context():
@@ -1260,8 +1506,231 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         f"({sweep_us:.2f} us) for M={m}, N={n}, K={k}")
 
     # The heuristic CuteDSL kernel should beat cuBLAS or be within tolerance.
-    cublas_tolerance = 1.05
+    # This is a cross-library comparison (CuteDSL vs cuBLASLt) at ~28us per call
+    # profiled over only 20 iterations; run-to-run jitter easily reaches a few
+    # percent from DVFS, L2 residency, and interleaving with cuBLAS autotune
+    # warmup, so keep this bound looser than the intra-CuteDSL one above.
+    cublas_tolerance = 1.10
     assert heuristic_us <= cublas_us * cublas_tolerance, (
         f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
         f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
         f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
+
+
+@pytest.mark.parametrize("distribution", ["random", "balanced"])
+def test_trtllm_gen_moe_dummy_topk_local_experts_less_than_topk(
+        distribution, monkeypatch):
+    """NVBugs 6457853: autotuner warmup must not fail on EP shards where
+    local_num_experts < top_k (e.g. gpt-oss-120b: 128 experts, top_k=4,
+    EP64 -> 2 local experts per rank, attention-DP => use_dp=True).
+    Dummy rows keep the production shape: top_k distinct ids per row, all
+    local experts present, remaining slots padded with out-of-shard ids."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import \
+        prepare_dummy_topk_and_hook
+
+    monkeypatch.setenv("TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION",
+                       distribution)
+    num_tokens, top_k = 8, 4
+    num_experts, local_num_experts, local_expert_offset = 128, 2, 6
+    hidden_states = torch.randn(num_tokens,
+                                64,
+                                dtype=torch.bfloat16,
+                                device="cuda")
+    topk_ids = torch.randint(0,
+                             num_experts, (num_tokens, top_k),
+                             dtype=torch.int32,
+                             device="cuda")
+    topk_weights = torch.ones(num_tokens,
+                              top_k,
+                              dtype=torch.bfloat16,
+                              device="cuda")
+
+    with autotune():
+        _, dummy_weights, dummy_ids, _ = prepare_dummy_topk_and_hook(
+            topk_weights,
+            topk_ids,
+            hidden_states,
+            None,
+            1,
+            TuningConfig(),
+            top_k,
+            num_experts,
+            local_num_experts,
+            None,
+            None,
+            None,
+            local_expert_offset=local_expert_offset,
+            use_dp=True)
+
+    assert dummy_ids.shape == (num_tokens, top_k)
+    assert dummy_ids.dtype == torch.int32
+    assert dummy_weights.shape == (num_tokens, top_k)
+    shard = range(local_expert_offset, local_expert_offset + local_num_experts)
+    for row in dummy_ids.tolist():
+        assert len(set(row)) == top_k, f"duplicate ids in row {row}"
+        assert sum(x in shard for x in row) == local_num_experts, (
+            f"expected all {local_num_experts} local experts in row {row}")
+        assert all(0 <= x < num_experts for x in row), row
+
+
+def test_post_tune_merge_tactics_min_time_and_subset_kept():
+    tuner = autotuner.AutoTuner()
+    tuner.mapping = Mapping(world_size=2, rank=0, tp_size=2)
+
+    r0 = {
+        ("gemm", "X"): (0, ("cutlass", 10), 1.0),
+        ("q", "A"): (0, ("trtllm", ), 1.0)
+    }
+    r1 = {
+        ("gemm", "X"): (0, ("cublaslt", 0), 0.5),
+        ("vae", "B"): (0, ("cutlass", 2), 1.0)
+    }
+
+    class _FakeDist:
+
+        def tp_cp_allgather(self, obj):
+            return [r0, r1]
+
+    tuner._dist = _FakeDist()
+    tuner.profiling_cache.cache = dict(r0)
+    tuner.post_tune_merge_tactics()
+
+    cache = tuner.profiling_cache.cache
+    assert cache[("gemm", "X")] == (0, ("cublaslt", 0), 0.5)
+    assert cache[("q", "A")] == r0[("q", "A")]
+    assert cache[("vae", "B")] == r1[("vae", "B")]
+
+
+def test_post_tune_merge_tactics_single_rank_noop():
+    tuner = autotuner.AutoTuner()
+    tuner.mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    tuner._dist = None
+    original = {("gemm", "X"): (0, ("cutlass", 10), 1.0)}
+    tuner.profiling_cache.cache = dict(original)
+    tuner.post_tune_merge_tactics()
+    assert tuner.profiling_cache.cache == original
+
+
+def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
+    # An enum tactic must survive save -> load: repr("<Enum.X: v>") isn't
+    # ast.literal_eval-parsable, so the cache serializes tactic.value instead.
+    class _Tac(enum.IntEnum):
+        TRTLLM = -1
+
+    key = ("op::x", "Runner", "(1,)")
+    src = autotuner.AutoTuner().profiling_cache
+    src.cache[key] = (0, _Tac.TRTLLM, 1.0)
+    path = str(tmp_path / "cache.json")
+    src.save_cache(path, rank=0)  # must not raise
+
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert dst.cache[key][1] == _Tac.TRTLLM  # IntEnum compares equal to -1
+
+
+def test_autotune_post_tune_merge_before_save(tmp_path):
+    # autotune(post_tune_merge_dist=...) must merge across ranks and persist the
+    # merged winner, then restore the singleton's prior distributed state.
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    r0 = {("gemm", "X"): (0, ("cutlass", 10), 1.0)}
+    r1 = {("gemm", "X"): (0, ("cublaslt", 0), 0.5)}
+    tuner.profiling_cache.cache = dict(r0)
+
+    class _FakeDist:
+        mapping = Mapping(world_size=2, rank=0, tp_size=2)
+
+        def tp_cp_allgather(self, obj):
+            return [r0, r1]
+
+    prev_mapping, prev_dist = tuner.mapping, tuner._dist
+    path = str(tmp_path / "cache.json")
+    with autotune(cache_path=path, post_tune_merge_dist=_FakeDist()):
+        pass
+
+    # Merged in memory (fastest tactic won) and persisted before the context
+    # exits (the saved file carries the merged winner).
+    assert tuner.profiling_cache.cache[("gemm", "X")] == (0, ("cublaslt", 0),
+                                                          0.5)
+    persisted = autotuner.AutoTuner().profiling_cache
+    persisted.load_cache(path, rank=0)
+    assert persisted.cache[("gemm", "X")][1] == ("cublaslt", 0)
+    # The temporary full-world distributed state was restored.
+    assert tuner.mapping is prev_mapping
+    assert tuner._dist is prev_dist
+
+
+def _post_tune_merge_worker(world_size):
+    """Run on each MPI rank: seed a distinct cache, then merge for real."""
+    rank = tensorrt_llm.mpi_rank()
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      tp_size=world_size,
+                      pp_size=1)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(mapping)
+
+    # Shared key: rank 1's tactic is faster (should win). Plus a rank-unique key.
+    shared = ("gemm", "X")
+    tuner.profiling_cache.cache = {
+        shared: (0, ("cutlass", 10), 1.0) if rank == 0 else
+        (0, ("cublaslt", 0), 0.5),
+        (f"only_rank{rank}", "K"): (0, ("trtllm", ), 1.0),
+    }
+    tuner.post_tune_merge_tactics()
+
+    cache = tuner.profiling_cache.cache
+    return {
+        "shared": cache[shared],
+        "has_r0": ("only_rank0", "K") in cache,
+        "has_r1": ("only_rank1", "K") in cache,
+    }
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_post_tune_merge_tactics_multi_rank(mpi_pool_executor):
+    # Real 2-rank merge over an actual process group (not a FakeDist): every
+    # rank must converge to the same cache — the min-time winner for the shared
+    # key and both ranks' unique keys kept.
+    world_size = 2
+    results = list(
+        mpi_pool_executor.map(_post_tune_merge_worker,
+                              *zip(*[(world_size, )] * world_size)))
+    assert len(results) == world_size
+    for r in results:
+        assert r["shared"] == (0, ("cublaslt", 0), 0.5)
+        assert r["has_r0"] and r["has_r1"]
+
+
+def _autotune_dist_allgather_worker(world_size):
+    import torch.distributed as dist
+
+    from tensorrt_llm._torch.visual_gen.mapping import _VisualGenAutotuneDist
+    rank = tensorrt_llm.mpi_rank()
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29557")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo",
+                                world_size=world_size,
+                                rank=rank)
+    # VG's real mesh has tp_size=1; the communicator must gather over the whole
+    # world regardless, so the mapping's tp axis is irrelevant to the gather.
+    d = _VisualGenAutotuneDist(
+        Mapping(world_size=world_size, rank=rank, tp_size=world_size))
+    return d.tp_cp_allgather(f"rank{rank}")
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
+    # _VisualGenAutotuneDist.tp_cp_allgather must gather every rank's object over
+    # the default world group (not the single-rank tp subgroup), and construct
+    # without running TorchDist.__init__.
+    world_size = 2
+    results = list(
+        mpi_pool_executor.map(_autotune_dist_allgather_worker,
+                              *zip(*[(world_size, )] * world_size)))
+    for got in results:
+        assert got == ["rank0", "rank1"]

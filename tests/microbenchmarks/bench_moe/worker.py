@@ -687,7 +687,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
 
 _WORKER_ENV = {
     "TRTLLM_CAN_USE_DEEP_EP": "1",
-    "TRTLLM_ENABLE_PDL": "0",
+    "TRTLLM_ENABLE_PDL": "1",
 }
 
 
@@ -723,6 +723,14 @@ def main() -> None:
                 f"({external_world_size}) under external mpirun/srun."
             )
         os.environ.update(_WORKER_ENV)
+        # Pin the detected size onto args before the context is resolved: the
+        # search-axis defaults are world-size dependent (the even-split hybrid
+        # parallel modes), and _run_benchmark_worker_under_current_mpi builds
+        # the context before it reads mpi_world_size() itself. Leaving this at
+        # None made an external `mpirun -np 8 ... --search parallel` silently
+        # resolve its defaults against world_size=1 and emit only the four
+        # legacy modes.
+        args.world_size = external_world_size
         _run_benchmark_worker_under_current_mpi(args, launcher="external_mpi")
         return
 

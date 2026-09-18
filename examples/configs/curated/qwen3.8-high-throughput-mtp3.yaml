@@ -1,0 +1,34 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+tensor_parallel_size: 32
+moe_expert_parallel_size: 32
+pipeline_parallel_size: 1
+enable_attention_dp: true
+enable_lm_head_tp_in_adp: true
+disable_mm_encoder: true
+max_batch_size: 36
+max_num_tokens: 1024
+max_seq_len: 9472
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 36
+kv_cache_config:
+  enable_block_reuse: false
+  use_kv_cache_manager_v2: false
+  free_gpu_memory_fraction: 0.78
+  dtype: fp8
+  mamba_ssm_cache_dtype: bfloat16
+moe_config:
+  backend: DEEPGEMM
+  max_num_tokens: 32768
+  use_low_precision_moe_combine: true
+  load_balancer: examples/configs/curated/eplb/qwen3.8-ep32-static544-mtp3.yaml
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+stream_interval: 10
+print_iter_log: false
+trust_remote_code: true
+num_postprocess_workers: 4

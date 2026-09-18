@@ -71,6 +71,8 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 131104
       backend: NIXL
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     stream_interval: 20
     num_postprocess_workers: 4
     allreduce_strategy: MNNVL
@@ -84,7 +86,7 @@ worker_config:
     pipeline_parallel_size: 4
     print_iter_log: true
     cuda_graph_config: null
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.4
@@ -92,5 +94,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 131104
       backend: NIXL
+      transceiver_runtime: PYTHON
     moe_config:
       backend: TRTLLM

@@ -13,7 +13,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <gmock/gmock.h>
@@ -48,7 +48,7 @@ protected:
         LlmRequest::RequestIdType requestId, std::shared_ptr<VecTokens> inputTokens)
     {
         SizeType32 constexpr maxNewTokens{0};
-        tr::SamplingConfig const samplingConfig{1};
+        tensorrt_llm::executor::SamplingConfig const samplingConfig{1};
         bool constexpr isStreaming{false};
         return std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     }
@@ -89,7 +89,7 @@ TEST_F(TruncateBlocksTest, MultiTurnConversationTruncation)
 
     // Create KVCacheManager with block reuse enabled
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -219,7 +219,7 @@ TEST_F(TruncateBlocksTest, SharedPrefixTruncation)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -317,7 +317,7 @@ TEST_F(TruncateBlocksTest, CompleteTruncation)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -377,7 +377,7 @@ TEST_F(TruncateBlocksTest, NonExistentTokensTruncation)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -453,7 +453,7 @@ TEST_F(TruncateBlocksTest, ComplexMultiTurnConversationTruncation)
 
     // Create KVCacheManager with block reuse enabled
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
