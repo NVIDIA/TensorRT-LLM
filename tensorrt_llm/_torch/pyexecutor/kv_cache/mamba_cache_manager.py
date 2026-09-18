@@ -1673,14 +1673,14 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             "mamba hybrid cache requires block reuse to be disabled in KV cache config"
         )
 
-        # Host-drafter spec modes (NGram) have no spec worker to call
-        # update_mamba_states; this manager promotes accepted states itself
-        # in update_resources. One-model modes (MTP/Eagle/DFlash) and the
-        # suffix-automaton worker promote from their spec workers and must
-        # NOT be promoted twice.
+        # Host-drafter spec modes (user-provided drafters) have no spec worker
+        # to call update_mamba_states; this manager promotes accepted states
+        # itself in update_resources. One-model modes (MTP/Eagle/DFlash) and
+        # the retrieval workers (NGram/SA) promote from their spec workers and
+        # must NOT be promoted twice.
         self._promote_states_in_update_resources = (
             spec_config is not None
-            and getattr(spec_config, "decoding_type", None) == "NGram")
+            and spec_config.spec_dec_mode.has_spec_drafter())
 
         pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
@@ -3049,7 +3049,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     "KDA replay requires conv_state_layout='q_k_v'")
         self._record_kda_replay_in_update_resources = (
             self.use_kda_replay_update
-            and getattr(spec_config, "decoding_type", None) == "NGram")
+            and spec_config.spec_dec_mode.has_spec_drafter())
 
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:

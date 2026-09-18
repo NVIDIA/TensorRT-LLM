@@ -230,6 +230,8 @@ l0_b200:
   # cuda-availability skipif like the sibling KDA parity tests; relocated
   # from tests/torch/ which test-db cannot list).
   - unittest/_torch/speculative/test_suffix_automaton.py
+  # On-device NGram spec-dec kernel tests (reference parity + CUDA graph replay).
+  - unittest/_torch/speculative/test_ngram_kernel.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial

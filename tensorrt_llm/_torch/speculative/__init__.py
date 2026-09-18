@@ -8,7 +8,7 @@ from .interface import (SpecMetadata, SpecWorkerBase, draft_prompt_lookahead,
                         restore_attn_metadata_after_draft_replay,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPSpecMetadata, MTPWorker
-from .ngram import NGramDrafter, NGramPoolManager
+from .ngram import NGramPoolManager, NGramSpecMetadata, NGramWorker
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_enhancer import SADraftEnhancer
 from .sa_worker import SASpecMetadata, SAWorker
@@ -33,8 +33,9 @@ __all__ = [
     "MTPEagleWorker",
     "MTPSpecMetadata",
     "MTPWorker",
-    "NGramDrafter",
     "NGramPoolManager",
+    "NGramSpecMetadata",
+    "NGramWorker",
     "PARDSpecMetadata",
     "PARDWorker",
     "SADraftEnhancer",

@@ -279,7 +279,6 @@ unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:1
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nemotron_h SKIP (https://nvbugs/6729495)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6535767)
-unittest/_torch/speculative/hw_agnostic/test_ngram.py::test_llama_ngram[True-True-TRTLLM] SKIP (https://nvbugs/6507102)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5461761)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cublaslt] SKIP (https://nvbugs/6581067)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cutlass] SKIP (https://nvbugs/6581067)

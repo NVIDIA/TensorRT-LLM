@@ -122,6 +122,10 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
+    # Retrieval drafters (NGram, SA) have no draft layers, so there is no draft
+    # KV cache to keep separate.
+    if spec_config.spec_dec_mode.is_retrieval_drafter():
+        return False
     # The embedded DSpark draft owns a dedicated rolling-window cache in
     # DSv4DSparkWorker and never reads the paged draft KV cache that attention
     # metadata manages. A standalone DSpark drafter runs on DSparkWorker
@@ -324,7 +328,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
-        ) or self.is_external_drafter() or self.is_sa()
+        ) or self.is_external_drafter() or self.is_retrieval_drafter()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -351,6 +355,10 @@ class SpeculativeDecodingMode(IntEnum):
     def is_sa(self):
         return self == SpeculativeDecodingMode.SA
 
+    def is_retrieval_drafter(self):
+        """Drafts by matching the sequence's own history (no neural draft model)."""
+        return self.is_ngram() or self.is_sa()
+
     def is_user_provided(self):
         return self == SpeculativeDecodingMode.USER_PROVIDED
 
@@ -368,27 +376,27 @@ class SpeculativeDecodingMode(IntEnum):
 
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_external_drafter() or self.is_sa()
+        ) or self.is_external_drafter() or self.is_retrieval_drafter()
 
     def needs_kv_cache_rewind(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram() or self.is_sa() or self.is_external_drafter()
+        ) or self.is_retrieval_drafter() or self.is_external_drafter()
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_sa() or self.is_external_drafter()
+        ) or self.is_retrieval_drafter() or self.is_external_drafter()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_external_drafter() or self.is_sa()
+        ) or self.is_external_drafter() or self.is_retrieval_drafter()
 
     def support_dynamic_draft_len(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
-        ) or self.is_draft_target_one_model() or self.is_sa()
+        ) or self.is_draft_target_one_model() or self.is_retrieval_drafter()
 
     def need_load_draft_weights(self):
         """
@@ -399,10 +407,11 @@ class SpeculativeDecodingMode(IntEnum):
 
     def has_spec_decoder(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_external_drafter() or self.is_sa()
+        ) or self.is_external_drafter() or self.is_retrieval_drafter()
 
     def has_spec_drafter(self):
-        return self.is_ngram() or self.is_user_provided()
+        """Drafts on the host through a ``Drafter`` before the target forward (two-model flow)."""
+        return self.is_user_provided()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

@@ -2596,7 +2596,13 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
-    """Configuration for NGram drafter speculative decoding."""
+    """Configuration for NGram (prompt lookup) speculative decoding.
+
+    Each request's token history is kept in a GPU pool and drafting runs inside
+    the target model forward: the tokens that followed the longest earlier
+    occurrence of the sequence's suffix are proposed as drafts. Supports CUDA
+    graph and the overlap scheduler.
+    """
     decoding_type: Literal["NGram"] = Field(default="NGram")
     max_matching_ngram_size: PositiveInt = Field(
         default=2,
@@ -2606,16 +2612,17 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_keep_all: bool = Field(
         default=True,
         description=
-        "Whether to keep all candidate pattern-matches pairs, only one "
-        "match is kept for each pattern if False.")
+        "Kept for backward compatibility and ignored: the GPU drafter always "
+        "searches the full token history instead of a pruned pattern pool.")
     is_use_oldest: bool = Field(
         default=True,
-        description="Whether to provide the oldest match when pattern is hit, "
-        "the newest one is provided if False.")
+        description="Whether to draft from the earliest occurrence of the "
+        "matched suffix, the latest occurrence is used if False.")
     is_public_pool: bool = Field(
         default=True,
-        description="Whether to use a common pool for all requests, or the pool "
-        "is private for each request if False.")
+        description="Whether to also search the token histories of the other "
+        "in-flight requests for a match, or only the request's own history "
+        "if False.")
 
     @model_validator(mode="after")
     def validate_ngram_config(self):

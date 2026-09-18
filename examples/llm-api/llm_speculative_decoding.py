@@ -70,8 +70,6 @@ def run_ngram():
     llm = LLM(
         model="meta-llama/Llama-3.1-8B-Instruct",
         speculative_config=spec_config,
-        # ngram doesn't work with overlap_scheduler
-        disable_overlap_scheduler=True,
     )
 
     for prompt in prompts:

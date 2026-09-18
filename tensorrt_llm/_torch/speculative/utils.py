@@ -31,7 +31,7 @@ from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
 from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
                                MTPEagleDynamicTreeWorker)
-from .ngram import NGramDrafter, NGramPoolManager
+from .ngram import NGramPoolManager, NGramSpecMetadata, NGramWorker
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
@@ -502,8 +502,15 @@ def _build_spec_metadata(spec_config,
             sa_manager=spec_resource_manager,
             max_matching_ngram_size=spec_config.max_matching_ngram_size,
         )
-    if spec_config.spec_dec_mode.is_ngram(
-    ) or spec_config.spec_dec_mode.is_user_provided():
+    if spec_config.spec_dec_mode.is_ngram():
+        return NGramSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            ngram_pool_manager=spec_resource_manager,
+        )
+    if spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -632,7 +639,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
                                           num_seq_slots=num_seq_slots)
         return None
     if spec_dec_mode.is_ngram():
-        return NGramPoolManager(spec_config, max_num_requests)
+        return NGramPoolManager(spec_config,
+                                max_num_requests,
+                                max_seq_len,
+                                num_seq_slots=num_seq_slots)
     if spec_dec_mode.is_sa():
         return SuffixAutomatonManager(spec_config,
                                       max_num_requests,
@@ -678,9 +688,6 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
-
-    if spec_config.spec_dec_mode.is_ngram():
-        return NGramDrafter(spec_config, spec_resource_manager)
 
     return None
 
@@ -760,6 +767,8 @@ def get_spec_worker(spec_config,
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
+    if spec_dec_mode.is_ngram():
+        return NGramWorker(spec_config, model_config)
     if spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelWorker(spec_config, mapping,
                                          use_separate_draft_kv_cache)

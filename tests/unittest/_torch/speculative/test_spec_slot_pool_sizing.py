@@ -35,6 +35,7 @@ from tensorrt_llm._torch.speculative.eagle3 import (
 )
 from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager
 from tensorrt_llm._torch.speculative.mtp_dynamic_tree import MTPEagleDynamicTreeResourceManager
+from tensorrt_llm._torch.speculative.ngram import NGramPoolManager
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAutomatonManager
 from tensorrt_llm._torch.speculative.utils import (
@@ -168,8 +169,6 @@ def test_mtp_slot_pool_survives_a_full_overlap_turnover():
 
 #: Managers that legitimately do not take a slot pool.
 _MANAGERS_WITHOUT_A_SLOT_POOL = {
-    # Keyed by pattern, not request identity, and NGRAM never runs with overlap.
-    "NGramPoolManager",
     # Hidden-state export path; no per-request slot pool.
     "SaveHiddenStatesResourceManager",
 }
@@ -180,6 +179,7 @@ _MANAGERS_WITH_A_SLOT_POOL = (
     Eagle3ResourceManager,
     Eagle3OneModelDynamicTreeResourceManager,
     SuffixAutomatonManager,
+    NGramPoolManager,
     SpecTreeManager,
 )
 
@@ -402,6 +402,37 @@ def test_an_explicit_sa_pool_is_a_floor_not_a_rejection():
     assert _sa_manager(POOL, enable_global_pool=True, global_pool_size=64).pool_size == 64
     assert _sa_manager(POOL, enable_global_pool=True, global_pool_size=R).pool_size == POOL
     assert _sa_manager(None, enable_global_pool=True, global_pool_size=R).pool_size == R
+
+
+def _ngram_manager(num_seq_slots):
+    config = types.SimpleNamespace(
+        max_draft_len=3, max_matching_ngram_size=2, is_use_oldest=True, is_public_pool=True
+    )
+    return NGramPoolManager(config, R, 64, num_seq_slots=num_seq_slots)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="NGram token histories live on CUDA")
+@pytest.mark.parametrize("num_seq_slots,expected_pool", [(POOL, POOL), (None, R)])
+def test_ngram_pool_spans_the_slot_pool(num_seq_slots, expected_pool):
+    """NGram histories are held for a request id's lifetime, so the pool follows it.
+
+    The dummy slot sits one past the pool, so every slot-indexed buffer is
+    ``pool + 1`` deep and the dummy never collides with a real slot.
+    """
+    mgr = _ngram_manager(num_seq_slots)
+
+    assert mgr.pool_size == expected_pool
+    assert mgr.slot_manager.max_num_requests == expected_pool
+    assert mgr.dummy_slot == expected_pool
+    assert mgr.history_tokens.shape[0] == expected_pool + 1
+    assert mgr.history_lens.shape[0] == expected_pool + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="NGram token histories live on CUDA")
+def test_ngram_pool_survives_a_full_overlap_turnover():
+    mgr = _ngram_manager(POOL)
+    slots = [mgr.slot_manager.add_slot(rid) for rid in range(POOL)]
+    assert len(set(slots)) == POOL
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="dynamic-tree slot storage is on CUDA")

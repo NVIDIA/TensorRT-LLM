@@ -1,17 +1,57 @@
 import unittest
+from typing import Optional
 
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.speculative.ngram import NGramDrafter, NGramPoolManager
-from tensorrt_llm.llmapi import (
-    CudaGraphConfig,
-    KvCacheConfig,
-    NGramDecodingConfig,
-    UserProvidedDecodingConfig,
-)
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.drafter import Drafter
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, UserProvidedDecodingConfig
+
+
+class PromptLookupDrafter(Drafter):
+    """Minimal host-side prompt-lookup drafter used to exercise the user-provided path.
+
+    Proposes the tokens that followed the latest earlier occurrence of the sequence's suffix
+    (up to ``max_matching_ngram_size`` tokens), the way the retired host NGram drafter did.
+    """
+
+    # Uses TorchSampler, whose rewind is computed from the padded draft length.
+    _needs_padding_kv_extension = True
+
+    def __init__(self, max_draft_len: int, max_matching_ngram_size: int = 2) -> None:
+        super().__init__(max_draft_len=max_draft_len, max_total_draft_tokens=max_draft_len)
+        self.max_matching_ngram_size = max_matching_ngram_size
+
+    def prepare_draft_tokens(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
+    ) -> None:
+        for request in scheduled_requests.generation_requests:
+            request.py_draft_tokens = self._lookup(list(request.get_tokens(0)))
+
+    def _lookup(self, tokens: list[int]) -> list[int]:
+        for size in range(min(self.max_matching_ngram_size, len(tokens) - 1), 0, -1):
+            pattern = tokens[-size:]
+            for start in range(len(tokens) - size - 1, -1, -1):
+                if tokens[start : start + size] == pattern:
+                    return tokens[start + size : start + size + self.max_draft_len]
+        return []
+
+
+@pytest.mark.cpu_only
+def test_prompt_lookup_drafter_prefers_longest_then_latest_match():
+    drafter = PromptLookupDrafter(max_draft_len=3, max_matching_ngram_size=3)
+    #          0  1  2  3  4  5  6  7  8  9
+    tokens = [1, 2, 3, 7, 1, 2, 3, 8, 2, 3]
+    assert drafter._lookup(tokens) == [8, 2, 3]  # suffix [2, 3], latest occurrence ends at 6
+    assert drafter._lookup([1, 2, 3, 4, 1, 2, 3]) == [4, 1, 2]  # 3-gram match
+    assert drafter._lookup([5]) == []
+    assert drafter._lookup([5, 6]) == []
 
 
 # TODO: add disable_overlap_scheduler=False
@@ -42,23 +82,7 @@ def test_llama_user_provided(
         max_num_tokens=2048,
     )
 
-    ngram_config = NGramDecodingConfig(
-        max_draft_len=max_draft_len,
-        max_matching_ngram_size=2,
-        is_keep_all=True,
-        is_use_oldest=True,
-        is_public_pool=True,
-    )
-
-    ngram_pool_manager = NGramPoolManager(
-        spec_config=ngram_config,
-        max_num_requests=max_batch_size,
-    )
-
-    drafter = NGramDrafter(
-        spec_config=ngram_config,
-        ngram_pool_manager=ngram_pool_manager,
-    )
+    drafter = PromptLookupDrafter(max_draft_len=max_draft_len, max_matching_ngram_size=2)
 
     spec_config = UserProvidedDecodingConfig(
         max_draft_len=max_draft_len,

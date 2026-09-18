@@ -1551,8 +1551,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
-            # Only create draft_model for modes MTP, Eagle3 (not SA)
-            if not spec_config.spec_dec_mode.is_sa():
+            # Retrieval drafters (NGram, SA) match the token history and have
+            # no draft model; every other one-engine mode builds one here.
+            if not spec_config.spec_dec_mode.is_retrieval_drafter():
                 requested_draft_moe_backend = _get_requested_draft_moe_backend(
                     model_config, spec_config)
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -1632,7 +1633,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     ) and self.draft_model is not None:
                     self.draft_model.logits_processor = self.logits_processor
 
-            # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
+            # spec_worker is created for all one-engine modes (MTP, Eagle3, SA, NGram)
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
