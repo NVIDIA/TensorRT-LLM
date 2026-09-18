@@ -234,30 +234,33 @@ def test_index_k_views_are_fullgraph_safe(
         meta.kv_cache_manager = manager
         for layer in (0, 5, 60):
             assert manager.get_index_k_buffer(layer) is None
-        with pytest.raises(ValueError, match="Unsupported kv_layout"):
-            manager.get_index_k_buffer(3, kv_layout="invalid")
-        nhd = manager.get_index_k_buffer(3, kv_layout="NHD")
-        hnd = manager.get_index_k_buffer(3, kv_layout="HND")
-        assert nhd.shape == (3, 4, 1, 8)
-        assert hnd.shape == (3, 1, 4, 8)
-        assert nhd.data_ptr() == hnd.data_ptr()
-        assert nhd.stride(0) == hnd.stride(0) == 2 * 4 * 8
-        assert manager.get_index_k_buffer(3) is (hnd if implementation == "msa" else nhd)
+        cache = manager.get_index_k_buffer(3)
+        expected_shape = (3, 1, 4, 8) if implementation == "msa" else (3, 4, 1, 8)
+        assert cache.shape == expected_shape
+        assert cache.data_ptr() == manager._test_index_pool.data_ptr()
+        assert cache.stride(0) == 2 * 4 * 8
+        if implementation == "msa":
+            assert meta.msa_idx_k_cache(3) is cache
 
     def forward(meta: MiniMaxM3MsaSparseAttentionMetadata, value: torch.Tensor) -> torch.Tensor:
-        first = meta.msa_idx_k_cache(3)
-        second = meta.msa_idx_k_cache(4)
+        get_cache = (
+            meta.msa_idx_k_cache
+            if implementation == "msa"
+            else meta.kv_cache_manager.get_index_k_buffer
+        )
+        first = get_cache(3)
+        second = get_cache(4)
         first.copy_(value.to(first.dtype))
         return first.float() + second.float()
 
     compiled = torch.compile(forward, backend="eager", fullgraph=True)
-    value = torch.full((3, 1, 4, 8), 2.0)
+    value = torch.full(expected_shape, 2.0)
     try:
         pools[0].fill_(1)
         torch.testing.assert_close(compiled(metadata[0], value), torch.full_like(value, 3))
-        # A later replay must see writes through either layout without a
+        # A later replay must see writes to the underlying pool without a
         # cloned or stale tensor. The other layer must remain independent.
-        managers[0].get_index_k_buffer(4, kv_layout="NHD").fill_(7)
+        pools[0][:, 1].fill_(7)
         torch.testing.assert_close(compiled(metadata[0], value + 2), torch.full_like(value, 11))
         torch.testing.assert_close(pools[0][:, 0].float(), torch.full((3, 4, 1, 8), 4.0))
         pools[1].fill_(9)
@@ -556,8 +559,8 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
         def __init__(self):
             self.calls = []
 
-        def get_index_k_buffer(self, layer_idx, kv_layout="NHD"):
-            self.calls.append((layer_idx, kv_layout))
+        def get_index_k_buffer(self, layer_idx):
+            self.calls.append(layer_idx)
             return hnd_cache
 
     manager = FakeCacheManager()
@@ -570,7 +573,7 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
 
     assert returned.data_ptr() == hnd_cache.data_ptr()
     assert not returned.is_contiguous()
-    assert manager.calls == [(3, "HND"), (3, "HND")]
+    assert manager.calls == [3, 3]
     torch.testing.assert_close(hnd_cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
     torch.testing.assert_close(hnd_cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
 

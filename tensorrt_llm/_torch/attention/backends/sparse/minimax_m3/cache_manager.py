@@ -338,20 +338,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # Resolve the zero-copy index-K views eagerly. The V2 pool geometry
         # stays fixed for this manager's lifetime, but resolving it calls
         # nanobind methods that Dynamo cannot trace from the fused FP8 indexer.
-        # MSA uses HND and Triton uses NHD; keep both explicit-layout views.
-        self._index_k_buffers: dict[tuple[int, str], Optional[torch.Tensor]] = {}
+        kv_layout = self._main_kv_layout_name()
+        self._index_k_buffers: dict[int, Optional[torch.Tensor]] = {}
         self._index_v_buffers: dict[int, torch.Tensor] = {}
         for layer_idx in self.sparse_layer_ids:
             if layer_idx not in self.layer_offsets:
                 continue
-            for kv_layout in ("NHD", "HND"):
-                self._index_k_buffers[layer_idx, kv_layout] = super().get_index_k_buffer(
-                    layer_idx,
-                    num_heads=1,
-                    head_dim=self.sparse_index_dim,
-                    dtype=torch_dtype,
-                    kv_layout=kv_layout,
-                )
+            self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
+                layer_idx,
+                num_heads=1,
+                head_dim=self.sparse_index_dim,
+                dtype=torch_dtype,
+                kv_layout=kv_layout,
+            )
             if layer_idx not in self.disable_index_value_layer_ids:
                 self._index_v_buffers[layer_idx] = torch.zeros(
                     (num_total_slots, 1, self.sparse_index_dim),
@@ -490,24 +489,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return torch.float8_e4m3fn
         return torch.bfloat16
 
-    def get_index_k_buffer(
-        self, layer_idx: int, kv_layout: Optional[str] = None
-    ) -> Optional[torch.Tensor]:
-        """Return the V2-managed paged index-K view for ``layer_idx``.
+    def get_index_k_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
+        """Return the V2-managed index-K view in the selected backend's layout.
 
-        NHD shape is ``[num_pages, tokens_per_block, 1, sparse_index_dim]``;
-        HND shape is ``[num_pages, 1, tokens_per_block, sparse_index_dim]``.
-        When omitted, ``kv_layout`` follows the selected sparse backend.
         Views are resolved during initialization so compiled forwards only
         read tensors, without entering the C++ pool-address accessors.
         """
-        if kv_layout is None:
-            kv_layout = self._main_kv_layout_name()
-        # Preserve the base accessor's validation: None means a missing layer,
-        # not an unsupported layout.
-        if kv_layout not in ("NHD", "HND"):
-            raise ValueError(f"Unsupported kv_layout: {kv_layout}")
-        return self._index_k_buffers.get((layer_idx, kv_layout))
+        return self._index_k_buffers.get(layer_idx)
 
     def get_index_v_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
         """Plain-tensor index-V cache for non-disabled sparse layers."""
