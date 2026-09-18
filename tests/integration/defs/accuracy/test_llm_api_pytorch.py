@@ -5943,6 +5943,57 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         mocker=mocker)
 
 
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_8_27B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.8-27B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.8-27B"
+    DFLASH2_MODEL_PATH = f"{llm_models_root()}/Qwen3.8-27B-DFlash2"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA"])
+    def test_dflash2(self, dflash_attention_backend):
+        """DFlash 2 drafter (incoai/Qwen3.8-27B-DFlash2) on its bf16 target.
+
+        Runs the DFlash 2 additions end to end: the per-sublayer block
+        convolutions, the non-causal symmetric sliding window, and the
+        candidate selector's path through the block. Acceptance length is
+        gated alongside GSM8K, since a drafter that silently degrades to
+        plain DFlash still passes the accuracy check. The drafter is trained
+        on chat generations, so the harness applies the chat template with
+        thinking off, like the other Qwen3.5-family DFlash tests.
+        max_draft_len=7 matches the checkpoint's block_size=8.
+        """
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=False)
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=7,
+            speculative_model=self.DFLASH2_MODEL_PATH,
+            attention_backend=dflash_attention_backend)
+
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 max_seq_len=4096,
+                 max_batch_size=8,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                   max_batch_size=8),
+                 speculative_config=spec_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert_acceptance_length_for_llm("TestQwen3_8_27B::test_dflash2",
+                                             llm)
+
+
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Seed-OSS/Seed-OSS-36B-Instruct"
