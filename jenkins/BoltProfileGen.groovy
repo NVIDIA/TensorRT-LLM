@@ -33,9 +33,10 @@
 // ("consume immediately after generating"); PROMOTE (set by the postmerge launch,
 // opt-in elsewhere) publishes the packaged bundle to the branch-keyed Artifactory
 // path so premerge can pull `latest` (apply_latest.sh). PUBLISH_BOLTED_TARBALL
-// pushes that re-BOLTed tarball back to the input artifactPath as
-// bolted-<tarball>, a SECOND object alongside the canonical one, so consumers of
-// the postmerge build that need optimized binaries have something to depend on.
+// (also set by the postmerge launch) pushes that re-BOLTed tarball back to the
+// input artifactPath as bolted-<tarball>, a SECOND object alongside the
+// canonical one, so consumers of the postmerge build that need optimized
+// binaries have something to depend on.
 // =============================================================================
 
 import groovy.transform.Field
@@ -102,8 +103,9 @@ APPLY_PROFILES = (params.applyProfiles ?: "true").toString()
 //
 // Requires APPLY_PROFILES=true (the bolted tarball is produced by the merge job's
 // BOLT_APPLY=1 step) and PROMOTE=true (only the postmerge producer publishes).
-// Default OFF -- the rollout is flipped on in a follow-up change -- so this is
-// inert until then. Resolution mirrors the other toggles: param, then env.
+// Set true by the postmerge launch in L0_MergeRequest.groovy, alongside the other
+// two; default OFF, so an on-demand or premerge run still publishes nothing
+// unless it asks. Resolution mirrors the other toggles: param, then env.
 PUBLISH_BOLTED_TARBALL = (params.boltPublishBolted ?: env.boltPublishBolted ?: "false").toString() == "true"
 // Multiply each workload's client `iterations` (num_requests = concurrency *
 // iterations) to lengthen the measured serving window without editing the shared
@@ -541,8 +543,8 @@ def submitProfileGen(pipeline)
         // node; without this it is reclaimed by the retention sweep below. Runs
         // BEFORE that sweep. Coupled to PROMOTE so only the postmerge producer
         // (which promotes the bundle) publishes -- a premerge generate-and-consume
-        // run (promote=false) never does, even with the toggle on. Gated off by
-        // default (PUBLISH_BOLTED_TARBALL).
+        // run (promote=false) never does, even with the toggle on.
+        // PUBLISH_BOLTED_TARBALL is set by the postmerge launch; off elsewhere.
         if (PUBLISH_BOLTED_TARBALL && APPLY_PROFILES == "true" && PROMOTE == "true") {
             stage("Publish BOLTed build") {
                 publishBoltedTarball(pipeline, remote,
@@ -551,6 +553,14 @@ def submitProfileGen(pipeline)
             }
         } else if (!PUBLISH_BOLTED_TARBALL) {
             pipeline.echo("PUBLISH_BOLTED_TARBALL=false: not publishing a BOLTed tarball.")
+        } else if (APPLY_PROFILES != "true") {
+            pipeline.echo("PUBLISH_BOLTED_TARBALL=true but applyProfiles=false: the merge job ran without " +
+                          "BOLT_APPLY=1, so there is no BOLTed tarball to publish.")
+        } else {
+            // applyProfiles DID produce a bolted tarball; this run simply is not a
+            // producer. Say that, rather than claiming nothing was built.
+            pipeline.echo("PUBLISH_BOLTED_TARBALL=true but promote=false: only the postmerge producer publishes, " +
+                          "so this run's BOLTed tarball stays on the cluster.")
         }
 
         // Retention: best-effort purge of workspaces older than 7 days so scratch
@@ -897,7 +907,7 @@ pipeline {
         choice(
             name: "boltPublishBolted",
             choices: ["false", "true"],
-            description: "After merge (requires applyProfiles=true and promote=true), push the BOLTed build back to the input artifactPath as bolted-<tarball>, a distinct object alongside the untouched canonical one. Default false; the rollout is turned on in a follow-up change. Renamed from boltPublishCanonical, which overwrote the canonical name; the first run after this lands drops the parent's value (an undeclared parameter is dropped even when sent) and publishes nothing."
+            description: "After merge (requires applyProfiles=true and promote=true), push the BOLTed build back to the input artifactPath as bolted-<tarball>, a distinct object alongside the untouched canonical one. Default false; the postmerge pipeline passes true. Renamed from boltPublishCanonical, which overwrote the canonical name; the first run after this lands drops the parent's value (an undeclared parameter is dropped even when sent) and publishes nothing."
         )
         string(
             name: "slurmPlatform",
