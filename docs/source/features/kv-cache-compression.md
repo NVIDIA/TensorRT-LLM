@@ -206,9 +206,9 @@ NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
 
 #### Keeping RoPE Precision
 
-Most models apply rotary position embedding (RoPE) to part of each K row: the
+Some models apply rotary position embedding (RoPE) to only part of each K row: the
 64-element tail of an MLA latent row, the first `head_dim * partial_rotary_factor`
-elements of a partial-rotary GQA head (Qwen3.5, Qwen3-Next), or the 64-element
+elements of a partial-rotary GQA head (Qwen3.5), or the 64-element
 tail of a DeepSeek-V4 compressed row. Those elements carry the token position, so
 their rounding error acts differently from the rest of the row, and some
 deployments prefer to leave them alone.
@@ -216,8 +216,11 @@ deployments prefer to leave them alone.
 `keep_rope_precision` makes that a choice. It is off by default: the whole row is
 quantized for the best ratio. Turning it on copies the RoPE part byte-for-byte
 from the active cache, which improves accuracy a little and lowers the ratio; an
-FP8 MLA row goes from 1.78x to 1.64x. Models whose K rows are fully rotated
-(Qwen3, Llama, GPT-OSS) have nothing left to quantize and reject the option.
+FP8 MLA row goes from 1.78x to 1.64x. The option is validated for DeepSeek-V4,
+GLM-5 (`glm_moe_dsa`), and the Qwen3.5 series. Any other model ignores it with a
+warning and quantizes whole rows; supporting a new model means checking its
+accuracy and adding its `model_type` to the list in `nvfp4_quantization.py`.
+Draft-model KV caches used by speculative decoding always quantize whole rows.
 
 ```yaml
 kv_cache_compression_config:
@@ -274,7 +277,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 specialized sparse cache | Not supported | Not supported |
+| DeepSeek-V4 specialized sparse cache | Compressed rows quantized; SWA, compressor, and indexer state preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,
     KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.
@@ -295,6 +298,7 @@ NVFP4 cold-page quantization has been tested with the following model families:
 - Qwen3.5 family
 - GLM family, including GLM-5.2
 - DeepSeek-R1 family
+- DeepSeek-V4 family
 
 TriAttention has been tested with the following model families:
 

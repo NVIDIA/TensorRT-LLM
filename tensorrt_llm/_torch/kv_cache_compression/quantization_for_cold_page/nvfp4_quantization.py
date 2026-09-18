@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config,
     read_modelopt_quant_config,
@@ -45,6 +46,12 @@ _INTEGER_FIELDS = 7
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
+
+# Models whose RoPE layout and keep_rope_precision accuracy have been validated.
+# Add a model_type here after checking both; other models ignore the switch.
+_KEEP_ROPE_PRECISION_MODEL_TYPES = frozenset(
+    {"deepseek_v4", "glm_moe_dsa", "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
+)
 
 _DEEPSEEK_V4_PREFIX = "deepseek_v4_"
 _DEEPSEEK_V4_SWA = f"{_DEEPSEEK_V4_PREFIX}swa"
@@ -196,13 +203,9 @@ def _text_config(pretrained_config: object) -> object:
 
 
 def _rotary_elements(text: object, head_dim: int) -> int:
-    """Leading K elements that carry RoPE: an explicit ``rotary_dim``, else
-    ``head_dim * partial_rotary_factor`` (top level or inside ``rope_parameters``),
-    else the whole head."""
+    """Leading K elements that carry RoPE: ``head_dim * partial_rotary_factor``
+    (top level or inside ``rope_parameters``), else the whole head."""
 
-    rotary_dim = getattr(text, "rotary_dim", None)
-    if isinstance(rotary_dim, int) and not isinstance(rotary_dim, bool):
-        return rotary_dim
     factor = getattr(text, "partial_rotary_factor", None)
     rope_parameters = getattr(text, "rope_parameters", None)
     if factor is None and isinstance(rope_parameters, Mapping):
@@ -222,15 +225,23 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         super().__init__(config, pretrained_config=pretrained_config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
         self._keep_rope_precision = bool(config.keep_rope_precision)
+        model_type = getattr(pretrained_config, "model_type", None)
+        if self._keep_rope_precision and model_type not in _KEEP_ROPE_PRECISION_MODEL_TYPES:
+            logger.warning(
+                "keep_rope_precision is validated for model types "
+                f"{sorted(_KEEP_ROPE_PRECISION_MODEL_TYPES)} only; ignoring it for "
+                f"{model_type!r} and quantizing whole KV rows."
+            )
+            self._keep_rope_precision = False
 
     def _quantized_run(
-        self, row_elements: int, rope_start: int, rope_elements: int, *, where: str
+        self, row_elements: int, rope_start: int, rope_elements: int, *, keep_rope: bool, where: str
     ) -> tuple[int, int]:
         """(start, length) of the one run the kernel quantizes in each row: the
-        whole row, or with ``keep_rope_precision`` the row minus its RoPE
-        elements, which are then copied byte-for-byte."""
+        whole row, or with ``keep_rope`` the row minus its RoPE elements, which
+        are then copied byte-for-byte."""
 
-        if not self._keep_rope_precision or rope_elements == 0:
+        if not keep_rope or rope_elements == 0:
             return 0, row_elements
         if rope_elements >= row_elements:
             raise ValueError(
@@ -254,14 +265,14 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         return start, length
 
     def _key_quantized_run(
-        self, layer_id: int, head_dim: int, *, key_only: bool
+        self, layer_id: int, head_dim: int, *, key_only: bool, keep_rope: bool
     ) -> tuple[int, int]:
         """Locate RoPE in a K row from the model config: a key-only layer holds MLA
         latent rows (``kv_lora_rank`` NoPE elements then ``qk_rope_head_dim`` RoPE
-        elements); a K/V layer rotates the first ``rotary_dim`` elements of each head.
-        Draft layers share the target model's layout."""
+        elements); a K/V layer rotates the first ``head_dim * partial_rotary_factor``
+        elements of each head."""
 
-        if not self._keep_rope_precision:
+        if not keep_rope:
             return 0, head_dim
         text = _text_config(self.pretrained_config)
         where = f"cold-page layer {layer_id} key"
@@ -278,8 +289,21 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     f"kv_lora_rank + qk_rope_head_dim ({kv_lora_rank} + {rope_dim}), so its RoPE "
                     "elements cannot be located; keep_rope_precision is unsupported here"
                 )
-            return self._quantized_run(head_dim, kv_lora_rank, rope_dim, where=where)
-        return self._quantized_run(head_dim, 0, _rotary_elements(text, head_dim), where=where)
+            return self._quantized_run(
+                head_dim, kv_lora_rank, rope_dim, keep_rope=keep_rope, where=where
+            )
+        return self._quantized_run(
+            head_dim, 0, _rotary_elements(text, head_dim), keep_rope=keep_rope, where=where
+        )
+
+    def _keep_rope(self, is_draft: bool) -> bool:
+        """Draft-model KV rows always quantize whole: the codec only holds the
+        target model's config, so it cannot locate RoPE in a draft's rows."""
+
+        if self._keep_rope_precision and is_draft:
+            logger.warning("keep_rope_precision: draft-model KV rows are quantized whole.")
+            return False
+        return self._keep_rope_precision
 
     def _build_deepseek_v4_layer_layouts(
         self,
@@ -333,6 +357,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     "DeepSeek-V4 KVCM layout and pp_layers have different model-layer counts"
                 )
 
+        keep_rope = self._keep_rope(is_draft)
         layouts: dict[int, _Nvfp4LayerLayout | None] = {}
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
@@ -394,6 +419,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 _DEEPSEEK_V4_ROW_STRIDE,
                 _DEEPSEEK_V4_NOPE_DIM,
                 _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM,
+                keep_rope=keep_rope,
                 where=f"cold-page layer {layer_id} {_DEEPSEEK_V4_COMPRESS}",
             )
             layouts[layer_id] = _Nvfp4LayerLayout(
@@ -452,6 +478,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 is_draft=is_draft,
             )
 
+        keep_rope = self._keep_rope(is_draft) if not deepseek_v4_layouts else False
         layer_layouts = []
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
@@ -486,7 +513,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     f"NVFP4 cold pages require head_dim divisible by 16, got {head_dim}"
                 )
             key_run = self._key_quantized_run(
-                layer_id, head_dim, key_only=compressed_roles == ("key",)
+                layer_id, head_dim, key_only=compressed_roles == ("key",), keep_rope=keep_rope
             )
             buffer_layouts = [
                 _Nvfp4BufferLayout(

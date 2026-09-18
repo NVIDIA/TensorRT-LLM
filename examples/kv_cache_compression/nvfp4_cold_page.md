@@ -61,7 +61,7 @@ Attention-visible GPU layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 specialized sparse cache | Not supported |
+| DeepSeek-V4 specialized sparse cache | Compressed rows quantized; SWA, compressor, and indexer state preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++
 KVCacheManagerV2, and an SM100 or SM103 GPU. Hot Attention KV can use FP16,
@@ -88,6 +88,7 @@ families:
 * Qwen3.5 family
 * GLM family, including GLM-5.2
 * DeepSeek-R1 family
+* DeepSeek-V4 family
 
 This is a tested-model list, not an exhaustive support list. Other models that
 use the supported cache types above are expected to work, subject to their
@@ -335,9 +336,13 @@ RoPE rotates part of each K row by the token position: the last 64 elements of a
 MLA latent row, the first 64 of a Qwen3.5 head, the last 64 of a DeepSeek-V4
 compressed row. By default the cold page quantizes them together with the rest of
 the row. Set `keep_rope_precision: true` to copy them byte-for-byte instead; this
-raises accuracy a little and lowers the ratio (FP8 MLA row 1.78x to 1.64x,
-DeepSeek-V4 compressed row 1.78x to 1.62x, Qwen3.5 K+V 1.78x to 1.62x). Models
-whose K rows are fully rotated (Qwen3, Llama, GPT-OSS) reject the option.
+raises accuracy a little and lowers the ratio. For FP8 hot rows: MLA 1.78x to
+1.64x, DeepSeek-V4 compressed row 1.78x to 1.62x, Qwen3.5 K+V 1.78x to 1.62x; for
+BF16 hot rows Qwen3.5 goes from 3.56x to 2.69x. The option is validated for
+DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5 series only; other models log
+a warning and keep quantizing whole rows, and draft-model KV caches always
+quantize whole rows. To add a model, check its accuracy and add its `model_type`
+to `_KEEP_ROPE_PRECISION_MODEL_TYPES` in `nvfp4_quantization.py`.
 
 ```yaml
 kv_cache_compression_config:

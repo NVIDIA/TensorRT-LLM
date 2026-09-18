@@ -1375,7 +1375,7 @@ def _mla_config(kv_lora_rank=512, qk_rope_head_dim=64):
     """MLA latent rows: kv_lora_rank NoPE elements then qk_rope_head_dim RoPE elements."""
 
     return SimpleNamespace(
-        model_type="deepseek_v3", kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+        model_type="glm_moe_dsa", kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
     )
 
 
@@ -1490,12 +1490,68 @@ def test_deepseek_v4_compressed_rows_follow_keep_rope_precision(
         {1: {"deepseek_v4_compress": 32 * 512, "deepseek_v4_indexer_compress": 32 * 68}},
     )
     assert metadata.cold_page_bytes == cold_page_bytes
+    # Tile sizing follows the quantized run, not the row stride: 32 * 448 / 8 vs 32 * 512 / 8.
+    assert metadata.max_half_groups_per_tile == (1792 if keep_rope_precision else 2048)
+
+
+def test_keep_rope_precision_quantizes_draft_kv_rows_whole() -> None:
+    """The codec holds only the target config, so a draft KVCM never keeps RoPE."""
+
+    native, _ = _native()
+    with patch(
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
+        "nvfp4_quantization.logger"
+    ) as mock_logger:
+        (layout,) = _create(
+            _manager(pretrained_config=_partial_rotary_config(), keep_rope_precision=True),
+            _kv_layer(256),
+            native,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(256,),
+            is_draft=True,
+        )
+    mock_logger.warning.assert_called_once()
+    assert [_run(buffer) for buffer in layout.buffers] == [(0, 256), (0, 256)]
 
 
 def test_keep_rope_precision_rejects_fully_rotated_keys() -> None:
+    """A validated model type whose config declares no NoPE part has nothing to keep."""
+
     native, _ = _native()
     with pytest.raises(ValueError, match="cannot keep RoPE precision"):
-        _create_kv(native, SimpleNamespace(model_type="qwen3"), 128, keep_rope_precision=True)
+        _create_kv(native, SimpleNamespace(model_type="qwen3_5"), 128, keep_rope_precision=True)
+
+
+@pytest.mark.parametrize("model_type", ("qwen3", "deepseek_v3", None))
+def test_keep_rope_precision_is_ignored_with_a_warning_outside_the_validated_models(
+    model_type,
+) -> None:
+    native, _ = _native()
+    config = SimpleNamespace(model_type=model_type, kv_lora_rank=512, qk_rope_head_dim=64)
+    cache_config = SimpleNamespace(
+        tokens_per_block=64,
+        layers=(
+            AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=64 * 576 * 2)]),
+        ),
+    )
+    with patch(
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
+        "nvfp4_quantization.logger"
+    ) as mock_logger:
+        (layout,) = _create(
+            _manager(pretrained_config=config, keep_rope_precision=True),
+            cache_config,
+            native,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(576,),
+        )
+    mock_logger.warning.assert_called_once()
+    assert "keep_rope_precision" in mock_logger.warning.call_args.args[0]
+    assert [_run(buffer) for buffer in layout.buffers] == [(0, 576)]
 
 
 def test_keep_rope_precision_requires_16_element_rope_alignment() -> None:
@@ -1507,7 +1563,7 @@ def test_keep_rope_precision_requires_16_element_rope_alignment() -> None:
 def test_keep_rope_precision_reads_the_text_config_of_a_composite_model() -> None:
     native, _ = _native()
     text = _partial_rotary_config()
-    composite = SimpleNamespace(model_type="qwen3_5_vl", get_text_config=lambda: text)
+    composite = SimpleNamespace(model_type="qwen3_5", get_text_config=lambda: text)
     layout = _create_kv(native, composite, 256, keep_rope_precision=True)
     assert _run(layout.buffers[0]) == (64, 192)
 
@@ -1515,7 +1571,8 @@ def test_keep_rope_precision_reads_the_text_config_of_a_composite_model() -> Non
 def test_keep_rope_precision_reads_partial_rotary_factor_from_rope_parameters() -> None:
     native, _ = _native()
     config = SimpleNamespace(
-        model_type="qwen3_next", rope_parameters={"rope_theta": 1e6, "partial_rotary_factor": 0.25}
+        model_type="qwen3_5_moe_text",
+        rope_parameters={"rope_theta": 1e7, "partial_rotary_factor": 0.25},
     )
     layout = _create_kv(native, config, 256, keep_rope_precision=True)
     assert _run(layout.buffers[0]) == (64, 192)
