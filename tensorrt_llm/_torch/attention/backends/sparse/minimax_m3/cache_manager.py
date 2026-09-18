@@ -44,9 +44,12 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
 )
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
-from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    BufferConfig,
+    DataRole,
+    PageIndexMode,
+)
 
 
 class MiniMaxM3SparseIndexCache:
