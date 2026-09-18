@@ -450,10 +450,10 @@ class Attention(nn.Module):
             and not p.force_dynamic_quantization
             # A quantization method may run a given call in higher precision
             # than its checkpoint recipe -- Cosmos3 does this on the outer
-            # denoising steps -- by publishing ``high_precision``. Quantizing
+            # denoising steps -- by publishing ``requires_unquantized_activation``. Quantizing
             # the shared activation here would hand such a call a tensor it
             # must not receive, so leave it in its input dtype.
-            and not getattr(p.quant_method, "high_precision", False)
+            and not p.requires_unquantized_activation
             for p in projections
         )
 

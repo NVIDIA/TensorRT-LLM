@@ -254,9 +254,8 @@ class GatedMLP(nn.Module):
         # As in _shares_gate_up_quantization: a method running this call in
         # higher precision needs a 16-bit activation, so do not emit FP8 for it.
         down_proj_is_fp8 = (
-            self.down_proj.has_fp8_qdq
-            or self.down_proj.has_w4a8_nvfp4_fp8) and not getattr(
-                self.down_proj.quant_method, "high_precision", False)
+            self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8
+        ) and not self.down_proj.requires_unquantized_activation
         if down_proj_is_fp8:
             return swiglu_2in(gate,
                               up,
@@ -286,11 +285,10 @@ class GatedMLP(nn.Module):
             and self.up_proj.input_scale is not None
             # A quantization method may run a given call in higher
             # precision than its checkpoint recipe -- Cosmos3 does this on
-            # the outer denoising steps -- by publishing ``high_precision``.
+            # the outer denoising steps -- by publishing ``requires_unquantized_activation``.
             # Quantizing the shared activation here would hand such a call
             # a tensor it must not receive, so leave it in its input dtype.
-            and
-            not getattr(self.gate_proj.quant_method, "high_precision", False))
+            and not self.gate_proj.requires_unquantized_activation)
 
     def _can_share_gate_up_quantization(self, x) -> bool:
         """Whether gate and up can consume one quantized activation.

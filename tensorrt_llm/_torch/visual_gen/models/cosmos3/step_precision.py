@@ -24,12 +24,11 @@ agree.
 """
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, List, Mapping, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
-from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod, Linear
+from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod, Linear, W8A16FP8LinearMethod
 
 # The policy the checkpoint publishes under
 # ``quantization_config.runtime.diffusion_step_policy``. Every field is
@@ -165,6 +164,32 @@ class StepPrecisionController:
         self.first_steps = first_steps
         self.last_steps = last_steps
         self.high_precision = False
+        # One shared instance serves every Linear: these methods hold no
+        # state, weights live on the module and are passed to apply().
+        self._a16_method = W8A16FP8LinearMethod()
+        # (module, its own FP8 method) for the projections this controller
+        # steers. The FP8 instance is kept rather than rebuilt so restoring is
+        # exact for anything that compares identity.
+        self._governed: List[Tuple[Linear, FP8QDQLinearMethod]] = []
+
+    def pin_unquantized(self, module: Linear) -> None:
+        """Bind *module* to the 16-bit path for good.
+
+        The reasoner's precision is stated by the policy rather than derived
+        from a step, so it is bound once and never revisited.
+        """
+        module.quant_method = self._a16_method
+
+    def govern(self, module: Linear, fp8_method: FP8QDQLinearMethod) -> None:
+        self._governed.append((module, fp8_method))
+        self._bind(module, fp8_method, self.high_precision)
+
+    def _bind(self, module: Linear, fp8_method: FP8QDQLinearMethod, a16: bool) -> None:
+        module.quant_method = self._a16_method if a16 else fp8_method
+
+    def _rebind_all(self) -> None:
+        for module, fp8_method in self._governed:
+            self._bind(module, fp8_method, self.high_precision)
 
     def set_step(self, step_index: int, num_steps: int) -> None:
         if num_steps <= 0:
@@ -176,85 +201,29 @@ class StepPrecisionController:
         # exercise a path the measured run never takes.
         if num_steps == 1:
             self.high_precision = False
+            self._rebind_all()
             return
         self.high_precision = (
             step_index < self.first_steps or step_index >= num_steps - self.last_steps
         )
+        self._rebind_all()
 
     def reset(self) -> None:
         self.high_precision = False
-
-
-def apply_fp8_w8a16_linear(
-    module: Linear, input: torch.Tensor, bias: Optional[torch.Tensor]
-) -> torch.Tensor:
-    """16-bit GEMM against the module's resident FP8 weight.
-
-    ``FP8QDQLinearMethod.create_weights`` allocates ``weight`` as ``[out, in]``
-    float8, which is the layout ``F.linear`` wants, so no transpose is needed.
-    ``weight_scale`` is the per-tensor scalar and broadcasts. ``input_scale`` is
-    deliberately unused -- leaving the activation unquantized is the point.
-    """
-    if input.dtype == torch.float8_e4m3fn:
-        raise RuntimeError(
-            "step precision: a high-precision step received an already-quantized "
-            "activation. A caller that pre-quantizes a shared activation (fused "
-            "gate/up or shared q/k/v) must stand down while high_precision is set, "
-            "otherwise the step is not actually running in 16-bit."
-        )
-    weight = module.weight.to(input.dtype) * module.weight_scale.to(input.dtype)
-    return F.linear(input, weight, bias)
-
-
-class StepPrecisionFp8LinearMethod:
-    """Dispatches each call to the checkpoint's FP8 path or the 16-bit path.
-
-    ``always_high`` serves the reasoner. The understanding tower builds its KV
-    cache on the first transformer call of a request and is cached after, so a
-    step-indexed decision would only match the policy while that call happens to
-    land inside a window -- true for the published 3/3 policy, false the moment
-    one ships ``first_steps: 0``. The policy states its precision directly.
-    """
-
-    def __init__(
-        self,
-        base_method: FP8QDQLinearMethod,
-        controller: StepPrecisionController,
-        always_high: bool = False,
-    ):
-        self.base_method = base_method
-        self.controller = controller
-        self.always_high = always_high
-
-    @property
-    def high_precision(self) -> bool:
-        """Published so activation-sharing callers can stand down for this step."""
-        return self.always_high or self.controller.high_precision
-
-    def __getattr__(self, name: str):
-        # Everything not overridden here (create_weights, load_weights,
-        # process_weights_after_loading, the quantizes_* properties Linear
-        # queries) belongs to the wrapped method.
-        return getattr(self.base_method, name)
-
-    def apply(
-        self, module: Linear, input: torch.Tensor, bias: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        if self.high_precision:
-            return apply_fp8_w8a16_linear(module, input, bias)
-        return self.base_method.apply(module, input, bias)
+        self._rebind_all()
 
 
 def linear_runs_high_precision(module: Optional[Linear]) -> bool:
     """Whether this Linear is currently on the 16-bit path.
 
-    The contract a wrapped quantization method publishes: activation-sharing
-    callers quantize once above the Linear, which would defeat the 16-bit step,
-    so they consult this before doing so.
+    Activation-sharing callers quantize once above several Linears, which
+    would defeat the 16-bit step, so they consult this before doing so. The
+    bound method answers: only W8A16FP8LinearMethod asks for an unquantized
+    activation, and it is bound exactly on the steps that want one.
     """
     if module is None:
         return False
-    return bool(getattr(module.quant_method, "high_precision", False))
+    return module.requires_unquantized_activation
 
 
 def install_step_precision(
@@ -262,32 +231,34 @@ def install_step_precision(
     controller: StepPrecisionController,
     always_high: bool = False,
 ) -> int:
-    """Wrap every static-FP8 Linear under *roots* for per-call dispatch.
+    """Put every static-FP8 Linear under *roots* under step control.
 
-    Must run after weight loading: the wrapper forwards the load-time hooks to
-    the base method, but wrapping earlier would put it in the path of the
-    loader's ``isinstance`` checks. Returns the number of wrapped modules; 0
-    means this is not a static-FP8 model.
+    Must run after weight loading: binding earlier would put the 16-bit method
+    in the path of the loader's ``isinstance`` checks. Returns the number of
+    governed modules; 0 means this is not a static-FP8 model.
+
+    ``always_high`` serves the reasoner. The understanding tower builds its KV
+    cache on the first transformer call of a request and is cached after, so a
+    step-indexed decision would only match the policy while that call happens
+    to land inside a window -- true for the published 3/3 policy, false the
+    moment one ships ``first_steps: 0``. Those projections are bound to the
+    16-bit method once and never rebound.
     """
-    wrapped = 0
+    governed = 0
     for root in roots:
         for module in root.modules():
             if not isinstance(module, Linear):
                 continue
             existing = module.quant_method
-            if isinstance(existing, StepPrecisionFp8LinearMethod):
-                # Installing twice must not leave wrappers pointing at a
-                # controller nobody drives: rebind them to the live one instead
-                # of skipping, or set_denoising_step would silently stop
-                # reaching the layers it is supposed to steer.
-                existing.controller = controller
-                existing.always_high = always_high
-                wrapped += 1
+            if isinstance(existing, W8A16FP8LinearMethod):
+                # Already bound by an earlier install; nothing to re-derive.
+                governed += 1
                 continue
             if not isinstance(existing, FP8QDQLinearMethod):
                 continue
-            module.quant_method = StepPrecisionFp8LinearMethod(
-                existing, controller, always_high=always_high
-            )
-            wrapped += 1
-    return wrapped
+            if always_high:
+                controller.pin_unquantized(module)
+            else:
+                controller.govern(module, existing)
+            governed += 1
+    return governed

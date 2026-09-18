@@ -14,10 +14,10 @@ step still receives FP8 activations and nothing changed.
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.linear import W8A16FP8LinearMethod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
-    StepPrecisionFp8LinearMethod,
-    apply_fp8_w8a16_linear,
+    install_step_precision,
     parse_diffusion_step_policy,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -48,6 +48,10 @@ pytestmark = pytest.mark.cpu_only
 class _StubBaseMethod:
     """Stands in for FP8QDQLinearMethod; records whether the FP8 path ran."""
 
+    # Mirrors LinearMethodBase: every method declares this, so callers read it
+    # directly and a rename fails loudly instead of silently defaulting.
+    requires_unquantized_activation = False
+
     def __init__(self):
         self.calls = 0
 
@@ -59,8 +63,11 @@ class _StubBaseMethod:
 class _StubLinear(torch.nn.Module):
     def __init__(self, out_features=4, in_features=8, scale=2.0):
         super().__init__()
-        self.weight = torch.ones(out_features, in_features, dtype=torch.bfloat16)
+        # float8: W8A16FP8LinearMethod rejects anything else, since it can
+        # only reinterpret an FP8 checkpoint, never quantize one.
+        self.weight = torch.ones(out_features, in_features).to(torch.float8_e4m3fn)
         self.weight_scale = torch.tensor(scale, dtype=torch.float32)
+        self.quant_method = _StubBaseMethod()
 
 
 class TestStepPolicy:
@@ -130,57 +137,88 @@ class TestStepPolicy:
             controller.set_step(0, num_steps=0)
 
 
+def _fp8_linear():
+    """A real Linear with a real FP8QDQLinearMethod, which is what the
+    installer looks for. Weights are not created; only the method matters."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    return Linear(
+        8,
+        8,
+        dtype=torch.bfloat16,
+        quant_config=ModelConfig(
+            quant_config=QuantConfig(quant_algo=QuantAlgo.FP8)
+        ).get_quant_config(),
+    )
+
+
+def _holder(*modules):
+    """An nn.Module parent, since install_step_precision walks .modules()."""
+    parent = torch.nn.Module()
+    for i, m in enumerate(modules):
+        parent.add_module(f"child{i}", m)
+    return parent
+
+
 class TestDispatch:
-    def test_middle_step_uses_the_checkpoint_path(self):
-        base = _StubBaseMethod()
-        controller = StepPrecisionController(first_steps=3, last_steps=3)
-        method = StepPrecisionFp8LinearMethod(base, controller)
-        controller.set_step(10, num_steps=50)
+    """The controller binds one of two methods; nothing wraps or proxies."""
+
+    def _governed(self, first=3, last=3):
+        controller = StepPrecisionController(first_steps=first, last_steps=last)
         module = _StubLinear()
-        method.apply(module, torch.ones(2, 8, dtype=torch.bfloat16))
-        assert base.calls == 1
+        base = module.quant_method
+        controller.govern(module, base)
+        return controller, module, base
 
-    def test_edge_step_bypasses_the_checkpoint_path(self):
-        base = _StubBaseMethod()
-        controller = StepPrecisionController(first_steps=3, last_steps=3)
-        method = StepPrecisionFp8LinearMethod(base, controller)
-        controller.set_step(0, num_steps=50)
-        module = _StubLinear()
-        out = method.apply(module, torch.ones(2, 8, dtype=torch.bfloat16))
-        assert base.calls == 0
-        # weight 1.0 * scale 2.0, summed over in_features=8 -> 16 per output.
-        assert torch.allclose(out, torch.full_like(out, 16.0))
-
-    def test_high_precision_is_published_for_sharing_callers(self):
-        """GatedMLP/Attention read this attribute to stand down. Contract test."""
-        controller = StepPrecisionController(first_steps=3, last_steps=3)
-        method = StepPrecisionFp8LinearMethod(_StubBaseMethod(), controller)
+    def test_middle_step_binds_the_checkpoint_path(self):
+        controller, module, base = self._governed()
         controller.set_step(10, num_steps=50)
-        assert method.high_precision is False
-        controller.set_step(0, num_steps=50)
-        assert method.high_precision is True
+        assert module.quant_method is base
 
-    def test_wrapper_forwards_unknown_attributes(self):
-        base = _StubBaseMethod()
-        base.quantizes_nvfp4_activations = False
-        method = StepPrecisionFp8LinearMethod(base, StepPrecisionController(3, 3))
-        assert method.quantizes_nvfp4_activations is False
+    def test_edge_step_binds_the_16bit_path(self):
+        controller, module, base = self._governed()
+        controller.set_step(0, num_steps=50)
+        assert isinstance(module.quant_method, W8A16FP8LinearMethod)
+
+    def test_reset_restores_the_checkpoint_path(self):
+        controller, module, base = self._governed()
+        controller.set_step(0, num_steps=50)
+        controller.reset()
+        assert module.quant_method is base
+
+    def test_the_16bit_method_is_shared_across_modules(self):
+        """Stateless, so one instance serves every Linear: no per-module copy."""
+        controller = StepPrecisionController(first_steps=3, last_steps=3)
+        a, b = _StubLinear(), _StubLinear()
+        controller.govern(a, a.quant_method)
+        controller.govern(b, b.quant_method)
+        controller.set_step(0, num_steps=50)
+        assert a.quant_method is b.quant_method
+
+    def test_stand_down_contract_is_published_by_the_bound_method(self):
+        """GatedMLP/Attention read this to stand down. Contract test."""
+        controller, module, _ = self._governed()
+        controller.set_step(10, num_steps=50)
+        assert not module.quant_method.requires_unquantized_activation
+        controller.set_step(0, num_steps=50)
+        assert module.quant_method.requires_unquantized_activation
 
 
 class TestW8A16Apply:
     def test_dequantized_weight_matches_scaled_reference(self):
         module = _StubLinear(out_features=3, in_features=4, scale=0.5)
-        module.weight = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        module.weight = torch.arange(12).reshape(3, 4).to(torch.float8_e4m3fn)
         x = torch.ones(2, 4, dtype=torch.bfloat16)
-        out = apply_fp8_w8a16_linear(module, x, bias=None)
+        out = W8A16FP8LinearMethod().apply(module, x, bias=None)
         expected = torch.nn.functional.linear(x, module.weight.to(x.dtype) * 0.5)
         assert torch.allclose(out, expected)
 
     def test_bias_is_applied(self):
         module = _StubLinear(out_features=2, in_features=3, scale=1.0)
-        module.weight = torch.zeros(2, 3, dtype=torch.bfloat16)
+        module.weight = torch.zeros(2, 3).to(torch.float8_e4m3fn)
         bias = torch.tensor([1.0, -1.0], dtype=torch.bfloat16)
-        out = apply_fp8_w8a16_linear(module, torch.ones(1, 3, dtype=torch.bfloat16), bias)
+        out = W8A16FP8LinearMethod().apply(module, torch.ones(1, 3, dtype=torch.bfloat16), bias)
         assert torch.allclose(out, bias.unsqueeze(0))
 
     def test_prequantized_activation_is_rejected(self):
@@ -189,8 +227,22 @@ class TestW8A16Apply:
         not actually running in higher precision."""
         module = _StubLinear()
         x = torch.ones(2, 8, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-        with pytest.raises(RuntimeError, match="must stand down"):
-            apply_fp8_w8a16_linear(module, x, bias=None)
+        with pytest.raises(RuntimeError, match="16-bit activation"):
+            W8A16FP8LinearMethod().apply(module, x, bias=None)
+
+    def test_fp32_activation_is_rejected(self):
+        """A16 is enforced, not merely documented: fp32 would silently be A32."""
+        module = _StubLinear()
+        x = torch.ones(2, 8, dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="16-bit activation"):
+            W8A16FP8LinearMethod().apply(module, x, bias=None)
+
+    def test_non_fp8_weights_are_rejected(self):
+        """The method reinterprets an FP8 checkpoint; it cannot quantize one."""
+        module = _StubLinear()
+        module.weight = torch.ones(4, 8, dtype=torch.bfloat16)
+        with pytest.raises(RuntimeError, match="float8_e4m3fn weights"):
+            W8A16FP8LinearMethod().apply(module, torch.ones(2, 8, dtype=torch.bfloat16), bias=None)
 
 
 class TestPolicyParsing:
@@ -265,24 +317,29 @@ class TestReasonerPath:
 
     def test_always_high_ignores_the_step(self):
         controller = StepPrecisionController(first_steps=3, last_steps=3)
-        method = StepPrecisionFp8LinearMethod(_StubBaseMethod(), controller, always_high=True)
+        module = _fp8_linear()
+        assert install_step_precision([_holder(module)], controller, always_high=True) == 1
         for step in (0, 10, 25, 49):
             controller.set_step(step, num_steps=50)
-            assert method.high_precision is True
+            assert isinstance(module.quant_method, W8A16FP8LinearMethod)
 
     def test_generation_path_still_follows_the_step(self):
         controller = StepPrecisionController(first_steps=3, last_steps=3)
-        method = StepPrecisionFp8LinearMethod(_StubBaseMethod(), controller, always_high=False)
+        module = _StubLinear()
+        base = module.quant_method
+        controller.govern(module, base)
         controller.set_step(25, num_steps=50)
-        assert method.high_precision is False
+        assert module.quant_method is base
 
-    def test_always_high_takes_the_16bit_path_mid_schedule(self):
-        base = _StubBaseMethod()
+    def test_reasoner_is_never_rebound_by_a_later_step(self):
+        """Bound once at install: nothing in the step loop governs it."""
         controller = StepPrecisionController(first_steps=3, last_steps=3)
-        method = StepPrecisionFp8LinearMethod(base, controller, always_high=True)
+        module = _fp8_linear()
+        install_step_precision([_holder(module)], controller, always_high=True)
+        bound = module.quant_method
         controller.set_step(25, num_steps=50)
-        method.apply(_StubLinear(), torch.ones(2, 8, dtype=torch.bfloat16))
-        assert base.calls == 0
+        controller.reset()
+        assert module.quant_method is bound
 
 
 class TestTransformerWiring:
@@ -340,27 +397,26 @@ class TestTransformerWiring:
         assert stub.step_precision_controller is not None
         gen = stub.gen_layers[0].quant_method
         reasoner = stub.language_model.layers[0].quant_method
-        assert isinstance(gen, StepPrecisionFp8LinearMethod)
-        assert isinstance(reasoner, StepPrecisionFp8LinearMethod)
         # The distinguishing property: mid-schedule the towers disagree.
         stub.step_precision_controller.set_step(25, num_steps=50)
-        assert gen.high_precision is False, "generation tower is not step-gated"
-        assert reasoner.high_precision is True, "reasoner tower is not unconditional"
+        gen = stub.gen_layers[0].quant_method
+        reasoner = stub.language_model.layers[0].quant_method
+        assert not isinstance(gen, W8A16FP8LinearMethod), "generation tower is not step-gated"
+        assert isinstance(reasoner, W8A16FP8LinearMethod), "reasoner tower is not unconditional"
 
     def test_reasoner_native_leaves_the_reasoner_alone(self):
         stub = self._stub_transformer(_policy(reasoner="native"))
         self._install(stub)
-        assert isinstance(stub.gen_layers[0].quant_method, StepPrecisionFp8LinearMethod)
-        assert not isinstance(
-            stub.language_model.layers[0].quant_method, StepPrecisionFp8LinearMethod
-        )
+        stub.step_precision_controller.set_step(0, num_steps=50)
+        assert isinstance(stub.gen_layers[0].quant_method, W8A16FP8LinearMethod)
+        assert not isinstance(stub.language_model.layers[0].quant_method, W8A16FP8LinearMethod)
 
-    def test_checkpoint_without_a_policy_wraps_nothing(self):
+    def test_checkpoint_without_a_policy_governs_nothing(self):
         stub = self._stub_transformer({})
         self._install(stub)
         assert stub.step_precision_controller is None
         for tower in (stub.gen_layers[0], stub.language_model.layers[0]):
-            assert not isinstance(tower.quant_method, StepPrecisionFp8LinearMethod)
+            assert not isinstance(tower.quant_method, W8A16FP8LinearMethod)
 
     def test_policy_is_read_from_the_documented_config_key(self):
         """A policy under any other key must not be picked up."""
@@ -368,13 +424,13 @@ class TestTransformerWiring:
         self._install(stub)
         assert stub.step_precision_controller is None
 
-    def test_installing_twice_keeps_wrappers_on_the_live_controller(self) -> None:
-        """post_load_weights running twice must not orphan the wrappers.
+    def test_installing_twice_keeps_the_layers_on_the_live_controller(self) -> None:
+        """post_load_weights running twice must not orphan the layers.
 
-        The second install previously skipped already-wrapped modules and then
-        cleared the controller, leaving every wrapper bound to one nothing
-        drives: set_denoising_step would stop reaching the layers it steers,
-        silently, with the edge steps landing on the quantized path.
+        The second install must leave every governed layer steered by the
+        controller the transformer now holds; otherwise set_denoising_step
+        stops reaching them, silently, with the edge steps landing on the
+        quantized path.
         """
         stub = self._stub_transformer(_policy())
         self._install(stub)
@@ -383,17 +439,12 @@ class TestTransformerWiring:
         self._install(stub)
         second_controller = stub.step_precision_controller
         assert second_controller is not None, "controller was cleared by the second install"
-
-        gen = stub.gen_layers[0].quant_method
-        reasoner = stub.language_model.layers[0].quant_method
-        assert gen.controller is second_controller
-        assert reasoner.controller is second_controller
-        # Not double-wrapped: the base method must still be the FP8 one.
-        assert not isinstance(gen.base_method, StepPrecisionFp8LinearMethod)
-        # And the live controller actually steers them.
-        second_controller.set_step(0, num_steps=50)
-        assert gen.high_precision is True
-        second_controller.set_step(25, num_steps=50)
-        assert gen.high_precision is False
-        assert reasoner.high_precision is True
         assert first_controller is not None
+
+        # The live controller actually steers the generation tower.
+        second_controller.set_step(0, num_steps=50)
+        assert isinstance(stub.gen_layers[0].quant_method, W8A16FP8LinearMethod)
+        second_controller.set_step(25, num_steps=50)
+        assert not isinstance(stub.gen_layers[0].quant_method, W8A16FP8LinearMethod)
+        # And the reasoner stays unconditional across both.
+        assert isinstance(stub.language_model.layers[0].quant_method, W8A16FP8LinearMethod)

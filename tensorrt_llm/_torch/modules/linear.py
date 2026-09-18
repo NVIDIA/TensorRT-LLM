@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Union
+from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -392,6 +392,10 @@ class LinearMethodBase(ABC):
     # internally; callers do not pass output_buffer_kind as a parameter.
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
     quantizes_nvfp4_activations: ClassVar[bool] = False
+    # True only for methods that need the activation left unquantized. Callers
+    # that would otherwise quantize one activation once above several Linears
+    # (fused gate/up, shared q/k/v) must stand down for those.
+    requires_unquantized_activation: ClassVar[bool] = False
 
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
@@ -1040,6 +1044,40 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         Post-process weights after all partial loads are complete.
         """
         self.rescale_fused_weights(module)
+
+
+class W8A16FP8LinearMethod(FP8QDQLinearMethod):
+    """W8A16 FP8 linear using on-the-fly weight dequantization.
+
+    Same weights, scales and loading as ``FP8QDQLinearMethod`` -- only the way
+    they are consumed differs, so everything but ``apply`` is inherited. The
+    activation is left in its 16-bit dtype and the weight is brought up to
+    meet it, which makes ``input_scale`` unused here.
+
+    Holds no state; one instance can serve every Linear in a model.
+    """
+
+    SUPPORTED_ACTIVATION_DTYPES: ClassVar[Tuple[torch.dtype,
+                                                ...]] = (torch.bfloat16,
+                                                         torch.float16)
+
+    requires_unquantized_activation: ClassVar[bool] = True
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        if module.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"W8A16FP8LinearMethod requires float8_e4m3fn weights, got "
+                f"{module.weight.dtype}. This method only reinterprets how an "
+                f"FP8 checkpoint's weights are consumed; it cannot quantize.")
+        if input.dtype not in self.SUPPORTED_ACTIVATION_DTYPES:
+            raise RuntimeError(
+                f"W8A16FP8LinearMethod requires a 16-bit activation, got "
+                f"{input.dtype}.")
+
+        weight = module.weight.to(input.dtype) * module.weight_scale.to(
+            input.dtype)
+        return F.linear(input, weight, bias)
 
 
 class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
@@ -4006,6 +4044,11 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    @property
+    def requires_unquantized_activation(self):
+        assert self._weights_created
+        return self.quant_method.requires_unquantized_activation
 
     @property
     def has_nvfp4_activation_quantization(self):
