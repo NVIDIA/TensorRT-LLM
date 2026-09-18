@@ -10,30 +10,22 @@
   },
   "hardware": "NVIDIA B200 (SM100)",
   "baseline_versions": {
-    "deepselect": "v1.0.0, 8e70df71d2",
-    "flashinfer": "0.6.14",
-    "sglang": "Top-K v2",
     "radix_cuda": "Production insertion/radix/split-work dispatcher",
     "temporal_r0": "Temporal R0 ladder implementation, public PR #16457",
     "temporal_tiered": "Tiered temporal implementation, public PR #16877"
   },
   "pairing": {
-    "deepselect": "cross-campaign; existing FP32 baseline matched by workload and batch to PR #19076",
     "radix_cuda": "cross-campaign",
-    "sglang": "cross-campaign; plan + transform",
-    "sglang_transform": "cross-campaign; transform only",
-    "flashinfer": "cross-campaign; values FP32 + indices INT64 API",
-    "deepselect_bf16": "same process as gvr_bf16_run_us; input conversion excluded",
     "temporal_r0": "cross-campaign, same (cell, batch), not an isolated algorithm ablation",
     "temporal_tiered": "cross-campaign, same (cell, batch), not an isolated algorithm ablation"
   },
   "published_files": {
-    "flash_timings.csv.gz": "6ba9512ebdfbf93d5923fbd5248beaef36d0720f4a51b961a64b8dae3fc296c5",
-    "pro_timings.csv.gz": "bce5e0cb029df863e674993711b2bb9a8fb4d1ec8fad892c8856748de05656d6",
-    "v32_timings.csv.gz": "3eec2da81ead5fe425dc2f3ba163d886e5e56c81ee77bb543bd4908873c8073d",
+    "flash_timings.csv.gz": "0f1c4799296bea1db9a012fe9ddf90521918af3ce73e6b39ad25a6c05115dcc6",
+    "pro_timings.csv.gz": "bfd713272ccd50cab57d8f436d1d788e29d3ef6cc2014818104b2872f4476cbd",
+    "v32_timings.csv.gz": "59bccd05ba685d01ed1ebb34c9a0b15df02d1879f8c16bbaffa2a264f512fd8d",
     "temporal_comparison.csv.gz": "0a0973e218209d1f2e4db89e9539a3736753073ad72dc16a30288e79fa9309bb"
   },
-  "scope": "Per-case cold kernel means with PR #19076 as the FP32 GVR V2 reference; all FP32 baseline comparisons are cross-campaign. Blank entries are missing/unsupported, never zero latency. Historical BF16 timings retain their separate paired reference.",
+  "scope": "Per-case FP32 cold kernel means with PR #19076 as the GVR V2 reference. Temporal GVR V1 R0, tiered V1, and TensorRT-LLM radix CUDA observations are paired across benchmark runs by workload and batch. All four implementations cover the same 9,746 cases.",
   "roofline_model": {
     "theoretical_bandwidth_tb_s": 8.0,
     "measured_bandwidth_tb_s": 6.912116,

@@ -16,7 +16,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import TwoSlopeNorm
+from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Rectangle
 from matplotlib.ticker import FuncFormatter
@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 COPYRIGHT = (
     "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. SPDX-License-Identifier: Apache-2.0"
 )
-ARMS = ["sglang", "flashinfer", "radix_cuda", "deepselect"]
+ARMS = ["radix_cuda"]
 MODELS = {
     "flash": "DeepSeek-V4 Flash · K=512",
     "pro": "DeepSeek-V4 Pro · K=1024",
@@ -33,23 +33,19 @@ MODELS = {
 }
 LABELS = {
     "gvr_v2": "GVR V2",
-    "sglang": "SGLang v2 (plan + transform)",
-    "flashinfer": "FlashInfer 0.6.14",
+    "temporal_r0": "GVR V1 · R0",
+    "temporal_tiered": "GVR V1 · tiered",
     "radix_cuda": "TensorRT-LLM radix CUDA",
-    "deepselect": "DeepSelect FP32",
 }
 COLORS = {
     "gvr_v2": "#579600",
     "temporal_r0": "#7395ab",
     "temporal_tiered": "#386781",
-    "sglang": "#7557a6",
-    "flashinfer": "#007e91",
     "radix_cuda": "#64748b",
-    "deepselect": "#d97416",
 }
-CROSS_CAMPAIGN = set(ARMS)
 REACHABLE_BW = 6.912116
 TEMPORAL = ["temporal_r0", "temporal_tiered"]
+CROSS_CAMPAIGN = set(TEMPORAL + ARMS)
 COMPARISON_ARMS = ["gvr_v2", *TEMPORAL, *ARMS]
 
 
@@ -124,21 +120,18 @@ def _comparison(rows: list[dict]) -> dict:
 
 def _overview(rows: list[dict]) -> None:
     data = _comparison(rows)
-    fig, axes = plt.subplots(1, 3, figsize=(14, 6.3), sharey=True)
-    fig.subplots_adjust(left=0.185, right=0.97, bottom=0.23, top=0.78, wspace=0.14)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5.2), sharey=True)
+    fig.subplots_adjust(left=0.185, right=0.97, bottom=0.23, top=0.73, wspace=0.14)
     labels = [
         "GVR V2",
-        "Temporal GVR · R0",
-        "Temporal GVR · tiered",
-        "SGLang v2",
-        "FlashInfer",
+        "GVR V1 · R0",
+        "GVR V1 · tiered",
         "TRT-LLM radix CUDA",
-        "DeepSelect FP32",
     ]
-    positions = [7.1, 5.8, 4.8, 3.5, 2.5, 1.5, 0.5]
+    positions = [3.8, 2.6, 1.6, 0.4]
     for ax, (model, title) in zip(axes, MODELS.items()):
         panel = data[model]
-        ax.axhspan(6.55, 7.65, color="#edf5df", zorder=0)
+        ax.axhspan(3.3, 4.3, color="#edf5df", zorder=0)
         ax.axvline(1, color="#579600", alpha=0.55, linewidth=1, linestyle=(0, (2, 3)))
         for y, arm in zip(positions, COMPARISON_ARMS):
             value = panel["latency_relative_to_v2"][arm]
@@ -162,7 +155,7 @@ def _overview(rows: list[dict]) -> None:
             fontsize=9.5,
             color="#52616f",
         )
-        ax.set(xlim=(0, 5.95), ylim=(-0.1, 7.7), xticks=[0, 1, 2, 3, 4, 5])
+        ax.set(xlim=(0, 5.95), ylim=(-0.15, 4.35), xticks=[0, 1, 2, 3, 4, 5])
         ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}×"))
         ax.set_yticks(positions, labels, fontsize=10.5)
         ax.tick_params(axis="both", length=0, pad=8)
@@ -174,7 +167,7 @@ def _overview(rows: list[dict]) -> None:
     fig.text(
         0.035,
         0.935,
-        "One view of the competition — and the GVR evolution",
+        "The GVR evolution: V1, V2, and radix CUDA",
         fontsize=20,
         weight="bold",
         color="#17202b",
@@ -196,14 +189,7 @@ def _overview(rows: list[dict]) -> None:
     fig.text(
         0.035,
         0.067,
-        "Temporal GVR: R0 threshold ladder and tiered execution. V2: current-row self-sampling.",
-        fontsize=9,
-        color="#52616f",
-    )
-    fig.text(
-        0.035,
-        0.032,
-        "SGLang includes plan + transform.",
+        "GVR V1: R0 threshold ladder and tiered execution. V2: current-row self-sampling.",
         fontsize=9,
         color="#52616f",
     )
@@ -835,7 +821,7 @@ def _integration() -> None:
 
 
 def _matching(rows: list[dict], model: str) -> list[dict]:
-    required = ["gvr_v2", *ARMS]
+    required = COMPARISON_ARMS
     return [
         r for r in rows if r["model"] == model and all(r[a + "_us"] is not None for a in required)
     ]
@@ -861,12 +847,12 @@ def _legend(fig: plt.Figure) -> None:
             linestyle="--" if a in CROSS_CAMPAIGN else "-",
             label=LABELS[a],
         )
-        for a in ["gvr_v2", *ARMS]
+        for a in COMPARISON_ARMS
     ]
     fig.legend(
         handles=handles,
         loc="lower center",
-        ncol=5,
+        ncol=4,
         frameon=False,
         bbox_to_anchor=(0.5, 0.01),
         fontsize=10,
@@ -879,7 +865,7 @@ def _latency(rows: list[dict]) -> None:
         matched = _matching(rows, model)
         for j, batch in enumerate((1, 1024)):
             ax = axes[i, j]
-            for arm in ["gvr_v2", *ARMS]:
+            for arm in COMPARISON_ARMS:
                 x, y = _line_data(matched, arm, batch)
                 ax.plot(
                     x,
@@ -914,7 +900,7 @@ def _roofline_reachable_rates(rows: list[dict]) -> dict:
         matched = _matching(rows, model)
         k = matched[0]["k"]
         by_model[model] = {}
-        for arm in ["gvr_v2", *ARMS]:
+        for arm in COMPARISON_ARMS:
             widths, times = _line_data(matched, arm, 1024)
             rates = []
             for n, us in zip(widths, times):
@@ -1011,7 +997,7 @@ def _roofline(rows: list[dict]) -> None:
         xroof = np.linspace(0.125, 0.25, 100)
         ax.fill_between(xroof, xroof * bw, 1.95, color="#f2f5f7", zorder=0)
         ax.plot(xroof, xroof * bw, color="#273746", linestyle=(0, (2, 2)), linewidth=1.5)
-        for arm in [*ARMS, "gvr_v2"]:
+        for arm in [*TEMPORAL, *ARMS, "gvr_v2"]:
             widths, times = _line_data(matched, arm, 1024)
             x = [n / (4 * (n + k)) for n in widths]
             y = [1024 * n / (us * 1e6) for n, us in zip(widths, times)]
@@ -1077,12 +1063,12 @@ def _roofline(rows: list[dict]) -> None:
             linestyle="--" if a in CROSS_CAMPAIGN else "-",
             label=LABELS[a],
         )
-        for a in ["gvr_v2", *ARMS]
+        for a in COMPARISON_ARMS
     ]
     fig.legend(
         handles=handles,
         loc="lower center",
-        ncol=5,
+        ncol=4,
         frameon=False,
         bbox_to_anchor=(0.53, 0.077),
         fontsize=10,
@@ -1108,8 +1094,8 @@ def _roofline(rows: list[dict]) -> None:
 def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(14, 5.8))
     batches = sorted({r["batch"] for r in rows})
-    norm = TwoSlopeNorm(vmin=0.8, vcenter=1, vmax=8)
-    cmap = plt.get_cmap("BrBG")
+    norm = Normalize(vmin=1, vmax=21)
+    cmap = plt.get_cmap("YlGnBu")
     for ax, (model, title) in zip(axes, MODELS.items()):
         selected = [r for r in rows if r["model"] == model and r[arm + "_us"] is not None]
         buckets = sorted({r["isl_bucket"] for r in selected}, key=lambda s: int(s[:-1]))
@@ -1156,19 +1142,19 @@ def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
     )
     fig.subplots_adjust(left=0.06, right=0.99, top=0.87, bottom=0.34, wspace=0.27)
     cax = fig.add_axes((0.34, 0.09, 0.32, 0.026))
-    bar = fig.colorbar(graphic, cax=cax, orientation="horizontal", ticks=[0.8, 1, 2, 4, 6, 8])
+    bar = fig.colorbar(graphic, cax=cax, orientation="horizontal", ticks=[1, 5, 10, 15, 21])
     bar.set_label(f"{label} time / GVR V2 time · geometric mean across layers", fontsize=9)
     fig.text(
         0.06,
         0.17,
-        f"{scope} · 1.0× is parity · shared color scale across both baseline maps.",
+        f"{scope} · 1.0× is parity · shared color scale across all three models.",
         fontsize=9,
     )
     _save(fig, arm + "_map")
 
 
 def main() -> None:
-    """Validate the frozen dataset, then regenerate statistics and ten figures."""
+    """Validate the frozen dataset, then regenerate statistics and nine figures."""
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
@@ -1188,8 +1174,6 @@ def main() -> None:
         "by_model": {
             m: {a: _stats([r for r in rows if r["model"] == m], a) for a in ARMS} for m in MODELS
         },
-        "sglang_transform_only": _stats(rows, "sglang_transform"),
-        "deepselect_bf16": _stats(rows, "deepselect_bf16", "gvr_bf16_run"),
         "temporal_vs_v2": {a: _stats(rows, a) for a in TEMPORAL},
         "roofline_reachable_rate": _roofline_reachable_rates(rows),
         "evolution_vs_radix": {
@@ -1210,8 +1194,7 @@ def main() -> None:
     _candidate_work()
     _algorithm()
     _gpu_sampling()
-    _speedup_map(rows, "sglang", "SGLang", "SGLang plan + transform")
-    _speedup_map(rows, "deepselect", "DeepSelect FP32", "DeepSelect FP32 · unsorted indices")
+    _speedup_map(rows, "radix_cuda", "radix CUDA", "TensorRT-LLM production dispatcher")
     _latency(rows)
     _roofline(rows)
     _integration()
