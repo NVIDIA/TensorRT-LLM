@@ -57,11 +57,13 @@ An admission threshold should leave enough survivors to contain Top-K, but few e
 
 #### A Biased Sample with Variable Value
 
-Temporal hints are a **biased sample** of current scores at previous winners' positions. The hit rate is the fraction of the current Top-K covered by the aligned previous selection. High, stable overlap makes that bias useful. Figure 2 shows why it is an unreliable assumption across layers and decode steps.
+Temporal hints are a **biased sample** of current scores at positions predicted from the previous step's winners. The hit rate is the fraction of the current Top-K covered by the mapped temporal hint. High, stable overlap makes that bias useful. Figure 2 shows why it is an unreliable assumption across layers and decode steps.
 
-![Temporal Top-K overlap for DeepSeek-V3.2 and DeepSeek-V4 Pro. Upper panels distinguish retained and new selections; lower panels show raw overlap across three layers, including abrupt drops despite a high average.](../media/gvr_v2/temporal_overlap.svg)
+![Temporal Top-K overlap for DeepSeek-V3.2 and DeepSeek-V4 Pro. Upper panels distinguish current selections matched by the mapped temporal hint from those it misses; lower panels show raw overlap across three layers, including abrupt drops despite a high average.](../media/gvr_v2/temporal_overlap.svg)
 
-*Figure 2. Temporal overlap on SWE-bench-64K workloads. Blue marks previous winners retained after coordinate alignment; orange marks new selections. V3.2 shifts prior indices by +1, while V4 Pro keeps compressed-bin coordinates. Upper panels show position crops; lower curves measure full-domain overlap across layers and steps, with means in parentheses. Even a high-mean layer can suffer an abrupt collapse.*
+*Figure 2. Temporal overlap on SWE-bench-64K workloads. Blue marks current selections matched after applying the temporal-hint index mapping; orange marks selections not predicted by that hint. V3.2 shifts prior indices by +1, while V4 Pro keeps the same compressed-bin indices. Upper panels show position crops; lower curves measure full-domain overlap across layers and steps, with means in parentheses. Even a high-mean layer can suffer an abrupt collapse.*
+
+The V3.2 +1 shift is a temporal prediction rule. Its overlap measures how well the shifted positions predict the current Top-K, rather than retention at identical token indices.
 
 Near-64K measurements also expose dependence on the input and layer:
 
