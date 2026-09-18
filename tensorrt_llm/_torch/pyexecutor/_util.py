@@ -1030,7 +1030,7 @@ class KvCacheCreator:
         return int(available_kv_mem)
 
     def _get_mla_chunked_profile_length(self, input_seq_len: int) -> int | None:
-        """Length needed to profile a full cached-KV chunk and another loop."""
+        """Length needed to profile two full cached-KV chunks with a full query."""
         model_config = self._model_engine.model.model_config
         # Skip-softmax preserves dense MLA. DSA-style hooks can switch to
         # absorption before this request reaches a full cached-KV chunk.
@@ -1052,13 +1052,13 @@ class KvCacheCreator:
 
         kv_chunk_tokens = (features.chunk_size *
                            features.chunked_prefill_buffer_batch_size)
-        # Successive scheduler chunks build a real cached prefix. Round up to
-        # a query-budget boundary, then run one full query budget and one more
-        # block so profiling also executes multiple cached-KV loop iterations.
-        cached_tokens = (ceil_div(kv_chunk_tokens, self._max_num_tokens) *
+        # The previous loop's K/V tensors can remain live while the next
+        # chunk is expanded. Exercise two full cached-KV chunks in one forward
+        # to include this overlap, alongside a full query budget. Round the
+        # prefix up to a scheduler-step boundary so the final query is full.
+        cached_tokens = (ceil_div(2 * kv_chunk_tokens, self._max_num_tokens) *
                          self._max_num_tokens)
-        profile_length = (cached_tokens + self._max_num_tokens +
-                          self._tokens_per_block)
+        profile_length = cached_tokens + self._max_num_tokens
         if profile_length > input_seq_len:
             # A short-context workload may fill the KV chunk through fan-out;
             # a single long request cannot cover that case. Keep its reserve.

@@ -92,23 +92,30 @@ def test_mla_profile_builds_full_cached_chunk(
     creator._mapping = Mapping(world_size=4, tp_size=4, enable_attention_dp=attention_dp)
     requests = creator._create_dummy_context_requests(262143)
     assert len(requests) == (4 if attention_dp else 1)
-    assert all(len(req.input_token_ids) == 40992 for req in requests)
-    # These are successive prefill steps of each long request. A fresh 8K
-    # prompt never reaches either of the cached-KV shapes being protected.
-    steps = [(position, min(8192, 40992 - position)) for position in range(0, 40992, 8192)]
-    assert (32768, 8192) in steps
-    assert (40960, 32) in steps
+    assert all(len(req.input_token_ids) == 73728 for req in requests)
+    # The final forward has a full query and two full cached-KV chunks,
+    # covering the previous chunk's live tensors during the next expansion.
+    steps = [(position, min(8192, 73728 - position)) for position in range(0, 73728, 8192)]
+    assert steps[-1] == (65536, 8192)
+    cached_tokens, query_tokens = steps[-1]
+    kv_chunk_tokens = 32768
+    chunk_lengths = [
+        min(kv_chunk_tokens, cached_tokens - offset)
+        for offset in range(0, cached_tokens, kv_chunk_tokens)
+    ]
+    assert chunk_lengths == [32768, 32768]
+    assert query_tokens == creator._max_num_tokens
 
 
-@pytest.mark.parametrize("input_seq_len", [40992, 40991, 8192, 4095])
+@pytest.mark.parametrize("input_seq_len", [73728, 73727, 8192, 4095])
 def test_mla_profile_respects_context_limit(
     input_seq_len: int, mla_profile_creator: KvCacheCreator
 ) -> None:
     creator = mla_profile_creator
     requests = creator._create_dummy_context_requests(input_seq_len)
     assert all(len(req.input_token_ids) <= input_seq_len for req in requests)
-    if input_seq_len == 40992:
-        assert creator._mla_chunked_profile_length == 40992
+    if input_seq_len == 73728:
+        assert creator._mla_chunked_profile_length == 73728
     else:
         assert creator._mla_chunked_profile_length is None
         assert sum(len(req.input_token_ids) for req in requests) == 8192
@@ -119,8 +126,11 @@ def test_mla_profile_uses_runtime_chunk_dimensions(mla_profile_creator: KvCacheC
     features = creator._model_engine.attn_runtime_features
     features.chunk_size = 4096
     features.chunked_prefill_buffer_batch_size = 3
-    # 12288 cached tokens round up to two 8192-token scheduler steps.
-    assert creator._get_mla_chunked_profile_length(262143) == 24576 + 32
+    # Two 12288-token KV chunks need three 8192-token scheduler steps.
+    assert creator._get_mla_chunked_profile_length(262143) == 32768
+    # A non-aligned prefix must round up, preserving a full final query.
+    features.chunk_size = 4097
+    assert creator._get_mla_chunked_profile_length(262143) == 40960
 
 
 @pytest.mark.parametrize("profiled", [False, True])
@@ -174,9 +184,9 @@ def test_mla_profile_supports_dense_prefill_modes(
             algorithm="skip_softmax"
         )
     requests = creator._create_dummy_context_requests(262143)
-    assert creator._mla_chunked_profile_length == 40992
+    assert creator._mla_chunked_profile_length == 73728
     assert len(requests) == 1
-    assert len(requests[0].input_token_ids) == 40992
+    assert len(requests[0].input_token_ids) == 73728
     assert requests[0].sampling_config.beam_width == creator._max_beam_width
 
 
@@ -186,7 +196,7 @@ def test_mla_profile_requires_bounded_runtime_path(
 ) -> None:
     monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: sm)
     length = mla_profile_creator._get_mla_chunked_profile_length(262143)
-    assert length == (None if sm < 100 else 40992)
+    assert length == (None if sm < 100 else 73728)
 
 
 class _TextModel:
@@ -1190,7 +1200,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
             is_disagg=False,
         )
 
-    creator._mla_chunked_profile_length = 1408 if chunked_workspace_profiled else None
+    creator._mla_chunked_profile_length = 2304 if chunked_workspace_profiled else None
     py_executor = Mock()
     py_executor.dist.mapping.rank = 0
     py_executor.dist.broadcast.side_effect = lambda value, root: value
