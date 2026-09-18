@@ -27,8 +27,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+from .allocation import Assignment, Ladder
 from .machines import MachineProfile, ProfileConfigError, default_catalog
-from .selector import CollectedTest, Decision, Mark, Selector
+from .selector import CollectedTest, Mark, Selector
 
 
 class ResourceMarkers:
@@ -132,6 +133,8 @@ class SelectionRequest:
 
     machine: str
     profile: MachineProfile
+    ladder: Optional[Ladder]
+    target_rung: Optional[int]
 
     @classmethod
     def of(cls, config: pytest.Config) -> Optional["SelectionRequest"]:
@@ -140,7 +143,48 @@ class SelectionRequest:
         if not machine:
             return None
         gpus = config.getoption(SelectionOptions.GPUS)
-        return cls(machine=machine, profile=cls.profile_for(machine, gpus))
+        profile = cls.profile_for(machine, gpus)
+        ladder = cls.ladder_for(config.getoption(SelectionOptions.LADDER), profile)
+        return cls(
+            machine=machine,
+            profile=profile,
+            ladder=ladder,
+            target_rung=cls.target_rung_for(gpus, ladder),
+        )
+
+    @staticmethod
+    def ladder_for(text: Optional[str], profile: MachineProfile) -> Optional[Ladder]:
+        """The parsed `--ladder`, or None when it was not given.
+
+        A rung larger than the machine's GPUs per node is a usage error: that
+        allocation cannot be requested.
+        """
+        if text is None:
+            return None
+        try:
+            ladder = Ladder.parse(text)
+        except ValueError as error:
+            raise pytest.UsageError(f"--ladder: {error}")
+        if ladder.largest > profile.max_gpu_per_node:
+            raise pytest.UsageError(
+                f"--ladder: rung {ladder.largest} exceeds {profile.name}, which has "
+                f"{profile.max_gpu_per_node} GPUs per node"
+            )
+        return ladder
+
+    @staticmethod
+    def target_rung_for(gpus: Optional[int], ladder: Optional[Ladder]) -> Optional[int]:
+        """The rung `--gpus` names, or None when no rung filter applies.
+
+        Without a ladder, `--gpus` is a feasibility ceiling already applied by
+        sizing the profile, so it names no rung. A `--gpus` outside the ladder
+        is a usage error rather than a run that selects nothing.
+        """
+        if ladder is None or gpus is None:
+            return None
+        if gpus not in ladder:
+            raise pytest.UsageError(f"--gpus: {gpus} is not a rung of --ladder={ladder}")
+        return gpus
 
     @staticmethod
     def profile_for(machine: str, gpus: Optional[int]) -> MachineProfile:
@@ -196,24 +240,42 @@ class Selection:
     STASH_KEY = pytest.StashKey()
 
     request: SelectionRequest
-    decisions: Tuple[Decision, ...]
+    assignments: Tuple[Assignment, ...]
 
     @classmethod
     def of(cls, request: SelectionRequest, items: List[pytest.Item]) -> "Selection":
-        """Decide every collected item against the request's machine."""
+        """Decide every collected item, then place it on the ladder.
+
+        Feasibility is decided first and independently: a `Decision` says the
+        test can run on the machine, and the rung says which allocation it
+        belongs to.
+        """
         selector = Selector(request.profile)
+        views = [ItemView.of(item) for item in items]
         return cls(
             request=request,
-            decisions=tuple(selector.decide(ItemView.of(item)) for item in items),
+            assignments=tuple(
+                Assignment.of(selector.decide(view), view, request.ladder) for view in views
+            ),
         )
+
+    def is_live(self, assignment: Assignment) -> bool:
+        """True when `assignment` runs in this invocation.
+
+        An infeasible test never runs. With a target rung, only the tests placed
+        on that rung run; without one, every feasible test does.
+        """
+        if not assignment.decision.selected:
+            return False
+        return self.request.target_rung is None or assignment.rung == self.request.target_rung
 
     def partition(self, items: List[pytest.Item]) -> Tuple[List[pytest.Item], List[pytest.Item]]:
         """`items` split into those to keep and those to deselect, in order.
 
-        Paired by position: `decisions` was built from `items` in one pass.
+        Paired by position: `assignments` was built from `items` in one pass.
         """
         kept: List[pytest.Item] = []
         dropped: List[pytest.Item] = []
-        for item, decision in zip(items, self.decisions):
-            (kept if decision.selected else dropped).append(item)
+        for item, assignment in zip(items, self.assignments):
+            (kept if self.is_live(assignment) else dropped).append(item)
         return kept, dropped
