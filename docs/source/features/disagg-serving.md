@@ -346,6 +346,19 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
+* `TLLM_CUDA_OBJECT_COLLECTIVES`: With the Ray orchestrator (`TLLM_DISABLE_MPI=1`), the executor's
+  per-iteration object collectives (attention-DP votes, response gathers) are staged through CUDA
+  tensors on dedicated NCCL communicators instead of the gloo CPU backend. Set
+  `TLLM_CUDA_OBJECT_COLLECTIVES=0` to restore the CPU path. The value is agreed by all ranks at
+  start-up, so it must be set identically on every rank.
+
+* Inside the CUDA object-collective transport above, an empty response list is exchanged as a zero
+  size and skips the payload round, gathers unpickle only on the destination rank, and the
+  size/payload staging uses persistent pinned buffers. Every one of these decisions is taken on
+  gathered sizes or configuration, never on rank-local state, so all ranks issue the same NCCL call
+  sequence. There is no switch for these paths; `TLLM_CUDA_OBJECT_COLLECTIVES=0` falls back to the
+  CPU-backend object collectives altogether.
+
 * `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph
   mixing support off by default to reduce launch overhead for CUDA graph-captured NCCL operations.
   This assumes the communicator is not used by parallel graph launches or by uncaptured NCCL calls
