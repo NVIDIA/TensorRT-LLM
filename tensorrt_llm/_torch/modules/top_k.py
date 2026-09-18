@@ -164,7 +164,7 @@ class TopK(nn.Module):
                 # zero-work self-sampling launch. Deliberate, no warning.
                 pass
             elif self._selfsampling_prefill_ok(scores):
-                from ..cute_dsl_kernels.blackwell.top_k import (
+                from ..kernels.blackwell.top_k import (
                     selfsampling_topk_prefill_ready,
                     selfsampling_topk_run_prefill,
                 )
@@ -366,7 +366,7 @@ class TopK(nn.Module):
             ):
                 # hint-free k derives from the output width; pin it to the module's k
                 assert output_indices.shape[1] == self.top_k
-                from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
+                from ..kernels.blackwell.top_k import selfsampling_topk_run_varlen
 
                 logger.info_once(
                     "self-sampling GVR top-K engaged "
@@ -468,10 +468,7 @@ class TopK(nn.Module):
         # schema note), so the tier is eager / CUDA-graph only
         if torch.compiler.is_dynamo_compiling():
             return {}
-        from ..cute_dsl_kernels.blackwell.top_k.gvr_emission import (
-            LIST_EMIT_MIN_N,
-            GvrEmissionState,
-        )
+        from ..kernels.blackwell.top_k.gvr_emission import LIST_EMIT_MIN_N, GvrEmissionState
 
         if self._gvr_emission_state is None:
             self._gvr_emission_state = GvrEmissionState(

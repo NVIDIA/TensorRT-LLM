@@ -23,7 +23,7 @@ Two backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
 * :class:`MegaMoECuteDsl` — architecture-dispatched CuteDSL fused dispatch +
   FC1 + activation + FC2 + combine kernels for NVFP4 weights. The kernel and
   helper sources are ported into
-  ``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``;
+  ``tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe``;
   ``NVFP4MegaMoECuteDslMethod`` owns the NVFP4 weight tensors, MegaMoE-format
   derived buffers, and per-expert scale tensors consumed by the kernel ABI.
 """

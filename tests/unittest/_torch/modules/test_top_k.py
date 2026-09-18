@@ -194,7 +194,7 @@ def _install_fake_selfsampling_runner(monkeypatch) -> Mock:
     runner = Mock()
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k",
+        "tensorrt_llm._torch.kernels.blackwell.top_k",
         SimpleNamespace(selfsampling_topk_run_varlen=runner),
     )
     return runner
@@ -489,7 +489,7 @@ def _install_fake_prefill_runner(monkeypatch) -> Mock:
     prefill = Mock()
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k",
+        "tensorrt_llm._torch.kernels.blackwell.top_k",
         SimpleNamespace(
             selfsampling_topk_run_varlen=Mock(),
             selfsampling_topk_run_prefill=prefill,
@@ -606,7 +606,7 @@ def test_gvr_v2_prefill_capture_uncompiled_uses_radix(monkeypatch) -> None:
     """Under CUDA graph capture an engine missed by warmup must not JIT; the
     exact radix path is captured instead."""
     runner = _install_fake_prefill_runner(monkeypatch)
-    fake = sys.modules["tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k"]
+    fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
     fake.selfsampling_topk_prefill_ready = Mock(return_value=False)
     radix = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)

@@ -64,7 +64,7 @@ def _k4_path() -> Path:
     importable, else the source tree this test file lives in)."""
     try:
         spec = importlib.util.find_spec(
-            "tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent"
+            "tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.k4_persistent"
         )
         if spec is not None and spec.origin:
             return Path(spec.origin)
@@ -72,7 +72,7 @@ def _k4_path() -> Path:
         pass
     return (
         Path(__file__).resolve().parents[4]
-        / "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/kimi_k3_kda/"
+        / "tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda/"
         "k4_persistent.py"
     )
 

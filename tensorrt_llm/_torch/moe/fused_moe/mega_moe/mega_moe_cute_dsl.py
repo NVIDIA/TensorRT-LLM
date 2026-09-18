@@ -17,7 +17,7 @@
 ConfigurableMoE-compatible MoE backend wrapping the ported
 architecture-specific MegaMoE kernels (fused dispatch + FC1 + activation + FC2 +
 combine) from
-``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``. The kernel is
+``tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
 the runner + op live in
 ``tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py``. This
@@ -238,7 +238,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             return False, reason
 
     try:
-        from ....cute_dsl_kernels.cutedsl_megamoe import (  # noqa: F401
+        from ....moe.kernels.cutedsl_megamoe import (  # noqa: F401
             BlackwellInferenceMegaMoE,
             RubinInferenceGenphaseMegaMoE,
             RubinInferenceLocalMegaMoE,
@@ -247,7 +247,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     except ImportError as e:
         reason = (
             f"Ported MegaMoE NVFP4 kernel package failed to import: "
-            f"{e!r}. Verify tensorrt_llm/_torch/cute_dsl_kernels/"
+            f"{e!r}. Verify tensorrt_llm/_torch/moe/kernels/"
             f"cutedsl_megamoe is in the install tree."
         )
         _RUNTIME_PROBE_CACHE[sm_version] = reason
