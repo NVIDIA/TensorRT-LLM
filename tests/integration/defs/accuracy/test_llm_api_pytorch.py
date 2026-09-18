@@ -5943,6 +5943,57 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         mocker=mocker)
 
 
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_8_27B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.8-27B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.8-27B"
+    DFLASH2_MODEL_PATH = f"{llm_models_root()}/Qwen3.8-27B-DFlash2"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA"])
+    def test_dflash2(self, dflash_attention_backend):
+        """DFlash 2 drafter (incoai/Qwen3.8-27B-DFlash2) on its bf16 target.
+
+        Runs the DFlash 2 additions end to end: the per-sublayer block
+        convolutions, the non-causal symmetric sliding window, and the
+        candidate selector's path through the block. Acceptance length is
+        gated alongside GSM8K, since a drafter that silently degrades to
+        plain DFlash still passes the accuracy check. The drafter is trained
+        on chat generations, so the harness applies the chat template with
+        thinking off, like the other Qwen3.5-family DFlash tests.
+        max_draft_len=7 matches the checkpoint's block_size=8.
+        """
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=False)
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=7,
+            speculative_model=self.DFLASH2_MODEL_PATH,
+            attention_backend=dflash_attention_backend)
+
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 max_seq_len=4096,
+                 max_batch_size=8,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                   max_batch_size=8),
+                 speculative_config=spec_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert_acceptance_length_for_llm("TestQwen3_8_27B::test_dflash2",
+                                             llm)
+
+
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Seed-OSS/Seed-OSS-36B-Instruct"
@@ -7126,20 +7177,22 @@ class TestNemotron35Lightning(LlmapiAccuracyTestHarness):
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
-    @skip_no_hopper
-    def test_nvfp4_marlin_mtp3_chunked_prefill(self):
-        """Single-GPU Hopper guard for the Marlin NVFP4 path.
+    def _run_mtp3_chunked_prefill(self, moe_backend, nvfp4_gemm_config=None):
+        """Evaluate the MTP=3 + chunked-prefill combination on one MoE backend.
 
         The checkpoint is MIXED_PRECISION: routed experts, shared experts and
         lm_head are W4A16_NVFP4, the Mamba projections are FP8 and the MTP
-        layers are left unquantized. ``moe_config.backend=MARLIN`` plus
-        ``nvfp4_gemm_config.allowed_backends=['marlin']`` pin both the MoE and
-        the dense NVFP4 GEMMs to Marlin, which is Ada/Hopper only. Chunked
-        prefill, CUDA graphs and the overlap scheduler are enabled together so
-        the combination with MTP drafting is covered end to end.
+        layers are left unquantized. Chunked prefill, CUDA graphs and the
+        overlap scheduler are enabled together so the combination with MTP
+        drafting is covered end to end. Only the backend pinning differs
+        between callers; everything else is held fixed so the two runs are
+        comparable against the same accuracy references.
         """
         max_batch_size = 32
         mtp_config = MTPDecodingConfig(max_draft_len=3)
+        extra_args = {}
+        if nvfp4_gemm_config is not None:
+            extra_args["nvfp4_gemm_config"] = nvfp4_gemm_config
         with LLM(
                 self.MODEL_PATH,
                 kv_cache_config=KvCacheConfig(
@@ -7155,9 +7208,9 @@ class TestNemotron35Lightning(LlmapiAccuracyTestHarness):
                 cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
-                moe_config=MoeConfig(backend="MARLIN"),
-                nvfp4_gemm_config={"allowed_backends": ["marlin"]},
+                moe_config=MoeConfig(backend=moe_backend),
                 speculative_config=mtp_config,
+                **extra_args,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(self.MODEL_NAME)
@@ -7166,6 +7219,16 @@ class TestNemotron35Lightning(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_no_hopper
+    def test_nvfp4_marlin_mtp3_chunked_prefill(self):
+        self._run_mtp3_chunked_prefill(
+            moe_backend="MARLIN",
+            nvfp4_gemm_config={"allowed_backends": ["marlin"]})
+
+    @skip_pre_blackwell
+    def test_nvfp4_cutedsl_mtp3_chunked_prefill(self):
+        self._run_mtp3_chunked_prefill(moe_backend="CUTEDSL")
 
 
 @skip_pre_blackwell
@@ -7310,11 +7373,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("eval_mode", ["default", "inferencex"])
+    @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
     @parametrize_with_ids("overlap_scheduler", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, eval_mode):
+                          overlap_scheduler, fuse_qkv_index_projection,
+                          eval_mode):
         # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
         # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K, or
         # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy
@@ -7349,7 +7414,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                    implementation="msa", indexer_kv_dtype="fp8"),
+                    implementation="msa",
+                    indexer_kv_dtype="fp8",
+                    fuse_qkv_index_projection=fuse_qkv_index_projection),
                 moe_config=MoeConfig(backend="CUTLASS"),
                 max_seq_len=max_seq_len,
                 max_batch_size=max_batch_size,
