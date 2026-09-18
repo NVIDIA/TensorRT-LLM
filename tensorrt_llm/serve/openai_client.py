@@ -35,7 +35,7 @@ from typing import (
 
 import aiohttp
 import msgspec
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -132,6 +132,20 @@ _GENERATION_LEG_RETRYABLE_ERRORS = (
     ConnectionResetError,
 )
 
+# The disagg server is a transparent relay: worker responses come from the
+# same trusted codebase, and a deployment may attach extra top-level fields to
+# them (orchestrator-side telemetry, token transports, ...). Validate the known
+# schema but keep unknown fields -- the protocol models are extra="forbid", so
+# validating worker output with them either 500s the request or silently strips
+# whatever the deployment attached. Strictness belongs at the request boundary,
+# not on the relay of our own workers' output.
+class RelayedCompletionResponse(CompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
+class RelayedChatCompletionResponse(ChatCompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
 
 class OpenAIClient(ABC):
     async def send_request(
@@ -143,13 +157,13 @@ class OpenAIClient(ABC):
     ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
-                "v1/completions", request, CompletionResponse, server, hooks, req_id
+                "v1/completions", request, RelayedCompletionResponse, server, hooks, req_id
             )
         elif isinstance(request, ChatCompletionRequest):
             return await self._send_request(
                 "v1/chat/completions",
                 request,
-                ChatCompletionResponse,
+                RelayedChatCompletionResponse,
                 server,
                 hooks,
                 req_id,
