@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
@@ -20,9 +20,9 @@
 { __trtllm_shell_flags=$-; set +x; } 2>/dev/null
 
 if [ -n "${TRTLLM_ORIGINAL_SH_ENV:-}" ] \
-    && [ "${TRTLLM_ORIGINAL_SH_ENV}" != "${BASH_SOURCE[0]}" ] \
+    && [ "${TRTLLM_ORIGINAL_SH_ENV}" != "${ENV:-}" ] \
     && [ -f "${TRTLLM_ORIGINAL_SH_ENV}" ]; then
-  source "${TRTLLM_ORIGINAL_SH_ENV}"
+  . "${TRTLLM_ORIGINAL_SH_ENV}"
 fi
 
 case "${__trtllm_shell_flags}" in
