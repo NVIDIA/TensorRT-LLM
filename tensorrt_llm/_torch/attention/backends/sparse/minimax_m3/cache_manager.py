@@ -338,6 +338,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # Resolve the zero-copy index-K views eagerly. The V2 pool geometry
         # stays fixed for this manager's lifetime, but resolving it calls
         # nanobind methods that Dynamo cannot trace from the fused FP8 indexer.
+        # MSA uses HND and Triton uses NHD; keep both explicit-layout views.
         self._index_k_buffers: dict[tuple[int, str], Optional[torch.Tensor]] = {}
         self._index_v_buffers: dict[int, torch.Tensor] = {}
         for layer_idx in self.sparse_layer_ids:
@@ -502,6 +503,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """
         if kv_layout is None:
             kv_layout = self._main_kv_layout_name()
+        # Preserve the base accessor's validation: None means a missing layer,
+        # not an unsupported layout.
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         return self._index_k_buffers.get((layer_idx, kv_layout))

@@ -16,4 +16,4 @@ l0_dgx_b200_m3_6gpu:
       stage: post_merge
       backend: pytorch
   tests:
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3_disagg_head_mismatched_bounce
+  - accuracy/test_disaggregated_serving.py::TestMiniMaxM3::test_nvfp4_eagle3_disagg_head_mismatched_bounce
