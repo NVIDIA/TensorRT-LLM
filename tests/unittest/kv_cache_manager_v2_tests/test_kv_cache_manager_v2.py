@@ -578,7 +578,9 @@ class TestFitToQuota(TestKVCacheManagerV2):
 
     def test_marked_request_need_not_be_first(self) -> None:
         cfg = self.make_config()
-        marked, fixed = cfg.constraints[0].kv_caches
+        # Native config getters expose vector elements; preserve values before
+        # replacing the vector that owns them.
+        marked, fixed = [replace(request) for request in cfg.constraints[0].kv_caches]
         cfg.constraints = [BatchDesc([KVCacheDesc(32, 0)]), BatchDesc([fixed, marked])]
         self.manager = KVCacheManager(cfg)
         resolved = self.manager.resolved_constraints
