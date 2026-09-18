@@ -269,3 +269,51 @@ class TestEtcdClusterStorage(TestClusterStorage):
             yield self.etcd, "etcd://localhost:2379"
         self.etcd.kill()
         self.etcd.wait()
+
+
+@pytest.mark.asyncio
+async def test_expiry_does_not_charge_the_storage_own_outage():
+    """A worker refreshing its TTL must survive a block longer than that TTL.
+
+    Workers refresh over ``/expire`` on the storage's own event loop, so while
+    that loop is blocked their refreshes sit unread rather than arriving late.
+    Charging the block to the key expires a live worker for the storage's own
+    outage, which evicts it from the routers and fails requests routed there
+    (https://nvbugs/6786712). Uses the tight functional-test timings
+    (ttl=2s, refresh every 1s) against a block that straddles the deadline.
+    """
+    ttl, refresh_sec, block_sec = 2, 1, 2.5
+    storage = HttpClusterStorageServer("", "")
+    await storage.start()
+    try:
+        key = gen_key("outage_key")
+        assert await storage.set(key, "worker", ttl=ttl)
+
+        async def refresh_periodically():
+            while True:
+                await asyncio.sleep(refresh_sec)
+                await storage.expire(key, ttl)
+
+        refresher = asyncio.create_task(refresh_periodically())
+        try:
+            await asyncio.sleep(refresh_sec + 0.2)  # one clean refresh first
+            # Busy-wait, holding the loop exactly as a cold tokenizer build does.
+            block_end = time.monotonic() + block_sec
+            while time.monotonic() < block_end:
+                pass
+            # Let the loop resume so the expiry sweep runs at least once.
+            await asyncio.sleep(storage._check_expired_interval + 0.5)
+            assert await storage.get(key) == "worker", (
+                "a live, refreshing worker was expired for time the storage "
+                "itself could not serve refreshes")
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
+
+        # The clock must still expire a worker that really stopped refreshing,
+        # otherwise the fix above would keep dead workers registered forever.
+        await asyncio.sleep(ttl + storage._check_expired_interval + 0.5)
+        assert await storage.get(key) is None
+    finally:
+        await storage.stop()

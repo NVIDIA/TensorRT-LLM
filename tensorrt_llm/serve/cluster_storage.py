@@ -208,6 +208,9 @@ def key_time():
 
 class HttpClusterStorageServer(ClusterStorage):
 
+    # Granularity at which the expiry sweep samples the event loop.
+    _OUTAGE_SAMPLE_SEC = 0.1
+
     def __init__(self,
                  cluster_uri,
                  cluster_name,
@@ -219,8 +222,24 @@ class HttpClusterStorageServer(ClusterStorage):
         self._watch_lock = asyncio.Lock()
         self._check_expired_task = None
         self._check_expired_interval = 1  # in seconds
+        # Total time this event loop was unable to serve requests, excluded
+        # from the clock TTLs are measured on (see _service_now).
+        self._unserviceable_sec = 0.0
         if server:
             self.add_routes(server)
+
+    def _service_now(self) -> float:
+        """Monotonic time minus however long this loop could not serve requests.
+
+        Workers refresh their TTL over ``/expire`` on this very event loop, so
+        while the loop is blocked their refreshes sit unread rather than
+        arriving late. Charging that time to a key expires a live worker for
+        the storage's own outage: the coordinator evicts it from the routers
+        and requests routed there fail. A worker that really stopped refreshing
+        still expires, because the clock only pauses while nobody could have
+        been served.
+        """
+        return key_time() - self._unserviceable_sec
 
     def add_routes(self, server: FastAPI):
         server.add_api_route("/set", jsonify(self._set), methods=["POST"])
@@ -259,7 +278,8 @@ class HttpClusterStorageServer(ClusterStorage):
             if storage_item.key in self._storage and not storage_item.overwrite_if_exists:
                 return False
             if storage_item.expire_time < 0 and storage_item.ttl and storage_item.ttl > 0:
-                storage_item.expire_time = key_time() + storage_item.ttl
+                storage_item.expire_time = (self._service_now() +
+                                            storage_item.ttl)
             self._storage[storage_item.key] = storage_item
             await self._notify_watch_event(storage_item.key, storage_item,
                                            WatchEventType.SET)
@@ -269,7 +289,8 @@ class HttpClusterStorageServer(ClusterStorage):
         async with self._lock:
             if key in self._storage:
                 item = self._storage[key]
-                if item.expire_time < 0 or item.expire_time > key_time():
+                now = self._service_now()
+                if item.expire_time < 0 or item.expire_time > now:
                     return item.value
                 else:
                     await self._notify_watch_event(key, item,
@@ -280,7 +301,7 @@ class HttpClusterStorageServer(ClusterStorage):
     async def expire(self, key: str, ttl: int) -> bool:
         async with self._lock:
             if key in self._storage:
-                self._storage[key].expire_time = key_time() + int(ttl)
+                self._storage[key].expire_time = self._service_now() + int(ttl)
                 return True
             return False
 
@@ -339,12 +360,29 @@ class HttpClusterStorageServer(ClusterStorage):
         logger.info(
             f"Notified watch event for key {key} with type {event_type}")
 
+    async def _sleep_counting_outage(self, duration: float) -> None:
+        """Sleep, accumulating however long the loop overran its own timers.
+
+        Sliced rather than one long sleep: a single sleep only reveals lateness
+        after its own deadline, so a block that started mid-sleep is credited
+        short by however far in it began. Crediting happens here, in the sweep's
+        own task, because a separate prober and the sweep would both be ready
+        when the loop resumes and the sweep could reap first.
+        """
+        remaining = duration
+        while remaining > 0:
+            slice_sec = min(self._OUTAGE_SAMPLE_SEC, remaining)
+            before = key_time()
+            await asyncio.sleep(slice_sec)
+            self._unserviceable_sec += max(0.0, key_time() - before - slice_sec)
+            remaining -= slice_sec
+
     async def _check_expired(self):
         while True:
-            await asyncio.sleep(self._check_expired_interval)
+            await self._sleep_counting_outage(self._check_expired_interval)
             try:
                 before_len = len(self._storage)
-                current_time = key_time()
+                current_time = self._service_now()
                 async with self._lock:
                     kv_to_delete = {
                         k: v
