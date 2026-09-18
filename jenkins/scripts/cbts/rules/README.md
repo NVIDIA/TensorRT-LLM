@@ -16,18 +16,20 @@ for the overall CBTS architecture.
 | `modeling_v2_rule.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
 | `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
-| `docs_rule.py` | `DocsRule` | `docsonly` | `docs/**`, `**/*.md`, `**/*.rst` → the dedicated `CPU-Build_Docs` stage |
+| `docs_rule.py` | `DocsRule` | `docsonly` | `docs/**`, `**/*.md`, `**/*.rst` → the dedicated `CPU-Build_Docs` stage plus the complete `l0_cpu` suite |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
 
 ## DocsRule
 
 Claims every file under `docs/` plus Markdown and reStructuredText files
-anywhere in the repository. It contributes the literal `CPU-Build_Docs`
-stage, which runs Doxygen and Sphinx `make html`; the stage is not backed by a
-test-db YAML. Documentation files inside another rule's source prefix remain
-excluded from that source rule, so a README-only edit runs docs rather than a
-backend test suite. Mixed documentation and targeted-test changes combine by
-unioning their stages.
+anywhere in the repository. It contributes the literal `CPU-Build_Docs` stage,
+which runs Doxygen and Sphinx `make html`, and keeps every block and entry in
+`l0_cpu.yml` so the matching `CPU-Generic-*` stages run their complete CPU
+suite. If the CPU test-db blocks or stages cannot be resolved, the rule forces
+fallback instead of silently running docs alone. Documentation files inside
+another rule's source prefix remain excluded from that source rule, so a
+README-only edit runs docs and CPU validation rather than a backend GPU suite.
+Mixed documentation and targeted-test changes combine by unioning their stages.
 
 ## WaivesRule
 
