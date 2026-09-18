@@ -1799,6 +1799,8 @@ class CuteDslFusedMoE(MoEImplBase):
     def load_weights(self,
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
+        if self._locality_domain_weight_shards is not None:
+            self.pre_reload_weights()
         super().load_weights(weights,
                              allow_partial_loading=allow_partial_loading)
         # Keep DWDP registration after base weight loading. This preserves

@@ -3091,11 +3091,31 @@ class TestServeDefaults:
         assert llm_args.get("tensor_parallel_size") == 4
 
     def test_serve_enable_locality_domain_flag(self):
+        llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
+        assert llm_args.get("enable_locality_domains", False) is False
+
         llm_args, _ = get_llm_args(model=llama_model_path,
                                    backend="pytorch",
                                    enable_locality_domains=True)
 
         assert llm_args["enable_locality_domains"] is True
+
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("load_format", ["AUTO", "GMS"])
+    def test_locality_domains_config_validation(
+            self, enabled: bool, load_format: Literal["AUTO", "GMS"]) -> None:
+        assert "enable_locality_domains" not in BaseLlmArgs.model_fields
+        kwargs = dict(model=llama_model_path,
+                      enable_locality_domains=enabled,
+                      load_format=load_format)
+        if enabled and load_format == "GMS":
+            with pytest.raises(ValidationError,
+                               match="GMS.*enable_locality_domains"):
+                TorchLlmArgs(**kwargs)
+        else:
+            args = TorchLlmArgs(**kwargs)
+            assert args.enable_locality_domains is enabled
 
     def test_serve_video_pruning_rate_maps_to_multimodal_config(self):
         llm_args, _ = get_llm_args(

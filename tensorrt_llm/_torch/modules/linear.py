@@ -3967,7 +3967,8 @@ class Linear(nn.Module):
 
     def create_weights(self):
         if self._weights_created:
-            if self.quant_config is not self._locality_domain_planned_quant_config:
+            if (self._locality_domain_policy.enabled and self.quant_config
+                    is not self._locality_domain_planned_quant_config):
                 raise RuntimeError(
                     "Linear quant_config changed after weights were created; "
                     "reset _weights_created and recreate the weight schema.")

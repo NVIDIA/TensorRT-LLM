@@ -3656,8 +3656,14 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-@pytest.mark.parametrize("quant_algo", [None, QuantAlgo.NVFP4])
-def test_moe_module_locality_domain_lifecycle_and_forward_rubin(quant_algo):
+@pytest.mark.parametrize(
+    ("quant_algo", "rtol", "atol"),
+    [
+        pytest.param(None, 1e-2, 2e-2, id="bf16"),
+        pytest.param(QuantAlgo.NVFP4, 1e-2, 0.15, id="nvfp4"),
+    ],
+)
+def test_moe_module_locality_domain_lifecycle_and_forward_rubin(quant_algo, rtol, atol):
     _skip_if_no_locality_domain()
 
     from _torch.moe.quantize_utils import get_test_quant_params
@@ -3775,17 +3781,20 @@ def test_moe_module_locality_domain_lifecycle_and_forward_rubin(quant_algo):
             locality_domain_output = locality_module(input_tensor, router_logits)
 
         torch.cuda.synchronize()
-        torch.testing.assert_close(base_output, locality_domain_output, rtol=1e-2, atol=0.15)
+        torch.testing.assert_close(base_output, locality_domain_output, rtol=rtol, atol=atol)
 
-        # Reload must replace localized shards through the wrapper lifecycle.
-        locality_module.pre_reload_weights()
-        locality_module.load_weights([weights])
-        locality_module.post_load_weights()
-        assert locality_module.backend._locality_domain_weight_shards is not shards
-        with torch.inference_mode():
-            reloaded_output = locality_module(input_tensor, router_logits)
-        torch.cuda.synchronize()
-        torch.testing.assert_close(reloaded_output, base_output, rtol=1e-2, atol=0.15)
+        # Both direct updates and explicit reload hooks must rebuild released weights.
+        for explicit_pre_reload in (False, True):
+            shards = locality_domain_backend._locality_domain_weight_shards
+            if explicit_pre_reload:
+                locality_module.pre_reload_weights()
+            locality_module.load_weights([weights])
+            locality_module.post_load_weights()
+            assert locality_domain_backend._locality_domain_weight_shards is not shards
+            with torch.inference_mode():
+                reloaded_output = locality_module(input_tensor, router_logits)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(reloaded_output, base_output, rtol=rtol, atol=atol)
 
 
 @pytest.mark.skipif(
