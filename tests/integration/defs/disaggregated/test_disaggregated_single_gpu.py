@@ -56,9 +56,9 @@ MPI_STARTED = MPI_TAG + 4
 MODEL_PATHS = {
     "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
-    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
+    "Qwen3-8B-eagle3": "Qwen3/qwen3_8b_eagle3",
     "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
+    "Qwen3-8B": "Qwen3/Qwen3-8B",
 }
 
 
@@ -517,8 +517,9 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["Llama-3.1-8B-Instruct"])
-@pytest.mark.parametrize("spec_dec_model_path", ["EAGLE3-LLaMA3.1-Instruct-8B"])
+@skip_pre_hopper
+@pytest.mark.parametrize("model", ["Qwen3-8B"])
+@pytest.mark.parametrize("spec_dec_model_path", ["Qwen3-8B-eagle3"])
 @pytest.mark.parametrize("generation_overlap", [False])
 def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
                                                  generation_overlap):
