@@ -324,6 +324,11 @@ class MoeAlltoAll:
         self._force_cft = get_force_cft()
         if self._force_cft is False:
             can_use_cft_counted_writes = False
+        elif self._force_cft is True:
+            # Opt-in only. No caller passes can_use_cft_counted_writes=True, so
+            # without this the CFT path cannot be reached at all. Leaving the
+            # variable unset keeps CFT disabled, as before.
+            can_use_cft_counted_writes = True
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()

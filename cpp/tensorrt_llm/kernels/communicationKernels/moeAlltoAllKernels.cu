@@ -231,10 +231,16 @@ int64_t moeA2AGetTimeoutCycles(bool is_warmup)
     }                                                                                                                  \
     }
 
+#ifndef TLLM_MOE_A2A_TIMEOUT_SECONDS
+#define TLLM_MOE_A2A_TIMEOUT_SECONDS 300
+#endif
 #if DISABLE_TIMEOUT
 #define check_timeout(s, budget) false
 #else
 // `budget` is in clock64() cycles, resolved on the host by moeA2AGetTimeoutCycles().
+// Multi-rank warmup can enter these kernels with large rank skew while CuTeDSL
+// kernels are still being JIT/autotuned on peer ranks; host budgets (incl. warmup)
+// cover that skew via moeA2AGetTimeoutCycles().
 #define check_timeout(s, budget) ((clock64() - (s)) > (budget))
 #endif
 
@@ -455,7 +461,8 @@ __global__ void moeA2APrepareDispatchKernel(
         recv_counters[next_parity * ep_size + idx] = -1;
     }
     // NOTE: LE-backed counters use cumulative baselines and are deliberately not zeroed
-    // here, so that the kernel never issues SM stores to LE-backed memory.
+    // here, so that the kernel never issues SM stores to LE-backed memory (historically
+    // broke fabric.try_put.counted with PDL).
 }
 
 // ============================================================================
@@ -746,6 +753,76 @@ __device__ __forceinline__ void store_invalid_expert_ids(int32_t* expert_ids, in
     }
 }
 
+// send_counters is final once every CTA has routed, so the elected CTA can publish it
+// without waiting for the data issue. Called by warp 0 of the elected CTA.
+template <bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
+__device__ __forceinline__ void cft_publish_recv_counters(DispatchKernelPointers const& ptrs, int rank_id, int ep_size,
+    uint32_t parity, int eplb_stats_num_experts, int lane_id)
+{
+    if constexpr (ENABLE_EPLB)
+    {
+#pragma unroll 1
+        for (int target_rank = 0; target_rank < ep_size; ++target_rank)
+        {
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    continue;
+            }
+            int* target_stats = ptrs.eplb_gathered_stats[target_rank];
+            for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
+                target_stats[rank_id * eplb_stats_num_experts + expert_id] = ptrs.eplb_local_stats[expert_id];
+        }
+    }
+
+// Send recv_counters to active peers via direct MNNVL write.
+#pragma unroll 1
+    for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
+    {
+        if constexpr (ENABLE_RANK_MASK)
+        {
+            if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                continue;
+        }
+        int send_count = ptrs.send_counters[target_rank];
+        int* slot = ptrs.recv_counters[target_rank] + static_cast<int>(parity) * ep_size + rank_id;
+        asm volatile("st.relaxed.sys.b32 [%0], %1;" ::"l"(slot), "r"(send_count) : "memory");
+    }
+}
+
+// Elect the CTA that finishes routing last and have it publish the counters.
+// Should be run by only 1 warp.
+template <bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
+__device__ __forceinline__ void cft_elect_and_publish(DispatchKernelPointers const& ptrs, int rank_id, int ep_size,
+    uint32_t parity, int eplb_stats_num_experts, int local_num_tokens, int& is_last_token_cta)
+{
+    int const lane_id = threadIdx.x % warpSize;
+    bool is_last_token = false;
+    if (lane_id == 0)
+    {
+        if (local_num_tokens != 0)
+        {
+            int cnt = atomicAdd(ptrs.local_token_counter, 1);
+            is_last_token = cnt + 1 == local_num_tokens;
+        }
+        else
+        {
+            is_last_token = true;
+        }
+    }
+    is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
+    if (lane_id == 0)
+    {
+        is_last_token_cta = static_cast<int>(is_last_token);
+    }
+    __syncwarp();
+    if (is_last_token)
+    {
+        cft_publish_recv_counters<ENABLE_EPLB, ENABLE_RANK_MASK>(
+            ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, lane_id);
+    }
+}
+
 template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
 __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_experts,
     DispatchKernelPointers const ptrs, int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id,
@@ -753,6 +830,11 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
 {
     int local_token_idx = blockIdx.x;
     uint32_t parity = 0;
+    __shared__ int is_last_token_cta;
+    if (threadIdx.x == 0)
+    {
+        is_last_token_cta = 0;
+    }
 
     if (local_num_tokens == 0)
     {
@@ -760,6 +842,12 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
             return;
         cudaGridDependencySynchronize();
         parity = round_parity(*ptrs.flag_val);
+        __syncthreads();
+        if (threadIdx.x < warpSize)
+        {
+            cft_elect_and_publish<ENABLE_EPLB, ENABLE_RANK_MASK>(
+                ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, local_num_tokens, is_last_token_cta);
+        }
     }
     else
     {
@@ -815,6 +903,14 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
                 num_experts, smem_topk_target_ranks, smem_topk_send_indices);
         }
         __syncthreads();
+
+        // Routing is done, so send_counters is final. Publish it here rather than after the data
+        // issue, so peers see the counts as early as possible.
+        if (threadIdx.x < warpSize)
+        {
+            cft_elect_and_publish<ENABLE_EPLB, ENABLE_RANK_MASK>(
+                ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, local_num_tokens, is_last_token_cta);
+        }
 
         int topk_target_ranks[TOP_K];
         int topk_send_indices[TOP_K];
@@ -921,103 +1017,44 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
 
     cudaTriggerProgrammaticLaunchCompletion();
 
-    // ---- is_last_token: metadata send + counter polling ----
-    __shared__ int is_last_token_cta;
-    if (threadIdx.x == 0)
-    {
-        is_last_token_cta = 0;
-    }
-    __syncthreads();
-
+    // ---- wait for every peer's counts; the election and the send happened before the data
+    // issue, so this is the only thing left that has to wait on peers ----
     bool is_first_warp = threadIdx.x / warpSize == 0;
     int lane_id = threadIdx.x % warpSize;
-    if (is_first_warp)
-    {
-        bool is_last_token = false;
-        if (lane_id == 0)
-        {
-            if (local_num_tokens != 0)
-            {
-                int cnt = atomicAdd(ptrs.local_token_counter, 1);
-                is_last_token = cnt + 1 == local_num_tokens;
-            }
-            else
-            {
-                is_last_token = true;
-            }
-        }
-        is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
-        if (lane_id == 0)
-        {
-            is_last_token_cta = static_cast<int>(is_last_token);
-        }
-
-        if (is_last_token)
-        {
-            if constexpr (ENABLE_EPLB)
-            {
-#pragma unroll 1
-                for (int target_rank = 0; target_rank < ep_size; ++target_rank)
-                {
-                    if constexpr (ENABLE_RANK_MASK)
-                    {
-                        if (!is_rank_active(ptrs.active_rank_mask, target_rank))
-                            continue;
-                    }
-                    int* target_stats = ptrs.eplb_gathered_stats[target_rank];
-                    for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
-                        target_stats[rank_id * eplb_stats_num_experts + expert_id] = ptrs.eplb_local_stats[expert_id];
-                }
-            }
-
-// Send recv_counters to active peers via direct MNNVL write.
-#pragma unroll 1
-            for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
-            {
-                if constexpr (ENABLE_RANK_MASK)
-                {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
-                        continue;
-                }
-                int send_count = ptrs.send_counters[target_rank];
-                int* slot = ptrs.recv_counters[target_rank] + static_cast<int>(parity) * ep_size + rank_id;
-                asm volatile("st.relaxed.sys.b32 [%0], %1;" ::"l"(slot), "r"(send_count) : "memory");
-            }
-            __syncwarp();
-
 #if !DISABLE_SYNC_FOR_PROFILING
-            // Poll recv_counters from all peers (including self). The whole CTA
-            // cooperatively sanitizes invalid expert-id payload slots after this.
+    if (is_first_warp && is_last_token_cta)
+    {
+        // Poll recv_counters from all peers (including self). The whole CTA
+        // cooperatively sanitizes invalid expert-id payload slots after this.
 #pragma unroll 1
-            for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
+        for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
+        {
+            if constexpr (ENABLE_RANK_MASK)
             {
-                if constexpr (ENABLE_RANK_MASK)
+                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
-                    {
-                        ptrs.recv_counters[rank_id][static_cast<int>(parity) * ep_size + peer_rank] = 0;
-                        continue;
-                    }
+                    ptrs.recv_counters[rank_id][static_cast<int>(parity) * ep_size + peer_rank] = 0;
+                    continue;
                 }
-                int32_t* recvCountPtr = ptrs.recv_counters[rank_id] + static_cast<int>(parity) * ep_size + peer_rank;
-                auto s = clock64();
-                int recv_count;
-                do
-                {
-                    asm volatile("ld.relaxed.sys.b32 %0, [%1];" : "=r"(recv_count) : "l"(recvCountPtr));
-                    if (check_timeout(s, ptrs.timeout_cycles))
-                    {
-                        printf(
-                            "dispatch: ---Rank %d timed out recv_counters from rank %d"
-                            " parity=%u observed=%d\n",
-                            rank_id, peer_rank, parity, recv_count);
-                        asm volatile("trap;");
-                    }
-                } while (recv_count == -1);
             }
-#endif // !DISABLE_SYNC_FOR_PROFILING
+            int32_t* recvCountPtr = ptrs.recv_counters[rank_id] + static_cast<int>(parity) * ep_size + peer_rank;
+            auto s = clock64();
+            int recv_count;
+            do
+            {
+                asm volatile("ld.relaxed.sys.b32 %0, [%1];" : "=r"(recv_count) : "l"(recvCountPtr));
+                if (check_timeout(s, ptrs.timeout_cycles))
+                {
+                    printf(
+                        "dispatch: ---Rank %d timed out recv_counters from rank %d"
+                        " parity=%u observed=%d\n",
+                        rank_id, peer_rank, parity, recv_count);
+                    asm volatile("trap;");
+                }
+            } while (recv_count == -1);
         }
     }
+#endif // !DISABLE_SYNC_FOR_PROFILING
 
     __syncthreads();
 
@@ -1862,7 +1899,7 @@ __global__ void moeA2ACftCombinePushKernel(
     int rank_id, int ep_size, int max_tokens_per_rank, int bytes_per_token, uint64_t combine_payload_base,
     uint64_t combine_counter_base, int combine_counter_ep_stride, int local_stride_per_token)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) || CLANGD_HOST_PASS
     // Wait for prepareCombine to finish writing the workspace we read from, then immediately
     // signal the next kernel (combineCountedWrite) that it can start. combineCountedWrite
     // polls for incoming counter writes from peers — it touches disjoint memory from our
@@ -1929,9 +1966,9 @@ __global__ void moeA2ACftCombinePushKernel(
             = combine_payload_base + (static_cast<uint64_t>(rank_id) * max_tokens_per_rank + t) * bytes_per_token;
         uint64_t counter_offset = combine_counter_base
             + (static_cast<uint64_t>(rank_id) * combine_counter_ep_stride + t) * kCftCounterStride;
-        // put_bar is a required mbarrier::report destination for the PTX, but it is not waited on.
-        // Completion for smem reuse is enforced by the CTA-scope fabric.wait.sync_restrict::reads
-        // below, which does not depend on mbarrier report delivery.
+        // put_bar is a required mbarrier::report destination for the PTX but is not waited on:
+        // mbarrier::report::fabric does not deliver reports on this Rubin/driver combo, so
+        // smem-reuse completion is enforced via CTA-scope fabric.wait.sync_restrict::reads below.
         cft_fabric_try_put_counted(le_id, data_offset, counter_offset, staging, bytes_per_token, put_bar);
         cft_fabric_submit();
         cft_fabric_wait_reads();
@@ -1949,7 +1986,7 @@ __global__ void moeA2ACombineCountedWriteKernel(const CombineKernelPointers ptrs
 {
     using InputT = std::conditional_t<LOW_PRECISION, __nv_fp8_e4m3, T>;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) || CLANGD_HOST_PASS
     int local_token_idx = blockIdx.x;
     int const size_per_token = elements_per_token * sizeof(InputT);
 
