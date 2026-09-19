@@ -91,7 +91,7 @@ def _resolve_skip_softmax_threshold_scale_factor(
         # read is a `.item()`, which is illegal while a graph is being captured.
         runtime_params = sparse_params.scheduler.get_runtime_params(
             timestep=timestep,
-            graph_phase=resolved_extra_key("skip_softmax_phase"),
+            graph_phase=resolved_extra_key("sparse_attn_phase"),
         )
         threshold_scale_factor = runtime_params.threshold_scale_factor_prefill
     if threshold_scale_factor is None or threshold_scale_factor <= 0.0:

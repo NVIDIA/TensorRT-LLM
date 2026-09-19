@@ -30,7 +30,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.attention_backend import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import SolAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
@@ -207,34 +207,19 @@ def test_sol_attn_rejects_gqa_mqa():
 def test_graph_phase_matches_skip_softmax_sense(timestep, expected):
     """Phase 0 is the dense prefix, 1 the sparse phase, None when undecidable.
 
-    Same contract as SkipSoftmaxScheduler.get_graph_phase_for_timestep.
+    Same contract as the shared graph_phase_for_timestep reduction.
     """
-    assert (
-        SkipSoftmaxScheduler.get_graph_phase_for_timestep(timestep, disabled_until_timestep=0.9545)
-        == expected
-    )
+    assert graph_phase_for_timestep(timestep, disabled_until_timestep=0.9545) == expected
 
 
 def test_graph_phase_none_when_prefix_unset():
-    assert (
-        SkipSoftmaxScheduler.get_graph_phase_for_timestep(0.5, disabled_until_timestep=None) is None
-    )
+    assert graph_phase_for_timestep(0.5, disabled_until_timestep=None) is None
 
 
 def test_graph_phase_accepts_tensor_timestep():
     """Pipelines pass a tensor; a 0-d or 1-element tensor must work."""
-    assert (
-        SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-            torch.tensor(0.99), disabled_until_timestep=0.95
-        )
-        == 0
-    )
-    assert (
-        SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-            torch.tensor([0.10]), disabled_until_timestep=0.95
-        )
-        == 1
-    )
+    assert graph_phase_for_timestep(torch.tensor(0.99), disabled_until_timestep=0.95) == 0
+    assert graph_phase_for_timestep(torch.tensor([0.10]), disabled_until_timestep=0.95) == 1
 
 
 def test_dense_prefix_skips_kernel(monkeypatch):
@@ -694,22 +679,24 @@ def test_dense_by_step_prefers_runner_resolved_phase(monkeypatch):
     never touch the tensor. `torch.compiler.disable` does not help here -- it
     only excludes Dynamo, not stream capture.
     """
+    import tensorrt_llm._torch.attention.backends.sparse.timestep_phase as timestep_phase
+
     reads = {"n": 0}
-    real = SkipSoftmaxScheduler._as_float
+    real = timestep_phase.timestep_to_float
 
     def spy(value):
         reads["n"] += 1
         return real(value)
 
-    monkeypatch.setattr(SkipSoftmaxScheduler, "_as_float", staticmethod(spy))
+    monkeypatch.setattr(timestep_phase, "timestep_to_float", spy)
     attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = 0.9
 
     # Resolved phase wins even when the tensor says otherwise: phase 0 is the
     # dense prefix, phase 1 the sparse phase.
-    with resolved_extra_keys_scope({"sol_attn_phase": 0}):
+    with resolved_extra_keys_scope({"sparse_attn_phase": 0}):
         assert attn._dense_by_step(torch.tensor(0.1)) is True
-    with resolved_extra_keys_scope({"sol_attn_phase": 1}):
+    with resolved_extra_keys_scope({"sparse_attn_phase": 1}):
         assert attn._dense_by_step(torch.tensor(0.99)) is False
     assert reads["n"] == 0, "timestep tensor was read despite a runner-resolved phase"
 
@@ -787,8 +774,8 @@ def test_sol_attn_dense_prefix_survives_cuda_graph_capture(make_runner):
     attn.disabled_until_timestep = cutoff
     runner = make_runner()
     runner.register_extra_key_fn(
-        "sol_attn_phase",
-        lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+        "sparse_attn_phase",
+        lambda *args, **kwargs: graph_phase_for_timestep(
             kwargs.get("timestep"), disabled_until_timestep=cutoff
         ),
     )

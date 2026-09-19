@@ -48,7 +48,7 @@ from typing import Any, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 
@@ -173,9 +173,9 @@ class SolAttention(AttentionBackend):
         # Under CUDA-graph capture the runner has already resolved the phase
         # host-side (it is part of the graph key); reading the tensor here
         # would `.item()` inside capture, which CUDA forbids.
-        phase = resolved_extra_key("sol_attn_phase")
+        phase = resolved_extra_key("sparse_attn_phase")
         if phase is None:
-            phase = SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+            phase = graph_phase_for_timestep(
                 timestep,
                 disabled_until_timestep=self.disabled_until_timestep,
             )

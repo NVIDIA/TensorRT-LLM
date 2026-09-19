@@ -33,6 +33,7 @@ from ...attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from ...attention.backends.sparse.params import SparseBackendForwardArgs, SparseParams
+from ...attention.backends.sparse.timestep_phase import graph_phase_for_timestep, timestep_to_float
 from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from .interface import AttentionBackend, AttentionTensorLayout
@@ -236,6 +237,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         self._preferred_layout = AttentionTensorLayout.NHD
 
         self.quant_attention_config = quant_attention_config
+        self._prepared_timestep: Optional[float] = None
+        self._timestep_prepared = False
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]) -> None:
         """Rebuild FMHA libraries and bind VisualGen-owned shared plan caches."""
@@ -247,6 +250,55 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         for fmha in self._fmha_manager.fmha_libs:
             if isinstance(fmha, PrimsTSBlockSparseFmha):
                 fmha.bind_plan_cache(cache_state)
+
+    @property
+    def timestep_cutoff(self) -> Optional[float]:
+        """Normalized timestep below which the sparse algorithm is enabled, if any."""
+
+        return getattr(self.sparse_params, "disabled_until_timestep", None)
+
+    def resolve_timestep(self, timestep: object) -> object:
+        """Reduce ``timestep`` to a host scalar once per eager call.
+
+        Timestep-scheduled sparse algorithms read the timestep on the host,
+        which CUDA Graph capture cannot do for a device tensor. Eager calls,
+        including the warmup that precedes capture, remember the reduced value
+        and capture reuses it. Without a cutoff the timestep passes through
+        untouched.
+        """
+
+        if self.timestep_cutoff is None:
+            return timestep
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if not self._timestep_prepared:
+                raise RuntimeError(
+                    "sparse attention timestep must be prepared before CUDA Graph capture"
+                )
+            return self._prepared_timestep
+        self._prepared_timestep = timestep_to_float(timestep)
+        self._timestep_prepared = True
+        return self._prepared_timestep
+
+    @property
+    def dense_layers(self) -> frozenset[int]:
+        """Layer indices that always run dense attention."""
+
+        return getattr(self.sparse_params, "dense_layers", frozenset())
+
+    def should_use_sparse(self, timestep: object) -> bool:
+        """Return whether this layer runs its sparse path for the prepared ``timestep``.
+
+        Dense layers never do. Otherwise the layer is sparse unless the timestep
+        schedule places the call in the dense prefix; without a cutoff or a
+        timestep the call is sparse.
+        """
+
+        if self.layer_idx in self.dense_layers:
+            return False
+        graph_phase = graph_phase_for_timestep(
+            timestep, disabled_until_timestep=self.timestep_cutoff
+        )
+        return graph_phase is None or graph_phase == 1
 
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
@@ -318,6 +370,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         Returns:
             Output tensor [B, S, H*D]
         """
+        timestep = self.resolve_timestep(timestep)
         block_sparse_inputs = (
             sparse_backend_args.block_sparse_inputs if sparse_backend_args is not None else None
         )
