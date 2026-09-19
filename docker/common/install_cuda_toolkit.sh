@@ -2,17 +2,13 @@
 
 set -ex
 
-# Reinstall CUDA from the run file on the non-DLFW base images. On most DLFW bumps
-# nvcr.io/nvidia/cuda has no rockylinux/ubuntu tag yet for the CUDA the DLFW image carries,
-# so those images start from an older public tag (docker/Makefile) and this script replaces
-# their CUDA with CUDA_VER. Bump CUDA_VER with the DLFW image: the checks below skip the
-# reinstall once the base image already ships it, which is what keeps this a no-op on DLFW.
-#
-# NB: newer CUDA releases dropped the driver version from the run file name
-# (cuda_<ver>_linux.run, was cuda_<ver>_<driver>_linux.run), so keep the two versions in
-# separate variables.
+# Reinstall CUDA from the run file on the base images that do not already ship CUDA_VER. On
+# most NGC PyTorch bumps nvcr.io/nvidia/cuda has no rockylinux/ubuntu tag yet for the CUDA the
+# NGC PyTorch image carries, so those images start from an older public tag (docker/Makefile)
+# and this script replaces their CUDA with CUDA_VER. Bump CUDA_VER with the NGC PyTorch image:
+# the check below skips the reinstall once the base image already ships it, which is what keeps
+# this a no-op on NGC PyTorch.
 CUDA_VER="13.4.1"
-CUDA_DRIVER_VER="615.71.09"
 
 # The aarch64 run file carries an _sbsa suffix.
 case "$(uname -m)" in
@@ -24,20 +20,10 @@ NVCC_VERSION_OUTPUT=$(nvcc --version)
 OLD_CUDA_VER=$(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1)
 echo "The version of pre-installed CUDA is ${OLD_CUDA_VER}."
 
-check_cuda_version() {
-    if [ -n "$CUDA_VERSION" ] && [ -n "$CUDA_DRIVER_VERSION" ]; then
-        CUDA_VERSION_SHORT=$(echo "$CUDA_VERSION" | cut -d'.' -f1-3)
-        if [ "$CUDA_VERSION_SHORT" = "$CUDA_VER" ] && [ "$CUDA_DRIVER_VERSION" = "$CUDA_DRIVER_VER" ]; then
-            echo "CUDA version matches (${CUDA_VERSION_SHORT}_${CUDA_DRIVER_VERSION}), skipping reinstallation"
-            return 0
-        fi
-    fi
-    return 1
-}
-
-# The DLFW image is Ubuntu based, and its CUDA_DRIVER_VERSION is an internal build that is
-# usually not published, so the Rocky check above would miss and wipe a good toolkit. Match
-# on the toolkit version alone: that is all the run file replaces.
+# Match on the toolkit version alone: that is all the run file replaces. A driver-version
+# check works on neither base image family: the NGC CUDA images do not set CUDA_DRIVER_VERSION
+# at all, and the NGC PyTorch one reports an internal build that is usually never published,
+# so it would never match and would wipe a perfectly good toolkit.
 check_cuda_toolkit_version() {
     if [ -n "$CUDA_VERSION" ] && [ "$(echo "$CUDA_VERSION" | cut -d'.' -f1-3)" = "$CUDA_VER" ]; then
         return 0
@@ -74,7 +60,7 @@ reinstall_ubuntu_cuda() {
 ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 case "$ID" in
   rocky)
-    if check_cuda_version; then
+    if check_cuda_toolkit_version; then
         echo "CUDA version matches ($CUDA_VER), skipping reinstallation"
         exit 0
     fi

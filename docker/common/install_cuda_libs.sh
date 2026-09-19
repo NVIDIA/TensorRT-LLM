@@ -2,16 +2,16 @@
 
 set -ex
 
-# Align with the pre-installed cuDNN / cuBLAS / NCCL versions from the DLFW release notes:
+# Align with the pre-installed cuDNN / cuBLAS / NCCL versions from the NGC PyTorch release notes:
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/
-CUDA_VER="13.4" # the DLFW image's CUDA_VERSION, major.minor
+CUDA_VER="13.4" # the NGC PyTorch image's CUDA_VERSION, major.minor
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-# The DLFW image usually ships an internal cuDNN build the public CUDA repo does not carry, so
-# pin the closest published version instead: every image, the DLFW-based one included, then
-# ends up on a cuDNN anyone can install, and the tests validate that combination rather than
-# one only NGC can reproduce. The version guard below will not match on DLFW, so its cuDNN is
-# deliberately purged and reinstalled at this version.
+# The NGC PyTorch image usually ships an internal cuDNN build the public CUDA repo does not
+# carry, so pin the closest published version instead: every image, the NGC PyTorch based one
+# included, then ends up on a cuDNN anyone can install, and the tests validate that combination
+# rather than one only NGC can reproduce. The version guard below will not match on NGC PyTorch,
+# so its cuDNN is deliberately purged and reinstalled at this version.
 CUDNN_VER="9.25.1.1-1"
 NCCL_VER="2.30.7-1+cuda13.3"
 CUBLAS_VER="13.7.0.27-1"
@@ -19,10 +19,10 @@ CUBLAS_VER="13.7.0.27-1"
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"
 CUDA_RUNTIME="13.4.49-1"
-# Pin the cuda-compat that ships with CUDA_VER; the DLFW image reports a CUDA_DRIVER_VERSION
-# of its own that is typically never published as a package.
-CUDA_DRIVER_VERSION="615.71.09-1.el8" # rockylinux only
-CUDA_COMPAT_VER="615.71.09-1ubuntu1" # ubuntu only
+# Pin the cuda-compat that ships with CUDA_VER; the NGC PyTorch image reports a
+# CUDA_DRIVER_VERSION of its own that is typically never published as a package. The package
+# revision suffix is distro specific, so it is spelled out at each use site.
+CUDA_DRIVER_VERSION="615.71.09"
 
 for i in "$@"; do
     case $i in
@@ -82,17 +82,21 @@ install_ubuntu_requirements() {
         apt-get remove --purge -y --allow-change-held-packages libcublas* || true
         PKGS_TO_INSTALL+=(libcublas-${NVRTC_CUDA_VERSION}=${CUBLAS_VER} libcublas-dev-${NVRTC_CUDA_VERSION}=${CUBLAS_VER})
     fi
-    # Always reinstall cuda-nvrtc-dev: the DLFW base image ships NVRTC without
+    # Always reinstall cuda-nvrtc-dev: the NGC PyTorch base image ships NVRTC without
     # libnvrtc_static.a, so a version match there does not mean the static library the cpp
     # build needs (CUDA::nvrtc_static) is present. The public CUDA repo package has it.
     apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* || true
     PKGS_TO_INSTALL+=(cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER})
 
-    # Restore the cuda-compat providing libcuda.so.1, which the run-file reinstall purges and
-    # --toolkit does not bring back, and which the NIXL build needs. Test for the library, not
-    # the package: an image that kept its own CUDA also kept a cuda-compat of its own.
+    # Restore the cuda-compat providing libcuda.so.1, which the run-file reinstall in
+    # install_cuda_toolkit.sh purges and --toolkit does not bring back, and which the NIXL
+    # build needs. Unlike the libraries above this installs only when libcuda.so.1 is missing,
+    # and tests for the library rather than the package version: an image that already ships
+    # CUDA_VER skips that reinstall and keeps its own cuda-compat, which on NGC PyTorch pairs
+    # with an internal driver the public repo never published, so a version comparison would
+    # always miss and overwrite a working compat layer.
     if [ -z "$(find /usr/local -name libcuda.so.1 -print -quit)" ]; then
-        PKGS_TO_INSTALL+=(cuda-compat-${NVRTC_CUDA_VERSION}=${CUDA_COMPAT_VER})
+        PKGS_TO_INSTALL+=(cuda-compat-${NVRTC_CUDA_VERSION}=${CUDA_DRIVER_VERSION}-1ubuntu1)
     fi
 
     if [ ${#PKGS_TO_INSTALL[@]} -gt 0 ]; then
@@ -138,7 +142,7 @@ install_rockylinux_requirements() {
     for pkg in \
         "libnccl-${NCCL_VER}.${ARCH1}" \
         "libnccl-devel-${NCCL_VER}.${ARCH1}" \
-        "cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}" \
+        "cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}-1.el8.${ARCH1}" \
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
@@ -154,7 +158,7 @@ install_rockylinux_requirements() {
     dnf -y install \
         libnccl-${NCCL_VER}.${ARCH1}.rpm \
         libnccl-devel-${NCCL_VER}.${ARCH1}.rpm \
-        cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}.rpm \
+        cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}-1.el8.${ARCH1}.rpm \
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
