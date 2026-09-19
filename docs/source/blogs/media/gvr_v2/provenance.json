@@ -1,0 +1,46 @@
+{
+  "copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0",
+  "reference": {
+    "repository": "NVIDIA/TensorRT-LLM",
+    "implementation": "GVR V2 self-sampling",
+    "entry": "run_varlen",
+    "mode": "hint-free",
+    "pull_request": "https://github.com/NVIDIA/TensorRT-LLM/pull/19076",
+    "commit": "be1b9885e8df9bf070e8cb68459e24a7119afaa9"
+  },
+  "hardware": "NVIDIA B200 (SM100)",
+  "baseline_versions": {
+    "radix_cuda": "Production insertion/radix/split-work dispatcher",
+    "temporal_tiered": "GVR V1 (temporal hint), tiered implementation from public PR #16877"
+  },
+  "pairing": {
+    "radix_cuda": "cross-campaign",
+    "temporal_tiered": "cross-campaign, same (cell, batch), not an isolated algorithm ablation"
+  },
+  "published_files": {
+    "flash_timings.csv.gz": "0f1c4799296bea1db9a012fe9ddf90521918af3ce73e6b39ad25a6c05115dcc6",
+    "pro_timings.csv.gz": "bfd713272ccd50cab57d8f436d1d788e29d3ef6cc2014818104b2872f4476cbd",
+    "v32_timings.csv.gz": "59bccd05ba685d01ed1ebb34c9a0b15df02d1879f8c16bbaffa2a264f512fd8d",
+    "temporal_comparison.csv.gz": "2abdeb8eafa1366be5673c79dfdb938a02716431cf8745f18d3a2fc240a778ca"
+  },
+  "scope": "Per-case FP32 cold kernel means with PR #19076 as the GVR V2 reference. GVR V1 (temporal hint, PR #16877) and TensorRT-LLM radix CUDA observations are paired across benchmark runs by workload and batch. All three implementations cover the same 9,746 cases.",
+  "roofline_model": {
+    "theoretical_bandwidth_tb_s": 8.0,
+    "measured_bandwidth_tb_s": 6.912116,
+    "theoretical_compare_t_s": 37.22496,
+    "measured_compare_t_s": 37.04749,
+    "work_definition": "One abstract comparison per input score; W=B*N, Qmin=4*B*(N+K).",
+    "compare_calibration": "Study counts two semantic binary comparisons per FMNMX3 result.",
+    "scope": "Single-GPU read-dominated ceiling; actual Top-K instruction count and extra traffic are excluded."
+  },
+  "illustrative_figures": {
+    "temporal_overlap.svg": {
+      "sha256": "4b9081122fb8f4fa208f4e3c66acc76bfd0ee131fab14cd9ef424db5b28be63c",
+      "source": "Temporal Top-K overlap figure supplied by the article authors",
+      "conversion": "Standalone figure converted from PDF to SVG; plotted values, labels, vector axes, and embedded point clouds preserved.",
+      "scope": "SWE-bench-64K traces for DeepSeek-V3.2 and DeepSeek-V4 Pro; temporal-hint hit rates after index mapping (+1 for V3.2, unchanged compressed-bin indices for V4 Pro), distinct from kernel timing comparisons.",
+      "reproduction": "Imported figure asset; not generated from the bundled kernel-timing CSVs.",
+      "display": "Intrinsic width is 1200 CSS pixels for responsive full-column display; the original viewBox, aspect ratio, and plotted content are preserved."
+    }
+  }
+}
