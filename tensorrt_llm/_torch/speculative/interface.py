@@ -122,6 +122,12 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
+    # Only TRTLLM attention borrows the managed paged context pool. VANILLA
+    # and FA4 keep context KV in worker-owned buffers; a second cache would
+    # reserve unused pages and impose an unrelated scheduler admission limit.
+    if (spec_config.spec_dec_mode.is_dflash()
+            and spec_config.attention_backend in ("VANILLA", "FA4")):
+        return False
     # The embedded DSpark draft owns a dedicated rolling-window cache in
     # DSv4DSparkWorker and never reads the paged draft KV cache that attention
     # metadata manages. A standalone DSpark drafter runs on DSparkWorker
