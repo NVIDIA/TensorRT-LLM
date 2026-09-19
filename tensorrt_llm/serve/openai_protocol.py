@@ -912,11 +912,44 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+# Maximum total number of `enum` values across all properties of one tool
+# function's parameters schema. Mirrors the cap reference OpenAI-compatible
+# platforms enforce; unbounded enums also inflate the guided-decoding
+# grammar compiled for strict tool calls.
+TOOL_PARAM_MAX_ENUM_VALUES = 1000
+
+
+def _count_schema_enum_values(schema: Any) -> int:
+    """Recursively count `enum` entries in a JSON-schema fragment."""
+    count = 0
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "enum" and isinstance(value, list):
+                count += len(value)
+            else:
+                count += _count_schema_enum_values(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            count += _count_schema_enum_values(item)
+    return count
+
+
 class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
     strict: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def check_enum_value_cap(self):
+        if self.parameters is not None:
+            num_enum_values = _count_schema_enum_values(self.parameters)
+            if num_enum_values > TOOL_PARAM_MAX_ENUM_VALUES:
+                raise ValueError(
+                    f"tool function {self.name!r} declares {num_enum_values} "
+                    f"enum values across its parameters schema; the maximum "
+                    f"is {TOOL_PARAM_MAX_ENUM_VALUES}.")
+        return self
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
