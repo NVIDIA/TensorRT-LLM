@@ -37,16 +37,41 @@ set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(th_utils PUBLIC ${SHARED_TARGET} ${TORCH_LIBRARIES}
                                       ${CUBLAS_LIB} ${CURAND_LIB})
 
-# TODO This does not compile with internal cutlass MOE gemm
-add_library(
-  th_common SHARED
+function(add_th_common_family target)
+  add_library(${target} OBJECT ${ARGN})
+  set_property(TARGET ${target} PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_target_properties(${target} PROPERTIES CXX_STANDARD 20
+                                             CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(
+    ${target} PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                      ${SHARED_TARGET} pg_utils)
+endfunction()
+
+add_th_common_family(
+  th_common_attention
   mlaPreprocessOp.cpp
-  allgatherOp.cpp
-  allreduceOp.cpp
-  alltoallOp.cpp
-  asyncUlyssesOp.cpp
   attentionOp.cpp
-  causalConv1dOp.cpp
+  fmhaPackMaskOp.cpp
+  deepseekV4BlockTableOp.cpp
+  inverseRopeFp8QuantOp.cpp
+  kdaDecodeOp.cpp
+  attnResOp.cpp
+  fusedQKNormRopeOp.cpp
+  IndexerKCacheGatherOp.cpp
+  IndexerKCacheScatterOp.cpp
+  IndexerTopKOp.cpp
+  sparseKvCacheCompactOp.cpp
+  minimaxM3Fp8IndexerOp.cpp
+  minimaxM3SelectBlocksOp.cpp
+  mlaRopeInplaceOp.cpp
+  relativeAttentionBiasOp.cpp
+  dsv3RopeOp.cpp
+  convertReqIndexToGlobalOp.cpp
+  nvfp4MlaKvCacheGatherOp.cpp
+  trtllmGenQKVProcessOp.cpp)
+
+add_th_common_family(
+  th_common_gemm_quant
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
@@ -54,7 +79,6 @@ add_library(
   marlinNvfp4MM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
-  fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp8PerTensorScalingTrtllmGenGemm.cpp
   fp4Op.cpp
@@ -69,100 +93,133 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
-  deepseekV4BlockTableOp.cpp
-  inverseRopeFp8QuantOp.cpp
-  kdaDecodeOp.cpp
-  attnResOp.cpp
-  fusedQKNormRopeOp.cpp
-  fusedAdaptiveLayerNormOp.cpp
-  fusedDiTQKNormRopeOp.cpp
-  fusedDiTSplitQKNormRopeOp.cpp
-  fusedDiTSplitNormOp.cpp
-  ulyssesPostUnscatterOp.cpp
-  ulyssesPermuteScatterOp.cpp
-  fusedDiTGateResidNormShiftScaleOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
   rmsNormFp4Quant.cpp
-  fusedTopkSoftmax.cpp
   groupRmsNormOp.cpp
-  helixPostProcessOp.cpp
-  llama4MinLatency.cpp
-  logitsBitmaskOp.cpp
-  mambaConv1dOp.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
-  noAuxTcOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
-  IndexerKCacheGatherOp.cpp
-  IndexerKCacheScatterOp.cpp
-  IndexerTopKOp.cpp
-  sparseKvCacheCompactOp.cpp
-  minimaxM3Fp8IndexerOp.cpp
-  minimaxM3SelectBlocksOp.cpp
-  mlaRopeInplaceOp.cpp
-  ncclCommunicatorOp.cpp
-  allocateOutput.cpp
-  parallelDecodeKVCacheUpdateOp.cpp
-  reducescatterOp.cpp
-  relativeAttentionBiasOp.cpp
-  dsv3RouterGemmOp.cpp
-  localityDomainAllocator.cpp
-  mamba2MTPSSMCacheOp.cpp
-  selectiveScanOp.cpp
-  userbuffersFinalizeOp.cpp
-  userbuffersTensor.cpp
-  virtualMemoryAllocator.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
-  specDecOp.cpp
-  fusedSamplingOp.cpp
-  dynamicTreeOp.cpp
-  loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
-  tinygemm2.cpp
-  dsv3RopeOp.cpp
-  fusedGemmAllreduceOp.cpp
-  convertReqIndexToGlobalOp.cpp
-  nvfp4MlaKvCacheGatherOp.cpp
-  trtllmGenQKVProcessOp.cpp
-  inplaceSliceCopyOp.cpp
-  mhcOp.cpp
-  compressorOp.cpp)
+  tinygemm2.cpp)
+
+# TODO This does not compile with internal cutlass MOE gemm
+add_th_common_family(
+  th_common_moe
+  moe/cuteDslMoeUtilsOp.cpp
+  moe/marlinNvfp4MoeMM.cpp
+  fusedTopkSoftmax.cpp
+  llama4MinLatency.cpp
+  moe/moeOp.cpp
+  moe/moeUtilOp.cpp
+  moe/moeGateOp.cpp
+  moe/moeCommOp.cpp
+  moe/moeAlltoAllOp.cpp
+  moe/moeLoadBalanceOp.cpp
+  moe/moeAlignOp.cpp
+  moe/megaMoePrepareOp.cpp
+  moe/mxFp4BlockScaleMoe.cpp
+  moe/fp8BlockScaleMoe.cpp
+  moe/fp8PerTensorScaleMoe.cpp
+  moe/fp4BlockScaleMoe.cpp
+  noAuxTcOp.cpp
+  dsv3RouterGemmOp.cpp
+  moe/customMoeRoutingOp.cpp)
 
 # MoE torch ops live in moe/<backend|role>/; that directory adds them to
 # th_common with target_sources() so the list stays next to the files.
 add_subdirectory(moe)
+
+add_th_common_family(
+  th_common_distributed
+  allgatherOp.cpp
+  allreduceOp.cpp
+  alltoallOp.cpp
+  asyncUlyssesOp.cpp
+  ulyssesPostUnscatterOp.cpp
+  ulyssesPermuteScatterOp.cpp
+  helixPostProcessOp.cpp
+  ncclCommunicatorOp.cpp
+  allocateOutput.cpp
+  reducescatterOp.cpp
+  localityDomainAllocator.cpp
+  userbuffersFinalizeOp.cpp
+  userbuffersTensor.cpp
+  virtualMemoryAllocator.cpp
+  fusedGemmAllreduceOp.cpp)
+
+add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
+                     mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
+
+add_th_common_family(
+  th_common_visual_gen fusedAdaptiveLayerNormOp.cpp fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp fusedDiTSplitNormOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp)
+
+add_th_common_family(
+  th_common_decoding
+  logitsBitmaskOp.cpp
+  parallelDecodeKVCacheUpdateOp.cpp
+  specDecOp.cpp
+  fusedSamplingOp.cpp
+  dynamicTreeOp.cpp
+  loraOp.cpp
+  inplaceSliceCopyOp.cpp
+  mhcOp.cpp
+  compressorOp.cpp)
+
+add_library(
+  th_common SHARED
+  $<TARGET_OBJECTS:th_common_attention>
+  $<TARGET_OBJECTS:th_common_gemm_quant>
+  $<TARGET_OBJECTS:th_common_moe>
+  $<TARGET_OBJECTS:th_common_distributed>
+  $<TARGET_OBJECTS:th_common_sequence>
+  $<TARGET_OBJECTS:th_common_visual_gen>
+  $<TARGET_OBJECTS:th_common_decoding>)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
 
 if(BUILD_DEEP_GEMM)
+  target_compile_definitions(th_common_decoding
+                             PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
   target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
 endif()
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+  target_compile_definitions(th_common_gemm_quant
+                             PRIVATE "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
 endif()
 
 if(USING_OSS_CUTLASS_FP4_GEMM)
+  target_compile_definitions(th_common_gemm_quant
+                             PRIVATE USING_OSS_CUTLASS_FP4_GEMM)
   target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_FP4_GEMM)
 endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(th_common_moe PRIVATE USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(th_common_gemm_quant
+                             PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
   target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
 endif()
 
 if(ENABLE_MULTI_DEVICE)
+  target_include_directories(th_common_distributed
+                             PRIVATE ${MPI_C_INCLUDE_DIRS})
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
   target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
