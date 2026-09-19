@@ -137,6 +137,7 @@ class PeriodicJUnitXML:
         self._hang_lock = threading.RLock()
 
         self.completed_tests = 0
+        self._completed_unfinished_tests: set[str] = set()
         self.last_save_time = time.time()
         self.suite_start_time = time.time()
 
@@ -205,6 +206,25 @@ class PeriodicJUnitXML:
         self.logxml.node_reporters_ordered = []  # type: ignore
         self.logxml.global_properties = []
 
+    def pytest_runtest_logstart(self, nodeid: str, location) -> None:
+        """Record the test before fixtures run, including setup-time hangs."""
+        if not self.save_unfinished_test:
+            return
+        # A new attempt of the same nodeid must remain tracked until it finishes.
+        self._completed_unfinished_tests.discard(nodeid)
+        unfinished_test_path = self.unfinished_test_path or os.path.join(
+            os.path.dirname(self.xmlpath), "unfinished_test.txt")
+        try:
+            os.makedirs(os.path.dirname(unfinished_test_path), exist_ok=True)
+            # Close the file before setup: thread-mode timeouts use os._exit(),
+            # which cannot flush Python buffers or run reporting hooks.
+            with open(unfinished_test_path, "a", encoding="utf-8") as f:
+                f.write(nodeid + "\n")
+        except OSError as e:
+            self._log_warning(
+                f"Error writing unfinished test {nodeid} to {unfinished_test_path}: {e}"
+            )
+
     def pytest_runtest_logreport(self, report: TestReport):
         """Handle test reports and trigger periodic saving."""
         # The teardown report lands after every fixture finalizer, so the item is
@@ -216,44 +236,13 @@ class PeriodicJUnitXML:
         # Collect the report for later batch processing (fast)
         self.pending_reports.append(report)
 
-        output_dir = os.path.dirname(self.xmlpath)
-        unfinished_test_path = self.unfinished_test_path or os.path.join(
-            output_dir, "unfinished_test.txt")
-
-        # save unfinished test nodeid to output-dir/unfinished_test.txt
-        if self.save_unfinished_test and report.when == "setup":
-            try:
-                # Create the directory actually being written to, not output_dir --
-                # they differ when self.unfinished_test_path redirects elsewhere.
-                os.makedirs(os.path.dirname(unfinished_test_path),
-                            exist_ok=True)
-                with open(unfinished_test_path, "a", encoding="utf-8") as f:
-                    f.write(report.nodeid + "\n")
-            except Exception as e:
-                self._log_warning(
-                    f"Error writing unfinished test {report.nodeid} to {unfinished_test_path}: {e}"
-                )
-
         # Only increment counter and check for save on teardown phase
         if report.when == "teardown":
             self.completed_tests += 1
             current_time = time.time()
 
             if self.save_unfinished_test:
-                if os.path.exists(unfinished_test_path):
-                    try:
-                        with open(unfinished_test_path, "r+",
-                                  encoding="utf-8") as f:
-                            lines = f.readlines()
-                            f.seek(0)
-                            f.truncate()
-                            for line in lines:
-                                if line.strip() != report.nodeid:
-                                    f.write(line)
-                    except Exception as e:
-                        self._log_warning(
-                            f"Error clearing nodeid {report.nodeid} from {unfinished_test_path}: {e}"
-                        )
+                self._completed_unfinished_tests.add(report.nodeid)
 
             # Flush if batch threshold reached OR time interval elapsed
             should_flush_by_time = (current_time -
@@ -368,6 +357,7 @@ class PeriodicJUnitXML:
 
             # Atomic rename to final location
             os.replace(temp_file, output_file)
+            self._clear_saved_unfinished_tests()
 
             self._log_info(
                 f"{'Final report' if is_final else 'Periodic report'} generated with {numtests} tests: {output_file}"
@@ -382,6 +372,32 @@ class PeriodicJUnitXML:
                 except OSError:
                     pass
             raise
+
+    def _clear_saved_unfinished_tests(self) -> None:
+        """Clear completed records only after their XML has been published."""
+        if not self.save_unfinished_test or not self._completed_unfinished_tests:
+            return
+        unfinished_test_path = self.unfinished_test_path or os.path.join(
+            os.path.dirname(self.xmlpath), "unfinished_test.txt")
+        temp_path = unfinished_test_path + ".tmp"
+        try:
+            with open(unfinished_test_path, encoding="utf-8") as f:
+                lines = f.readlines()
+            # Preserve active tests if interrupted during setup/call/teardown.
+            # Atomic replacement avoids losing them if cleanup is interrupted.
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.writelines(line for line in lines if line.strip()
+                             not in self._completed_unfinished_tests)
+            os.replace(temp_path, unfinished_test_path)
+            self._completed_unfinished_tests.clear()
+        except OSError as e:
+            self._log_warning(
+                f"Error clearing saved tests from {unfinished_test_path}: {e}")
+            # Keep completed nodeids so the next successful save retries cleanup.
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     def _hang_traceback_path(self) -> str:
         """Path of the sidecar file that captures thread stacks on a hang."""
