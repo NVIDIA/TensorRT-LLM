@@ -1765,6 +1765,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "torch_compile_config.compile_only_piecewise_graphs"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "torch_compile_config.enable_fullgraph"
     },
     {
