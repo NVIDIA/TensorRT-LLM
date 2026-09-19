@@ -112,7 +112,7 @@ def test_ignores_safe_or_unrelated_run_calls(source: str) -> None:
     assert _missing_timeout_lines(source) == []
 
 
-def test_subprocess_run_calls_have_timeouts() -> None:
+def test_every_subprocess_run_call_in_test_code_must_set_timeout() -> None:
     """Every subprocess.run call in the test tree must have a timeout."""
     missing_timeouts: list[str] = []
 
