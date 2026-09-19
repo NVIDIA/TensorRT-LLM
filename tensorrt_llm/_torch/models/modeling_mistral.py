@@ -359,133 +359,26 @@ class MistralCommonImageProcessor:
         return processed
 
 
-class MistralHFInputProcessor(BaseMultimodalInputProcessor,
-                              BaseMultimodalDummyInputsBuilder):
-    """Input processor for Mistral VLM checkpoints in HuggingFace format."""
+class MistralPixtralEncoderContract:
+    """MM encoder item-scheduling contract for Pixtral-based Mistral VLMs.
 
-    def __init__(self,
-                 model_path: str,
-                 config: PretrainedConfig,
-                 tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True,
-                 **kwargs):
-        super().__init__(model_path=model_path,
-                         config=config,
-                         tokenizer=tokenizer,
-                         trust_remote_code=trust_remote_code,
-                         **kwargs)
-        self._config = config
-        self._dtype = self._config.torch_dtype
-        self._model_path = model_path
-        self._tokenizer = (tokenizer if tokenizer is not None else
-                           AutoTokenizer.from_pretrained(
-                               model_path,
-                               config=config,
-                               use_fast=True,
-                               trust_remote_code=True))
-        self._processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
-        logger.info(f"[mistral] HF processor={type(self._processor).__name__} "
-                    f"tokenizer={type(self._tokenizer).__name__}")
+    `Mistral3VLM` declares `supports_mm_encoder_item_scheduling` on the *model*
+    class, but the engine requires the contract from the input processor, which
+    `create_input_processor` picks from `checkpoint_format` alone. Both Mistral
+    frontends drive the same `PixtralVisionModel` + `Mistral3MultiModalProjector`,
+    so this geometry belongs to the checkpoint rather than to the preprocessing
+    frontend; sharing it keeps the capability and the requirement together.
 
-    @property
-    def config(self) -> PretrainedConfig:
-        return self._config
+    Mixed into processors supplying `config`/`processor`/`dtype`. The
+    mistral-native frontend serves every native checkpoint, including ones with
+    no vision encoder at all, so each entry point degrades to the base class's
+    neutral value when the config carries no `vision_config`.
+    """
 
-    @property
-    def tokenizer(self) -> AutoTokenizer:
-        return self._tokenizer
-
-    @property
-    def model_path(self) -> str:
-        return self._model_path
-
-    @property
-    def processor(self) -> AutoProcessor:
-        return self._processor
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._dtype
-
-    def get_mm_encoder_item_metadata(
-        self,
-        _prompt_token_ids: List[int],
-        multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
-        """Return Pixtral image items and physical ViT patch counts."""
-        image_data = multimodal_data.get("image")
-        if not isinstance(image_data, dict):
-            return None
-        image_sizes = image_data.get("image_sizes")
-        if image_sizes is None:
-            return None
-        patch, merge, _, _ = self._vision_geometry()
-        encoder_token_lengths = [
-            self._vit_tokens(width=int(width), height=int(height), patch=patch)
-            for height, width in image_sizes
-        ]
-        min_tokens_per_image = merge * merge
-        if any(token_length < min_tokens_per_image or token_length %
-               min_tokens_per_image for token_length in encoder_token_lengths):
-            raise ValueError(
-                "Processed Mistral image geometry must contain a nonempty "
-                f"multiple of {min_tokens_per_image} encoder tokens")
-        item_refs = [("image", item_idx)
-                     for item_idx in range(len(encoder_token_lengths))]
-        output_embedding_lengths = [
-            token_length // (merge * merge)
-            for token_length in encoder_token_lengths
-        ]
-        return MultimodalEncoderItemMetadata(
-            item_refs=item_refs,
-            encoder_token_lengths=encoder_token_lengths,
-            output_embedding_lengths=output_embedding_lengths)
-
-    @torch.inference_mode()
-    def call_with_text_prompt(
-        self, inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], ExtraProcessedInputs | None]:
-        images = inputs.get("multi_modal_data", {}).get("image")
-        do_rescale = getattr(self.processor.image_processor, "do_rescale",
-                             False)
-        if images is not None and isinstance(images[0], torch.Tensor):
-            # The default multimodal input loader will normalize images to [0, 1] when the requested
-            # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
-            do_rescale = False
-
-        prompt = inputs["prompt"]
-        processed = self.processor(text=prompt,
-                                   images=images,
-                                   do_rescale=do_rescale)
-        input_ids = processed.pop("input_ids").tolist()[0]
-        # Remaining in `processed`:
-        # * "attention_mask": [B, num_input_tokens]
-        # * "pixel_values": [B, C, H, W]
-        # * "image_sizes": [B, 2]
-        extra_processed_inputs = None
-        pixel_values = processed.get("pixel_values")
-        if pixel_values is not None:
-            # We have no use for the `attention_mask`.
-            processed.pop("attention_mask")
-            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
-            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
-            # reaching the model forward. Since its values are used to infer the amount of padding
-            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
-            # list here to avoid this.
-            processed["image_sizes"] = processed["image_sizes"].tolist()
-            # NOTE: `processed` is a dict-like object, but not actually a dict.
-            extra_processed_inputs = {
-                "multimodal_data": {
-                    "image": {
-                        **processed
-                    }
-                }
-            }
-
-        return input_ids, extra_processed_inputs
+    def _has_vision_encoder(self) -> bool:
+        """``MistralConfigLoader`` synthesizes ``vision_config`` only for vision
+        checkpoints, so its absence makes the geometry below meaningless."""
+        return getattr(self.config, "vision_config", None) is not None
 
     # ------------------------------------------------------------------
     # Deterministic dummy sizing for KV-cache encoder profiling.
@@ -559,11 +452,47 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             }
         }
 
+    def get_mm_encoder_item_metadata(
+        self,
+        _prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[MultimodalEncoderItemMetadata]:
+        """Return Pixtral image items and physical ViT patch counts."""
+        image_data = multimodal_data.get("image")
+        if not isinstance(image_data, dict):
+            return None
+        image_sizes = image_data.get("image_sizes")
+        if image_sizes is None:
+            return None
+        patch, merge, _, _ = self._vision_geometry()
+        encoder_token_lengths = [
+            self._vit_tokens(width=int(width), height=int(height), patch=patch)
+            for height, width in image_sizes
+        ]
+        min_tokens_per_image = merge * merge
+        if any(token_length < min_tokens_per_image or token_length %
+               min_tokens_per_image for token_length in encoder_token_lengths):
+            raise ValueError(
+                "Processed Mistral image geometry must contain a nonempty "
+                f"multiple of {min_tokens_per_image} encoder tokens")
+        item_refs = [("image", item_idx)
+                     for item_idx in range(len(encoder_token_lengths))]
+        output_embedding_lengths = [
+            token_length // (merge * merge)
+            for token_length in encoder_token_lengths
+        ]
+        return MultimodalEncoderItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=output_embedding_lengths)
+
     def get_mm_max_tokens_per_item(
         self,
         max_num_encoder_tokens: Optional[int] = None,
     ) -> Dict[str, int]:
         """Return the largest legal Pixtral image encoder item size."""
+        if not self._has_vision_encoder():
+            return {}
         patch, merge, _, max_size = self._vision_geometry()
         unit = patch * merge
         edge = max((max_size // unit) * unit, unit)
@@ -581,14 +510,18 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         return {"image": encoder_tokens}
 
     def get_max_mm_encoder_output_embeddings(
-            self, max_num_encoder_tokens: int) -> int:
+            self, max_num_encoder_tokens: int) -> Optional[int]:
         """Bound post-merger embeddings from one Pixtral encoder iteration."""
+        if not self._has_vision_encoder():
+            return None
         _, merge, _, _ = self._vision_geometry()
         return max_num_encoder_tokens // (merge * merge)
 
     def get_mm_encoder_attention_metadata_capacity(
             self, max_num_tokens: int) -> Optional[Dict[str, int]]:
         """Bound Pixtral contexts by the physical-token budget."""
+        if not self._has_vision_encoder():
+            return None
         _, merge, _, _ = self._vision_geometry()
         min_tokens_per_image = merge * merge
         return {"attention": max(1, max_num_tokens // min_tokens_per_image)}
@@ -603,6 +536,10 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         """Build processed Pixtral tensors for profiler-selected images."""
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
+        if not self._has_vision_encoder():
+            raise NotImplementedError(
+                "Checkpoint has no vision encoder; cannot build dummy "
+                "multimodal data")
         unsupported_modalities = set(mm_counts) - {"image"}
         if unsupported_modalities:
             raise ValueError("Pixtral cannot build dummy data for modalities "
@@ -629,6 +566,102 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             dtype=dtype,
         )
 
+
+class MistralHFInputProcessor(MistralPixtralEncoderContract,
+                              BaseMultimodalInputProcessor,
+                              BaseMultimodalDummyInputsBuilder):
+    """Input processor for Mistral VLM checkpoints in HuggingFace format."""
+
+    def __init__(self,
+                 model_path: str,
+                 config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
+        self._config = config
+        self._dtype = self._config.torch_dtype
+        self._model_path = model_path
+        self._tokenizer = (tokenizer if tokenizer is not None else
+                           AutoTokenizer.from_pretrained(
+                               model_path,
+                               config=config,
+                               use_fast=True,
+                               trust_remote_code=True))
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
+        logger.info(f"[mistral] HF processor={type(self._processor).__name__} "
+                    f"tokenizer={type(self._tokenizer).__name__}")
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    @torch.inference_mode()
+    def call_with_text_prompt(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], ExtraProcessedInputs | None]:
+        images = inputs.get("multi_modal_data", {}).get("image")
+        do_rescale = getattr(self.processor.image_processor, "do_rescale",
+                             False)
+        if images is not None and isinstance(images[0], torch.Tensor):
+            # The default multimodal input loader will normalize images to [0, 1] when the requested
+            # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
+            do_rescale = False
+
+        prompt = inputs["prompt"]
+        processed = self.processor(text=prompt,
+                                   images=images,
+                                   do_rescale=do_rescale)
+        input_ids = processed.pop("input_ids").tolist()[0]
+        # Remaining in `processed`:
+        # * "attention_mask": [B, num_input_tokens]
+        # * "pixel_values": [B, C, H, W]
+        # * "image_sizes": [B, 2]
+        extra_processed_inputs = None
+        pixel_values = processed.get("pixel_values")
+        if pixel_values is not None:
+            # We have no use for the `attention_mask`.
+            processed.pop("attention_mask")
+            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
+            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
+            # reaching the model forward. Since its values are used to infer the amount of padding
+            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
+            # list here to avoid this.
+            processed["image_sizes"] = processed["image_sizes"].tolist()
+            # NOTE: `processed` is a dict-like object, but not actually a dict.
+            extra_processed_inputs = {
+                "multimodal_data": {
+                    "image": {
+                        **processed
+                    }
+                }
+            }
+
+        return input_ids, extra_processed_inputs
+
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
         # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
@@ -653,9 +686,14 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         ])
 
 
-class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
+class MistralNativeInputProcessor(MistralPixtralEncoderContract,
+                                  BaseMultimodalInputProcessor,
                                   BaseMultimodalDummyInputsBuilder):
-    """Input processor for Mistral VLM checkpoints in mistral-native format."""
+    """Input processor for Mistral VLM checkpoints in mistral-native format.
+
+    Unlike the HF frontend, this one serves *every* mistral-native checkpoint
+    (text-only, MoE, mamba, audio and vision).
+    """
 
     def __init__(
         self,
