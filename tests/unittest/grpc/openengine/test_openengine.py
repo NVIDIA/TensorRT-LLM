@@ -12,32 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the OpenEngine gRPC adapter.
-
-The OpenEngine bindings resolve only from a custom index, so they are
-installed on the CPU-Generic stages that own this test (see the gateway
-install guard in jenkins/L0_Test.groovy). Tests that need the bindings are
-guarded with ``importorskip`` so the module still collects cleanly in an
-environment without them; the optional-dependency error path that every
-environment can exercise lives in ``tests/unittest/grpc/test_grpc_optional.py``.
-"""
+"""Unit tests for the OpenEngine gRPC adapter."""
 
 import asyncio
 from types import SimpleNamespace
 
 import pytest
 
-openengine_pb2_grpc = pytest.importorskip(
-    "openengine.v1.openengine_pb2_grpc",
-    reason='OpenEngine bindings not installed (pip install "tensorrt_llm[openengine]")',
-)
-server_pb2 = pytest.importorskip(
-    "openengine.v1.server_pb2",
-    reason='OpenEngine bindings not installed (pip install "tensorrt_llm[openengine]")',
+grpc = pytest.importorskip(  # noqa: E402
+    "grpc", reason='gRPC runtime not installed (pip install "tensorrt_llm[openengine]")'
 )
 
-import grpc  # noqa: E402
-
+from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc, server_pb2  # noqa: E402
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
@@ -93,6 +79,9 @@ def test_openengine_server_serves_the_control_contract() -> None:
             control = openengine_pb2_grpc.ControlStub(channel)
             info = await control.GetServerInfo(server_pb2.GetServerInfoRequest(), timeout=5)
             assert info.engine_name == "tensorrt_llm"
+            assert info.schema_revision == 1
+            assert info.minimum_client_revision == 1
+            assert info.schema_release == "768a93c7b44e40f28c692ad0b471a8f2"
         finally:
             await channel.close()
             await server.stop(grace=0)

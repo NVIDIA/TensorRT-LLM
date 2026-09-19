@@ -5090,17 +5090,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
             // Gateway adapters (SMG, OpenEngine) are opt-in extras excluded
-            // from requirements.txt, each declaring its pins in a dedicated
-            // requirements-<gateway>.txt so it is tested under the dependency
-            // set its real opt-in users receive. Both are installed on every
-            // stage: their pins co-resolve, so no stage-name guard is needed to
-            // keep them apart, and no stage silently loses a gateway's coverage
-            // to an `importorskip` at collection.
-            //
-            // OpenEngine's bindings resolve only from a custom index
-            // (--extra-index-url https://buf.build/gen/python), but that flag is
-            // scoped to this one pip invocation and does not affect how any
-            // other package resolves.
+            // from requirements.txt. OpenEngine's private bindings are already
+            // in the wheel/source artifact, so its requirements file contains
+            // only the optional gRPC runtime. Install both runtime sets on every
+            // stage and verify that their dependency constraints co-resolve.
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
@@ -5123,7 +5116,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
+                // Resolve the optional dependency sets through the installed
+                // artifact so wheel metadata participates in this check.
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install 'tensorrt_llm[grpc-smg,openengine]'")
             }
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 check")
             if (stageName.contains("-ModelExpress-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
                 // ModelExpress imports nixl._api, while requirements-dev.txt
