@@ -801,6 +801,12 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
 
+    # Required MIME type prefix for `data:` URIs handled by this modality
+    # (e.g. `"image/"`). A data URI whose declared media type falls outside
+    # this prefix is rejected rather than decoded. URIs that omit the media
+    # type are accepted for backward compatibility. `None` disables the check.
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = None
+
     @classmethod
     def set_executor(cls, executor: Executor) -> None:
         """Publish a shared executor for blocking decode work.
@@ -874,6 +880,12 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             encoding = parts[1] if len(parts) > 1 else ""
             if encoding != "base64":
                 raise NotImplementedError("Only base64 data URLs are supported for now.")
+            prefix = self._data_uri_mime_prefix
+            if prefix and media_type and not media_type.startswith(prefix):
+                raise ValueError(
+                    f"data URI declares media type {media_type!r}, which does not "
+                    f"match the expected {prefix}* type for this content part"
+                )
             return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
             return await self._run_in_executor(self.load_file, url)
@@ -891,6 +903,8 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
+
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "image/"
 
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
         if format not in _SUPPORTED_IMAGE_FORMATS:
@@ -923,6 +937,8 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
     """I/O for the audio modality."""
 
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
+
     def __init__(self, **kwargs) -> None:
         # AudioMediaIO has no configurable parameters. An explicit __init__
         # is needed so that BaseMediaIO.create() does not crash when kwargs
@@ -950,6 +966,8 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
     """I/O for the video modality; customizes merge for `fps`/`num_frames` coupling."""
+
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
 
     def __init__(
         self,
