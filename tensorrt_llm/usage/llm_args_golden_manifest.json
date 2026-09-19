@@ -1060,6 +1060,11 @@
       "path": "peft_cache_config.optimal_adapter_size"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "per_request_spec_decode_stats"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "perf_metrics_max_requests"

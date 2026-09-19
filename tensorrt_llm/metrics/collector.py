@@ -20,6 +20,14 @@ from typing import Dict, List, Optional, Union
 
 from .enums import MetricNames
 
+# Upper bound on distinct ``token_position`` label values for the per-position
+# speculative-decoding counters. Each position is one Prometheus time series per
+# model, so this caps label cardinality no matter how deep a request drafts.
+# This bound used to be implicit in the per-request arrays' fixed length; those
+# now grow with max_draft_len so per-request accuracy is not truncated, which
+# makes the metrics-side limit its own explicit concern.
+MAX_SPEC_DECODE_POSITION_LABELS = 16
+
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
 class MetricsCollector:
@@ -696,7 +704,8 @@ class MetricsCollector:
                     if per_pos_drafted[i] > 0:
                         last_nonzero = i
                         break
-                for pos in range(last_nonzero + 1):
+                for pos in range(
+                        min(last_nonzero + 1, MAX_SPEC_DECODE_POSITION_LABELS)):
                     labels_with_pos = {
                         **self.labels, self.labelname_token_pos: pos
                     }
