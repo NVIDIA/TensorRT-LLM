@@ -4843,7 +4843,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"Missing V2 KV cache for request {req.py_request_id}")
                 caches.append(kv_cache)
             host_view = self._host_state_indices[:n].numpy()
-            get_many(caches, self.ssm_layer_group_id, host_view)
+            try:
+                get_many(caches, self.ssm_layer_group_id, host_view)
+            except TypeError:
+                # Not native KV cache objects (test doubles / Python core):
+                # scalar path.
+                for i, kv_cache in enumerate(caches):
+                    host_view[i] = kv_cache.get_ssm_block_base_index(
+                        self.ssm_layer_group_id)
             bad = int((host_view < 0).sum())
             if bad:
                 for req, base_index in zip(requests, host_view.tolist()):

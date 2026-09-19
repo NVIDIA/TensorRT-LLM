@@ -1394,12 +1394,13 @@ class TestNoBatching(TestKVCacheManagerV2):
 
 
 class TestLivingKvCacheGuard(TestKVCacheManagerV2):
-    """Guard against clearing/freeing the reuse state while KV caches are still open.
+    """Living-cache handling of the two reuse-state entry points.
 
-    `clear_reusable_blocks()` detaches the whole radix tree and `shutdown()` frees the
-    storage the pages live in. A request that is still open keeps committing into the
-    detached subtree, which silently discards work on the Python backend and segfaults on
-    the C++ one, so both entry points must reject the call instead.
+    `shutdown()` frees the storage the pages live in, so it must reject the call while a
+    KV cache is still open. `clear_reusable_blocks()` (reset_prefix_cache after a weight
+    refit, with requests in flight) instead keeps every open cache: the cache stays
+    active on its pages, stops committing (VIRTUAL_STOP), and only the reuse tree is
+    dropped -- the V1 manager's semantics.
     """
 
     # The two backends raise different types: the Python backend raises its own
@@ -1433,25 +1434,26 @@ class TestLivingKvCacheGuard(TestKVCacheManagerV2):
             ReuseScope(lora_id=None), [self.next_token() for _ in range(64)]
         )
 
-    def test_clear_reusable_blocks_rejects_open_kv_cache(self) -> None:
+    def test_clear_reusable_blocks_keeps_open_kv_cache_and_clears_tree(self) -> None:
         self.prepare(32 << 20, 32 << 20, 1 << 30, 4, 128, 1)
         prompt = self._seed_reusable_prompt()
         kv_cache = self._open_cache()
         try:
-            with self.assertRaises(self.GuardError) as ctx:
-                self.manager.clear_reusable_blocks()
-            # The message must name the API the caller actually invoked, and report how
-            # many sequences are still open.
-            self.assertIn("clear_reusable_blocks()", str(ctx.exception))
-            self.assertIn("1 KV cache(s) still open", str(ctx.exception))
-            # The rejected call must be a no-op: the check runs before the tree is
-            # touched, so every block is still reusable.
-            self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+            # Allowed with the cache open: the tree is dropped, the cache stays active.
+            self.manager.clear_reusable_blocks()
+            self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 0)
+            self.assertNotEqual(kv_cache.status, _KVCache.Status.CLOSED)
+            # The open cache must not re-register its pre-reset blocks: committing
+            # after the clear is a no-op for the tree.
+            stream_holder = CachedCudaStream()
+            kv_cache.resume(cast(CudaStream, stream_holder.handle))
+            kv_cache.capacity = 64
+            kv_cache.commit(prompt[:32])
+            self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 0)
         finally:
             kv_cache.close()
 
-        # ...and once permitted it really does clear, which is what stops the assertion
-        # above from passing vacuously.
+        # A second clear with everything closed is still fine (idempotent).
         self.manager.clear_reusable_blocks()
         self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 0)
 
@@ -1479,7 +1481,7 @@ class TestLivingKvCacheGuard(TestKVCacheManagerV2):
         del self.manager
 
     def test_guard_counts_only_open_caches(self) -> None:
-        """The guard counts sequences still open, not objects still referenced."""
+        """The shutdown() guard counts sequences still open, not objects still referenced."""
         self.prepare(32 << 20, 32 << 20, 1 << 30, 4, 128, 1)
         caches = [
             self.manager.create_kv_cache(
@@ -1489,12 +1491,12 @@ class TestLivingKvCacheGuard(TestKVCacheManagerV2):
         ]
         try:
             with self.assertRaises(self.GuardError) as ctx:
-                self.manager.clear_reusable_blocks()
+                self.manager.shutdown()
             self.assertIn("3 KV cache(s) still open", str(ctx.exception))
 
             caches[0].close()
             with self.assertRaises(self.GuardError) as ctx:
-                self.manager.clear_reusable_blocks()
+                self.manager.shutdown()
             self.assertIn("2 KV cache(s) still open", str(ctx.exception))
         finally:
             # Close every cache, not just caches[1:]: if an assertion above fails before
@@ -1505,7 +1507,8 @@ class TestLivingKvCacheGuard(TestKVCacheManagerV2):
 
         # `caches` still holds all three references, so a passing call here proves the
         # guard tracks close() rather than object liveness.
-        self.manager.clear_reusable_blocks()
+        self.manager.shutdown()
+        del self.manager
 
 
 class TestBatching(TestKVCacheManagerV2):
