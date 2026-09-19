@@ -3669,7 +3669,9 @@ class PyExecutor:
         handling path. One terminal rank prevents the global benchmark fill
         gate from opening. ``_benchmark_fill_phase_active`` is rank-local, so
         it is voted rather than read: a rank that has cleared it must still
-        join the gather its peers may already be inside.
+        join the gather its peers may already be inside. The terminal vote is
+        counted only from ranks that are still filling, so a rank that has
+        left the fill phase cannot fail-fast a peer that is still in it.
 
         Args:
             scheduler_fitting_disagg_gen_init_requests: Generation INIT
@@ -3703,7 +3705,8 @@ class PyExecutor:
         if not any(status[0] for status in all_rank_status):
             return False
         all_ranks_fetched = all(status[1] for status in all_rank_status)
-        any_rank_terminal_no_fit = any(status[2] for status in all_rank_status)
+        any_rank_terminal_no_fit = any(
+            status[2] for status in all_rank_status if status[0])
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
