@@ -291,6 +291,135 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
         return merged
 
 
+# Symbolic dim names allowed in EncodeExtraInputSpec.shape; a spec uses exactly
+# one. "num_tokens" resolves to the padded token bucket, "batch_size" to the
+# padded request count (per-request features that ignore sequence length).
+_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS: Tuple[str,
+                                         ...] = ("num_tokens", "batch_size")
+
+# Names that may not be declared as extra model inputs: input_ids, position_ids,
+# seq_lens and attn_metadata are built or consumed by the encode-only path
+# itself, while multi_item_part_lens and return_context_logits are stripped from
+# model_kwargs by LLM.encode() and so could never satisfy a spec.
+_ENCODE_EXTRA_INPUT_RESERVED_NAMES: Set[str] = {
+    "input_ids",
+    "position_ids",
+    "seq_lens",
+    "multi_item_part_lens",
+    "attn_metadata",
+    "return_context_logits",
+}
+
+
+class EncodeExtraInputSpec(StrictBaseModel):
+    """Declares an extra encoder-forward tensor kwarg for CUDA graph capture.
+
+    One spec is required for every tensor kwarg passed to
+    `LLM.encode(..., **model_kwargs)` (e.g. `token_type_ids` for BERT). The
+    runner backs each with a static buffer sized at the bucket maximum, and
+    warmup captures every bucket with a zero-filled stand-in so the graph sees
+    the full forward signature before the first real call.
+
+    Only tensors can be declared: a non-tensor kwarg cannot be captured and
+    instead forces that `encode()` call onto the eager path. Device is not part
+    of the spec -- host or device tensors are both accepted.
+    """
+
+    name: str = Field(
+        description="Kwarg name as it appears in the encoder forward() "
+        "signature (e.g. \"token_type_ids\").")
+
+    shape: Tuple[Union[Literal["num_tokens", "batch_size"], PositiveInt],
+                 ...] = Field(
+                     description="Tensor shape. Use exactly one symbolic dim "
+                     "from {\"num_tokens\", \"batch_size\"}: \"num_tokens\" "
+                     "scales with the packed token bucket (e.g. "
+                     "token_type_ids), \"batch_size\" scales with the request "
+                     "bucket (e.g. per-request features that are independent "
+                     "of sequence length). Remaining dims must be positive "
+                     "integer literals (e.g. hidden_size).")
+
+    dtype: str = Field(
+        description="Tensor dtype string accepted by tensorrt_llm "
+        "(e.g. \"int32\", \"float32\", \"bfloat16\"). See "
+        "`tensorrt_llm._utils._str_to_torch_dtype_dict` for the full list.")
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        if not value or not value.isidentifier():
+            raise ValueError(
+                f"EncodeExtraInputSpec.name must be a non-empty Python "
+                f"identifier, got {value!r}")
+        if value in _ENCODE_EXTRA_INPUT_RESERVED_NAMES:
+            raise ValueError(
+                f"EncodeExtraInputSpec.name {value!r} is reserved by the "
+                f"encode-only path. Reserved names: "
+                f"{sorted(_ENCODE_EXTRA_INPUT_RESERVED_NAMES)}")
+        return value
+
+    @field_validator("shape")
+    @classmethod
+    def _validate_shape(
+            cls, value: Tuple[Union[str, int],
+                              ...]) -> Tuple[Union[str, int], ...]:
+        if not value:
+            raise ValueError(
+                "EncodeExtraInputSpec.shape must contain at least one "
+                "dimension")
+        symbolic_count = sum(
+            1 for d in value
+            if isinstance(d, str) and d in _ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS)
+        if symbolic_count != 1:
+            raise ValueError(
+                f"EncodeExtraInputSpec.shape must contain exactly one "
+                f"symbolic dim from {_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS} "
+                f"(a tensor may use \"num_tokens\" OR \"batch_size\", never "
+                f"both), got shape={value} with {symbolic_count} symbolic dims")
+        return value
+
+    @field_validator("dtype")
+    @classmethod
+    def _validate_dtype(cls, value: str) -> str:
+        if value not in _str_to_torch_dtype_dict:
+            raise ValueError(
+                f"EncodeExtraInputSpec.dtype {value!r} is not supported. "
+                f"Supported dtypes: {sorted(_str_to_torch_dtype_dict)}")
+        return value
+
+    def resolve_shape(self, num_tokens: int,
+                      batch_size: int) -> Tuple[int, ...]:
+        """Substitute the symbolic dim with the matching size, leaving literals alone.
+
+        Each spec uses exactly one symbolic dim (validated). The caller passes
+        both candidate sizes; only the one this spec actually uses is consumed.
+        """
+        resolved: List[int] = []
+        for d in self.shape:
+            if d == "num_tokens":
+                resolved.append(num_tokens)
+            elif d == "batch_size":
+                resolved.append(batch_size)
+            else:
+                resolved.append(int(d))
+        return tuple(resolved)
+
+    def symbolic_dim(self) -> Tuple[str, int]:
+        """Return ``(name, axis)`` of the spec's single symbolic dim.
+
+        The shape validator guarantees exactly one symbolic dim is present.
+        """
+        for axis, d in enumerate(self.shape):
+            if isinstance(d, str) and d in _ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS:
+                return d, axis
+        # Unreachable: validator enforces exactly-one occurrence.
+        raise ValueError(
+            f"EncodeExtraInputSpec.shape={self.shape} has no symbolic dim")
+
+    def torch_dtype(self) -> torch.dtype:
+        return _str_to_torch_dtype_dict[self.dtype]
+
+
 class EncodeCudaGraphConfig(BaseCudaGraphConfig):
     """CUDA graph configuration for encode-only requests."""
 
@@ -332,6 +461,19 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         "`seq_lens` is generated from this value. Ignored by a fixed-shape "
         "feature encoder.")
 
+    extra_model_inputs: List[EncodeExtraInputSpec] = Field(
+        default_factory=list,
+        description=
+        "Tensor kwargs (beyond input_ids / position_ids) that LLM.encode() "
+        "will pass through to the encoder forward(). Each spec is "
+        "pre-allocated as a static buffer sized along its symbolic dim at "
+        "the bucket maximum (`num_tokens` → `max(num_tokens)`, "
+        "`batch_size` → `max(batch_sizes)`; pre-capture synthesizes "
+        "zero-filled stand-ins so every bucket captures with the correct "
+        "forward signature. Required when calling encode() with "
+        "model_kwargs while encoder CUDA graphs are enabled. The tensors "
+        "themselves may be passed on the host or on the device.")
+
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
         # Encoder fields — only generate defaults when the user opted in by
@@ -370,6 +512,15 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         elif self.max_seq_len > 0:
             self.seq_lens = self._generate_cuda_graph_seq_lens(
                 self.max_seq_len, self.enable_padding)
+
+        if self.extra_model_inputs:
+            seen_names: Set[str] = set()
+            for spec in self.extra_model_inputs:
+                if spec.name in seen_names:
+                    raise ValueError(
+                        f"EncodeCudaGraphConfig.extra_model_inputs contains "
+                        f"duplicate name {spec.name!r}")
+                seen_names.add(spec.name)
 
         return self
 
