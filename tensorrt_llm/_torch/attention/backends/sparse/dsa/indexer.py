@@ -81,6 +81,24 @@ _DSL_FP4_USE_DYN = _DSL_FP4_DYN_SCHED == "1" or (
     _DSL_FP4_DYN_SCHED == "auto" and _DSL_FP4_DYN_DEFAULT_ON
 )
 
+_fp4_scorer_eager_fn = None
+
+
+def _fp4_scorer_eager():
+    """Body of torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits, called
+    directly outside torch.compile / export tracing (same pattern as the
+    self-sampling top-k engine): saves the torch.library dispatch on the
+    eager decode path. Lazily imported to keep the custom-op package out of
+    this module's import graph."""
+    global _fp4_scorer_eager_fn
+    if _fp4_scorer_eager_fn is None:
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            cute_dsl_fp4_paged_mqa_logits_eager,
+        )
+
+        _fp4_scorer_eager_fn = cute_dsl_fp4_paged_mqa_logits_eager
+    return _fp4_scorer_eager_fn
+
 
 def _pick_dsl_expand(
     next_n: int,
@@ -1878,7 +1896,12 @@ class Indexer(nn.Module):
 
                     if _DSL_FP4_USE_DYN and getattr(metadata, "dsl_dyn_state", None) is not None:
                         gvr_emit_kwargs["dyn_state"] = metadata.dsl_dyn_state
-                    logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+                    scorer = (
+                        torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits
+                        if torch.compiler.is_compiling()
+                        else _fp4_scorer_eager()
+                    )
+                    logits_decode = scorer(
                         dsl_q,
                         decode_q_scale,
                         k_cache,

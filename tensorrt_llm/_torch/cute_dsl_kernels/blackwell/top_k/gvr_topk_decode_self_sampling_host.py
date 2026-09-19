@@ -1615,7 +1615,7 @@ def run_varlen(
     # out of bounds).
     if not (logits.is_cuda and indices.is_cuda):
         raise RuntimeError("all tensors must be CUDA")
-    if logits.dtype is not _F32 or indices.dtype is not _I32:
+    if indices.dtype is not _I32:
         raise RuntimeError("logits must be float32; indices must be int32")
     if len(indices.shape) != 2 or indices.shape[0] != num_rows:
         raise RuntimeError(
@@ -1671,8 +1671,14 @@ def run_varlen(
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
     profile = _device_profile_key(d)
-    skip = block_max is not None
-    if skip:
+    if block_max is None:
+        # dense engine: shape + device-profile key, dead block-max ABI slot
+        key = (num_rows, npad, k, n_env, nn, cr, profile)
+        bm = _DUMMY_BMAX.get(d)
+        if bm is None:
+            bm = _dummy_bmax(d, logits.device)
+        skip_en = 0
+    else:
         if not (block_max.is_cuda and block_max.dtype is _F32 and block_max.is_contiguous()):
             raise RuntimeError("block_max must be a contiguous CUDA float32 tensor")
         if len(block_max.shape) != 2 or block_max.shape[0] < num_rows:
@@ -1685,7 +1691,10 @@ def run_varlen(
             )
         if block_max.data_ptr() & 15:
             raise RuntimeError("block_max base must be 16-byte aligned")
-    key = (num_rows, npad, k, n_env, nn, cr, profile) + (("skip",) if skip else ())
+        # the skipping variant is a distinct engine and gets a tagged key
+        key = (num_rows, npad, k, n_env, nn, cr, profile, "skip")
+        bm = block_max
+        skip_en = 1
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -1694,10 +1703,8 @@ def run_varlen(
             )
         num_sms, sm_version = _unpack_device_profile(profile)
         lc = _varlen_launcher(
-            num_rows, npad, k, n_env, nn, cr, num_sms, sm_version, block_skip=skip
+            num_rows, npad, k, n_env, nn, cr, num_sms, sm_version, block_skip=skip_en == 1
         )
-    bm = block_max if skip else _dummy_bmax(d, logits.device)
-    skip_en = 1 if skip else 0
     idx = indices
     if idx.shape[1] != k:
         idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
