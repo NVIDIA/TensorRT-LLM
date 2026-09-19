@@ -14,6 +14,7 @@ import contextlib
 import os
 import sys
 import unittest
+from collections import OrderedDict
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -22,15 +23,23 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import (
+    PyTorchModelEngine,
+    _ContextOnlyCompiledModel,
+)
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.speculative.utils import update_draft_len
+from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
@@ -39,6 +48,192 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local_contexts", [0, 1])
+def test_context_only_compile_uses_all_rank_prefill_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    local_contexts: int,
+) -> None:
+    """Route using the global prefill decision, regardless of local contexts."""
+    eager = torch.nn.Linear(4, 4)
+    compiled = torch.nn.Module()
+    compiled.shared = eager
+    expected = torch.ones((2, 4))
+    eager.forward = Mock(return_value=expected)
+    compiled.forward = Mock(return_value=expected)
+    router = _ContextOnlyCompiledModel(eager, compiled)
+    assert router.weight is eager.weight
+    assert list(router.parameters()) == list(eager.parameters())
+    # Local decode-only ranks participate when another attention-DP rank
+    # prefills; an over-ceiling local context batch uses eager instead.
+    metadata = SimpleNamespace(num_contexts=local_contexts)
+    for eligible in (True, False):
+        monkeypatch.setattr(
+            model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+        )
+        assert router(expected, attn_metadata=metadata) is expected
+        selected = compiled if eligible else eager
+        selected.forward.assert_called_once_with(expected, attn_metadata=metadata)
+    assert compiled.forward.call_count == eager.forward.call_count == 1
+
+
+@pytest.mark.cpu_only
+def test_context_only_compile_preserves_partial_weight_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reload selected weights by original names into both model entry points."""
+    import tensorrt_llm._torch.models.modeling_utils as modeling_utils
+
+    eager = torch.nn.Sequential(OrderedDict(layers=torch.nn.Sequential(torch.nn.Linear(4, 4))))
+    compiled = torch.compile(eager, backend="eager")
+    model = DecoderModelForCausalLM.__new__(DecoderModelForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(tie_word_embeddings=False)
+    model.model = _ContextOnlyCompiledModel(eager, compiled)
+    mapper = HfWeightMapper()
+    mapper._model = model
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.weight_mapper = mapper
+    monkeypatch.setenv("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
+    monkeypatch.setattr(modeling_utils, "local_mpi_rank", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    weight = eager.layers[0].weight
+    old_bias = eager.layers[0].bias.detach().clone()
+    replacement = torch.full_like(weight, 3)
+    for remove_duplicate in (False, True):
+        names = dict(model.named_modules(remove_duplicate=remove_duplicate))
+        assert names["model.layers.0"] is eager.layers[0]
+        assert not any("eager_model" in name or "compiled_model" in name for name in names)
+    loader.reload(model, {"model.layers.0.weight": replacement}, allow_partial_loading=True)
+
+    assert eager.layers[0].weight is weight
+    assert compiled.layers[0].weight is weight
+    torch.testing.assert_close(weight, replacement)
+    torch.testing.assert_close(eager.layers[0].bias, old_bias)
+    inputs = torch.ones(2, 4)
+    for eligible in (False, True):
+        monkeypatch.setattr(
+            model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+        )
+        torch.testing.assert_close(model.model(inputs), inputs @ replacement.t() + old_bias)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("eligible", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_context_only_compile_scopes_whole_model_forward(
+    monkeypatch: pytest.MonkeyPatch,
+    eligible: bool,
+    raises: bool,
+) -> None:
+    """Keep compile state active through model epilogues and restore it on exit."""
+    observed = []
+
+    def forward(**kwargs: object) -> str:
+        """Record compile state as a stand-in for a model-specific epilogue."""
+        observed.append(is_torch_compiling())
+        # This represents work after the transformer, such as Eagle3 drafting.
+        if raises:
+            raise RuntimeError("epilogue failure")
+        observed.append(is_torch_compiling())
+        return "done"
+
+    engine = SimpleNamespace(
+        model=SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward),
+        _torch_compile_backend=None,
+        _torch_compile_context_only=True,
+        _eager_workspace_reclaimer=None,
+        is_warmup=False,
+    )
+    monkeypatch.setattr(model_engine_module, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(
+        model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+    )
+    monkeypatch.setattr(model_engine_module, "is_trace_enabled", lambda name: False)
+    with torch_compiling(True):
+        if raises:
+            with pytest.raises(RuntimeError, match="epilogue failure"):
+                PyTorchModelEngine.model_forward(engine, attn_metadata=Mock())
+        else:
+            assert PyTorchModelEngine.model_forward(engine, attn_metadata=Mock()) == "done"
+        assert is_torch_compiling()
+    assert observed == [eligible] * (1 if raises else 2)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("context_only", [False, True])
+@pytest.mark.parametrize("backend", [None, "auto", "flashinfer"])
+def test_compiled_mxfp8_warmup_backend_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    context_only: bool,
+    backend: str | None,
+) -> None:
+    """PCG retains eager decode tuning; all-batch compile settles auto on native."""
+    import tensorrt_llm._torch.modules.linear as linear_module
+
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    if backend is not None:
+        monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", backend)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", Mock(), raising=False)
+    flashinfer_tune = Mock(return_value=contextlib.nullcontext())
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
+    method = MXFP8LinearMethod()
+    engine = SimpleNamespace(
+        llm_args=SimpleNamespace(enable_autotuner=True),
+        _torch_compile_enabled=True,
+        _torch_compile_context_only=context_only,
+        cuda_graph_runner=SimpleNamespace(enabled=True),
+        model=SimpleNamespace(
+            modules=lambda: [
+                SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
+                SimpleNamespace(quant_method=method),
+            ]
+        ),
+        mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+        dist=object(),
+        kv_cache_manager_key="kv_cache",
+        max_num_tokens=16,
+        batch_size=16,
+        max_seq_len=2,
+        original_max_draft_len=0,
+        max_total_draft_tokens=0,
+        is_draft_model=False,
+        guided_decoder=None,
+        no_cuda_graph=lambda: contextlib.nullcontext(),
+        _create_warmup_request=Mock(return_value=object()),
+        _release_batch_context=lambda *args: contextlib.nullcontext(object()),
+        _should_run_warmup_batch=Mock(return_value=True),
+        _release_megamoe_profiling_scratch=Mock(),
+        forward=Mock(),
+    )
+    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    resources = SimpleNamespace(
+        get_resource_manager=lambda key: cache if key == "kv_cache" else None
+    )
+    tuner = Mock(profiling_cache={})
+    monkeypatch.setattr(model_engine_module.AutoTuner, "get", lambda: tuner)
+    monkeypatch.setattr(model_engine_module, "autotune", lambda **kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(MXFP8GemmRunner, "sync_all_tactic_caches", Mock())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_engine_module, "clear_memory_buffers", lambda: None)
+
+    PyTorchModelEngine._run_autotuner_warmup(engine, resources)
+
+    flashinfer_expected = context_only or backend == "flashinfer"
+    assert method.backend == (
+        "flashinfer" if backend == "flashinfer" else "auto" if context_only else "trtllm"
+    )
+    assert method._native_autotuned
+    assert method._flashinfer_autotuned == flashinfer_expected
+    assert flashinfer_tune.call_count == int(flashinfer_expected)
+    assert engine.forward.call_count == (4 if flashinfer_expected else 2)
 
 
 @pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
@@ -424,6 +619,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
+                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -485,6 +681,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
+                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -598,6 +795,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
+                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -696,6 +894,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
+                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -750,6 +949,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(engine.forward.call_count, 1)
 
     def test_native_mxfp8_respects_disabled_global_autotuner(self):
+        """Avoid native MXFP8 warmup when the global autotuner is disabled."""
         with (
             patch(
                 "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",
@@ -762,6 +962,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=False),
+                _torch_compile_enabled=False,
                 model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
             )
 

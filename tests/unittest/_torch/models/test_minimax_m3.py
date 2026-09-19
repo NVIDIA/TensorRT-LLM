@@ -483,6 +483,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
         qkv_proj=lambda hidden_states: packed,
+        attn=object(),  # Compatibility path, without the captured FP8 producer.
         register_to_config=True,
         num_heads=1,
         head_dim=3,
@@ -518,43 +519,371 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
 
 
 @pytest.mark.cpu_only
-def test_msa_attention_core_routes_compact_q_to_attention_dispatcher() -> None:
+def test_piecewise_captured_producer_preserves_symbolic_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retain an unbacked symbolic token count in both fake query outputs."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    layer = SimpleNamespace(q_size=1024, index_q_size=128)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (None, layer),
+    )
+    with FakeTensorMode(shape_env=ShapeEnv()) as mode:
+        num_tokens = mode.shape_env.create_unbacked_symint()
+        hidden = torch.empty((num_tokens, 512), dtype=torch.bfloat16)
+        positions = torch.empty((1, num_tokens), dtype=torch.int32)
+        kv_cache = torch.empty((2, 2, 1, 128, 128), dtype=torch.float8_e4m3fn)
+        index_cache = torch.empty((2, 1, 128, 128), dtype=torch.float8_e4m3fn)
+        slots = torch.empty((4096,), dtype=torch.int32)
+        q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+            hidden, positions, kv_cache, index_cache, slots, "3"
+        )
+    for output, width in ((q, 1024), (idx_q, 128)):
+        assert output.shape[0].node.expr == num_tokens.node.expr
+        assert output.shape[1] == width
+        assert output.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.cpu_only
+def test_piecewise_captures_horizontal_producer_before_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run the captured producer before eager sparse attention consumes caches."""
+    from unittest.mock import Mock
+
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    packed = torch.empty((4, 7), dtype=torch.bfloat16)
+    q = torch.empty((4, 3), dtype=torch.float8_e4m3fn)
+    idx_q = torch.empty((4, 1), dtype=torch.float8_e4m3fn)
+    output = torch.empty((4, 3), dtype=torch.bfloat16)
+    kv_cache = torch.empty(8, dtype=torch.float8_e4m3fn)
+    index_cache = torch.empty_like(kv_cache)
+    slots = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_tokens=2, msa_layer_cache_tensors={3: (kv_cache, index_cache)}, msa_out_cache_loc=slots
+    )
+    layer = SimpleNamespace(
+        enable_fused_qkv_index_projection=True,
+        register_to_config=True,
+        attn=backend,
+        _emit_fp8_main_qkv=lambda: True,
+        layer_idx=3,
+        layer_idx_str="3",
+        qkv_proj=Mock(return_value=packed),
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=(q, idx_q)),
+        _forward_attention_core=Mock(return_value=output),
+        o_proj=lambda output, all_reduce_params: output,
+    )
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (metadata, layer),
+    )
+    hidden = torch.empty((4, 5), dtype=torch.bfloat16)
+    positions = torch.arange(4).reshape(1, 4)
+    result = MiniMaxM3Attention._sparse_forward(layer, positions, hidden, metadata)
+    assert result is output
+    layer.qkv_proj.assert_called_once_with(hidden)
+    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once_with(
+        packed, positions, metadata, cache_tensors=(kv_cache, index_cache, slots)
+    )
+    layer._forward_attention_core.assert_called_once_with(q, None, None, idx_q, None, metadata)
+
+
+@pytest.mark.cpu_only
+def test_piecewise_captured_producer_rejects_unavailable_fusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject unsupported fused geometry without an eager fallback in capture."""
+    from unittest.mock import Mock
+
+    layer = SimpleNamespace(
+        qkv_proj=Mock(side_effect=lambda hidden: hidden.clone()),
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=None),
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (None, layer)
+    )
+    with pytest.raises(RuntimeError) as exc:
+        torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+            torch.zeros(2, 4),
+            torch.arange(2),
+            torch.zeros(4),
+            torch.zeros(4),
+            torch.arange(2, dtype=torch.int32),
+            "3",
+        )
+    assert str(exc.value) == (
+        "MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer."
+    )
+    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("restore_inplace", [False, True])
+def test_piecewise_captured_producer_declares_cache_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+    restore_inplace: bool,
+) -> None:
+    """Real custom-op schema/AOT checks with CPU cache writes in place of CUDA math."""
+    from torch._dynamo.backends.common import aot_autograd
+    from torch._functorch.aot_autograd import make_boxed_func
+    from torch._higher_order_ops.auto_functionalize import (
+        auto_functionalized,
+        auto_functionalized_v2,
+    )
+
+    from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
+
+    def producer(
+        packed: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: object,
+        *,
+        cache_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Emulate native cache writes using only the explicit tensor arguments."""
+        kv_cache, index_cache, slots = cache_tensors
+        # Deliberately use only the explicit caches, not the runtime metadata.
+        valid = slots >= 0
+        indices = slots[valid].long()
+        kv_cache.index_copy_(0, indices, packed[valid, :3].float())
+        index_cache.index_copy_(0, indices, packed[valid, :1].float() + 1)
+        return packed[:, :3].to(torch.float8_e4m3fn), packed[:, :1].to(torch.float8_e4m3fn)
+
+    layer = SimpleNamespace(
+        q_size=3,
+        index_q_size=1,
+        qkv_proj=lambda hidden: hidden + 2,
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=producer,
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (None, layer)
+    )
+    op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer.default
+    assert {
+        arg.name for arg in op._schema.arguments if arg.alias_info and arg.alias_info.is_write
+    } == {"kv_cache", "index_k_cache"}
+    hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    positions = torch.arange(4)
+    kv_cache = torch.zeros(8, 3)
+    index_cache = torch.zeros(8, 1)
+    slots = torch.tensor([1, 3, -1, -1], dtype=torch.int32)
+    args = (hidden, positions, kv_cache, index_cache, slots, "3")
+    assert all(result == "SUCCESS" for result in torch.library.opcheck(op, args).values())
+
+    def run(
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        main: torch.Tensor,
+        index: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Expose query results and immediate observations of both live caches."""
+        q, idx_q = op(hidden, positions, main, index, slots, "3")
+        return q.float(), idx_q.float(), main.clone(), index.clone()
+
+    optimized_graphs = []
+
+    def optimize(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]) -> object:
+        """Apply the production in-place recovery pass and inspect its aliases."""
+        remove_copy_for_mutates_args(gm.graph)
+        gm.graph.lint()
+        gm.recompile()
+        producer_nodes = [node for node in gm.graph.nodes if node.target == op]
+        assert len(producer_nodes) == 1
+        # No full-pool functionalization clones between the graph inputs and
+        # the producer: MSA's eager boundary must observe the original pools.
+        assert producer_nodes[0].kwargs["kv_cache"].op == "placeholder"
+        assert producer_nodes[0].kwargs["index_k_cache"].op == "placeholder"
+        assert all(
+            node.target not in (auto_functionalized, auto_functionalized_v2)
+            for node in gm.graph.nodes
+        )
+        optimized_graphs.append(gm)
+        return make_boxed_func(gm.forward)
+
+    # Match the production backend's functionalization version.
+    monkeypatch.setattr(torch._inductor.config, "enable_auto_functionalized_v2", False)
+    compiled = torch.compile(
+        run,
+        backend=aot_autograd(fw_compiler=optimize) if restore_inplace else "aot_eager",
+        fullgraph=True,
+    )
+    for offset in (0, 4):
+        kv_cache.zero_()
+        index_cache.zero_()
+        q, idx_q, observed_main, observed_index = compiled(
+            hidden + offset, positions, kv_cache, index_cache, slots
+        )
+        packed = hidden + offset + 2
+        expected_main = torch.zeros_like(kv_cache)
+        expected_index = torch.zeros_like(index_cache)
+        expected_main[[1, 3]] = packed[:2, :3]
+        expected_index[[1, 3]] = packed[:2, :1] + 1
+        torch.testing.assert_close(kv_cache, expected_main)
+        torch.testing.assert_close(index_cache, expected_index)
+        torch.testing.assert_close(observed_main, expected_main)
+        torch.testing.assert_close(observed_index, expected_index)
+        torch.testing.assert_close(q, packed[:, :3].to(torch.float8_e4m3fn).float())
+        torch.testing.assert_close(idx_q, packed[:, :1].to(torch.float8_e4m3fn).float())
+        torch.testing.assert_close(slots, torch.tensor([1, 3, -1, -1], dtype=torch.int32))
+    if restore_inplace:
+        assert len(optimized_graphs) == 1
+
+
+@pytest.mark.cpu_only
+def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep index-cache mutation outside capture when projections are separate."""
+    from unittest.mock import Mock
+
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    q, k, v, idx_q, idx_k = [torch.empty((4, 128), dtype=torch.float8_e4m3fn) for _ in range(5)]
+    metadata = SimpleNamespace(num_tokens=2)
+    layer = SimpleNamespace(
+        enable_fused_qkv_index_projection=False,
+        register_to_config=True,
+        attn=backend,
+        _emit_fp8_main_qkv=lambda: True,
+        qkv_proj=Mock(return_value=torch.empty((4, 384), dtype=torch.bfloat16)),
+        index_qk_proj=Mock(return_value=torch.empty((4, 256), dtype=torch.bfloat16)),
+        _fused_qk_norm_rope=Mock(
+            side_effect=[torch.cat((q, k, v), dim=-1), torch.cat((idx_q, idx_k), dim=-1)]
+        ),
+        _fused_fp8_index_qk_norm_rope=Mock(),
+        _split_main_qkv=lambda tensor: (q, k, v),
+        _split_index_qk=lambda tensor: (idx_q, idx_k),
+        num_heads=1,
+        num_key_value_heads=1,
+        head_dim=128,
+        sparse_num_index_heads=1,
+        sparse_index_dim=128,
+        q_norm=object(),
+        k_norm=object(),
+        index_q_norm=object(),
+        index_k_norm=object(),
+        ln_events=(None, None),
+        aux_stream=None,
+        _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
+        o_proj=lambda output, all_reduce_params: output,
+    )
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "maybe_execute_in_parallel",
+        lambda first, second, *args, **kwargs: (first(), second()),
+    )
+    MiniMaxM3Attention._sparse_forward(
+        layer, torch.arange(4).reshape(1, 4), torch.empty((4, 128), dtype=torch.bfloat16), metadata
+    )
+    layer._fused_fp8_index_qk_norm_rope.assert_not_called()
+    assert layer._fused_qk_norm_rope.call_count == 2
+    assert all(call.kwargs["out_fp8"] for call in layer._fused_qk_norm_rope.call_args_list)
+    layer._forward_attention_core.assert_called_once_with(q, k, v, idx_q, idx_k, metadata)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("indexer_dtype", "caches_prewritten"),
+    [("fp8", False), ("fp8", True), ("bf16", False)],
+    ids=["unfused-fp8", "fused-fp8", "bf16"],
+)
+def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
+    monkeypatch: pytest.MonkeyPatch, indexer_dtype: str, caches_prewritten: bool
+) -> None:
+    """Exercise the real MSA indexer after live-row slicing and cache insertion."""
+    from unittest.mock import Mock
+
+    dtype = torch.float8_e4m3fn if indexer_dtype == "fp8" else torch.bfloat16
+    q, k, v, idx_q, idx_k = [torch.full((4, 128), value).to(dtype) for value in range(1, 6)]
+    index_cache = torch.zeros((4, 1, 1, 128), dtype=dtype)
+    expected_cache = torch.zeros_like(index_cache)
+    expected_cache[:2, 0, 0].copy_(idx_k[:2])
+    if caches_prewritten:
+        index_cache.copy_(expected_cache)
     selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        num_tokens=2,
+        msa_decode_span=None,
+        msa_idx_k_cache=Mock(return_value=index_cache),
+        msa_write_idx_k=Mock(),
+        msa_prefill_proxy_plan=None,
+        msa_prefill_n_valid_blocks=None,
+        msa_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
+        msa_qo_lens_cpu=torch.tensor([2], dtype=torch.int32),
+        msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
+        msa_qo_offset_cpu=torch.tensor([0], dtype=torch.int32),
+    )
 
-    class FakeMsaBackend:
-        def __init__(self) -> None:
-            self.prepopulated_call = None
+    def write_caches(
+        live_k: torch.Tensor,
+        live_v: torch.Tensor,
+        live_idx_k: torch.Tensor,
+        metadata: SimpleNamespace,
+    ) -> None:
+        """Replace only CUDA scatter math, retaining the live cache-write inputs."""
+        assert metadata is attn_metadata
+        torch.testing.assert_close(live_k.float(), k[:2].float())
+        torch.testing.assert_close(live_v.float(), v[:2].float())
+        torch.testing.assert_close(live_idx_k.float(), idx_k[:2].float())
+        index_cache[:2, 0, 0].copy_(live_idx_k)
 
-        def write_layer_caches(self, k, v, idx_k, metadata) -> None:
-            pytest.fail("The horizontal producer has already written both caches")
+    def select_blocks(
+        live_idx_q: torch.Tensor, cache: torch.Tensor, **kwargs: object
+    ) -> torch.Tensor:
+        """Require the cache write to precede selection, without running CUDA scoring."""
+        assert cache is index_cache
+        torch.testing.assert_close(cache.float(), expected_cache.float())
+        torch.testing.assert_close(live_idx_q.flatten(1).float(), idx_q[:2].float())
+        return selected_blocks
 
-        def run_indexer(self, idx_q, idx_k, metadata, *, idx_k_prewritten):
-            assert idx_k is None
-            assert idx_k_prewritten
-            assert metadata is attn_metadata
-            return selected_blocks
-
-        def forward(self, q, k, v, metadata, forward_args) -> None:
-            assert k is None and v is None
-            self.prepopulated_call = (q, metadata, forward_args)
-
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.layer_idx = 3
+    backend.indexer_kv_dtype = indexer_dtype
+    backend.m3_config = SimpleNamespace(num_index_heads=1, sparse_index_dim=128)
+    backend.write_layer_caches = Mock(side_effect=write_caches)
+    backend.indexer = SimpleNamespace(select_blocks=Mock(side_effect=select_blocks))
+    backend.forward = Mock()
     layer = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
-    backend = FakeMsaBackend()
     layer.attn = backend
     layer.is_sparse_attention_layer = True
-    q = torch.randn(2, 8)
-    idx_q = torch.randn(2, 4)
-    attn_metadata = SimpleNamespace()
-    output = torch.empty_like(q)
+    output = torch.empty((4, 128), dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (attn_metadata, layer),
+    )
+    modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
+        q,
+        None if caches_prewritten else k,
+        None if caches_prewritten else v,
+        idx_q,
+        None if caches_prewritten else idx_k,
+        None,
+        None,
+        "3",
+        output,
+    )
 
-    result = layer._msa_attention_core(q, None, None, idx_q, None, attn_metadata, output)
-
-    assert result is output
-    assert backend.prepopulated_call is not None
-    called_q, called_metadata, forward_args = backend.prepopulated_call
-    assert called_q is q
+    assert backend.write_layer_caches.call_count == (0 if caches_prewritten else 1)
+    attn_metadata.msa_write_idx_k.assert_not_called()
+    attn_metadata.msa_idx_k_cache.assert_called_once_with(3)
+    backend.indexer.select_blocks.assert_called_once()
+    backend.forward.assert_called_once()
+    called_q, called_k, called_v, called_metadata = backend.forward.call_args.args
+    assert called_k is None and called_v is None
+    torch.testing.assert_close(called_q.float(), q[:2].float())
     assert called_metadata is attn_metadata
-    assert forward_args.output is output
+    forward_args = backend.forward.call_args.kwargs["forward_args"]
+    assert forward_args.output.shape == (2, 128)
+    assert forward_args.output.data_ptr() == output.data_ptr()
     assert forward_args.sparse_backend_args.topk_indices is selected_blocks
 
 

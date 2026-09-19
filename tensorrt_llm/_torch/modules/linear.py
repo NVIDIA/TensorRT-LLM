@@ -38,7 +38,8 @@ from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     replace_parameter_and_save_metadata, unswizzle_sf)
+                     is_torch_compiling, replace_parameter_and_save_metadata,
+                     unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
 
@@ -3366,6 +3367,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 and self.use_cutlass)
 
     def _load_flashinfer(self, *, required: bool) -> bool:
+        """Load the optional GEMM backend, raising only when explicitly required."""
         if not self.use_cutlass:
             if required:
                 raise RuntimeError(
@@ -3373,9 +3375,13 @@ class MXFP8LinearMethod(LinearMethodBase):
                     "quantization ops on Blackwell")
             return False
         try:
-            from flashinfer import autotune, mm_mxfp8
+            from flashinfer import autotune
             if not callable(autotune):
                 raise ImportError("flashinfer.autotune is unavailable")
+            flashinfer_mxfp8 = getattr(torch.ops.trtllm, "flashinfer_mm_mxfp8",
+                                       None)
+            if flashinfer_mxfp8 is None:
+                raise ImportError("trtllm::flashinfer_mm_mxfp8 is unavailable")
         except ImportError as error:
             if required:
                 raise RuntimeError(
@@ -3386,7 +3392,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 "TensorRT-LLM GEMM backend.",
                 key="flashinfer_mxfp8_unavailable")
             return False
-        self._flashinfer_mxfp8 = mm_mxfp8
+        self._flashinfer_mxfp8 = flashinfer_mxfp8
         return True
 
     def enable_flashinfer_auto(self) -> bool:
@@ -3452,13 +3458,14 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
         if self.use_cutlass:
             input = input.contiguous()
-            if (self.tune_decode_graph_backends
+            if (self.tune_decode_graph_backends and not is_torch_compiling()
                     and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
                 output = mxfp8_quantize_gemm_autotuned(
@@ -3473,7 +3480,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
                 act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
                 use_flashinfer = self.backend == "flashinfer" or (
-                    self.backend == "auto" and
+                    self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                      (self._flashinfer_autotuned
                       and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
@@ -3482,12 +3489,10 @@ class MXFP8LinearMethod(LinearMethodBase):
                     assert flashinfer_mxfp8 is not None
                     output = flashinfer_mxfp8(
                         act_e4m3,
-                        module.weight.t(),
                         act_sf,
+                        module.weight,
                         module.weight_scale,
-                        out_dtype=module.dtype,
-                        use_8x4_sf_layout=False,
-                        backend="cutlass",
+                        module.dtype,
                     )
                 else:
                     # globalScale is the alpha multiplier; pure MXFP8xMXFP8

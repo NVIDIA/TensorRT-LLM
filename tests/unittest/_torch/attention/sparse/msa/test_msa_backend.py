@@ -39,6 +39,46 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
+@pytest.mark.cpu_only
+def test_msa_metadata_clears_padded_cache_slot_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A smaller replay must not reuse the previous step's live cache slots."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_buffers_ready = True
+    metadata.request_ids = [0]
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=4,
+        get_buffers=lambda layer_idx: torch.empty(1),
+        get_block_ids_per_seq=lambda request_ids: torch.tensor([[3]], dtype=torch.int32),
+    )
+    metadata.msa_out_cache_loc = torch.full((4,), 99, dtype=torch.int32)
+    metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    metadata.msa_subpage_block_table = None
+    metadata._msa_runs_no_fmha = lambda: True
+    metadata._msa_kv_lens_may_change = lambda: False
+    original_ptr = metadata.msa_out_cache_loc.data_ptr()
+
+    for count in (4, 2, 1):
+        metadata._msa_qo_lens_cpu = torch.tensor([count], dtype=torch.int32)
+        metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
+        metadata._msa_qo_offset_cpu = torch.zeros(1, dtype=torch.int32)
+        metadata._build_msa_fields()
+        assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
+            4 - count
+        )
+        assert metadata.msa_out_cache_loc.data_ptr() == original_ptr
+        assert metadata._msa_fields_ready
+
+    metadata.request_ids = []
+    metadata._msa_qo_lens_cpu = torch.empty(0, dtype=torch.int32)
+    metadata._build_msa_fields()
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 4
+
+
 def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         msa_package_available,
@@ -270,6 +310,36 @@ def test_msa_buffers_include_graph_stable_block_table():
         True,
     )
     assert requested["msa_seq_lens_cuda"] == ((MAX_NUM_SEQUENCES,), torch.int32, True)
+
+
+@pytest.mark.cpu_only
+def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage zero-copy cache views only for sparse layers on the local rank."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(sparse_layer_ids=[3, 4], layer_offsets={3: 0})
+    main_cache = torch.zeros(2, 2, 1, 128, 128)
+    index_cache = torch.zeros(2, 1, 128, 128)
+    manager = metadata.kv_cache_manager
+    manager.get_buffers = Mock(return_value=main_cache)
+    manager.get_index_k_buffer = Mock(return_value=index_cache)
+    monkeypatch.setattr(
+        metadata,
+        "get_empty",
+        lambda buffers, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]),
+    )
+    # No native pool in this CPU test; only zero-copy cache-view staging is under test.
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+    metadata._create_msa_buffers()
+    manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    manager.get_index_k_buffer.assert_called_once_with(3, kv_layout="HND")
+    assert set(metadata.msa_layer_cache_tensors) == {3}
+    main, index = metadata.msa_layer_cache_tensors[3]
+    assert main is main_cache and index is index_cache
+    main.fill_(2)
+    index.fill_(3)
+    torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
+    torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1664,13 +1734,13 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
     torch.testing.assert_close(idx_pool, ref_idx_pool)
 
 
-@pytest.mark.parametrize("sparse", [True, False])
-def test_msa_attention_core_owns_the_cache_write(sparse):
+@pytest.mark.parametrize("sparse,indexer_dtype", [(True, "fp8"), (True, "bf16"), (False, "fp8")])
+def test_msa_attention_core_owns_the_cache_write(sparse: bool, indexer_dtype: str) -> None:
     """The model layer's MSA core must write the caches exactly once and in
     the right place: write_layer_caches runs before run_indexer (whose proxy
     pass reads the index-K cache), run_indexer is told index-K is already
-    resident, and forward() receives k=v=None so no FMHA phase writes K/V
-    again."""
+    resident (with no live index-K for FP8), and forward() receives k=v=None
+    so no FMHA phase writes K/V again."""
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
 
     num_tokens, width = 3, 128
@@ -1679,6 +1749,7 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
 
     class FakeBackend:
         layer_idx = 7
+        indexer_kv_dtype = indexer_dtype
 
         def write_layer_caches(self, k, v, idx_k, metadata):
             events.append(("write", k, v, idx_k, metadata))
@@ -1704,7 +1775,11 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
     if sparse:
         assert names == ["write", "indexer", "forward"]
         _, indexer_q, indexer_k, indexer_metadata, prewritten = events[1]
-        assert indexer_q is idx_q and indexer_k is idx_k and indexer_metadata is metadata
+        assert indexer_q is idx_q and indexer_metadata is metadata
+        if indexer_dtype == "fp8":
+            assert indexer_k is None
+        else:
+            assert indexer_k is idx_k
         assert prewritten is True
     else:
         assert names == ["write", "forward"]
