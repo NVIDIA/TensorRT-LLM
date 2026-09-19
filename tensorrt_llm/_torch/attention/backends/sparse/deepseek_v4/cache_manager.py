@@ -315,6 +315,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 "for DeepseekV4CacheManager"
             )
 
+        self._enable_kv_cache_offload = sparse_attn_config.enable_kv_cache_offload
+        if self._enable_kv_cache_offload:
+            # Remove this guard when sparse staging and read-table consumption are connected.
+            raise NotImplementedError(
+                "DeepSeek-V4 KV cache offload requires the KVCM v2 sparse runtime and "
+                "per-layer attention fetch integration, which are not implemented yet."
+            )
+
         # DeepSeek-V4 specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
         assert num_kv_heads == 1, "DeepSeek-V4 only supports num_kv_heads == 1"
@@ -1060,6 +1068,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layer_idx: int,
             attention_types: List[DeepseekV4AttentionType],
             sliding_window_size: int | None,
+            *,
+            is_sparse: bool = False,
         ) -> None:
             layer_id = LayerId(len(layers))
             for attn_type in attention_types:
@@ -1068,13 +1078,15 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     layer_idx,
                     attn_type,
                 )
-            buffers = [
-                BufferConfig(
-                    role=attn_type.role,
-                    size=self._get_attn_bytes_per_block(attn_type, layer_idx),
-                )
-                for attn_type in attention_types
-            ]
+            buffers = []
+            for attn_type in attention_types:
+                size = self._get_attn_bytes_per_block(attn_type, layer_idx)
+                if is_sparse:
+                    buffer = BufferConfig(role=attn_type.role, size=size, is_sparse=True)
+                else:
+                    # The current runtime does not yet accept the sparse keyword.
+                    buffer = BufferConfig(role=attn_type.role, size=size)
+                buffers.append(buffer)
             if self._use_nvfp4_compress and DeepseekV4AttentionType.COMPRESS in attention_types:
                 scale_page_size = (
                     self.compressed_block_sizes[layer_idx]
@@ -1134,14 +1146,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     [DeepseekV4AttentionType.SWA],
                     self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
                 )
-                _add_layer(
-                    layer,
-                    [
-                        DeepseekV4AttentionType.COMPRESS,
-                        DeepseekV4AttentionType.INDEXER_COMPRESS,
-                    ],
-                    None,
-                )
+                if self._enable_kv_cache_offload:
+                    _add_layer(layer, [DeepseekV4AttentionType.COMPRESS], None, is_sparse=True)
+                    _add_layer(layer, [DeepseekV4AttentionType.INDEXER_COMPRESS], None)
+                else:
+                    _add_layer(
+                        layer,
+                        [
+                            DeepseekV4AttentionType.COMPRESS,
+                            DeepseekV4AttentionType.INDEXER_COMPRESS,
+                        ],
+                        None,
+                    )
                 _add_layer(
                     layer,
                     [

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from unittest.mock import patch
@@ -22,6 +23,9 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
+    cache_manager as deepseek_v4_cache,
+)
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
@@ -57,12 +61,112 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
     _introspection,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _config as kv_cache_config_module
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
     Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
 ]
+
+
+@dataclass(slots=True)
+class _SparseBufferConfig(kv_cache_config_module.BufferConfig):
+    """Test the declared sparse buffer contract before its runtime is available."""
+
+    is_sparse: bool = False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+@pytest.mark.parametrize("pp_layers", [[0, 1, 2, 3], [2, 3]])
+@pytest.mark.parametrize(("dtype", "bytes_per_element"), [(DataType.BF16, 2), (DataType.FP8, 1)])
+def test_sparse_offload_cache_roles(
+    enabled: bool,
+    tokens_per_block: int,
+    pp_layers: list[int],
+    dtype: DataType,
+    bytes_per_element: int,
+) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager._enable_kv_cache_offload = enabled
+    manager.pp_layers = pp_layers
+    manager._compress_ratios = [1, 4, 128, 4]
+    manager.compressed_block_sizes = [tokens_per_block // r for r in manager._compress_ratios]
+    manager.tokens_per_block = tokens_per_block
+    manager.head_dim = 512
+    manager.index_head_dim = 128
+    manager.dtype = dtype
+    manager._indexer_k_dtype = "fp8"
+    manager._use_nvfp4_compress = False
+    manager.use_fp8_ds_mla = False
+    manager._swa_window_size = 128
+    manager._max_draft_len = 0
+    config = kv_cache_config_module.KVCacheManagerConfig(
+        tokens_per_block=tokens_per_block,
+        cache_tiers=[
+            kv_cache_config_module.GpuCacheTierConfig(quota=1 << 20),
+            kv_cache_config_module.HostCacheTierConfig(quota=1 << 20),
+        ],
+        layers=[],
+    )
+    buffer_config = _SparseBufferConfig if enabled else kv_cache_config_module.BufferConfig
+    with (
+        patch.object(deepseek_v4_cache, "BufferConfig", buffer_config),
+        patch.object(
+            deepseek_v4_cache, "AttentionLayerConfig", kv_cache_config_module.AttentionLayerConfig
+        ),
+    ):
+        result = manager._build_cache_config(config)
+
+    assert result.tokens_per_block == tokens_per_block
+    assert len(result.layers) == manager._num_manager_layers
+    layers = {layer.layer_id: layer for layer in result.layers}
+    for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
+        assert model_layer in pp_layers
+        assert manager._manager_layer_id_to_layer_attn[layer_id, attn_type.role] == (
+            model_layer,
+            attn_type,
+        )
+        buffer = next(b for b in layers[layer_id].buffers if b.role == attn_type.role)
+        assert buffer.tokens_per_block_override is None
+        ratio = manager._compress_ratios[model_layer]
+        if enabled:
+            assert buffer.is_sparse == (
+                ratio == 4 and attn_type == DeepseekV4AttentionType.COMPRESS
+            )
+        if attn_type == DeepseekV4AttentionType.COMPRESS:
+            assert buffer.size == tokens_per_block // ratio * manager.head_dim * bytes_per_element
+            if ratio == 4:
+                indexer_layer_id = manager._layer_attn_to_layer_id[
+                    model_layer, DeepseekV4AttentionType.INDEXER_COMPRESS
+                ]
+                assert (layer_id != indexer_layer_id) is enabled
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_rejects_inference_before_cache_allocation() -> None:
+    sparse_config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+    with (
+        patch.object(deepseek_v4_cache, "get_sm_version") as get_sm_version,
+        patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
+        pytest.raises(NotImplementedError, match="per-layer attention fetch integration"),
+    ):
+        DeepseekV4CacheManager(
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False, host_cache_size=1 << 20),
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+            num_layers=len(sparse_config.compress_ratios),
+            max_batch_size=1,
+            tokens_per_block=128,
+            max_seq_len=256,
+            vocab_size=128,
+            mapping=Mapping(),
+            sparse_attn_config=sparse_config,
+        )
+
+    get_sm_version.assert_not_called()
+    initialize_cache.assert_not_called()
 
 
 @pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
