@@ -274,7 +274,8 @@ _DEEP_GEMM_PDL_CONFIGURED = False
 # warmup capture path.
 NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7,
                                                     top_k=50,
-                                                    top_p=0.9)
+                                                    top_p=0.9,
+                                                    min_p=0.05)
 
 
 def _configure_deep_gemm_pdl() -> None:
