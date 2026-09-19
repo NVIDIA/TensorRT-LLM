@@ -1083,6 +1083,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         decoding-iteration index with the array's own length so that decoding
         past the end of the array holds its last width.
 
+        Indexed with ``py_decoding_iter``, the counter the Python sampling loop
+        advances, rather than the C++ ``decoding_iter``. Under the overlap
+        scheduler ``_handle_responses`` copies the former into the latter only
+        once the step has been sampled, so reading ``decoding_iter`` here trails
+        by one step exactly where the width is consumed: a widening schedule
+        repeats a width instead of advancing, and the run ends narrower than
+        beam_width_array asks for. The two counters are equal wherever the C++
+        side reads the width -- the micro-batch scheduler runs before the
+        sampler advances ``py_decoding_iter`` -- so the clamping formula still
+        agrees with llmRequest.cpp; test_vbws_cpp_formula_matches_past_array_end
+        pins that with the counters held in sync.
+
         The C++ implementation used to clamp with the global
         kMaxBeamWidthArrayLength constant instead, reading past the end of
         the user array and returning arbitrary widths; that is fixed in
@@ -1091,8 +1103,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         would otherwise bind to whatever libtensorrt_llm.so happens to
         provide -- including a prebuilt one from before that fix, against
         which the mismatch starves the request in the micro-batch scheduler
-        and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
-        pins the agreement.
+        and decoding hangs.
 
         An empty array falls through to the base implementation rather than
         indexing it, matching the emptiness guard the C++ side checks before
@@ -1100,7 +1111,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """
         beam_width_array = self.sampling_config.beam_width_array
         if beam_width_array:
-            iteration = self.decoding_iter + (1 if for_next_iteration else 0)
+            iteration = self.py_decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)
             return int(beam_width_array[index])
         return super().get_beam_width_by_iter(for_next_iteration)
