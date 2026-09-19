@@ -127,7 +127,7 @@ class AttentionConfig(StrictBaseModel):
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
             "skip_softmax (TRTLLM / CUTEDSL backends), vsa (CUTEDSL / TRTLLM backends), "
-            "or sol_attn (CUTEDSL backend)."
+            "or sol_attn (TRTLLM / CUTEDSL backends)."
         ),
     )
 
@@ -225,7 +225,7 @@ class AttentionConfig(StrictBaseModel):
         supported_backends = {
             "skip_softmax": ("TRTLLM", "CUTEDSL"),
             "vsa": ("CUTEDSL", "TRTLLM"),
-            "sol_attn": ("CUTEDSL",),
+            "sol_attn": ("TRTLLM", "CUTEDSL"),
         }.get(algo)
         if supported_backends is None:
             return self
@@ -244,7 +244,7 @@ class AttentionConfig(StrictBaseModel):
         if self.quant_attention_config is None or self.sparse_attention_config is None:
             return self
 
-        # VSA and Sol-Attn replace the dense attention path on every backend that
+        # VSA and SOL replace the dense attention path on every backend that
         # serves them and never consume quant_attention_config, so accepting a
         # quantization recipe would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
@@ -252,7 +252,23 @@ class AttentionConfig(StrictBaseModel):
         if algorithm == "vsa":
             raise ValueError("VSA and quant_attention_config are mutually exclusive.")
         if algorithm == "sol_attn":
-            raise ValueError("Sol-Attn and quant_attention_config are mutually exclusive.")
+            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_sol_thresh_type(self) -> "AttentionConfig":
+        # The TRTLLM predictor implements the diag threshold only; the exact
+        # policy exists in the fused CUTEDSL kernel.
+        sparse_config = self.sparse_attention_config
+        if (
+            isinstance(sparse_config, SolAttentionConfig)
+            and self.backend == "TRTLLM"
+            and sparse_config.thresh_type != "diag"
+        ):
+            raise ValueError(
+                f"TRTLLM SOL supports thresh_type='diag' only, got "
+                f"thresh_type={sparse_config.thresh_type!r}; use backend='CUTEDSL'."
+            )
         return self
 
 
@@ -791,6 +807,21 @@ class VisualGenArgs(StrictBaseModel):
             data = {**data, "quant_config": QuantConfig()}
         return data
 
+    @model_validator(mode="after")
+    def _validate_sol_fullgraph(self) -> "VisualGenArgs":
+        sparse_config = self.attention_config.sparse_attention_config
+        if (
+            isinstance(sparse_config, SolAttentionConfig)
+            and self.torch_compile_config.enable
+            and self.torch_compile_config.enable_fullgraph
+        ):
+            raise ValueError(
+                "SOL sparse attention does not support torch.compile fullgraph; "
+                "set torch_compile_config.enable_fullgraph=False or disable "
+                "torch.compile."
+            )
+        return self
+
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:
         return self.cache_config.cache_backend if self.cache_config is not None else None  # type: ignore[return-value]
@@ -842,6 +873,7 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
+    "SolAttentionConfig",
     "VideoSparseAttentionConfig",
     "SolAttentionConfig",
     "AttentionConfig",

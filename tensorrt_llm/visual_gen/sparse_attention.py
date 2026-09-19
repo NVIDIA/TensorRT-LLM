@@ -238,29 +238,40 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
 
 class SolAttentionConfig(BaseSparseAttentionConfig):
-    """Sol-Attn sparse attention configuration for visual generation.
+    """SOL sparse attention configuration for visual generation.
 
-    Dynamic block routing + sparse computation + approximation correction in
-    one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL on
-    datacenter Blackwell -- sm100 (B200/GB200) and sm103 (B300/GB300) --
-    head_dim=128, bf16, MHA.
+    SOL (Sol-Attn, arXiv:2607.24027) routes attention blocks dynamically and
+    corrects the approximation of the blocks it skips. Two backends serve it:
 
-    On an unsupported *shape, dtype, or architecture* the kernel falls back to
-    dense attention -- the configured backend's dense kernel where available,
-    torch SDPA otherwise -- and counts the fallback, so setting this config on the wrong GPU
-    degrades rather than fails. Two cases are not covered by that fallback and do raise: GQA/MQA
-    (num_kv_heads != num_heads) here at construction, and context parallelism
-    (cp_size > 1), rejected in visual_gen/modules/attention.py.
+    - ``TRTLLM`` runs SOL in two stages. A TRT-LLM-owned predictor derives an
+      exact block bitmask and K/V proxy summaries from Q/K/V, then the generic
+      PrimTS block-sparse FMHA executes that route. Unsupported runtime tensor
+      envelopes raise instead of silently falling back to dense attention.
+    - ``CUTEDSL`` runs the fused kernel vendored from the reference
+      implementation, which folds routing, sparse computation and correction
+      into one online-softmax pass on datacenter Blackwell (sm100/sm103) with
+      head_dim=128, bf16 and MHA. Inputs the kernel cannot serve fall back to
+      dense attention and are counted; GQA/MQA raises at construction.
+
+    Context parallelism (cp_size > 1) is rejected for both backends in
+    visual_gen/modules/attention.py.
     """
 
     algorithm: Literal["sol_attn"] = "sol_attn"
     tau: float = PydanticField(
         1.0,
-        description="Per-block routing threshold; higher tau routes more blocks sparse.",
+        allow_inf_nan=False,
+        description=(
+            "Routing threshold in standard deviations above the mean block score; "
+            "higher tau routes more blocks sparse."
+        ),
     )
     thresh_type: Literal["diag", "exact"] = PydanticField(
         "diag",
-        description="Threshold policy forwarded to the kernel (kernel default: 'diag').",
+        description=(
+            "Threshold policy of the CUTEDSL kernel (kernel default: 'diag'). "
+            "The TRTLLM predictor implements 'diag' only."
+        ),
     )
     disabled_until_timestep: Optional[float] = PydanticField(
         None,
@@ -269,15 +280,13 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
         description=(
             "Dense-prefix cutoff on the normalized denoising timestep, with the "
             "same sense as skip_softmax's field of the same name: the layer runs "
-            "dense while timestep >= this value and switches to the sparse kernel "
-            "below it. Larger timesteps are earlier, noisier steps, so this "
-            "protects the high-noise prefix. Use None (not 0.0) to disable the "
-            "prefix; 0.0 is rejected because it would run dense on every step "
-            "and silently turn Sol-Attn off entirely. "
-            "Read from the `timestep` forward kwarg, which must be the normalized "
-            "scheduler time (larger = noisier). WAN and LTX-2 pass it; a pipeline "
-            "that does not, or that passes something else, gets a one-time warning "
-            "and runs sparse on every step (fail-open)."
+            "dense while timestep >= this value and switches to SOL below it. "
+            "Larger timesteps are earlier, noisier steps, so this protects the "
+            "high-noise prefix. Use None (not 0.0) to disable the prefix; 0.0 is "
+            "rejected because it would run dense on every step and silently turn "
+            "SOL off entirely. Read from the `timestep` forward kwarg, which must "
+            "be the normalized scheduler time (larger = noisier); a pipeline that "
+            "does not pass it runs sparse on every step (fail-open)."
         ),
     )
     dense_layers: Optional[list[int]] = PydanticField(
@@ -300,11 +309,16 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
         return sorted(set(layers))
 
     def to_sparse_params(self, **kwargs):
-        # Sol-Attn's knobs are consumed directly by SolAttention.__init__
-        # (constructed via CUTEDSL backend dispatch in create_attention), not
-        # lowered into a shared SparseParams -- the vendored kernel has no
-        # checkpoint-calibration step to resolve here, unlike skip_softmax.
-        return None
+        """Lower the public recipe into the SOL parameters shared by both backends."""
+        del kwargs
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+
+        return SolParams(
+            tau=self.tau,
+            thresh_type=self.thresh_type,
+            disabled_until_timestep=self.disabled_until_timestep,
+            dense_layers=frozenset(self.dense_layers or ()),
+        )
 
 
 class VideoSparseAttentionConfig(StrictBaseModel):

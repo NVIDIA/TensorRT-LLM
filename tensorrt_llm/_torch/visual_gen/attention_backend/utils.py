@@ -50,7 +50,7 @@ def get_visual_gen_attention_backend(
                         and architecture-specific NVFP4 attention recipes.
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
-        - "CUTEDSL": CuTe DSL kernels. create_attention selects dense/SkipSoftmax FMHA or VSA
+        - "CUTEDSL": CuTe DSL kernels. create_attention selects dense/SkipSoftmax FMHA, VSA or SOL
                       from AttentionConfig.sparse_attention_config.
         - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
                    selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).
@@ -136,6 +136,7 @@ def create_attention(
     )
     sparse_algorithm = getattr(sparse_attention_config, "algorithm", None)
     is_vsa = sparse_algorithm == "vsa"
+    is_sol = sparse_algorithm == "sol_attn"
 
     backend_name = backend.upper()
     if is_vsa and backend_name == "CUTEDSL":
@@ -146,11 +147,14 @@ def create_attention(
         from .sparse.vsa.backend import VSATrtllmAttention
 
         attn_cls = VSATrtllmAttention
-    elif sparse_algorithm == "sol_attn" and backend_name == "CUTEDSL":
-        from .cute_dsl.sol_attn import SolAttention
+    elif is_sol and backend_name == "CUTEDSL":
+        from .sparse.sol.backend import SOLCuTeDSLAttention
 
-        attn_cls = SolAttention
-        kwargs["sparse_attention_config"] = sparse_attention_config
+        attn_cls = SOLCuTeDSLAttention
+    elif is_sol and backend_name == "TRTLLM":
+        from .sparse.sol.backend import SOLTrtllmAttention
+
+        attn_cls = SOLTrtllmAttention
     else:
         attn_cls = get_visual_gen_attention_backend(backend)
 
@@ -158,6 +162,10 @@ def create_attention(
         sparse_params = kwargs.pop("sparse_params", None)
         if sparse_params is not None:
             raise ValueError("VSA does not lower through core SparseParams.")
+    elif is_sol and kwargs.get("sparse_params") is None:
+        # The attention module lowers the config once per layer; callers that
+        # construct a backend directly get the same lowering here.
+        kwargs["sparse_params"] = sparse_attention_config.to_sparse_params()
 
     # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
     # FMHA backend.

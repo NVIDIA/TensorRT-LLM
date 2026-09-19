@@ -21,7 +21,7 @@ simplified metadata that doesn't require KV caching.
 """
 
 from .cudnn import CuDNNAttention
-from .cute_dsl import CuTeDSLAttention, SolAttention
+from .cute_dsl import CuTeDSLAttention
 from .flash_attn4 import FlashAttn4Attention
 from .flashinfer import FlashInferAttention
 from .interface import AttentionBackend, AttentionTensorLayout
@@ -39,7 +39,6 @@ __all__ = [
     "FlashAttn4Attention",
     "FlashInferAttention",
     "RingAttention",
-    "SolAttention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "UlyssesAttention",

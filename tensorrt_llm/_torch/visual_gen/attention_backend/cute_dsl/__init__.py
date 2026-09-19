@@ -15,15 +15,12 @@
 """
 CuTe DSL attention backend family for visual generation models.
 
-  fmha.py      — CuTeDSLAttention  (dense and blockscaled JIT FMHA)
-  sol_attn.py  — SolAttention      (Sol-Attn dynamic block routing, CuTe JIT + SDPA fallback)
+  fmha.py — CuTeDSLAttention (dense and blockscaled JIT FMHA)
 """
 
 from .fmha import CuTeDSLAttention, _cute_dsl_import_error
-from .sol_attn import SolAttention
 
 __all__ = [
     "CuTeDSLAttention",
     "_cute_dsl_import_error",
-    "SolAttention",
 ]

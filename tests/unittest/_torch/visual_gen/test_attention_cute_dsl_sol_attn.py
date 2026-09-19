@@ -15,7 +15,7 @@
 """Sol-Attn correctness tests: backend dispatch, config guards, step-context
 dense_layers/disabled_until_timestep guards.
 
-Mirrors test_attention_cute_dsl_vsa.py's structure and scope for its sibling
+Mirrors test_attention_vsa.py's structure and scope for its sibling
 sparse-attention algorithm. GPU kernel-vs-dense numerical equivalence is
 covered by test_cute_kernel_matches_dense_on_a_single_block: Sol-Attn's
 routing is score-derived, so no tau provably forces dense routing the way
@@ -32,7 +32,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.attention_backend import CuTeDSLAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import SolAttention
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend import SOLCuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -69,7 +69,7 @@ def test_cute_dsl_factory_dispatches_dense_and_sol_attn() -> None:
     )
 
     assert isinstance(dense_attention, CuTeDSLAttention)
-    assert isinstance(sol_attn_attention, SolAttention)
+    assert isinstance(sol_attn_attention, SOLCuTeDSLAttention)
     assert sol_attn_attention.tau == 2.0
     assert sol_attn_attention.disabled_until_timestep == 0.9545
 
@@ -129,7 +129,7 @@ def test_sol_attn_cross_attention_delegates_to_dense_cutedsl():
     assert cross_attn.attn_backend == "CUTEDSL", (
         f"expected CUTEDSL, got {cross_attn.attn_backend!r}"
     )
-    assert isinstance(cross_attn.attn, SolAttention), (
+    assert isinstance(cross_attn.attn, SOLCuTeDSLAttention), (
         "Sol-Attn should remain the backend and delegate per call, not be "
         f"swapped out at construction; got {type(cross_attn.attn).__name__}"
     )
@@ -148,7 +148,7 @@ def test_sol_attn_self_attention_is_served_under_separate_qkv():
     Qwen-Image uses it unconditionally. Both are self-attention; both must still
     get the sparse kernel.
     """
-    attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
+    attn = SOLCuTeDSLAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = None
     # CPU tensors on purpose: `_can_serve` compares shapes and the layer index
     # and never touches the device, so this runs on CPU-only hosts too.
@@ -190,7 +190,7 @@ def test_sol_attn_with_context_parallelism_raises():
 def test_sol_attn_rejects_gqa_mqa():
     """Sol-Attn is MHA-only; num_kv_heads != num_heads must fail fast at construction."""
     with pytest.raises(ValueError, match="MHA-only"):
-        SolAttention(layer_idx=0, num_heads=8, head_dim=128, num_kv_heads=2)
+        SOLCuTeDSLAttention(layer_idx=0, num_heads=8, head_dim=128, num_kv_heads=2)
 
 
 @pytest.mark.parametrize(
@@ -229,14 +229,14 @@ def test_dense_prefix_skips_kernel(monkeypatch):
     routes to the CuTe kernel on CUDA is covered by
     `test_dense_paths_use_cutedsl_backend`.
     """
-    import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+    import tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend as sol_attn_mod
 
     def _fail_if_called(*args, **kwargs):
         raise AssertionError("kernel must not run inside the dense prefix")
 
     monkeypatch.setattr(sol_attn_mod, "_sol_attn_run", _fail_if_called)
 
-    attn = SolAttention(layer_idx=0, num_heads=2, head_dim=16)
+    attn = SOLCuTeDSLAttention(layer_idx=0, num_heads=2, head_dim=16)
     attn.disabled_until_timestep = 0.9
     q = k = v = torch.randn(1, 4, 2, 16)
     out = attn.forward(q, k, v, timestep=torch.tensor(0.95))
@@ -249,7 +249,7 @@ def test_missing_timestep_fails_open_to_sparse(monkeypatch):
 
     Matches the CuTeDSL skip-softmax path's fail-open choice.
     """
-    import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+    import tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend as sol_attn_mod
 
     called = {"n": 0}
 
@@ -259,7 +259,7 @@ def test_missing_timestep_fails_open_to_sparse(monkeypatch):
 
     monkeypatch.setattr(sol_attn_mod, "_sol_attn_run", _record)
 
-    attn = SolAttention(layer_idx=0, num_heads=2, head_dim=16)
+    attn = SOLCuTeDSLAttention(layer_idx=0, num_heads=2, head_dim=16)
     attn.disabled_until_timestep = 0.9
     q = k = v = torch.randn(1, 4, 2, 16)
     attn.forward(q, k, v)  # no timestep kwarg
@@ -268,14 +268,14 @@ def test_missing_timestep_fails_open_to_sparse(monkeypatch):
 
 def test_dense_layers_guard_skips_kernel(monkeypatch):
     """A layer_idx in dense_layers must use the dense SDPA path and never invoke the kernel."""
-    import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+    import tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend as sol_attn_mod
 
     def _fail_if_called(*args, **kwargs):
         raise AssertionError("kernel must not be invoked for a dense_layers-forced layer")
 
     monkeypatch.setattr(sol_attn_mod, "_sol_attn_run", _fail_if_called)
 
-    attn = SolAttention(layer_idx=3, num_heads=2, head_dim=16)
+    attn = SOLCuTeDSLAttention(layer_idx=3, num_heads=2, head_dim=16)
     attn.dense_layers = frozenset({3})
     q = k = v = torch.randn(1, 4, 2, 16)
     out = attn.forward(q, k, v)
@@ -596,8 +596,8 @@ def test_timestep_scalar_read_is_opaque_to_dynamo():
 
     Otherwise it graph-breaks the enclosing block once per attention layer.
     """
-    assert _is_dynamo_disabled(SolAttention._dense_by_step), (
-        "SolAttention._dense_by_step must be decorated with @torch.compiler.disable"
+    assert _is_dynamo_disabled(SOLCuTeDSLAttention._dense_by_step), (
+        "SOLCuTeDSLAttention._dense_by_step must be decorated with @torch.compiler.disable"
     )
 
 
@@ -615,7 +615,7 @@ def test_dense_paths_use_cutedsl_backend(monkeypatch):
     The CPU-tensor tests above cannot see this: `_dense` falls back to SDPA when
     `q.is_cuda` is false, so they exercise the wrong branch by construction.
     """
-    import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+    import tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend as sol_attn_mod
 
     if not sol_attn_mod._cute_dense_available():
         # A CUDA device is not enough: the premise here is that the dense paths
@@ -627,7 +627,7 @@ def test_dense_paths_use_cutedsl_backend(monkeypatch):
     q = k = v = torch.randn(1, 64, 2, 128, device=device, dtype=torch.bfloat16)
 
     def _make():
-        a = SolAttention(layer_idx=0, num_heads=2, head_dim=128)
+        a = SOLCuTeDSLAttention(layer_idx=0, num_heads=2, head_dim=128)
         calls = {"n": 0}
         real = a._inner.forward
 
@@ -689,7 +689,7 @@ def test_dense_by_step_prefers_runner_resolved_phase(monkeypatch):
         return real(value)
 
     monkeypatch.setattr(timestep_phase, "timestep_to_float", spy)
-    attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
+    attn = SOLCuTeDSLAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = 0.9
 
     # Resolved phase wins even when the tensor says otherwise: phase 0 is the
@@ -770,7 +770,7 @@ def test_sol_attn_dense_prefix_survives_cuda_graph_capture(make_runner):
         pytest.skip("no Sol-Attn kernel for this device")
 
     cutoff = 0.9
-    attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
+    attn = SOLCuTeDSLAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = cutoff
     runner = make_runner()
     runner.register_extra_key_fn(
@@ -951,14 +951,14 @@ def test_key_padding_mask_routes_to_vanilla_and_is_honored(monkeypatch):
     correct destination is VANILLA. The output is checked against a masked
     SDPA reference so a mask that was routed but then dropped still fails.
     """
-    import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+    import tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend as sol_attn_mod
 
     monkeypatch.setattr(
         sol_attn_mod,
         "_sol_attn_run",
         lambda *a, **k: pytest.fail("sparse kernel ran on a masked call"),
     )
-    attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
+    attn = SOLCuTeDSLAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = None
     calls = {"vanilla": 0}
     real = attn._vanilla.forward
@@ -991,14 +991,14 @@ def test_causal_mask_routes_to_dense_and_is_honored(monkeypatch):
     device it is `_sdpa`, which previously dropped it. Either way the result
     must match a causal reference.
     """
-    import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+    import tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend as sol_attn_mod
 
     monkeypatch.setattr(
         sol_attn_mod,
         "_sol_attn_run",
         lambda *a, **k: pytest.fail("sparse kernel ran on a causal call"),
     )
-    attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
+    attn = SOLCuTeDSLAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = None
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 64, 2, 128, dtype=torch.float32) for _ in range(3))
@@ -1012,7 +1012,7 @@ def test_causal_mask_routes_to_dense_and_is_honored(monkeypatch):
 
 def test_unmasked_self_attention_is_still_served():
     """The routing change must not touch the measured path: no mask, sparse."""
-    attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
+    attn = SOLCuTeDSLAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = None
     q = k = torch.randn(1, 64, 2, 128, dtype=torch.bfloat16)
     assert attn._can_serve(q, k)
