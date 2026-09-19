@@ -32,6 +32,31 @@ llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8')
 llm.generate("Hello, my name is")
 ```
 
+#### W4A16 GPTQ on the PyTorch backend
+
+The PyTorch backend loads dense Hugging Face GPTQ checkpoints with 4-bit
+weights, a group size of 64 or 128, and `desc_act=false`. Both the standard
+`gptq` and `gptq_v2` checkpoint formats are accepted. Activations use FP16 or
+BF16; the weights remain packed INT4 during inference.
+
+```python
+from tensorrt_llm import LLM
+
+llm = LLM(model="/path/to/hf-gptq-checkpoint", dtype="float16")
+llm.generate("Hello, my name is")
+```
+
+The checkpoint's `config.json` must include its Hugging Face
+`quantization_config`. Conversion of `qweight`, `qzeros`, `scales`, and
+optional `g_idx` happens while loading, before tensor-parallel slicing and
+fusing Q/K/V or gate/up projections. No separate checkpoint conversion is
+required. Tensor-parallel input shards must contain complete quantization groups.
+
+Activation-order checkpoints, prepacked Marlin formats, dynamic
+per-layer quantization, selective `modules_in_block_to_quantize`, quantized
+`lm_head`, and partial weight updates are not supported. Modules listed in
+`modules_to_not_convert` and `lm_head` stay unquantized.
+
 #### FP8 KV Cache
 
 ```{note}

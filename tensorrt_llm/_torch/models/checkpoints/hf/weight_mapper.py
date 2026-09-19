@@ -18,8 +18,10 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..base_weight_mapper import BaseWeightMapper
+from .gptq import convert_gptq_weights
 
 
 @register_mapper("MX")
@@ -29,6 +31,7 @@ class HfWeightMapper(BaseWeightMapper):
     def __init__(self):
         super().__init__()
         self._callbacks = [
+            self._convert_gptq_weights,
             self._duplicate_kv_weights,
         ]
 
@@ -86,6 +89,36 @@ class HfWeightMapper(BaseWeightMapper):
             return config.num_key_value_heads
         return config.num_attention_heads
 
+    def is_special_instance_module(self, module: nn.Module) -> bool:
+        from tensorrt_llm._torch.modules.linear import Linear
+
+        return (isinstance(module, Linear) and module.quant_config is not None
+                and module.quant_config.quant_algo == QuantAlgo.W4A16_GPTQ)
+
+    def handle_special_instance_module(
+            self,
+            module: nn.Module,
+            module_name: str,
+            module_weights: Mapping[str, torch.Tensor],
+            allow_partial_loading: bool = False) -> None:
+        if allow_partial_loading:
+            raise ValueError("GPTQ does not support partial weight loading")
+        weights = self._convert_gptq_weights(module, module_name,
+                                             dict(module_weights))
+        module.load_weights(weights=[weights])
+
+    def _convert_gptq_weights(
+            self, module: nn.Module, new_name: str,
+            weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        quant_config = getattr(module, "quant_config", None)
+        if (quant_config is None
+                or quant_config.quant_algo != QuantAlgo.W4A16_GPTQ):
+            return weights
+        hf_quant_config = self.model.config.quantization_config
+        return convert_gptq_weights(
+            weights, quant_config.group_size,
+            hf_quant_config.get("checkpoint_format", "gptq"))
+
     def _duplicate_kv_weights(
             self, module: nn.Module, new_name: str,
             weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -103,6 +136,9 @@ class HfWeightMapper(BaseWeightMapper):
             duplicated_keys = ["weight", "bias"]
             if module.quant_config.quant_mode.has_nvfp4():
                 duplicated_keys.append("weight_scale")
+
+            if module.quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
+                duplicated_keys.extend(["weight_scale", "weight_zero"])
 
             processed_weights = {
                 k:
