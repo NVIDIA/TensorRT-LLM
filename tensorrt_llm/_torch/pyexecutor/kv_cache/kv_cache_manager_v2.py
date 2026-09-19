@@ -3183,22 +3183,19 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_draft_block_table(self, request_ids: List[int]) -> torch.Tensor:
         """Current rank-local page mappings; unused tail entries point to page zero."""
-        layer_id = self.layer_offsets[self.draft_layer_ids[0]]
-        pool_id = self.impl.get_layer_group_id(layer_id)
-        scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
-        table = torch.zeros((len(request_ids), self.max_blocks_per_seq), dtype=torch.int32)
-        for row, request_id in enumerate(request_ids):
+        for request_id in request_ids:
             cache = self.kv_cache_map.get(request_id)
             if cache is None or not cache.is_active:
                 raise ValueError(f"Standalone draft request {request_id} has no active cache")
-            indices = cache.get_base_page_indices(pool_id)[: cache.num_blocks]
+        batch_indices = self.get_batch_cache_indices(request_ids, self.draft_layer_ids[0])
+        table = torch.zeros((len(request_ids), self.max_blocks_per_seq), dtype=torch.int32)
+        for row, indices in enumerate(batch_indices):
+            cache = self.kv_cache_map[request_ids[row]]
             if len(indices) != cache.num_blocks or len(indices) > self.max_blocks_per_seq:
                 raise ValueError("Standalone draft cache has an incomplete or oversized page table")
             if any(index == BAD_PAGE_INDEX for index in indices):
                 raise ValueError("Standalone full-attention draft cache contains missing pages")
-            table[row, : len(indices)] = torch.tensor(
-                [int(index) * int(scale) // 2 for index in indices], dtype=torch.int32
-            )
+            table[row, : len(indices)] = torch.tensor(indices, dtype=torch.int32)
         return table
 
     def get_draft_history(self, request_id: int) -> Optional[StandaloneDraftHistory]:

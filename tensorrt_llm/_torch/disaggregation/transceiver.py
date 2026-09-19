@@ -590,6 +590,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # metadata crosses the wire; the manager retains the receiver's request/page map.
             self._kv_cache_manager.restore_draft_history(req.py_request_id, history)
 
+    def _prepare_received_history(self, session: RxSessionBase, req: LlmRequest) -> None:
+        if self._need_aux_transfer(req):
+            self._apply_aux(session, req)
+        self._assert_disagg_history_declared(req)
+        self._restore_draft_history(req)
+
     def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
         if not getattr(self, "_fp4_mla_bridge_enabled", False):
             return True
@@ -1083,10 +1089,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.set_kv_cache_size(
                     self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
                 )
-                if self._need_aux_transfer(req):
-                    self._apply_aux(session, req)
-                self._assert_disagg_history_declared(req)
-                self._restore_draft_history(req)
+                self._prepare_received_history(session, req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -1297,12 +1300,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req = self._recv_reqs[rid]
                 if has_draft_history:
                     try:
-                        self._apply_aux(session, req)
-                        self._assert_disagg_history_declared(req)
                         # Restore also validates the receiver's allocation and page map.
                         # A peer failure below leaves this request unschedulable; its
                         # ordinary failure cleanup releases any restored history and KV.
-                        self._restore_draft_history(req)
+                        self._prepare_received_history(session, req)
                     except (ValueError, RuntimeError) as error:
                         logger.warning(
                             f"Disagg draft history validation FAILED rank={self._dist.rank} "
@@ -1357,11 +1358,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = self._recv_reqs[rid]
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
-            if not has_draft_history and self._need_aux_transfer(req):
-                self._apply_aux(session, req)
             if not has_draft_history:
-                self._assert_disagg_history_declared(req)
-                self._restore_draft_history(req)
+                self._prepare_received_history(session, req)
             self._close_session_or_raise(session, rid, "completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]

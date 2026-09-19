@@ -348,15 +348,17 @@ class DFlashWorker(SpecWorkerBase):
     def _has_unified_draft_cache(self) -> bool:
         return getattr(getattr(self, "_ctx_kv_manager", None), "draft_layout", None) is not None
 
-    def _restore_managed_slots(self, request_ids: list[int], num_contexts: int) -> None:
-        """Bind generation requests after initialization or a manager replacement.
+    def _prepare_managed_history(self, request_ids: list[int]) -> None:
+        """Restore each request's committed history before this forward's writes.
 
         Metadata preparation precedes lazy buffer binding. That binding can
         replace an estimation manager and clear its staging slots, so generation
         must rebind here even when metadata preparation already assigned slots.
+        Context requests also restore here so continuation and restart detection
+        use the same authoritative state as generation.
         """
         updates = {self._dummy_slot: 0}
-        for request_id in request_ids[num_contexts:]:
+        for request_id in request_ids:
             if (
                 request_id != ATTENTION_DP_DUMMY_REQUEST_ID
                 and request_id < self._graph_dummy_id_floor
@@ -377,20 +379,6 @@ class DFlashWorker(SpecWorkerBase):
                 device=self._batch_to_slot.device,
             )
         )
-
-    def _store_managed_context_kv(
-        self, k: torch.Tensor, v: torch.Tensor, rows: torch.Tensor, positions: torch.Tensor
-    ) -> None:
-        """Write projected accepted features to the authoritative draft pages.
-
-        K/V have shape [tokens, layers, heads, head_dim]. Rows address this
-        iteration's request table, independently of the worker's staging slots.
-        """
-        pages = self._ctx_block_tables[rows, positions // self._ctx_page_size].long()
-        offsets = positions % self._ctx_page_size
-        for layer_idx, pool in enumerate(self._ctx_kv_buf):
-            pool[pages, 0, :, offsets, :] = k[:, layer_idx]
-            pool[pages, 1, :, offsets, :] = v[:, layer_idx]
 
     def _gather_managed_context(self, request_ids: list[int]) -> None:
         """Refresh VANILLA's dense input staging from manager-owned history.
@@ -716,6 +704,13 @@ class DFlashWorker(SpecWorkerBase):
                 dtype=torch.int32,
                 device="cuda",
             )
+            max_blocks = draft_kv_cache_manager.max_blocks_per_seq
+            self._ctx_block_indptr = torch.arange(
+                0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
+            )
+            self._ctx_kv_last_page_len = torch.full(
+                (num_slots,), self._ctx_page_size, dtype=torch.int32, device="cuda"
+            )
             if self._dflash_attention_backend == "VANILLA":
                 # Dense FlashAttention inputs are transient forward staging;
                 # every history read is refreshed from the authoritative pool.
@@ -851,22 +846,7 @@ class DFlashWorker(SpecWorkerBase):
                 return None
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            history = (
-                self._ctx_kv_manager.get_draft_history(req_id)
-                if self._has_unified_draft_cache() and not reset
-                else None
-            )
-            if history is None:
-                clear(slot)
-            else:
-                # The receiving manager owns validity. A new local staging
-                # slot must preserve it, regardless of the sender's slot ID.
-                if updates is None:
-                    self._write_ctx_len({slot: history.valid_length})
-                else:
-                    updates[slot] = history.valid_length
-                    self._ctx_len_host[slot] = history.valid_length
-                self._req_ctx_pos[req_id] = history.position
+            clear(slot)
         return self._req_to_slot[req_id]
 
     def _get_ctx_paged_append(self) -> Callable[..., None]:
@@ -891,12 +871,13 @@ class DFlashWorker(SpecWorkerBase):
         positions_i32 = positions.to(torch.int32)
         kv_indices, kv_indptr = self._ctx_paged_index_args()
         for layer_idx in range(k.size(1)):
+            pool = self._ctx_kv_buf[layer_idx]
             append_paged_kv_cache(
-                append_key=k[:, layer_idx].contiguous(),
-                append_value=v[:, layer_idx].contiguous(),
+                append_key=k[:, layer_idx].to(pool.dtype).contiguous(),
+                append_value=v[:, layer_idx].to(pool.dtype).contiguous(),
                 batch_indices=rows_i32,
                 positions=positions_i32,
-                paged_kv_cache=self._ctx_kv_buf[layer_idx],
+                paged_kv_cache=pool,
                 kv_indices=kv_indices,
                 kv_indptr=kv_indptr,
                 kv_last_page_len=self._ctx_kv_last_page_len,
@@ -1029,10 +1010,6 @@ class DFlashWorker(SpecWorkerBase):
             # request id reused after completion, a prefill restarted after
             # preemption -- has to start from a clean slot.
             previous_position = self._req_ctx_pos.get(req_id)
-            if self._has_unified_draft_cache():
-                history = self._ctx_kv_manager.get_draft_history(req_id)
-                if history is not None:
-                    previous_position = history.position
             reset = previous_position != first_pos
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
@@ -1079,14 +1056,10 @@ class DFlashWorker(SpecWorkerBase):
                     chunk_proj_cast, chunk_pos[:actual]
                 )
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                if self._has_unified_draft_cache():
-                    self._store_managed_context_kv(
-                        chunk_k,
-                        chunk_v,
-                        torch.full((actual,), i, dtype=torch.long, device="cuda"),
-                        torch.arange(cur, end, dtype=torch.long, device="cuda"),
-                    )
-                elif self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
+                if (
+                    self._has_unified_draft_cache()
+                    or self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS
+                ):
                     # Manager block tables are keyed by batch position, the
                     # private arena's by slot. See _ctx_paged_index_args.
                     row = i if self._ctx_block_tables is not None else slot
@@ -1161,7 +1134,7 @@ class DFlashWorker(SpecWorkerBase):
         )
         spec_metadata._dflash_worker = self
         if self._has_unified_draft_cache():
-            self._restore_managed_slots(spec_metadata.request_ids, num_contexts)
+            self._prepare_managed_history(spec_metadata.request_ids)
         # Before any store: prefill and decode both address pages through it.
         self._refresh_ctx_block_tables(attn_metadata, batch_size, spec_metadata.request_ids)
         if self._has_unified_draft_cache():
@@ -1673,13 +1646,10 @@ class DFlashWorker(SpecWorkerBase):
                 v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
-                if self._has_unified_draft_cache():
-                    rows_long = gen_rows_out.unsqueeze(1).expand(-1, K + 1).reshape(-1)
-                    self._store_managed_context_kv(k_new, v_new, rows_long, col_long)
-                    if self._dflash_attention_backend == "VANILLA":
-                        self._ctx_k_buf[slot_long, :, col_long] = k_new
-                        self._ctx_v_buf[slot_long, :, col_long] = v_new
-                elif self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
+                if (
+                    self._has_unified_draft_cache()
+                    or self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS
+                ):
                     if self._ctx_block_tables is not None:
                         # Batch positions of the gen requests, matching the
                         # per-request block table's row order.
@@ -1687,7 +1657,7 @@ class DFlashWorker(SpecWorkerBase):
                     else:
                         rows_long = slot_long
                     self._store_context_kv_paged(k_new, v_new, rows_long, col_long)
-                else:  # VANILLA DFlash backend (FlashAttention)
+                if self._dflash_attention_backend == "VANILLA":
                     self._ctx_k_buf[slot_long, :, col_long] = k_new
                     self._ctx_v_buf[slot_long, :, col_long] = v_new
 
