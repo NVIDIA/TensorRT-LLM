@@ -512,7 +512,9 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             return False
 
         return (
-            gate_up_proj.use_cute_dsl_blockscaling_mm
+            # Same predicate the weight transform uses, so dispatch can never
+            # consume a layout the loader did not produce.
+            gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell()
             and gate_up_proj.has_nvfp4
             and not gate_up_proj.has_bias
             and self._is_cute_dsl_swiglu_layout_compatible(

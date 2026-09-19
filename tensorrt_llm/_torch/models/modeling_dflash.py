@@ -625,6 +625,10 @@ class DFlashForCausalLM(nn.Module):
             )
 
     @property
+    def is_dflash2(self) -> bool:
+        return self._is_dflash2
+
+    @property
     def has_block_conv(self) -> bool:
         return self.attention_convs is not None
 
@@ -1108,6 +1112,39 @@ class DFlashForCausalLM(nn.Module):
             return False, (sliding_window - 1, sliding_window - 1)
         return True, (sliding_window - 1, 0)
 
+    def _resolve_block_attention(self, layer_idx: int) -> tuple[bool, tuple[int, int]]:
+        causal, window_size = self._get_attention_mask_args(layer_idx)
+        swa_window = (
+            self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
+        )
+        if swa_window != (-1, -1):
+            window_size = swa_window
+        return causal, window_size
+
+    def validate_block_attention_windows(self) -> None:
+        """Refuse windows the TRTLLM block-decode kernel cannot apply.
+
+        TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
+        rejects ``causal=False`` with any finite ``window_left`` outright. A
+        non-causal windowed layer must therefore run on VANILLA or FA4, which
+        take a two-sided window.
+        """
+        if self.dflash_attention_backend != "TRTLLM":
+            return
+        num_layers = getattr(self.config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = len(self.model.layers)
+        for layer_idx in range(num_layers):
+            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
+            if causal or window_left < 0:
+                continue
+            raise ValueError(
+                f"DFlash draft layer {layer_idx} attends non-causally within a "
+                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
+                "attention backend does not support non-causal sliding-window "
+                "attention. Use attention_backend=VANILLA or FA4."
+            )
+
     def _prepare_dflash_trtllm_gen_buffers(
         self,
         dtype: torch.dtype,
@@ -1454,12 +1491,7 @@ class DFlashForCausalLM(nn.Module):
                 v_noise_bshd = v_noise_all.reshape(B, block_size, num_kv_heads_per_rank, head_dim)
 
             # Per-layer view into the pooled ctx cache.
-            causal, window_size = self._get_attention_mask_args(layer_idx)
-            swa_window = (
-                self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
-            )
-            if swa_window != (-1, -1):
-                window_size = swa_window
+            causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
                 trtllm_gen_ops.append_paged_kv_cache(

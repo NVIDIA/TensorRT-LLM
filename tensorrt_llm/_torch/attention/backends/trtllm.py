@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 
@@ -47,6 +47,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
+from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
@@ -69,6 +70,23 @@ def _resolve_skip_correction_threshold(threshold: float,
         key="skip_correction_unsupported_sm",
     )
     return 0.0
+
+
+def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
+                             sm_version: int) -> bool:
+    uses_spcompress = bool(
+        isinstance(sparse_params, SkipSoftmaxParams)
+        and sparse_params.uses_spcompress)
+    if not uses_spcompress:
+        return False
+    if sm_version == 107:
+        return True
+    logger.warning_once(
+        "spcompress is supported only on SM107; "
+        f"disabling it on SM{sm_version}.",
+        key="uses_spcompress_unsupported_sm",
+    )
+    return False
 
 
 @functools.cache
@@ -102,6 +120,7 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
+    workspace_reclaimable: bool = field(default=True, init=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -212,6 +231,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _mla_ctx_cu_seqlens_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
+    _fp4_mla_fp8_context_state: Optional[Tuple[Any, Any]] = field(init=False,
+                                                                  default=None,
+                                                                  repr=False,
+                                                                  compare=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
@@ -682,6 +705,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return None
 
     def prepare(self) -> None:
+        # The FP8 scratch metadata view is shared by every local FP4 MLA layer
+        # in one eager context forward and must be rebuilt for the next batch.
+        self._fp4_mla_fp8_context_state = None
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
@@ -1200,7 +1226,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Args:
             batch_size: int, the number of requests in the batch.
             is_spec_decoding_enabled: bool, whether the attention need to be spec_decoding mode, which is determined by attention_need_spec_dec_mode() function.
-            is_spec_dec_tree: bool, whether the spec-dec mode is a tree, i.e., static tree or dynamic tree. For linear-tree, it is always False.
+            is_spec_dec_tree: bool, whether the spec-dec mode is a tree, i.e., dynamic tree. For linear-tree, it is always False.
             is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
             max_draft_len: int, the number of the draft layers.
             max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
@@ -1226,7 +1252,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # on the C++ ``layer_idx == 0`` fallback to rebuild the target mask:
         # the dynamic draft loop clears that mask before the next target step.
         self.force_prepare_spec_dec_tree_mask = is_spec_dec_dynamic_tree
-        # Forward static tree length to FMHA kernel selection.
+        # Forward the tree length to FMHA kernel selection.
         self.max_total_draft_tokens = max_total_draft_tokens
 
         # Parameters can be fixed and not changed during runtime if the
@@ -1238,28 +1264,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
             if is_spec_dec_tree and self.spec_decoding_position_offsets is None:
-                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
-                    # Dynamic tree: use _internal_buf_dim which may be larger
-                    # than max_total_draft_tokens+1 to accommodate K*max_draft_len
-                    buf_dim = spec_tree_manager._internal_buf_dim
-                    # Dynamic tree: 1D layout for flexible view() in drafting loop
-                    self.spec_decoding_position_offsets = torch.empty(
-                        (self.max_num_requests * buf_dim, ),
-                        dtype=torch.int,
-                        device='cuda',
-                    )
-                else:
-                    # Static tree: keep 2D layout
-                    self.spec_decoding_position_offsets = torch.empty(
-                        [self.max_num_requests, max_total_draft_tokens + 1],
-                        dtype=torch.int,
-                        device='cuda',
-                    )
+                # Dynamic tree: use _internal_buf_dim which may be larger
+                # than max_total_draft_tokens+1 to accommodate K*max_draft_len.
+                # 1D layout for flexible view() in the drafting loop.
+                buf_dim = spec_tree_manager._internal_buf_dim
+                self.spec_decoding_position_offsets = torch.empty(
+                    (self.max_num_requests * buf_dim, ),
+                    dtype=torch.int,
+                    device='cuda',
+                )
             if is_spec_dec_tree and self.spec_decoding_packed_mask is None:
-                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
-                    buf_dim = spec_tree_manager._internal_buf_dim
-                else:
-                    buf_dim = max_total_draft_tokens + 1
+                buf_dim = spec_tree_manager._internal_buf_dim
                 # Zero-init: dynamic-tree dst has inner dim
                 # ceil(buf_dim/32) but only ceil((max_total_draft_tokens+1)/32)
                 # is written each step. Unwritten cols would otherwise feed the
@@ -1331,25 +1346,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
                 cpp_query_len = n_dt
 
-            # Case 2: static tree (target model only)
-            elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert spec_metadata.spec_dec_mode.is_eagle3_one_model(
-                ), "Tree decoding is only supported for Eagle3 now"
-                assert not getattr(spec_metadata, 'is_draft_model', False), (
-                    "Static tree spec-dec params are only prepared for the target model"
-                )
-
-                # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
-                self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                    spec_tree_manager.spec_dec_position_offsets[0, :],
-                    non_blocking=True)
-                self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                    spec_tree_manager.spec_dec_packed_mask[0, :, :],
-                    non_blocking=True)
-                self.spec_decoding_generation_lengths[:batch_size].fill_(
-                    spec_tree_manager.max_total_draft_tokens + 1)
-
-            # Case 3: linear tree
+            # Case 2: linear tree
             else:
                 # Currently dynamic draft length is only supported for linear tree
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
@@ -1414,6 +1411,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            sparse_params (SparseParams): Optional sparse-attention backend parameters
+                (e.g. skip-softmax). Algorithm-specific fields are documented on the
+                corresponding ``SparseParams`` subclass.
             kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
                 values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
                 torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
@@ -1449,6 +1449,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             skip_correction_threshold,
             get_sm_version(),
             is_mla=self.is_mla_enable)
+        self.uses_spcompress = _resolve_uses_spcompress(sparse_params,
+                                                        get_sm_version())
 
         if self.is_mla_enable:
             self.q_lora_rank = self.mla_params.q_lora_rank
@@ -1625,6 +1627,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx = metadata.kv_cache_manager.layer_offsets[
             self.layer_idx]
         return self.local_layer_idx
+
+    def get_fp4_mla_local_layer_idx(self,
+                                    metadata: TrtllmAttentionMetadata) -> int:
+        """Return the compact index used by FP4 MLA-only side pools."""
+        local_layer_idx = self.get_local_layer_idx(metadata)
+        if metadata.kv_cache_manager is None:
+            return local_layer_idx
+        to_compact = getattr(metadata.kv_cache_manager,
+                             "_fp4_mla_compact_layer_idx", None)
+        if not callable(to_compact):
+            raise RuntimeError(
+                "FP4 MLA requires a cache manager with compact layer mapping.")
+        return to_compact(local_layer_idx)
 
     def use_nvfp4_output(
         self,
@@ -1842,7 +1857,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
 
         has_q_only = False
-        if not self.is_mla_enable and not metadata.is_cross and k is None and v is None:
+        if self.is_mla_enable:
+            forward_args.is_fused_qkv = False
+            forward_args.update_kv_cache = True
+            has_q_only = k is None and v is None
+        elif not metadata.is_cross and k is None and v is None:
             q_hidden_size = self.num_heads * self.head_dim
             qkv_hidden_size = q_hidden_size + 2 * self.num_kv_heads * self.head_dim
             has_q_only = q.size(-1) == q_hidden_size
@@ -2008,19 +2027,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
+            assert not forward_args.is_fused_qkv
             sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
             is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
             ) > 0
             if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
-                assert forward_args.is_fused_qkv
+                assert k is None and v is None
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
             elif attention_input_type == AttentionInputType.context_only:
-                assert not forward_args.is_fused_qkv
+                assert k is not None and v is not None
                 qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                     self.qk_rope_head_dim)
             elif attention_input_type == AttentionInputType.generation_only:
-                assert forward_args.is_fused_qkv
+                assert k is None and v is None
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
             else:
@@ -2093,6 +2113,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
+        if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
+            # Conservatively disable reclamation for metadata used by graphs
+            # or backends that can retain staged workspace state.
+            metadata.workspace_reclaimable = False
         try:
             fmha.forward(q, k, v, metadata, forward_args)
         except RuntimeError as exc:

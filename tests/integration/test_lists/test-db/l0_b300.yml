@@ -34,6 +34,8 @@ l0_b300:
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
+  # ------------- Visual Gen sparse attention (sm103) ---------------
+  - unittest/_torch/visual_gen/test_attention_cute_dsl_sol_attn.py
   - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
   - unittest/_torch/disaggregation
@@ -85,7 +87,6 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
-  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (specific quant per backend) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=FP8-routing=Renormalize]

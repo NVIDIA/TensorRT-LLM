@@ -4,7 +4,6 @@
 
 import ast
 import inspect
-from dataclasses import fields
 from unittest.mock import Mock
 
 import pytest
@@ -12,7 +11,6 @@ import pytest
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.orchestration import interfaces as interfaces_module
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    DisaggLoopDelegates,
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
@@ -37,20 +35,6 @@ def _public_methods(cls) -> set:
     }
 
 
-def _delegating_coordinator(delegates: DisaggLoopDelegates) -> DisaggTransferCoordinator:
-    return DisaggTransferCoordinator(
-        transceiver=Mock(),
-        transfer_manager=Mock(),
-        kv_cache_manager=Mock(),
-        dist=Mock(),
-        effects=Mock(spec=ExecutorEffects),
-        registry=Mock(),
-        enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
-        delegates=delegates,
-    )
-
-
 @pytest.mark.parametrize("module", [coordinator_module, interfaces_module])
 def test_orchestration_modules_do_not_depend_on_py_executor(module) -> None:
     """The coordinator must be constructible and testable without PyExecutor."""
@@ -67,13 +51,15 @@ def test_orchestration_modules_do_not_depend_on_py_executor(module) -> None:
 
 def test_executor_facing_surface_is_a_closed_set() -> None:
     """The executor-owned behavior the coordinator can trigger is a closed set:
-    four effects plus one registry mutation. Growing it is a design decision,
+    six effects plus one registry mutation. Growing it is a design decision,
     not a convenience."""
     assert _public_methods(ExecutorEffects) == {
         "terminate_request",
         "stage_transfer_response",
         "fail_requests",
         "fail_fatal",
+        "prepare_gen_resources",
+        "revert_ctx_alloc",
     }
     assert _public_methods(ActiveRequestRegistry) == {
         "active_requests",
@@ -83,31 +69,19 @@ def test_executor_facing_surface_is_a_closed_set() -> None:
     }
 
 
-@pytest.mark.parametrize("name", [f.name for f in fields(DisaggLoopDelegates)])
-def test_delegated_methods_forward_to_their_own_delegate(name: str) -> None:
-    """Each still-delegated entry point must reach exactly its own delegate with
-    the arguments unchanged; a cross-wired or dropped call changes loop behavior
-    and may break rank symmetry for collective-sensitive entry points."""
-    delegates = DisaggLoopDelegates(**{f.name: Mock() for f in fields(DisaggLoopDelegates)})
-    coordinator = _delegating_coordinator(delegates)
-    method = getattr(coordinator, name)
-    args = [object() for _ in inspect.signature(method).parameters]
-
-    result = method(*args)
-
-    getattr(delegates, name).assert_called_once_with(*args)
-    for other in fields(DisaggLoopDelegates):
-        if other.name != name:
-            getattr(delegates, other.name).assert_not_called()
-    expected = getattr(delegates, name).return_value if name == "admit" else None
-    assert result is expected
-
-
 def test_noop_coordinator_admits_everything_unchanged() -> None:
     """Without a transceiver, scheduler-fitting gen-init requests must pass
     through unfiltered and never report a transfer-budget block."""
     fitting = [object(), object()]
     assert NoopDisaggCoordinator().admit(fitting) == (fitting, False)
+
+
+def test_noop_coordinator_has_no_completed_receives_to_finish() -> None:
+    """Without a transceiver no receive can complete: the query is empty and
+    finishing is declined, so the executor never runs its receive tail."""
+    noop = NoopDisaggCoordinator()
+    assert noop.completed_gen_receives(Mock(generation_requests=[Mock()])) == []
+    assert noop.try_finish_gen_receive(Mock()) is False
 
 
 def test_noop_coordinator_overrides_every_entry_point() -> None:
@@ -118,7 +92,7 @@ def test_noop_coordinator_overrides_every_entry_point() -> None:
         for name in _public_methods(DisaggTransferCoordinator)
         if name not in vars(NoopDisaggCoordinator)
     }
-    assert inherited <= {"admit"} | set(f.name for f in fields(DisaggLoopDelegates)), inherited
+    assert inherited == set(), inherited
 
 
 def test_noop_coordinator_accepts_every_loop_call() -> None:

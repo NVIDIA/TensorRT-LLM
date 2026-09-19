@@ -61,7 +61,8 @@ Attention-visible GPU layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 specialized sparse cache | Not supported |
+| DeepSeek-V4 CSA cache | Supported; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly |
+| DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++
 KVCacheManagerV2, and an SM100 or SM103 GPU. Hot Attention KV can use FP16,
@@ -88,6 +89,7 @@ families:
 * Qwen3.5 family
 * GLM family, including GLM-5.2
 * DeepSeek-R1 family
+* DeepSeek-V4 family
 
 This is a tested-model list, not an exhaustive support list. Other models that
 use the supported cache types above are expected to work, subject to their
@@ -289,6 +291,43 @@ that the worker migrated a Page to its cold tier. This configuration
 demonstrates disaggregated serving. Enable block reuse and use a workload with
 reusable prefixes when measuring cache-capacity and hit-rate benefits.
 
+## DeepSeek-V4
+
+DeepSeek-V4 keeps its compressed sparse attention (CSA) cache as one entry per
+four tokens, each entry a 512-element row: 448 elements without positional
+encoding (NoPE) and 64 with it (RoPE), plus an indexer cache. NVFP4 cold-page
+compression encodes the 448 NoPE elements of every row as NVFP4 data with block
+scales and copies the RoPE elements and the indexer cache as they are. The
+sliding-window, HCA, and compressor caches of the model are preserved
+losslessly in their own lifecycles.
+
+The same two configuration blocks as for the other models enable it. The
+settings below were validated with DeepSeek-V4-Flash on one node (TP=4, EP=4,
+Attention DP) and with DeepSeek-V4-Pro in disaggregated serving on GB300:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  dtype: fp8
+  enable_block_reuse: true
+  tokens_per_block: 128
+  host_cache_size: 193273528320   # 180 GiB per rank; size it to the host memory available
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+```
+
+DeepSeek-V4 specific requirements:
+
+* `tokens_per_block` must be 128 or 256, the values the DeepSeek-V4 cache
+  manager accepts. The CSA cache holds one entry per four tokens, so a page of
+  128 tokens holds 32 CSA entries.
+* The FP8 `fp8_ds_mla` footer-scale KV layout is not supported; use the
+  ordinary FP8 or BF16 runtime KV layout.
+* If `scale_checkpoint_path` supplies ModelOpt KV scales, only the per-layer
+  K scale is applied to the CSA cache; the V scale is not used. Checkpoints
+  without scale metadata use identity scales and need no calibration.
+
 ## Verify Activation
 
 Configuration alone does not prove that a Page crossed the compression
@@ -326,8 +365,10 @@ kv_cache_compression_config:
 `scale_checkpoint_path` supplies optional metadata; it is not the model path.
 TensorRT-LLM does not derive KV activation scales from ordinary model weights.
 These per-layer K/V global scales apply to the conventional two-buffer K/V
-layout. Key-only MLA and draft-model cold Pages currently use identity global
-scales.
+layout. For the DeepSeek-V4 CSA cache, `scale_checkpoint_path` supplies only
+the per-layer K scale; the V scale is not used, and CSA cold Pages use identity
+scales when no scale metadata is supplied. Key-only MLA and draft-model cold
+Pages currently use identity global scales.
 
 ## Enablement Checklist
 

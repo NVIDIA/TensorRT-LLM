@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ast
 import functools
 import json
 import math
@@ -80,7 +79,6 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
-_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
@@ -114,7 +112,8 @@ def Field(default: Any = ...,
             telemetry=TelemetryField.categorical(...) to opt an otherwise unsafe
             categorical branch in with exact allowed values, or telemetry=False
             to opt a type-safe field out.
-        **kwargs: All other arguments passed to the original Pydantic Field
+        **kwargs: All other arguments passed to the original Pydantic Field.
+            json_schema_extra must be a dict when status or telemetry is set.
 
     Returns:
         A Pydantic FieldInfo object with extra metadata added to
@@ -125,7 +124,9 @@ def Field(default: Any = ...,
 
     if status is not None or telemetry_requested or telemetry_explicit_exclude:
         trtllm_schema_extra: dict[str, Any] = {}
-        json_schema_extra = kwargs.get('json_schema_extra', {})
+        json_schema_extra = kwargs.get('json_schema_extra')
+        if json_schema_extra is None:
+            json_schema_extra = {}
         if status is not None:
             trtllm_schema_extra['status'] = status
         if telemetry_explicit_exclude:
@@ -143,35 +144,21 @@ def Field(default: Any = ...,
                 raise TypeError(
                     "telemetry must be bool, dict, or TelemetryField")
             trtllm_schema_extra['telemetry'] = telemetry_metadata
-        if isinstance(json_schema_extra, dict):
-            json_schema_extra = {**json_schema_extra, **trtllm_schema_extra}
-        elif callable(json_schema_extra):
-            original_json_schema_extra = json_schema_extra
-
-            def merged_json_schema_extra(schema: dict[str, Any]) -> None:
-                original_extra = original_json_schema_extra(schema)
-                if isinstance(original_extra, dict):
-                    schema.update(original_extra)
-                schema.update(trtllm_schema_extra)
-
-            setattr(merged_json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR,
-                    trtllm_schema_extra)
-            json_schema_extra = merged_json_schema_extra
-        else:
-            json_schema_extra = trtllm_schema_extra
-        kwargs['json_schema_extra'] = json_schema_extra
+        if not isinstance(json_schema_extra, dict):
+            raise TypeError(
+                "json_schema_extra must be a dict when status or telemetry metadata is set"
+            )
+        kwargs['json_schema_extra'] = {
+            **json_schema_extra,
+            **trtllm_schema_extra
+        }
 
     return PydanticField(default, **kwargs)
 
 
 def _get_trtllm_json_schema_extra(field_info: Any) -> dict[str, Any]:
     json_schema_extra = getattr(field_info, "json_schema_extra", None)
-    if callable(json_schema_extra):
-        json_schema_extra = getattr(json_schema_extra,
-                                    _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
-    if isinstance(json_schema_extra, dict):
-        return json_schema_extra
-    return {}
+    return json_schema_extra if isinstance(json_schema_extra, dict) else {}
 
 
 class BaseCudaGraphConfig(StrictBaseModel):
@@ -859,7 +846,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     algorithm: Literal["minimax_m3"] = "minimax_m3"
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
-        description="Number of index-attention heads (per TP rank's view).",
+        description=
+        "Global checkpoint index-attention head count. Index heads shard with "
+        "their KV-head groups in both separate and fused projections.",
     )
     sparse_index_dim: int = Field(
         default=128,
@@ -899,6 +888,17 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "by the MSA implementation.",
         status="prototype",
     )
+    fuse_qkv_index_projection: bool = Field(
+        default=False,
+        description=
+        "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q "
+        "is sharded with the KV heads and index-K is replicated. MSA batches "
+        "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
+        "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
+        "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
+        "main KV cache.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -933,6 +933,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
             raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
                              "sparse_disable_index_value=True.")
+        if self.fuse_qkv_index_projection and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "the 'msa' implementation.")
+        if self.fuse_qkv_index_projection and self.indexer_kv_dtype != "fp8":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "indexer_kv_dtype='fp8'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -947,6 +955,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
         return MiniMaxM3SparseParams(
             num_index_heads=self.sparse_num_index_heads,
+            global_num_kv_heads=(
+                self.to_sparse_metadata_params(**kwargs).global_num_kv_heads
+                or None),
             sparse_index_dim=self.sparse_index_dim,
             block_size=self.sparse_block_size,
             topk=self.sparse_topk_blocks,
@@ -956,6 +967,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
             indexer_kv_dtype=self.indexer_kv_dtype,
+            fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1420,6 +1432,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description="Target sparsity for prefill and/or decode phases. "
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
+    uses_spcompress: bool = Field(
+        default=False,
+        description="Whether to enable spcompress (context phase, SM107 only).")
 
     @field_validator("target_sparsity")
     @classmethod
@@ -1500,7 +1515,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             is not None else SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 ckpt_sparse_attention_config=ckpt_sparse_attention_config))
-        return SkipSoftmaxParams(scheduler=scheduler)
+        return SkipSoftmaxParams(scheduler=scheduler,
+                                 uses_spcompress=self.uses_spcompress)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1602,8 +1618,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
-_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
-                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
+                      "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
 
 
@@ -2333,16 +2349,9 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
 
 class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Eagle"] = Field(default="Eagle")
-    eagle_choices: Optional[List[List[int]]] = Field(
-        default=None,
-        description=
-        "Static tree structure for draft token generation. Each sublist represents a path in the tree. Mutually exclusive with use_dynamic_tree."
-    )
     use_dynamic_tree: Optional[bool] = Field(
         default=False,
-        description=
-        "Whether to use dynamic tree (Eagle-2 algorithm). Mutually exclusive with eagle_choices."
-    )
+        description="Whether to use dynamic tree (Eagle-2 algorithm).")
     dynamic_tree_max_topK: Optional[int] = Field(
         default=None,
         description=
@@ -2366,22 +2375,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         default="llama3",
         description="The model architecture of the eagle3 model.")
 
-    @field_validator('eagle_choices', mode='before')
-    @classmethod
-    def validate_eagle_choices(cls, v):
-        if v is not None:
-            logger.warning(
-                "The eagle_choices/static tree feature is deprecated and will be removed in release 1.4."
-            )
-            if not isinstance(v, list):
-                if isinstance(v, str):
-                    v = ast.literal_eval(v.replace(" ", ""))
-                else:
-                    raise ValueError(
-                        "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
-                    )
-        return v
-
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
@@ -2391,28 +2384,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
             self.eagle3_layers_to_capture = {-1}
-
-        # Static tree logic
-        # Checks whether the input eagle choices is valid
-        # and reset the max_draft_len and num_eagle_layers if necessary
-        if self.eagle_choices is not None:
-            if self.use_dynamic_tree:
-                raise ValueError(
-                    "If eagle_choices is provided, use_dynamic_tree should be False"
-                )
-
-            # Get num_eagle_layers from eagle_choices
-            num_eagle_layers_from_choices = self.check_eagle_choices()
-            if num_eagle_layers_from_choices != self.num_eagle_layers:
-                logger.warning(
-                    f"Based on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
-                )
-                self.num_eagle_layers = num_eagle_layers_from_choices
-                self.max_draft_len = num_eagle_layers_from_choices
-
-            # Each draft node has a path(choice) from the root to it.
-            # So the number of choices also represents the number of max draft nodes.
-            self.max_total_draft_tokens = len(self.eagle_choices)
 
         # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
         # dynamic_tree_max_topK alone does not turn it on.
@@ -2425,9 +2396,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
         # Dynamic tree logic
         if self.use_dynamic_tree:
-            if self.eagle_choices is not None:
-                raise ValueError(
-                    "If use_dynamic_tree is True, eagle_choices should be None")
             if self.max_draft_len is None or self.max_draft_len <= 0:
                 raise ValueError(
                     "max_draft_len should be provided, which indicates the number of drafter layers"
@@ -2463,25 +2431,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("Draft model must be provided for EAGLE")
         return self
 
-    def check_eagle_choices(self):
-        # 1) Check connectivity
-        unique_choices = set(
-            tuple(sub_choice)
-            for sub_choice in self.eagle_choices)  # remove repeated choices
-        self.eagle_choices = sorted([list(t) for t in unique_choices],
-                                    key=lambda x: (len(x), x))  # sort choices
-        for choice in self.eagle_choices:
-            if len(choice) > 1:
-                assert choice[
-                    0:
-                    -1] in self.eagle_choices, f"Error: choice {choice} is not connected"
-
-        # 2) Get num_eagle_layers_from_choices
-        num_eagle_layers_from_choices = max(
-            len(choice) for choice in self.eagle_choices)
-
-        return num_eagle_layers_from_choices
-
     @functools.cached_property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
@@ -2500,9 +2449,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def is_linear_tree(self) -> bool:
-        if self.eagle_choices is None and self.use_dynamic_tree is False:
-            return True
-        return False
+        return not self.use_dynamic_tree
 
 
 class SAEnhancerConfig(StrictBaseModel):
@@ -2578,12 +2525,6 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
         init=False,
         description=
         "Internal field, not user-configurable. Fixed to 1 since this mode captures hidden states without draft token generation."
-    )
-    eagle_choices: Optional[List[List[int]]] = Field(
-        default=None,
-        init=False,
-        description=
-        "Internal field, not user-configurable. Always None since this mode does not use tree-based draft token structures."
     )
 
     _last_hidden_in_save: bool = PrivateAttr(default=True)

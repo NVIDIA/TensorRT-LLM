@@ -28,8 +28,8 @@ namespace kernels::moe_comm
 // Configuration constants
 static constexpr int kMaxTopK = 22;      // Maximum top-k experts per token
 static constexpr int kMaxPayloads = 4;   // Maximum number of different payload types
-static constexpr int kMaxRanks = 128;    // Maximum supported EP size (covers NVL72 with headroom)
-static constexpr int kRankMaskWords = 2; // uint64 words to hold the active-rank bitmask
+static constexpr int kMaxRanks = 256;    // Maximum supported EP size (covers NVL576 EP256)
+static constexpr int kRankMaskWords = 4; // uint64 words to hold the active-rank bitmask
                                          // (kRankMaskWords * 64 must be >= kMaxRanks)
 static_assert(kRankMaskWords * 64 >= kMaxRanks, "active_rank_mask too small for kMaxRanks");
 
@@ -115,7 +115,7 @@ struct DispatchKernelPointers
     int32_t invalid_expert_id;
 
     // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
-    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. Tokens routed to a masked
+    // Word w covers ranks 64*w..64*w+63 for w in [0, kRankMaskWords). Tokens routed to a masked
     // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped.
     // The local rank's own bit must always be set; this is checked at launch time.
     uint64_t active_rank_mask[kRankMaskWords];
@@ -220,7 +220,7 @@ struct MoeA2ADispatchParams
     // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
     // The mask is copied by value into kernel arguments. Rank-mask mode must reject
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
-    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
+    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -310,7 +310,7 @@ struct MoeA2ACombineParams
     // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
     // The mask is copied by value into kernel arguments. Rank-mask mode must reject
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
-    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
+    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};

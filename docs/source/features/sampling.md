@@ -185,7 +185,7 @@ modes.
     with `enable_penalty: true` in the speculative decoding config, because they need
     an occurrence workspace that is allocated up front. While the flag is off, a
     request that sets any of the three is rejected at admission rather than decoded
-    without them. Tree speculation (`eagle_choices` or a dynamic tree) is not
+    without them. Tree speculation (a dynamic tree) is not
     supported and such requests are rejected even when the flag is on. Only the
     target distribution is penalized; the draft model proposes from its unpenalized
     distribution, which leaves the sampled result unchanged but can lower the

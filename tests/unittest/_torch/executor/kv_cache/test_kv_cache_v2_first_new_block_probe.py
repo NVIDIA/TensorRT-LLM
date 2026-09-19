@@ -21,7 +21,7 @@ of that contract:
 
 * the probe marshals tokens and the reuse scope exactly like
   ``prepare_context_cache`` does, and
-* the key it selects is the one for the first block past the reusable prefix.
+* it forwards the core probe result without a second tree lookup.
 
 No GPU: the KV cache manager is stubbed down to the attributes both paths touch.
 """
@@ -32,11 +32,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kvcm_v2
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
-    KVCacheManagerV2,
-    _first_new_block_key,
-)
-from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 pytestmark = pytest.mark.cpu_only
 
@@ -46,7 +42,6 @@ TOKENS_PER_BLOCK = 4
 def make_stub_manager(
     tokens_per_block: int = TOKENS_PER_BLOCK,
     enable_block_reuse: bool = True,
-    num_reusable: int = 0,
     reuse_match_backoff: int = 0,
 ) -> KVCacheManagerV2:
     """A KVCacheManagerV2 reduced to what the two token paths need."""
@@ -70,10 +65,11 @@ def make_stub_manager(
     # per-request stats are opt-in and off in this stub's manager.
     mgr.is_draft = False
     mgr.enable_stats = False
+    mgr.is_estimating_kv_cache = False
     mgr._request_stats_enabled_ids = set()
     mgr._stream = Mock()
     mgr.impl = Mock()
-    mgr.impl.probe_reuse.return_value = num_reusable
+    mgr.impl.probe_first_new_block_key.return_value = b"probed-block-key"
     mgr.impl.create_kv_cache.return_value = Mock(num_committed_tokens=0)
     # Resume touches real CUDA state; the token marshalling is already done.
     mgr._resume_and_restore = lambda req_id, kv_cache: True
@@ -112,6 +108,10 @@ class StubRequest:
         self.multimodal_hashes = None
         self.multimodal_positions = None
         self.multimodal_lengths = None
+        self.multimodal_item_run_cu_offsets = None
+        self.multimodal_run_positions = None
+        self.multimodal_run_lengths = None
+        self.py_mm_run_metadata = None
 
     def get_tokens(self, beam=0):
         return list(self._tokens)
@@ -162,9 +162,11 @@ def prepared_tokens_and_scope(mgr, req):
 
 def probed_tokens_and_scope(mgr, req):
     """Tokens and reuse scope that the probe hands to the impl."""
-    mgr.impl.probe_reuse.reset_mock()
+    mgr.impl.probe_first_new_block_key.reset_mock()
     mgr.probe_first_new_block_key(req)
-    args, _ = mgr.impl.probe_reuse.call_args
+    mgr.impl.probe_first_new_block_key.assert_called_once()
+    mgr.impl.probe_reuse.assert_not_called()
+    args, _ = mgr.impl.probe_first_new_block_key.call_args
     scope, tokens = args[0], args[1]
     return list(tokens), scope
 
@@ -203,19 +205,49 @@ class TestTokenParity:
         assert tuple(probe_scope)[0] == 7
         assert tuple(probe_scope)[1] is not None
 
-    def test_cache_salt_changes_the_key(self):
+    def test_cache_salt_changes_the_scope(self) -> None:
         """Different reuse namespaces must not dedup against each other."""
         mgr = make_stub_manager()
-        plain = mgr.probe_first_new_block_key(make_request(range(20)))
-        salted = mgr.probe_first_new_block_key(make_request(range(20), cache_salt="tenant-a"))
-        assert plain is not None and salted is not None
-        assert plain != salted
+        _, plain = probed_tokens_and_scope(mgr, make_request(range(20)))
+        _, salted = probed_tokens_and_scope(mgr, make_request(range(20), cache_salt="tenant-a"))
+        assert tuple(plain) != tuple(salted)
 
-    def test_lora_id_changes_the_key(self):
+    def test_lora_id_changes_the_scope(self) -> None:
         mgr = make_stub_manager()
-        base = mgr.probe_first_new_block_key(make_request(range(20)))
-        lora = mgr.probe_first_new_block_key(make_request(range(20), lora_task_id=3))
-        assert base != lora
+        _, base = probed_tokens_and_scope(mgr, make_request(range(20)))
+        _, lora = probed_tokens_and_scope(mgr, make_request(range(20), lora_task_id=3))
+        assert tuple(base) != tuple(lora)
+
+    def test_request_changes_are_visible_to_next_probe(self) -> None:
+        mgr = make_stub_manager()
+        req = make_request(range(20))
+        before, _ = probed_tokens_and_scope(mgr, req)
+        req._tokens[0] = 999
+        after, _ = probed_tokens_and_scope(mgr, req)
+        assert after == [999] + before[1:]
+
+    @pytest.mark.parametrize("key", [None, bytes(range(32))])
+    def test_core_result_is_returned_without_a_second_lookup(self, key: bytes | None) -> None:
+        mgr = make_stub_manager()
+        mgr.impl.probe_first_new_block_key.return_value = key
+        assert mgr.probe_first_new_block_key(make_request(range(20))) is key
+        mgr.impl.probe_first_new_block_key.assert_called_once()
+        mgr.impl.probe_reuse.assert_not_called()
+
+    def test_multimodal_tokens_match_prepare_context(self) -> None:
+        mgr = make_stub_manager()
+        req = make_request(range(20))
+        req.multimodal_hashes = [[17] * 8]
+        req.multimodal_positions = [3]
+        req.multimodal_lengths = [2]
+        probed, _ = probed_tokens_and_scope(mgr, req)
+        prepared, _ = prepared_tokens_and_scope(mgr, req)
+        assert probed == prepared
+        assert isinstance(probed[3], bytes) and len(probed[3]) == 32
+        req.multimodal_hashes[0][0] = 19
+        changed, _ = probed_tokens_and_scope(mgr, req)
+        assert changed[3] != probed[3]
+        assert changed[:3] + changed[4:] == probed[:3] + probed[4:]
 
     def test_augmentation_call_matches_prepare_context(self):
         """Multimodal requests key on content digests, so the probe has to use
@@ -236,85 +268,33 @@ class TestTokenParity:
         assert calls[0] == calls[1]
 
 
-class TestKeySelection:
-    def test_key_is_the_block_after_the_reusable_prefix(self):
-        tokens = list(range(16))
-        scope = ReuseScope()
-        keys = [key for _, key in sequence_to_blockchain_keys(TOKENS_PER_BLOCK, scope, tokens)]
-        # keys[0] is the root digest; keys[i + 1] belongs to block i.
-        for num_reusable, expected_block in ((0, 0), (4, 1), (8, 2), (12, 3)):
-            assert (
-                _first_new_block_key(tokens, TOKENS_PER_BLOCK, scope, num_reusable)
-                == keys[expected_block + 1]
-            )
-
-    def test_partial_match_selects_the_block_being_completed(self):
-        tokens = list(range(16))
-        scope = ReuseScope()
-        keys = [key for _, key in sequence_to_blockchain_keys(TOKENS_PER_BLOCK, scope, tokens)]
-        # A mid-block match still leaves block 1 as the first one completed.
-        assert _first_new_block_key(tokens, TOKENS_PER_BLOCK, scope, 5) == keys[2]
-        assert _first_new_block_key(tokens, TOKENS_PER_BLOCK, scope, 7) == keys[2]
-
-    def test_none_when_next_block_is_partial(self):
-        scope = ReuseScope()
-        # 10 tokens, 4 per block: block 2 would hold only 2 tokens.
-        assert _first_new_block_key(list(range(10)), TOKENS_PER_BLOCK, scope, 8) is None
-
-    def test_none_when_everything_is_reusable(self):
-        scope = ReuseScope()
-        tokens = list(range(16))
-        assert _first_new_block_key(tokens, TOKENS_PER_BLOCK, scope, len(tokens)) is None
-
-    def test_truncation_is_exact(self):
-        """The key is hashed from a truncated prefix; that must equal the key
-        computed over the whole sequence."""
-        scope = ReuseScope(lora_id=2, salt=99)
-        short, long = list(range(8)), list(range(64))
-        assert _first_new_block_key(short, TOKENS_PER_BLOCK, scope, 0) == _first_new_block_key(
-            long, TOKENS_PER_BLOCK, scope, 0
-        )
-
-    def test_shared_prefix_yields_the_same_key(self):
-        """The property the scheduler relies on: two requests whose prompts
-        share the uncached prefix collide on the same key."""
-        scope = ReuseScope()
-        a = list(range(16)) + [100, 101]
-        b = list(range(16)) + [200, 201]
-        assert _first_new_block_key(a, TOKENS_PER_BLOCK, scope, 0) == _first_new_block_key(
-            b, TOKENS_PER_BLOCK, scope, 0
-        )
-
-    def test_diverging_prefix_yields_different_keys(self):
-        scope = ReuseScope()
-        a = [1, 2, 3, 4, 5, 6, 7, 8]
-        b = [1, 2, 3, 9, 5, 6, 7, 8]
-        assert _first_new_block_key(a, TOKENS_PER_BLOCK, scope, 0) != _first_new_block_key(
-            b, TOKENS_PER_BLOCK, scope, 0
-        )
-
-
 @pytest.mark.usefixtures("token_source")
 class TestGuards:
     def test_none_without_block_reuse(self):
         mgr = make_stub_manager(enable_block_reuse=False)
         assert mgr.probe_first_new_block_key(make_request(range(20))) is None
+        mgr.impl.probe_first_new_block_key.assert_not_called()
         mgr.impl.probe_reuse.assert_not_called()
 
     @pytest.mark.parametrize("num_tokens", [0, 1])
     def test_none_for_degenerate_prompts(self, num_tokens):
         mgr = make_stub_manager()
         assert mgr.probe_first_new_block_key(make_request(range(num_tokens))) is None
+        mgr.impl.probe_first_new_block_key.assert_not_called()
 
     def test_none_when_prompt_shorter_than_one_block(self):
         mgr = make_stub_manager()
+        mgr.impl.probe_first_new_block_key.return_value = None
         assert mgr.probe_first_new_block_key(make_request(range(TOKENS_PER_BLOCK))) is None
+        mgr.impl.probe_first_new_block_key.assert_called_once()
 
     def test_probe_does_not_create_a_kv_cache(self):
         """Read-only: the probe must not touch the tree or take a slot."""
         mgr = make_stub_manager()
         mgr.probe_first_new_block_key(make_request(range(20)))
         mgr.impl.create_kv_cache.assert_not_called()
+        mgr.index_mapper.add_new_sequence.assert_not_called()
+        mgr.impl.probe_reuse.assert_not_called()
         assert mgr.kv_cache_map == {}
 
 

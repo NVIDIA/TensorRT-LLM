@@ -122,6 +122,12 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
+    # Only TRTLLM attention borrows the managed paged context pool. VANILLA
+    # and FA4 keep context KV in worker-owned buffers; a second cache would
+    # reserve unused pages and impose an unrelated scheduler admission limit.
+    if (spec_config.spec_dec_mode.is_dflash()
+            and spec_config.attention_backend in ("VANILLA", "FA4")):
+        return False
     # The embedded DSpark draft owns a dedicated rolling-window cache in
     # DSv4DSparkWorker and never reads the paged draft KV cache that attention
     # metadata manages. A standalone DSpark drafter runs on DSparkWorker
@@ -462,7 +468,7 @@ class SpecMetadata:
     max_num_requests: int
     # The number of draft layers. (Also the number of draft tokens for the linear tree.)
     max_draft_len: int
-    # The max number of draft tokens for the static tree and dynamic tree   .
+    # The max number of draft tokens for the dynamic tree.
     max_total_draft_tokens: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
@@ -511,11 +517,9 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
-    # NOTE: For the linear tree, though it can be treated as a special case of static tree.
-    # NOTE: But we do not set `is_spec_dec_tree` to True for this cases.
-    # NOTE: i.e., for the linear tree, is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
-    # whether the spec-dec mode is a tree (can be static tree or dynamic tree).
+    # whether the spec-dec mode is a tree.
+    # NOTE: The linear tree is not treated as a tree here: for the linear tree,
+    # NOTE: is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
     is_spec_dec_tree: bool = False
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
@@ -1158,9 +1162,10 @@ class SpecMetadata:
 
             use_top_k = not is_greedy and top_k is not None and top_k > 0
 
-            normalized_temperature = (DISABLE_TEMP_VAL
-                                      if is_greedy or temperature is None
-                                      or temperature == 0 else temperature)
+            # The sentinel is one-hot under softmax, so it must not reach a
+            # non-greedy row; those resolve 1.0, as resolve_sampling_strategy does.
+            normalized_temperature = (DISABLE_TEMP_VAL if is_greedy else
+                                      (temperature or 1.0))
             normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
             normalized_top_p = (DISABLE_TOPP_VAL
                                 if is_greedy or top_p is None else top_p)
@@ -2678,6 +2683,23 @@ class SpecWorkerBase(nn.Module, ABC):
         """Execute guided decoder on target model logits if available."""
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
+
+    def _rollback_guided_decoder_after_verify(self, num_accepted_tokens):
+        """Restore the accepted grammar prefix after a one-shot draft step.
+
+        ``execute`` advances every matcher through the golden token and the
+        draft tokens the grammar accepts. Workers that draft through
+        ``execute_draft_batch(draft_step=0)`` undo the rejected suffix there.
+        Workers that draft in one shot never enter that loop, so they must
+        roll back here; otherwise their matchers keep tokens the target
+        rejected and the next target step masks from the wrong state.
+
+        Call this after the native drafting kernels are enqueued: the
+        rollback's host callbacks need the GIL, and a native call that
+        synchronizes the stream while holding it would stall against them.
+        """
+        if self.guided_decoder is not None:
+            self.guided_decoder.rollback_rejected_batch(num_accepted_tokens)
 
     def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens,
                                  batch_indices_cuda, batch_size,

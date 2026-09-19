@@ -1275,7 +1275,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        return LlmResponse(
+        response = LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,
             result=LlmResult(result,
@@ -1283,6 +1283,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                              is_final,
                              time_breakdown_metrics=time_breakdown_metrics),
             client_id=self.py_client_id) if len(result) > 0 else None
+        if response is not None:
+            response.result.cached_tokens = self.cached_tokens
+        return response
 
     @property
     def is_dummy(self):
@@ -1658,6 +1661,17 @@ def executor_request_to_llm_request(
             llm_request.create_child_request(child_id)
 
     return llm_request
+
+
+def rewind_context_after_cache_drop(request: LlmRequest,
+                                    tokens_per_block: int) -> None:
+    """Reset context progress after callers release the request's KV caches."""
+    request.set_prepopulated_prompt_len(0, tokens_per_block)
+    # Clearing prepopulation does not rewind the native context cursor.
+    request.context_current_position = 0
+    request.context_chunk_size = request.prompt_len
+    request.estimated_reusable_tokens = 0
+    request.py_ctx_pre_resize_cap = None
 
 
 def get_draft_token_length(request: LlmRequest) -> int:

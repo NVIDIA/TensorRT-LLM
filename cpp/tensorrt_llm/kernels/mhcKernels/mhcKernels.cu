@@ -27,6 +27,22 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::mhc
 {
 
+// Blackwell can issue two independent FP32 FMAs with one packed instruction.
+// Phase 2 always updates adjacent bf16 values with the same pre-mix scalar.
+__device__ __forceinline__ float2 mhcFmaF32x2(float2 const& a, float2 const& b, float2 const& c)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
+    float2 result;
+    asm volatile("fma.rn.f32x2 %0, %1, %2, %3;"
+                 : "=l"(reinterpret_cast<uint64_t&>(result))
+                 : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)),
+                 "l"(reinterpret_cast<uint64_t const&>(c)));
+    return result;
+#else
+    return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+
 // ===================================================================
 // Kernel 1: big_fuse — one CTA per token
 //
@@ -37,11 +53,11 @@ namespace kernels::mhc
 //  Phase 1a (warp 0, lanes 0-3): RMS norm + sigmoid → s_pre_mix, post_mix
 //  ── __syncthreads ──
 //  Phase 1b (warp 0, lanes 0-3) ‖ Phase 2 (remaining warps) — overlapped
-//    1b: parallel Sinkhorn (4 lanes, __shfl_xor col normalize) → comb_mix
+//    1b: one 4-element Sinkhorn row per lane → comb_mix
 //     2: stream residual × pre_mix → layer_input
 // ===================================================================
 
-template <int NUM_SPLITS, int BLOCK_SIZE, bool kFuseNorm = false>
+template <int NUM_SPLITS, int BLOCK_SIZE, bool kFuseNorm = false, bool kUseTma = false>
 __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __restrict__ y_acc,
     float const* __restrict__ r_acc, __nv_bfloat16 const* __restrict__ residual, float const* __restrict__ hc_scale,
     float const* __restrict__ hc_base, float* __restrict__ post_mix, float* __restrict__ comb_mix,
@@ -67,40 +83,73 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     cudaGridDependencySynchronize();
 #endif
 
+    // Small-M/BS512 specialization: issue one bulk asynchronous copy for the
+    // token's contiguous [4, hidden] residual before Phase 1a, then overlap it
+    // with RMS/sigmoid/Sinkhorn. Consumers wait on the mbarrier independently,
+    // so warp 0 can keep running Sinkhorn while the copy completes.
+    extern __shared__ __align__(16) unsigned char s_tma_residual_raw[];
+    __shared__ alignas(8) uint64_t s_tma_bar;
+    if constexpr (kUseTma)
+    {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        uint32_t const tma_bytes = HC_MULT * hidden_size * static_cast<uint32_t>(sizeof(__nv_bfloat16));
+        if (tid == 0)
+        {
+            uint32_t const bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&s_tma_bar));
+            uint32_t const dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(s_tma_residual_raw));
+            __nv_bfloat16 const* src = residual + static_cast<long long>(token) * HC_MULT * hidden_size;
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" : : "r"(bar_addr) : "memory");
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                         :
+                         : "r"(bar_addr), "r"(tma_bytes)
+                         : "memory");
+            asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                         :
+                         : "r"(dst_addr), "l"(reinterpret_cast<uint64_t>(src)), "r"(tma_bytes), "r"(bar_addr)
+                         : "memory");
+        }
+#endif
+    }
+
     __shared__ float s_pre_mix[HC_MULT];
 
     float cm[HC_MULT];
 
     // ---- Phase 1a (warp 0, lanes 0..3): split-K reduce → RMS norm → sigmoid ----
-    // Each lane handles one of the 4 hc_mult slots.
-    // Produces: s_pre_mix[4] (shared), post_mix[4] (global), cm[4×4] (registers).
+    // Keep one full comb row per lane: its four independent values provide ILP
+    // across Sinkhorn's reciprocal/shuffle dependency chains. Load only the
+    // six y values this lane actually consumes instead of materializing all 24.
     if (warp_id == 0 && lane < HC_MULT)
     {
         float r_val;
-        float y_local[HC_MULT3];
+        float y_pre = 0.0f;
+        float y_post = 0.0f;
+#pragma unroll
+        for (int k = 0; k < HC_MULT; k++)
+            cm[k] = 0.0f;
 
         if constexpr (NUM_SPLITS == 1)
         {
             r_val = r_acc[token];
             float const* y_row = y_acc + token * HC_MULT3;
+            y_pre = y_row[lane];
+            y_post = y_row[HC_MULT + lane];
 #pragma unroll
-            for (int c = 0; c < HC_MULT3; c++)
-                y_local[c] = y_row[c];
+            for (int k = 0; k < HC_MULT; k++)
+                cm[k] = y_row[2 * HC_MULT + lane * HC_MULT + k];
         }
         else
         {
-            // Reduce across split-K partials
             r_val = 0.0f;
-#pragma unroll
-            for (int c = 0; c < HC_MULT3; c++)
-                y_local[c] = 0.0f;
             for (int s = 0; s < NUM_SPLITS; s++)
             {
                 r_val += r_acc[s * M + token];
                 float const* y_row = y_acc + (static_cast<long long>(s) * M + token) * HC_MULT3;
+                y_pre += y_row[lane];
+                y_post += y_row[HC_MULT + lane];
 #pragma unroll
-                for (int c = 0; c < HC_MULT3; c++)
-                    y_local[c] += y_row[c];
+                for (int k = 0; k < HC_MULT; k++)
+                    cm[k] += y_row[2 * HC_MULT + lane * HC_MULT + k];
             }
         }
 
@@ -108,76 +157,60 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         float const rstd = rsqrtf(r_val / static_cast<float>(K) + rms_eps);
         float const s0 = hc_scale[0], s1 = hc_scale[1], s2 = hc_scale[2];
 
-        // y_local layout: [pre_mix(4) | post_mix(4) | comb_mix(4×4)]
-        // pre_mix: sigmoid(norm * scale0 + base) + eps → shared for Phase 2
-        float v = y_local[lane] * rstd * s0 + hc_base[lane];
+        float v = y_pre * rstd * s0 + hc_base[lane];
         s_pre_mix[lane] = 1.0f / (1.0f + expf(-v)) + hc_pre_eps;
 
-        // post_mix: sigmoid(norm * scale1 + base) * mult → global
-        v = y_local[HC_MULT + lane] * rstd * s1 + hc_base[HC_MULT + lane];
+        v = y_post * rstd * s1 + hc_base[HC_MULT + lane];
         post_mix[token * HC_MULT + lane] = 1.0f / (1.0f + expf(-v)) * hc_post_mult_value;
 
-        // comb_mix init: norm * scale2 + base → cm[4] per lane (one row of 4×4 matrix)
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
-            cm[k] = y_local[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
+            cm[k] = cm[k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
     }
 
     __syncthreads();
 
     // ---- Phase 1b (warp 0, lanes 0..3): Sinkhorn normalization ----
-    // Each lane holds one row of the 4×4 comb matrix.
-    // Row normalize via local sum, column normalize via __shfl_xor across 4 lanes.
     if (warp_id == 0 && lane < HC_MULT)
     {
-        constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1; // 0xf for HC_MULT=4
+        constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
 
         // Softmax rows: subtract the row max to avoid inf / inf when comb logits
         // are large.
-        float const rowMax = fmaxf(fmaxf(cm[0], cm[1]), fmaxf(cm[2], cm[3]));
+        float const row_max = fmaxf(fmaxf(cm[0], cm[1]), fmaxf(cm[2], cm[3]));
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
-            cm[k] = expf(cm[k] - rowMax);
-        // Replace per-element fdiv with one reciprocal + 4 fmul. fp32 fdiv on
-        // B200 is multi-cycle while fmul retires at peak rate; sinkhorn's
-        // O(HC_MULT * sinkhorn_repeat) divisions per token (160 at sinkhorn=20)
-        // dominate the bigfuse epilogue cost on this 4-lane warp. Math is
-        // identical modulo last-bit round-off, which sinkhorn iteration
-        // absorbs.
-        float inv_rs = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3]);
+            cm[k] = expf(cm[k] - row_max);
+        float inv_row_sum = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3]);
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
-            cm[k] = cm[k] * inv_rs + hc_sinkhorn_eps;
-
-            // Column normalize: sum across lanes (rows) via butterfly shuffle
+            cm[k] = cm[k] * inv_row_sum + hc_sinkhorn_eps;
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
         {
-            float cs = cm[k];
-            cs += __shfl_xor_sync(LANE_MASK, cs, 1);
-            cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-            cm[k] *= 1.0f / (cs + hc_sinkhorn_eps);
+            float col_sum = cm[k];
+            col_sum += __shfl_xor_sync(LANE_MASK, col_sum, 1);
+            col_sum += __shfl_xor_sync(LANE_MASK, col_sum, 2);
+            cm[k] *= 1.0f / (col_sum + hc_sinkhorn_eps);
         }
 
         // Remaining Sinkhorn iterations: alternate row / column normalize
         for (int it = 1; it < sinkhorn_repeat; it++)
         {
-            inv_rs = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3] + hc_sinkhorn_eps);
+            inv_row_sum = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3] + hc_sinkhorn_eps);
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
-                cm[k] *= inv_rs;
-
+                cm[k] *= inv_row_sum;
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
             {
-                float cs = cm[k];
-                cs += __shfl_xor_sync(LANE_MASK, cs, 1);
-                cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                cm[k] *= 1.0f / (cs + hc_sinkhorn_eps);
+                float col_sum = cm[k];
+                col_sum += __shfl_xor_sync(LANE_MASK, col_sum, 1);
+                col_sum += __shfl_xor_sync(LANE_MASK, col_sum, 2);
+                cm[k] *= 1.0f / (col_sum + hc_sinkhorn_eps);
             }
         }
 
-        // Write 4×4 comb_mix to global (lane = row index, k = col index)
         float* cm_out = comb_mix + token * HC_MULT2;
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
@@ -206,7 +239,30 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         for (int j = 0; j < HC_MULT; j++)
             pm[j] = s_pre_mix[j];
 
-        __nv_bfloat16 const* rbase = residual + static_cast<long long>(token) * HC_MULT * hidden_size;
+        __nv_bfloat16 const* rbase;
+        if constexpr (kUseTma)
+        {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+            uint32_t const bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&s_tma_bar));
+            uint32_t complete;
+            do
+            {
+                asm volatile(
+                    "{ .reg .pred P; mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;"
+                    "  selp.b32 %0, 1, 0, P; }"
+                    : "=r"(complete)
+                    : "r"(bar_addr), "r"(0u)
+                    : "memory");
+            } while (!complete);
+            rbase = reinterpret_cast<__nv_bfloat16 const*>(s_tma_residual_raw);
+#else
+            rbase = residual + static_cast<long long>(token) * HC_MULT * hidden_size;
+#endif
+        }
+        else
+        {
+            rbase = residual + static_cast<long long>(token) * HC_MULT * hidden_size;
+        }
         __nv_bfloat16* obase = layer_input + static_cast<long long>(token) * hidden_size;
 
         int const p2_tid = tid - WARP_SIZE;
@@ -215,19 +271,19 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         float sum_sq_local = 0.f;
         for (int h = p2_tid * BF16_VEC; h < hidden_size; h += p2_threads * BF16_VEC)
         {
-            float acc[BF16_VEC] = {};
+            float2 acc[BF16_VEC / 2] = {};
 
 #pragma unroll
             for (int j = 0; j < HC_MULT; j++)
             {
                 uint4 raw = *reinterpret_cast<uint4 const*>(&rbase[j * hidden_size + h]);
                 __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+                float2 const coefficient = make_float2(pm[j], pm[j]);
 #pragma unroll
                 for (int v = 0; v < BF16_VEC / 2; v++)
                 {
-                    float2 f = __bfloat1622float2(pairs[v]);
-                    acc[2 * v + 0] += pm[j] * f.x;
-                    acc[2 * v + 1] += pm[j] * f.y;
+                    float2 const f = __bfloat1622float2(pairs[v]);
+                    acc[v] = mhcFmaF32x2(coefficient, f, acc[v]);
                 }
             }
 
@@ -235,7 +291,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
 #pragma unroll
             for (int v = 0; v < BF16_VEC / 2; v++)
-                opairs[v] = __float22bfloat162_rn(make_float2(acc[2 * v], acc[2 * v + 1]));
+                opairs[v] = __float22bfloat162_rn(acc[v]);
             *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
 
             if constexpr (kFuseNorm)
@@ -327,11 +383,19 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
 // turns those otherwise-ignored qualifiers into part of the function type. Clang then rejects the instantiation;
 // GCC does not diagnose it.
 #define INST_BIGFUSE(NS, BS)                                                                                           \
-    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/false>(float const* __restrict__,                  \
-        float const* __restrict__, __nv_bfloat16 const* __restrict__, float const* __restrict__,                       \
-        float const* __restrict__, float* __restrict__, float* __restrict__, __nv_bfloat16* __restrict__, int, int,    \
-        int, float, float, float, float, int, __nv_bfloat16 const* __restrict__, float);                               \
-    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/true>(float const* __restrict__,                   \
+    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/false, /*kUseTma=*/false>(                         \
+        float const* __restrict__, float const* __restrict__, __nv_bfloat16 const* __restrict__,                       \
+        float const* __restrict__, float const* __restrict__, float* __restrict__, float* __restrict__,                \
+        __nv_bfloat16* __restrict__, int, int, int, float, float, float, float, int,                                   \
+        __nv_bfloat16 const* __restrict__, float);                                                                     \
+    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/true, /*kUseTma=*/false>(                          \
+        float const* __restrict__, float const* __restrict__, __nv_bfloat16 const* __restrict__,                       \
+        float const* __restrict__, float const* __restrict__, float* __restrict__, float* __restrict__,                \
+        __nv_bfloat16* __restrict__, int, int, int, float, float, float, float, int,                                   \
+        __nv_bfloat16 const* __restrict__, float);
+
+#define INST_BIGFUSE_TMA(FN)                                                                                           \
+    template __global__ void mhcBigFuseKernel<1, 512, /*kFuseNorm=*/FN, /*kUseTma=*/true>(float const* __restrict__,   \
         float const* __restrict__, __nv_bfloat16 const* __restrict__, float const* __restrict__,                       \
         float const* __restrict__, float* __restrict__, float* __restrict__, __nv_bfloat16* __restrict__, int, int,    \
         int, float, float, float, float, int, __nv_bfloat16 const* __restrict__, float);
@@ -351,6 +415,9 @@ INST_BIGFUSE(8, 512)
 INST_BIGFUSE(16, 128)
 INST_BIGFUSE(16, 256)
 INST_BIGFUSE(16, 512)
+INST_BIGFUSE_TMA(false)
+INST_BIGFUSE_TMA(true)
+#undef INST_BIGFUSE_TMA
 #undef INST_BIGFUSE
 
 // ===================================================================
@@ -791,22 +858,44 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
 {
     dim3 grid(static_cast<unsigned int>(M));
 
-#define LAUNCH_BF(BS)                                                                                                  \
-    tensorrt_llm::common::launchWithPdlWhenEnabled("mhcBigFuseKernel", mhcBigFuseKernel<NUM_SPLITS, BS, kFuseNorm>,    \
-        grid, dim3(BS), 0, stream, y_acc, r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K,   \
-        hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps)
+#define LAUNCH_BF(BS, USE_TMA, SMEM_BYTES)                                                                             \
+    tensorrt_llm::common::launchWithPdlWhenEnabled("mhcBigFuseKernel",                                                 \
+        mhcBigFuseKernel<NUM_SPLITS, BS, kFuseNorm, USE_TMA>, grid, dim3(BS), SMEM_BYTES, stream, y_acc, r_acc,        \
+        residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K, hidden_size, rms_eps, hc_pre_eps,          \
+        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps)
 
     if (block_size >= 512)
     {
-        LAUNCH_BF(512);
+        if constexpr (NUM_SPLITS == 1)
+        {
+            // BS512 is the measured winner for the small-M one-wave regime. Bulk
+            // TMA wins only through M=64; its shared-memory footprint regresses
+            // M>=128, where regular LDG has enough latency hiding.
+            if (M <= 64)
+            {
+                size_t const tma_smem_bytes = static_cast<size_t>(4) * hidden_size * sizeof(__nv_bfloat16);
+                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+                    reinterpret_cast<void const*>(mhcBigFuseKernel<NUM_SPLITS, 512, kFuseNorm, true>),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tma_smem_bytes)));
+                LAUNCH_BF(512, true, tma_smem_bytes);
+            }
+            else
+            {
+                LAUNCH_BF(512, false, 0);
+            }
+        }
+        else
+        {
+            LAUNCH_BF(512, false, 0);
+        }
     }
     else if (block_size >= 256)
     {
-        LAUNCH_BF(256);
+        LAUNCH_BF(256, false, 0);
     }
     else
     {
-        LAUNCH_BF(128);
+        LAUNCH_BF(128, false, 0);
     }
 #undef LAUNCH_BF
 }
