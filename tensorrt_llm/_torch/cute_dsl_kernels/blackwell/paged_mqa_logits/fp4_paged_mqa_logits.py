@@ -60,6 +60,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
@@ -570,6 +572,8 @@ class FP4MQALogitsKernel:
         dynamic_sched: bool = False,
         ring_depth: int = 128,
         b_cap: int = 1024,
+        pdl: bool | None = None,
+        pdl_trigger: int = 2,
         num_kv_stages: int = 6,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
@@ -699,9 +703,18 @@ class FP4MQALogitsKernel:
         # below it every CTA walks exactly its DG range. Global state lives in
         # a caller-owned int32 buffer [0]=arrival, [32..40)=exhausted mask,
         # [64..64+NC)=per-range claim counters, restored to zero by the last
-        # arriving CTA. Not PDL-launched: the state words would need
-        # griddepcontrol.wait before the first claim.
+        # arriving CTA. Under PDL the kernel-entry griddepcontrol.wait orders
+        # the first claim after the previous grid's reset of these words.
         self.dynamic_sched = dynamic_sched
+        # pdl: launch with the programmatic-dependent-launch attribute and
+        # wait at kernel entry before any role's first input read; default
+        # follows TRTLLM_ENABLE_PDL. pdl_trigger: release the dependent top-k
+        # 0 never, 1 at kernel entry, 2 at each CTA's tile-loop exit (the
+        # dependent still waits for this grid's completion before reading)
+        self.pdl = TRTLLM_ENABLE_PDL if pdl is None else bool(pdl)
+        self.pdl_trigger = int(pdl_trigger)
+        if self.pdl_trigger not in (0, 1, 2):
+            raise ValueError("pdl_trigger must be 0, 1 or 2")
         self.ring_depth = ring_depth
         self.b_cap = b_cap
         # setmaxnreg split (producer warps, math WGs) of the 168 x 384 pool;
@@ -1194,6 +1207,7 @@ class FP4MQALogitsKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
+            use_pdl=self.pdl,
         )
 
     @cute.jit
@@ -1740,6 +1754,13 @@ class FP4MQALogitsKernel:
         NUM_MATH_WG = 2  # kNumMathWarpGroups
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
         sm_idx = bidz
+        if cutlass.const_expr(self.pdl):
+            # every warp waits here, before the role split: the reads below
+            # (schedule_meta, context_lens, block table, q / K / weights via
+            # TMA, the dynamic scheduler's state words) all follow it
+            griddepcontrol_wait()
+            if cutlass.const_expr(self.pdl_trigger == 1):
+                griddepcontrol_launch_dependents()
         start_q = mScheduleMeta[(sm_idx, 0)]
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
         end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
@@ -3908,6 +3929,9 @@ class FP4MQALogitsKernel:
                         # Update while-loop condition
                         has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.pdl and self.pdl_trigger == 2):
+                    # past this CTA's last work tile
+                    griddepcontrol_launch_dependents()
                 if cutlass.const_expr(self.defer_logits):
                     if lg_on != cutlass.Int32(0):
                         for _t in cutlass.range_constexpr(next_n):
@@ -4829,6 +4853,9 @@ class FP4MQALogitsKernel:
                         # Update while-loop condition
                         has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.pdl and self.pdl_trigger == 2):
+                    # past this CTA's last work tile
+                    griddepcontrol_launch_dependents()
                 if cutlass.const_expr(self.defer_logits):
                     if lg_on != cutlass.Int32(0):
                         for _t in cutlass.range_constexpr(next_n):

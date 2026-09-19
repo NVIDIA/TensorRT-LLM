@@ -1519,8 +1519,13 @@ class GvrMainKernel:
         hint_free: bool = False,
         prefill: bool = False,
         block_skip: bool = False,
+        pdl: bool = False,
     ) -> None:
         assert nbs == 256, "SNB must stay 256"
+        # pdl: launched with the programmatic-dependent-launch attribute;
+        # griddepcontrol.wait at kernel entry orders every global read
+        # (kv_lens, logits, block_max, the SPLIT slab) after the producer grid
+        self.pdl = bool(pdl)
         # block-max skip: P3 elides the float4 loads of 32-position blocks whose
         # scorer-emitted max is below the attempt's line (bmax tensor + skip_en arg)
         self.block_skip = bool(block_skip)
@@ -2003,6 +2008,8 @@ class GvrMainKernel:
         if cutlass.const_expr(self.split):
             part = bx
         lane = tidx & cutlass.Int32(31)
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()  # before the first global read
 
         # ================= per-row varlen prologue (varlen mode only) =========
         # Production contract: row r serves request r // next_n with
@@ -3771,6 +3778,9 @@ class GvrMainKernel:
                     while j < k:
                         out_row[j] = cutlass.Int32(-1)
                         j = j + cutlass.Int32(BLK)
+        if cutlass.const_expr(self.pdl):
+            # after the last input read (the final emit pass reads logits)
+            cute.arch.griddepcontrol_launch_dependents()
 
     # ------------------------------------------------------------------
     # host launcher (grid dim3(R, b); MINB wall via min_blocks_per_mp)
@@ -3828,7 +3838,13 @@ class GvrMainKernel:
             tsh_en,
             bmax,
             skip_en,
-        ).launch(grid=(R, b, 1), block=(self.blk, 1, 1), stream=stream, min_blocks_per_mp=self.minb)
+        ).launch(
+            grid=(R, b, 1),
+            block=(self.blk, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3843,6 +3859,7 @@ def get_compiled(
     hint_free: bool = False,
     prefill: bool = False,
     block_skip: bool = False,
+    pdl: bool = False,
 ) -> Any:
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3855,7 +3872,7 @@ def get_compiled(
     the cache key — otherwise a DSv3.2 decode varlen engine and the prefill
     engine collide on the same tuple. The prefill compile also retypes the
     pre_idx ABI slot to a 1-D align-4 fake (it carries 4B-aligned row_ends)."""
-    key = (tuple(tpl), options_extra, bool(hint_free), bool(prefill), bool(block_skip))
+    key = (tuple(tpl), options_extra, bool(hint_free), bool(prefill), bool(block_skip), bool(pdl))
     hit = _COMPILE_CACHE.get(key)
     if hit is not None:
         return hit
@@ -3873,6 +3890,7 @@ def get_compiled(
             bool(tshg),
             hint_free=bool(hint_free),
             block_skip=bool(block_skip),
+            pdl=bool(pdl),
         )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
@@ -3891,6 +3909,7 @@ def get_compiled(
             hint_free=bool(hint_free),
             prefill=bool(prefill),
             block_skip=bool(block_skip),
+            pdl=bool(pdl),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -5394,8 +5413,10 @@ class GvrClusKernel:
         cr_shift: int = 0,
         hint_free: bool = False,
         block_skip: bool = False,
+        pdl: bool = False,
     ) -> None:
         self.block_skip = bool(block_skip)  # block-max skip in P3 (bmax tensor + skip_en arg)
+        self.pdl = bool(pdl)  # PDL launch + griddepcontrol.wait at kernel entry (see GvrMainKernel)
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         assert nbs == 256, "SNB must stay 256"
@@ -5617,6 +5638,8 @@ class GvrClusKernel:
         rank = bx
         row = by
         lane = tidx & cutlass.Int32(31)
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()  # before the first global read
 
         # ============ per-row varlen prologue — shared contract lives in ======
         # GvrMainKernel's prologue (per-row n from kv_lens; ladder scalars are
@@ -6629,6 +6652,9 @@ class GvrClusKernel:
                             p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
                         )
                         it = it + cutlass.Int32(1)
+        if cutlass.const_expr(self.pdl):
+            # after the last input read (the final emit pass reads logits)
+            cute.arch.griddepcontrol_launch_dependents()
 
     # ------------------------------------------------------------------
     # host launcher: grid dim3(CS, b) + cluster (CS,1,1);
@@ -6686,6 +6712,7 @@ class GvrClusKernel:
             cluster=(self.cs, 1, 1),
             stream=stream,
             min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
         )
 
 
@@ -6705,6 +6732,7 @@ def get_compiled__clus(
     cr_shift: int = 0,
     hint_free: bool = False,
     block_skip: bool = False,
+    pdl: bool = False,
 ) -> Any:
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
@@ -6719,6 +6747,7 @@ def get_compiled__clus(
         int(cr_shift),
         bool(hint_free),
         bool(block_skip),
+        bool(pdl),
     )
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
@@ -6737,6 +6766,7 @@ def get_compiled__clus(
         cr_shift=cr_shift,
         hint_free=hint_free,
         block_skip=block_skip,
+        pdl=pdl,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()

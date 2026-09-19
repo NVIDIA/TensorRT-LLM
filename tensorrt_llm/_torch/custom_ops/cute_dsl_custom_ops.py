@@ -10857,14 +10857,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      emit_cand_bucketed=False,
                      accept_cap=8192,
                      dynamic_sched=False,
-                     has_dyn_state=False):
+                     has_dyn_state=False,
+                     pdl=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
                    emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state,
-                   _fp4_kv_stages(dynamic_sched))
+                   _fp4_kv_stages(dynamic_sched), pdl)
             if key in cls.kernel_cache:
                 return
 
@@ -11028,6 +11029,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ring_depth=_FP4_DYN_RING,
                 b_cap=_FP4_DYN_B_CAP,
                 num_kv_stages=_fp4_kv_stages(dynamic_sched),
+                pdl=pdl,
             )
             dyn_state_fake = None
             if has_dyn_state:
@@ -11369,13 +11371,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"dyn_chunk={dyn_chunk} must be in [1, {_FP4_DYN_CHUNK_MAX}]"
                 )
 
+            # PDL launch attribute + griddepcontrol trigger for the top-k that
+            # follows; same shape gate as the top-k's dependent launch
+            from ..cute_dsl_kernels.blackwell.utils import gvr_pdl_enabled
+            pdl = gvr_pdl_enabled(B * next_n, aligned_max_ctx)
+
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
                    emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state,
-                   _fp4_kv_stages(dynamic_sched))
+                   _fp4_kv_stages(dynamic_sched), pdl)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -11397,7 +11404,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     emit_cand_bucketed=emit_cand_bucketed,
                     accept_cap=accept_cap,
                     dynamic_sched=dynamic_sched,
-                    has_dyn_state=has_dyn_state)
+                    has_dyn_state=has_dyn_state,
+                    pdl=pdl)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed. Trailing

@@ -52,6 +52,17 @@ from collections.abc import Sequence
 
 import torch
 
+try:
+    from ..utils import gvr_pdl_enabled
+except ImportError:  # standalone import of this module
+    _PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    _PDL_MAX_B = int(os.environ.get("TRTLLM_GVR_PDL_MAX_B", "16"))
+    _PDL_MAX_NPAD = int(os.environ.get("TRTLLM_GVR_PDL_MAX_NPAD", "16384"))
+
+    def gvr_pdl_enabled(rows: int, npad: int) -> bool:
+        return _PDL and (int(rows) <= _PDL_MAX_B or int(npad) <= _PDL_MAX_NPAD)
+
+
 _dev_mod = None
 
 
@@ -839,6 +850,9 @@ def _varlen_launcher(
     n_kernel = min(n_env, npad)
     n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
+    # PDL dependent launch of the top-k (shape-gated; a pure function of this
+    # cache key)
+    pdl = gvr_pdl_enabled(num_rows, npad)
     dev = _device()
     # ---- route() parity, family tier 1: clustered register-resident --------
     # Admit reg_clus exactly where the free route picks it; its whole
@@ -849,6 +863,7 @@ def _varlen_launcher(
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
+            pdl=pdl,
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
@@ -867,6 +882,7 @@ def _varlen_launcher(
     if plan_free["kernel"] in ("reg", "regimg"):
         fn = dev.get_compiled__reg(
             tuple(plan_free["tpl"]),
+            pdl=pdl,
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
@@ -898,6 +914,7 @@ def _varlen_launcher(
             cr_shift=cr_shift,
             hint_free=True,
             block_skip=bool(block_skip),
+            pdl=pdl,
         )
         lc = (
             "clus",
@@ -917,6 +934,7 @@ def _varlen_launcher(
         tpl[:6] + (False,) + (next_n, cr_shift, r_const),
         hint_free=True,
         block_skip=bool(block_skip),
+        pdl=pdl,
     )
     big = num_rows * r_const <= 148
     aim_base = (
