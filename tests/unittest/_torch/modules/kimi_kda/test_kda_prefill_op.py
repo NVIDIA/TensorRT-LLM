@@ -468,11 +468,48 @@ def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
 
 @torch.no_grad()
 def test_kda_mixer_empty_prefill():
-    """The production mixer handles an empty token payload without raising."""
+    """An empty token payload still publishes the conv state for its slot."""
     optimized = _make_kda()
     hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-    out = _run_production_prefill(optimized, hidden_states)
+    # Seed the pool with a sentinel: the output shape alone would still match if the
+    # zero-token state write-back were skipped, so only the pool can catch that.
+    conv_pool = torch.full(
+        (1, 3 * NUM_HEADS * HEAD_DIM, CONV_KERNEL_SIZE - 1),
+        7.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    out = _run_production_prefill(optimized, hidden_states, conv_pool=conv_pool)
     assert out.shape == (1, 0, HIDDEN_SIZE)
+    # Without an initial state a zero-token sequence leaves an all-zero causal window.
+    assert torch.equal(conv_pool, torch.zeros_like(conv_pool))
+
+
+@torch.no_grad()
+def test_kda_mixer_empty_prefill_preserves_initial_conv_state():
+    """A zero-token payload carrying an initial state leaves that state untouched."""
+    optimized = _make_kda()
+    hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    conv_seed = (
+        torch.randn(
+            1,
+            3 * NUM_HEADS * HEAD_DIM,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+    )
+    conv_pool = conv_seed.clone()
+    out = _run_production_prefill(
+        optimized,
+        hidden_states,
+        conv_pool=conv_pool,
+        has_initial_states=torch.ones(1, dtype=torch.bool, device="cuda"),
+    )
+    assert out.shape == (1, 0, HIDDEN_SIZE)
+    # No token shifts into the window, so the write-back must republish it verbatim.
+    assert torch.equal(conv_pool, conv_seed)
 
 
 @torch.no_grad()
