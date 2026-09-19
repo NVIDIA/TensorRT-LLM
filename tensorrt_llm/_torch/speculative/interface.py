@@ -1156,9 +1156,10 @@ class SpecMetadata:
 
             use_top_k = not is_greedy and top_k is not None and top_k > 0
 
-            normalized_temperature = (DISABLE_TEMP_VAL
-                                      if is_greedy or temperature is None
-                                      or temperature == 0 else temperature)
+            # The sentinel is one-hot under softmax, so it must not reach a
+            # non-greedy row; those resolve 1.0, as resolve_sampling_strategy does.
+            normalized_temperature = (DISABLE_TEMP_VAL if is_greedy else
+                                      (temperature or 1.0))
             normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
             normalized_top_p = (DISABLE_TOPP_VAL
                                 if is_greedy or top_p is None else top_p)
