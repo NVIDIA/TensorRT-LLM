@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
 from tensorrt_llm.llmapi.llm import EncoderOutput
 
 # isort: off
@@ -275,3 +275,320 @@ def test_encode_cuda_graph_and_return_raw_logits(bert_encode_llm_cuda_graph):
     raw_single = bert_encode_llm_cuda_graph.encode(PROMPTS[0], return_raw_logits=True)
     assert isinstance(raw_single, torch.Tensor)
     assert raw_single.shape == (1, 2)
+
+
+# --------------------------------------------------------------------------- #
+# EncodeExtraInputSpec — Pydantic-level validation (no GPU)
+# --------------------------------------------------------------------------- #
+
+
+class TestEncodeExtraInputSpec:
+    """Validation of the user-facing spec class. Pure Pydantic; no model load."""
+
+    def test_basic_spec(self):
+        s = EncodeExtraInputSpec(name="token_type_ids", shape=("num_tokens",), dtype="int32")
+        assert s.name == "token_type_ids"
+        assert s.resolve_shape(num_tokens=64, batch_size=8) == (64,)
+        assert s.symbolic_dim() == ("num_tokens", 0)
+        assert s.torch_dtype() == torch.int32
+
+    def test_multidim_spec(self):
+        s = EncodeExtraInputSpec(name="inputs_embeds", shape=("num_tokens", 768), dtype="bfloat16")
+        assert s.resolve_shape(num_tokens=32, batch_size=8) == (32, 768)
+        assert s.symbolic_dim() == ("num_tokens", 0)
+        assert s.torch_dtype() == torch.bfloat16
+
+    def test_batch_size_spec(self):
+        """A spec keyed on 'batch_size' instead of 'num_tokens' (e.g. per-request features)."""
+        s = EncodeExtraInputSpec(
+            name="per_request_feature", shape=("batch_size", 40), dtype="int32"
+        )
+        assert s.resolve_shape(num_tokens=64, batch_size=4) == (4, 40)
+        assert s.symbolic_dim() == ("batch_size", 0)
+
+    def test_batch_size_symbolic_axis_nonzero(self):
+        s = EncodeExtraInputSpec(name="x", shape=(32, "batch_size"), dtype="float32")
+        assert s.resolve_shape(num_tokens=64, batch_size=8) == (32, 8)
+        assert s.symbolic_dim() == ("batch_size", 1)
+
+    def test_mixed_symbolic_dims_rejected(self):
+        """A single tensor cannot use both 'num_tokens' and 'batch_size'."""
+        with pytest.raises(Exception, match="symbolic dim"):
+            EncodeExtraInputSpec(name="x", shape=("num_tokens", "batch_size"), dtype="int32")
+
+    def test_reserved_name_rejected(self):
+        for reserved in (
+            "input_ids",
+            "position_ids",
+            "seq_lens",
+            "multi_item_part_lens",
+            "attn_metadata",
+            "return_context_logits",
+        ):
+            with pytest.raises(Exception, match="reserved"):
+                EncodeExtraInputSpec(name=reserved, shape=("num_tokens",), dtype="int32")
+
+    def test_non_identifier_name_rejected(self):
+        with pytest.raises(Exception, match="identifier"):
+            EncodeExtraInputSpec(name="123abc", shape=("num_tokens",), dtype="int32")
+
+    def test_missing_symbolic_dim_rejected(self):
+        with pytest.raises(Exception, match="symbolic dim"):
+            EncodeExtraInputSpec(name="x", shape=(64,), dtype="int32")
+
+    def test_duplicate_symbolic_dim_rejected(self):
+        with pytest.raises(Exception, match="symbolic dim"):
+            EncodeExtraInputSpec(name="x", shape=("num_tokens", "num_tokens"), dtype="int32")
+
+    def test_unknown_dtype_rejected(self):
+        with pytest.raises(Exception, match="dtype"):
+            EncodeExtraInputSpec(name="x", shape=("num_tokens",), dtype="not_a_dtype")
+
+    def test_duplicate_names_in_extra_model_inputs_rejected(self):
+        s = EncodeExtraInputSpec(name="token_type_ids", shape=("num_tokens",), dtype="int32")
+        with pytest.raises(Exception, match="duplicate name"):
+            EncodeCudaGraphConfig(num_tokens=[32], seq_lens=[16], extra_model_inputs=[s, s])
+
+
+# --------------------------------------------------------------------------- #
+# LLM.encode() validation under encoder CUDA graphs + extra_model_inputs
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def bert_encode_llm_cuda_graph_with_token_type_ids():
+    """BERT encode_only LLM with token_type_ids declared as an extra model input."""
+    model_dir = get_model_path(BERT_MODEL_PATH)
+    cgc = EncodeCudaGraphConfig(
+        batch_sizes=[1, 4],
+        num_tokens=[16, 64],
+        seq_lens=[8, 32],
+        enable_padding=True,
+        extra_model_inputs=[
+            EncodeExtraInputSpec(name="token_type_ids", shape=("num_tokens",), dtype="int32"),
+        ],
+    )
+    llm = LLM(model=model_dir, encode_only=True, cuda_graph_config=cgc)
+    yield llm
+    llm.shutdown()
+
+
+def _build_token_type_ids(prompts, device="cuda"):
+    """Build a packed token_type_ids tensor sized to the BERT tokenization."""
+    from transformers import AutoTokenizer
+
+    model_dir = get_model_path(BERT_MODEL_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    encoded = tokenizer(prompts, padding=False, truncation=True, max_length=512)
+    total = sum(len(t) for t in encoded["input_ids"])
+    return torch.zeros(total, dtype=torch.int32, device=device)
+
+
+def test_encode_with_declared_token_type_ids(bert_encode_llm_cuda_graph_with_token_type_ids):
+    """Encoder CUDA graphs + declared token_type_ids — encode() succeeds."""
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    token_type_ids = _build_token_type_ids(PROMPTS)
+    outs = llm.encode(PROMPTS, token_type_ids=token_type_ids)
+    assert len(outs) == len(PROMPTS)
+    for o in outs:
+        assert o.logits.shape == (2,)
+
+
+def test_encode_rejects_undeclared_kwarg(bert_encode_llm_cuda_graph_with_token_type_ids):
+    """encode() with a kwarg that wasn't declared in extra_model_inputs raises."""
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    token_type_ids = _build_token_type_ids(PROMPTS)
+    bogus = torch.zeros(token_type_ids.shape[0], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="not declared"):
+        llm.encode(PROMPTS, token_type_ids=token_type_ids, bogus_kwarg=bogus)
+
+
+def test_encode_rejects_missing_declared_kwarg(bert_encode_llm_cuda_graph_with_token_type_ids):
+    """encode() that omits a declared kwarg raises."""
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    with pytest.raises(ValueError, match="missing model_kwargs"):
+        llm.encode(PROMPTS)
+
+
+def test_encode_rejects_wrong_dtype(bert_encode_llm_cuda_graph_with_token_type_ids):
+    """encode() with a declared kwarg of the wrong dtype raises."""
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    token_type_ids = _build_token_type_ids(PROMPTS)
+    wrong_dtype = token_type_ids.to(torch.int64)
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        llm.encode(PROMPTS, token_type_ids=wrong_dtype)
+
+
+def test_encode_rejects_wrong_rank(bert_encode_llm_cuda_graph_with_token_type_ids):
+    """encode() with a declared kwarg of the wrong rank raises."""
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    token_type_ids = _build_token_type_ids(PROMPTS)
+    wrong_rank = token_type_ids.unsqueeze(0)  # ('num_tokens',) -> (1, n)
+    with pytest.raises(ValueError, match="rank mismatch"):
+        llm.encode(PROMPTS, token_type_ids=wrong_rank)
+
+
+def test_encode_rejects_non_tensor_kwarg(bert_encode_llm_cuda_graph_with_token_type_ids):
+    """encode() with a non-tensor value for a declared kwarg raises."""
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    with pytest.raises(ValueError, match="must be a torch.Tensor"):
+        llm.encode(PROMPTS, token_type_ids=[0] * 32)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_encode_declared_kwarg_accepts_either_device(
+    bert_encode_llm, bert_encode_llm_cuda_graph_with_token_type_ids, device
+):
+    """A declared kwarg may be passed on the host or on the device.
+
+    Graph replay copies it into the static buffer and the eager path moves it
+    to the device, so the caller must not have to know which one runs. The
+    all-zero segment ids match BERT's internal default, so both devices must
+    also reproduce the plain eager logits.
+    """
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    token_type_ids = _build_token_type_ids(PROMPTS, device=device)
+    outs = llm.encode(PROMPTS, token_type_ids=token_type_ids)
+
+    eager_outs = bert_encode_llm.encode(PROMPTS)
+    got = torch.stack([o.logits.cpu() for o in outs])
+    eager = torch.stack([o.logits.cpu() for o in eager_outs])
+    torch.testing.assert_close(got, eager, rtol=1e-3, atol=1e-3)
+
+
+def test_encode_host_declared_kwarg_on_eager_fallback(
+    bert_encode_llm, bert_encode_llm_cuda_graph_with_token_type_ids
+):
+    """A host declared kwarg still works when the call falls back to eager.
+
+    The undeclared non-tensor kwarg forces the eager path, which hands the
+    kwargs straight to forward(); the engine has to move `token_type_ids` to
+    the device rather than letting the embedding lookup fail on a CPU tensor.
+    """
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    token_type_ids = _build_token_type_ids(PROMPTS, device="cpu")
+    outs = llm.encode(PROMPTS, token_type_ids=token_type_ids, some_flag=True)
+
+    eager_outs = bert_encode_llm.encode(PROMPTS)
+    got = torch.stack([o.logits.cpu() for o in outs])
+    eager = torch.stack([o.logits.cpu() for o in eager_outs])
+    torch.testing.assert_close(got, eager, rtol=1e-3, atol=1e-3)
+
+
+def test_encode_undeclared_non_tensor_kwarg_falls_back_to_eager(
+    bert_encode_llm, bert_encode_llm_cuda_graph_with_token_type_ids
+):
+    """Verify an undeclared non-tensor model kwarg falls back to eager execution.
+
+    Such a kwarg is allowed under encoder CUDA graphs but forces the call onto
+    the eager path because a captured graph cannot represent a non-tensor
+    value. The declared tensor kwarg is still provided; BERT ignores the extra
+    non-tensor kwarg via **kwargs, so the output must match plain eager
+    execution.
+    """
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    token_type_ids = _build_token_type_ids(PROMPTS)
+    # `some_flag` is undeclared and non-tensor: previously this raised
+    # ("not declared"); now it is allowed and triggers eager fallback.
+    graph_outs = llm.encode(PROMPTS, token_type_ids=token_type_ids, some_flag=True)
+    assert len(graph_outs) == len(PROMPTS)
+
+    eager_outs = bert_encode_llm.encode(PROMPTS)
+    graph = torch.stack([o.logits.cpu() for o in graph_outs])
+    eager = torch.stack([o.logits.cpu() for o in eager_outs])
+    torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)
+
+
+# --------------------------------------------------------------------------- #
+# batch_size-shaped extra inputs (per-request features)
+# BERT's forward ignores unknown kwargs via **kwargs, so an extra
+# batch_size-shaped tensor exercises the static-buffer / capture / replay
+# machinery without changing the model's output. That lets us pin numerical
+# parity between graph-on (with the kwarg declared and passed) and eager
+# (no kwarg) — a regression here would mean the static buffer machinery is
+# corrupting the model's compute.
+# --------------------------------------------------------------------------- #
+
+_BATCH_SIZE_EXTRA = EncodeExtraInputSpec(
+    name="per_request_feature", shape=("batch_size", 40), dtype="int32"
+)
+
+
+@pytest.fixture(scope="module")
+def bert_encode_llm_cuda_graph_with_batch_size_extra():
+    """BERT encode_only LLM with a per_request_feature shape=(batch_size, 40) extra."""
+    model_dir = get_model_path(BERT_MODEL_PATH)
+    cgc = EncodeCudaGraphConfig(
+        batch_sizes=[1, 4],
+        num_tokens=[16, 64],
+        seq_lens=[8, 32],
+        enable_padding=True,
+        extra_model_inputs=[_BATCH_SIZE_EXTRA],
+    )
+    llm = LLM(model=model_dir, encode_only=True, cuda_graph_config=cgc)
+    yield llm
+    llm.shutdown()
+
+
+def _build_batch_size_feature(batch: int):
+    return torch.arange(batch * 40, dtype=torch.int32, device="cuda").reshape(batch, 40)
+
+
+def test_encode_accepts_batch_size_extra(bert_encode_llm_cuda_graph_with_batch_size_extra):
+    """encode() with a declared batch_size-shaped kwarg succeeds."""
+    llm = bert_encode_llm_cuda_graph_with_batch_size_extra
+    feat = _build_batch_size_feature(len(PROMPTS))
+    outs = llm.encode(PROMPTS, per_request_feature=feat)
+    assert len(outs) == len(PROMPTS)
+    for o in outs:
+        assert o.logits.shape == (2,)
+
+
+def test_encode_batch_size_extra_wrong_dim_rejected(
+    bert_encode_llm_cuda_graph_with_batch_size_extra,
+):
+    """Wrong batch dim along the symbolic axis raises a clear error."""
+    llm = bert_encode_llm_cuda_graph_with_batch_size_extra
+    # One extra row vs. number of prompts.
+    feat = _build_batch_size_feature(len(PROMPTS) + 1)
+    with pytest.raises(ValueError, match="'batch_size'"):
+        llm.encode(PROMPTS, per_request_feature=feat)
+
+
+def test_encode_batch_size_extra_wrong_literal_dim_rejected(
+    bert_encode_llm_cuda_graph_with_batch_size_extra,
+):
+    """Wrong literal dim raises a shape mismatch."""
+    llm = bert_encode_llm_cuda_graph_with_batch_size_extra
+    # 40 → 39 along the literal axis.
+    feat = torch.zeros(len(PROMPTS), 39, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="shape mismatch"):
+        llm.encode(PROMPTS, per_request_feature=feat)
+
+
+def test_encode_batch_size_extra_wrong_dtype_rejected(
+    bert_encode_llm_cuda_graph_with_batch_size_extra,
+):
+    llm = bert_encode_llm_cuda_graph_with_batch_size_extra
+    feat = _build_batch_size_feature(len(PROMPTS)).to(torch.int64)
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        llm.encode(PROMPTS, per_request_feature=feat)
+
+
+def test_encode_batch_size_extra_replay_matches_eager(
+    bert_encode_llm, bert_encode_llm_cuda_graph_with_batch_size_extra
+):
+    """Verify batch-size static-buffer replay reproduces eager output.
+
+    BERT ignores unknown kwargs (**kwargs in forward), so the kwarg has no
+    effect on compute. The comparison directly checks that the per-spec static
+    buffer plumbing doesn't perturb the graph.
+    """
+    eager_outs = bert_encode_llm.encode(PROMPTS)
+    graph_llm = bert_encode_llm_cuda_graph_with_batch_size_extra
+    feat = _build_batch_size_feature(len(PROMPTS))
+    graph_outs = graph_llm.encode(PROMPTS, per_request_feature=feat)
+
+    eager = torch.stack([o.logits.cpu() for o in eager_outs])
+    graph = torch.stack([o.logits.cpu() for o in graph_outs])
+    torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)

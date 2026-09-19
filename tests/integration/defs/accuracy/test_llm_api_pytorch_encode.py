@@ -29,7 +29,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
 
 from ..conftest import llm_models_root
 from .accuracy_core import LlmapiAccuracyTestHarness
@@ -166,6 +166,95 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             assert isinstance(raw, torch.Tensor)
             assert raw.shape == hf_logits.shape
             torch.testing.assert_close(raw.cpu().float(), hf_logits, rtol=1.5e-2, atol=1.5e-2)
+
+    @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
+    def test_encoder_encode_with_token_type_ids_matches_huggingface(self, model_name, model_path):
+        """Verify token_type_ids propagate through encoder CUDA graph replay.
+
+        All-zero token_type_ids equal BERT's internal default (`forward`
+        fills `token_type_ids=None` with zeros), so an all-zero check alone
+        cannot tell "kwarg copied into the static CUDA-graph buffer and
+        replayed" apart from "kwarg silently dropped". This test uses a
+        non-trivial segment pattern and asserts two things:
+
+        1. Propagation: non-zero token_type_ids change the logits vs. all-zero
+           on the same graph-enabled LLM. A dropped kwarg would make both
+           calls collapse to the zeros default and be bit-identical.
+        2. Correctness: the non-zero result matches HF given the *same*
+           token_type_ids, within the existing packed-vs-padded tolerance.
+        """
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+            extra_model_inputs=[
+                EncodeExtraInputSpec(
+                    name="token_type_ids",
+                    shape=("num_tokens",),
+                    dtype="int32",
+                ),
+            ],
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        encoded = tokenizer(PROMPTS, padding=False, truncation=True, max_length=512)
+        per_prompt_lens = [len(t) for t in encoded["input_ids"]]
+
+        # Non-trivial segment pattern: mark the second half of each prompt's
+        # real tokens as segment 1 (valid: BERT type_vocab_size == 2). The
+        # packed order (prompt-by-prompt concatenation) matches encode()'s flat
+        # input_ids, and a position-dependent pattern makes the HF comparison
+        # sensitive to buffer ordering, not just a global shift.
+        per_prompt_tt = [[0] * (L - L // 2) + [1] * (L // 2) for L in per_prompt_lens]
+        packed_nonzero = torch.tensor(
+            [tt for row in per_prompt_tt for tt in row],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        packed_zero = torch.zeros_like(packed_nonzero)
+
+        with LLM(model_path, encode_only=True, dtype=llm_dtype, cuda_graph_config=cgc) as llm:
+            outs_nonzero = llm.encode(PROMPTS, token_type_ids=packed_nonzero)
+            outs_zero = llm.encode(PROMPTS, token_type_ids=packed_zero)
+
+        tllm_nonzero = torch.stack([o.logits.cpu().float() for o in outs_nonzero])
+        tllm_zero = torch.stack([o.logits.cpu().float() for o in outs_zero])
+
+        # (1) Propagation: two calls on the same graph-enabled LLM with
+        # different token_type_ids must differ. If the kwarg were dropped, both
+        # would collapse to the zeros default and be bit-identical.
+        max_abs_diff = (tllm_nonzero - tllm_zero).abs().max().item()
+        assert max_abs_diff > 1e-3, (
+            f"[{model_name}] non-zero token_type_ids produced logits identical "
+            f"to all-zero (max|delta|={max_abs_diff:.3e}); the kwarg is not "
+            f"propagating through the encoder CUDA-graph static buffer."
+        )
+
+        hf_model = (
+            AutoModelForSequenceClassification.from_pretrained(model_path, torch_dtype=torch_dtype)
+            .cuda()
+            .eval()
+        )
+        with torch.inference_mode():
+            hf_inputs = tokenizer(PROMPTS, return_tensors="pt", padding="longest").to(
+                hf_model.device
+            )
+            # Apply the same segment pattern HF-side. HF pads on the right, so
+            # each prompt's real tokens occupy [0:len]; padded positions stay 0
+            # (attention-masked, and BERT pools [CLS] at position 0, so they do
+            # not affect the classification logits).
+            hf_token_type_ids = torch.zeros_like(hf_inputs["input_ids"])
+            for i, row in enumerate(per_prompt_tt):
+                hf_token_type_ids[i, : len(row)] = torch.tensor(row, device=hf_model.device)
+            hf_inputs["token_type_ids"] = hf_token_type_ids
+            hf_logits = hf_model(**hf_inputs).logits.float().cpu()
+
+        # (2) Correctness: match HF given the same token_type_ids.
+        torch.testing.assert_close(tllm_nonzero, hf_logits, rtol=1.5e-2, atol=1.5e-2)
 
     @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
     def test_encoder_encode_cuda_graph_matches_eager_logits(self, model_name, model_path):
