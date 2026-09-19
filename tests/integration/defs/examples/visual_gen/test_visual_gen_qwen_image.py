@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 import torch
+import yaml
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
@@ -201,14 +202,17 @@ def _flatten_qwen_image_layered_lpips_image(input_path, output_path):
         background.convert("RGB").save(output_path)
 
 
-def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path):
+def _generate_qwen_image_layered_lpips_image(
+    model_path, input_path, output_path, visual_gen_args_path
+):
     """Generate the Qwen-Image-Layered LPIPS sample (default setting, compile-off)."""
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
     from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
     _disable_inductor_compile_worker_quiesce()
-    args = VisualGenArgs(
+    args = VisualGenArgs.from_yaml(
+        visual_gen_args_path,
         model=model_path,
         torch_compile_config=TorchCompileConfig(enable=False),
     )
@@ -228,11 +232,12 @@ def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path
                 resolution=QWEN_IMAGE_LAYERED_LPIPS_RESOLUTION,
                 cfg_normalize=True,
                 use_en_prompt=True,
+                save_layers_to_grid=True,
                 seed=QWEN_IMAGE_LAYERED_LPIPS_SEED,
             )
         generated_image = result.image[0].detach().cpu()
     finally:
-        del pipeline
+        _cleanup_single_device_feature_pipeline(pipeline)
         _cleanup_cuda()
 
     save_image(generated_image, output_path)
@@ -335,7 +340,7 @@ def test_qwenimage_lpips_against_golden(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_qwen_image_layered_lpips_against_golden(tmp_path):
+def test_qwen_image_layered_lpips_against_golden(tmp_path, llm_root):
     input_path = tmp_path / "qwen_image_layered_input.png"
     generated_path = tmp_path / "qwen_image_layered_generated.png"
     golden_path = tmp_path / "qwen_image_layered_golden_grid.png"
@@ -347,6 +352,13 @@ def test_qwen_image_layered_lpips_against_golden(tmp_path):
         get_checkpoint(QWEN_IMAGE_LAYERED_MODEL_SUBPATH),
         input_path,
         generated_path,
+        visual_gen_args_path=os.path.join(
+            llm_root,
+            "examples",
+            "visual_gen",
+            "configs",
+            "qwen-image-layered-1gpu.yaml",
+        ),
     )
     # Ignore invisible RGB values under transparent pixels while preserving
     # partially transparent layer edges.
@@ -404,8 +416,9 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
-def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_venv):
-    """Run examples/visual_gen/models/qwen_image_layered.py end-to-end."""
+@pytest.mark.parametrize("feature", ["baseline", "fp8", "cache-dit"])
+def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_venv, feature):
+    """Run the Qwen-Image-Layered example configurations end-to-end."""
     model_path = get_checkpoint(QWEN_IMAGE_LAYERED_MODEL_SUBPATH)
     model_index_path = os.path.join(model_path, "model_index.json")
     assert os.path.isfile(model_index_path), (
@@ -416,19 +429,29 @@ def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_ve
     _copy_qwen_image_layered_lpips_input(tmp_path, input_path)
 
     out_dir = os.path.join(
-        llm_venv.get_working_directory(), "visual_gen_output", "qwen_image_layered_example"
+        llm_venv.get_working_directory(),
+        "visual_gen_output",
+        f"qwen_image_layered_{feature}_example",
     )
     os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, "qwen_image_layered_output.png")
+    output_path = os.path.join(out_dir, f"qwen_image_layered_{feature}_output.png")
 
     script_path = os.path.join(
         llm_root, "examples", "visual_gen", "models", "qwen_image_layered.py"
     )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "qwen-image-layered-1gpu.yaml"
+    config_name = (
+        "qwen-image-layered-fp8-1gpu.yaml" if feature == "fp8" else "qwen-image-layered-1gpu.yaml"
     )
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", config_name)
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
+    if feature == "cache-dit":
+        with open(config_path) as config_file:
+            config = yaml.safe_load(config_file)
+        config["cache_config"] = {"cache_backend": "cache_dit"}
+        config_path = tmp_path / "qwen-image-layered-cache-dit-1gpu.yaml"
+        with open(config_path, "w") as config_file:
+            yaml.safe_dump(config, config_file, sort_keys=False)
 
     venv_check_call(
         llm_venv,
@@ -446,7 +469,13 @@ def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_ve
             output_path,
         ],
     )
-    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    for layer_idx in range(4):
+        layer_output_path = os.path.join(
+            out_dir, f"qwen_image_layered_{feature}_output_layer_{layer_idx}.png"
+        )
+        assert os.path.isfile(layer_output_path), (
+            f"Example did not produce layer output at {layer_output_path}"
+        )
 
 
 def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv: Any) -> None:
