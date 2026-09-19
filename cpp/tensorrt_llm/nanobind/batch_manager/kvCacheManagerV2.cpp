@@ -2334,6 +2334,31 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
+        .def(
+            "probe_first_new_block_key",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens) -> nb::object
+            {
+                kv::ReuseScope const reuseScope = castReuseScope(std::move(reuseScopeObj));
+                if (inputTokens.is_none())
+                {
+                    return nb::none();
+                }
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest) -> nb::object
+                    {
+                        std::optional<kv::BlockKey> key;
+                        {
+                            nb::gil_scoped_release release;
+                            key = self->probeFirstNewBlockKey(reuseScope, view, knownNoDigest);
+                        }
+                        if (!key)
+                        {
+                            return nb::none();
+                        }
+                        return nb::bytes(reinterpret_cast<char const*>(key->data()), key->size());
+                    });
+            },
+            nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
             nb::arg("data_role"), nb::arg("index_mode") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))

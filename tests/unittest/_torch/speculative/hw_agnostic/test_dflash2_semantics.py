@@ -362,10 +362,10 @@ def test_select_candidate_path_restricts_logits_to_the_walk():
 # ---------------------------------------------------------------------------
 
 
-def _worker(mapping=None, d2t=None):
+def _worker(mapping=None):
     worker = DFlashWorker.__new__(DFlashWorker)
     worker.mapping = mapping
-    worker._d2t = d2t
+    worker._d2t = None
     return worker
 
 
@@ -438,18 +438,33 @@ def test_global_top_k_rejects_a_width_it_cannot_interpret():
         )
 
 
-def test_selector_rejects_a_remapped_draft_vocab():
+def _bind_drafter(is_dflash2: bool, d2t):
+    """Bind a drafter whose backbone carries ``d2t`` to a fresh worker."""
+    worker = _worker()
+    worker._dflash_attention_backend = "VANILLA"
+    drafter = _dflash2_wrapper(
+        _is_dflash2=is_dflash2,
+        dflash_attention_backend="VANILLA",
+        model=SimpleNamespace(d2t=d2t),
+    )
+    worker.set_draft_model(drafter)
+    return worker
+
+
+def test_dflash2_drafter_with_a_remapped_draft_vocab_fails_at_bind():
     """The codebooks are indexed by draft-vocab id, so a d2t remap would score
-    the wrong tokens."""
-    worker = _worker(d2t=torch.zeros(VOCAB, dtype=torch.long))
+    the wrong tokens. No DFlash 2 drafter ships one, so it is an invariant
+    checked when the worker binds the drafter, not on the first draft step."""
     with pytest.raises(NotImplementedError, match="shared draft/target"):
-        worker._apply_dflash2_selector(
-            _dflash2_wrapper(candidate_selector=_selector()),
-            torch.randn(B, K, VOCAB),
-            torch.randn(B, K, HID),
-            torch.zeros(B, dtype=torch.long),
-            SimpleNamespace(),
-        )
+        _bind_drafter(is_dflash2=True, d2t=torch.zeros(VOCAB, dtype=torch.long))
+
+
+def test_d2t_binding_is_otherwise_unrestricted():
+    """Plain DFlash keeps its d2t support, and a DFlash 2 drafter without d2t
+    binds and caches the absent map."""
+    d2t = torch.zeros(VOCAB, dtype=torch.long)
+    assert _bind_drafter(is_dflash2=False, d2t=d2t)._d2t is d2t
+    assert _bind_drafter(is_dflash2=True, d2t=None)._d2t is None
 
 
 # ---------------------------------------------------------------------------
@@ -518,13 +533,34 @@ def test_validate_dflash2_config_rejects_a_degenerate_top_k():
         _validation_wrapper(_dflash2_selector_top_k=1)._validate_dflash2_config()
 
 
-def _mask_wrapper(config, is_dflash2=True, sliding_layers_causal=False):
+def _mask_wrapper(
+    config,
+    is_dflash2=True,
+    sliding_layers_causal=False,
+    backend="VANILLA",
+    layer_windows=(),
+):
     wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
     torch.nn.Module.__init__(wrapper)
     wrapper.config = config
     wrapper._is_dflash2 = is_dflash2
     wrapper._sliding_layers_causal = sliding_layers_causal
+    wrapper.dflash_attention_backend = backend
+    wrapper._layer_windows = list(layer_windows)
     return wrapper
+
+
+def _all_sliding_config(sliding_window, num_layers=2, **overrides):
+    config = dict(
+        is_causal=False,
+        num_hidden_layers=num_layers,
+        layer_types=["sliding_attention"] * num_layers,
+        sliding_window=sliding_window,
+        use_sliding_window=True,
+        max_window_layers=num_layers,
+    )
+    config.update(overrides)
+    return SimpleNamespace(**config)
 
 
 def test_released_drafter_attention_is_non_causal_and_symmetrically_windowed():
@@ -583,6 +619,47 @@ def test_is_causal_is_ignored_for_a_plain_dflash_drafter():
     wrapper = _mask_wrapper(config, is_dflash2=False)
     assert wrapper._get_attention_mask_args(0) == (True, (511, 0))
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
+
+
+# ---------------------------------------------------------------------------
+# TRTLLM block-decode backend: no non-causal sliding window
+# ---------------------------------------------------------------------------
+
+
+def test_released_drafter_window_runs_on_two_sided_backends():
+    """VANILLA and FA4 hand both window bounds to their kernels."""
+    for backend in ("VANILLA", "FA4"):
+        _mask_wrapper(_all_sliding_config(2048), backend=backend).validate_block_attention_windows()
+
+
+def test_trtllm_backend_rejects_the_released_drafter_window():
+    """flashinfer's trtllm-gen context kernel refuses causal=False with any
+    finite window_left, so the released non-causal 2048 window cannot run."""
+    wrapper = _mask_wrapper(_all_sliding_config(2048), backend="TRTLLM")
+    with pytest.raises(ValueError, match="non-causally within a 2048-token sliding window"):
+        wrapper.validate_block_attention_windows()
+
+
+def test_trtllm_backend_accepts_causal_or_unwindowed_layers():
+    # A causal sliding window is supported by the kernel.
+    _mask_wrapper(
+        _all_sliding_config(4, is_causal=True), backend="TRTLLM"
+    ).validate_block_attention_windows()
+    # No window at all, either.
+    _mask_wrapper(
+        SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
+        backend="TRTLLM",
+    ).validate_block_attention_windows()
+
+
+def test_trtllm_window_check_reads_the_use_swa_override():
+    """A use_swa window replaces the checkpoint-inferred one in the block
+    decode, so the check must resolve the same window the forward uses."""
+    config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2)
+    wrapper = _mask_wrapper(config, backend="TRTLLM", layer_windows=[(3, 3), (3, 3)])
+    assert wrapper._resolve_block_attention(0) == (False, (3, 3))
+    with pytest.raises(ValueError, match="draft layer 0"):
+        wrapper.validate_block_attention_windows()
 
 
 # ---------------------------------------------------------------------------
