@@ -71,6 +71,10 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con256_c
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con30_ctx1_tep2_gen2_tp4_eplb0_eagle3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con30_ctx1_tp4_gen2_tp4_eplb0_eagle3_ccb-NIXL]
 
+# GB300 Nemotron-3-Ultra
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_nemotron-ultra-v3-fp4_8k64k_con64_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+
 # GB300 Qwen3-235B
 
 # VR200 DeepSeek-V4-Pro
