@@ -244,6 +244,12 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             else:  # GQA head: the leading numbers carry RoPE.
                 rope = (0, rope_dim)
         rope_start, rope_elements = rope
+        if rope_start < 0 or rope_elements < 0 or rope_start + rope_elements > row_elements:
+            raise ValueError(
+                f"{buffer_name}: RoPE range [{rope_start}, {rope_start + rope_elements}) lies "
+                f"outside the {row_elements}-element row; check partial_rotary_factor and "
+                "qk_rope_head_dim in the model config"
+            )
         if rope_elements == 0:
             return 0, row_elements
         if rope_elements >= row_elements:

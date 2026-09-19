@@ -1524,6 +1524,7 @@ def test_keep_rope_precision_quantizes_draft_kv_rows_whole() -> None:
             is_draft=True,
         )
     mock_logger.warning.assert_called_once()
+    assert "draft-model" in mock_logger.warning.call_args.args[0]
     assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 256), (0, 256)]
 
 
@@ -1561,8 +1562,19 @@ def test_keep_rope_precision_is_ignored_with_a_warning_outside_the_validated_mod
             head_dim_per_layer=(576,),
         )
     mock_logger.warning.assert_called_once()
-    assert "keep_rope_precision" in mock_logger.warning.call_args.args[0]
+    assert "validated for model types" in mock_logger.warning.call_args.args[0]
     assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 576)]
+
+
+@pytest.mark.parametrize("partial_rotary_factor", (-0.0625, 1.25))
+def test_keep_rope_precision_rejects_rope_ranges_outside_the_row(partial_rotary_factor) -> None:
+    """A negative or oversized rotary width must not reach the kernel metadata."""
+
+    native, _ = _native()
+    with pytest.raises(ValueError, match="outside the 256-element row"):
+        _create_kv(
+            native, _partial_rotary_config(partial_rotary_factor), 256, keep_rope_precision=True
+        )
 
 
 def test_keep_rope_precision_requires_16_element_rope_alignment() -> None:
