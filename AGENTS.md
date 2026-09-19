@@ -173,6 +173,88 @@ CI is triggered by posting comments on the PR. Basic commands:
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 
+### Advisory semantic conflict review
+
+The `CodeRabbit Semantic Conflict Review` workflow performs best-effort semantic
+compatibility analysis for open, non-draft PRs targeting `main` or `release/**`.
+No opt-in label is needed. It compares both branches from their merge base and
+follows affected callers, contracts, configuration, and tests across files.
+
+- PR creation, reopening, updates, and becoming ready evaluate the threshold;
+  they do not automatically spend an AI call. An hourly scan also evaluates it.
+- The first analysis needs new target commits and either 24 hours since the
+  merge-base commit or at least 30 target commits beyond that base. After a
+  completed PASS/FAIL analysis, count from its target SHA and completion time.
+  PR updates invalidate the old verdict but do not bypass these thresholds.
+- An authorized `ci: full pre-merge approved` label or enabling auto-merge
+  bypasses the threshold. Approval-label authors are checked against the existing
+  `trt-llm-ci-approvers` team using its existing token. All pre-merge requests
+  share a one-hour cooldown, including when the SHA pair changes. A signal
+  during cooldown is skipped; ordinary scans and the post-merge audit remain.
+- Exact revision pairs, including requests still awaiting a reply, are deduplicated.
+  With no completed analysis, new-pair routine requests wait 24 hours to avoid
+  repeated service-failure retries. A missing reply for the same pair requires
+  a manual retry. Workflow dispatch accepts one PR number and bypasses the
+  thresholds, cooldown and deduplication for that PR only.
+- Merge events request a post-merge audit regardless of thresholds or cooldown.
+  The hourly scan recovers merges from the preceding 24 hours. The audit pins
+  the actual merge commit and historical target, including for release PRs;
+  later target updates do not invalidate it. Squash-only rules or the two-parent
+  merge must establish the historical target; ambiguous rebase history is rejected.
+  A pre-merge result/request can be reused only when its head/target pair and
+  GitHub's recorded test-merge tree match the actual merged tree. Otherwise the
+  audit includes the actual merged code in a new analysis request.
+
+This dedicated custom check is `off` in `.coderabbit.yaml` during ordinary
+reviews. The workflow explicitly requests `evaluate custom pre-merge check`
+with warning mode and the configured instructions so regular reviews cannot
+bypass the spending policy. CodeRabbit Custom Pre-Merge Checks access is needed.
+Its native Post-Merge Actions only support the default branch; this workflow
+uses an explicit command on the merged PR instead. Acceptance of Actions-bot
+commands, especially on merged/release PRs, requires deployment validation.
+An absent/rejected AI reply remains without a verdict, never a semantic pass.
+
+The `Semantic conflict with target branch` Check starts neutral. Stale results
+become neutral when the PR event or hourly scan observes a version change.
+The verifier checks the bot identity, most recent trusted request, exact revision
+record, and GitHub merge base. Publication and preview select the newest applicable
+reply after that request; delayed events cannot restore an older verdict, and
+pending manual retries cannot reuse an earlier PASS. Before deployment, the preview
+also accepts manual evaluations when no trusted request exists for the pair.
+PASS becomes success; FAIL makes the Check and
+publishing job red; Inconclusive remains neutral. A successful request job only
+means orchestration succeeded. Checks on the actual merge SHA use the distinct
+`Semantic conflict audit (post-merge)` name, with a receipt linking the analysis
+on the original PR. Evidence includes code locations and regression scenarios.
+The instructions first discover cross-branch interactions, then verify their
+contracts, including test replacements and the production paths they exercise.
+Explanations precede the machine record and must cite immutable source links
+with full SHAs and line numbers from both head and target. A PASS/FAIL without
+those citations becomes Inconclusive, including in the preview; an older PASS
+cannot substitute for that incomplete reply. Citation presence does not prove
+the AI's reasoning or the cited code is correct.
+
+CodeRabbit can make mistakes, including false positives. Keep these checks and
+workflows non-required: their failures then do not block merging. No required
+waiting gate is added, and auto-merge does not wait for this analysis. Audit does
+not revert code or modify branches. Repository rules remain unchanged.
+The thresholds and cooldown limit frequency, not total calls per PR.
+
+Changes to this automation run the separate read-only `CodeRabbit Semantic
+Review Preview` workflow, including fork drafts. `Automation tests and result
+lookup (not AI approval)` runs Node tests and reads actual CodeRabbit replies;
+`AI verdict (advisory; skipped = unavailable)` runs only for a verified current
+PASS/FAIL and is otherwise gray/skipped. `precommit-check.yml` is unchanged.
+
+Both workflows use the same verifier. Privileged jobs load only trusted default
+branch scripts, never PR code. The preview has read-only permissions. Before
+merge, request `@coderabbitai evaluate custom pre-merge check` with the name
+`Semantic conflict with target branch`, `--mode warning`, and `--instructions`
+containing the configured instructions and fixed head/target/merge-base SHAs.
+After the reply arrives, rerun the **tests and result lookup** job; rerunning only
+the AI job reuses old outputs. Preview tests do not establish production trigger,
+permission, command-acceptance or post-merge behavior.
+
 ### Trouble Shooting
 
 - Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.
