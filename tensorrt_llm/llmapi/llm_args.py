@@ -2705,6 +2705,15 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
 class MTPDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["MTP"] = Field(default="MTP")
+    draft_skip_top_k_top_p: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Skip top-k/top-p filtering for stochastic MTP drafts, keeping request "
+        "temperature, greedy behavior, and target sampling unchanged. "
+        "Implemented for PyTorch linear MTP; dynamic trees and AutoDeploy use "
+        "different sampling paths. Rejection sampling is optional and retains "
+        "its existing compatibility checks. Deploy-time setting.")
     use_relaxed_acceptance_for_thinking: bool = Field(
         default=False,
         description=
@@ -2825,7 +2834,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
+    @model_validator(mode="after")
+    def validate_draft_skip_top_k_top_p(self) -> "MTPDecodingConfig":
+        if self.draft_skip_top_k_top_p and self.use_dynamic_tree:
+            raise ValueError(
+                "draft_skip_top_k_top_p is not implemented for dynamic-tree MTP; "
+                "tree expansion uses a separate top-k candidate selector")
+        return self
+
     def supports_backend(self, backend: str) -> bool:
+        if self.draft_skip_top_k_top_p:
+            return backend == "pytorch"
         return backend in ("pytorch", "_autodeploy")
 
     @property

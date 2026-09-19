@@ -3951,8 +3951,11 @@ class PyTorchModelEngine(ModelEngine):
         """
         # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
         # Mapping.__init__), so ADP needs no separate check here.
-        if not (self.mapping.enable_lm_head_tp_in_adp
-                and spec_metadata.use_rejection_sampling):
+        # Use deploy-time flags, not the rank-local wants_advanced_draft_sampling:
+        # a greedy rank must participate when another rank samples drafts.
+        if not (self.mapping.enable_lm_head_tp_in_adp and
+                (spec_metadata.use_rejection_sampling
+                 or spec_metadata.draft_skip_top_k_top_p)):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
         all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]

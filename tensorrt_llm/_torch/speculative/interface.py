@@ -543,7 +543,7 @@ class SpecMetadata:
     is_all_greedy_sample: bool = True
     # Group-synchronized override for ``is_all_greedy_sample`` (AND over the
     # TP group's local flags; None = no group sync configured, use the local
-    # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
+    # value). Under ADP + LM-head TP with stochastic drafting, the greedy-vs-
     # advanced choice gates group collectives, so all ranks must take the same
     # path even though their batches (and thus local flags) differ. Set by
     # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
@@ -555,6 +555,8 @@ class SpecMetadata:
     use_rejection_sampling: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
+    # MTP proposal-only policy; never changes target filtering or greedy dispatch.
+    draft_skip_top_k_top_p: bool = False
     # Whether the occurrence penalties are enabled (deploy-time; from
     # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
     enable_penalty: bool = False
@@ -1231,8 +1233,11 @@ class SpecMetadata:
 
     @property
     def wants_advanced_draft_sampling(self) -> bool:
-        """Whether the current batch takes the advanced (rejection) draft
-        path: rejection sampling enabled AND not an all-greedy batch.
+        """Whether the current batch takes the stochastic draft path.
+
+        Non-greedy batches sample drafts when rejection sampling is enabled or
+        temperature-only draft proposals are explicitly requested. Verification
+        still independently follows ``use_rejection_sampling``.
 
         Single source of truth for the greedy-vs-advanced decision: the
         sampler branch (``sample_draft_tokens``) and the worker's LM-head-TP
@@ -1240,7 +1245,8 @@ class SpecMetadata:
         divergence feeds the wrong logits layout to the sampler -- so both
         read this property instead of re-deriving the predicate.
         """
-        return self.use_rejection_sampling and not self.is_all_greedy_sample
+        return (self.use_rejection_sampling or
+                self.draft_skip_top_k_top_p) and not self.is_all_greedy_sample
 
     def update_is_all_greedy_sample(self, requests: list["LlmRequest"]) -> None:
         """Refresh ``is_all_greedy_sample`` for the *current* batch.
@@ -2102,6 +2108,11 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    end=batch_size,
                                                    step_offset=1 +
                                                    (draft_step or 0))
+        if spec_metadata.draft_skip_top_k_top_p:
+            # Change draft filtering regardless of the verification method.
+            # Do not mutate the request filters shared with target sampling.
+            eff_top_ks = None
+            eff_top_ps = None
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             draft_tokens, probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(logits,
@@ -2632,15 +2643,9 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         is_block = logits.dim() == 3
 
-        # Draft tokens use argmax unless rejection sampling is engaged for a
-        # non-greedy batch. Rejection sampling is the only path that needs the
-        # draft's stochastic proposal distribution (stored in draft_probs); every
-        # other path (all-greedy, or non-greedy with strict/exact-match
-        # acceptance) accepts a draft token only when it equals the target's
-        # choice, and there argmax maximizes the acceptance rate (E[accept] =
-        # max_i p_i >= sum_i p_i^2 = E[accept] for a stochastic draft). This
-        # matches sglang/vLLM, which draft with argmax/top-k by default and apply
-        # sampling params only on the target/acceptance side.
+        # Keep the existing argmax path by default. Non-greedy requests can
+        # opt into temperature-only proposals independently of verification;
+        # only rejection sampling needs their probability distribution saved.
         advanced = spec_metadata.wants_advanced_draft_sampling
 
         # All samplers below return tokens in draft-vocab space; d2t is applied
@@ -2659,9 +2664,8 @@ class SpecWorkerBase(nn.Module, ABC):
             # so the input batch shape no longer applies. Keep as-is; the
             # caller trims the max_num_requests padding to token_count.
         else:
-            # Advanced sampling gathers the vocab-sharded draft logits to full
-            # vocab, then samples (scattering this step's proposal distribution
-            # into draft_probs).
+            # Advanced sampling gathers vocab-sharded draft logits to full
+            # vocab, then samples. Only rejection sampling stores draft_probs.
             logits = self.maybe_gather_sharded_draft_logits(
                 logits, spec_metadata, mapping_lm_head_tp)
             if is_block:
