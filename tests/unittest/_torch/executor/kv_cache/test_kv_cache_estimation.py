@@ -12,7 +12,7 @@ share, not all copies.
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -123,6 +123,8 @@ def _make_reserve_creator(
 def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     monkeypatch,
 ):
+    scope = MagicMock()
+
     class _InputProcessor:
         def __init__(self):
             self.calls = []
@@ -151,6 +153,8 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
             self.last_output = None
 
         def encode_multimodal_inputs(self, multimodal_params):
+            assert scope.__enter__.called
+            assert not scope.__exit__.called
             count = multimodal_params[0].multimodal_data["image"]["item_count"]
             self.forwarded_item_counts.append(count)
             self.last_output = torch.arange(count * 4).reshape(count, 4)
@@ -181,10 +185,17 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
 
     creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
+    encoder_inputs = creator._dummy_encoder_inputs
     assert input_processor.calls == [(8192, {"image": 2}, torch.float16)]
 
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
-    retained_output = creator._encode_dummy_inputs()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor._util.discard_nccl_window_tensor_outputs",
+        return_value=scope,
+    ) as make_scope:
+        retained_output = creator._encode_dummy_inputs()
+    make_scope.assert_called_once_with(encoder_inputs)
+    scope.__exit__.assert_called_once_with(None, None, None)
     assert model.forwarded_item_counts == [2]
     assert retained_output.data_ptr() != model.last_output.data_ptr()
     assert creator._dummy_encoder_inputs == []

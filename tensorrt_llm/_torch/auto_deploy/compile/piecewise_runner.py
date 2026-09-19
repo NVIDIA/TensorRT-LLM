@@ -55,7 +55,7 @@ import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten
 
-from .._compat import make_weak_ref
+from .._compat import make_weak_ref, nccl_window_graph_capture
 from ..utils.logger import ad_logger
 
 
@@ -399,8 +399,9 @@ class ADPiecewiseRunner(nn.Module):
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
 
+            graph_pool = self._graph_pool or torch.cuda.graph_pool_handle()
             dynamic_out_bufs: Dict[int, torch.Tensor] = {}
-            with torch.cuda.graph(graph, pool=self._graph_pool):
+            with nccl_window_graph_capture(graph, graph_pool):
                 output = self.submodule(*args, **kwargs)
                 for submod_id, info in self._next_dynamic_out_infos.items():
                     dynamic_out_bufs[submod_id] = torch.empty(
@@ -409,8 +410,7 @@ class ADPiecewiseRunner(nn.Module):
 
             torch.cuda.synchronize()
 
-            if self._graph_pool is None:
-                self._graph_pool = graph.pool()
+            self._graph_pool = graph_pool
 
             entry.cuda_graph = graph
             entry.static_output = make_weak_ref(output)

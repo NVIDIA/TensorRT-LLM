@@ -397,6 +397,7 @@ def _warmup_runner(*, world_size: int) -> EncoderRunner:
     runner._deps = SimpleNamespace(
         dist=SimpleNamespace(world_size=world_size),
         mapping=SimpleNamespace(dwdp_enabled=False),
+        input_ids_cuda=torch.empty(0, dtype=torch.int32),
     )
     runner._encoder_cuda_graph_runner = SimpleNamespace(
         enabled=True,
@@ -432,10 +433,13 @@ def test_encoder_warmup_oom_is_fatal_when_distributed() -> None:
     runner._execute_prepared.assert_called_once_with(runner._prepare_encoder_batch.return_value)
 
 
-def test_encoder_release_clears_owned_graph_backend() -> None:
+@pytest.mark.parametrize("release_nccl_window_owners", [True, False])
+def test_encoder_release_clears_owned_graph_backend(release_nccl_window_owners: bool) -> None:
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = Mock()
 
-    runner.cleanup()
+    runner.cleanup(release_nccl_window_owners=release_nccl_window_owners)
 
-    runner._encoder_cuda_graph_runner.clear.assert_called_once_with()
+    runner._encoder_cuda_graph_runner.clear.assert_called_once_with(
+        release_nccl_window_owners=release_nccl_window_owners
+    )

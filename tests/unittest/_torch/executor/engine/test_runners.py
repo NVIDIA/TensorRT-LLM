@@ -333,7 +333,7 @@ def test_model_engine_releases_runner_owned_graphs() -> None:
 
     engine._release_cuda_graphs()
 
-    engine._runner.cleanup.assert_called_once_with()
+    engine._runner.cleanup.assert_called_once_with(release_nccl_window_owners=True)
 
 
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:

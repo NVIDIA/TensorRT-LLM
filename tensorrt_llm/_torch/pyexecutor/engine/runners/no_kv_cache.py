@@ -371,7 +371,7 @@ class NoKVCacheRunner(ABC):
     def capture_graphs(self, resource_manager: ResourceManager) -> None:
         return
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, release_nccl_window_owners: bool = True) -> None:
         return
 
     def forward(
