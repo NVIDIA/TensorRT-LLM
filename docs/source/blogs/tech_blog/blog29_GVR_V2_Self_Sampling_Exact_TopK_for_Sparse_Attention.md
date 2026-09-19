@@ -351,6 +351,16 @@ The strongest shape-average gains occur around 4K scores at $B=1024$: **19.85× 
 
 The advantage extends across all 275 plotted shapes. The smallest shape-average speedups are **1.55× for Flash, 1.52× for Pro, and 3.50× for V3.2**. These averages summarize layers at each shape; the overall table retains the lower minimum across individual workload cases.
 
+GVR V1 is the closer comparison. Figure 8 uses the same grid and aggregation, with a separate **1–3× color scale** to resolve the smaller differences.
+
+![Three heatmap panels of GVR V2 speedup over GVR V1 across captured row lengths and all eleven batch sizes. Cell values are geometric means across layers; orange corners mark shapes containing at least one layer where V2 is slower.](../media/gvr_v2/gvr_v1_map.svg)
+
+*Figure 8. GVR V1 time divided by GVR V2 time, geometrically averaged across layers at each shape. All three panels share a 1–3× color scale, with parity at 1.0× and cell labels rounded to two decimal places. An orange corner marks at least one constituent layer with speedup below 1×, even when the cell average is above parity.*
+
+The strongest shape-average gains are **2.87× for Flash, 2.83× for Pro, and 1.86× for V3.2**. Flash and Pro peak at $B=1024$ on short rows; V3.2 peaks near 128K scores at $B=8$.
+
+All 275 shape averages exceed parity, but layer averaging can hide local regressions. For Pro at $N=131{,}075$ and $B=512$, the shape average is **1.05×** even though one layer reaches **0.689×**. The orange markers preserve this distinction; the earlier [V1-to-V2 analysis](#from-gvr-v1-to-v2-why-move-beyond-temporal-hints) explains why informative temporal hints can still give V1 a local admission advantage.
+
 #### What Explains the Differences
 
 **TensorRT-LLM radix CUDA.** The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2's **5.05×** advantage is consistent with reducing full-row selection passes and matching execution to the workload.
@@ -361,7 +371,7 @@ The advantage extends across all 275 plotted shapes. The smallest shape-average 
 
 ![Cold kernel latency for GVR V2, GVR V1, and TensorRT-LLM radix CUDA versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
-*Figure 8. Mean cold kernel time across all captured layers: 21 for Flash, 30 for Pro, and 61 for V3.2. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
+*Figure 9. Mean cold kernel time across all captured layers: 21 for Flash, 30 for Pro, and 61 for V3.2. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
 
 At $B=1$, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At $B=1024$, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.
 
@@ -387,15 +397,15 @@ P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
 P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
 $$
 
-The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. Their **5.36 compare/byte** intersection exceeds the maximum ideal Top-K intensity by over 21×, placing the workload band on Figure 9A's bandwidth slope.
+The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. Their **5.36 compare/byte** intersection exceeds the maximum ideal Top-K intensity by over 21×, placing the workload band on Figure 10A's bandwidth slope.
 
 ![A two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2, GVR V1, and TensorRT-LLM radix CUDA at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
-*Figure 9.* A: theoretical and calibrated roofs. B: Pareto curves at $B=1024$, plotting useful throughput $P=BN/t$ against ideal intensity $I=N/[4(N+K)]$. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share $Q_{\min}$; extra work remains in measured time. This measures useful work relative to ideal traffic, not actual DRAM utilization.
+*Figure 10.* A: theoretical and calibrated roofs. B: Pareto curves at $B=1024$, plotting useful throughput $P=BN/t$ against ideal intensity $I=N/[4(N+K)]$. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share $Q_{\min}$; extra work remains in measured time. This measures useful work relative to ideal traffic, not actual DRAM utilization.
 
 #### Compare Pareto Curves and Reachable Rates
 
-Each operator's **Pareto curve** in Figure 9B is its measured intensity–throughput trace across row lengths at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 8 retains the contrasting single-row view, and Figure 7 covers all 11 batch sizes.
+Each operator's **Pareto curve** in Figure 10B is its measured intensity–throughput trace across row lengths at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 9 retains the contrasting single-row view, and Figures 7–8 cover all 11 batch sizes.
 
 The **reachable rate** is useful throughput divided by the calibrated roof, expressed as a percentage. Throughout the plotted bandwidth branch, its underlying ratio simplifies to
 
@@ -404,7 +414,7 @@ $$
 =\frac{Q_{\min}}{\mathrm{BW}\,t}.
 $$
 
-It measures efficiency relative to the ideal traffic bound. The table compares **average / peak reachable rate** along each Pareto curve: the average weights the plotted intensity points equally, and the peak is their maximum. Both use the same layer-averaged timings as Figure 9B.
+It measures efficiency relative to the ideal traffic bound. The table compares **average / peak reachable rate** along each Pareto curve: the average weights the plotted intensity points equally, and the peak is their maximum. Both use the same layer-averaged timings as Figure 10B.
 
 <div align="center">
 
@@ -444,7 +454,7 @@ TensorRT-LLM separates phase-specific row metadata from shared selection logic. 
 
 ![Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes.](../media/gvr_v2/integration.svg)
 
-*Figure 10. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
+*Figure 11. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.*
 
 The adapters preserve each phase's indexing semantics. Decode derives valid prefixes from device KV lengths, multi-token prediction offsets, and compression. Prefill receives `[start, end)` in compressed columns and returns indices relative to `start`. Both write INT32 indices into caller-owned output, with identity indices and `-1` padding for short rows.
 

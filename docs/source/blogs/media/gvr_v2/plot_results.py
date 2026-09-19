@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
-from matplotlib.patches import FancyBboxPatch, Rectangle
+from matplotlib.patches import FancyBboxPatch, Polygon, Rectangle
 from matplotlib.ticker import FuncFormatter
 
 ROOT = Path(__file__).resolve().parent
@@ -1110,7 +1110,8 @@ def _roofline(rows: list[dict]) -> None:
 def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(14, 5.8))
     batches = sorted({r["batch"] for r in rows})
-    norm = Normalize(vmin=1, vmax=21)
+    is_v1 = arm == "temporal_tiered"
+    norm = Normalize(vmin=1, vmax=3 if is_v1 else 21)
     cmap = plt.get_cmap("YlGnBu")
     for ax, (model, title) in zip(axes, MODELS.items()):
         selected = [r for r in rows if r["model"] == model and r[arm + "_us"] is not None]
@@ -1132,15 +1133,28 @@ def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
         graphic = ax.imshow(data, aspect="auto", cmap=cmap, norm=norm)
         for y in range(len(buckets)):
             for x in range(len(batches)):
+                if is_v1 and any(
+                    r[arm + "_us"] < r["gvr_v2_us"]
+                    for r in selected
+                    if r["isl_bucket"] == buckets[y] and r["batch"] == batches[x]
+                ):
+                    ax.add_patch(
+                        Polygon(
+                            [(x + 0.21, y - 0.5), (x + 0.5, y - 0.5), (x + 0.5, y - 0.21)],
+                            facecolor="#d46d24",
+                            edgecolor="white",
+                            linewidth=0.3,
+                        )
+                    )
                 red, green, blue, _ = cmap(norm(data[y, x]))
                 brightness = 0.299 * red + 0.587 * green + 0.114 * blue
                 ax.text(
                     x,
                     y,
-                    f"{data[y, x]:.1f}",
+                    f"{data[y, x]:.2f}" if is_v1 else f"{data[y, x]:.1f}",
                     ha="center",
                     va="center",
-                    fontsize=7.1,
+                    fontsize=6.9 if is_v1 else 7.1,
                     color="white" if brightness < 0.5 else "#17202b",
                 )
         ax.set_xticks(range(len(batches)), batches, rotation=60, fontsize=9)
@@ -1157,20 +1171,39 @@ def _speedup_map(rows: list[dict], arm: str, label: str, scope: str) -> None:
         y=1.02,
     )
     fig.subplots_adjust(left=0.06, right=0.99, top=0.87, bottom=0.34, wspace=0.27)
-    cax = fig.add_axes((0.34, 0.09, 0.32, 0.026))
-    bar = fig.colorbar(graphic, cax=cax, orientation="horizontal", ticks=[1, 5, 10, 15, 21])
+    cax = fig.add_axes((0.34, 0.055 if is_v1 else 0.09, 0.32, 0.026))
+    ticks = [1, 1.5, 2, 2.5, 3] if is_v1 else [1, 5, 10, 15, 21]
+    bar = fig.colorbar(graphic, cax=cax, orientation="horizontal", ticks=ticks)
+    if is_v1:
+        bar.ax.set_xticklabels(["1× · parity", "1.5×", "2×", "2.5×", "3×"])
     bar.set_label(f"{label} time / GVR V2 time · geometric mean across layers", fontsize=9)
     fig.text(
         0.06,
-        0.17,
+        0.19 if is_v1 else 0.17,
         f"{scope} · 1.0× is parity · shared color scale across all three models.",
         fontsize=9,
     )
-    _save(fig, arm + "_map")
+    if is_v1:
+        fig.add_artist(
+            Polygon(
+                [(0.06, 0.155), (0.07, 0.155), (0.07, 0.133)],
+                transform=fig.transFigure,
+                facecolor="#d46d24",
+                edgecolor="none",
+            )
+        )
+        fig.text(
+            0.08,
+            0.138,
+            "Orange corner: at least one layer is slower in V2. Layer averages do not show every case.",
+            fontsize=9,
+            color="#52616f",
+        )
+    _save(fig, "gvr_v1_map" if is_v1 else arm + "_map")
 
 
 def main() -> None:
-    """Validate the frozen dataset, then regenerate statistics and nine figures."""
+    """Validate the frozen dataset, then regenerate statistics and ten figures."""
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
@@ -1211,6 +1244,7 @@ def main() -> None:
     _algorithm()
     _gpu_sampling()
     _speedup_map(rows, "radix_cuda", "radix CUDA", "TensorRT-LLM production dispatcher")
+    _speedup_map(rows, "temporal_tiered", "GVR V1", "GVR V1 (temporal hint)")
     _latency(rows)
     _roofline(rows)
     _integration()
