@@ -5122,6 +5122,7 @@ class PyExecutor:
                 # we need to delay the update of the previous batch's sample state,
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
+                forward_failed = False
                 if can_queue:
 
                     # The generation requests that do not have batch_idx
@@ -5193,6 +5194,10 @@ class PyExecutor:
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device,
                                 num_accepted_tokens_device)
+
+                    forward_failed = batch_outputs is None
+                    if forward_failed:
+                        can_queue = False
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
@@ -5281,6 +5286,8 @@ class PyExecutor:
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
+                    if forward_failed:
+                        self.previous_batch = None
                 else:
                     self._enqueue_responses([])
 
