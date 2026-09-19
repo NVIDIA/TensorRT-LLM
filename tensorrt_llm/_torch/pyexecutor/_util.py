@@ -930,20 +930,15 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         use_separate_draft_kv_cache = (
             self._should_create_separate_draft_kv_cache())
+        draft_kwargs = {}
+        if self._uses_unified_standalone_draft_cache():
+            draft_kwargs["draft_layout"] = self._get_standalone_draft_layout()
         total = self._per_manager_cache_cost(
             self._kv_cache_manager_cls,
             model_config,
             kv_cache_config,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        if self._uses_unified_standalone_draft_cache():
-            draft_layout = self._get_standalone_draft_layout()
-            # The unified allocator reserves an envelope for draft capture and
-            # noise in every attention group. Include its fixed cost as well
-            # as the distinct BF16 draft layers in the common byte budget.
-            total += CacheCost(
-                slope=draft_layout.bytes_per_token,
-                intercept=(total.slope + draft_layout.bytes_per_token) *
-                draft_layout.extra_tokens * self._max_batch_size)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            **draft_kwargs)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
         draft_cost = self._get_draft_cache_cost(
@@ -1680,7 +1675,18 @@ class KvCacheCreator:
                 and not spec_config._use_shared_kv_cache)
 
     def _uses_unified_standalone_draft_cache(self) -> bool:
-        return self._is_standalone_dspark() and self._is_kv_cache_manager_v2
+        if not self._is_standalone_dspark() or not self._is_kv_cache_manager_v2:
+            return False
+        if self._is_disagg:
+            # Disaggregation must validate unified ownership, never fall back
+            # to draft state that the transceiver cannot transfer.
+            return True
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND
+
+        # Preserve the existing aggregate C++/CUDA-graph draft-cache path.
+        # Python V2 with eager execution also supports unified aggregate runs
+        # for comparison with the same configuration in disaggregation.
+        return BACKEND == "python" and self._llm_args.cuda_graph_config is None
 
     def _validate_standalone_draft_cache(self) -> None:
         """Reject unsupported standalone state ownership before profiling."""
@@ -1698,6 +1704,8 @@ class KvCacheCreator:
                     "Standalone DSpark disaggregation requires "
                     "kv_cache_config.use_kv_cache_manager_v2=True and "
                     "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python on both workers.")
+            return
+        if not self._uses_unified_standalone_draft_cache():
             return
         from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND
 

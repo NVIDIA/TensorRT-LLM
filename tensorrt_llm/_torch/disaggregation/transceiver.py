@@ -1291,6 +1291,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             0 if need_progress else wait_num,
             block_all,
         )
+        has_draft_history = (
+            getattr(getattr(self, "_kv_cache_manager", None), "draft_layout", None) is not None
+        )
 
         completed, failed, cancelled = [], [], []
         for rid in to_process:
@@ -1306,6 +1309,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
+                if has_draft_history:
+                    try:
+                        self._apply_aux(session, req)
+                        self._assert_disagg_history_declared(req)
+                        # Restore also validates the receiver's allocation and page map.
+                        # A peer failure below leaves this request unschedulable; its
+                        # ordinary failure cleanup releases any restored history and KV.
+                        self._restore_draft_history(req)
+                    except (ValueError, RuntimeError) as error:
+                        logger.warning(
+                            f"Disagg draft history validation FAILED rank={self._dist.rank} "
+                            f"rid={rid}: {error}"
+                        )
+                        failed.append(rid)
+                        continue
                 if session.transfer_end_time is not None:
                     req.set_kv_cache_transfer_end(session.transfer_end_time)
                 if session.kv_cache_size_bytes > 0:
@@ -1353,10 +1371,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = self._recv_reqs[rid]
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
-            if self._need_aux_transfer(req):
+            if not has_draft_history and self._need_aux_transfer(req):
                 self._apply_aux(session, req)
-            self._assert_disagg_history_declared(req)
-            self._restore_draft_history(req)
+            if not has_draft_history:
+                self._assert_disagg_history_declared(req)
+                self._restore_draft_history(req)
             self._close_session_or_raise(session, rid, "completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]

@@ -516,11 +516,14 @@ def _estimate_cache_size_components(
     *,
     scratch: bool,
     generation_capacity_headroom: int,
+    standalone_draft_reserve: int = 0,
 ) -> tuple[int, int, int]:
     """Return context/generation bytes per token and generation bytes per request.
 
     Static profiling and runtime quota conversion must charge the same SWA
-    retention pages and context scratch space. Resume-watermark normalization
+    retention pages and context scratch space. The standalone draft reserve
+    is a shared allocation envelope, including windowed attention groups;
+    it does not represent committed history. Resume-watermark normalization
     is separate from these usable-capacity costs.
     """
     full_attn_size = _estimate_full_attn_size_per_token(layer_sizes, attention_windows)
@@ -538,7 +541,7 @@ def _estimate_cache_size_components(
     return (
         full_attn_size + context_swa_size,
         full_attn_size + generation_swa_size,
-        generation_swa_per_request,
+        generation_swa_per_request + standalone_draft_reserve * sum(layer_sizes),
     )
 
 
@@ -2354,16 +2357,16 @@ class KVCacheManagerV2(BaseResourceManager):
         (
             context_size_per_token,
             generation_size_per_token,
-            generation_swa_size_per_request,
+            generation_size_per_request,
         ) = _estimate_cache_size_components(
             layer_sizes,
             attention_windows,
             self.tokens_per_block,
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            standalone_draft_reserve=self._standalone_draft_reserve,
         )
-        size_per_batch = self.max_batch_size * generation_swa_size_per_request
-        size_per_batch += self._standalone_draft_fixed_bytes(layer_sizes)
+        size_per_batch = self.max_batch_size * generation_size_per_request
         if quota < size_per_batch:
             return 0
         context_limit_quota = self.max_num_tokens * context_size_per_token + size_per_batch
@@ -2391,27 +2394,22 @@ class KVCacheManagerV2(BaseResourceManager):
         (
             context_size_per_token,
             generation_size_per_token,
-            generation_swa_size_per_request,
+            generation_size_per_request,
         ) = _estimate_cache_size_components(
             layer_sizes,
             attention_windows,
             self.tokens_per_block,
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            standalone_draft_reserve=self._standalone_draft_reserve,
         )
         context_tokens = min(max_tokens, self.max_num_tokens)
         generation_tokens = max_tokens - context_tokens
         return int(
             context_tokens * context_size_per_token
             + generation_tokens * generation_size_per_token
-            + self.max_batch_size * generation_swa_size_per_request
-            + self._standalone_draft_fixed_bytes(layer_sizes)
+            + self.max_batch_size * generation_size_per_request
         )
-
-    def _standalone_draft_fixed_bytes(self, layer_sizes: Sequence[int]) -> int:
-        # All groups share one conservative allocation envelope in V2. Its
-        # scratch tail is capacity, never evidence of valid draft history.
-        return self.max_batch_size * self._standalone_draft_reserve * sum(layer_sizes)
 
     def _get_event_num_blocks_per_cache_level(
         self,
@@ -5600,6 +5598,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_num_tokens: int = 0,
         spec_config=None,
         is_draft: bool = False,
+        draft_layout: Optional[StandaloneDraftLayout] = None,
         **kwargs,
     ):
         layer_sizes, attention_windows = _get_static_cache_size_layer_components(
@@ -5632,10 +5631,16 @@ class KVCacheManagerV2(BaseResourceManager):
         _, generation_capacity_headroom = _get_generation_kv_capacity(
             spec_config, is_draft=is_draft
         )
+        draft_reserve = 0
+        if draft_layout is not None:
+            layer_sizes.extend([draft_layout.bytes_per_layer_token] * draft_layout.num_layers)
+            attention_windows.extend([None] * draft_layout.num_layers)
+            draft_reserve = draft_layout.extra_tokens
+            generation_capacity_headroom += draft_reserve
         (
             context_size_per_token,
             cache_size_per_token,
-            swa_size_per_request,
+            generation_size_per_request,
         ) = _estimate_cache_size_components(
             layer_sizes,
             attention_windows,
@@ -5646,11 +5651,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 and not is_draft
             ),
             generation_capacity_headroom=generation_capacity_headroom,
+            standalone_draft_reserve=draft_reserve,
         )
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.
         fixed_cost = (
-            swa_size_per_request * max_batch_size
+            generation_size_per_request * max_batch_size
             + (context_size_per_token - cache_size_per_token) * max_num_tokens
         )
         bytes_per_slot = _get_single_swa_pool_slot_bytes(
