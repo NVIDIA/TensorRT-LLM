@@ -65,8 +65,9 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float16, Int32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import BaseDSL, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -259,9 +260,12 @@ class FP8MQALogitsKernel:
 
         self.num_q_stages = 3  # 3 stages for Q pipelining across batch sequences
 
-        # TMEM: 512 columns total, each group needs N columns per UMMA stage
-        # max_umma_stages = 512 // (2 * N)
-        TMEM_COLS = 512
+        # TMEM columns (arch-aware): each group needs N columns per UMMA stage,
+        # so max_umma_stages = TMEM_COLS // (2 * N). Rubin exposes 576 (sm_107) /
+        # 832 (sm_109) vs Blackwell's 512, letting larger N still fit >= 2 UMMA
+        # stages (e.g. next_n=3 N=192 gets 2 stages on sm_109).
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        TMEM_COLS = get_max_tmem_alloc_cols(f"sm_{arch.major}{arch.minor}")
         if max_umma_pipeline:
             self.num_umma_stages = min(2, TMEM_COLS // (2 * self.N))
         else:
