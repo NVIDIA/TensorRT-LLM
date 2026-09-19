@@ -1095,12 +1095,15 @@ class _KVCache:
                 new_num_committed_tokens,
             ), "commit_min_snapshot requires commit() to start or end at history_length"
         self._committed_tokens.extend(accepted_input_tokens)
+        # Committed tokens are history under VIRTUAL_STOP as well: only the tree
+        # publication is suppressed, and the num_committed_tokens <= history_length
+        # invariant that suspend() / close() check still has to hold.
+        if self.history_length < self.num_committed_tokens:
+            self.history_length = self.num_committed_tokens
         if self._commit_state == self.CommitState.VIRTUAL_STOP:
             if is_end:
                 self._commit_state = self.CommitState.USER_STOP
             return
-        if self.history_length < self.num_committed_tokens:
-            self.history_length = self.num_committed_tokens
         num_committed_blocks = self._num_committed_blocks
         new_num_full_blocks = BlockOrdinal(self.num_committed_tokens // self.tokens_per_block)
         has_partial_snapshot = (
@@ -1231,6 +1234,26 @@ class _KVCache:
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
     # If there is a uncommitted block containing committed tokens, we will commit the block immediately.
+    def _mark_reuse_state_stale(self) -> None:
+        """Called by ``KVCacheManager.clear_reusable_blocks`` while this cache is open.
+
+        Keeps every page this cache still needs (the caller is detaching the radix
+        tree, not the pages) but forbids further commits: the tree blocks referenced
+        by ``SeqBlock.tree_block`` are about to become orphans, which must never serve
+        as ``prev`` of a new ``Block``, and their contents predate the weight update
+        that motivated the clear. VIRTUAL_STOP rather than ``stop_committing()``:
+        the latter snapshots the partial last block into the tree, which would
+        re-register stale data right after the clear. Leaving ALLOWED still ends the
+        hold on the out-of-window SWA pages of uncommitted blocks, which were kept only
+        for the commit that would have published them (``_on_stop_committing``, as on
+        every other exit from ALLOWED).
+        """
+        if self._status == self.Status.CLOSED:
+            return
+        if self._commit_state == self.CommitState.ALLOWED:
+            self._commit_state = self.CommitState.VIRTUAL_STOP
+            self._on_stop_committing()
+
     def stop_committing(self) -> None:
         assert self.status != self.Status.CLOSED
         if self._commit_state == self.CommitState.USER_STOP:

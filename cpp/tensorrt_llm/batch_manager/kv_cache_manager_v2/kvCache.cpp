@@ -1770,7 +1770,9 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
     }
 
     // Update history before mutating the committed-token state so an invalid growth leaves commit() retryable.
-    if (mCommitState != CommitState::VIRTUAL_STOP && mHistoryLength < numCommitted)
+    // Committed tokens are history under VIRTUAL_STOP as well: only the tree publication is suppressed, and the
+    // num_committed_tokens <= history_length invariant that suspend() / close() check still has to hold.
+    if (mHistoryLength < numCommitted)
         setHistoryLength(numCommitted);
 
     // Append tokens to committed list.

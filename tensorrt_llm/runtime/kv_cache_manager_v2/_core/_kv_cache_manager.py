@@ -349,7 +349,25 @@ class KVCacheManager:
             storage.destroy()
 
     def clear_reusable_blocks(self) -> None:
-        self._check_no_living_kv_caches("clear_reusable_blocks()")
+        """Invalidate every reusable block; open KV caches keep the pages they still need.
+
+        Mirrors the V1 ``BlockManager::clearReusableBlocks`` contract, which the
+        RL refit path relies on (``PyExecutor.reset_prefix_cache`` runs while the
+        CUDA-graph padding dummy -- and, under PD disaggregation, transfer-bound
+        requests -- are still open). Detaching the tree is safe for a living
+        cache: its ``SeqBlock.tree_block`` references keep the detached
+        ``Block`` objects alive, and ``Block._release_pages`` only reclaims
+        pages that are DROPPABLE, so pages HELD through the cache's page locks
+        (including deferred reuse copies and in-flight disaggregated sends)
+        survive until the cache closes. What a living cache must *not* do is
+        commit further blocks: a detached block is a dangling ``prev`` for
+        ``Block.__init__`` and, once weights changed, its data is stale, so each
+        open cache is switched to VIRTUAL_STOP first (no partial-block snapshot
+        is taken, unlike ``stop_committing()``; the out-of-window SWA pages a cache
+        held only for a commit are released, as ``stop_committing()`` does).
+        """
+        for r in list(self._living_kv_caches):
+            unwrap_rawref(r)._mark_reuse_state_stale()
         self._radix_tree.clear()
 
     def get_mem_pool_base_address(
