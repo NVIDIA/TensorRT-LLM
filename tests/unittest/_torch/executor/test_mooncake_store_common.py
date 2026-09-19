@@ -22,6 +22,7 @@ Runs without a Mooncake installation: the store handle is replaced by an
 in-process fake that records what it was handed.
 """
 
+import importlib
 import json
 from types import SimpleNamespace
 
@@ -71,13 +72,19 @@ class FakeStore:
     calls belong to the connector.
     """
 
-    def __init__(self, register_status=0):
+    def __init__(self, register_status=0, unregister_status=0):
         self.registered = []
+        self.unregistered = []
         self._register_status = register_status
+        self._unregister_status = unregister_status
 
     def register_buffer(self, address, size):
         self.registered.append((address, size))
         return self._register_status
+
+    def unregister_buffer(self, address):
+        self.unregistered.append(address)
+        return self._unregister_status
 
 
 @pytest.fixture
@@ -100,6 +107,7 @@ def store_config(tmp_path, monkeypatch):
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_ROLE", raising=False)
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_PREFIX", raising=False)
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_MODEL_KEY", raising=False)
+    monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", raising=False)
     return path
 
 
@@ -317,6 +325,20 @@ def test_config_staging_env_override(store_config, monkeypatch, value, expected)
     assert MooncakeStoreConnectorConfig.from_env().stage_through_host is expected
 
 
+def test_config_namespace_env_overrides(store_config, monkeypatch):
+    # Both feed KeyNamespace, which decides whether two engines share cache.
+    # Getting either wrong silently loses every hit, or lets one engine read
+    # another's pages.
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_PREFIX", "tenant-a")
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_MODEL_KEY", "llama-3.1-8b@rev7")
+
+    config = MooncakeStoreConnectorConfig.from_env()
+
+    assert config.cache_prefix == "tenant-a"
+    # Overrides the JSON's model_key, not just the basename default.
+    assert config.resolve_model_key("/models/test-model") == "llama-3.1-8b@rev7"
+
+
 def test_config_rejects_a_non_boolean_staging_env(store_config, monkeypatch):
     monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", "sometimes")
     with pytest.raises(ValueError, match="not a boolean"):
@@ -384,6 +406,16 @@ def test_uses_connector_rejects_an_unknown_preset():
         uses_connector(config, "mooncake-stroe")
 
 
+def test_the_registered_preset_resolves_to_refusing_classes():
+    """py_executor_creator resolves both by name from the package."""
+    config = KvCacheConnectorConfig(connector="mooncake-store")
+    module = importlib.import_module(config.connector_module)
+
+    for class_name in (config.connector_scheduler_class, config.connector_worker_class):
+        with pytest.raises(NotImplementedError, match="not available in this build"):
+            getattr(module, class_name)(llm_args=None)
+
+
 # ---- host staging ----
 
 
@@ -425,6 +457,27 @@ def test_staging_pool_refuses_to_start_when_registration_fails():
     # rule out, so it has to be loud rather than fall back to the pools.
     with pytest.raises(RuntimeError, match="register_buffer failed"):
         make_pool(store=FakeStore(register_status=-1))
+
+
+def test_staging_pool_close_unregisters_before_the_buffer_goes():
+    store = FakeStore()
+    pool = make_pool(slot_bytes=256, num_slots=4, store=store)
+    base = pool.slot_address(0)
+
+    pool.close()
+    pool.close()
+
+    assert store.unregistered == [base]
+
+
+def test_staging_pool_close_keeps_the_buffer_when_unregistration_fails():
+    store = FakeStore(unregister_status=-1)
+    pool = make_pool(slot_bytes=256, num_slots=4, store=store)
+
+    with pytest.raises(RuntimeError, match="unregister_buffer failed"):
+        pool.close()
+
+    assert pool._buffer is not None
 
 
 def test_staging_pool_slots_are_contiguous_and_bounds_checked():

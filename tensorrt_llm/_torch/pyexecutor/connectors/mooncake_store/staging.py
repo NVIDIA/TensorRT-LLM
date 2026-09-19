@@ -127,6 +127,7 @@ class HostStagingPool:
     ):
         self._slot_bytes = int(slot_bytes)
         self._num_slots = int(num_slots)
+        self._store = store
         self._label = label
 
         # Page-locking is a correctness requirement here rather than a
@@ -151,6 +152,26 @@ class HostStagingPool:
             f"{self._slot_bytes} B = {self._buffer.numel() / 1024**2:.1f} MiB pinned "
             f"(pinned={pin})"
         )
+
+    def close(self) -> None:
+        """Hand the registration back before the buffer is freed.
+
+        The store registers an address range rather than the tensor, so a buffer
+        freed while it still holds one leaves the fabric able to reach memory the
+        allocator has since handed out again. Called once the connector's pending
+        transfers have drained. Idempotent, and a failed unregistration keeps the
+        buffer rather than freeing memory the store may still reach.
+        """
+        if self._buffer is None:
+            return
+        status = self._store.unregister_buffer(self._base)
+        if status != 0:
+            raise RuntimeError(
+                f"MooncakeDistributedStore.unregister_buffer failed with status "
+                f"{status} for the {self._label} host staging buffer at "
+                f"{self._base:#x}. The buffer is kept alive rather than freed."
+            )
+        self._buffer = None
 
     @property
     def num_slots(self) -> int:
