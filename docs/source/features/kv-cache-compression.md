@@ -203,8 +203,43 @@ Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets `KvCacheConfig(dtype="nvfp4")` and keeps active GPU KV in
 NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
+
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
+
+#### Keeping RoPE Precision
+
+For every token and KV head, the KV cache stores one K vector and one V vector
+of `head_dim` numbers. In some models only part of the K vector carries the
+token's position (the RoPE part); the rest does not (the NoPE part). GLM-5 and
+other MLA models store one 576-number vector per token instead of separate K and
+V, and its last 64 numbers are RoPE; Qwen3.5 rotates the first 64 of its 256
+numbers; a DeepSeek-V4 compressed entry has 512 numbers of which the last 64 are
+RoPE. Position information reacts to
+4-bit rounding differently from the rest, so some deployments prefer to leave it
+untouched.
+
+`keep_rope_precision` controls this:
+
+- Off (default): the whole K vector and the whole V vector become NVFP4. This
+  gives the highest compression ratio.
+- On: only the NoPE part of the K vector becomes NVFP4. The RoPE part is copied
+  into the cold page unchanged, so it keeps the hot cache's precision (FP8 or
+  BF16). The V vector still becomes NVFP4 in full. Accuracy improves a little and
+  the compression ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
+
+The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
+series. Any other model ignores it with a warning and quantizes whole vectors; to
+support a new model, check its accuracy and add its `model_type` to
+`_KEEP_ROPE_PRECISION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of a
+draft model (speculative decoding) always quantizes whole vectors.
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  keep_rope_precision: true
+```
 
 ### TriAttention
 
@@ -251,7 +286,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `keep_rope_precision` is on) and the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,
