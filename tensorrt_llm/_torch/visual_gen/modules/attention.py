@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -96,21 +97,34 @@ class Attention(nn.Module):
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
-        _is_vsa = (
-            base_backend == "CUTEDSL"
-            and _sa_cfg is not None
-            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        _sa_algo = getattr(_sa_cfg, "algorithm", None) if _sa_cfg is not None else None
+        _is_vsa = base_backend == "CUTEDSL" and _sa_algo == "vsa"
+        _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
+        separate_qkv_cross_attention = (
+            self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
         )
 
         # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
+        # Sol-Attn is absent by design; see SolAttention._can_serve.
+        if separate_qkv_cross_attention and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
+            requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
+            # Warn once per (module class, requested, resolved) triple so the
+            # fallback is visible without per-module-instance log spam.
+            logger.warning_once(
+                f"{type(self).__name__}: requested attention backend {requested} does not "
+                f"support qkv_mode=SEPARATE_QKV; falling back to {backend_name}.",
+                key=(type(self).__name__, requested, backend_name),
+            )
         else:
             backend_name = base_backend
 
-        if _is_vsa and cp_size > 1:
+        # Every sparse algorithm here routes over the whole token sequence, so
+        # none of them can be split across context-parallel ranks.
+        if (_is_vsa or _is_sol_attn) and cp_size > 1:
+            _algo_name = "VSA" if _is_vsa else "Sol-Attn"
             raise ValueError(
-                f"VSA needs the full token sequence per rank, so it is incompatible "
+                f"{_algo_name} needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
             )
@@ -211,10 +225,14 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Resolve sparse attention params for TRTLLM backend
+        # Lower the shared SkipSoftmax user/checkpoint config for each backend
+        # whose kernel consumes SkipSoftmaxParams.
         sparse_params = None
         ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
+        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name in (
+            "TRTLLM",
+            "CUTEDSL",
+        ):
             sparse_params = ss_cfg.to_sparse_params(
                 module_name=self.module_name,
                 pretrained_config=config.pretrained_config,

@@ -24,13 +24,14 @@ import json
 import os
 import tempfile
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.llmapi import RequestOutput
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.llmapi import KvCacheConfig, RequestOutput
 
 # HF module name -> block path relative to layers.{idx}.
 # Attention targets work on all architectures. MLP targets only apply to
@@ -119,12 +120,14 @@ def run_with_and_without_lora(
     lora_config: LoraConfig,
     lora_dir: str,
     prompts: list[str],
+    kv_cache_config: KvCacheConfig | None = None,
 ) -> tuple[list[RequestOutput], list[RequestOutput]]:
     """Run inference with and without LoRA, return (lora_outputs, base_outputs)."""
     with LLM(
         model=model_path,
         backend="pytorch",
         lora_config=lora_config,
+        kv_cache_config=kv_cache_config or KvCacheConfig(),
         tensor_parallel_size=1,
         max_batch_size=4,
         max_num_tokens=256,
@@ -164,11 +167,31 @@ def assert_lora_changes_output(
     assert any_differ, "LoRA outputs identical to base model (same tokens AND same logprobs)"
 
 
+def assert_outputs_match(actual: RequestOutput, expected: RequestOutput) -> None:
+    """Assert that two request outputs have identical tokens and logprobs."""
+    actual_completion = actual.outputs[0]
+    expected_completion = expected.outputs[0]
+    assert actual_completion.token_ids == expected_completion.token_ids
+
+    actual_logprobs = actual_completion.logprobs
+    expected_logprobs = expected_completion.logprobs
+    assert len(actual_logprobs) == len(expected_logprobs)
+    for actual_step, expected_step in zip(actual_logprobs, expected_logprobs, strict=True):
+        assert actual_step.keys() == expected_step.keys()
+        for token_id in actual_step:
+            assert actual_step[token_id].logprob == pytest.approx(
+                expected_step[token_id].logprob, abs=1e-6
+            )
+
+
 def run_lora_test(
     model_path: str,
     target_modules: dict[str, str],
     trtllm_modules: list[str],
     dtype: torch.dtype = torch.bfloat16,
+    overlap: bool = False,
+    specialize_cuda_graph: bool = False,
+    kv_cache_config: KvCacheConfig | None = None,
 ) -> None:
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -184,11 +207,14 @@ def run_lora_test(
             lora_target_modules=trtllm_modules,
             max_lora_rank=16,
             max_loras=2,
+            overlap_lora_and_base=overlap,
+            cuda_graph_specialize_lora=specialize_cuda_graph,
         )
         out_lora, out_base = run_with_and_without_lora(
             model_path,
             lora_config,
             lora_dir,
             ["The capital of France is", "Hello, how are you"],
+            kv_cache_config=kv_cache_config,
         )
         assert_lora_changes_output(out_lora, out_base)

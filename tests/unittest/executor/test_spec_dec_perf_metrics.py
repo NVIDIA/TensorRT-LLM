@@ -14,14 +14,12 @@
 # limitations under the License.
 """Unit tests for backfilling RequestPerfMetrics.speculative_decoding.
 
-The PyTorch flow (TorchSampler) never calls
-LlmRequest::updateNumTokensPerIteration — the only C++ writer of the
-speculative_decoding perf-metrics section — so with
-SamplingParams(return_perf_metrics=True) the section used to arrive zeroed
-even when drafting ran. GenerationResultBase._maybe_fill_spec_dec_perf_metrics
-backfills it from the cumulative totals the PyTorch executor attaches to the
-response (LlmResult.spec_dec_totals). These tests exercise that client-side
-fill logic directly (CPU-only; no engine needed).
+Nothing populates the speculative_decoding perf-metrics section runtime-side,
+so with SamplingParams(return_perf_metrics=True) it arrives zeroed even when
+drafting ran. GenerationResultBase._maybe_fill_spec_dec_perf_metrics backfills
+it from the cumulative totals the PyTorch executor attaches to the response
+(LlmResult.spec_dec_totals). These tests exercise that client-side fill logic
+directly (CPU-only; no engine needed).
 """
 
 from types import SimpleNamespace
@@ -62,23 +60,6 @@ def test_noop_without_totals():
     assert pm.speculative_decoding.total_accepted_draft_tokens == 0
     assert pm.speculative_decoding.total_draft_tokens == 0
     assert pm.speculative_decoding.acceptance_rate == pytest.approx(0.0)
-
-
-def test_noop_when_section_already_populated():
-    # TRT-engine / TRTLLMSampler paths populate the section runtime-side
-    # (updateNumTokensPerIteration); the backfill must not overwrite it.
-    pm = tllm.RequestPerfMetrics()
-    spec_dec = tllm.SpeculativeDecodingMetrics()
-    spec_dec.total_accepted_draft_tokens = 5
-    spec_dec.total_draft_tokens = 10
-    spec_dec.acceptance_rate = 0.5
-    pm.speculative_decoding = spec_dec
-
-    _fill((30, 40), pm)
-
-    assert pm.speculative_decoding.total_accepted_draft_tokens == 5
-    assert pm.speculative_decoding.total_draft_tokens == 10
-    assert pm.speculative_decoding.acceptance_rate == pytest.approx(0.5)
 
 
 def test_noop_on_nonpositive_drafted():

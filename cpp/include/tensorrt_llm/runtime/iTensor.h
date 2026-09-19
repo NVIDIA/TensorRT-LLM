@@ -65,7 +65,7 @@ public:
     [[nodiscard]] DimType64 getDimension() const
     {
         auto const shape = getShape();
-        static_assert(n < shape.MAX_DIMS && n >= -shape.MAX_DIMS,
+        static_assert(n < Shape::MAX_DIMS && n >= -Shape::MAX_DIMS,
             "Trying to access the dimension of a tensor, when its maximal shape cannot have that dimension.");
         if constexpr (n < 0)
         {

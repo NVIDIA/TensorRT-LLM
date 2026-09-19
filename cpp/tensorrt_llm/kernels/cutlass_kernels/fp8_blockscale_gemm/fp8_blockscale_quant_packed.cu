@@ -235,6 +235,168 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
 #endif
 }
 
+// Each warp consumes one row of a [gate, up] tensor and produces four
+// 128-element FP8 quantization blocks. SwiGLU is rounded to BF16 before
+// quantization to match the existing silu_and_mul -> quantize sequence.
+template <int WarpsPerBlock>
+__global__ void silu_and_mul_fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict__ fp8_output,
+    void* __restrict__ scale_output, __nv_bfloat16 const* __restrict__ input, int const m, int const k,
+    int const scale_leading_dim_uint32, bool const use_r128c4_layout, float const swiglu_limit,
+    bool const has_swiglu_limit)
+{
+    int const packed_sf_k_idx = static_cast<int>(blockIdx.x);
+    int const warpId = static_cast<int>(threadIdx.x) >> 5;
+    int const laneId = static_cast<int>(threadIdx.x) & 31;
+    int64_t const mBlockIdx = static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y;
+    int64_t const mIdx = mBlockIdx * WarpsPerBlock + warpId;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
+    bool const rowInRange = mIdx < m;
+    uint32_t packed = 0U;
+    if (rowInRange)
+    {
+        constexpr int kElemsPerLane = 16;
+        int const kBase = packed_sf_k_idx * 512 + laneId * kElemsPerLane;
+        bool const kInRange = kBase < k;
+
+        union Bf16Pack
+        {
+            double4 pack;
+            __nv_bfloat16 values[kElemsPerLane];
+        };
+
+        Bf16Pack gate;
+        Bf16Pack up;
+        gate.pack = double4{};
+        up.pack = double4{};
+        if (kInRange)
+        {
+            int64_t const rowOffset = static_cast<int64_t>(mIdx) * 2 * k;
+            gate.pack = *reinterpret_cast<double4 const*>(input + rowOffset + kBase);
+            up.pack = *reinterpret_cast<double4 const*>(input + rowOffset + k + kBase);
+        }
+
+        int const valid = kInRange ? min(kElemsPerLane, k - kBase) : 0;
+        __nv_bfloat16 maxElem = __nv_bfloat16(0.0F);
+#pragma unroll
+        for (int i = 0; i < kElemsPerLane; ++i)
+        {
+            if (i < valid)
+            {
+                float gateValue = static_cast<float>(gate.values[i]);
+                float upValue = static_cast<float>(up.values[i]);
+                if (has_swiglu_limit)
+                {
+                    gateValue = fminf(gateValue, swiglu_limit);
+                    upValue = fminf(fmaxf(upValue, -swiglu_limit), swiglu_limit);
+                }
+                float const silu = gateValue / (1.0F + __expf(-gateValue));
+                gate.values[i] = __nv_bfloat16(silu * upValue);
+                maxElem = __hmax(maxElem, __habs(gate.values[i]));
+            }
+            else
+            {
+                gate.values[i] = __nv_bfloat16(0.0F);
+            }
+        }
+
+        float amax = static_cast<float>(maxElem);
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 4, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 2, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 1, 8));
+        amax = fmaxf(amax, 1e-10F);
+
+        float const dequantScaleRaw = amax * reciprocal_approximate_ftz_local(448.0F);
+        __nv_fp8_e8m0 ue8m0Scale;
+        ue8m0Scale.__x = __nv_cvt_float_to_e8m0(dequantScaleRaw, __NV_SATFINITE, cudaRoundPosInf);
+
+        constexpr uint32_t kFp32ExponentBias = 127U;
+        float const quantScale = ue8m0Scale.__x == 0
+            ? 1.0F
+            : exp2f(static_cast<float>(kFp32ExponentBias) - static_cast<float>(ue8m0Scale.__x));
+
+        union Fp8Pack
+        {
+            float4 pack;
+            __nv_fp8_e4m3 values[kElemsPerLane];
+        };
+
+        Fp8Pack output;
+        output.pack = float4{};
+#pragma unroll
+        for (int i = 0; i < kElemsPerLane; ++i)
+        {
+            output.values[i] = __nv_fp8_e4m3(static_cast<float>(gate.values[i]) * quantScale);
+        }
+
+        if (kInRange)
+        {
+            auto* outputPtr = reinterpret_cast<float4*>(fp8_output + static_cast<int64_t>(mIdx) * k + kBase);
+            outputPtr[0] = output.pack;
+        }
+
+        uint32_t const s0 = __shfl_sync(0xFFFFFFFFU, static_cast<uint32_t>(ue8m0Scale.__x), 0);
+        uint32_t const s1 = __shfl_sync(0xFFFFFFFFU, static_cast<uint32_t>(ue8m0Scale.__x), 8);
+        uint32_t const s2 = __shfl_sync(0xFFFFFFFFU, static_cast<uint32_t>(ue8m0Scale.__x), 16);
+        uint32_t const s3 = __shfl_sync(0xFFFFFFFFU, static_cast<uint32_t>(ue8m0Scale.__x), 24);
+        if (laneId == 0)
+        {
+            int const numSfK = (k + 127) / 128;
+            int const sfKBase = packed_sf_k_idx * 4;
+            if (sfKBase < numSfK)
+            {
+                packed |= s0;
+            }
+            if (sfKBase + 1 < numSfK)
+            {
+                packed |= s1 << 8;
+            }
+            if (sfKBase + 2 < numSfK)
+            {
+                packed |= s2 << 16;
+            }
+            if (sfKBase + 3 < numSfK)
+            {
+                packed |= s3 << 24;
+            }
+        }
+    }
+
+    if (laneId == 0)
+    {
+        if (use_r128c4_layout)
+        {
+            int const numSfK = (k + 127) / 128;
+            int const mTile = mIdx / 128;
+            int const mInTile = mIdx % 128;
+            for (int scaleIdx = 0; scaleIdx < 4; ++scaleIdx)
+            {
+                int const sfK = packed_sf_k_idx * 4 + scaleIdx;
+                if (sfK < numSfK)
+                {
+                    int64_t const byteOffset
+                        = ((((static_cast<int64_t>(mTile) * numSfK + sfK) * 32 + mInTile % 32) * 4 + mInTile / 32) * 4);
+                    uint32_t const scale = (packed >> (scaleIdx * 8)) & 0xFFU;
+                    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(scale_output) + byteOffset)
+                        = scale * 0x01010101U;
+                }
+            }
+        }
+        else if (mIdx < scale_leading_dim_uint32)
+        {
+            static_cast<int32_t*>(scale_output)[static_cast<int64_t>(packed_sf_k_idx) * scale_leading_dim_uint32 + mIdx]
+                = packed;
+        }
+    }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 } // namespace
 
 void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32_t* packed_scale_output,
@@ -276,6 +438,27 @@ void launch_fp8_quantize_1x128_cutedsl_bf16_e4m3(__nv_fp8_e4m3* fp8_output, uint
     tensorrt_llm::common::launchWithPdlWhenEnabled("fp8_quantize_1x128_cutedsl_kernel_impl",
         fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock, true>, grid, block, 0, stream, fp8_output,
         reinterpret_cast<int32_t*>(swizzled_scale_output), input, m, k, padded_m);
+}
+
+void launch_silu_and_mul_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, void* scale_output,
+    __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, bool use_r128c4_layout, float swiglu_limit,
+    bool has_swiglu_limit, cudaStream_t stream)
+{
+    if (m <= 0 || k <= 0)
+    {
+        return;
+    }
+
+    constexpr int kWarpsPerBlock = 4;
+    int const numPackedSfK = (((k + 127) / 128) + 3) / 4;
+    int const mExtent = use_r128c4_layout ? (m + 127) / 128 * 128 : scale_leading_dim_uint32;
+    int const mBlocks = (mExtent + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    dim3 const grid = makeQuantizeGrid(numPackedSfK, mBlocks);
+    dim3 const block(kWarpsPerBlock * 32, 1, 1);
+
+    tensorrt_llm::common::launchWithPdlWhenEnabled("silu_and_mul_fp8_quantize_1x128_packed_kernel_impl",
+        silu_and_mul_fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock>, grid, block, 0, stream, fp8_output,
+        scale_output, input, m, k, scale_leading_dim_uint32, use_r128c4_layout, swiglu_limit, has_swiglu_limit);
 }
 
 } // namespace kernels::fp8_blockscale_gemm

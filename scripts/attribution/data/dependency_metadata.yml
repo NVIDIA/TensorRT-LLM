@@ -23,14 +23,14 @@ cutlass/v4.3.0:
 deep_ep/5be51b228a7c82dbdb213ea58e77bffd12b38af8:
   license: 452b3ef002dc6ec283fb723f0dd84997
   source: https://github.com/deepseek-ai/DeepEP/tree/5be51b228a7c82dbdb213ea58e77bffd12b38af8
-deepgemm/f8e8fb5830fa5cda6e4ea73d360bb3f21f87a3ca:
+deepgemm/8b1392b978f5a03c828dd1711090d7fb50958b8a:
   license: 452b3ef002dc6ec283fb723f0dd84997
-  source: https://github.com/deepseek-ai/DeepGEMM/tree/f8e8fb5830fa5cda6e4ea73d360bb3f21f87a3ca
+  source: https://github.com/deepseek-ai/DeepGEMM/tree/8b1392b978f5a03c828dd1711090d7fb50958b8a
 dlpack/v1.0:
   license: cd9881918c97ec7b4962691660bb733e
-flashmla/1408756a88e52a25196b759eaf8db89d2b51b5a1:
+flashmla/15f13e5030374295491c5ce31b02d7e63a7772c6:
   license: 452b3ef002dc6ec283fb723f0dd84997
-  source: https://github.com/deepseek-ai/FlashMLA/tree/1408756a88e52a25196b759eaf8db89d2b51b5a1
+  source: https://github.com/deepseek-ai/FlashMLA/tree/15f13e5030374295491c5ce31b02d7e63a7772c6
 fmt/11.2.0-57-g553ec11e:
   license: a0b1787992db284ce6c0cb61aa9e108f
 hedley/v3.12.0:

@@ -16,22 +16,96 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.distributed import AllReduceFusionOp
 from tensorrt_llm._torch.models.modeling_qwen3_next import (
     Qwen3NextForCausalLM,
+    Qwen3NextFullAttentionDecoderLayer,
     Qwen3NextLinearDecoderLayer,
+    Qwen3NextMTP,
     _eager_fusion_enabled,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import EventType
 
 
 def _new_causal_lm() -> Qwen3NextForCausalLM:
     model = Qwen3NextForCausalLM.__new__(Qwen3NextForCausalLM)
     nn.Module.__init__(model)
     return model
+
+
+def _new_mtp() -> Qwen3NextMTP:
+    model = Qwen3NextMTP.__new__(Qwen3NextMTP)
+    nn.Module.__init__(model)
+    model.pre_fc_norm_embedding = nn.Identity()
+    model.pre_fc_norm_hidden = nn.Identity()
+    model.fc = nn.Identity()
+    model.shared_head = nn.Module()
+    model.shared_head.norm = MagicMock(
+        side_effect=lambda hidden_states, residual: (hidden_states, None)
+    )
+    model.event_dict = {EventType.Main: None, EventType.MoeShared: None}
+    model.aux_stream = None
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=True)
+    )
+    return model
+
+
+@torch.no_grad()
+def test_mtp_forward_uses_and_restores_draft_rank_token_counts(monkeypatch) -> None:
+    model = _new_mtp()
+    target_rank_tokens = [1024, 1024]
+    draft_rank_tokens = [1, 1]
+    attn_metadata = SimpleNamespace(all_rank_num_tokens=target_rank_tokens)
+
+    def decoder_forward(self, **kwargs):
+        assert kwargs["attn_metadata"].all_rank_num_tokens is draft_rank_tokens
+        return kwargs["hidden_states"], None
+
+    monkeypatch.setattr(Qwen3NextFullAttentionDecoderLayer, "forward", decoder_forward)
+
+    hidden_states = model(
+        input_ids=torch.tensor([0]),
+        position_ids=torch.tensor([0]),
+        hidden_states=torch.ones(1, 2),
+        embed_tokens=nn.Embedding(1, 2),
+        attn_metadata=attn_metadata,
+        all_rank_num_tokens=draft_rank_tokens,
+    )
+
+    assert hidden_states.shape == (1, 4)
+    assert attn_metadata.all_rank_num_tokens is target_rank_tokens
+
+
+@torch.no_grad()
+def test_mtp_forward_restores_rank_token_counts_after_failure(monkeypatch) -> None:
+    model = _new_mtp()
+    target_rank_tokens = [1024, 1024]
+    draft_rank_tokens = [1, 1]
+    attn_metadata = SimpleNamespace(all_rank_num_tokens=target_rank_tokens)
+
+    def decoder_forward(self, **kwargs):
+        assert kwargs["attn_metadata"].all_rank_num_tokens is draft_rank_tokens
+        raise RuntimeError("draft forward failed")
+
+    monkeypatch.setattr(Qwen3NextFullAttentionDecoderLayer, "forward", decoder_forward)
+
+    with pytest.raises(RuntimeError, match="draft forward failed"):
+        model(
+            input_ids=torch.tensor([0]),
+            position_ids=torch.tensor([0]),
+            hidden_states=torch.ones(1, 2),
+            embed_tokens=nn.Embedding(1, 2),
+            attn_metadata=attn_metadata,
+            all_rank_num_tokens=draft_rank_tokens,
+        )
+
+    assert attn_metadata.all_rank_num_tokens is target_rank_tokens
 
 
 @torch.no_grad()

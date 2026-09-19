@@ -49,7 +49,7 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
@@ -824,7 +824,7 @@ def verify_all_requests(
         for layer_idx in range(num_layers):
             # Compute expected_valid: the number of non-stale blocks that
             # were actually transferred, using the same eviction formula as
-            # _create_kv_slice.  Only compare these blocks in verification.
+            # _create_chunk.  Only compare these blocks in verification.
             expected_valid = None
             win = layer_to_window.get(layer_idx)
             if win is not None and win < MAX_SEQ_LEN:
@@ -981,6 +981,7 @@ def run_transfer_test(
     request_lengths: Optional[List[int]] = None,
     enable_indexer_k_cache: bool = False,
     indexer_k_cache_layer_mask: list[bool] | None = None,
+    expect_cpp_bounce: bool = False,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
@@ -1024,6 +1025,18 @@ def run_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
+        # Keep the Python-native bounce layer disabled by default (size 0).
+        # Dedicated C++ bounce coverage enables the NIXL agent's bounce v2 via
+        # agent_bounce_buffer_enable + kv_cache_bounce_size_mb plus
+        # agent_bounce_params, which exercises the config plumbing end-to-end.
+        kv_cache_bounce_size_mb=64 if expect_cpp_bounce else 0,
+        agent_bounce_buffer_enable=expect_cpp_bounce,
+        agent_bounce_params={
+            "min_descriptor_count": "1",
+            "max_average_descriptor_size": "1MB",
+        }
+        if expect_cpp_bounce
+        else None,
     )
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
@@ -1156,6 +1169,22 @@ def run_transfer_test(
                 gen_request_ids=gen_request_ids,
                 num_layers=num_layers,
             )
+
+        # Programmatic bounce check (no log parsing): every agent must have the C++
+        # bounce v2 transport active, and at least one transfer must have been routed
+        # through it (only KV senders submit WRITEs, so we assert on the total).
+        if expect_cpp_bounce:
+            # The shared capacity must be routed to exactly one implementation: with
+            # agent_bounce_buffer_enable the Python-native bounce stays off.
+            assert all(tc._transfer_worker._config.bounce is None for tc in ctx_tcs + gen_tcs), (
+                "Python-native bounce must stay disabled when the C++ agent bounce is selected"
+            )
+            agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
+            assert all(getattr(agent, "bounce_enabled", False) for agent in agents), (
+                "C++ bounce v2 transport is not active on every NIXL agent"
+            )
+            total_bounce_submits = sum(agent.bounce_submit_count for agent in agents)
+            assert total_bounce_submits > 0, "no transfer was routed through the bounce fast path"
 
         # 9. Cleanup
         if use_v2:
@@ -1544,6 +1573,61 @@ def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
         request_lengths=[30],
         enable_indexer_k_cache=True,
         indexer_k_cache_layer_mask=[False, False, True, True],
+    )
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    (
+        "ctx_tp",
+        "ctx_pp",
+        "gen_tp",
+        "gen_pp",
+        "is_mla",
+        "use_v2",
+        "enable_indexer_k_cache",
+    ),
+    [
+        pytest.param(1, 1, 1, 1, False, True, False, id="v2_mha"),
+        pytest.param(2, 1, 2, 1, True, True, False, id="v2_mla_tp2"),
+        pytest.param(1, 1, 1, 1, True, False, True, id="v1_dsa_indexer"),
+        pytest.param(2, 1, 1, 2, False, True, False, id="v2_ctx_tp2_gen_pp2"),
+    ],
+)
+def test_python_nixl_cache_transceiver_uses_cpp_bounce(
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    is_mla: bool,
+    use_v2: bool,
+    enable_indexer_k_cache: bool,
+) -> None:
+    """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
+
+    Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb) and tuned
+    (agent_bounce_params) via CacheTransceiverConfig inside run_transfer_test, covering
+    the config plumbing end-to-end; engagement is asserted programmatically there
+    (agent.bounce_enabled / bounce_submit_count).
+    """
+    # BindingsNixlTransferStatus.last_status_str() resolves this exact attribute on the C++
+    # status; if the binding name drifts, failure details silently degrade to "<unavailable>".
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus
+
+    assert hasattr(TransferStatus, "get_last_status_str")
+
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=is_mla,
+        use_v2=use_v2,
+        request_lengths=[30, 60],
+        enable_indexer_k_cache=enable_indexer_k_cache,
+        expect_cpp_bounce=True,
     )
 
 

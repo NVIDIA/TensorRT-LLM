@@ -2284,6 +2284,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
         ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GLUAdaptor<cutlass::epilogue::thread::GELU>>
         : activation_type == ActivationType::SwigluBias
         ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
+        : activation_type == ActivationType::SiTu
+        ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SiTuAdaptor>
         : nullptr;
     TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
     fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size, num_experts_per_node,
@@ -2809,6 +2811,9 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                 case ActivationType::SwigluBias:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
                         decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
+                case ActivationType::SiTu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor,
+                        decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Relu2:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value,
@@ -2963,6 +2968,8 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
                 case ActivationType::SwigluBias:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor, NVFP4_TYPE, kRows,
                         true>;
+                case ActivationType::SiTu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor, NVFP4_TYPE, kRows, true>;
                 case ActivationType::Relu2:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, NVFP4_TYPE, kRows, true>;
@@ -3325,12 +3332,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         size_t factor = is_gated_activation ? 2 : 1;
         size_t blockscale_fc1_output_size = factor * interbuf_elems * gemm_output_dtype;
         size_t blockscale_fc2_output_size = permuted_elems * gemm_output_dtype;
-        overlapped_gemm1_gemm2_inputs_size
-            = std::max(std::max(permuted_data_size, fc1_result_size), blockscale_fc2_output_size);
-        // The fused pre-FC2 path writes the FC2 GEMM output into the outputs buffer (glu_inter_result_)
-        // instead of the aliased fc2_result_, so size it for the larger of the FC1 raw output and the
-        // FC2 output.
-        overlapped_gemm1_gemm2_outputs_size = std::max(blockscale_fc1_output_size, blockscale_fc2_output_size);
+        overlapped_gemm1_gemm2_inputs_size = std::max(permuted_data_size, fc1_result_size);
+        overlapped_gemm1_gemm2_outputs_size = blockscale_fc1_output_size;
 
         auto* blockscale_gemm_runner = getDeepSeekBlockScaleGemmRunner();
         TLLM_CHECK(blockscale_gemm_runner != nullptr);
@@ -3338,20 +3341,26 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         // depends only on (num_rows, top_k, num_experts) so it is shape_k-independent and shared by FC1/FC2.
         if (blockscale_gemm_runner->isActivationPrequantized())
         {
+            // FC2's input (fc1_result_) is aliased onto fc2_result_ in the inputs buffer, so FC2 writes
+            // its output into the outputs buffer (glu_inter_result_).
+            overlapped_gemm1_gemm2_outputs_size = std::max(blockscale_fc1_output_size, blockscale_fc2_output_size);
             // Fused: the runner needs no internal workspace (both operands pre-quantized). The fused quant
             // instead packs fp8 activations + the padded 1x128 scales into the overlapped inputs buffer
             // (fc1_result_ for FC2, permuted_data_ for FC1); size it for both (hidden_size > inter_size makes
-            // FC1 dominant). The scale leading dim (~num_experts*32) can dwarf the token count, so it is not
-            // covered by the bf16-activation size.
+            // FC1 dominant). The scale leading dim (~num_experts*32) can dwarf the token count. The buffer
+            // holds these fp8 regions only, never the bf16 activations.
             blockscale_gemm_runner->getWorkspaceSize(
                 num_rows, hidden_size, inter_size, experts_per_token, num_experts_per_node);
             int64_t const scale_leading_dim = blockscale_gemm_runner->getActScaleLeadingDim();
-            overlapped_gemm1_gemm2_inputs_size = std::max({overlapped_gemm1_gemm2_inputs_size,
-                fp8BlockScaleRegionBytes(num_moe_inputs, inter_size, scale_leading_dim),
-                fp8BlockScaleRegionBytes(num_moe_inputs, hidden_size, scale_leading_dim)});
+            overlapped_gemm1_gemm2_inputs_size
+                = std::max(fp8BlockScaleRegionBytes(num_moe_inputs, inter_size, scale_leading_dim),
+                    fp8BlockScaleRegionBytes(num_moe_inputs, hidden_size, scale_leading_dim));
         }
         else
         {
+            // FC2 writes fc2_result_, which is aliased into the inputs buffer.
+            overlapped_gemm1_gemm2_inputs_size
+                = std::max(overlapped_gemm1_gemm2_inputs_size, blockscale_fc2_output_size);
             // Unfused: the <bf16,fp8,bf16> runner quantizes A internally into deepseek_fc_workspace.
             auto deepseek_fc1_workspace_size = blockscale_gemm_runner->getWorkspaceSize(
                 num_rows, factor * inter_size, hidden_size, experts_per_token, num_experts_per_node);
@@ -5030,6 +5039,18 @@ __global__ void populateRandomBufferKernel(void* buffer_void, size_t size)
         buffer[tid * elem_per_thread + i] = curand4(&state);
 }
 
+__global__ void populateProfilerSiTuParamsKernel(float* alpha, float* beta, int const numExperts)
+{
+    int const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= numExperts)
+    {
+        return;
+    }
+
+    alpha[tid] = 1.0F;
+    beta[tid] = 1.0F;
+}
+
 template <int BLOCK_SIZE, int NUM_ROUTING_SAMPLES>
 __global__ void prepareMinLatencyBuffer(int* num_active_experts_per_node, int* active_expert_global_ids,
     int64_t* expert_first_token_offset, int const num_tokens, int const num_experts_per_token,
@@ -5292,10 +5313,12 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
         = mMinLatencyMode ? sizeof(int) * NUM_ROUTING_SAMPLES : 0; // smaller than or equal to num_experts_per_node
     size_t active_expert_global_ids_size = mMinLatencyMode ? mNumExpertsPerNode * sizeof(int) * NUM_ROUTING_SAMPLES : 0;
 
-    bool is_swiglu_bias = mActivationType == ActivationType::SwigluBias && mGemmToProfile == GemmToProfile::GEMM_1;
-    size_t swiglu_alpha_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
-    size_t swiglu_beta_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
-    size_t swiglu_limit_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
+    bool const profilesGemm1 = mGemmToProfile == GemmToProfile::GEMM_1;
+    bool const isSwigluBias = mActivationType == ActivationType::SwigluBias && profilesGemm1;
+    bool const isSitu = mActivationType == ActivationType::SiTu && profilesGemm1;
+    size_t swiglu_alpha_size = (isSwigluBias || isSitu) ? num_experts_per_node * sizeof(float) : 0;
+    size_t swiglu_beta_size = (isSwigluBias || isSitu) ? num_experts_per_node * sizeof(float) : 0;
+    size_t swiglu_limit_size = isSwigluBias ? num_experts_per_node * sizeof(float) : 0;
 
     size_t map_offset = 0;
     std::map<std::string, std::pair<size_t, size_t>> out_map;
@@ -5331,14 +5354,14 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     ADD(quant_4);
     ADD(quant_5);
     ADD(quant_6);
-    ADD(tma_ws_input_workspace);
-    ADD(w4a8_alpha);
-    ADD(alpha_scale_ptr_array);
-    ADD(fp4_act_scale_flat);
-    ADD(gemm_workspace);
     ADD(swiglu_alpha);
     ADD(swiglu_beta);
     ADD(swiglu_limit);
+    ADD(w4a8_alpha);
+    ADD(tma_ws_input_workspace);
+    ADD(alpha_scale_ptr_array);
+    ADD(fp4_act_scale_flat);
+    ADD(gemm_workspace);
 #undef ADD_NAME
 #undef ADD
 
@@ -5618,6 +5641,22 @@ void GemmProfilerBackend::prepare(
 
     auto workspace_size = getWorkspaceSize(num_tokens);
     populateRandomBuffer(workspace_ptr_char, workspace_size, stream);
+
+    if (mActivationType == ActivationType::SiTu && mGemmToProfile == GemmToProfile::GEMM_1)
+    {
+        auto const workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
+        auto const& alphaWorkspace = workspaces.at("swiglu_alpha");
+        auto const& betaWorkspace = workspaces.at("swiglu_beta");
+        size_t const expectedSize = static_cast<size_t>(mNumExpertsPerNode) * sizeof(float);
+        TLLM_CHECK_WITH_INFO(alphaWorkspace.first >= expectedSize && betaWorkspace.first >= expectedSize,
+            "SiTu profiler activation-parameter workspace has the wrong size");
+        auto* alpha = reinterpret_cast<float*>(workspace_ptr_char + alphaWorkspace.second);
+        auto* beta = reinterpret_cast<float*>(workspace_ptr_char + betaWorkspace.second);
+        constexpr int kThreadsPerBlock = 128;
+        populateProfilerSiTuParamsKernel<<<ceilDiv(mNumExpertsPerNode, kThreadsPerBlock), kThreadsPerBlock, 0,
+            stream>>>(alpha, beta, mNumExpertsPerNode);
+        sync_check_cuda_error(stream);
+    }
 
     prepareRouting(num_tokens, workspace_ptr_char, stream);
     prepareQuantParams(num_tokens, workspace_ptr_char, stream);

@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (troubleshooting)=
 
 # Troubleshooting
@@ -18,7 +22,7 @@ Solution: try running build script with `--clean`, or try running `rm -r build c
 
 ## Debug on Unit Tests
 
-Here is an example to print the values of the MLP output tensor in a unit test ([full example](../../../../tests/unittest/others/test_debugging_api.py)).
+Here is an example to print the values of the MLP output tensor in a unit test ([full example](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tests/unittest/others/test_debugging_api.py)).
 
 1. Register the intermediate tensors as the network outputs with `register_network_output` API.
 
@@ -141,7 +145,7 @@ python3 ../run.py \
 
 5. See the value of the tensor.
 
-```txt
+```text
 ......
 dict_keys(['context_lengths', 'cache_indirection', 'position_ids', 'logits', 'last_token_ids', 'input_ids', 'kv_cache_block_pointers', 'host_kv_cache_block_pointers', 'sequence_length', 'host_past_key_value_lengths', 'host_sink_token_length', 'host_request_types', 'host_max_attention_window_sizes', 'host_context_lengths', 'transformer.layers.0.mlp_output', 'transformer.layers.1.mlp_output', 'transformer.layers.2.mlp_output', 'transformer.layers.3.mlp_output', 'transformer.layers.4.mlp_output', 'transformer.layers.5.mlp_output', 'transformer.layers.6.mlp_output', 'transformer.layers.7.mlp_output', 'transformer.layers.8.mlp_output', 'transformer.layers.9.mlp_output', 'transformer.layers.10.mlp_output', 'transformer.layers.11.mlp_output', 'transformer.layers.12.mlp_output', 'transformer.layers.13.mlp_output', 'transformer.layers.14.mlp_output', 'transformer.layers.15.mlp_output', 'transformer.layers.16.mlp_output', 'transformer.layers.17.mlp_output', 'transformer.layers.18.mlp_output', 'transformer.layers.19.mlp_output', 'transformer.layers.20.mlp_output', 'transformer.layers.21.mlp_output', 'transformer.layers.22.mlp_output', 'transformer.layers.23.mlp_output'])
 Step: 0
@@ -186,7 +190,7 @@ If problems come from runtime-shape of the input tensors, double-check the shape
 
 For example, one possible reason of getting the error information like below is, we use mismatched configuration between engine building and running, including code change (update of repo or users' rewriting), too large or too small input shape, etc..
 
-```txt
+```text
 unexpected shape for input 'XXX' for model 'YYY'. Expected [-1,-1,-1], got [8,16]. NOTE: Setting a non-zero max_batch_size in the model config requires a batch dimension to be prepended to each input shape. If you want to specify the full shape including the batch dim in your input dims config, try setting max_batch_size to zero. See the model configuration docs for more info on max_batch_size.
 
 [TensorRT-LLM][ERROR] Assertion failed: Tensor 'input_ids' has invalid shape (8192), expected (-1) (/code/tensorrt_llm/cpp/tensorrt_llm/runtime/tllmRuntime.cpp:149)
@@ -198,7 +202,7 @@ By setting environment variable `export TLLM_LOG_LEVEL=TRACE`, we can get more i
 
 Before the first forward computation, the shapes of all input / output tensors and their corresponding allowed ranges are provided in a table like:
 
-```txt
+```text
 [TensorRT-LLM][TRACE] Information of engine input / output.
 [TensorRT-LLM][TRACE] =====================================================================
 [TensorRT-LLM][TRACE]              Name              |I/O|Location|DataType|    Shape     |
@@ -248,7 +252,7 @@ Before the first forward computation, the shapes of all input / output tensors a
 
 Before each forward computation, the real shapes of all input / output tensors for TRT engine are provided by a table like:
 
-```txt
+```text
 [TensorRT-LLM][TRACE] Information of context input / output.
 [TensorRT-LLM][TRACE] Using Optimization Profile: 0
 [TensorRT-LLM][TRACE] =================================================

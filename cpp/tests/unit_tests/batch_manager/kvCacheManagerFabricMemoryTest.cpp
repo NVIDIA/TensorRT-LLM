@@ -22,7 +22,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <gtest/gtest.h>
@@ -208,7 +207,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, OffloadOnboardRoundTripWithFabricPrimary)
 
     // Drive the primary block allocator through addSequenceBatch.
     SizeType32 constexpr maxNewTokens{0};
-    tr::SamplingConfig const samplingConfig{beamWidth};
+    tensorrt_llm::executor::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
 
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});

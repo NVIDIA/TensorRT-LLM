@@ -80,19 +80,23 @@ _STAGE_GOAL_CODER_PROTOCOL = """\
 The bring-up workflow organizes `plan.md`'s `## Implementation Steps`
 into Stages and Goals. `status.md` carries a `## Stages & Goals` table
 at the top of the file that is the live state machine for those Stages
-and Goals. Read it via `read_status` at the start of every turn and
+and Goals. Read it at the start of every turn and
 locate the single `[Doing]` Goal — that is the **only Goal you work
 on this turn**.
 
 State tokens you will see in the table:
 
 - Stage states: `PENDING` (not yet started), `IN_PROGRESS` (active),
-  `CLOSED` (verified by QA), and the transient `CLOSED (pending QA)`
-  the Reviewer uses while submitting to QA.
+  `CLOSED` (verified by QA), the transient `CLOSED (pending QA)`
+  the Reviewer uses while submitting to QA, and `INTERRUPTED`
+  (preempted by a feedback-triggered replan; terminal, PlanDrafter-
+  owned).
 - Goal states: `[Undo]` (not yet started), `[Doing]` (active, with an
   `(iterations=N)` suffix the Reviewer maintains), `[Done]` (closed
-  with evidence), `[Failed]` (Reviewer judged unrecoverable). At most
-  one `[Doing]` Goal per Stage.
+  with evidence), `[Failed]` (Reviewer judged unrecoverable), and
+  `[Skipped]` (preempted by a feedback-triggered replan; terminal,
+  PlanDrafter-owned — never work on it, its still-needed work lives in
+  a later Stage's Goals). At most one `[Doing]` Goal per Stage.
 
 ### Per-turn rules
 
@@ -114,7 +118,7 @@ State tokens you will see in the table:
    only append a short evidence pointer to your own `[Doing]` Goal's
    row if a new artifact (test name, log path) became available this
    turn. Everything else is Reviewer-owned.
-4. **`update_status` always rewrites the whole file.** Put the
+4. **Your status update always rewrites the whole file.** Put the
    `## Stages & Goals` block first (unchanged from the prior turn
    plus any allowed evidence pointer), then the `Current status` /
    `Execution path` / `Done & TODO` sections, refreshed to reflect
@@ -125,7 +129,7 @@ State tokens you will see in the table:
 A Goal can be marked `[Failed]` by the Reviewer only when **both**
 conditions hold simultaneously:
 
-1. Your most recent `append_coder_progress` `summary` contains a
+1. Your most recent progress-entry `summary` contains a
    line starting `BLOCKER:` that names the dead end you have hit, and
 2. The Reviewer independently agrees by re-checking the evidence you
    cite.

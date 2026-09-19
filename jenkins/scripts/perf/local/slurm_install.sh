@@ -46,8 +46,6 @@ slurm_install_setup() {
 
         echo "(Installing TensorRT-LLM and requirements) Install mode: ${INSTALL_MODE:-source}"
 
-        retry_command pip install --retries 10 opencv-python-headless
-
         # Support two installation modes: source (default) and wheel
         if [ "${INSTALL_MODE:-source}" = "wheel" ]; then
             # Wheel installation mode
@@ -76,6 +74,17 @@ slurm_install_setup() {
         else
             # Source installation mode (default)
             retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
+        fi
+
+        # Generic post-install hook (opt-in; no-op unless POST_INSTALL_HOOK set).
+        # Runs ONCE per node here, on the localid-0 task, INSIDE the locked section
+        # and BEFORE the lock file is written -- so the other ranks (which wait on
+        # the lock below) don't start the workload until the hook has finished
+        # (e.g. BOLT swapping in instrumented libs, which must be in place before
+        # any worker rank loads them). Container-visible path; must be idempotent.
+        if [ -n "${POST_INSTALL_HOOK:-}" ]; then
+            echo "(Running POST_INSTALL_HOOK) $POST_INSTALL_HOOK"
+            bash "$POST_INSTALL_HOOK"
         fi
 
         cd /tmp

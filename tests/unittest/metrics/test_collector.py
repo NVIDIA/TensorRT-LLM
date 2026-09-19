@@ -217,8 +217,8 @@ class TestConfigInfoMetrics:
 
     def test_model_config_info(self, collector):
         model_config = {
-            "model": "meta-llama/Llama-3-8B",
-            "served_model_name": "Llama-3-8B",
+            "model": "meta-llama/Llama-3.1-8B-Instruct",
+            "served_model_name": "Llama-3.1-8B-Instruct",
             "dtype": "float16",
             "quantization": "none",
             "max_model_len": "4096",
@@ -731,12 +731,24 @@ class TestLogIterationStatsKvCacheIteration:
                 }
             }
         }
+        stats["iterDiskPrefetchBlocks"] = 7
+        # Two GPU levels: the split keeps them apart even though they share a tier name.
+        stats["iterCachedTokensByLevel"] = [5, 2, 1]
+        stats["kvCacheLevelTiers"] = ["gpu", "gpu", "host"]
         collector.log_iteration_stats(stats)
 
         # Host utilization = 20/50 = 0.4
         assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
         # Iter reuse rate = 5/(5+3) = 0.625
         assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(0.625)
+        assert _get_counter_value(collector, "kv_cache_disk_prefetch_blocks_total") == 7
+        assert [
+            _counter_value_with_labels(
+                collector.counter_tokens_cached_prompt_by_tier,
+                {**collector.labels, "cache_level": str(level), "cache_tier": tier},
+            )
+            for level, tier in enumerate(["gpu", "gpu", "host"])
+        ] == [5, 2, 1]
 
     def test_counters_incremented(self):
         """Counter metrics should accumulate deltas across calls."""
@@ -833,12 +845,16 @@ class TestLogIterationStatsKvCacheIteration:
             },
             "kvCacheIterationStatsByPoolGroup": {
                 "0": {
-                    "secondaryMaxNumBlocks": 50,
-                    "secondaryUsedNumBlocks": 20,
                     "iterGenAllocBlocks": 2,
                     "iterOnboardBytes": 4096,
                     "iterOffloadBytes": 2048,
                     "iterIntraDeviceCopyBytes": 8192,
+                }
+            },
+            "kvCacheIterationStatsByColdPoolGroup": {
+                "0": {
+                    "secondaryMaxNumBlocks": 50,
+                    "secondaryUsedNumBlocks": 20,
                 }
             },
         }
@@ -864,6 +880,22 @@ class TestLogIterationStatsKvCacheIteration:
         assert _get_counter_value(
             collector, "kv_cache_onboard_bytes_total"
         ) - before_onboard == pytest.approx(4096)
+
+    def test_v2_cold_pool_group_stats_work_without_hot_views(self):
+        """A cold-only V2 report should still update host utilization."""
+        collector = _make_kv_iter_collector()
+        stats = {
+            "kvCacheIterationStatsByColdPoolGroup": {
+                "0": {
+                    "secondaryMaxNumBlocks": 50,
+                    "secondaryUsedNumBlocks": 20,
+                }
+            }
+        }
+
+        collector.log_iteration_stats(stats)
+
+        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
 
     def test_v2_ssm_only_lifecycle_falls_back_to_attention_window_stats(self):
         """An SSM lifecycle entry must not hide attention's window aggregate."""

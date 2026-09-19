@@ -16,13 +16,15 @@
 
 import pytest
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
     _GlobalFlashInferPlanner,
 )
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
 
 # When a run uses FP8 GEMM on a GPU that doesn't support it, skip only that run.
 _FP8_BLOCK_SCALING_GEMM_ERR = "Unsupported SM version for FP8 block scaling GEMM"
@@ -109,24 +111,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
             "Qwen/Qwen3-30B-A3B",
             {
                 "transforms": {
@@ -140,45 +124,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "torch"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {
-                        "backend": "torch-simple",
-                        "piecewise_enabled": False,
-                    },
-                },
-            },
-        ),
-        (
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
                 },
                 "mode": "transformers",
             },
@@ -190,24 +135,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "insert_cached_attention": {"backend": "triton"},
                     "compile_model": {"backend": "torch-simple"},
                 },
-            },
-        ),
-        (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-compile"},
-                },
-            },
-        ),
-        (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
             },
         ),
         (

@@ -1818,7 +1818,7 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
         num_q_blocks: cutlass.Int32,
         sP: cute.Tensor,
         tCtS: cute.Tensor,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         sm_scale_log2: cutlass.Float32,
         sScale: cute.Tensor,
         corr_pipeline: pipeline.PipelineAsync,
@@ -1848,8 +1848,8 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
             tCcS[(None, None), 0, None], (self.mma_tiler_qk[0], self.block_n)
         )
         tCcS_ld = thr_copy_t2r.partition_D(cS_load)
-        tCrS_ld = cute.make_fragment(cute.select(tCcS_ld.shape, mode=[0, 1, 2]), self.acc_dtype)
-        tCrS_ld_half = cute.make_fragment(tCrS_ld.layout, sP.element_type)
+        tCrS_ld = cute.make_rmem_tensor(cute.select(tCcS_ld.shape, mode=[0, 1, 2]), self.acc_dtype)
+        tCrS_ld_half = cute.make_rmem_tensor(tCrS_ld.layout, sP.element_type)
 
         sP_cpy_slice = None
         tiled_copy_r2t = None
@@ -2174,7 +2174,7 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
         st_O_pipeline: pipeline.PipelineAsync,
         st_O_producer_state: pipeline.PipelineState,
         tCtO: cute.Tensor,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         sO: cute.Tensor,
         corr_pipeline: pipeline.PipelineAsync,
         correction_consumer_state: pipeline.PipelineState,
@@ -2225,7 +2225,7 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
             tCcO[(None, None), 0, None], (self.mma_tiler_pv[0], corr_ld_inst)
         )
         corr_tCcO_ld = corr_thr_copy_t2r.partition_D(corr_cO_load)
-        corr_tCrO_ld = cute.make_fragment(
+        corr_tCrO_ld = cute.make_rmem_tensor(
             cute.select(corr_tCcO_ld.shape, mode=[0, 1, 2]), self.acc_dtype
         )
 
@@ -2252,10 +2252,10 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
             tCcO[(None, None), 0, None], (self.mma_tiler_pv[0], wb_ld_inst)
         )
         wb_tCcO_ld = wb_thr_copy_t2r.partition_D(wb_cO_load)
-        wb_tCrO_ld = cute.make_fragment(
+        wb_tCrO_ld = cute.make_rmem_tensor(
             cute.select(wb_tCcO_ld.shape, mode=[0, 1, 2]), self.acc_dtype
         )
-        wb_tCrO_ld_half = cute.make_fragment(wb_tCrO_ld.layout, sO.element_type)
+        wb_tCrO_ld_half = cute.make_rmem_tensor(wb_tCrO_ld.layout, sO.element_type)
         tv_layout = cute.make_ordered_layout(
             (self.threads_per_wg, self.mma_tiler_pv[1], self.s_stage), (0, 1, 2)
         )
@@ -2264,7 +2264,7 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
 
         wb_tCrO_reduction = None
         if cutlass.const_expr(self.o_stage != 1):
-            wb_tCrO_reduction = cute.make_fragment(wb_tCrO_ld.layout, self.acc_dtype)
+            wb_tCrO_reduction = cute.make_rmem_tensor(wb_tCrO_ld.layout, self.acc_dtype)
 
         _correction_loop = partial(
             self.correction_loop,

@@ -14,10 +14,9 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     DataLayout,
@@ -27,7 +26,10 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
+    MAMBA_CONV_ROLE,
+    MAMBA_SSM_ROLE,
     AttentionLayerGroup,
+    CacheKind,
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
@@ -36,19 +38,22 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPool,
     PhysicalPoolGroup,
     PoolView,
+    RoleLayout,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     compute_layer_byte_ranges,
+    get_layer_byte_ranges,
     get_physical_pool,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -59,8 +64,16 @@ _V2_ROLE_MAPPER_KINDS = frozenset(
         MapperKind.INDEXED,
         MapperKind.REPLICATED,
         MapperKind.NHD,
+        MapperKind.SECTIONED,
     }
 )
+
+# Mapper kinds each life cycle's policy can serve. A SECTIONED attention
+# view or an NHD recurrent view has no mapper and is rejected at build time.
+_MAPPER_KINDS_BY_CACHE_KIND = {
+    CacheKind.PAGED: frozenset({MapperKind.INDEXED, MapperKind.REPLICATED, MapperKind.NHD}),
+    CacheKind.STATE: frozenset({MapperKind.INDEXED, MapperKind.REPLICATED, MapperKind.SECTIONED}),
+}
 
 
 class KVRegionExtractorV1(RegionExtractorBase):
@@ -78,10 +91,50 @@ class KVRegionExtractorV1(RegionExtractorBase):
             # Assume it is a manager (KVCacheManager / KVCacheManagerV2)
             self._page_table = build_page_table_from_manager(kv_arg)
         self._data_layout = DataLayout.HND
+        # extract_slot runs per request per view, but the page table is fixed
+        # once built, so resolve each view's layer offsets only once.
+        self._slot_layouts: Dict[Tuple[int, int], Tuple[np.ndarray, int]] = {}
+
+    def _slot_layout(self, layer_group_id: int, pool_idx: int) -> "Tuple[np.ndarray, int]":
+        layout = self._slot_layouts.get((layer_group_id, pool_idx))
+        if layout is None:
+            pv = self._page_table.layer_groups[layer_group_id].pool_views[pool_idx]
+            layer_offsets, bytes_per_layer = get_layer_byte_ranges(pv)
+            layout = (np.array(sorted(layer_offsets.values()), dtype=np.int64), bytes_per_layer)
+            self._slot_layouts[(layer_group_id, pool_idx)] = layout
+        return layout
 
     @property
     def page_table(self) -> KVCachePageTable:
         return self._page_table
+
+    @nvtx_range("KVRegionExtractorV1.extract_slot")
+    def extract_slot(
+        self,
+        slot_id: int,
+        layer_group_id: int = 0,
+        pool_idx: int = 0,
+    ) -> SpecRegion:
+        """Extract per-layer pointers for a single slot (used for mamba state).
+
+        Returns a SpecRegion with one pointer per layer:
+            ptr[i] = base + view_offset[i] + slot_id * slot_stride
+
+        View offsets are explicit because a recurrent role may exist on only a
+        subset of layers or be interleaved with another role in a V2 pool.
+        """
+        lg = self._page_table.layer_groups[layer_group_id]
+        pv = lg.pool_views[pool_idx]
+        pool = get_physical_pool(self._page_table, layer_group_id, pv.pool_idx)
+
+        base_ptr = pool.base_address
+        slot_stride = pool.slot_stride_bytes
+        assert slot_stride is not None
+
+        ordered_offsets, bytes_per_layer = self._slot_layout(layer_group_id, pool_idx)
+        ptrs = ordered_offsets + (base_ptr + slot_id * slot_stride)
+        memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=bytes_per_layer)
+        return SpecRegion(memory=memory)
 
     @nvtx_range("KVRegionExtractorV1.extract")
     def extract(
@@ -125,13 +178,65 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
+def _build_mamba_pool_views(
+    conv_pool,
+    ssm_pool,
+    local_layers,
+    *,
+    conv_section_bytes: List[int],
+    ssm_bytes_per_head: int,
+):
+    """Build pool_views for mamba: conv at pool_idx=0, ssm at pool_idx=1.
+
+    Conv uses mapper_kind=SECTIONED with ``section_bytes`` (each section is
+    TP-sharded independently), SSM uses mapper_kind=INDEXED with
+    ``bytes_per_head`` (head-level granularity). MambaPolicy.build_mapper
+    dispatches ConvStateMismatchMapper vs MambaHeadMismatchMapper accordingly.
+    """
+    sorted_lids = [
+        ll.local_layer_id for ll in sorted(local_layers, key=lambda ll: ll.local_layer_id)
+    ]
+    conv_layer_stride = int(conv_pool.layer_stride_bytes)
+    ssm_layer_stride = int(ssm_pool.layer_stride_bytes)
+    return [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [
+                    (lid, offset * conv_layer_stride, conv_pool.slot_bytes)
+                    for offset, lid in enumerate(sorted_lids)
+                ],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_pool.slot_bytes,
+            section_bytes=[int(x) for x in conv_section_bytes],
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [
+                    (lid, offset * ssm_layer_stride, ssm_pool.slot_bytes)
+                    for offset, lid in enumerate(sorted_lids)
+                ],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_pool.slot_bytes,
+            bytes_per_head=int(ssm_bytes_per_head),
+        ),
+    ]
+
+
 def _build_layer_group_for_mamba(
     manager: MambaHybridCacheManager, pool_group_idx: int
-) -> MambaLayerGroup:
-    mamba_layer_offsets = {
-        int(global_layer_id): int(local_layer_id)
-        for global_layer_id, local_layer_id in manager._impl.mamba_layer_offsets.items()
-    }
+) -> "tuple[MambaLayerGroup, PhysicalPoolGroup]":
+    local_layers = [
+        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
+        for gid, lid in sorted(manager._impl.mamba_layer_offsets.items(), key=lambda x: x[1])
+    ]
 
     conv_state = manager._impl.mamba_cache.conv
     ssm_state = manager._impl.mamba_cache.temporal
@@ -164,99 +269,40 @@ def _build_layer_group_for_mamba(
     ssm_elem_size = ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
-    return MambaLayerGroup(
+    pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
+    layer_group = MambaLayerGroup(
         pool_group_idx=pool_group_idx,
-        mamba_layer_offsets=mamba_layer_offsets,
-        conv_states=conv_pool,
-        ssm_states=ssm_pool,
-        conv_section_bytes=conv_section_bytes,
-        ssm_bytes_per_head=ssm_bytes_per_head,
+        local_layers=local_layers,
+        pool_views=_build_mamba_pool_views(
+            conv_pool,
+            ssm_pool,
+            local_layers,
+            conv_section_bytes=conv_section_bytes,
+            ssm_bytes_per_head=ssm_bytes_per_head,
+        ),
     )
+    return layer_group, pool_group
 
 
-def _slot_stride_bytes(tensor: torch.Tensor) -> int:
-    return int(tensor.stride(0) * tensor.element_size())
+def _build_non_kv_layers(
+    manager,
+    layer_groups: List[LayerGroup],
+    pool_groups: List[PhysicalPoolGroup],
+) -> None:
+    """Append non-KV (recurrent/state) layer groups for a V1 manager.
 
-
-def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
-    """Describe affine layer/slot addressing for one V2 Mamba state role."""
-    if not states:
-        raise ValueError("V2 Mamba state pool requires at least one layer")
-
-    first_state = states[0]
-    base_address = int(first_state.data_ptr())
-    num_slots = int(first_state.shape[0])
-    slot_bytes = int(first_state[0].numel() * first_state.element_size())
-    slot_stride_bytes = _slot_stride_bytes(first_state)
-
-    num_layers = len(states)
-    if slot_stride_bytes % num_layers != 0:
-        raise ValueError("V2 Mamba physical slot must divide evenly across layers")
-    # Each role appears once per layer in its size-class pool. Equal-size SSM
-    # and convolution states share that pool and are interleaved, so their
-    # layer stride includes both role payloads.
-    layer_stride_bytes = slot_stride_bytes // num_layers
-
-    for layer_offset, state in enumerate(states):
-        state_slot_bytes = int(state[0].numel() * state.element_size())
-        if (
-            int(state.shape[0]) != num_slots
-            or state_slot_bytes != slot_bytes
-            or _slot_stride_bytes(state) != slot_stride_bytes
-        ):
-            raise ValueError("V2 Mamba state tensors must share one slot layout per role")
-        expected_address = base_address + layer_offset * layer_stride_bytes
-        if int(state.data_ptr()) != expected_address:
-            raise ValueError("V2 Mamba state tensors must have a uniform layer stride per role")
-
-    return PhysicalPool(
-        base_address=base_address,
-        slot_bytes=slot_bytes,
-        num_slots=num_slots,
-        slot_stride_bytes=slot_stride_bytes,
-        layer_stride_bytes=layer_stride_bytes,
-    )
-
-
-def _build_layer_group_for_v2_mamba(
-    manager: MambaHybridCacheManagerV2, pool_group_idx: int
-) -> MambaLayerGroup:
-    mamba_layer_offsets = {
-        int(global_layer_id): int(local_layer_id)
-        for global_layer_id, local_layer_id in manager.mamba_layer_offsets.items()
-    }
-
-    expected_offsets = list(range(len(mamba_layer_offsets)))
-    if sorted(mamba_layer_offsets.values()) != expected_offsets:
-        raise ValueError("V2 Mamba layer offsets must be dense")
-    if len(manager.all_conv_states) != len(expected_offsets) or len(manager.all_ssm_states) != len(
-        expected_offsets
+    V1 managers have no pool descriptors, so the recurrent layer group is
+    described from the state tensors. V2 managers describe every life cycle,
+    recurrent ones included, from ``pool_group_descs`` in
+    ``_build_page_table_v2``.
+    """
+    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
+        manager, MambaHybridCacheManagerV2
     ):
-        raise ValueError("V2 Mamba state tensors must match the layer-offset table")
-
-    first_conv_state = manager.all_conv_states[0]
-    first_ssm_state = manager.all_ssm_states[0]
-    conv_pool = _build_v2_mamba_state_pool(manager.all_conv_states)
-    ssm_pool = _build_v2_mamba_state_pool(manager.all_ssm_states)
-    if conv_pool.num_slots != ssm_pool.num_slots:
-        raise ValueError("V2 Mamba convolution and SSM states must have the same number of slots")
-
-    d_conv_m1 = manager.conv_state_shape[1]
-    conv_elem_size = first_conv_state.element_size()
-    _, head_dim, d_state = manager.ssm_state_shape
-    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in manager.conv_section_dims]
-
-    ssm_elem_size = first_ssm_state.element_size()
-    ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
-
-    return MambaLayerGroup(
-        pool_group_idx=pool_group_idx,
-        mamba_layer_offsets=mamba_layer_offsets,
-        conv_states=conv_pool,
-        ssm_states=ssm_pool,
-        conv_section_bytes=conv_section_bytes,
-        ssm_bytes_per_head=ssm_bytes_per_head,
-    )
+        pool_group_idx = len(pool_groups)
+        layer_group, pool_group = _build_layer_group_for_mamba(manager, pool_group_idx)
+        layer_groups.append(layer_group)
+        pool_groups.append(pool_group)
 
 
 def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
@@ -400,10 +446,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                 pool_views=pool_views,
             )
         )
-    if isinstance(kv_cache_manager, MambaHybridCacheManager):
-        mamba_layer_group_idx = len(pool_groups)
-        mamba_layer_group = _build_layer_group_for_mamba(kv_cache_manager, mamba_layer_group_idx)
-        layer_groups.append(mamba_layer_group)
+    _build_non_kv_layers(kv_cache_manager, layer_groups, pool_groups)
 
     return KVCachePageTable(
         tokens_per_block=tokens_per_block,
@@ -451,13 +494,106 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     return [inverse[lid][0] * num_attn_types + inverse[lid][1] for lid in local_layer_ids]
 
 
+def _build_pool_views_for_variant(
+    variant,
+    role_mapper_kinds: Dict,
+    default_mapper_kind: MapperKind,
+    layer_group_id: int,
+    role_layouts: Optional[Dict] = None,
+    ignored_roles: frozenset[DataRole] = frozenset(),
+) -> List[PoolView]:
+    """Bucket one slot-desc variant's coalesced buffers into pool views.
+
+    One view is emitted per ``(physical pool, mapper kind)``; roles sharing a
+    kind share a view (KEY+VALUE), roles with different kinds in the same
+    physical pool get separate views (M3 coalesced index-K). ``role_layouts``
+    supplies the per-role resharding geometry carried onto the view.
+    """
+    role_layouts = role_layouts or {}
+    bucket_entries: Dict[tuple, list] = defaultdict(list)
+    bucket_roles: Dict[tuple, set] = defaultdict(set)
+    bucket_layouts: Dict[tuple, set] = defaultdict(set)
+    for pool_idx, coalesced_buffer in enumerate(variant.coalesced_buffers):
+        single_buffer_size = int(coalesced_buffer.single_buffer_size)
+        offset = 0
+        for buffer_id in coalesced_buffer.buffer_ids:
+            # Local-only buffers still occupy physical slot offsets,
+            # but do not contribute model state to a transfer view.
+            if buffer_id.role not in ignored_roles:
+                kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
+                bucket_key = (pool_idx, kind)
+                bucket_entries[bucket_key].append(
+                    (int(buffer_id.layer_id), offset, single_buffer_size)
+                )
+                bucket_roles[bucket_key].add(str(buffer_id.role))
+                bucket_layouts[bucket_key].add(role_layouts.get(buffer_id.role))
+            offset += single_buffer_size
+
+    # All ordering below is canonicalization — the page table is
+    # serialized and matched against peers, so view order (pool,
+    # then lowest slot offset), entry order (slot offset), and role
+    # text must not depend on dict/set iteration order.
+    pool_views = []
+    lg_bucket_keys = sorted(
+        bucket_entries,
+        key=lambda key: (key[0], min(entry[1] for entry in bucket_entries[key])),
+    )
+    for bucket_key in lg_bucket_keys:
+        pool_idx, mapper_kind = bucket_key
+        roles = frozenset(bucket_roles[bucket_key])
+        context = (
+            f"View(layer_group={layer_group_id}, pool={pool_idx}, "
+            f"kind={mapper_kind.name}, role={sorted(roles)})"
+        )
+        entries = np.array(
+            sorted(bucket_entries[bucket_key], key=lambda entry: entry[1]),
+            dtype=BUFFER_ENTRY_DTYPE,
+        )
+        # Fail fast on invalid geometry and record the uniform
+        # per-layer region size on the wire. Every kind is
+        # entries-driven, so the contiguous-layer-region /
+        # uniform-size invariants apply to all views uniformly.
+        _, bytes_per_layer = compute_layer_byte_ranges(entries, context=context)
+        # Roles that share a view must agree on their resharding geometry;
+        # roles without one contribute None.
+        layouts = {layout for layout in bucket_layouts[bucket_key] if layout is not None}
+        if len(layouts) > 1:
+            raise ValueError(f"{context} mixes roles with different layouts: {sorted(roles)}")
+        layout = layouts.pop() if layouts else RoleLayout()
+        if layout.section_bytes is not None and sum(layout.section_bytes) != bytes_per_layer:
+            raise ValueError(
+                f"{context} section_bytes {list(layout.section_bytes)} do not sum to "
+                f"bytes_per_layer={bytes_per_layer}"
+            )
+        if layout.bytes_per_head is not None and bytes_per_layer % layout.bytes_per_head != 0:
+            raise ValueError(
+                f"{context} bytes_per_layer={bytes_per_layer} is not a multiple of "
+                f"bytes_per_head={layout.bytes_per_head}"
+            )
+        pool_views.append(
+            PoolView(
+                pool_idx=pool_idx,
+                buffer_entries=entries,
+                pool_role=roles,
+                mapper_kind=mapper_kind,
+                bytes_per_layer=bytes_per_layer,
+                section_bytes=(
+                    list(layout.section_bytes) if layout.section_bytes is not None else None
+                ),
+                bytes_per_head=layout.bytes_per_head,
+            )
+        )
+
+    return pool_views
+
+
 def _build_page_table_v2(manager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
     Uses KVCacheManagerV2's public ``pool_group_descs`` layout API and
     stamps each PoolView with the manager's native role-name strings
     (``pool_role``) plus the closed-set ``mapper_kind`` discriminator used
-    by ``build_kv_mapper``.
+    by the policy ``build_mapper`` methods.
 
     A physical pool group may be shared by several layer groups (life
     cycles whose coalesced-buffer sizes are identical); each layer group
@@ -472,6 +608,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     # Every V2 manager declares how native roles map to the closed set of
     # disaggregation mapper kinds; Role.ALL is the required fallback.
     role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
+    ignored_roles = frozenset(getattr(manager, "get_disagg_ignored_roles", lambda: frozenset())())
     if Role.ALL not in role_mapper_kinds:
         raise ValueError("Disaggregation role mapping must define Role.ALL")
     for role, mapper_kind in role_mapper_kinds.items():
@@ -495,6 +632,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 f"got it for role {role!s}"
             )
     default_mapper_kind = role_mapper_kinds[Role.ALL]
+    role_layouts = manager.get_disagg_role_layouts()
+    for role, layout in role_layouts.items():
+        if not isinstance(layout, RoleLayout):
+            raise ValueError(f"Invalid disaggregation role layout {layout!r} for role {role!s}")
 
     def _window_size_for_layer(internal_layer_id: int):
         if internal_layer_id < len(config.layers):
@@ -540,88 +681,59 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         for variant in pg_desc.slot_desc.variants:
             layer_group_id = int(variant.layer_group_id)
             all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
-            if isinstance(manager, MambaHybridCacheManagerV2) and any(
-                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
-            ):
-                layer_groups_by_id[layer_group_id] = _build_layer_group_for_v2_mamba(
-                    manager, storage_pg_to_list_idx[storage_pg_idx]
-                )
-                continue
-
             all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
-
             local_layers = [
                 LocalLayer(local_layer_id=int(iid), global_layer_id=int(gid))
                 for iid, gid in zip(all_internal_layer_ids, all_global_layer_ids)
             ]
 
+            # A life cycle is recurrent when its layers are the manager's
+            # mamba layers. Recurrent and attention layers never share a life
+            # cycle: their buffer configs differ, so V2 groups them apart.
+            is_recurrent = isinstance(manager, MambaHybridCacheManagerV2) and any(
+                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+            )
+            if is_recurrent and not all(
+                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+            ):
+                raise ValueError(
+                    f"Layer group {layer_group_id} mixes recurrent and attention layers"
+                )
+            cache_kind = CacheKind.STATE if is_recurrent else CacheKind.PAGED
+
             # Bucket buffer entries by (pool, mapper kind). One PoolView is
             # emitted per bucket and spans every layer of that role class,
             # so the view count per layer group is bounded by the number of
-            # role classes — never by the layer count. A physical pool may
-            # hold several classes (V2 storage coalesces buffers purely by
-            # size within a layer group, so e.g. MiniMax M3's index-K shares
-            # the K/V pool when their per-block sizes coincide); each class
-            # still gets its own view, which keeps peer matching independent
-            # of that physical coalescing decision. ``pool_role`` stays the
-            # manager-supplied equivalence label used for peer matching
+            # role classes — never by the layer count. ``pool_role`` stays
+            # the manager-supplied equivalence label used for peer matching
             # without enumerating role names. Buffer offsets within a slot
             # follow ``buffer_ids`` order: the i-th buffer of a coalesced
             # buffer lives at ``i * single_buffer_size``.
-            bucket_entries: Dict[tuple, list] = defaultdict(list)
-            bucket_roles: Dict[tuple, set] = defaultdict(set)
-            for pool_idx, coalesced_buffer in enumerate(variant.coalesced_buffers):
-                single_buffer_size = int(coalesced_buffer.single_buffer_size)
-                offset = 0
-                for buffer_id in coalesced_buffer.buffer_ids:
-                    kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
-                    bucket_key = (pool_idx, kind)
-                    bucket_entries[bucket_key].append(
-                        (int(buffer_id.layer_id), offset, single_buffer_size)
-                    )
-                    bucket_roles[bucket_key].add(str(buffer_id.role))
-                    offset += single_buffer_size
-
-            # Emit this layer group's views: one per (pool, mapper-kind
-            # class of roles). Roles sharing a kind share a view
-            # (KEY+VALUE); roles with different kinds in the same physical
-            # pool get separate views (M3 coalesced index-K).
-            # All ordering below is canonicalization — the page table is
-            # serialized and matched against peers, so view order (pool,
-            # then lowest slot offset), entry order (slot offset), and role
-            # text must not depend on dict/set iteration order.
-            pool_views = []
-            lg_bucket_keys = sorted(
-                bucket_entries,
-                key=lambda key: (key[0], min(entry[1] for entry in bucket_entries[key])),
+            pool_views = _build_pool_views_for_variant(
+                variant,
+                role_mapper_kinds,
+                default_mapper_kind,
+                layer_group_id,
+                role_layouts=role_layouts,
+                ignored_roles=ignored_roles,
             )
-            for bucket_key in lg_bucket_keys:
-                pool_idx, mapper_kind = bucket_key
-                roles = frozenset(bucket_roles[bucket_key])
-                entries = np.array(
-                    sorted(bucket_entries[bucket_key], key=lambda entry: entry[1]),
-                    dtype=BUFFER_ENTRY_DTYPE,
-                )
-                # Fail fast on invalid geometry and record the uniform
-                # per-layer region size on the wire. Every kind is
-                # entries-driven, so the contiguous-layer-region /
-                # uniform-size invariants apply to all views uniformly.
-                _, bytes_per_layer = compute_layer_byte_ranges(
-                    entries,
-                    context=(
-                        f"View(layer_group={layer_group_id}, pool={pool_idx}, "
-                        f"kind={mapper_kind.name}, role={sorted(roles)})"
-                    ),
-                )
-                pool_views.append(
-                    PoolView(
-                        pool_idx=pool_idx,
-                        buffer_entries=entries,
-                        pool_role=roles,
-                        mapper_kind=mapper_kind,
-                        bytes_per_layer=bytes_per_layer,
+            for pool_view in pool_views:
+                if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:
+                    raise ValueError(
+                        f"Layer group {layer_group_id} ({cache_kind.name}) has no mapper for "
+                        f"{pool_view.mapper_kind.name} view {sorted(pool_view.pool_role)}"
                     )
+
+            if is_recurrent:
+                # One slot per request holds every layer of the life cycle;
+                # per-layer offsets live in the views' buffer entries.
+                layer_groups_by_id[layer_group_id] = MambaLayerGroup(
+                    pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],
+                    local_layers=local_layers,
+                    pool_views=pool_views,
+                    slot_major_layout=True,
                 )
+                continue
 
             # Determine layer group metadata.
             # For managers with virtual layers, internal layer_ids
@@ -642,18 +754,12 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 pool_views=pool_views,
             )
 
+    # Layer groups are indexed by layer_group_id (== life cycle id).
     layer_groups: List[LayerGroup] = []
     for layer_group_id, layer_group in enumerate(layer_groups_by_id):
         if layer_group is None:
             raise ValueError(f"Missing V2 layer group descriptor for layer group {layer_group_id}")
         layer_groups.append(layer_group)
-
-    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
-        manager, MambaHybridCacheManagerV2
-    ):
-        mamba_layer_group_idx = len(pool_groups)
-        mamba_layer_group = _build_layer_group_for_mamba(manager, mamba_layer_group_idx)
-        layer_groups.append(mamba_layer_group)
 
     return KVCachePageTable(
         tokens_per_block=config.tokens_per_block,

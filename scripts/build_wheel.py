@@ -21,6 +21,7 @@ import shutil
 import sys
 import sysconfig
 import tempfile
+import time
 import warnings
 from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
@@ -614,7 +615,38 @@ def _tar_pipe_copy(src: Path, dst: Path) -> bool:
     return producer.returncode == 0 and consumer.returncode == 0
 
 
-def sync_tree(src, dst, exclude: Sequence[str] = ()):
+# How recently a source file must have been written for its mtime to be
+# untrustworthy as a change marker. Inode timestamps come from a coarse clock
+# (one timer tick on Linux) and some filesystems store whole seconds, so a file
+# rewritten shortly after being copied can still report the mtime the copy
+# recorded. A size+mtime comparison would then call it unchanged and leave a
+# stale copy behind. Two seconds covers a whole-second-granularity destination
+# (which can make an mtime look up to a second older than it is) on top of the
+# tick granularity of the source.
+_MTIME_RACE_WINDOW = 2.0
+
+
+def _demote_racy_mtime(dst_file: Path, src_stat: Optional[os.stat_result],
+                       now: float) -> None:
+    """Break the mtime match for a copy whose source was just written.
+
+    A copy normally records the source's mtime so the next sync can skip it.
+    That is only sound once the source mtime has aged out of the window above;
+    before that the source can change again without its mtime moving. Backdating
+    the copy makes the next sync's comparison mismatch, so the file is re-copied
+    instead of silently kept stale. It costs one extra copy of files written
+    right before a sync, and converges: the re-copy records the real mtime.
+    """
+    if src_stat is None or src_stat.st_mtime <= now - _MTIME_RACE_WINDOW:
+        return
+    try:
+        os.utime(dst_file,
+                 (src_stat.st_atime, src_stat.st_mtime - _MTIME_RACE_WINDOW))
+    except OSError:
+        pass
+
+
+def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
     """Mirror the src directory into dst, touching only what changed.
 
     Replaces the rmtree+copytree pattern for artifact copy-back: files are
@@ -623,16 +655,36 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
     destination (which may be a slow network filesystem). A missing dst is
     populated via a streamed tar pipeline instead of per-file copies.
     Symlinks are dereferenced like copytree(symlinks=False); mtimes are
-    preserved so the next sync can compare against them. exclude lists
-    fnmatch patterns for entry names to skip.
+    preserved so the next sync can compare against them, except for sources
+    written within _MTIME_RACE_WINDOW of the copy, whose mtimes cannot yet
+    prove the content settled. exclude lists fnmatch patterns for entry names
+    to skip.
     """
     import fnmatch
 
     src = Path(src).resolve()
     dst = Path(dst)
+    now = time.time()
 
-    def excluded(name):
+    def excluded(name: str) -> bool:
         return any(fnmatch.fnmatch(name, pat) for pat in exclude)
+
+    def demote_racy_mtimes() -> None:
+        # A cold populate (tar or copytree) copies source mtimes verbatim, so
+        # apply the same guard the incremental path applies per file. Walk the
+        # source rather than the freshly written destination: the source is
+        # local and warm, and only the few racy entries need a write.
+        for root, dirs, files in os.walk(src, followlinks=True):
+            dirs[:] = [d for d in dirs if not excluded(d)]
+            rel = Path(root).relative_to(src)
+            for name in files:
+                if excluded(name):
+                    continue
+                try:
+                    src_stat = (Path(root) / name).stat()
+                except OSError:
+                    continue
+                _demote_racy_mtime(dst / rel / name, src_stat, now)
 
     if dst.is_symlink():
         dst.unlink()
@@ -641,11 +693,13 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
 
     if not dst.exists():
         if not exclude and _tar_pipe_copy(src, dst):
+            demote_racy_mtimes()
             return
         copytree(src,
                  dst,
                  symlinks=False,
                  ignore=shutil.ignore_patterns(*exclude) if exclude else None)
+        demote_racy_mtimes()
         return
 
     for root, dirs, files in os.walk(src, followlinks=True):
@@ -667,11 +721,16 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
         for name in files:
             src_file = Path(root) / name
             dst_file = dst_root / name
+            src_stat = None
             try:
                 src_stat = src_file.stat()
                 dst_stat = dst_file.stat()
+                # Trust the match only once the source mtime has aged past the
+                # race window; a just-written source can be rewritten again
+                # without the mtime moving, which would strand a stale copy.
                 if (src_stat.st_size == dst_stat.st_size
-                        and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3):
+                        and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3
+                        and src_stat.st_mtime <= now - _MTIME_RACE_WINDOW):
                     continue
             except OSError:
                 pass
@@ -679,6 +738,7 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
                 rmtree(dst_file)
             # copy2: mtime must survive for the next sync's comparison.
             shutil.copy2(src_file, dst_file)
+            _demote_racy_mtime(dst_file, src_stat, now)
 
 
 def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
@@ -691,15 +751,17 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
     staging_dir.mkdir(parents=True, exist_ok=True)
     # examples: setup.py's root-level find_packages() ships the
     # examples.configs.database package from it.
-    for tree in ("tensorrt_llm", "triton_kernels", "examples",
-                 "3rdparty/MSA/python/fmha_sm100"):
+    for tree in ("tensorrt_llm", "triton_kernels", "examples"):
         sync_tree(project_dir / tree,
                   staging_dir / tree,
                   exclude=("__pycache__", "*.pyc"))
     top_level_files = [
-        "setup.py", "pyproject.toml", "requirements.txt",
-        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+        "setup.py", "pyproject.toml", "constraints.txt", "LICENSE", "README.md"
     ]
+    # setup.py reads requirements for optional extras and platform variants too.
+    top_level_files += sorted(f.name
+                              for f in project_dir.glob("requirements*.txt")
+                              if f.is_file())
     top_level_files += [
         f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
     ]
@@ -707,6 +769,17 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
         src = project_dir / name
         if src.exists():
             copy(src, staging_dir / name)
+
+
+def install_editable_package(venv_python: Path) -> None:
+    """Editable-install the built package into the venv `setup_venv` created.
+
+    Not `sys.executable`: a fresh checkout has to start this script with the
+    system interpreter, so installing with it puts the package in the system
+    site-packages and leaves the new venv without it. The wheel build above
+    already uses `venv_python` for the same reason.
+    """
+    build_run(f"\"{venv_python}\" -m pip install -e .[devel]")
 
 
 def main(*,
@@ -790,24 +863,6 @@ def main(*,
     apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
-    # Get all submodules and check their folder exists. If not,
-    # invoke git submodule update
-    with open(project_dir / ".gitmodules", "r") as submodules_f:
-        submodules = [
-            l.split("=")[1].strip() for l in submodules_f.readlines()
-            if "path = " in l
-        ]
-    missing_submodules = [
-        s for s in submodules if not (project_dir / s / ".git").exists()
-    ]
-    if missing_submodules:
-        if out_of_tree:
-            raise RuntimeError(
-                "Missing submodules: " + ", ".join(missing_submodules) +
-                ". Run 'git submodule update --init --recursive' before a "
-                "out-of-tree build; the checkout is not modified during the "
-                "build.")
-        build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
 
@@ -1360,6 +1415,35 @@ def main(*,
                 build_dir / "tensorrt_llm" / "flash_mla" / "python" /
                 "flash_mla", pkg_dir / "flash_mla")
 
+        # Stage the FetchContent-patched MSA package for setup.py packaging.
+        msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+        cutlass_src = build_dir / "_deps" / "cutlass-src"
+        msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
+        if not (msa_src / "cute" / "interface.py").is_file():
+            raise FileNotFoundError(
+                f"MSA package missing at {msa_src}; CMake FetchContent for msa "
+                "did not populate the expected sources.")
+        if msa_dst.is_symlink():
+            msa_dst.unlink()
+        elif msa_dst.exists():
+            rmtree(msa_dst)
+        msa_dst.mkdir(parents=True)
+        for python_source in msa_src.glob("*.py"):
+            install_file(python_source, msa_dst)
+        for source_dir, relative_dir in (
+            (msa_src / "csrc", Path("csrc")),
+            (msa_src / "cute", Path("cute")),
+            (cutlass_src / "include", Path("cutlass/include")),
+            (cutlass_src / "tools/util/include",
+             Path("cutlass/tools/util/include")),
+        ):
+            (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
+            install_tree(
+                source_dir,
+                msa_dst / relative_dir,
+            )
+        install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
+
         if not skip_stubs:
             with working_directory(pkg_dir):
                 if on_windows:
@@ -1442,9 +1526,6 @@ def main(*,
                 f"Copied auto-generated attributions to {wheel_project_dir / 'ATTRIBUTIONS.md'}"
             )
 
-        build_run(
-            f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
-        )
         env = os.environ.copy()
         if mypyc:
             env["TRTLLM_ENABLE_MYPYC"] = "1"
@@ -1452,11 +1533,11 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
-        build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
+        install_editable_package(venv_python)
 
 
 def add_arguments(parser: ArgumentParser):

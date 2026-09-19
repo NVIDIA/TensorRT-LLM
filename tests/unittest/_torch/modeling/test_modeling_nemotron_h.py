@@ -1,31 +1,31 @@
 import pytest
 import torch
 from utils.llm_data import llm_models_root
-from utils.util import skip_fp8_pre_ada, skip_gpu_memory_less_than
+from utils.util import (skip_fp8_pre_ada, skip_gpu_memory_less_than,
+                        skip_single_gpu)
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, LoadFormat
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, LoadFormat,
+                                          PrefillCudaGraphBackend)
 from tensorrt_llm.sampling_params import SamplingParams
 
 
 def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
     raw_probs = torch.softmax(logits, dim=-1)
     index = token_ids.unsqueeze(1)
-    assert index.device == raw_probs.device, f"index and raw_probs should be on the same device, but got index location: {index.device}, raw_probs location: {raw_probs.device}"
+    assert index.device == raw_probs.device, (
+        "index and raw_probs should be on the same device, "
+        f"but got index location: {index.device}, raw_probs location: {raw_probs.device}"
+    )
     token_probs = torch.gather(raw_probs, dim=1, index=index).squeeze(-1)
     return torch.log(token_probs)
 
 
-def extract_prefill_logprobs(result: RequestOutput) -> torch.Tensor:
-    token_ids = torch.tensor(result.prompt_token_ids[1:])
-    logits = result.context_logits[:-1, :]
-    return get_logprobs(token_ids.cuda(), logits)
-
-
 def extract_decode_logprobs(result: RequestOutput,
                             gen_idx: int = 0) -> torch.Tensor:
+    """Shared by test_modeling_nemotron_h_multimodal.py."""
     token_ids = torch.tensor(result.outputs[gen_idx].token_ids)
     logits = result.outputs[gen_idx].generation_logits
     return get_logprobs(token_ids, logits)
@@ -38,7 +38,8 @@ def create_nemotron_h_llm(model_folder,
                           mamba_ssm_cache_dtype=None,
                           enable_chunked_prefill=False,
                           max_num_tokens=8192,
-                          load_format=None):
+                          load_format=None,
+                          cuda_graph_batch_sizes=None):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/{model_folder}"
     kwargs = {}
@@ -47,11 +48,23 @@ def create_nemotron_h_llm(model_folder,
     if load_format is not None:
         kwargs["load_format"] = load_format
 
+    cuda_graph_config = None
+    if use_cuda_graph:
+        # Pin capture sizes when provided so MoE decode hits an exact graph
+        # rather than a padded bucket.
+        if cuda_graph_batch_sizes is not None:
+            cuda_graph_config = CudaGraphConfig(
+                batch_sizes=list(cuda_graph_batch_sizes),
+                enable_padding=False,
+            )
+        else:
+            cuda_graph_config = CudaGraphConfig()
+
     return LLM(
         model=model_dir,
         tensor_parallel_size=1,
         max_batch_size=max_batch_size,
-        cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
+        cuda_graph_config=cuda_graph_config,
         disable_overlap_scheduler=disable_overlap_scheduler,
         kv_cache_config=KvCacheConfig(
             mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
@@ -61,17 +74,32 @@ def create_nemotron_h_llm(model_folder,
     )
 
 
+# Nemotron-H-8B-Base-8K product coverage was pruned (TRTLLM-15100/15101).
+# Keep hybrid-architecture behavior on in-scope Nano-30B successors instead.
+# Dense-8B CG/eager/overlap logprob equality was not ported: Nano-30B-A3B is
+# MoE and flips greedy tokens (and fails absolute / cosine logit checks) under
+# tiny numeric drift in L0. Product accuracy stays on GSM8K/MMLU; the tests
+# below exercise the real-weight hybrid / CG / overlap / chunked-prefill paths.
+_NANO_30B_BF16 = "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+_NANO_30B_FP8 = "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
+
+
 @pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
                          ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
 @pytest.mark.parametrize("model_folder", [
-    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    pytest.param(_NANO_30B_BF16,
                  marks=skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)),
-    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    pytest.param(_NANO_30B_FP8,
                  marks=skip_gpu_memory_less_than((30 + 1) * 2**30)),
 ])
 def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
+    """Hybrid path smoke only: LoadFormat.DUMMY (random weights), no numerics.
+
+    See test_nemotron_h_cuda_graph_overlap_scheduler for real-weight CG /
+    overlap path coverage on Nano.
+    """
     # Skip test if FP8 is not supported on the current architecture.
-    use_fp8 = model_folder == "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
+    use_fp8 = model_folder == _NANO_30B_FP8
     skip_fp8_pre_ada(use_fp8)
 
     torch.cuda.empty_cache()
@@ -117,306 +145,51 @@ def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
         nemotron_h.generate(text_prompts_with_completions, sampling_params)
 
 
-@pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
-                         ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
-@pytest.mark.parametrize("model_folder", [
-    pytest.param("Nemotron-H-8B-Base-8K",
-                 marks=skip_gpu_memory_less_than((2 * 8 + 1) * 2**30)),
-])
-def test_nemotron_h_correctness(mamba_ssm_cache_dtype, model_folder):
-    torch.cuda.empty_cache()
-
-    text_prompts = [
-        "The future of AI is",
-        "The president of the United States is",
-    ]
-    num_prompts = len(text_prompts)
-
-    nemotron_h = create_nemotron_h_llm(
-        model_folder=model_folder,
-        use_cuda_graph=False,
-        disable_overlap_scheduler=False,
-        max_batch_size=num_prompts,
-        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
-
-    if model_folder == "Nemotron-H-8B-Base-8K":
-        expected_completions = [
-            " bright, with endless possibilities for innovation and growth",
-            " the head of state and head of government of",
-        ]
-
-        # reference logprobs for first prompt from mcore for prompt minus first token
-        # TODO(oargov): generate a reference on-the-fly once we have confidence in the HF impl
-        prefill_logprobs_ref_mcore = torch.tensor([
-            -7.415980815887451, -0.36192911863327026, -2.8658294677734375,
-            -2.316344738006592
-        ])
-
-        # reference logprobs from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1 on single RTX 6000)
-        initial_impl_atol = 0.2
-        batching_atol = 0.2
-
-        prefill_logprobs_ref_initial_no_batching = [
-            torch.tensor([
-                -7.4359540939331055,
-                -0.37661877274513245,
-                -2.8925108909606934,
-                -2.268364906311035,
-            ]),
-            torch.tensor([
-                -8.759482383728027,
-                -1.656238079071045,
-                -0.5448741912841797,
-                -1.7702054977416992,
-                -0.05832016468048096,
-                -1.460732102394104,
-            ])
-        ]
-        prefill_logprobs_ref_initial_with_batching = [
-            torch.tensor([
-                -7.401950836181641, -0.38696032762527466, -2.8725428581237793,
-                -2.2654521465301514
-            ]),
-            torch.tensor([
-                -8.73007583618164, -1.6853574514389038, -0.5468529462814331,
-                -1.7846013307571411, -0.053610533475875854, -1.4385275840759277
-            ])
-        ]
-
-        decode_logprobs_ref_initial_no_batching = [
-            torch.tensor([
-                -2.2722280025482178, -0.5124826431274414, -0.7916123270988464,
-                -2.1908130645751953, -0.059298671782016754, -0.5125972032546997,
-                -0.3856367766857147, -0.055953752249479294, -1.1059765815734863
-            ]),
-            torch.tensor([
-                -1.329713225364685, -1.5038213729858398, -0.021283088251948357,
-                -0.38457369804382324, -0.3582419157028198, -0.16527847945690155,
-                -0.0044861179776489735, -0.059462934732437134,
-                -0.041099339723587036
-            ])
-        ]
-        decode_logprobs_ref_initial_with_batching = [
-            torch.tensor([
-                -2.2877156734466553, -0.46699056029319763, -0.7909849286079407,
-                -2.1276988983154297, -0.062114741653203964, -0.5291495323181152,
-                -0.38685765862464905, -0.05595658719539642, -1.1020748615264893
-            ]),
-            torch.tensor([
-                -1.3567769527435303, -1.5647790431976318, -0.022344056516885757,
-                -0.38503751158714294, -0.3581986725330353, -0.18398350477218628,
-                -0.004726295825093985, -0.05941498652100563,
-                -0.04291720315814018
-            ])
-        ]
-    else:
-        raise ValueError(f"Invalid model folder: {model_folder}")
-
-    try:
-        sampling_params = SamplingParams(max_tokens=9,
-                                         temperature=0.0,
-                                         add_special_tokens=False,
-                                         return_context_logits=True,
-                                         return_generation_logits=True)
-
-        results_no_batching = [
-            nemotron_h.generate(text_prompt, sampling_params)
-            for text_prompt in text_prompts
-        ]
-        completions_no_batching = [
-            result.outputs[0].text for result in results_no_batching
-        ]
-        prefill_logprobs_no_batching = [
-            extract_prefill_logprobs(result).cpu()
-            for result in results_no_batching
-        ]
-        decode_logprobs_no_batching = [
-            extract_decode_logprobs(result).cpu()
-            for result in results_no_batching
-        ]
-
-        results_batching = nemotron_h.generate(text_prompts, sampling_params)
-        completions_batching = [
-            result.outputs[0].text for result in results_batching
-        ]
-        prefill_logprobs_batching = [
-            extract_prefill_logprobs(result).cpu()
-            for result in results_batching
-        ]
-        decode_logprobs_batching = [
-            extract_decode_logprobs(result).cpu() for result in results_batching
-        ]
-
-        # compare logprobs with mcore logprobs, check that the max error is less than 0.3
-        mcore_atol = 0.3
-        torch.testing.assert_close(torch.tensor(
-            prefill_logprobs_no_batching[0]),
-                                   prefill_logprobs_ref_mcore,
-                                   atol=mcore_atol,
-                                   rtol=0.0)
-
-        for i in range(num_prompts):
-            # compare prompt logprobs with initial implementation
-            torch.testing.assert_close(
-                prefill_logprobs_no_batching[i],
-                prefill_logprobs_ref_initial_no_batching[i],
-                atol=initial_impl_atol,
-                rtol=0.0)
-            torch.testing.assert_close(
-                prefill_logprobs_batching[i],
-                prefill_logprobs_ref_initial_with_batching[i],
-                atol=initial_impl_atol,
-                rtol=0.0)
-
-            # compare expected completion
-            assert completions_batching[i] == expected_completions[i]
-            assert completions_no_batching[i] == expected_completions[i]
-
-            # compare decode logprobs with initial implementation
-            torch.testing.assert_close(
-                decode_logprobs_no_batching[i],
-                decode_logprobs_ref_initial_no_batching[i],
-                atol=initial_impl_atol,
-                rtol=0.0)
-            torch.testing.assert_close(
-                decode_logprobs_batching[i],
-                decode_logprobs_ref_initial_with_batching[i],
-                atol=initial_impl_atol,
-                rtol=0.0)
-
-            # compare logprobs with and without batching, tolerace by diff in initial implementation
-            torch.testing.assert_close(prefill_logprobs_batching[i],
-                                       prefill_logprobs_no_batching[i],
-                                       atol=batching_atol,
-                                       rtol=0.0)
-            torch.testing.assert_close(decode_logprobs_batching[i],
-                                       decode_logprobs_no_batching[i],
-                                       atol=batching_atol,
-                                       rtol=0.0)
-
-        # now let's test that decodes match prefill logprobs
-        text_prompts_with_completions = [
-            f"{text_prompts[i]}{completions_batching[i]}"
-            for i in range(num_prompts)
-        ]
-
-        sampling_params.max_tokens = 1
-        full_sequence_results = nemotron_h.generate(
-            text_prompts_with_completions, sampling_params)
-        full_sequence_logprobs = [
-            extract_prefill_logprobs(result).cpu()
-            for result in full_sequence_results
-        ]
-
-        # compare full sequence logprobs with prefill+decode logprobs, tolerance like mcore tolerance
-        for i in range(num_prompts):
-            prefill_decode_logprobs = torch.cat(
-                [prefill_logprobs_batching[i], decode_logprobs_batching[i]])
-            torch.testing.assert_close(full_sequence_logprobs[i],
-                                       prefill_decode_logprobs,
-                                       atol=mcore_atol,
-                                       rtol=0.0)
-
-    finally:
-        nemotron_h.shutdown()
-
-
+@skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)
 def test_nemotron_h_cuda_graph_overlap_scheduler():
-    prompts = [
-        "The sky is blue because",
-        "The sum of two and two is",
-        "The largest mammal is the",
-        "The chemical symbol for water is",
-    ]
+    """Real-weight Nano smoke: eager, CUDA-graph, and CG+overlap all generate.
 
-    # max_tokens=2 keeps the smoke check tight.
-    sampling_config = SamplingParams(max_tokens=2,
-                                     temperature=0.0,
-                                     return_generation_logits=True)
+    Ported from dense 8B equality checks onto Nano-30B-BF16. MoE greedy /
+    logit equality is too noisy for L0 (CG vs eager and overlap on vs off
+    both flip tokens), so this only verifies the hybrid path runs under each
+    config. Distribution / SSM-cache numeric equality belongs in a follow-up
+    with MoE-stable refs or a denser in-scope checkpoint.
+    """
+    prompts = ["The sky is blue because"]
+    batch_size = len(prompts)
+    cg_batch_sizes = [batch_size]
+    sampling_config = SamplingParams(max_tokens=1, temperature=0.0)
 
-    # Test without cg and overlap scheduler disabled
-    with create_nemotron_h_llm(model_folder="Nemotron-H-8B-Base-8K",
-                               use_cuda_graph=False,
-                               disable_overlap_scheduler=True,
-                               max_batch_size=16) as llm:
-        outputs_no_cg_no_overlap = llm.generate(prompts,
-                                                sampling_params=sampling_config,
-                                                use_tqdm=True)
-
-    # Test with cg and overlap scheduler disabled
-    with create_nemotron_h_llm(model_folder="Nemotron-H-8B-Base-8K",
-                               use_cuda_graph=True,
-                               disable_overlap_scheduler=True,
-                               max_batch_size=16) as llm:
-        outputs_with_cg_no_overlap = llm.generate(
-            prompts, sampling_params=sampling_config, use_tqdm=True)
-
-    # Test with cg and overlap scheduler enabled
-    with create_nemotron_h_llm(model_folder="Nemotron-H-8B-Base-8K",
-                               use_cuda_graph=True,
-                               disable_overlap_scheduler=False,
-                               max_batch_size=16) as llm:
-        outputs_with_cg_with_overlap = llm.generate(
-            prompts, sampling_params=sampling_config, use_tqdm=True)
-
-    # Verify outputs are consistent
-    for i, (no_cg_no_overlap, with_cg_no_overlap,
-            with_cg_with_overlap) in enumerate(
-                zip(outputs_no_cg_no_overlap, outputs_with_cg_no_overlap,
-                    outputs_with_cg_with_overlap)):
-
-        assert (
-            no_cg_no_overlap.outputs[0].text ==
-            with_cg_no_overlap.outputs[0].text
-        ), f"Prompt {i}: no CG no overlap generated text != with CG no overlap generated text"
-        assert (
-            with_cg_no_overlap.outputs[0].text ==
-            with_cg_with_overlap.outputs[0].text
-        ), f"Prompt {i}: with CG no overlap generated text != with CG with overlap generated text"
-
-        # similar to other unittests comparing with / without CG, compare logits of first generation step (2nd generated token)
-        torch.testing.assert_close(
-            no_cg_no_overlap.outputs[0].generation_logits[1, :],
-            with_cg_no_overlap.outputs[0].generation_logits[1, :],
-            atol=0.2,
-            rtol=0.2,
-            msg=lambda x:
-            f"Prompt {i}: with/without CG (no overlap) logits for first generated step {x}"
-        )
-
-        # compare logprobs of all generated tokens
-        torch.testing.assert_close(
-            extract_decode_logprobs(no_cg_no_overlap),
-            extract_decode_logprobs(with_cg_no_overlap),
-            atol=0.2,
-            rtol=0.2,
-            msg=lambda x:
-            f"Prompt {i}: with/without CG (no overlap) logprobs for all selected tokens {x}"
-        )
-
-        # Similar comparison for with / without overlap scheduler, compare logits of first generation step (2nd generated token)
-        # overlap scheduler should have no effect on all logits - low tolerance
-        torch.testing.assert_close(
-            with_cg_no_overlap.outputs[0].generation_logits[1, :],
-            with_cg_with_overlap.outputs[0].generation_logits[1, :],
-            atol=0.05,
-            rtol=0.05,
-            msg=lambda x:
-            f"Prompt {i}: with/without overlap scheduler (with CG) logits for first generated step {x}"
-        )
-
-        # compare logprobs of all generated tokens
-        torch.testing.assert_close(
-            extract_decode_logprobs(with_cg_no_overlap),
-            extract_decode_logprobs(with_cg_with_overlap),
-            atol=0.05,
-            rtol=0.05,
-            msg=lambda x:
-            f"Prompt {i}: with/without overlap scheduler (with CG) logprobs for all selected tokens {x}"
-        )
+    configs = (
+        ("eager", False, True, None),
+        ("cg", True, True, cg_batch_sizes),
+        ("cg_overlap", True, False, cg_batch_sizes),
+    )
+    for label, use_cuda_graph, disable_overlap, cg_sizes in configs:
+        with create_nemotron_h_llm(
+                model_folder=_NANO_30B_BF16,
+                use_cuda_graph=use_cuda_graph,
+                disable_overlap_scheduler=disable_overlap,
+                max_batch_size=batch_size,
+                cuda_graph_batch_sizes=cg_sizes,
+        ) as llm:
+            outputs = llm.generate(prompts,
+                                   sampling_params=sampling_config,
+                                   use_tqdm=True)
+        assert len(outputs) == 1, f"{label}: expected one response"
+        assert len(outputs[0].outputs[0].token_ids
+                   ) > 0, f"{label}: produced empty output"
+        assert len(
+            outputs[0].outputs[0].text) > 0, f"{label}: produced empty text"
 
 
+@skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)
 def test_nemotron_h_chunked_prefill():
+    """Real-weight Nano: non-empty output with chunked prefill on the Mamba path.
+
+    Ported from the pruned 8B coverage onto Nano-30B-BF16 so chunked prefill
+    on hybrid SSM layers stays exercised.
+    """
     # Long prompts (~100 tokens) to make sure chunked prefill is enabled
     # (At the time of development, tokens_per_block isn't configurable from the LLM API,
     # and max_tokens (i.e. chunk size) needs to be a multiple of tokens_per_block)
@@ -429,7 +202,7 @@ def test_nemotron_h_chunked_prefill():
     ]
     sampling_config = SamplingParams(max_tokens=2, temperature=0.0)
 
-    with create_nemotron_h_llm(model_folder="Nemotron-H-8B-Base-8K",
+    with create_nemotron_h_llm(model_folder=_NANO_30B_BF16,
                                use_cuda_graph=False,
                                disable_overlap_scheduler=True,
                                max_batch_size=16,
@@ -445,3 +218,187 @@ def test_nemotron_h_chunked_prefill():
                    ) > 0, f"Prompt {i}: chunked prefill produced empty output"
         assert len(output.outputs[0].text
                    ) > 0, f"Prompt {i}: chunked prefill produced empty text"
+
+
+# Breakable prefill CUDA graphs (BCG) on the hybrid path. Under BCG the Mamba2
+# layers run through the eager_on_graph boundary op (mamba2_mixer.py), so this
+# covers the NemotronH-specific bridge rather than the generic BCG runner
+# (which unittest/_torch/executor/test_breakable_cuda_graph.py exercises).
+_BCG_MAX_NUM_TOKENS = 256
+_BCG_CAPTURE_NUM_TOKENS = [64, 128, 256]
+# Probability-ratio bound shared with ray_orchestrator/multi_gpu/
+# test_accuracy_with_allreduce_strategy.py::compare_logprobs (e^-2.30 ~ 0.1x).
+_BCG_LOGPROB_TOLERANCE = 2.30
+# Context batches: an exact capture bucket, one token past a bucket (padded
+# replay), two context requests of unequal length in one batch, and a prompt
+# longer than max_num_tokens (chunked prefill: 256 + 44).
+_BCG_CONTEXT_BATCHES = [
+    [[17] * 128],
+    [[17] * 129],
+    [[17] * 64, [23] * 65],
+    [[31] * 300],
+]
+# The mixed-batch section adds the streaming decode request and the context
+# request admitted while it decodes.
+_BCG_MIXED_BATCH_REQUESTS = 2
+# Decode length of that streaming request: with EOS ignored this is a ~1 s
+# generation window, orders of magnitude longer than the client-side gap
+# before the second request is submitted.
+_BCG_STREAM_MAX_TOKENS = 64
+# One (token_ids, logprobs) entry per request from each backend run.
+_BCG_NUM_REQUESTS = (sum(len(batch) for batch in _BCG_CONTEXT_BATCHES) +
+                     _BCG_MIXED_BATCH_REQUESTS)
+
+
+def _first_step_logprobs(output) -> torch.Tensor:
+    """Log-probabilities of the first generated position for one request."""
+    return torch.log_softmax(
+        output.outputs[0].generation_logits[0].float().cpu(), dim=-1)
+
+
+def _assert_mixed_batch_overlap(decoding_out, admitted_out) -> None:
+    """Prove that `admitted` was prefilled while `decoding` was still decoding.
+
+    Both requests return per-request iteration metrics taken from the engine's
+    iteration counter. With the overlap scheduler disabled, a batch capacity of
+    4 and 65 + 1 tokens inside the token budget, the scheduler runs every active
+    generation request each iteration, so admitted's first iteration (its
+    context chunk) falling inside decoding's generation window means that
+    iteration carried a context chunk and a decode token together.
+    """
+    dec = decoding_out.outputs[0].request_perf_metrics
+    adm = admitted_out.outputs[0].request_perf_metrics
+    assert dec is not None and adm is not None, "request_perf_metrics missing"
+    assert None not in (dec.first_iter, dec.last_iter, adm.first_iter), (
+        f"iteration metrics not populated: decoding {dec.first_iter}.."
+        f"{dec.last_iter}, admitted {adm.first_iter}")
+    assert dec.first_iter < adm.first_iter <= dec.last_iter, (
+        f"no mixed batch: decoding ran iterations [{dec.first_iter}, "
+        f"{dec.last_iter}] but admitted was prefilled at iteration "
+        f"{adm.first_iter}")
+
+
+def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
+                                    tp_size: int):
+    """Run the fixed prompt schedule with one prefill CUDA graph backend.
+
+    Returns one (token_ids, first_step_logprobs) pair per request, in a
+    deterministic order shared by both backends.
+    """
+    # ignore_eos on every compared request: the two backends may legitimately
+    # pick different greedy tokens after the first step (see the test
+    # docstring), and if one of them is EOS the arms would stop at different
+    # lengths for a difference the test otherwise accepts.
+    sampling_params = SamplingParams(max_tokens=4,
+                                     temperature=0.0,
+                                     ignore_eos=True,
+                                     return_generation_logits=True)
+    per_request = []
+    with LLM(
+            model=f"{llm_models_root(check=True)}/{_NANO_30B_BF16}",
+            tensor_parallel_size=tp_size,
+            # Pin NCCL so the allreduce path under BCG is the plain one on
+            # every platform (AUTO may pick MNNVL on multi-node NVLink).
+            allreduce_strategy="NCCL",
+            max_batch_size=4,
+            max_num_tokens=_BCG_MAX_NUM_TOKENS,
+            enable_chunked_prefill=True,
+            disable_overlap_scheduler=True,
+            gather_generation_logits=True,
+            kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32"),
+            cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                              max_batch_size=4),
+            prefill_cuda_graph_backend=backend,
+            prefill_capture_num_tokens=_BCG_CAPTURE_NUM_TOKENS,
+    ) as llm:
+        # The validator must not have downgraded the requested backend.
+        assert llm.args.prefill_cuda_graph_backend == backend
+        for batch in _BCG_CONTEXT_BATCHES:
+            for output in llm.generate(batch, sampling_params=sampling_params):
+                per_request.append((list(output.outputs[0].token_ids),
+                                    _first_step_logprobs(output)))
+
+        # Mixed batch: admit a context request while another request is
+        # decoding, so BCG replays a batch that carries both a context chunk
+        # and decode tokens. The overlap is proved afterwards from the two
+        # requests' iteration metrics rather than assumed.
+        decoding = llm.generate_async([17] * 128,
+                                      sampling_params=SamplingParams(
+                                          max_tokens=_BCG_STREAM_MAX_TOKENS,
+                                          temperature=0.0,
+                                          ignore_eos=True,
+                                          return_generation_logits=True,
+                                          return_perf_metrics=True),
+                                      streaming=True)
+        # In streaming mode every response carries only the newest step's
+        # logits, so the first-step distribution must be read from the first
+        # streamed response, before the stream moves on.
+        next(decoding)
+        decoding_first_step_logprobs = _first_step_logprobs(decoding)
+        admitted = llm.generate_async([23] * 65,
+                                      sampling_params=SamplingParams(
+                                          max_tokens=4,
+                                          temperature=0.0,
+                                          ignore_eos=True,
+                                          return_generation_logits=True,
+                                          return_perf_metrics=True),
+                                      streaming=False)
+        decoding_out = decoding.result()
+        admitted_out = admitted.result()
+        _assert_mixed_batch_overlap(decoding_out, admitted_out)
+        per_request.append((list(decoding_out.outputs[0].token_ids),
+                            decoding_first_step_logprobs))
+        per_request.append((list(admitted_out.outputs[0].token_ids),
+                            _first_step_logprobs(admitted_out)))
+    return per_request
+
+
+@skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)
+@pytest.mark.mpi_ray_parity
+@pytest.mark.parametrize("tp_size", [
+    1,
+    pytest.param(2, marks=skip_single_gpu),
+],
+                         ids=lambda n: f"tp{n}")
+def test_nemotron_h_breakable_prefill_cuda_graph(tp_size):
+    """Real-weight Nano: breakable prefill CUDA graphs vs eager prefill.
+
+    Same context / chunked-prefill / mixed-admission schedule with
+    prefill_cuda_graph_backend DISABLED and BREAKABLE. The first generated
+    token is the direct product of the (captured) prefill, so its
+    distribution is compared per request within the repo's accepted
+    probability-ratio bound and BCG's greedy pick must be one of eager's top-2.
+    Full-sequence greedy equality is reported but not required: Nano-30B-A3B
+    is MoE and flips greedy tokens under padding-induced numeric drift (see
+    the note above test_nemotron_h_sanity). NCCL allreduce is pinned: tp1 has
+    no allreduce at all, tp2 (skipped below 2 GPUs) runs the NCCL allreduce inside the captured
+    segments. Runs under the MPI executor and, with --run-ray, under the Ray
+    executor (mpi_ray_parity). The mixed-admission overlap is proved from the
+    two requests' iteration metrics, not assumed.
+    """
+    eager = _run_nemotron_h_prefill_backend(PrefillCudaGraphBackend.DISABLED,
+                                            tp_size)
+    bcg = _run_nemotron_h_prefill_backend(PrefillCudaGraphBackend.BREAKABLE,
+                                          tp_size)
+    assert len(eager) == len(bcg) == _BCG_NUM_REQUESTS
+
+    identical = 0
+    worst_diff = 0.0
+    for i, ((eager_ids, eager_lp), (bcg_ids,
+                                    bcg_lp)) in enumerate(zip(eager, bcg)):
+        assert len(bcg_ids) == len(eager_ids) > 0, (
+            f"request {i}: BCG produced {len(bcg_ids)} tokens, "
+            f"eager {len(eager_ids)}")
+        eager_top1 = eager_ids[0]
+        diff = (eager_lp[eager_top1] - bcg_lp[eager_top1]).abs().item()
+        worst_diff = max(worst_diff, diff)
+        assert diff < _BCG_LOGPROB_TOLERANCE, (
+            f"request {i}: BCG log-prob of eager's first token differs by "
+            f"{diff:.3f} nats (bound {_BCG_LOGPROB_TOLERANCE})")
+        eager_top2 = torch.topk(eager_lp, 2).indices.tolist()
+        assert bcg_ids[0] in eager_top2, (
+            f"request {i}: BCG first token {bcg_ids[0]} not in eager top-2 "
+            f"{eager_top2}")
+        identical += int(bcg_ids == eager_ids)
+    print(f"BCG vs eager: {identical}/{len(eager)} sequences identical, "
+          f"worst first-token log-prob diff {worst_diff:.3f} nats")

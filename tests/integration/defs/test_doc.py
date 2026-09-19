@@ -16,8 +16,7 @@
 import concurrent.futures
 import os
 import re
-from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pytest
 import requests
@@ -46,6 +45,11 @@ EXCEPTION_URLS = [
 ]
 
 HTML_LINK_PATTERN = re.compile(r'<a\s+(?:[^>]*?\s+)?href="([^"]*)"')
+TRTLLM_GITHUB_PATH_PATTERN = re.compile(
+    r"^/nvidia/tensorrt-llm/(?P<link_type>blob|tree)/"
+    r"(?P<git_ref>[^/]+)/(?P<repo_path>.+)$",
+    re.IGNORECASE,
+)
 
 
 def _get_session():
@@ -85,11 +89,33 @@ def _extract_markdown_links(text):
 
         if close_paren != -1:
             url = text[open_paren + 1 : close_paren]
-            links.append(url)
+            links.append((url, start_bracket))
             i = close_paren + 1
         else:
             i = open_paren + 1
     return links
+
+
+def _is_in_inline_code(text, position):
+    """Return whether a position is enclosed by a Markdown backtick span."""
+    offset = 0
+    while offset < position:
+        if text[offset] != "`":
+            offset += 1
+            continue
+
+        delimiter_end = offset
+        while delimiter_end < len(text) and text[delimiter_end] == "`":
+            delimiter_end += 1
+        delimiter = text[offset:delimiter_end]
+        closing_offset = text.find(delimiter, delimiter_end)
+        if closing_offset == -1:
+            offset = delimiter_end
+            continue
+        if delimiter_end <= position < closing_offset:
+            return True
+        offset = closing_offset + len(delimiter)
+    return False
 
 
 def _clean_url(url):
@@ -107,6 +133,19 @@ def _clean_url(url):
     return url.strip()
 
 
+def _clean_markdown_destination(destination):
+    """Remove an optional Markdown link title from a destination."""
+    destination = destination.strip()
+    if destination.startswith("<"):
+        closing_bracket = destination.find(">")
+        if closing_bracket != -1:
+            destination = destination[1:closing_bracket]
+    else:
+        destination = re.split(r"(?<!\\)\s", destination, maxsplit=1)[0]
+        destination = destination.replace(r"\ ", " ")
+    return destination.strip()
+
+
 def _find_markdown_files(root_dir):
     markdown_files = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -122,30 +161,74 @@ def _find_markdown_files(root_dir):
     return markdown_files
 
 
-def _extract_urls(file_path):
-    """Extract and normalize URLs from a markdown file."""
+def _extract_links(file_path):
+    """Extract and normalize link destinations from a markdown file."""
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.read().split("\n")
 
     url_info_list = []
 
+    code_fence = None
     for line_num, line in enumerate(lines, 1):
-        for url in _extract_markdown_links(line):
-            url_info_list.append((_clean_url(url), line_num))
+        fence_match = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence_match:
+            fence = fence_match.group(1)
+            if code_fence is None:
+                code_fence = fence
+            elif (
+                fence[0] == code_fence[0]
+                and len(fence) >= len(code_fence)
+                and not line[fence_match.end() :].strip()
+            ):
+                code_fence = None
+            continue
+
+        for url, column in _extract_markdown_links(line):
+            url_info_list.append(
+                (
+                    _clean_markdown_destination(url),
+                    line_num,
+                    code_fence is not None or _is_in_inline_code(line, column),
+                )
+            )
         for match in HTML_LINK_PATTERN.finditer(line):
-            url_info_list.append((_clean_url(match.group(1)), line_num))
+            url_info_list.append(
+                (
+                    _clean_url(match.group(1)),
+                    line_num,
+                    code_fence is not None or _is_in_inline_code(line, match.start()),
+                )
+            )
 
     normalized = []
-    for url, line_num in url_info_list:
+    for url, line_num, is_in_code in url_info_list:
         if url.startswith("www."):
             url = "https://" + url
-        if not url.startswith(("http://", "https://")):
-            continue
-        normalized.append((url, line_num))
+        normalized.append((url, line_num, is_in_code))
     return normalized
 
 
-def _check_url(url_info):
+def _check_relative_repository_link(url_info, source_file, root_dir):
+    """Validate a relative link against the repository worktree."""
+    url, line_num = url_info
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc or not parsed.path or os.path.isabs(parsed.path):
+        return None
+
+    root_dir = os.path.abspath(root_dir)
+    local_path = os.path.abspath(os.path.join(os.path.dirname(source_file), unquote(parsed.path)))
+    if os.path.commonpath((root_dir, local_path)) != root_dir:
+        return False, url, line_num, "Path escapes the TensorRT-LLM repository"
+
+    candidate_paths = [local_path]
+    if not os.path.splitext(local_path)[1]:
+        candidate_paths.extend((f"{local_path}.md", f"{local_path}.rst"))
+    is_valid = any(os.path.exists(candidate_path) for candidate_path in candidate_paths)
+    reason = f"Repository path {'exists' if is_valid else 'not found'}: {local_path}"
+    return is_valid, url, line_num, reason
+
+
+def _check_url(url_info, root_dir):
     """Return (is_valid, url, line_num, reason)."""
     url, line_num = url_info
 
@@ -159,8 +242,30 @@ def _check_url(url_info):
         return True, url, line_num, "local"
     if "drive.google.com" in parsed.netloc:
         return True, url, line_num, "Google Drive (auth required)"
-    if parsed.netloc == "github.com" and ("/blob/" in parsed.path or "/tree/" in parsed.path):
-        return True, url, line_num, "GitHub repo-internal ref"
+    github_path = parsed.path.lower()
+    if (
+        parsed.netloc.lower() == "github.com"
+        and github_path.startswith("/nvidia/tensorrt-llm/")
+        and ("/blob/" in github_path or "/tree/" in github_path)
+    ):
+        path_match = TRTLLM_GITHUB_PATH_PATTERN.fullmatch(parsed.path)
+        if path_match and path_match.group("git_ref") == "main":
+            link_type = path_match.group("link_type").lower()
+            repo_path = unquote(path_match.group("repo_path"))
+            local_path = os.path.abspath(os.path.join(root_dir, repo_path))
+            root_dir = os.path.abspath(root_dir)
+            if os.path.commonpath((root_dir, local_path)) != root_dir:
+                return False, url, line_num, "Path escapes the TensorRT-LLM repository"
+
+            if link_type == "blob":
+                is_valid = os.path.isfile(local_path)
+                target_type = "file"
+            else:
+                is_valid = os.path.isdir(local_path)
+                target_type = "directory"
+            reason = f"TensorRT-LLM {target_type} {'exists' if is_valid else 'not found'} locally"
+            return is_valid, url, line_num, reason
+        return True, url, line_num, "TensorRT-LLM repo-internal ref"
 
     session = _get_session()
     try:
@@ -179,8 +284,20 @@ def _check_url(url_info):
         return False, url, line_num, f"Error: {e}"
 
 
-def test_url_validity(llm_root):
-    """Scan all markdown files in the repo and assert no URLs return 404."""
+def _fail_on_invalid_links(invalid):
+    if not invalid:
+        return
+
+    invalid.sort()
+    file_count = len({md_file for md_file, _, _, _ in invalid})
+    report_lines = [f"Found {len(invalid)} invalid link(s) in {file_count} file(s):"]
+    for index, (md_file, line_num, url, reason) in enumerate(invalid, 1):
+        report_lines.append(f"{index}. {os.path.abspath(md_file)}:{line_num} [{reason}] {url}")
+    pytest.fail("\n".join(report_lines))
+
+
+def test_http_url_validity(llm_root):
+    """Scan all markdown files and validate HTTP URLs."""
     md_files = _find_markdown_files(llm_root)
     assert md_files, f"No markdown files found under {llm_root}"
 
@@ -195,13 +312,16 @@ def test_url_validity(llm_root):
     }
     all_urls = []
     for md_file in md_files:
-        for url, line_num in _extract_urls(md_file):
+        for url, line_num, _ in _extract_links(md_file):
+            parsed = urlparse(url)
+            if parsed.scheme.lower() not in ("http", "https"):
+                continue
             if _normalize(url) in skip_urls:
                 continue
             all_urls.append((url, line_num, md_file))
 
     if not all_urls:
-        pytest.skip("No URLs found in any markdown file")
+        pytest.skip("No HTTP URLs found in any markdown file")
 
     # De-duplicate URLs (check each unique URL once, keep all locations for reporting)
     unique_urls = {}
@@ -214,21 +334,36 @@ def test_url_validity(llm_root):
 
     invalid = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_check_url, item): item for item in url_items}
+        futures = {executor.submit(_check_url, item, llm_root): item for item in url_items}
         for future in concurrent.futures.as_completed(futures):
             is_valid, url, _, reason = future.result()
             if not is_valid:
                 for md_file, line_num in unique_urls[url]:
                     invalid.append((md_file, line_num, url, reason))
 
-    if invalid:
-        invalid.sort()
-        by_file = defaultdict(list)
-        for md_file, line_num, url, reason in invalid:
-            by_file[md_file].append((line_num, url, reason))
-        report_lines = [f"Found {len(invalid)} invalid URL(s) in {len(by_file)} file(s):"]
-        for md_file, entries in sorted(by_file.items()):
-            report_lines.append(f"{md_file}:")
-            for line_num, url, reason in entries:
-                report_lines.append(f"  L{line_num} [{reason}] {url}")
-        pytest.fail("\n".join(report_lines))
+    _fail_on_invalid_links(invalid)
+
+
+def test_relative_path_validity(llm_root):
+    """Scan all markdown files and validate relative repository paths."""
+    md_files = _find_markdown_files(llm_root)
+    assert md_files, f"No markdown files found under {llm_root}"
+
+    invalid = []
+    has_relative_path = False
+    for md_file in md_files:
+        for url, line_num, is_in_code in _extract_links(md_file):
+            if is_in_code:
+                continue
+            result = _check_relative_repository_link((url, line_num), md_file, llm_root)
+            if result is None:
+                continue
+            has_relative_path = True
+            is_valid, _, _, reason = result
+            if not is_valid:
+                invalid.append((md_file, line_num, url, reason))
+
+    if not has_relative_path:
+        pytest.skip("No relative repository paths found in any markdown file")
+
+    _fail_on_invalid_links(invalid)

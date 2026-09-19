@@ -1,0 +1,37 @@
+# Kimi K3 NVFP4 on DEP16 for GPQA-Diamond (4 nodes x 4 GPU).
+#
+# Differs from the GSM8K DEP16 config in exactly one thing that matters:
+# max_seq_len. GSM8K answers are a few hundred tokens, so 8192 covered prompt
+# plus generation. GPQA-Diamond is a reasoning benchmark and the published
+# Kimi-K3 numbers were measured with a 65536-token generation budget, so the
+# sequence budget has to hold 4096 of prompt plus all of that.
+#
+# max_batch_size is 8, revised up from 4 after the 8-question smoke (job
+# 475469) measured what this model actually generates here: 3431 and 6000
+# tokens, not the 65536 the budget allows. The budget still has to cover the
+# worst case, but sizing CONCURRENCY for it was wrong -- at ~6k tokens and
+# ~63 KiB/token a sequence wants ~0.4 GiB, not ~4 GiB, so the pool funds
+# several. The V2 Mamba minimum also stays comfortable: ~0.42 GiB per resident
+# slot means ~4.2 GiB at batch 8, well under the ~15 GiB quota, and the GSM8K
+# DEP16 run already ran at 8. If several questions do run long the scheduler
+# simply admits fewer of them.
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 69632
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+moe_config:
+  backend: CUTLASS
+  max_num_tokens: 131072
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.35
+  tokens_per_block: 64

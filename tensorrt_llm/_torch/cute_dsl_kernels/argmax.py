@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025, Tri Dao.
 # SPDX-FileCopyrightText: Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -117,7 +117,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @cute.jit
     def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
-        tApA = cute.make_fragment(
+        tApA = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     cute.size(tAcA, mode=[0, 1]),
