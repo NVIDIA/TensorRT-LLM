@@ -2526,6 +2526,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // main, so a ref with no promoted bundle still gets profiles.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
+                            // The overlay above only bakes in the profile bundle; it
+                            // leaves the installed wheel unoptimized. This makes the
+                            // SBSA release image install the BOLT-optimized wheel,
+                            // by waiting for BoltProfileGen to publish
+                            // bolted-<tarball> rather than grabbing whichever
+                            // tarball exists first. Inert on x86_64 (no promoted
+                            // bundle) and whenever the wheel is built from source
+                            // rather than downloaded.
+                            'boltRequireBoltedWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2585,9 +2594,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'uploadPath': UPLOAD_PATH,
                             // Must match Build-Docker-Images above: this path pushes the
                             // same tags, so the scanned+registered image has to be the
-                            // BOLTed canonical one rather than a plain build.
+                            // BOLTed canonical one rather than a plain build, built on
+                            // the BOLT-optimized wheel rather than the first tarball to
+                            // appear.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
+                            'boltRequireBoltedWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
