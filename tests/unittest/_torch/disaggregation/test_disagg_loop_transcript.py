@@ -10,17 +10,17 @@ coordinator; a changed sequence is a review signal, not necessarily a bug.
 
 Rank symmetry is checked only in the narrow form that fits one process: the
 first and a non-first PP rank must issue the same collective-sensitive calls in
-the same order during an idle iteration. Real multi-rank blocking semantics are
-covered elsewhere (Gloo tests; FakeDist arrives with CS-2). Regular disagg PP
+the same order during an idle iteration. Rank skew inside the coordinator is
+covered by the FakeDist tests (test_disagg_coordinator_progress.py); real
+multi-process blocking semantics only by multi-GPU E2E. Regular disagg PP
 termination advances from executed-batch handling; a recompute-pause fallback
 can call the same termination handler from an idle iteration. Neither path is
-covered here (nothing is pending in these iterations); both belong to the
-executed-batch/lifecycle transcripts of PR-5.
+covered here (nothing is pending in these iterations); both belong to
+executed-batch and lifecycle transcripts, which do not exist yet.
 """
 
 import inspect
 import queue
-from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -31,7 +31,6 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    DisaggLoopDelegates,
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
@@ -47,9 +46,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 
 pytestmark = pytest.mark.cpu_only
 
-# Coordinator entry points whose delegates run a rank-consensus collective.
-# Derived from the delegate targets in PyExecutor._build_disagg_coordinator;
-# update alongside them.
+# Coordinator entry points that run a rank-consensus collective. Maintained by
+# hand as entry points move.
 _COLLECTIVE_COORDINATOR_CALLS = {
     "handle_errors_synced",  # dist.allreduce / tp_allgather under ADP
     "prepare_context_schedulable",  # transceiver.prepare_context_requests consensus
@@ -113,6 +111,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.kv_cache_transceiver = Mock()
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.has_any_inflight_requests.return_value = False
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
     executor.kv_connector_manager = None
 
     executor.device_id = 0
@@ -319,18 +318,16 @@ def test_pp_ranks_issue_the_same_collective_sensitive_calls(monkeypatch) -> None
 def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExecutor:
     """Idle executor on a two-rank ADP group with the coordinator the executor
     would really build: the no-op one without a transceiver, otherwise a real
-    one whose CS-1 paths run against a quiet transceiver (the still-delegated
-    entry points are stubbed)."""
+    one running against a quiet transceiver."""
     executor = _idle_executor(monkeypatch, calls)
     executor.enable_attention_dp = True
     executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
     executor.dist.tp_allgather_int64.return_value = Mock(any=lambda: False)
+    # The real error vote iterates the gathered votes; echo this rank's twice.
+    executor.dist.tp_allgather.side_effect = lambda obj: [obj, obj]
     executor.kv_cache_transceiver = transceiver
     del executor._disagg_coordinator
     if transceiver is not None:
-        # admit is the one delegate whose return value the loop unpacks.
-        delegates = {f.name: (lambda *a, **k: None) for f in fields(DisaggLoopDelegates)}
-        delegates["admit"] = lambda fitting: (fitting, False)
         executor._disagg_coordinator = DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=executor.async_transfer_manager,
@@ -340,7 +337,6 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
             force_terminate_ctx_for_partial_reuse=False,
-            delegates=DisaggLoopDelegates(**delegates),
         )
     return executor
 

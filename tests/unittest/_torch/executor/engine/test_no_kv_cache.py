@@ -91,6 +91,7 @@ def _prepare(
             draft_tokens_cuda=draft_tokens_cuda,
             cache_indirection=None,
             lora=lora,
+            moe_load_balancer=None,
             model_forward=Mock(),
         ),
         NoKVCacheRunnerConfig(

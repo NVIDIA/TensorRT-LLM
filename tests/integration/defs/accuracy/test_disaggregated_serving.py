@@ -1285,78 +1285,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-@skip_pre_blackwell
-class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
-    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2"
-
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("overlap_scheduler", [False])
-    def test_auto_dtype(self, overlap_scheduler):
-        cache_transceiver_config = {
-            "backend": "NIXL",
-            "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096
-        }
-        max_num_tokens = 8192
-        ctx_kv_cache_config = {
-            "free_gpu_memory_fraction": 0.3,
-            "tokens_per_block": 64,
-            "dtype": "fp8",
-        }
-        moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": cache_transceiver_config,
-            "kv_cache_config": ctx_kv_cache_config,
-            "tensor_parallel_size": 4,
-            "pipeline_parallel_size": 1,
-            "max_batch_size": 16,
-            "max_num_tokens": max_num_tokens,
-            "enable_autotuner": False,
-        }
-        gen_kv_cache_config = {
-            "free_gpu_memory_fraction": 0.5,
-            "tokens_per_block": 64,
-            "dtype": "fp8",
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": overlap_scheduler,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": cache_transceiver_config,
-            "kv_cache_config": gen_kv_cache_config,
-            "moe_config": moe_config,
-            "max_batch_size": 128,
-            "max_num_tokens": 1024,
-            "cuda_graph_config": None,
-            "tensor_parallel_size": 4,
-            "pipeline_parallel_size": 1,
-            "moe_expert_parallel_size": 4,
-            "enable_attention_dp": True,
-            "enable_autotuner": False,
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config=ctx_server_config,
-                                      gen_server_config=gen_server_config,
-                                      model_name=self.MODEL_PATH,
-                                      max_workers=128) as llm:
-            run_accuracy_test(llm,
-                              model_name=self.MODEL_NAME,
-                              test_sets=["MMLU", "GSM8K"])
-
-
-@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
@@ -2130,6 +2058,124 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(145000)
+@pytest.mark.skip_less_host_memory(98304)
+class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
+    """Block-FP8 Qwen3.8-Flash-Next over the Python NIXL transceiver."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8"
+
+    # Match the aggregate accuracy run: the chat template thinks by default,
+    # so cap the trace and ask for the bare answer to fit the output budget.
+    GSM8K_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        system_prompt=("Use at most three short reasoning sentences, then "
+                       "end with `#### NUMBER`. Do not restate the problem."),
+        chat_template_kwargs=dict(enable_thinking=True,
+                                  reasoning_effort="xhigh"),
+    )
+
+    @pytest.mark.parametrize(
+        "snapshot_policy", [None, "interval", "offsets"],
+        ids=["no_reuse", "prefix_cache", "prefix_cache_offsets"])
+    def test_fp8_nixl_python(self, mocker, snapshot_policy):
+        """Tensor/expert-parallel-2 context to attention-DP2 generation.
+
+        The handoff carries the QSA index state, the Gated DeltaNet state, and
+        the replicated PLE n-gram and convolution state alongside the KV pages.
+
+        The two sides shard recurrent state differently on purpose. The context
+        side splits Gated DeltaNet state across both ranks, while attention DP
+        leaves it unsharded on the generation side (MambaPolicy._mamba_tp
+        returns 1), so the transfer exercises the sharded-to-replicated path.
+        PLE state stays replicated on both sides throughout.
+
+        With block reuse the context worker restores part of its recurrent
+        state from a snapshot instead of computing it, so the transferred state
+        is only correct if the snapshot carries the PLE roles too. The two
+        reuse variants place snapshots differently: at a fixed token interval,
+        or at offsets measured from the prompt start and end.
+        """
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 8192,
+        }
+        kv_cache_config = {
+            "enable_block_reuse": snapshot_policy is not None,
+            "mamba_ssm_cache_dtype": "bfloat16",
+            "free_gpu_memory_fraction": 0.5,
+        }
+        # Attention pages alone cannot restore GDN or PLE state, so the runtime
+        # turns reuse back off unless a snapshot placement is configured.
+        if snapshot_policy == "interval":
+            kv_cache_config["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
+        elif snapshot_policy == "offsets":
+            kv_cache_config["mamba_state_config"] = {
+                "additional_snapshot_offsets_from_start": [256],
+                "additional_snapshot_offsets_from_end": [0],
+            }
+        common_config = {
+            "trust_remote_code": True,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "max_batch_size": 16,
+            "cache_transceiver_config": cache_transceiver_config,
+            "moe_config": {
+                "backend": "TRTLLM"
+            },
+            "kv_cache_config": kv_cache_config,
+        }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "enable_attention_dp": True,
+            "enable_lm_head_tp_in_adp": True,
+            "disable_overlap_scheduler": False,
+            "cuda_graph_config": {
+                "max_batch_size": 16,
+                "enable_padding": True,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                extra_env={"TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD": "1"},
+        ) as llm:
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME, ["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)

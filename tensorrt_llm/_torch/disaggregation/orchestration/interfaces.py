@@ -15,7 +15,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse
 class ExecutorEffects(Protocol):
     """Executor-owned side effects the coordinator may trigger.
 
-    These three are the complete set; adding one is a design decision, not
+    These six are the complete set; adding one is a design decision, not
     a convenience.
     """
 
@@ -45,6 +45,24 @@ class ExecutorEffects(Protocol):
         charge_budget: bool,
     ) -> None:
         """Fail requests through the executor's error path."""
+        ...
+
+    def fail_fatal(self, error_msg: str) -> None:
+        """Mark the executor fatal and fail every active request.
+
+        Called only after a world-wide collective agreed on the failure, so
+        the executor takes its collective-aligned fatal path on every rank.
+        """
+        ...
+
+    def prepare_gen_resources(self, requests: List[LlmRequest]) -> None:
+        """Prepare the executor's resource managers (KV, spec, draft KV) for
+        gen-init requests that are about to start their KV receive."""
+        ...
+
+    def revert_ctx_alloc(self, requests: List[LlmRequest]) -> None:
+        """Give back the KV that scheduler V2 grew for gen-init requests that
+        were scheduled but not admitted this iteration."""
         ...
 
 

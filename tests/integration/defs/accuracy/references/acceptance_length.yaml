@@ -90,3 +90,6 @@ disagg::TestDeepSeekV3Lite::test_gen_first:
 disagg::TestNemotron3Super120B::test_auto_dtype:
   ref_al: 3.542334313074808
   min_al: 3.3652175974210676
+TestQwen3_8_27B::test_dflash2:
+  ref_al: 5.899181450085933
+  min_al: 5.604222377581636

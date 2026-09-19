@@ -231,7 +231,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         fwd=forward_args,
         workspace=torch.empty(0, dtype=torch.uint8),
         qkv_input=torch.empty((batch_size, 2, 4)),
-        context_buf=output,
+        output=output,
         sequence_lengths=torch.ones(batch_size, dtype=torch.int32),
         input_seq_length=1,
         num_tokens=batch_size,
