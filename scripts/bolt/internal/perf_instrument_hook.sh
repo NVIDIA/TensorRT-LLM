@@ -31,7 +31,7 @@
 #   BOLT_FDATA_DIR    (required) run-level shared dir; this node writes <dir>/<host>
 #   BOLT_LLVM_DIR     (optional) dir to stage/reuse llvm-bolt (default /tmp/bolt-llvm)
 #   BOLT_WORK_DIR     (optional) per-node work dir (default /tmp/bolt_work_<jobid>)
-#   LLVM_BOLT_VERSION (optional) default 21.1.5
+#   LLVM_BOLT_VERSION (optional) overrides the pin in internal/llvm_bolt_version.sh
 
 set -euo pipefail
 
@@ -47,7 +47,7 @@ mkdir -p "$FDATA_OUTPUT_DIR"
 # Ensure llvm-bolt / merge-fdata on PATH (self-stage if absent). Race-safe
 # extract-then-atomic-rename in case BOLT_LLVM_DIR is a shared path hit by
 # multiple nodes.
-LLVM_BOLT_VERSION="${LLVM_BOLT_VERSION:-21.1.5}"
+. "$HERE/llvm_bolt_version.sh"
 BOLT_LLVM_DIR="${BOLT_LLVM_DIR:-/tmp/bolt-llvm}"
 if ! command -v llvm-bolt >/dev/null 2>&1; then
     if [ ! -x "$BOLT_LLVM_DIR/bin/llvm-bolt" ]; then
