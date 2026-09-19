@@ -1326,6 +1326,49 @@ class TestNoBatching(TestKVCacheManagerV2):
         with self.assertRaises(AttributeError):
             buffer_id.layer_id = LayerId(2)
 
+    @unittest.skipUnless(KV_CACHE_MANAGER_V2_BACKEND == "cpp", "internal C++ residency API")
+    def test_internal_residency_groups_and_window(self) -> None:
+        dense = AttentionLayerConfig(LayerId(0), [BufferConfig("key", 4096)])
+        sparse = AttentionLayerConfig(LayerId(1), [BufferConfig("key", 4096)])
+        self.assertEqual(dense._residency_group, 0)
+        sparse._residency_group = 1
+        self.assertEqual(deepcopy(sparse)._residency_group, 1)
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                layers=[dense, sparse],
+            )
+        )
+        dense_group = self.manager.get_layer_group_id(dense.layer_id)
+        sparse_group = self.manager.get_layer_group_id(sparse.layer_id)
+        self.assertNotEqual(dense_group, sparse_group)
+        kv_cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            try:
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(20, 16))
+                kv_cache._set_residency_window(sparse_group, 5, num_sink_tokens=4)
+                self.assertEqual(
+                    list(kv_cache.get_base_page_indices(sparse_group))[1:3],
+                    [BAD_PAGE_INDEX, BAD_PAGE_INDEX],
+                )
+                self.assertTrue(all(i >= 0 for i in kv_cache.get_base_page_indices(dense_group)))
+                kv_cache.suspend()
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertEqual(
+                    list(kv_cache.get_base_page_indices(sparse_group))[1:3],
+                    [BAD_PAGE_INDEX, BAD_PAGE_INDEX],
+                )
+                kv_cache._set_residency_window(sparse_group, None)
+                self.assertTrue(all(i >= 0 for i in kv_cache.get_base_page_indices(sparse_group)))
+                with self.assertRaises(ValueError):
+                    kv_cache._set_residency_window(sparse_group, 0)
+            finally:
+                kv_cache.close()
+        s.take_finish_event()
+
     def test_shrink_capacity_truncates_base_page_indices(self) -> None:
         self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
         kv_cache = self.manager.create_kv_cache()
