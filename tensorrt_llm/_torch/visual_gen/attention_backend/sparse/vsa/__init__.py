@@ -22,7 +22,7 @@ from .metadata import (
     get_vsa_forward_context,
     set_vsa_forward_context,
 )
-from .predictor import VSAForwardInputs, VSAPredictor, VSAPreprocessor
+from .predictor import VSAForwardInputs, VSAPredictor
 
 __all__ = [
     "VSA_TILE_SIZE",
@@ -30,7 +30,6 @@ __all__ = [
     "VSAMetadata",
     "VSAMetadataBuilder",
     "VSAPredictor",
-    "VSAPreprocessor",
     "get_vsa_forward_context",
     "set_vsa_forward_context",
 ]

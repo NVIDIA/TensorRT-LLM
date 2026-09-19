@@ -16,7 +16,6 @@
 """Shared Video Sparse Attention prediction and post-processing."""
 
 from dataclasses import dataclass, field
-from functools import cache
 from math import ceil
 from typing import Optional
 
@@ -24,6 +23,7 @@ import torch
 
 from .....attention.backends.interface import PredefinedAttentionMask
 from .....attention.backends.sparse.params import BlockSparseForwardInputs
+from .kernels import blend_coarse_fine, sort_last_dim, tile_and_pool_cubes
 from .metadata import (
     _DEFAULT_MAX_CACHED_SHAPES,
     VSA_BLOCK_SIZE,
@@ -31,58 +31,22 @@ from .metadata import (
     get_vsa_forward_context,
 )
 
-_BITS_PER_WORD = 32
 _SIGNED_INT32_MAX = torch.iinfo(torch.int32).max
-
-
-def _mean_pool_cubes(
-    x_tiled: torch.Tensor,
-    variable_block_sizes: torch.LongTensor,
-    prod_tile: int,
-    num_cubes: int,
-) -> torch.Tensor:
-    batch_size, _padded, num_heads, head_dim = x_tiled.shape
-    x_cubes = x_tiled.view(batch_size, num_cubes, prod_tile, num_heads, head_dim)
-    # FP32 accumulation avoids perturbing the coarse softmax when inputs are BF16.
-    x_sum = x_cubes.float().sum(dim=2)
-    valid_counts = variable_block_sizes.float().clamp(min=1).view(1, num_cubes, 1, 1)
-    return (x_sum / valid_counts).to(x_tiled.dtype)
-
-
-class VSAPreprocessor:
-    """Convert compact BSHD tensors between sequence-major and tile-major order."""
-
-    @staticmethod
-    def tile(
-        x: torch.Tensor,
-        non_pad_index: torch.LongTensor,
-        gather_idx: torch.LongTensor,
-        padded_seq_len: int,
-    ) -> torch.Tensor:
-        # index_select + index_copy_ keeps this path traceable by torch.compile.
-        batch_size, _seq_len, num_heads, head_dim = x.shape
-        x_valid = x.index_select(1, gather_idx)
-        x_padded = x.new_zeros(batch_size, padded_seq_len, num_heads, head_dim)
-        x_padded.index_copy_(1, non_pad_index, x_valid)
-        return x_padded
-
-    @staticmethod
-    def untile(
-        x: torch.Tensor,
-        untile_idx: torch.LongTensor,
-    ) -> torch.Tensor:
-        return torch.index_select(x, 1, untile_idx)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, eq=False)
 class VSAPostProcessContext:
-    """Per-call tensors needed after the backend executes the fine stage."""
+    """Per-call tensors needed after the backend executes the fine stage.
+
+    ``coarse_output`` stays per cube (``[batch, num_cubes, heads, head_dim]``); the
+    post-process gathers it to compact token order together with the fine output.
+    """
 
     coarse_output: torch.Tensor = field(repr=False)
     gate_compress: torch.Tensor = field(repr=False)
     gate_fine: Optional[torch.Tensor] = field(default=None, repr=False)
-    untile_idx: Optional[torch.LongTensor] = field(default=None, repr=False)
-    output_shape: tuple[int, int, int, int]
+    untile_idx: torch.LongTensor = field(repr=False)
+    fine_is_tiled: bool
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, eq=False)
@@ -120,76 +84,58 @@ class _VSARouteBuilder:
     def from_selected_blocks(
         self,
         selected_blocks: torch.Tensor,
-        kv_valid_bits: torch.Tensor,
+        kv_valid_words: torch.Tensor,
     ) -> BlockSparseForwardInputs:
+        """Build the BSR carrier for one prediction.
+
+        Args:
+            selected_blocks: ``[batch, kv_heads, q_blocks, blocks_per_row]`` int32 selected
+                KV cube per query cube, in any order within a row.
+            kv_valid_words: ``[words]`` uint32 packed valid-token mask of the padded
+                sequence, shared by every batch entry.
+        """
         batch_size, num_kv_heads, num_q_blocks, blocks_per_row = map(int, selected_blocks.shape)
-        key = (
-            selected_blocks.device,
-            batch_size,
-            num_kv_heads,
-            num_q_blocks,
-            blocks_per_row,
-        )
+        key = (selected_blocks.device, batch_size, num_kv_heads, num_q_blocks, blocks_per_row)
         block_indptr = self._indptr_cache.get(key)
         if block_indptr is None:
-            if len(self._indptr_cache) >= self._max_cached_shapes:
-                raise RuntimeError(
-                    "VSA route cache reached its "
-                    f"{self._max_cached_shapes}-shape limit; restart the pipeline or "
-                    "reuse a configured resolution/frame profile"
-                )
-            if selected_blocks.is_cuda and torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "VSA route cache miss during CUDA Graph capture; "
-                    "run an eager warmup with the same selected-block shape first"
-                )
-            total_entries = batch_size * num_kv_heads * num_q_blocks * blocks_per_row
-            if total_entries > _SIGNED_INT32_MAX:
-                raise OverflowError("VSA route offsets must fit in signed int32")
-            row_offsets = torch.arange(
-                num_q_blocks + 1,
-                dtype=torch.int32,
-                device=selected_blocks.device,
-            ).reshape(1, 1, -1)
-            head_offsets = torch.arange(
-                batch_size * num_kv_heads,
-                dtype=torch.int32,
-                device=selected_blocks.device,
-            ).reshape(batch_size, num_kv_heads, 1)
-            block_indptr = (
-                head_offsets * (num_q_blocks * blocks_per_row) + row_offsets * blocks_per_row
-            ).contiguous()
+            block_indptr = self._build_block_indptr(*key)
             self._indptr_cache[key] = block_indptr
         return BlockSparseForwardInputs(
             q_block_size=VSA_BLOCK_SIZE,
             kv_block_size=VSA_BLOCK_SIZE,
             max_blocks_per_row=blocks_per_row,
             block_indptr=block_indptr,
-            block_indices=torch.sort(selected_blocks, dim=-1).values.reshape(-1).contiguous(),
-            kv_valid_bits=kv_valid_bits,
+            block_indices=sort_last_dim(selected_blocks).reshape(-1),
+            kv_valid_bits=kv_valid_words.unsqueeze(0).expand(batch_size, -1).contiguous(),
         )
 
-
-@cache
-def _get_bit_weights(device: torch.device) -> torch.Tensor:
-    bit_positions = torch.arange(_BITS_PER_WORD, dtype=torch.int64, device=device)
-    return torch.bitwise_left_shift(torch.ones_like(bit_positions), bit_positions)
-
-
-def _pack_kv_token_mask(kv_token_mask: torch.Tensor, batch_size: int) -> torch.Tensor:
-    if kv_token_mask.ndim == 1:
-        batched_mask = kv_token_mask.unsqueeze(0).expand(batch_size, -1)
-    else:
-        batched_mask = kv_token_mask
-    seq_len_kv = int(batched_mask.shape[1])
-    padded_length = ceil(seq_len_kv / _BITS_PER_WORD) * _BITS_PER_WORD
-    if padded_length != seq_len_kv:
-        batched_mask = torch.nn.functional.pad(batched_mask, (0, padded_length - seq_len_kv))
-    words = (
-        batched_mask.reshape(batch_size, -1, _BITS_PER_WORD).to(torch.int64)
-        * _get_bit_weights(kv_token_mask.device)
-    ).sum(dim=-1)
-    return words.to(torch.uint32).contiguous()
+    def _build_block_indptr(
+        self,
+        device: torch.device,
+        batch_size: int,
+        num_kv_heads: int,
+        num_q_blocks: int,
+        blocks_per_row: int,
+    ) -> torch.Tensor:
+        if len(self._indptr_cache) >= self._max_cached_shapes:
+            raise RuntimeError(
+                "VSA route cache reached its "
+                f"{self._max_cached_shapes}-shape limit; restart the pipeline or "
+                "reuse a configured resolution/frame profile"
+            )
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "VSA route cache miss during CUDA Graph capture; "
+                "run an eager warmup with the same selected-block shape first"
+            )
+        if batch_size * num_kv_heads * num_q_blocks * blocks_per_row > _SIGNED_INT32_MAX:
+            raise OverflowError("VSA route offsets must fit in signed int32")
+        row_offsets = torch.arange(num_q_blocks + 1, dtype=torch.int32, device=device)
+        head_offsets = torch.arange(batch_size * num_kv_heads, dtype=torch.int32, device=device)
+        return (
+            head_offsets.reshape(batch_size, num_kv_heads, 1) * (num_q_blocks * blocks_per_row)
+            + row_offsets.reshape(1, 1, -1) * blocks_per_row
+        ).contiguous()
 
 
 class VSAPredictor:
@@ -281,62 +227,52 @@ class VSAPredictor:
             raise ValueError("VSA batch_size and seq_len must match the compact QKV tensors.")
 
         metadata = metadata or self.get_metadata()
-        padded_len = metadata.padded_seq_length
         num_cubes = metadata.num_cubes
         cur_topk = max(1, ceil((1.0 - metadata.vsa_sparsity) * num_cubes))
-        q_tiled = VSAPreprocessor.tile(q, metadata.non_pad_index, metadata.gather_idx, padded_len)
-        k_tiled = VSAPreprocessor.tile(k, metadata.non_pad_index, metadata.gather_idx, padded_len)
-        v_tiled = VSAPreprocessor.tile(v, metadata.non_pad_index, metadata.gather_idx, padded_len)
 
-        q_coarse = _mean_pool_cubes(
-            q_tiled, metadata.variable_block_sizes, VSA_BLOCK_SIZE, num_cubes
+        (q_tiled, q_coarse), (k_tiled, k_coarse), (v_tiled, v_coarse) = (
+            tile_and_pool_cubes(
+                x,
+                metadata.tile_source_index,
+                metadata.variable_block_sizes,
+                cube_size=VSA_BLOCK_SIZE,
+            )
+            for x in (q, k, v)
         )
-        k_coarse = _mean_pool_cubes(
-            k_tiled, metadata.variable_block_sizes, VSA_BLOCK_SIZE, num_cubes
-        )
-        v_coarse = _mean_pool_cubes(
-            v_tiled, metadata.variable_block_sizes, VSA_BLOCK_SIZE, num_cubes
-        )
+
         coarse_scores = torch.einsum("bnhd,bmhd->bhnm", q_coarse, k_coarse) * q.shape[-1] ** -0.5
         coarse_probs = coarse_scores.softmax(dim=-1)
         coarse_output = torch.einsum("bhnm,bmhd->bnhd", coarse_probs, v_coarse)
-        topk_indices = coarse_probs.topk(cur_topk, dim=-1).indices.to(torch.int32)
-        coarse_output_tiled = (
-            coarse_output.unsqueeze(2)
-            .expand(batch_size, num_cubes, VSA_BLOCK_SIZE, q.shape[2], q.shape[3])
-            .reshape(batch_size, padded_len, q.shape[2], q.shape[3])
-        )
-        coarse_output_compact = VSAPreprocessor.untile(coarse_output_tiled, metadata.untile_idx)
+        # BSR routes are re-sorted by cube index, so their value order is not needed; other
+        # consumers keep receiving the selected cubes in descending probability order.
+        topk_indices = coarse_probs.topk(
+            cur_topk, dim=-1, sorted=not produce_block_sparse_inputs
+        ).indices.to(torch.int32)
 
         block_sparse_inputs = None
         if use_sparse_fine and produce_block_sparse_inputs:
-            kv_valid_bits = _pack_kv_token_mask(metadata.kv_token_mask, batch_size)
             block_sparse_inputs = self._route_builder.from_selected_blocks(
                 topk_indices,
-                kv_valid_bits,
+                metadata.kv_valid_words,
             )
 
-        effective_q = q_tiled if use_sparse_fine else q
-        effective_k = k_tiled if use_sparse_fine else k
-        effective_v = v_tiled if use_sparse_fine else v
-        effective_seq_len = padded_len if use_sparse_fine else seq_len
         return VSAForwardInputs(
-            q=effective_q,
-            k=effective_k,
-            v=effective_v,
+            q=q_tiled if use_sparse_fine else q,
+            k=k_tiled if use_sparse_fine else k,
+            v=v_tiled if use_sparse_fine else v,
             batch_size=batch_size,
-            seq_len=effective_seq_len,
+            seq_len=metadata.padded_seq_length if use_sparse_fine else seq_len,
             block_sparse_inputs=block_sparse_inputs,
             topk_indices=topk_indices,
             variable_block_sizes=metadata.variable_block_sizes,
             cur_topk=cur_topk,
             num_cubes=num_cubes,
             post_context=VSAPostProcessContext(
-                coarse_output=coarse_output_compact,
+                coarse_output=coarse_output,
                 gate_compress=gate_compress,
                 gate_fine=gate_fine,
-                untile_idx=metadata.untile_idx if use_sparse_fine else None,
-                output_shape=tuple(q.shape),
+                untile_idx=metadata.untile_idx,
+                fine_is_tiled=use_sparse_fine,
             ),
         )
 
@@ -346,16 +282,17 @@ def vsa_post_process(output: torch.Tensor, inputs: VSAForwardInputs) -> torch.Te
 
     context = inputs.post_context
     fine_output = output.reshape(
-        inputs.batch_size,
-        inputs.seq_len,
-        context.output_shape[2],
-        context.output_shape[3],
+        inputs.batch_size, inputs.seq_len, *context.gate_compress.shape[2:]
     )
-    if context.untile_idx is not None:
-        fine_output = VSAPreprocessor.untile(fine_output, context.untile_idx)
-    if context.gate_fine is not None:
-        fine_output = context.gate_fine * fine_output
-    return context.gate_compress * context.coarse_output + fine_output
+    return blend_coarse_fine(
+        fine_output,
+        context.coarse_output,
+        context.gate_compress,
+        context.gate_fine,
+        context.untile_idx,
+        cube_size=VSA_BLOCK_SIZE,
+        fine_is_tiled=context.fine_is_tiled,
+    )
 
 
 __all__ = [
