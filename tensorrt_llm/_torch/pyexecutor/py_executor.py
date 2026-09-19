@@ -3513,7 +3513,12 @@ class PyExecutor:
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Commit one context frontier to target and draft caches."""
         self.kv_cache_manager.update_context_resources(scheduled_batch)
-        if self.enable_joint_kv_cache_reuse:
+        # Advance draft history whenever a draft/indexer pool exists, not only
+        # under joint reuse. With enable_block_reuse=false the unpaired draft
+        # mirror still resizes capacity during prefill; leaving history at 0
+        # until the first generation update_resources then races capacity
+        # reclaim under MTP rewind (see #18661).
+        if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.update_context_resources(
                 scheduled_batch)
 
