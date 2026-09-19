@@ -1637,6 +1637,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
         ctx_server_config = {
             "disable_overlap_scheduler": True,
+            "max_batch_size": 256,
             "trust_remote_code": True,
             "kv_cache_config": {
                 "enable_block_reuse": True
@@ -1648,6 +1649,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
+            "max_batch_size": 256,
             "trust_remote_code": True,
             "kv_cache_config": {
                 "enable_block_reuse": False
