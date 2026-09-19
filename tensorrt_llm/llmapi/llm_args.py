@@ -6386,6 +6386,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
+                if (self.cache_transceiver_config is not None
+                        and self.cache_transceiver_config.backend is not None):
+                    # The transceiver moves the target KV cache, but the
+                    # drafter's context is built from target hidden states
+                    # during prefill and is not transferred with it, so a
+                    # generation server drafts without the prompt. Drafts are
+                    # verified against the target, so this costs acceptance
+                    # rather than correctness: warn, do not reject.
+                    logger.warning(
+                        "DFlash acceptance is degraded under disaggregated "
+                        "serving: the cache transceiver moves the target KV "
+                        "cache, but the drafter's context is built during "
+                        "prefill and is not transferred, so a generation "
+                        "server drafts without the prompt context. Output is "
+                        "unaffected; expect a lower acceptance rate than the "
+                        "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # A Hugging Face repo id is not readable yet; CachedModelLoader
                 # calls this again after the drafter is downloaded.
