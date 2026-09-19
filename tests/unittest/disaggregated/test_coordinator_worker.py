@@ -23,12 +23,12 @@ coordinator:
     in a ``CoordinatorDelegatingRouter`` whose ``get_next_server`` computes the
     routing key locally and POSTs it to the coordinator's ``/select``;
     ``finish_request`` releases coordinator-side state via ``/finish`` and the
-    returned handle. *Stateless* routers (round_robin) are used as-is and place
-    locally in the worker.
+    returned handle. ``round_robin`` is used as-is and places locally in the
+    worker.
 
-This proves the routing split: stateful routers (conversation, kv_cache_aware)
-delegate to the coordinator via ``routing_key`` + ``get_next_server_by_key``,
-while stateless routers never touch the coordinator.
+This proves the routing split: globally stateful routers (load_balancing,
+conversation, kv_cache_aware) delegate to the coordinator via ``routing_key`` +
+``get_next_server_by_key``, while round-robin routing remains local.
 """
 
 import asyncio
@@ -454,6 +454,43 @@ def test_stateless_router_places_locally_in_worker():
             assert set(picks) == {gen0.url, gen1.url}, (
                 f"local round-robin should hit both gen workers, got {picks}"
             )
+
+
+def test_load_balancing_router_uses_global_coordinator_state():
+    """Two fleet workers choose different servers while both requests are active."""
+    from tensorrt_llm.serve.router import LoadBalancingRouter
+
+    with _FakeWorker() as ctx0, _FakeWorker() as gen0, _FakeWorker() as gen1:
+        config = _make_config([ctx0.url], [gen0.url, gen1.url], "round_robin", "load_balancing")
+        with _CoordinatorThread(config) as coord:
+            assert asyncio.run(_wait_coord_ready(coord.url)), "coordinator never became healthy"
+
+            def _request(request_id):
+                return CompletionRequest(
+                    model="m",
+                    prompt="hello",
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="generation_only",
+                        ctx_request_id=request_id,
+                    ),
+                )
+
+            async def drive():
+                first_worker = CoordinatorClient(coord.url, config)
+                second_worker = CoordinatorClient(coord.url, config)
+                assert isinstance(first_worker.gen_router, CoordinatorDelegatingRouter)
+                assert isinstance(first_worker.gen_router._local, LoadBalancingRouter)
+                first_request, second_request = _request(1), _request(2)
+                first, _ = await first_worker.gen_router.get_next_server(first_request)
+                second, _ = await second_worker.gen_router.get_next_server(second_request)
+                await first_worker.gen_router.finish_request(first_request)
+                await second_worker.gen_router.finish_request(second_request)
+                await first_worker.stop()
+                await second_worker.stop()
+                return first, second
+
+            first, second = asyncio.run(drive())
+            assert {first, second} == {gen0.url, gen1.url}
 
 
 def test_static_stateless_router_prepares_generation_first_server_info():

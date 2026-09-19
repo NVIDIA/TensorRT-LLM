@@ -29,8 +29,9 @@ Two implementations for the coordinator/worker deployment:
   coordinator's ``/select`` / ``/finish`` handlers.
 * :class:`CoordinatorClient` -- runs in each forked worker. Stateful routers
   (conversation, centralized) are wrapped in a :class:`CoordinatorDelegatingRouter`
-  that posts the routing key to ``/select`` (finish -> ``/finish``); stateless
-  routers (round_robin, load_balancing) place locally in the worker. Readiness /
+  that posts the routing key to ``/select`` (finish -> ``/finish``). The
+  round-robin router places locally; load-balancing, conversation, and
+  KV-cache-aware routers delegate to preserve global routing state. Readiness /
   cluster_info proxy the coordinator over HTTP.
 """
 
@@ -452,15 +453,16 @@ def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
 
 
 class CoordinatorClient(DisaggCoordinator):
-    """Worker-side coordinator: delegate stateful routing to the coordinator.
+    """Worker-side coordinator: delegate global routing to the coordinator.
 
-    A *stateful* router (conversation, centralized -- it exposes
+    A router that needs globally shared state (load_balancing, conversation,
+    centralized -- it exposes
     ``get_next_server_by_key``) is wrapped in a :class:`CoordinatorDelegatingRouter`
     so the worker computes the small routing key locally and the coordinator makes
-    the placement (placement -> ``/select``, finish -> ``/finish``). A *stateless*
-    router (round_robin, load_balancing) is used as-is and places locally in the
-    worker -- no coordinator round-trip. A background ``/cluster_info`` poll keeps
-    readiness and stateless-router server lists synchronized with the coordinator.
+    the placement (placement -> ``/select``, finish -> ``/finish``). The
+    round-robin router is used as-is and places locally in the worker. A background
+    ``/cluster_info`` poll keeps readiness and local-router server lists synchronized
+    with the coordinator.
 
     Args:
         remote_url: Coordinator base URL (e.g. ``http://host:PORT``).
@@ -515,9 +517,9 @@ class CoordinatorClient(DisaggCoordinator):
         self._gen_router = self._maybe_delegate(gen_router, "generation")
 
     def _maybe_delegate(self, local_router: Router, role: str) -> Router:
-        # Stateful routers expose get_next_server_by_key -> delegate placement to
-        # the coordinator; stateless ones place locally (used unchanged). Pass the
-        # RAW url so the delegating router picks the UDS connector when applicable.
+        # Routers that expose get_next_server_by_key delegate placement to the
+        # coordinator. Round-robin remains local. Pass the RAW url so the
+        # delegating router picks the UDS connector when applicable.
         if hasattr(local_router, "get_next_server_by_key"):
             return CoordinatorDelegatingRouter(
                 self._remote_url_raw, local_router, role, self._request_timeout_s

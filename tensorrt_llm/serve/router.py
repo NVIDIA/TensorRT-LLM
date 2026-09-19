@@ -78,12 +78,18 @@ class ServerState:
 
     async def increment_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        await self.increment_load_by(num_tokens)
+
+    async def increment_load_by(self, num_tokens: int = 0):
         async with self._lock:
             self._num_active_requests += 1
             self._num_active_tokens += num_tokens
 
     async def decrement_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        await self.decrement_load_by(num_tokens)
+
+    async def decrement_load_by(self, num_tokens: int = 0):
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
@@ -752,6 +758,9 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers, use_tokens)
+        # The coordinator path cannot retain the request object, so preserve its
+        # token weight by disaggregated request ID until /finish arrives.
+        self._coord_request_tokens: dict[int, int] = {}
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -784,6 +793,47 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         del session, success, req_id
         async with self._lock:
             await self._unregister_request(request)
+
+    # ---- coordinator delegation -------------------------------------------------
+
+    def routing_key(self, request: OpenAIRequest) -> dict[str, int]:
+        """Return the request's load weight for coordinator-side placement."""
+        return {
+            "num_tokens":
+            get_request_num_tokens(request) if self._use_tokens else 0,
+        }
+
+    async def get_next_server_by_key(self,
+                                     routing_key,
+                                     exclude_server=None,
+                                     req_id=None):
+        """Place globally and retain the worker-provided token weight by ID."""
+        if req_id is None:
+            raise ValueError(
+                "Load-balancing coordinator routing requires a request ID")
+        self._validate_servers_available()
+        num_tokens = int((routing_key or {}).get("num_tokens", 0))
+        async with self._lock:
+            server = self._select_least_loaded(exclude_server)
+            if server is None:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
+            await self._server_state[server].increment_load_by(num_tokens)
+            self._req_routing_table[req_id] = server
+            self._coord_request_tokens[req_id] = num_tokens
+        return server, {
+            "server_info": self._server_info.get(server, {})
+        }, req_id
+
+    async def finish_request_by_id(self, req_id, success=True):
+        del success
+        if req_id is None:
+            return
+        async with self._lock:
+            server = self._req_routing_table.pop(req_id, None)
+            num_tokens = self._coord_request_tokens.pop(req_id, 0)
+            if server is not None and server in self._server_state:
+                await self._server_state[server].decrement_load_by(num_tokens)
 
 
 class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
@@ -1649,16 +1699,17 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 class CoordinatorDelegatingRouter(Router):
     """Worker-side Router that delegates placement to the disagg coordinator.
 
-    Used only for *stateful* routers (conversation, kv_cache_aware): the worker
-    must not keep its own copy of that state, so it wraps a local router of the same
-    type and, for each request, computes the small ``routing_key`` locally and
-    POSTs it to the coordinator's ``/select``. ``finish_request`` POSTs the
-    returned handle to ``/finish`` so the coordinator releases per-request state.
+    Used for routers with global routing state (load_balancing, conversation,
+    kv_cache_aware): the worker must not keep its own copy of that state, so it
+    wraps a local router of the same type and, for each request, computes the small
+    ``routing_key`` locally and POSTs it to the coordinator's ``/select``.
+    ``finish_request`` POSTs the returned handle to ``/finish`` so the coordinator
+    releases per-request state.
     Server-pool / prepare / close operations delegate to the wrapped local router.
 
-    Stateless routers (round_robin, load_balancing) are NOT wrapped -- the worker
-    holds the real router and places locally, so they never reach this class (see
-    ``CoordinatorClient``). ``OpenAIClient`` already drives
+    The round-robin router is NOT wrapped -- the worker holds the real router and
+    places locally, so it never reaches this class (see ``CoordinatorClient``).
+    ``OpenAIClient`` already drives
     ``router.get_next_server`` / ``router.finish_request``, so the completions
     service needs no worker-specific branching.
     """
@@ -1948,12 +1999,12 @@ def build_disagg_routers(
 ) -> tuple[Router, Router]:
     """Build the ctx and gen routers for one disagg process.
 
-    Each side is built independently via :func:`create_router`. Stateful router
-    types (conversation, kv_cache_aware) expose ``routing_key`` /
+    Each side is built independently via :func:`create_router`. Globally shared
+    router types (load_balancing, conversation, kv_cache_aware) expose ``routing_key`` /
     ``get_next_server_by_key``; when this process is a delegating client, the
     caller (:class:`CoordinatorClient`) wraps those in a
     :class:`CoordinatorDelegatingRouter` so placement is delegated to the
-    coordinator. Stateless types (round_robin, load_balancing) place locally.
+    coordinator. Round-robin placement stays local.
     ``is_delegating_client`` is accepted for call-site symmetry; router
     construction itself does not depend on it.
     """
