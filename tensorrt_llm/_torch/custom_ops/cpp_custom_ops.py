@@ -1399,6 +1399,7 @@ def _register_fake():
         host_kv_cache_pool_mapping: Optional[torch.Tensor],
         kv_scale_orig_quant: Optional[torch.Tensor],
         kv_scale_quant_orig: Optional[torch.Tensor],
+        kv_cache_scale_orig_quant: Optional[torch.Tensor],
         out_scale: Optional[torch.Tensor],
         block_ids_per_seq: Optional[torch.Tensor],
         helix_tensor_params: List[Optional[torch.Tensor]],
@@ -1407,6 +1408,7 @@ def _register_fake():
         num_heads: int,
         num_kv_heads: int,
         head_size: int,
+        residual_dim: int,
         tokens_per_block: int,
         attention_window_size: int,
         beam_width: int,
@@ -1425,6 +1427,9 @@ def _register_fake():
         kv_only: bool = False,
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
+        # Declared by the schema in dsv3RopeOp.cpp; meta dispatch passes it
+        # positionally, so the fake has to accept it.
+        q_rope_applied: bool = False,
     ) -> None:
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place
