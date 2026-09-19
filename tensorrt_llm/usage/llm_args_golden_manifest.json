@@ -529,6 +529,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_compression_config.keep_rope_precision"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
     },
     {
