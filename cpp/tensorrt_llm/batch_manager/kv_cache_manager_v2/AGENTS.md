@@ -103,17 +103,68 @@ live pages may be moved into the radix tree rather than copied.
 doing so would append the same tokens twice. It also releases stale held SWA
 pages and performs final commit-state bookkeeping.
 
-### Page status
+### Internal sparse residency
 
-- `LOCKED`: required on GPU; neither eviction nor dropping is permitted.
-- `HELD`: eviction is allowed, but dropping is not.
-- `DROPPABLE`: both eviction and dropping are allowed.
+- `AttentionLayerConfig::residencyGroup` separates otherwise-identical attention
+  lifecycles. Independently managed data must use separate layer descriptors with
+  unique layer IDs; buffers within one descriptor still share one page lifecycle.
+- `KvCache::setResidencyWindow()` opts a full-history attention group into mixed
+  residency. Sinks, the local window, and writable pages stay locked; older pages
+  remain held, including uncommitted generated history. Logical stale ranges and
+  prefix retention are unchanged. SWA and SSM retain their existing residency rules.
+- Advancing `historyLength` means the corresponding writes have been submitted on
+  the request stream. Release records completion events before slots can be reused.
+  Commit must preserve any migration completion event attached to a held page.
+- `nullopt` restores full GPU residency. Acquisition failure leaves the previous
+  residency requirements in effect. The Python binding exposes this C++ capability
+  through `_residency_group` and `_set_residency_window`; the reference backend does
+  not implement the opt-in.
+- This primitive does not acquire arbitrary top-K selections. Attention integration
+  must acquire the selected historical data before using it; held pages have invalid
+  GPU page-table entries even when their storage has not yet moved off GPU.
 
-The `PageHolder`, `UniqPageLock`, and `SharedPageLock` types implement these
-transitions. CUDA ready/finish events are part of their correctness contract:
-they establish write completion, migration ordering, and safe reuse across
-streams. A stream change for an active cache intentionally synchronizes the
-new stream with the old one.
+### Retained host copies
+
+- `KvCache::backupToHost()` retains a host-tier slot using the configured cold-page
+  codec. `HostPageCopy` owns that slot; `Page` may alias it as its primary slot.
+  Never release the alias through the ordinary page allocator a second time.
+- `offloadToHost()` requires a held page and enough backed-up tokens. It reuses
+  the retained slot and protects the released GPU source with completion events.
+  Full-page GPU restoration keeps the host copy.
+- Call `invalidateHostCopy()` before writing backed-up, uncommitted GPU data.
+  Open `HostPageRead` handles block invalidation. Closed reads still protect the
+  slot until their CUDA work finishes. Publish only completed host coverage.
+- Host-copy and residency APIs take the manager's exclusive API lock. Host-reader
+  queries take it shared; close takes it exclusively. Bindings release the GIL
+  before taking either lock, including reader destruction from Python cleanup.
+- Retained copies pin host addresses. Pool resize/defrag must reject live pins
+  and wait for retired copies' events. A reader also keeps `KvCacheManager` alive.
+- Active retained pages use explicit offload. Last-request cleanup releases extra
+  copies of cached GPU pages; inactive host pages remain normally evictable.
+- See [host-copy usage and layout](../../../../docs/source/developer-guide/kv-cache-host-copies.md).
+
+### Host-source table
+
+- `KvCacheManager` owns optional fixed mapped metadata. The executor derives capacity
+  from existing IndexMapper, page-table, and beam limits. Bind existing IndexMapper
+  rows explicitly; never add a second row allocator or GPU request-ID lookup.
+- Row-and-generation pairs name a batch's sources. Unbind before early index release;
+  retained pages may outlive that row. Generation changes reject stale reuse.
+- `updateHostSources(cache, ordinal)` updates that page and shared users. Structural
+  changes rebuild only the affected request; append uses only the changed range.
+  Pool changes use the global guard.
+  Extend these hooks for new APIs that change request pages or host copies.
+- Read acquisition polls only pending copies in the requested rows and publishes
+  completed coverage. Manual polling is named `refreshHostSourceTableForTest` and
+  must not appear in production callers. Never wait for pending backups to publish.
+- `HostSourceView` borrows storage; `HostSourceRead` protects batch rows with existing
+  `HostPageRead` handles. Open scopes block changes to those rows, not unrelated rows.
+  Closed scopes' CUDA events protect metadata until completion. Pool changes and
+  shutdown require all readers to close. Acquire and close outside graph capture.
+- Host sources describe whole cold slots using existing pool metadata. Offload uses
+  the existing whole-page codec API and does not require per-buffer offsets.
+  Entry addressing belongs to the future refetch adapter. Model `EntryFormat`
+  contains no lifecycle or pool placement.
 
 ## Ownership and lifetime
 

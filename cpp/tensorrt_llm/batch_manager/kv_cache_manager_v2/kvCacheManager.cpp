@@ -158,6 +158,11 @@ void KvCacheManager::shutdown()
         return;
     }
     _checkNoLivingKvCaches("shutdown()");
+    TLLM_CHECK_WITH_INFO(mStorage->mHostReaders == 0, "Close host readers before storage shutdown");
+    if (mHostSources)
+    {
+        mHostSources->waitForReaders();
+    }
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
 
@@ -171,7 +176,84 @@ void KvCacheManager::shutdown()
         }
     }
 
+    mHostSources.reset();
     mStorage->destroy();
+}
+
+void KvCacheManager::initializeHostSourceTable(int maxRequests, int maxPages, int maxBeams)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (mHostSources)
+    {
+        throw LogicError("Host source table is already reserved; its addresses must stay fixed");
+    }
+    mHostSources = std::make_unique<HostSourceTable>(*mStorage, tokensPerBlock(), maxRequests, maxPages, maxBeams);
+}
+
+HostSourceView KvCacheManager::hostSourceView() const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    if (!mHostSources)
+    {
+        throw LogicError("Initialize the host source table first");
+    }
+    return mHostSources->view();
+}
+
+void KvCacheManager::refreshHostSourceTableForTest()
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (!mHostSources)
+    {
+        throw LogicError("Initialize the host source table first");
+    }
+    mHostSources->refreshForTest();
+}
+
+std::unique_ptr<HostSourceRead> KvCacheManager::acquireHostSources(
+    std::vector<HostSourceRow> const& rows, CUstream stream)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (!mHostSources)
+    {
+        throw LogicError("Initialize the host source table first");
+    }
+    return mHostSources->acquire(shared_from_this(), rows, stream);
+}
+
+int KvCacheManager::hostSourceSlot(KvCache const& cache) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    return mHostSources ? mHostSources->requestSlot(cache) : -1;
+}
+
+void KvCacheManager::bindHostSourceRow(KvCache& cache, int row)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (!mHostSources || &cache.manager() != this)
+        throw LogicError("Initialize this manager's host source table before binding its requests");
+    mHostSources->bindRequest(cache, row);
+}
+
+HostSourceRow KvCacheManager::hostSourceRef(KvCache const& cache) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    return mHostSources ? mHostSources->requestRef(cache) : HostSourceRow{-1, 0};
+}
+
+void KvCacheManager::checkHostSourceCapacity(KvCache const& cache, int capacity) const
+{
+    if (mHostSources && mHostSources->requestSlot(cache) >= 0)
+    {
+        mHostSources->checkCapacity(cache, capacity);
+    }
 }
 
 void KvCacheManager::clearReusableBlocks()
@@ -181,6 +263,18 @@ void KvCacheManager::clearReusableBlocks()
     _checkNoLivingKvCaches("clear_reusable_blocks()");
     TLLM_CHECK_DEBUG(mRadixTree);
     mRadixTree->clear();
+}
+
+void KvCacheManager::setHostSourceRequestId(KvCache& cache, std::optional<RequestIdType> id)
+{
+    if (mHostSources)
+    {
+        mHostSources->setRequestId(cache, id);
+    }
+    else
+    {
+        cache.id = id;
+    }
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
@@ -446,6 +540,7 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    auto const sourceUpdate = updateHostSources();
     // Same precondition as adjust(): _adjustLevel may defragment, invalidating any page index an
     // ACTIVE cache holds.
     for (KvCache* kvc : mLivingKvCaches)
@@ -919,9 +1014,10 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
                     // Mirrors Python assertions for invariant checking.
                     TLLM_CHECK_DEBUG_WITH_INFO(
                         pg->status() == PageStatus::HELD, "Page in suspended KvCache must be HELD");
-                    TLLM_CHECK_DEBUG_WITH_INFO((pg->scheduledForEviction() == (pg->cacheLevel != lastLevel)),
+                    TLLM_CHECK_DEBUG_WITH_INFO(pg->scheduledForEviction() == mStorage->isEvictable(*pg),
                         "Eviction scheduling invariant violated");
-                    if (pg->scheduledForEviction())
+                    // Retained host copies also keep pages out of eviction on warmer levels.
+                    if (pg->cacheLevel != lastLevel)
                     {
                         continue;
                     }
@@ -946,6 +1042,8 @@ void KvCacheManager::registerKvCache(KvCache* kvc)
 void KvCacheManager::unregisterKvCache(KvCache* kvc)
 {
     auto const apiLock = lockExclusive();
+    if (mHostSources)
+        mHostSources->removeRequest(*kvc);
     mLivingKvCaches.erase(kvc);
 }
 
@@ -1041,6 +1139,7 @@ void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    auto const sourceUpdate = updateHostSources();
     for (KvCache* kvc : mLivingKvCaches)
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
             "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "
