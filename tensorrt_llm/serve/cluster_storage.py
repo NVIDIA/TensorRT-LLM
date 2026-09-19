@@ -197,7 +197,7 @@ def jsonify(f):
     async def wrapper(*args, **kwargs):
         result = await f(*args, **kwargs)
         return JSONResponse({"result": result},
-                            status_code=200 if result else 400)
+                            status_code=400 if result is False or result is None else 200)
 
     return wrapper
 
