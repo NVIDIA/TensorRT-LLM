@@ -182,6 +182,10 @@ def _stored_events(events):
     return [event for event in events if event["data"]["type"] == "stored"]
 
 
+def _removed_events(events):
+    return [event for event in events if event["data"]["type"] == "removed"]
+
+
 def _stored_block_hashes(events):
     return [
         block["block_hash"] for event in _stored_events(events) for block in event["data"]["blocks"]
@@ -249,6 +253,86 @@ def test_native_event_manager_queue_and_stored_coalescing():
         "block0",
         "block1",
     ]
+
+
+def test_routing_selection_filters_lifecycles_and_scoped_blocks(real_block_factory):
+    event_manager = NativeKVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+    )
+    event_manager.set_routing_layer_group(0)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    plain = make_block([1, 2, 3, 4], [4, 4])
+    scoped = make_block(
+        [5, 6, 7, 8],
+        [4, 4],
+        reuse_scope=ReuseScope(salt=123),
+    )
+
+    _add_stored_block(event_manager, plain)
+    _add_stored_block(event_manager, scoped)
+    events = _flush_serialized_events(event_manager)
+
+    assert len(_stored_events(events)) == 1
+    assert _stored_events(events)[0]["layer_group_id"] == 0
+    assert len(_stored_events(events)[0]["data"]["blocks"]) == 1
+
+    event_manager.add_removed_event(_block_key(plain))
+    removed_events = _flush_serialized_events(event_manager)
+
+    assert len(_removed_events(removed_events)) == 1
+    assert _removed_events(removed_events)[0]["layer_group_id"] == 0
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="compares native and Python event managers")
+def test_routing_stored_payload_is_bounded_consistently():
+    for manager_type, block_type, token_type in (
+        (KVCacheEventManager, KVCacheStoredBlockData, UniqueToken),
+        (NativeKVCacheEventManager, NativeKVCacheStoredBlockData, NativeUniqueToken),
+    ):
+        manager = manager_type(max_kv_event_entries=4096, hash_algo=KV_CACHE_HASH_ALGO_V1)
+        manager.set_routing_layer_group(0)
+        blocks = [block_type(index, [token_type(index)], 0, 35) for index in range(300)]
+
+        manager.add_stored_event(None, blocks, 0)
+        manager.flush_iteration_events()
+        events = manager.get_latest_events(0)
+
+        assert len(events) == 1
+        assert len(events[0].data.blocks) == 256
+        assert manager.dropped_event_count == 44
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ event manager")
+def test_native_event_manager_close_wakes_blocked_reader():
+    """A publisher reader must not hang engine shutdown while the queue is empty."""
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=1)
+    result = None
+
+    def read_events():
+        nonlocal result
+        result = event_manager.get_latest_events()
+
+    reader = threading.Thread(target=read_events)
+    reader.start()
+    event_manager.close()
+    reader.join(timeout=1)
+
+    assert not reader.is_alive()
+    assert result == []
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ event manager")
+def test_native_event_manager_reports_bounded_queue_overflow():
+    """A direct publisher must be able to distinguish overflow from an empty queue."""
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=1)
+    event_manager.add_created_event([1])
+    event_manager.add_created_event([2])
+    event_manager.flush_iteration_events()
+
+    assert event_manager.dropped_event_count == 1
+    assert event_manager.queue_high_watermark == 1
 
 
 def test_native_event_manager_v1_hash_matches_legacy_cpp_hasher():

@@ -35,6 +35,10 @@ server_pb2 = pytest.importorskip(
     "openengine.v1.server_pb2",
     reason='OpenEngine bindings not installed (pip install "tensorrt_llm[openengine]")',
 )
+kv_pb2 = pytest.importorskip(
+    "openengine.v1.kv_pb2",
+    reason='OpenEngine bindings not installed (pip install "tensorrt_llm[openengine]")',
+)
 
 import grpc  # noqa: E402
 
@@ -93,8 +97,47 @@ def test_openengine_server_serves_the_control_contract() -> None:
             control = openengine_pb2_grpc.ControlStub(channel)
             info = await control.GetServerInfo(server_pb2.GetServerInfoRequest(), timeout=5)
             assert info.engine_name == "tensorrt_llm"
+            sources = await control.GetKvEventSources(kv_pb2.GetKvEventSourcesRequest(), timeout=5)
+            assert list(sources.sources) == []
+            with pytest.raises(grpc.aio.AioRpcError) as error:
+                async for _ in control.SubscribeKvEvents(
+                    kv_pb2.SubscribeKvEventsRequest(), timeout=5
+                ):
+                    pass
+            assert error.value.code() == grpc.StatusCode.FAILED_PRECONDITION
         finally:
             await channel.close()
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+@pytest.mark.parametrize("publisher_enabled", [False, True])
+def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> None:
+    """Configured events must not advertise a source absent from the loaded engine."""
+    from tensorrt_llm.grpc.openengine.kv_events import KvEventsUnavailableError
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(
+            guided_decoding_backend=None,
+            kv_cache_config=SimpleNamespace(
+                kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq")
+            ),
+        ),
+        _executor=SimpleNamespace(
+            get_kv_cache_capacity=lambda: {"kvEventsEnabled": True} if publisher_enabled else {}
+        ),
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer(host="127.0.0.1", port=0, llm=llm, model="test-model")
+        try:
+            if publisher_enabled:
+                await server.start()
+            else:
+                with pytest.raises(KvEventsUnavailableError, match="no streaming publisher"):
+                    await server.start()
+        finally:
             await server.stop(grace=0)
 
     asyncio.run(exercise_server())

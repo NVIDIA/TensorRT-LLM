@@ -36,11 +36,16 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _first_new_block_key,
 )
+from tensorrt_llm.runtime.kv_cache_hash import get_cache_salt_id
 from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
 
 pytestmark = pytest.mark.cpu_only
 
 TOKENS_PER_BLOCK = 4
+
+
+def test_reuse_salt_uses_router_hash_contract() -> None:
+    assert KVCacheManagerV2._derive_reuse_salt("tenant-a") == get_cache_salt_id("tenant-a")
 
 
 def make_stub_manager(

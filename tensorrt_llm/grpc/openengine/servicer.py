@@ -13,11 +13,16 @@ from openengine.v1 import error_pb2, generation_pb2, openengine_pb2_grpc
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
-from .request_mapping import _input_from_request, _trace_headers, sampling_params_from_request
+from .request_mapping import (
+    _input_from_request,
+    _metadata_from_context,
+    sampling_params_from_request,
+)
 from .streaming import (
     RESPONSE_STALL_TIMEOUT_SECONDS,
     ActiveRequest,
@@ -121,7 +126,30 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
 
             inputs = _input_from_request(request)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
-            trace_headers = _trace_headers(context)
+            trace_headers, target_dp_rank = _metadata_from_context(context)
+            if target_dp_rank is not None:
+                if sampling_params.n > 1:
+                    raise ValueError(
+                        "openengine-target-dp-rank does not support multiple output sequences"
+                    )
+                args = getattr(self._llm, "args", None)
+                dp_size = (
+                    max(1, int(getattr(args, "tensor_parallel_size", 1) or 1))
+                    if getattr(args, "enable_attention_dp", False)
+                    else 1
+                )
+                if target_dp_rank >= dp_size:
+                    raise ValueError(
+                        f"openengine-target-dp-rank must be in [0, {dp_size}), got {target_dp_rank}"
+                    )
+            scheduling_params = (
+                SchedulingParams(
+                    attention_dp_rank=target_dp_rank,
+                    attention_dp_relax=False,
+                )
+                if target_dp_rank is not None
+                else None
+            )
             cache_salt = (
                 request.kv.cache_salt
                 if request.HasField("kv") and request.kv.HasField("cache_salt")
@@ -154,6 +182,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 sampling_params=sampling_params,
                 streaming=True,
                 trace_headers=trace_headers,
+                scheduling_params=scheduling_params,
                 cache_salt=cache_salt,
                 priority=DEFAULT_REQUEST_PRIORITY,
                 disaggregated_params=disaggregated_params,

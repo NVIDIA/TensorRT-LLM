@@ -59,6 +59,18 @@ TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
 
 
+def test_python_backend_primary_block_counts(monkeypatch):
+    """Python KVCM2 must sample all groups without a C++-only method."""
+    monkeypatch.setattr(kv_cache_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "python")
+    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.impl = object()
+    manager._get_storage_statistics = lambda level: [
+        SimpleNamespace(total=10, available=3),
+        SimpleNamespace(total=20, available=5),
+    ]
+    assert manager.get_primary_block_counts() == (22, 30)
+
+
 class _CacheTierInitError(Exception):
     pass
 
@@ -92,6 +104,31 @@ class _FakeKVCache:
 
     def stop_committing(self) -> None:
         self.stopped_committing = True
+
+
+def test_event_window_discovery_uses_backend_neutral_introspection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = SimpleNamespace(layer_grouping=[[0], [1], [2]])
+    manager.max_seq_len = 128
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=[
+            SimpleNamespace(sliding_window_size=None),
+            SimpleNamespace(sliding_window_size=32),
+            SimpleNamespace(sliding_window_size=64),
+        ]
+    )
+    monkeypatch.setattr(
+        kv_cache_v2_module._introspection,
+        "attention_life_cycle_ids",
+        lambda impl: [0, 2],
+    )
+
+    assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {
+        0: 128,
+        2: 64,
+    }
 
 
 def _make_cache_config_for_test(

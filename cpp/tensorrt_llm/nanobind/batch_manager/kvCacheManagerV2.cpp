@@ -1069,6 +1069,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_group_ids") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("set_layer_group_window_sizes", &kv::EventManager::setLayerGroupWindowSizes, nb::arg("window_sizes"),
             nb::call_guard<nb::gil_scoped_release>())
+        .def("set_routing_layer_group", &kv::EventManager::setRoutingLayerGroup, nb::arg("layer_group_id"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "add_stored_event",
             [](kv::EventManager& self, nb::object parentHash, nb::object blocks, kv::EventLayerGroupId layerGroupId)
@@ -1154,7 +1156,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "flush_iteration_events", &kv::EventManager::flushIterationEvents, nb::call_guard<nb::gil_scoped_release>())
         .def("get_latest_events", &kv::EventManager::getLatestEvents, nb::arg("timeout_ms") = std::nullopt,
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("max_events") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
+        .def("discard_events", &kv::EventManager::discardEvents, nb::call_guard<nb::gil_scoped_release>())
+        .def("close", &kv::EventManager::close, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "dropped_event_count", &kv::EventManager::getDroppedEventCount, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "queue_high_watermark", &kv::EventManager::getQueueHighWatermark, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("closed_and_empty", &kv::EventManager::isClosedAndEmpty, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("hash_algo", &kv::EventManager::hashAlgorithm)
         .def_prop_ro("_hash_algo", &kv::EventManager::hashAlgorithm)
         .def_static("_hash_block_key", &kv::EventManager::hashV1BlockKey, nb::arg("tokens"), nb::arg("parent_hash") = 0,
@@ -2299,6 +2308,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_block_counts",
+            [](kv::KvCacheManager const& self, int cacheLevel)
+            { return self.getBlockCounts(kv::CacheLevel{cacheLevel}); },
+            nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
             [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)

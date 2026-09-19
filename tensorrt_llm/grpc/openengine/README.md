@@ -25,52 +25,51 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
+## Independent KV telemetry
+
+The OpenEngine server is the configuration authority. Clients discover event sources through `GetKvEventSources` and KV occupancy through optional `GetLoad` fields. The published OpenEngine protocol and Python bindings are unchanged; the server exposes engine telemetry, not router-specific policy.
+
+- Enable routing-load sampling with `--openengine-enable-load-metrics`. This option requires `--grpc --grpc-protocol openengine` and does not enable iteration statistics.
+- Enable KV events independently with `kv_cache_config.kv_events_config.enable_kv_cache_events: true`, a reachable ZMQ endpoint, and `kv_cache_event_hash_algo: v1_block_key` for Dynamo-compatible hashes.
+- Either, both, or neither may be enabled. DP-rank targeting remains independently available. Full Dynamo KV-aware routing uses both, with the frontend in `--router-mode kv`.
+- Native HTTP serving does not enable this load sampler. Its existing KV-event configuration and publisher behavior are unchanged.
+
+An empty event-source list means no external publisher is configured. Absent KV occupancy fields mean load sampling is disabled; enabled-but-unavailable load returns `UNAVAILABLE` instead of pretending to be disabled. Older servers may return `UNIMPLEMENTED`; clients can fall back to generation-only operation.
+
+Existing `ServerInfo.extra` carries optional engine metadata: `trtllm_supports_dp_rank_targeting` and, when streaming events are configured, `kv_event_heartbeat_interval_ms`. These are TensorRT-LLM extensions, not portable OpenEngine capabilities. Missing metadata disables the corresponding client optimization. Strict rank validation remains on the server, and clients without heartbeat metadata must not infer event-source failure merely from idle silence.
+
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health`, `Abort` and the KV-event RPCs; its LoRA lifecycle RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. `openengine-target-dp-rank` is accepted and mapped to strict attention-DP scheduling. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health`, `Abort` and the KV-event RPCs; its LoRA lifecycle RPCs return `UNIMPLEMENTED`.
 
 ### KV cache events
 
-`Control.GetKvEventSources` and `Control.SubscribeKvEvents` expose TensorRT-LLM's
-streaming KV cache event publisher, which is off until
-`kv_cache_config.kv_events_config` enables it:
+`Control.GetKvEventSources` and `Control.SubscribeKvEvents` expose the native KV cache manager's direct per-rank publishers. Configure direct publishing and Dynamo-compatible block hashes as follows:
 
 ```yaml
 kv_cache_config:
+  use_kv_cache_manager_v2: true
   enable_block_reuse: true
+  kv_cache_event_hash_algo: v1_block_key
   kv_events_config:
     enable_kv_cache_events: true
-    endpoint: "tcp://*:5557"
-    replay_endpoint: "tcp://*:5657"
+    endpoint: tcp://*:5557
+    replay_endpoint: tcp://*:5657
 ```
 
-Events are produced inside the engine: every attention-DP rank binds its own
-ZeroMQ `PUB` socket at `base_port + rank` and publishes msgpack batches from a
-background thread. `GetKvEventSources` advertises those sockets -- resolving the
-bind wildcard to a routable host, because a client cannot connect to one -- so a
-router subscribes to the engine directly and events never touch this server's
-event loop. `SubscribeKvEvents` is for clients that cannot reach the ZeroMQ
-ports: it subscribes on the client's behalf and re-publishes each batch as
-protobuf, at the cost of a decode and re-encode per batch in this process.
+Each KVCM2 rank writes routing events for one attention lifecycle to its own bounded native queue. A worker-local background publisher blocks on that queue, serializes each batch once as msgpack, and publishes it over ZMQ. `GetKvEventSources` advertises the connectable endpoint, topic, replay endpoint, buffer size, queue size, and HWM for every attention-DP rank. The direct data path does not use an attention-DP gather, frontend worker RPC, JSON, protobuf conversion, or polling.
 
-Both return nothing rather than an error when publishing is disabled, so a
-client can tell "not configured" from "not supported". Two configurations are
-rejected with `FAILED_PRECONDITION` instead of being advertised unusably:
-`ipc://` and `inproc://` endpoints, which have no host and port for the protocol
-to carry, and attention DP spanning more than one node, where ranks bind on
-hosts this process cannot name.
+Direct OpenEngine discovery currently supports a single host. It returns `FAILED_PRECONDITION` for multi-host attention-DP because one OpenEngine listener cannot infer a connectable host for each remote publisher.
 
-Delivery is best effort in both modes. Every batch carries a sequence number, so
-a batch dropped by a full queue leaves an observable gap; a subscriber must treat
-any gap as lost KV-cache state and resynchronize. When a replay endpoint is
-configured, `SubscribeKvEventsRequest.start_sequence_number` and
-`include_snapshot` replay the retained batches first.
+`SubscribeKvEvents` is a demand-driven compatibility bridge for clients that cannot reach the worker-local ZMQ ports. It subscribes to the same normalized msgpack stream and converts batches to protobuf only while the RPC is active. It does not drain `LLM.get_kv_events()`, so it cannot race the public buffered event API.
 
-The ZeroMQ listeners are a second unauthenticated, unencrypted surface alongside
-the gRPC one -- see [Transport security](#transport-security) -- so the same
-colocation rule applies to them.
+Discovery returns no sources when direct publishing is disabled. Non-TCP endpoints and multi-host attention-DP return `FAILED_PRECONDITION` rather than advertising unreachable sources. OpenEngine checks the loaded executor's publisher capability before starting the listener and rejects enabled events without a publisher. Native HTTP retains its warning-only behavior for event configuration on V1. Discovery describes the startup-validated configuration; clients must still treat connection failures after startup as source failures because a publisher can fail after it has been advertised.
+
+Internally detected publisher queue loss, native queue loss, and translation failures schedule a rank-local `AllBlocksCleared` batch, including at an idle tail. Pre-loss queued batches are discarded before that recovery fence. ZeroMQ can independently drop a PUB message for a slow subscriber at its HWM; the publisher cannot observe that per-subscriber loss, so a direct subscriber detects it from a later sequence gap and an idle-tail drop has no immediate recovery signal. Native reads are chunked, and encoded publisher/replay retention has a 64 MiB byte cap in addition to its configured count cap. Sequence replay remains bounded by `buffer_steps`; a replay that starts after the requested sequence still requires the client to resynchronize. Sequence numbers start from a wall-clock epoch so resume cursors remain ordered across publisher restarts. Direct replay clients must use a receive deadline because a disconnected or persistently unwritable client cannot be guaranteed the terminal sentinel. The in-tree bridge uses a two-second deadline. A slow protobuf subscriber receives a retryable terminal stream error instead of silently losing a state-changing batch.
+
+Cold-tier, salted, LoRA-scoped, and multimodal blocks are omitted because Dynamo routing currently targets directly reusable GPU KV and the wire contract cannot faithfully carry the scoped cache namespace. LoRA, multimodal generation, and authoritative snapshots remain outside this initial routing contract.
 
 ### Disaggregated serving
 

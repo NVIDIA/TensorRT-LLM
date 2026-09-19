@@ -235,15 +235,18 @@ or over the `/kv_cache_events` endpoint of `trtllm-serve`.
 
 #### Streaming path (prototype)
 
-Configured with ```kv_cache_config.kv_events_config```. Each rank encodes its own events and
-publishes them directly over a ZeroMQ `PUB` socket from a background thread, so there is no
-rank-0 gather and no per-iteration pull.
+Configured with ```kv_cache_config.kv_events_config```. With the default C++ KV cache manager,
+each rank writes to a bounded native event queue. A worker-local background thread blocks on
+that queue, encodes each batch once, and publishes it over a ZeroMQ `PUB` socket, so there is no
+rank-0 gather, frontend worker RPC, JSON conversion, or per-iteration pull.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
 
 kv_cache_config = KvCacheConfig(
+    use_kv_cache_manager_v2=True,
     enable_block_reuse=True,
+    kv_cache_event_hash_algo="v1_block_key",
     kv_events_config=KVEventsConfig(
         enable_kv_cache_events=True,
         endpoint="tcp://*:5557",
@@ -252,43 +255,57 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
-**Constraints.** The streaming path requires KV cache manager V2 running on its Python
-backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
-consume the Python event sink and raises an error naming this variable. Pipeline
-parallelism and context parallelism are rejected. Events are not published for draft
-models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
-returns an empty list rather than raising.
+**Constraints.** The streaming path uses the canonical KV cache manager V2 event manager
+with both the default C++ backend and the deprecated Python fallback. Pipeline parallelism
+and context parallelism are rejected. Dynamo publishing requires
+```kv_cache_event_hash_algo="v1_block_key"```. Events are not published for draft models or
+during KV-cache-size estimation. When streaming is enabled the buffered pull API returns an
+empty list rather than competing with the direct publisher for the native event queue. The
+Dynamo routing stream includes only directly reusable GPU-resident text blocks; cold-tier,
+salted, LoRA-scoped, and multimodal blocks are suppressed at the producer.
 
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
-**global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
-each rank's port is distinct — on a multi-node deployment, rank 8 binds `base_port + 8`
-whichever node it runs on. Co-located engines — for example disaggregated prefill and
-decode on one host — must use base ports at least `N` apart.
+attention-DP rank, so `N` ranks occupy `[base_port, base_port + N - 1]`. Co-located engines
+— for example disaggregated prefill and decode on one host — must use non-overlapping port
+ranges. OpenEngine discovery currently requires TCP sources whose advertised hosts are
+reachable from the Dynamo sidecar, and supports a single host. Multi-host attention-DP
+discovery is rejected instead of advertising remote publishers on the frontend host.
 
-```replay_endpoint``` follows the same convention. Because only ranks co-located on one
-host actually contend for a port, and a host holds a contiguous run of ranks, its base
-port must be at least *ranks-per-host* away from ```endpoint```'s rather than `N` away.
+```replay_endpoint``` follows the same convention. Its base port must be far enough from
+```endpoint``` to keep every co-located rank's publish and replay sockets disjoint.
 Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints, which
-have no port, each rank appends a `_dp<rank>` suffix instead.
+have no port, each rank appends a `_dp<rank>` suffix instead; those transports are not
+advertised through OpenEngine because its sidecar source contract requires a host and port.
 
 **Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
 an 8-byte big-endian sequence number, and a msgpack payload
 `[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
-`BlockStored`, `BlockRemoved` or `AllBlocksCleared` — carrying int64 block hashes derived
-from the V2 radix block keys. This is the format documented for custom router backends; it
+`BlockStored`, `BlockRemoved` or `AllBlocksCleared` — carrying canonical signed int64
+`v1_block_key` hashes. This is the format documented for custom router backends; it
 differs from vLLM's positional-array encoding of the individual events, though the batch
 envelope is positional in both.
 
-**Delivery guarantees.** Delivery is best effort, but loss is observable. Every accepted
-batch reserves a sequence number up front, so a batch dropped by a full publisher queue
-(```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
-treat any gap as lost KV-cache state and resynchronize rather than assuming continuity.
+**Delivery guarantees.** Delivery is best effort. An internally detected native queue
+overflow, malformed batch, full publisher queue (```max_queue_size```), or failed send
+schedules an explicit `AllBlocksCleared` recovery batch, including when no later inference
+event arrives. ZeroMQ can independently drop a PUB message for a slow subscriber at its
+HWM; the publisher cannot observe that per-subscriber loss, so a direct subscriber detects
+it from a later sequence gap and an idle-tail drop has no immediate recovery signal. Replay
+eviction can also start above the requested sequence, which the subscriber must treat as
+lost state and resynchronize. Internally detected loss advances a publisher epoch: queued
+events from the old epoch are discarded before the clear, so pre-loss stores cannot rebuild
+stale state after the recovery fence. The native queue is bounded by routing entries, native
+reads are chunked, and encoded publish and replay retention are each capped at 64 MiB in
+addition to their configured count limits.
 
 **Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
 subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and
 receives each retained batch as `[delimiter, topic, seq, payload]`, terminated by a sentinel
 with an empty payload. Only the last ```buffer_steps``` batches are retained, so a replay
-can legitimately start above the requested sequence — that too is a gap.
+can legitimately start above the requested sequence — that too is a gap. Direct replay
+clients must enforce a receive deadline: a disconnected or persistently unwritable client
+cannot be guaranteed a terminal sentinel. Publisher sequence numbers use a wall-clock epoch
+so a restarted publisher advances beyond resume cursors from the previous process.
 
 ### Deprecated Properties
 

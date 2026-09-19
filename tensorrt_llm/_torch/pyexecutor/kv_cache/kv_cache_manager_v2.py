@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import hashlib
 import math
 import os
 import sys
@@ -46,7 +45,10 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
+from tensorrt_llm.runtime.kv_cache_hash import (
+    get_cache_salt_id,
+    get_effective_kv_cache_event_hash_algo,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     BAD_PAGE_INDEX,
@@ -68,7 +70,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
-    LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
@@ -91,7 +92,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
-from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
+from ..kv_cache_events import validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -100,6 +101,7 @@ from ..kv_cache_stats import (
     KVCacheV2SsmSnapshotIterationStats,
 )
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..native_kv_cache_events import NATIVE_EVENT_QUEUE_CAPACITY, NativeKVCacheEventPublisher
 from ..resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
@@ -1110,7 +1112,10 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len if window_size is None else int(window_size)
             for window_size in self.max_attention_window_vec
         )
-        self.event_manager: Optional[KVCacheEventManager | StreamingKVCacheEventManager] = None
+        self.event_manager: Optional[KVCacheEventManager] = None
+        self.event_publisher: Optional[NativeKVCacheEventPublisher] = None
+        native_streaming_config: Optional[KVEventsConfig] = None
+        streaming_event_rank = 0
         streaming_events_enabled = (
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
@@ -1123,8 +1128,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     "will return no events."
                 )
             assert kv_events_config is not None
-            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
-            # publish/replay port ranges, all before any socket is bound.
+            if kv_cache_event_hash_algo != "v1_block_key":
+                raise ValueError(
+                    "Streaming KV events for Dynamo require "
+                    "kv_cache_config.kv_cache_event_hash_algo='v1_block_key'"
+                )
+            # Reject unsupported parallelism and colliding publish/replay port
+            # ranges before any socket is bound.
             validate_streaming_support(
                 kv_events_config,
                 pp_size=mapping.pp_size,
@@ -1137,13 +1147,16 @@ class KVCacheManagerV2(BaseResourceManager):
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 # Constructing it is side-effect free; start() below binds the socket
                 # and starts the publisher thread once every other check has passed.
-                event_rank = mapping.rank if mapping.enable_attention_dp else 0
-                self.event_manager = StreamingKVCacheEventManager(
-                    kv_events_config,
-                    data_parallel_rank=event_rank,
-                    block_size=self.tokens_per_block,
-                    max_window_size=event_window_size,
+                streaming_event_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
+                self.event_manager = KVCacheEventManager(
+                    NATIVE_EVENT_QUEUE_CAPACITY,
+                    window_size=event_window_size,
+                    attention_dp_rank=(
+                        streaming_event_rank if mapping.enable_attention_dp else None
+                    ),
+                    hash_algo=kv_cache_event_hash_algo,
                 )
+                native_streaming_config = kv_events_config
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
@@ -1419,15 +1432,33 @@ class KVCacheManagerV2(BaseResourceManager):
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
-            self.event_manager.set_layer_group_window_sizes(
-                self._get_event_window_sizes_by_layer_group(
-                    attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
-                )
+            window_sizes_by_layer_group = self._get_event_window_sizes_by_layer_group(
+                attention_only=streaming_events_enabled
             )
+            if streaming_events_enabled and not window_sizes_by_layer_group:
+                raise ValueError("Streaming KV events require an attention KV cache lifecycle")
+            self.event_manager.set_layer_group_window_sizes(window_sizes_by_layer_group)
+            if streaming_events_enabled:
+                routing_window_size = max(window_sizes_by_layer_group.values())
+                target_layer_group_id = min(
+                    layer_group_id
+                    for layer_group_id, window_size in window_sizes_by_layer_group.items()
+                    if window_size == routing_window_size
+                )
+                self.event_manager.set_routing_layer_group(target_layer_group_id)
             self.event_manager.add_created_event(
                 self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
             )
+            if native_streaming_config is not None:
+                self.event_publisher = NativeKVCacheEventPublisher(
+                    native_streaming_config,
+                    self.event_manager,
+                    data_parallel_rank=streaming_event_rank,
+                    block_size=self.tokens_per_block,
+                    max_window_size=routing_window_size,
+                    window_sizes_by_layer_group=window_sizes_by_layer_group,
+                )
 
         # Both backends build layer_grouping on demand, and the layer order
         # within a group is not part of its contract. Cache a stable physical-
@@ -1537,9 +1568,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # above has passed. Constructing the manager is side-effect free, so a failure
         # anywhere earlier -- including the rank-coordinated aborts, where this rank
         # raises because a peer failed -- leaves nothing bound to clean up.
-        if isinstance(self.event_manager, StreamingKVCacheEventManager):
-            self.event_manager.start()
-            logger.info("Streaming KV event fast path reuses V2 radix block hashes")
+        if self.event_publisher is not None:
+            self.event_publisher.start()
+            logger.info("Streaming KV events use the native V2 event queue")
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.
@@ -1906,11 +1937,15 @@ class KVCacheManagerV2(BaseResourceManager):
             return self.max_seq_len if window_size is None else int(window_size)
 
         window_sizes: Dict[int, int] = {}
+        attention_life_cycle_ids = (
+            set(_introspection.attention_life_cycle_ids(self.impl)) if attention_only else None
+        )
         for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
-            if attention_only:
-                life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
-                if not isinstance(life_cycle, AttnLifeCycle):
-                    continue
+            if (
+                attention_life_cycle_ids is not None
+                and layer_group_id not in attention_life_cycle_ids
+            ):
+                continue
             window_sizes[int(layer_group_id)] = get_event_window_size(int(layer_ids[0]))
         return window_sizes
 
@@ -3672,6 +3707,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache_stats
 
+    def get_primary_block_counts(self) -> tuple[int, int]:
+        """Return used and total GPU slots for scheduler-owned load sampling."""
+        if KV_CACHE_MANAGER_V2_BACKEND == "python":
+            stats = self._get_storage_statistics(GPU_LEVEL)
+            return (
+                sum(stat.total - stat.available for stat in stats),
+                sum(stat.total for stat in stats),
+            )
+        used, total = self.impl.get_block_counts(GPU_LEVEL)
+        return int(used), int(total)
+
     def flush_iteration_events(self):
         event_manager = self.event_manager
         if event_manager is not None:
@@ -3683,13 +3729,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # degrades cleanly instead of raising. Snapshot event_manager once so a
         # concurrent shutdown cannot turn it into None between the check and use.
         event_manager = self.event_manager
-        if event_manager is None:
+        if event_manager is None or self.event_publisher is not None:
             return []
         return event_manager.get_latest_events(timeout_ms)
 
     @property
     def streaming_kv_events_enabled(self) -> bool:
-        return isinstance(self.event_manager, StreamingKVCacheEventManager)
+        return self.event_publisher is not None
 
     def get_iteration_stats(self):
         if not self.enable_stats:
@@ -4284,8 +4330,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # reference) are still flushed before the publisher stops. Do not null
         # event_manager: get_latest_events/flush snapshot it and operate safely
         # on a closed manager, so there is no teardown-time None race.
-        if isinstance(self.event_manager, StreamingKVCacheEventManager):
-            self.event_manager.shutdown()
+        if self.event_publisher is not None:
+            self.event_publisher.shutdown()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
@@ -4527,8 +4573,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if cache_salt is None:
             return None
-        digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], "little")
+        return get_cache_salt_id(cache_salt)
 
     def _create_kv_cache(
         self,

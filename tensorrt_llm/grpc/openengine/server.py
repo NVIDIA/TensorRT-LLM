@@ -17,6 +17,7 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
 
 from .control import OpenEngineControlServicer
+from .kv_events import KvEventsUnavailableError, events_config
 from .servicer import OpenEngineInferenceServicer
 
 __all__ = ["OpenEngineServer", "launch_server"]
@@ -85,6 +86,7 @@ class OpenEngineServer:
     def __init__(self, host: str, port: int, llm: Any, model: str) -> None:
         self.host = host
         self.port = port
+        self._llm = llm
         self._server = grpc.aio.server(options=_SERVER_OPTIONS)
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(llm, model, kv_transfer_backend=kv_transfer_backend)
@@ -116,6 +118,13 @@ class OpenEngineServer:
 
     async def start(self) -> None:
         """Start accepting OpenEngine requests."""
+        if events_config(self._llm) is not None:
+            capacity = await asyncio.to_thread(self._llm._executor.get_kv_cache_capacity)
+            if not capacity.get("kvEventsEnabled", False):
+                raise KvEventsUnavailableError(
+                    "KV events are configured but the loaded engine has no streaming publisher; "
+                    "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
+                )
         await self._server.start()
         address = _format_bind_address(self.host, self.port)
         logger.info(f"OpenEngine server started on {address}")
@@ -139,6 +148,7 @@ def launch_server(
     port: int,
     llm_args: dict[str, Any],
     served_model_name: str | None = None,
+    enable_load_metrics: bool = False,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -147,6 +157,7 @@ def launch_server(
         port: Port on which the server listens.
         llm_args: Arguments for LLM initialization.
         served_model_name: Model name accepted by Generate. Defaults to the model path.
+        enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
     """
 
     async def serve() -> None:
@@ -184,6 +195,7 @@ def launch_server(
             loop.add_signal_handler(sig, signal_handler)
 
         try:
+            llm_args["_enable_routing_load"] = enable_load_metrics
             llm = PyTorchLLM(**llm_args)
             logger.info("Model loaded successfully")
             server = OpenEngineServer(host=host, port=port, llm=llm, model=model)

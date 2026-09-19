@@ -331,6 +331,19 @@ class TestDefaultADPRouter:
         assert states[1] == rank1
         dist.tp_allgather.assert_called_once_with(expected_local.serialize())
 
+    def test_kv_load_payload_only_changes_wire_shape_when_enabled(self):
+        payload = RankIterStatsPayload(
+            kv_used_blocks=4,
+            kv_total_blocks=10,
+            kv_load_timestamp_ns=123,
+        )
+        state = RankState(rank=0, iter_stats=payload)
+
+        assert len(state.serialize()) == 12
+        enabled = state.serialize(include_kv_cache_load=True)
+        assert len(enabled) == 15
+        assert RankState.deserialize(enabled).iter_stats.kv_used_blocks == 4
+
 
 def test_schedule_attention_dp_requests_scheduled_requests(
     attention_dp_config, all_ranks_num_active_requests, all_ranks_num_active_tokens

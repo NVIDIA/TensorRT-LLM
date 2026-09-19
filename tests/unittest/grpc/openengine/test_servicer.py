@@ -748,23 +748,15 @@ def test_generate_does_not_abort_slow_engine(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.parametrize(
-    ("key", "value"),
+    "value",
     [
-        ("openengine-priority", "7"),
-        ("openengine-priority", "not-an-integer"),
-        ("openengine-target-dp-rank", "0"),
-        ("openengine-target-dp-rank", "-1"),
+        "7",
+        "not-an-integer",
     ],
 )
-def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> None:
-    """Unsupported OpenEngine metadata returns UNIMPLEMENTED, whatever the value.
-
-    Control advertises both headers as unsupported and Generate never reads the
-    value, so the status must tell the client to stop sending the header rather
-    than to correct it.
-    """
+def test_generate_rejects_unsupported_priority_metadata(value: str) -> None:
     servicer = OpenEngineInferenceServicer(_FakeLlm([]), model="test-model")
-    context = FakeServicerContext(metadata=((key, value),))
+    context = FakeServicerContext(metadata=(("openengine-priority", value),))
     request = generation_pb2.GenerateRequest(
         request_id="request-6",
         model="test-model",
@@ -779,6 +771,76 @@ def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> 
         asyncio.run(collect_responses())
 
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+
+
+def test_generate_maps_target_dp_rank_to_strict_scheduling() -> None:
+    """A Dynamo route must not be relaxed onto a rank that lacks the selected prefix."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "2"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-dp-rank",
+        model="test-model",
+        prompt="hello",
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(collect_responses())
+
+    scheduling_params = llm.generate_kwargs["scheduling_params"]
+    assert scheduling_params.attention_dp_rank == 2
+    assert scheduling_params.attention_dp_relax is False
+
+
+def test_generate_rejects_target_dp_rank_with_multiple_sequences() -> None:
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "2"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-multi-dp-rank",
+        model="test-model",
+        prompt="hello",
+        sampling=generation_pb2.SamplingParams(num_sequences=2),
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError):
+        asyncio.run(collect_responses())
+
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("value", ["-1", "4", "not-an-integer"])
+def test_generate_rejects_invalid_target_dp_rank(value: str) -> None:
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", value),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-invalid-dp-rank",
+        model="test-model",
+        prompt="hello",
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError):
+        asyncio.run(collect_responses())
+
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
 
 
 def test_generate_context_only_ends_at_prefill_ready() -> None:

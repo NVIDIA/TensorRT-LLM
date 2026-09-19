@@ -63,6 +63,7 @@ def _llm(**overrides):
         max_beam_width=1,
         reasoning_parser=None,
         kv_cache_config=SimpleNamespace(tokens_per_block=32),
+        _enable_routing_load=overrides.get("_enable_routing_load", "_kv_load" in overrides),
     )
     for key, value in overrides.items():
         if key.startswith("_"):
@@ -73,6 +74,8 @@ def _llm(**overrides):
     executor = SimpleNamespace(
         is_shutdown=lambda: shutdown,
         check_health=lambda: not (shutdown or unhealthy),
+        get_kv_cache_capacity=lambda: overrides.get("_kv_capacity", {}),
+        get_kv_cache_load=lambda: overrides.get("_kv_load", {}),
     )
     return SimpleNamespace(
         args=args,
@@ -95,7 +98,9 @@ def _servicer(inference=None, kv_transfer_backend="NIXL", bind_host="127.0.0.1",
 
 @pytest.mark.asyncio
 async def test_server_info_reports_identity_parallelism_and_capacity():
-    info = await _servicer().GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
+    info = await _servicer(_kv_capacity={"maxNumBlocks": 100}).GetServerInfo(
+        server_pb2.GetServerInfoRequest(), FakeServicerContext()
+    )
 
     assert info.engine_name == "tensorrt_llm"
     assert info.instance_id == "instance-1"
@@ -105,6 +110,7 @@ async def test_server_info_reports_identity_parallelism_and_capacity():
     assert info.capacity.max_running_requests == 16
     assert info.capacity.max_batched_tokens == 8192
     assert info.capacity.kv_block_size == 32
+    assert info.capacity.total_kv_blocks == 100
     assert info.kv_connector.enabled is True
     assert info.kv_connector.transfer_backend == "NIXL"
     # Abort(kv_session) is UNIMPLEMENTED, so cleanup must not be advertised: a
@@ -185,6 +191,36 @@ async def test_get_load_counts_in_flight_requests():
     assert load.running_requests == 2
     assert load.instance_id == "instance-1"
     assert load.timestamp_unix_nanos > 0
+
+
+@pytest.mark.asyncio
+async def test_get_load_reports_kv_snapshot_and_honors_per_rank_opt_in():
+    snapshot = {
+        "timestampUnixNanos": 123,
+        "usedKvBlocks": 7,
+        "totalKvBlocks": 20,
+        "ranks": [
+            {
+                "rank": 0,
+                "runningRequests": 2,
+                "usedKvBlocks": 7,
+                "totalKvBlocks": 20,
+            }
+        ],
+    }
+    servicer = _servicer(_kv_load=snapshot)
+
+    aggregate = await servicer.GetLoad(server_pb2.GetLoadRequest(), FakeServicerContext())
+    per_rank = await servicer.GetLoad(
+        server_pb2.GetLoadRequest(include_per_rank=True), FakeServicerContext()
+    )
+
+    assert aggregate.timestamp_unix_nanos > 123
+    assert aggregate.used_kv_blocks == 7
+    assert aggregate.total_kv_blocks == 20
+    assert list(aggregate.ranks) == []
+    assert per_rank.ranks[0].data_parallel_rank == 0
+    assert per_rank.ranks[0].used_kv_blocks == 7
 
 
 @pytest.mark.asyncio
@@ -558,6 +594,38 @@ def _kv_servicer(kv_events_config=None, **overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("events_enabled", [False, True])
+@pytest.mark.parametrize("load_enabled", [False, True])
+async def test_routing_capabilities_are_independent(events_enabled, load_enabled):
+    snapshot = {
+        "usedKvBlocks": 7,
+        "totalKvBlocks": 20,
+        "ranks": [{"rank": 0, "runningRequests": 0, "usedKvBlocks": 7, "totalKvBlocks": 20}],
+    }
+    servicer = _kv_servicer(
+        _kv_events() if events_enabled else None,
+        _enable_routing_load=load_enabled,
+        _kv_load=snapshot,
+    )
+    info = await servicer.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
+    assert info.extra["trtllm_supports_dp_rank_targeting"] is True
+    sources = await servicer.GetKvEventSources(
+        kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext()
+    )
+    assert bool(sources.sources) == events_enabled
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), FakeServicerContext())
+    assert load.HasField("used_kv_blocks") == load_enabled
+
+
+@pytest.mark.asyncio
+async def test_enabled_load_without_snapshot_is_unavailable_not_disabled():
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _servicer(_enable_routing_load=True).GetLoad(server_pb2.GetLoadRequest(), context)
+    assert context.abort_code == grpc.StatusCode.UNAVAILABLE
+
+
+@pytest.mark.asyncio
 async def test_kv_event_sources_are_empty_when_publishing_is_off():
     """Implemented-but-empty, not UNIMPLEMENTED.
 
@@ -574,7 +642,7 @@ async def test_kv_event_sources_are_empty_when_publishing_is_off():
 @pytest.mark.asyncio
 async def test_kv_event_sources_are_empty_for_a_null_publisher():
     """`publisher="null"` builds the event path without binding a socket."""
-    config = _kv_events(enable_kv_cache_events=False, publisher="null")
+    config = _kv_events(publisher="null")
     response = await _kv_servicer(config).GetKvEventSources(
         kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext()
     )
@@ -583,7 +651,13 @@ async def test_kv_event_sources_are_empty_for_a_null_publisher():
 
 @pytest.mark.asyncio
 async def test_kv_event_sources_describe_the_single_rank_publisher():
-    config = _kv_events(topic="kv", replay_endpoint="tcp://*:5657", buffer_steps=7, hwm=9)
+    config = _kv_events(
+        topic="kv",
+        replay_endpoint="tcp://*:5657",
+        buffer_steps=7,
+        hwm=9,
+        max_queue_size=11,
+    )
     response = await _kv_servicer(config).GetKvEventSources(
         kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext()
     )
@@ -591,13 +665,27 @@ async def test_kv_event_sources_describe_the_single_rank_publisher():
     (source,) = response.sources
     assert source.transport == "zmq"
     assert source.encoding == "msgpack"
+    assert source.schema_version == 1
     assert source.topic == "kv"
     assert source.data_parallel_rank == 0
     assert source.buffer_steps == 7
     assert source.hwm == 9
+    assert source.max_queue_size == 11
     assert source.endpoint_addr.protocol == "tcp"
     assert source.endpoint_addr.port == 5557
     assert source.replay_endpoint == "tcp://127.0.0.1:5657"
+
+
+@pytest.mark.asyncio
+async def test_kv_event_sources_format_ipv6_endpoints_for_connection():
+    response = await _kv_servicer(
+        _kv_events(endpoint="tcp://[::1]:5557", replay_endpoint="tcp://[::1]:5657")
+    ).GetKvEventSources(kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext())
+
+    (source,) = response.sources
+    assert source.endpoint_addr.host == "::1"
+    assert source.endpoint_addr.port == 5557
+    assert source.replay_endpoint == "tcp://[::1]:5657"
 
 
 @pytest.mark.asyncio

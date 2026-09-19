@@ -53,11 +53,12 @@ __all__ = [
 # `endpoint_addr` to carry one.
 _WILDCARD_HOSTS = frozenset({"*", "0.0.0.0", "::", ""})
 
-# Batches held for one `SubscribeKvEvents` subscriber before the oldest are
-# dropped. The engine's own publisher drops rather than blocks (a full queue
-# leaves an observable sequence gap), so a slow gRPC consumer must not be the
-# one thing that can apply backpressure all the way to the scheduler.
+# Batches held for one `SubscribeKvEvents` subscriber before its stream is
+# terminated. A slow gRPC consumer must neither lose state-changing events nor
+# apply backpressure to the engine's publisher.
 _MAX_QUEUED_BATCHES = 1024
+_REPLAY_TIMEOUT_MS = 2_000
+_LIVE_SOURCE_TIMEOUT_MS = 15_000
 
 _STORAGE_MEDIUM_BY_NAME = {
     "GPU": kv_pb2.STORAGE_MEDIUM_GPU,
@@ -84,8 +85,7 @@ class ResolvedKvEventSource:
     @property
     def endpoint(self) -> str:
         """Connectable ZeroMQ endpoint for this rank's PUB socket."""
-        host = f"[{self.host}]" if ":" in self.host else self.host
-        return f"tcp://{host}:{self.port}"
+        return _format_tcp_endpoint(self.host, self.port)
 
 
 def resolve_advertise_host(bind_host: str) -> str:
@@ -146,6 +146,19 @@ def _split_tcp_endpoint(endpoint: str) -> tuple[str, int]:
     return host.strip("[]"), int(port_text)
 
 
+def _format_tcp_endpoint(host: str, port: int) -> str:
+    """Format a connectable TCP endpoint, including IPv6 brackets."""
+    formatted_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"tcp://{formatted_host}:{port}"
+
+
+def _enable_ipv6_for_endpoint(socket_: zmq.Socket, endpoint: str) -> None:
+    """Enable IPv6 before connecting a ZeroMQ socket to an IPv6 endpoint."""
+    host, _ = _split_tcp_endpoint(endpoint)
+    if ":" in host:
+        socket_.setsockopt(zmq.IPV6, 1)
+
+
 def resolve_sources(llm: Any, advertise_host: str) -> list[ResolvedKvEventSource]:
     """Address every rank's publisher, or return [] when events are disabled.
 
@@ -157,6 +170,11 @@ def resolve_sources(llm: Any, advertise_host: str) -> list[ResolvedKvEventSource
         return []
 
     dp_size = data_parallel_size(llm)
+    if dp_size > 1 and getattr(getattr(llm, "args", None), "orchestrator_type", None) == "ray":
+        raise KvEventsUnavailableError(
+            "multi-rank KV event discovery cannot infer per-rank hosts for Ray placement; "
+            "use a single-node RPC/MPI deployment"
+        )
     gpus_per_node = getattr(getattr(llm, "args", None), "gpus_per_node", None) or dp_size
     if dp_size > gpus_per_node:
         # Ranks bind by *global* rank, so ranks beyond this node bind on a host
@@ -179,7 +197,7 @@ def resolve_sources(llm: Any, advertise_host: str) -> list[ResolvedKvEventSource
             replay_host, replay_port = _split_tcp_endpoint(replay)
             if replay_host.lower() in _WILDCARD_HOSTS:
                 replay_host = advertise_host
-            replay = f"tcp://{replay_host}:{replay_port}"
+            replay = _format_tcp_endpoint(replay_host, replay_port)
         sources.append(
             ResolvedKvEventSource(
                 data_parallel_rank=rank,
@@ -303,11 +321,18 @@ async def _replay(
     """
     socket_ = context.socket(zmq.DEALER)
     try:
+        _enable_ipv6_for_endpoint(socket_, endpoint)
+        socket_.setsockopt(zmq.RCVTIMEO, _REPLAY_TIMEOUT_MS)
         socket_.connect(endpoint)
         await socket_.send_multipart((b"", start_sequence_number.to_bytes(8, "big")))
         highest = -1
         while True:
-            frames = await socket_.recv_multipart()
+            try:
+                frames = await socket_.recv_multipart()
+            except zmq.Again as error:
+                raise KvEventsUnavailableError(
+                    f"KV cache event replay timed out after {_REPLAY_TIMEOUT_MS} ms"
+                ) from error
             if len(frames) != 4:
                 raise KvEventsUnavailableError(
                     f"KV cache event replay returned {len(frames)} frames, expected four"
@@ -340,23 +365,34 @@ async def _pump(
     decoder = msgspec.msgpack.Decoder(KVEventBatch)
     socket_ = context.socket(zmq.SUB)
     try:
+        _enable_ipv6_for_endpoint(socket_, source.endpoint)
+        socket_.setsockopt(zmq.RCVTIMEO, _LIVE_SOURCE_TIMEOUT_MS)
         socket_.connect(source.endpoint)
         socket_.setsockopt_string(zmq.SUBSCRIBE, topic)
-        replayed_through = -1
+        replayed_through = start_sequence_number - 1
         if (include_snapshot or start_sequence_number > 0) and source.replay_endpoint:
             # Subscribe first, then replay: PUB/SUB drops anything published
             # before the subscription lands, and the replay buffer is what
             # covers that window.
-            replayed_through = await _replay(
-                context,
-                source.replay_endpoint,
-                start_sequence_number,
-                decoder,
-                queue,
-                source.data_parallel_rank,
+            replayed_through = max(
+                replayed_through,
+                await _replay(
+                    context,
+                    source.replay_endpoint,
+                    start_sequence_number,
+                    decoder,
+                    queue,
+                    source.data_parallel_rank,
+                ),
             )
+        stale_sequence_since: float | None = None
         while True:
-            frames = await socket_.recv_multipart()
+            try:
+                frames = await socket_.recv_multipart()
+            except zmq.Again as error:
+                raise KvEventsUnavailableError(
+                    f"KV cache event source was silent for {_LIVE_SOURCE_TIMEOUT_MS} ms"
+                ) from error
             if len(frames) != 3:
                 logger.warning(
                     f"Discarding KV cache event message with {len(frames)} frames, expected three"
@@ -365,7 +401,17 @@ async def _pump(
             _, sequence, payload = frames
             sequence_number = int.from_bytes(sequence, "big")
             if sequence_number <= replayed_through:
+                if stale_sequence_since is None:
+                    stale_sequence_since = asyncio.get_running_loop().time()
+                elif (
+                    asyncio.get_running_loop().time() - stale_sequence_since
+                    >= _LIVE_SOURCE_TIMEOUT_MS / 1000
+                ):
+                    raise KvEventsUnavailableError(
+                        "KV cache event source sequence regressed after publisher restart"
+                    )
                 continue
+            stale_sequence_since = None
             envelope = _Envelope(
                 data_parallel_rank=source.data_parallel_rank,
                 sequence_number=sequence_number,
@@ -374,12 +420,20 @@ async def _pump(
             try:
                 queue.put_nowait(envelope)
             except asyncio.QueueFull:
-                # Same contract as the engine's publisher: drop and leave a gap
-                # rather than stall the producer.
-                logger.warning(
-                    "Dropping KV cache event batch for a subscriber that is not keeping up; "
-                    f"seq={sequence_number} will be missing from the stream"
+                error = (
+                    "KV cache event subscriber is not keeping up; terminating the stream "
+                    "instead of dropping state-changing events"
                 )
+                logger.warning(error)
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                queue.put_nowait(
+                    _Envelope(data_parallel_rank=source.data_parallel_rank, error=error)
+                )
+                return
     except asyncio.CancelledError:
         raise
     except Exception as error:

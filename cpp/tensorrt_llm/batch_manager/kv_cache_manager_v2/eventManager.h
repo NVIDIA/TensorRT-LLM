@@ -169,6 +169,7 @@ public:
     void addCreatedEvent(
         std::vector<int> numBlocksPerCacheLevel, std::optional<std::vector<int>> layerGroupIds = std::nullopt);
     void setLayerGroupWindowSizes(std::map<int, int> windowSizes);
+    void setRoutingLayerGroup(int layerGroupId);
     void addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId = std::nullopt);
     void addRemovedEvent(std::vector<EventBlockHash> blockHashes, EventLayerGroupId layerGroupId = std::nullopt);
     void addUpdatedEvent(EventBlockHash blockHash, std::optional<KVCacheEventDiff> cacheLevel = std::nullopt,
@@ -177,7 +178,14 @@ public:
         std::optional<KVCacheEventDiff> priority = std::nullopt, EventLayerGroupId layerGroupId = std::nullopt);
 
     void flushIterationEvents();
-    std::vector<KVCacheEvent> getLatestEvents(std::optional<double> timeoutMs = std::nullopt);
+    std::vector<KVCacheEvent> getLatestEvents(
+        std::optional<double> timeoutMs = std::nullopt, std::optional<int> maxEvents = std::nullopt);
+    int64_t discardEvents();
+    void close();
+
+    int64_t getDroppedEventCount() const;
+    int getQueueHighWatermark() const;
+    bool isClosedAndEmpty() const;
 
     std::string const& hashAlgorithm() const noexcept
     {
@@ -211,18 +219,28 @@ private:
 
     using V1RootAttrs = std::pair<std::optional<LoraTaskIdType>, std::optional<std::uint64_t>>;
 
+    struct V1HashState
+    {
+        uint64_t hash;
+        bool compatible;
+        V1RootAttrs rootAttrs;
+    };
+
     static std::pair<HashAlgorithm, std::string> parseHashAlgorithm(std::string const& hashAlgo);
     static std::string digestToHex(Digest const& digest);
     static uint64_t truncateDigestToInt64(Digest const& digest);
+    static std::optional<uint64_t> hashV1BlockTokens(std::vector<TokenIdExt> const& tokens, uint64_t parentHash,
+        std::optional<LoraTaskIdType> loraTaskId, std::optional<std::uint64_t> cacheSaltId,
+        std::vector<UniqueToken>* eventTokens = nullptr);
     static std::vector<KVCacheEvent> trimEvents(std::vector<KVCacheEvent> events, int maxKvEventEntries);
 
     EventBlockHash normalizeDigest(Digest const& digest) const;
     EventBlockHash hashFromBlock(Block const& block);
-    uint64_t v1HashFromBlock(Block const& block);
+    uint64_t v1HashFromBlock(Block const& block, std::vector<UniqueToken>* eventTokens = nullptr);
     uint64_t fallbackV1Hash(Digest const& blockKey);
     std::optional<EventBlockHash> parentHashFromBlock(Block const& block);
     std::optional<KVCacheStoredBlockData> storedBlockFromBlock(
-        Block const& block, std::optional<std::set<int>> const& lifeCycleIds = std::nullopt);
+        Block const& block, std::optional<int> lifeCycleId = std::nullopt);
 
     void addStoredBlockUnlocked(Block const& block);
     void addStoredEventUnlocked(KVCacheStoredData data, EventLayerGroupId layerGroupId);
@@ -231,9 +249,12 @@ private:
     void flushAllRemovedEventsUnlocked();
     KVCacheEvent& addEventUnlocked(KVCacheEventData data, EventLayerGroupId layerGroupId);
     std::vector<KVCacheEvent> drainPendingEventsUnlocked();
-    void publishEventsUnlocked(std::vector<KVCacheEvent> events, std::optional<int> maxKvEventEntries = std::nullopt);
+    bool publishEventsUnlocked(std::vector<KVCacheEvent> events, std::optional<int> maxKvEventEntries = std::nullopt);
     int getWindowSize(EventLayerGroupId layerGroupId) const;
+    int routingEventWeight(KVCacheEvent const& event) const;
     void dropHashCache(Digest const& blockKey);
+    bool acceptsRoutingLayerGroup(EventLayerGroupId layerGroupId) const;
+    bool isRoutingBlockSupported(Block const& block) const;
 
     int mMaxKvEventEntries;
     int mWindowSize;
@@ -243,16 +264,23 @@ private:
     HashAlgorithm mHashAlgo;
     std::string mHashAlgoName;
     int64_t mNextEventId = 0;
+    std::optional<int> mRoutingLayerGroupId;
+    int mPendingRoutingEntries = 0;
+    int mQueuedRoutingEntries = 0;
 
     std::unordered_map<Digest, StoredBlockState> mStoredBlocks;
+    std::unordered_set<Digest> mSuppressedRoutingBlockKeys;
     std::map<EventLayerGroupId, int64_t> mLatestStoredEventIds;
     std::map<EventLayerGroupId, std::vector<EventBlockHash>> mLatestRemovedBlockHashes;
     std::vector<KVCacheEvent> mPendingEvents;
     std::deque<KVCacheEvent> mEvents;
+    int64_t mDroppedEventCount = 0;
+    int mQueueHighWatermark = 0;
+    int mActiveGatherCount = 0;
+    bool mClosing = false;
+    bool mClosed = false;
 
-    std::unordered_map<Digest, uint64_t> mV1HashByBlockKey;
-    std::unordered_set<Digest> mV1HashCompatibleKeys;
-    std::unordered_map<Digest, V1RootAttrs> mV1RootAttrsByBlockKey;
+    std::unordered_map<Digest, V1HashState> mV1HashStates;
     bool mWarnedV1HashFallback = false;
 
     mutable std::mutex mMutex;

@@ -30,6 +30,7 @@ from openengine.v1 import (
 )
 
 from tensorrt_llm import __version__ as trtllm_version
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import HEARTBEAT_INTERVAL_SECONDS
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
 
@@ -78,6 +79,7 @@ _MODE_BY_GUIDE_FIELD = {
 }
 
 _INFERENCE_PROBE_TIMEOUT_SECONDS = 30.0
+_LOAD_SNAPSHOT_CACHE_SECONDS = 0.05
 
 
 def _abort_quietly(handle: Any, reason: str) -> None:
@@ -130,6 +132,26 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         self._kv_transfer_backend = kv_transfer_backend
         self._advertise_host = resolve_advertise_host(bind_host)
         self._probe: Optional[asyncio.Future] = None
+        self._load_snapshot: dict = {}
+        self._load_snapshot_deadline = 0.0
+        self._load_snapshot_lock = asyncio.Lock()
+        self._load_reporting_enabled = bool(getattr(llm.args, "_enable_routing_load", False))
+
+    async def _get_kv_cache_load(self) -> dict:
+        """Coalesce concurrent control-plane polls into one engine query."""
+        if not self._load_reporting_enabled:
+            return {}
+        now = time.monotonic()
+        if now < self._load_snapshot_deadline:
+            return self._load_snapshot
+        async with self._load_snapshot_lock:
+            now = time.monotonic()
+            if now >= self._load_snapshot_deadline:
+                executor = getattr(self._llm, "_executor", None)
+                getter = getattr(executor, "get_kv_cache_load", None)
+                self._load_snapshot = await asyncio.to_thread(getter) if callable(getter) else {}
+                self._load_snapshot_deadline = now + _LOAD_SNAPSHOT_CACHE_SECONDS
+        return self._load_snapshot
 
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
@@ -217,7 +239,26 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         block_size = _positive_int(self._llm.args.kv_cache_config.tokens_per_block)
         if block_size is not None:
             capacity.kv_block_size = block_size
+        executor = getattr(self._llm, "_executor", None)
+        capacity_getter = getattr(executor, "get_kv_cache_capacity", None)
+        if callable(capacity_getter):
+            kv_capacity = await asyncio.to_thread(capacity_getter)
+            local_blocks = _positive_int(kv_capacity.get("maxNumBlocks"))
+            if local_blocks is not None:
+                capacity.total_kv_blocks = local_blocks * data_parallel_size(self._llm)
         info.capacity.CopyFrom(capacity)
+
+        # Optional engine metadata, not a routing policy or a protocol extension.
+        # The request handler still validates every strict DP-rank hint.
+        info.extra.update({"trtllm_supports_dp_rank_targeting": True})
+        if events_config(self._llm) is not None:
+            info.extra.update(
+                {"kv_event_heartbeat_interval_ms": int(HEARTBEAT_INTERVAL_SECONDS * 1000)}
+            )
+        if self._load_reporting_enabled:
+            snapshot = await self._get_kv_cache_load()
+            if snapshot.get("ranks"):
+                info.capacity.total_kv_blocks = snapshot["totalKvBlocks"]
 
         return info
 
@@ -288,14 +329,39 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         request: server_pb2.GetLoadRequest,
         context: grpc.aio.ServicerContext,
     ) -> server_pb2.LoadInfo:
-        load = server_pb2.LoadInfo(
-            instance_id=str(getattr(self._llm, "llm_id", "") or ""),
-            timestamp_unix_nanos=time.time_ns(),
-        )
-        # Scheduler internals are only available through the streaming stats
-        # iterator, which a point query cannot sample without blocking, so they
-        # stay unset.
+        snapshot = await self._get_kv_cache_load()
+        if self._load_reporting_enabled and not snapshot.get("ranks"):
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "KV occupancy is enabled but no load snapshot is available",
+            )
+        load = server_pb2.LoadInfo(instance_id=str(getattr(self._llm, "llm_id", "") or ""))
+        # This timestamp describes when the RPC observed the snapshot. The
+        # scheduler sample itself may remain unchanged while a healthy engine is
+        # idle; exposing its age here would make routers reject healthy workers.
+        load.timestamp_unix_nanos = time.time_ns()
         load.running_requests = self._inference.active_request_count()
+        used_blocks = snapshot.get("usedKvBlocks")
+        total_blocks = snapshot.get("totalKvBlocks")
+        if isinstance(used_blocks, int) and used_blocks >= 0:
+            load.used_kv_blocks = used_blocks
+        if isinstance(total_blocks, int) and total_blocks > 0:
+            load.total_kv_blocks = total_blocks
+        if request.include_per_rank:
+            for rank in snapshot.get("ranks", []):
+                rank_load = load.ranks.add()
+                rank_load.data_parallel_rank = int(rank["rank"])
+                rank_used = rank.get("usedKvBlocks")
+                rank_total = rank.get("totalKvBlocks")
+                rank_running = rank.get("runningRequests")
+                if data_parallel_size(self._llm) == 1:
+                    rank_running = load.running_requests
+                if isinstance(rank_used, int) and rank_used >= 0:
+                    rank_load.used_kv_blocks = rank_used
+                if isinstance(rank_total, int) and rank_total > 0:
+                    rank_load.total_kv_blocks = rank_total
+                if isinstance(rank_running, int) and rank_running >= 0:
+                    rank_load.running_requests = rank_running
         return load
 
     # -- Health and lifecycle ----------------------------------------------

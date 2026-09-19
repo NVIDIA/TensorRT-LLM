@@ -19,7 +19,6 @@
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/page.h"
-#include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
 #include <chrono>
@@ -32,30 +31,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-constexpr uint32_t kUint32HashConst = 0x045D9F3BU;
-constexpr uint64_t kUint64HashConst1 = 0xBF58476D1CE4E5B9ULL;
-constexpr uint64_t kUint64HashConst2 = 0x94D049BB133111EBULL;
-constexpr uint32_t kHashCombineConst = 0x9E3779B9U;
-constexpr uint64_t kParentHashConst = 0xBF58476D1CE4E5B9ULL;
-
-uint64_t hash32Mix(int64_t input, uint64_t seed)
-{
-    uint32_t value = static_cast<uint32_t>(input);
-    value = ((value >> 16U) ^ value) * kUint32HashConst;
-    value = ((value >> 16U) ^ value) * kUint32HashConst;
-    value = (value >> 16U) ^ value;
-    value += kHashCombineConst;
-    return seed ^ (static_cast<uint64_t>(value) + (seed << 6U) + (seed >> 2U));
-}
-
-uint64_t hash64Mix(int64_t input, uint64_t seed)
-{
-    uint64_t value = static_cast<uint64_t>(input);
-    value = (value ^ (value >> 30U)) * kUint64HashConst1;
-    value = (value ^ (value >> 27U)) * kUint64HashConst2;
-    value ^= value >> 31U;
-    return seed ^ (value + static_cast<uint64_t>(kHashCombineConst) + (seed << 6U) + (seed >> 2U));
-}
+constexpr std::size_t kMaxRoutingBlocksPerEvent = 256;
 
 // A page whose recorded token count is short of the block's span cannot be announced: the
 // event payload carries the block's full token list and cannot express a shorter valid
@@ -103,15 +79,31 @@ void EventManager::addCreatedEvent(
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed)
+    {
+        return;
+    }
+    if (mRoutingLayerGroupId.has_value())
+    {
+        // Direct routing only consumes stored/removed state. Avoid allocating a
+        // created event that the wire translator would immediately discard.
+        return;
+    }
     KVCacheCreatedData data{std::move(numBlocksPerCacheLevel)};
     if (!layerGroupIds.has_value())
     {
-        addEventUnlocked(std::move(data), std::nullopt);
+        if (acceptsRoutingLayerGroup(std::nullopt))
+        {
+            addEventUnlocked(std::move(data), std::nullopt);
+        }
         return;
     }
     for (int layerGroupId : *layerGroupIds)
     {
-        addEventUnlocked(data, layerGroupId);
+        if (acceptsRoutingLayerGroup(layerGroupId))
+        {
+            addEventUnlocked(data, layerGroupId);
+        }
     }
 }
 
@@ -121,6 +113,26 @@ void EventManager::setLayerGroupWindowSizes(std::map<int, int> windowSizes)
     mWindowSizeByLayerGroup = std::move(windowSizes);
 }
 
+void EventManager::setRoutingLayerGroup(int layerGroupId)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (layerGroupId < 0)
+    {
+        throw std::invalid_argument("Routing layer group must be non-negative");
+    }
+    if (mHashAlgo != HashAlgorithm::kV1)
+    {
+        throw std::logic_error("Routing events require v1_block_key hashes");
+    }
+    if (mClosing || mClosed || mNextEventId != 0 || !mPendingEvents.empty() || !mEvents.empty()
+        || !mLatestRemovedBlockHashes.empty() || !mStoredBlocks.empty() || !mSuppressedRoutingBlockKeys.empty()
+        || !mV1HashStates.empty())
+    {
+        throw std::logic_error("Routing event selection must be configured before use");
+    }
+    mRoutingLayerGroupId = layerGroupId;
+}
+
 void EventManager::addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId)
 {
     if (data.blocks.empty() || mMaxKvEventEntries <= 0)
@@ -128,6 +140,10 @@ void EventManager::addStoredEvent(KVCacheStoredData data, EventLayerGroupId laye
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed || !acceptsRoutingLayerGroup(layerGroupId))
+    {
+        return;
+    }
     flushRemovedEventUnlocked(layerGroupId);
     addStoredEventUnlocked(std::move(data), layerGroupId);
 }
@@ -139,6 +155,10 @@ void EventManager::addRemovedEvent(std::vector<EventBlockHash> blockHashes, Even
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed || !acceptsRoutingLayerGroup(layerGroupId))
+    {
+        return;
+    }
     enqueueRemovedEventUnlocked(std::move(blockHashes), layerGroupId);
 }
 
@@ -150,6 +170,16 @@ void EventManager::addUpdatedEvent(EventBlockHash blockHash, std::optional<KVCac
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed || !acceptsRoutingLayerGroup(layerGroupId))
+    {
+        return;
+    }
+    if (mRoutingLayerGroupId.has_value() && mPendingRoutingEntries >= mMaxKvEventEntries)
+    {
+        ++mDroppedEventCount;
+        return;
+    }
+    mPendingRoutingEntries += mRoutingLayerGroupId.has_value() ? 1 : 0;
     addEventUnlocked(KVCacheUpdatedData{std::move(blockHash), cacheLevel, priority}, layerGroupId);
 }
 
@@ -161,11 +191,21 @@ void EventManager::addUpdatedEvent(Digest const& blockKey, std::optional<KVCache
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed || !acceptsRoutingLayerGroup(layerGroupId))
+    {
+        return;
+    }
     auto const state = mStoredBlocks.find(blockKey);
     if (state == mStoredBlocks.end())
     {
         return;
     }
+    if (mRoutingLayerGroupId.has_value() && mPendingRoutingEntries >= mMaxKvEventEntries)
+    {
+        ++mDroppedEventCount;
+        return;
+    }
+    mPendingRoutingEntries += mRoutingLayerGroupId.has_value() ? 1 : 0;
     addEventUnlocked(KVCacheUpdatedData{state->second.blockHash, cacheLevel, priority}, layerGroupId);
 }
 
@@ -176,11 +216,45 @@ void EventManager::addStoredBlock(Block const& block)
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed)
+    {
+        return;
+    }
     addStoredBlockUnlocked(block);
 }
 
 void EventManager::addStoredBlockUnlocked(Block const& block)
 {
+    if (mSuppressedRoutingBlockKeys.count(block.key) != 0)
+    {
+        return;
+    }
+    if (mRoutingLayerGroupId.has_value())
+    {
+        int const lifeCycleId = *mRoutingLayerGroupId;
+        auto const* page = lifeCycleId >= 0 && lifeCycleId < block.storage.size().value()
+            ? block.getPage(LifeCycleId{lifeCycleId})
+            : nullptr;
+        if (!pageCoversBlock(page, block))
+        {
+            return;
+        }
+        std::vector<UniqueToken> eventTokens;
+        EventBlockHash blockHash = v1HashFromBlock(block, &eventTokens);
+        if (!isRoutingBlockSupported(block))
+        {
+            mSuppressedRoutingBlockKeys.insert(block.key);
+            return;
+        }
+        mStoredBlocks.insert_or_assign(block.key, StoredBlockState{blockHash, {}});
+        flushRemovedEventUnlocked(lifeCycleId);
+        addStoredEventUnlocked(KVCacheStoredData{parentHashFromBlock(block),
+                                   {KVCacheStoredBlockData{std::move(blockHash), std::move(eventTokens),
+                                       page->cacheLevel.value(), page->priority, {}, std::nullopt}}},
+            lifeCycleId);
+        return;
+    }
+
     std::set<int> lifeCycleIds;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
     {
@@ -195,11 +269,17 @@ void EventManager::addStoredBlockUnlocked(Block const& block)
     }
 
     EventBlockHash blockHash = hashFromBlock(block);
-    mStoredBlocks.insert_or_assign(block.key, StoredBlockState{blockHash, lifeCycleIds});
-    auto parentHash = parentHashFromBlock(block);
-    for (int lifeCycleId : lifeCycleIds)
+    if (!isRoutingBlockSupported(block))
     {
-        auto blockData = storedBlockFromBlock(block, std::set<int>{lifeCycleId});
+        mSuppressedRoutingBlockKeys.insert(block.key);
+        return;
+    }
+    auto const storedState
+        = mStoredBlocks.insert_or_assign(block.key, StoredBlockState{blockHash, std::move(lifeCycleIds)}).first;
+    auto parentHash = parentHashFromBlock(block);
+    for (int lifeCycleId : storedState->second.lifeCycleIds)
+    {
+        auto blockData = storedBlockFromBlock(block, lifeCycleId);
         if (blockData.has_value())
         {
             flushRemovedEventUnlocked(lifeCycleId);
@@ -215,10 +295,18 @@ void EventManager::addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle)
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed || !acceptsRoutingLayerGroup(lifeCycle.value()))
+    {
+        return;
+    }
     auto state = mStoredBlocks.find(block.key);
     if (state == mStoredBlocks.end())
     {
         addStoredBlockUnlocked(block);
+        return;
+    }
+    if (mRoutingLayerGroupId.has_value())
+    {
         return;
     }
     int const lifeCycleId = lifeCycle.value();
@@ -226,7 +314,7 @@ void EventManager::addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle)
     {
         return;
     }
-    auto blockData = storedBlockFromBlock(block, std::set<int>{lifeCycleId});
+    auto blockData = storedBlockFromBlock(block, lifeCycleId);
     if (!blockData.has_value())
     {
         return;
@@ -243,13 +331,27 @@ void EventManager::addRemovedBlock(Digest const& blockKey)
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
-    auto state = mStoredBlocks.find(blockKey);
-    if (state == mStoredBlocks.end())
+    if (mClosing || mClosed)
     {
         return;
     }
+    auto state = mStoredBlocks.find(blockKey);
+    if (state == mStoredBlocks.end())
+    {
+        mSuppressedRoutingBlockKeys.erase(blockKey);
+        dropHashCache(blockKey);
+        return;
+    }
     EventBlockHash blockHash = state->second.blockHash;
-    auto lifeCycleIds = state->second.lifeCycleIds;
+    if (mRoutingLayerGroupId.has_value())
+    {
+        int const lifeCycleId = *mRoutingLayerGroupId;
+        mStoredBlocks.erase(state);
+        dropHashCache(blockKey);
+        enqueueRemovedEventUnlocked({std::move(blockHash)}, lifeCycleId);
+        return;
+    }
+    auto lifeCycleIds = std::move(state->second.lifeCycleIds);
     mStoredBlocks.erase(state);
     dropHashCache(blockKey);
 
@@ -271,9 +373,29 @@ void EventManager::addRemovedLifeCycle(Digest const& blockKey, LifeCycleId lifeC
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed || !acceptsRoutingLayerGroup(lifeCycle.value()))
+    {
+        return;
+    }
     auto state = mStoredBlocks.find(blockKey);
     int const lifeCycleId = lifeCycle.value();
-    if (state == mStoredBlocks.end() || state->second.lifeCycleIds.erase(lifeCycleId) == 0)
+    if (state == mStoredBlocks.end())
+    {
+        if (mSuppressedRoutingBlockKeys.erase(blockKey) != 0)
+        {
+            dropHashCache(blockKey);
+        }
+        return;
+    }
+    if (mRoutingLayerGroupId.has_value())
+    {
+        EventBlockHash blockHash = std::move(state->second.blockHash);
+        mStoredBlocks.erase(state);
+        dropHashCache(blockKey);
+        enqueueRemovedEventUnlocked({std::move(blockHash)}, lifeCycleId);
+        return;
+    }
+    if (state->second.lifeCycleIds.erase(lifeCycleId) == 0)
     {
         return;
     }
@@ -294,11 +416,21 @@ void EventManager::addCacheLevelUpdated(
         return;
     }
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mClosing || mClosed || !acceptsRoutingLayerGroup(lifeCycle.value()))
+    {
+        return;
+    }
     auto state = mStoredBlocks.find(blockKey);
     if (state == mStoredBlocks.end())
     {
         return;
     }
+    if (mRoutingLayerGroupId.has_value() && mPendingRoutingEntries >= mMaxKvEventEntries)
+    {
+        ++mDroppedEventCount;
+        return;
+    }
+    mPendingRoutingEntries += mRoutingLayerGroupId.has_value() ? 1 : 0;
     addEventUnlocked(
         KVCacheUpdatedData{state->second.blockHash, KVCacheEventDiff{oldLevel.value(), newLevel.value()}, std::nullopt},
         lifeCycle.value());
@@ -306,6 +438,21 @@ void EventManager::addCacheLevelUpdated(
 
 void EventManager::addStoredEventUnlocked(KVCacheStoredData data, EventLayerGroupId layerGroupId)
 {
+    if (mRoutingLayerGroupId.has_value())
+    {
+        int const available
+            = std::min<int>(kMaxRoutingBlocksPerEvent, std::max(0, mMaxKvEventEntries - mPendingRoutingEntries));
+        if (static_cast<int>(data.blocks.size()) > available)
+        {
+            mDroppedEventCount += static_cast<int64_t>(data.blocks.size()) - available;
+            data.blocks.resize(static_cast<std::size_t>(available));
+        }
+        if (data.blocks.empty())
+        {
+            return;
+        }
+        mPendingRoutingEntries += static_cast<int>(data.blocks.size());
+    }
     bool const hasPendingRemovedEvents = !mLatestRemovedBlockHashes.empty();
     auto latest = mLatestStoredEventIds.find(layerGroupId);
     if (!hasPendingRemovedEvents && latest != mLatestStoredEventIds.end())
@@ -317,6 +464,8 @@ void EventManager::addStoredEventUnlocked(KVCacheStoredData data, EventLayerGrou
             throw std::logic_error("Stored event coalescing lost the pending event");
         }
         if (auto* stored = std::get_if<KVCacheStoredData>(&pending->data); stored != nullptr && !stored->blocks.empty()
+            && (!mRoutingLayerGroupId.has_value()
+                || stored->blocks.size() + data.blocks.size() <= kMaxRoutingBlocksPerEvent)
             && data.parentHash.has_value() && stored->blocks.back().blockHash == *data.parentHash)
         {
             std::move(data.blocks.begin(), data.blocks.end(), std::back_inserter(stored->blocks));
@@ -333,6 +482,20 @@ void EventManager::enqueueRemovedEventUnlocked(std::vector<EventBlockHash> block
     if (blockHashes.empty())
     {
         return;
+    }
+    if (mRoutingLayerGroupId.has_value())
+    {
+        int const available = std::max(0, mMaxKvEventEntries - mPendingRoutingEntries);
+        if (static_cast<int>(blockHashes.size()) > available)
+        {
+            mDroppedEventCount += static_cast<int64_t>(blockHashes.size()) - available;
+            blockHashes.resize(static_cast<std::size_t>(available));
+        }
+        if (blockHashes.empty())
+        {
+            return;
+        }
+        mPendingRoutingEntries += static_cast<int>(blockHashes.size());
     }
     auto& pending = mLatestRemovedBlockHashes[layerGroupId];
     std::move(blockHashes.begin(), blockHashes.end(), std::back_inserter(pending));
@@ -384,21 +547,64 @@ std::vector<KVCacheEvent> EventManager::drainPendingEventsUnlocked()
     auto events = std::move(mPendingEvents);
     mPendingEvents.clear();
     mLatestStoredEventIds.clear();
+    mPendingRoutingEntries = 0;
     return events;
 }
 
-void EventManager::publishEventsUnlocked(std::vector<KVCacheEvent> events, std::optional<int> maxKvEventEntries)
+bool EventManager::publishEventsUnlocked(std::vector<KVCacheEvent> events, std::optional<int> maxKvEventEntries)
 {
-    if (events.empty())
+    if (events.empty() || mClosed)
     {
-        return;
+        return false;
     }
     int const capacity = maxKvEventEntries.value_or(mMaxKvEventEntries);
-    std::move(events.begin(), events.end(), std::back_inserter(mEvents));
-    while (static_cast<int>(mEvents.size()) > capacity)
+    if (capacity <= 0)
+    {
+        mDroppedEventCount += static_cast<int64_t>(events.size());
+        return false;
+    }
+    if (mRoutingLayerGroupId.has_value())
+    {
+        int incomingEntries = 0;
+        for (auto const& event : events)
+        {
+            incomingEntries += routingEventWeight(event);
+        }
+        while (!events.empty() && incomingEntries > capacity)
+        {
+            int const dropped = routingEventWeight(events.front());
+            incomingEntries -= dropped;
+            mDroppedEventCount += dropped;
+            events.erase(events.begin());
+        }
+        while (!mEvents.empty() && mQueuedRoutingEntries + incomingEntries > capacity)
+        {
+            int const dropped = routingEventWeight(mEvents.front());
+            mQueuedRoutingEntries -= dropped;
+            mDroppedEventCount += dropped;
+            mEvents.pop_front();
+        }
+        if (events.empty())
+        {
+            return false;
+        }
+        std::move(events.begin(), events.end(), std::back_inserter(mEvents));
+        mQueuedRoutingEntries += incomingEntries;
+        mQueueHighWatermark = std::max(mQueueHighWatermark, mQueuedRoutingEntries);
+        return true;
+    }
+    auto const keepIncoming = std::min<std::size_t>(events.size(), static_cast<std::size_t>(capacity));
+    auto const maxExisting = static_cast<std::size_t>(capacity) - keepIncoming;
+    auto const droppedExisting = mEvents.size() > maxExisting ? mEvents.size() - maxExisting : 0;
+    while (mEvents.size() > maxExisting)
     {
         mEvents.pop_front();
     }
+    mDroppedEventCount += static_cast<int64_t>(droppedExisting + events.size() - keepIncoming);
+    auto first = events.end() - static_cast<std::ptrdiff_t>(keepIncoming);
+    std::move(first, events.end(), std::back_inserter(mEvents));
+    mQueueHighWatermark = std::max(mQueueHighWatermark, static_cast<int>(mEvents.size()));
+    return keepIncoming > 0;
 }
 
 std::vector<KVCacheEvent> EventManager::trimEvents(std::vector<KVCacheEvent> events, int maxKvEventEntries)
@@ -419,54 +625,178 @@ void EventManager::flushIterationEvents()
     if (mAttentionDpGather)
     {
         std::vector<KVCacheEvent> localEvents;
+        int64_t trimmedEventCount = 0;
         {
             std::lock_guard<std::mutex> lock(mMutex);
-            localEvents = trimEvents(drainPendingEventsUnlocked(), mMaxKvEventEntries);
+            if (mClosing || mClosed)
+            {
+                return;
+            }
+            ++mActiveGatherCount;
+            auto pendingEvents = drainPendingEventsUnlocked();
+            trimmedEventCount += std::max<int64_t>(0, static_cast<int64_t>(pendingEvents.size()) - mMaxKvEventEntries);
+            localEvents = trimEvents(std::move(pendingEvents), mMaxKvEventEntries);
         }
-        auto gatheredEvents = mAttentionDpGather(localEvents);
-        if (mAttentionDpRank != std::optional<int>{0})
+        std::vector<std::vector<KVCacheEvent>> gatheredEvents;
+        try
         {
-            return;
+            gatheredEvents = mAttentionDpGather(localEvents);
+        }
+        catch (...)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                --mActiveGatherCount;
+            }
+            mCondition.notify_all();
+            throw;
         }
 
         std::vector<KVCacheEvent> events;
-        for (auto& rankEvents : gatheredEvents)
+        if (mAttentionDpRank == std::optional<int>{0})
         {
-            auto trimmed = trimEvents(std::move(rankEvents), mMaxKvEventEntries);
-            std::move(trimmed.begin(), trimmed.end(), std::back_inserter(events));
+            for (auto& rankEvents : gatheredEvents)
+            {
+                trimmedEventCount += std::max<int64_t>(0, static_cast<int64_t>(rankEvents.size()) - mMaxKvEventEntries);
+                auto trimmed = trimEvents(std::move(rankEvents), mMaxKvEventEntries);
+                std::move(trimmed.begin(), trimmed.end(), std::back_inserter(events));
+            }
         }
         {
             std::lock_guard<std::mutex> lock(mMutex);
-            publishEventsUnlocked(std::move(events), mMaxKvEventEntries * std::max<int>(1, gatheredEvents.size()));
+            mDroppedEventCount += trimmedEventCount;
+            if (!mClosed && mAttentionDpRank == std::optional<int>{0})
+            {
+                publishEventsUnlocked(std::move(events), mMaxKvEventEntries * std::max<int>(1, gatheredEvents.size()));
+            }
+            --mActiveGatherCount;
         }
+        // Also wakes close(), which may be waiting for this gather to finish.
         mCondition.notify_all();
         return;
     }
 
+    bool published = false;
     {
         std::lock_guard<std::mutex> lock(mMutex);
-        publishEventsUnlocked(drainPendingEventsUnlocked());
+        if (!mClosing && !mClosed)
+        {
+            published = publishEventsUnlocked(drainPendingEventsUnlocked());
+        }
     }
-    mCondition.notify_all();
+    if (published)
+    {
+        mCondition.notify_all();
+    }
 }
 
-std::vector<KVCacheEvent> EventManager::getLatestEvents(std::optional<double> timeoutMs)
+std::vector<KVCacheEvent> EventManager::getLatestEvents(std::optional<double> timeoutMs, std::optional<int> maxEvents)
 {
     std::unique_lock<std::mutex> lock(mMutex);
     if (mEvents.empty() && !timeoutMs.has_value())
     {
-        mCondition.wait(lock, [&] { return !mEvents.empty(); });
+        mCondition.wait(lock, [&] { return mClosed || !mEvents.empty(); });
     }
     else if (mEvents.empty() && *timeoutMs > 0)
     {
         mCondition.wait_for(
-            lock, std::chrono::duration<double, std::milli>(*timeoutMs), [&] { return !mEvents.empty(); });
+            lock, std::chrono::duration<double, std::milli>(*timeoutMs), [&] { return mClosed || !mEvents.empty(); });
     }
+    std::size_t count = mEvents.size();
+    if (maxEvents.has_value())
+    {
+        count = std::min(count, static_cast<std::size_t>(std::max(0, *maxEvents)));
+    }
+    std::deque<KVCacheEvent> queued;
+    for (std::size_t index = 0; index < count; ++index)
+    {
+        if (mRoutingLayerGroupId.has_value())
+        {
+            mQueuedRoutingEntries -= routingEventWeight(mEvents.front());
+        }
+        queued.push_back(std::move(mEvents.front()));
+        mEvents.pop_front();
+    }
+    lock.unlock();
     std::vector<KVCacheEvent> events;
-    events.reserve(mEvents.size());
-    std::move(mEvents.begin(), mEvents.end(), std::back_inserter(events));
-    mEvents.clear();
+    events.reserve(queued.size());
+    std::move(queued.begin(), queued.end(), std::back_inserter(events));
     return events;
+}
+
+int64_t EventManager::discardEvents()
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mPendingEvents.clear();
+    mLatestStoredEventIds.clear();
+    mLatestRemovedBlockHashes.clear();
+    mPendingRoutingEntries = 0;
+    mEvents.clear();
+    mQueuedRoutingEntries = 0;
+    return mDroppedEventCount;
+}
+
+void EventManager::close()
+{
+    std::unique_lock<std::mutex> lock(mMutex);
+    if (mClosed)
+    {
+        return;
+    }
+    if (mClosing)
+    {
+        mCondition.wait(lock, [&] { return mClosed; });
+        return;
+    }
+    mClosing = true;
+    mCondition.wait(lock, [&] { return mActiveGatherCount == 0; });
+    auto pendingEvents = drainPendingEventsUnlocked();
+    if (mAttentionDpGather && mAttentionDpRank != std::optional<int>{0})
+    {
+        mDroppedEventCount += static_cast<int64_t>(pendingEvents.size());
+    }
+    else
+    {
+        publishEventsUnlocked(std::move(pendingEvents));
+    }
+    mClosed = true;
+    mClosing = false;
+    lock.unlock();
+    mCondition.notify_all();
+}
+
+bool EventManager::acceptsRoutingLayerGroup(EventLayerGroupId layerGroupId) const
+{
+    return !mRoutingLayerGroupId.has_value() || layerGroupId == mRoutingLayerGroupId;
+}
+
+bool EventManager::isRoutingBlockSupported(Block const& block) const
+{
+    if (!mRoutingLayerGroupId.has_value())
+    {
+        return true;
+    }
+    auto const state = mV1HashStates.find(block.key);
+    return mHashAlgo == HashAlgorithm::kV1 && state != mV1HashStates.end() && state->second.compatible
+        && !state->second.rootAttrs.first.has_value() && !state->second.rootAttrs.second.has_value();
+}
+
+int64_t EventManager::getDroppedEventCount() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mDroppedEventCount;
+}
+
+int EventManager::getQueueHighWatermark() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mQueueHighWatermark;
+}
+
+bool EventManager::isClosedAndEmpty() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mClosed && mEvents.empty();
 }
 
 int EventManager::getWindowSize(EventLayerGroupId layerGroupId) const
@@ -477,6 +807,19 @@ int EventManager::getWindowSize(EventLayerGroupId layerGroupId) const
     }
     auto const windowSize = mWindowSizeByLayerGroup.find(*layerGroupId);
     return windowSize == mWindowSizeByLayerGroup.end() ? mWindowSize : windowSize->second;
+}
+
+int EventManager::routingEventWeight(KVCacheEvent const& event) const
+{
+    if (auto const* stored = std::get_if<KVCacheStoredData>(&event.data))
+    {
+        return std::max(1, static_cast<int>(stored->blocks.size()));
+    }
+    if (auto const* removed = std::get_if<KVCacheRemovedData>(&event.data))
+    {
+        return std::max(1, static_cast<int>(removed->blockHashes.size()));
+    }
+    return 1;
 }
 
 std::string EventManager::digestToHex(Digest const& digest)
@@ -535,14 +878,14 @@ std::optional<EventBlockHash> EventManager::parentHashFromBlock(Block const& blo
 }
 
 std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
-    Block const& block, std::optional<std::set<int>> const& lifeCycleIds)
+    Block const& block, std::optional<int> lifeCycleId)
 {
     CacheLevel cacheLevel = kHotLevel;
     Priority priority = kPriorityDefault;
     bool foundPage = false;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
     {
-        if (lifeCycleIds.has_value() && lifeCycleIds->count(lifeCycle.value()) == 0)
+        if (lifeCycleId.has_value() && lifeCycle.value() != *lifeCycleId)
         {
             continue;
         }
@@ -555,7 +898,7 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
             break;
         }
     }
-    if (lifeCycleIds.has_value() && !foundPage)
+    if (lifeCycleId.has_value() && !foundPage)
     {
         return std::nullopt;
     }
@@ -579,111 +922,6 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     }
     return KVCacheStoredBlockData{
         hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority, {}, std::nullopt};
-}
-
-uint64_t EventManager::hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash,
-    std::optional<LoraTaskIdType> loraTaskId, std::optional<std::uint64_t> cacheSaltId)
-{
-    uint64_t seed = static_cast<uint64_t>(tokens.size()) ^ (parentHash * kParentHashConst);
-    if (parentHash == 0 && cacheSaltId.has_value())
-    {
-        seed = hash64Mix(*cacheSaltId, seed);
-    }
-    for (TokenId token : tokens)
-    {
-        seed = hash32Mix(token, seed);
-    }
-    if (loraTaskId.has_value())
-    {
-        seed = hash64Mix(*loraTaskId, seed);
-    }
-    return seed;
-}
-
-uint64_t EventManager::v1HashFromBlock(Block const& block)
-{
-    if (auto const cached = mV1HashByBlockKey.find(block.key); cached != mV1HashByBlockKey.end())
-    {
-        return cached->second;
-    }
-
-    std::vector<Block const*> chain;
-    NodeBase const* current = &block;
-    uint64_t parentHash = 0;
-    bool parentIsV1Compatible = true;
-    V1RootAttrs rootAttrs;
-    while (current->type() == NodeBase::Type::kBLOCK)
-    {
-        auto const* currentBlock = static_cast<Block const*>(current);
-        if (auto const cached = mV1HashByBlockKey.find(currentBlock->key); cached != mV1HashByBlockKey.end())
-        {
-            parentHash = cached->second;
-            parentIsV1Compatible = mV1HashCompatibleKeys.count(currentBlock->key) != 0;
-            rootAttrs = mV1RootAttrsByBlockKey.at(currentBlock->key);
-            break;
-        }
-        chain.push_back(currentBlock);
-        current = currentBlock->prev;
-        if (current == nullptr)
-        {
-            throw std::logic_error("Cannot hash an orphan KV cache block");
-        }
-    }
-    if (current->type() == NodeBase::Type::kROOT_BLOCK)
-    {
-        auto const& reuseScope = static_cast<RootBlock const*>(current)->reuseScope;
-        rootAttrs = {reuseScope.loraId, reuseScope.salt};
-    }
-
-    for (auto chainIter = chain.rbegin(); chainIter != chain.rend(); ++chainIter)
-    {
-        Block const& currentBlock = **chainIter;
-        std::vector<TokenId> textTokens;
-        textTokens.reserve(currentBlock.tokens.size());
-        if (parentIsV1Compatible)
-        {
-            for (auto const& token : currentBlock.tokens)
-            {
-                if (token.isDigest())
-                {
-                    parentIsV1Compatible = false;
-                    break;
-                }
-                textTokens.push_back(token.tokenId());
-            }
-        }
-        if (parentIsV1Compatible)
-        {
-            parentHash = hashV1BlockKey(textTokens, parentHash, rootAttrs.first, rootAttrs.second);
-            mV1HashCompatibleKeys.insert(currentBlock.key);
-        }
-        else
-        {
-            parentHash = fallbackV1Hash(currentBlock.key);
-        }
-        mV1HashByBlockKey.insert_or_assign(currentBlock.key, parentHash);
-        mV1RootAttrsByBlockKey.insert_or_assign(currentBlock.key, rootAttrs);
-    }
-    return parentHash;
-}
-
-uint64_t EventManager::fallbackV1Hash(Digest const& blockKey)
-{
-    if (!mWarnedV1HashFallback)
-    {
-        TLLM_LOG_WARNING(
-            "V2 KV cache event hash algorithm v1_block_key only matches v1 for text-token radix blocks. "
-            "Falling back to truncated SHA-256 block hash for unsupported blocks.");
-        mWarnedV1HashFallback = true;
-    }
-    return truncateDigestToInt64(blockKey);
-}
-
-void EventManager::dropHashCache(Digest const& blockKey)
-{
-    mV1HashByBlockKey.erase(blockKey);
-    mV1HashCompatibleKeys.erase(blockKey);
-    mV1RootAttrsByBlockKey.erase(blockKey);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
