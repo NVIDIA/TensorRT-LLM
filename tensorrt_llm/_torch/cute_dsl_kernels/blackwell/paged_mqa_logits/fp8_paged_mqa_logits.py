@@ -178,6 +178,16 @@ def add_f16x2(
     )
 
 
+def _target_is_rubin() -> bool:
+    """Whether the JIT target is a Rubin arch (R100 sm_107 / R150 sm_109).
+
+    major==10 & minor>=7 is a heuristic: Arch.is_family_of is suffix-sensitive
+    (False for the base sm_107/sm_109, True only for sm_107a/sm_109a).
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch.major == 10 and arch.minor >= 7
+
+
 class FP8MQALogitsKernel:
     """FP8 paged MQA logits kernel for Blackwell (SM100).
 
@@ -205,6 +215,7 @@ class FP8MQALogitsKernel:
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         use_relu_trick: bool = True,
+        use_flat_logits_view=None,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -236,6 +247,14 @@ class FP8MQALogitsKernel:
         # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
         # (FMNMX). fp32 epilogue only -- f16x2 has no abs modifier.
         self.use_relu_trick = use_relu_trick
+        # Flat logits view + carried row offset: the store address is
+        # base + out_row*stride0 + kv_pos, but out_row only changes on a
+        # q-change, so recomputing the row term there leaves the hot path a
+        # single add. Auto-off on Rubin, where it regresses (the backend
+        # schedules the UMMA consumer-release late in the math loop).
+        if use_flat_logits_view is None:
+            use_flat_logits_view = not _target_is_rubin()
+        self.use_flat_logits_view = use_flat_logits_view
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
         # Without padding, e.g. fp16 + N=32 gives 64B per stage, so stage 1
@@ -1379,6 +1398,23 @@ class FP8MQALogitsKernel:
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
+                # The 2D alias keeps `mLogits` itself out of the gated store
+                # code: referencing a defined tensor from the untraced arm
+                # changes the loop-region captures, while an undefined name
+                # is dropped harmlessly.
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    # Sized by the pitched span (rows * stride0), not the
+                    # visible width: stores also cover the aligned padding
+                    # past max_context_len (the host allocates the full pitch).
+                    mLogits_flat = cute.make_tensor(
+                        mLogits.iterator,
+                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
+                    )
+                    out_row_off = cutlass.Int32(0)
+                else:
+                    mLogits_2d = mLogits
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -1393,6 +1429,8 @@ class FP8MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_row_off = self._atom_out_row_base(q_idx) * logits_stride0
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
@@ -1594,17 +1632,28 @@ class FP8MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = self._atom_out_row_base(q_idx) + t
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                        # relu trick's / 2 folds into the store scale.
+                        scale_eff = scale_val
+                        if cutlass.const_expr(self.use_relu_trick):
+                            scale_eff = scale_val * cutlass.Float32(0.5)
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_off_t = out_row_off + t * logits_stride0 + kv_pos
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_flat[out_off_t] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_flat[out_off_t] = self.output_dtype(result_t * scale_eff)
                         else:
-                            # relu trick's / 2 folds into the store scale.
-                            scale_eff = scale_val
-                            if cutlass.const_expr(self.use_relu_trick):
-                                scale_eff = scale_val * cutlass.Float32(0.5)
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_eff)
+                            out_row = self._atom_out_row_base(q_idx) + t
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * scale_eff
+                                )
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1648,6 +1697,23 @@ class FP8MQALogitsKernel:
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
+                # The 2D alias keeps `mLogits` itself out of the gated store
+                # code: referencing a defined tensor from the untraced arm
+                # changes the loop-region captures, while an undefined name
+                # is dropped harmlessly.
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    # Sized by the pitched span (rows * stride0), not the
+                    # visible width: stores also cover the aligned padding
+                    # past max_context_len (the host allocates the full pitch).
+                    mLogits_flat = cute.make_tensor(
+                        mLogits.iterator,
+                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
+                    )
+                    out_row_off = cutlass.Int32(0)
+                else:
+                    mLogits_2d = mLogits
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -1662,6 +1728,8 @@ class FP8MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_row_off = self._atom_out_row_base(q_idx) * logits_stride0
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
@@ -1844,17 +1912,28 @@ class FP8MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = self._atom_out_row_base(q_idx) + t
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                        # relu trick's / 2 folds into the store scale.
+                        scale_eff = scale_val
+                        if cutlass.const_expr(self.use_relu_trick):
+                            scale_eff = scale_val * cutlass.Float32(0.5)
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_off_t = out_row_off + t * logits_stride0 + kv_pos
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_flat[out_off_t] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_flat[out_off_t] = self.output_dtype(result_t * scale_eff)
                         else:
-                            # relu trick's / 2 folds into the store scale.
-                            scale_eff = scale_val
-                            if cutlass.const_expr(self.use_relu_trick):
-                                scale_eff = scale_val * cutlass.Float32(0.5)
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_eff)
+                            out_row = self._atom_out_row_base(q_idx) + t
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * scale_eff
+                                )
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
