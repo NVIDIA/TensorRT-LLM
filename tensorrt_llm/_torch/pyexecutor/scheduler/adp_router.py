@@ -50,7 +50,14 @@ if TYPE_CHECKING:
 
     from ..executor_request_queue import RequestQueueItem
 
-HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
+# ``num_tokens``/``num_requests`` are the PLACEMENT view: they order the heap and
+# may include work that is retiring on a rank. ``num_admitted`` is the ADMISSION
+# view: it is what the per-rank cap is tested against, and it counts only the
+# requests the router has actually assigned.
+HeapVal = namedtuple(
+    "HeapVal",
+    ["num_tokens", "num_requests", "rank", "request_list", "num_admitted"],
+)
 
 
 def _num_input_tokens(request) -> int:
@@ -427,6 +434,33 @@ class DefaultADPRouter(ADPRouter):
         }
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
+        # Placement must see the work that is retiring on a rank; admission must
+        # not. ``gather_all_rank_states`` nets GENERATION_TO_COMPLETE requests out
+        # of both vectors above when ``exclude_retiring_requests`` is set. That is
+        # right for the admission budget -- the seat is freed before the next
+        # admission is executed -- but wrong for choosing WHICH rank should run a
+        # new request: the teardown still runs on that rank on the next iteration,
+        # so a rank mid-teardown is not idle. Under the overlap scheduler the park
+        # phase differs across ranks, so dropping the term makes whichever rank
+        # most recently parked report the lightest load and win the placement.
+        #
+        # The retiring COUNT is transported in RankState; the retiring token mass
+        # is not, so it is estimated from the rank's own mean live-request size.
+        # An estimate is sufficient here because this value only ORDERS a heap --
+        # it never gates admission, and a rank with no live requests contributes
+        # its count term alone.
+        all_ranks_placement_requests = [
+            s.num_active_requests + s.num_retiring_requests for s in all_rank_states
+        ]
+        all_ranks_placement_tokens = [
+            s.num_active_tokens
+            + (
+                (s.num_active_tokens // s.num_active_requests) * s.num_retiring_requests
+                if s.num_active_requests
+                else 0
+            )
+            for s in all_rank_states
+        ]
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
@@ -460,6 +494,8 @@ class DefaultADPRouter(ADPRouter):
             all_ranks_num_active_requests,
             all_ranks_num_active_tokens,
             expected_num_active_requests,
+            all_ranks_placement_requests=all_ranks_placement_requests,
+            all_ranks_placement_tokens=all_ranks_placement_tokens,
         )
 
         return all_ranks_new_requests, expected_num_active_requests
@@ -471,6 +507,9 @@ class DefaultADPRouter(ADPRouter):
         all_ranks_num_active_requests: List[int],
         all_ranks_num_active_tokens: List[int],
         expected_num_active_requests: int,
+        *,
+        all_ranks_placement_requests: Optional[List[int]] = None,
+        all_ranks_placement_tokens: Optional[List[int]] = None,
     ) -> Dict[int, List]:
         """Balance requests across ranks for attention DP.
 
@@ -484,6 +523,21 @@ class DefaultADPRouter(ADPRouter):
             all_ranks_num_active_requests: Number of active requests per rank.
             all_ranks_num_active_tokens: Number of active tokens per rank.
             expected_num_active_requests: Target number of active requests per rank.
+            all_ranks_placement_requests: Per-rank request count used to ORDER
+                placement, including the retiring requests that
+                ``all_ranks_num_active_requests`` omits. Defaults to
+                ``all_ranks_num_active_requests``.
+            all_ranks_placement_tokens: Per-rank token mass used to ORDER
+                placement, including an estimate of the retiring tokens that
+                ``all_ranks_num_active_tokens`` omits. Defaults to
+                ``all_ranks_num_active_tokens``. This is the PRIMARY heap key, so
+                a retiring request missing from it outweighs the count term.
+
+        Both placement arguments affect ORDER only. Eligibility against
+        ``expected_num_active_requests`` always uses
+        ``all_ranks_num_active_requests``, so widening the placement view can
+        never make a rank ineligible nor shrink the pool the heap draws from.
+        Omitting both reproduces the previous behaviour exactly.
 
         Returns:
             Updated all_ranks_new_requests dict with new requests distributed.
@@ -491,15 +545,26 @@ class DefaultADPRouter(ADPRouter):
         if not new_requests:
             return all_ranks_new_requests
 
+        if all_ranks_placement_requests is None:
+            all_ranks_placement_requests = all_ranks_num_active_requests
+        if all_ranks_placement_tokens is None:
+            all_ranks_placement_tokens = all_ranks_num_active_tokens
+
         all_ranks_new_requests_heap = [
-            HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
+            HeapVal(
+                all_ranks_placement_tokens[tp_rank],
+                all_ranks_placement_requests[tp_rank],
+                tp_rank,
+                [],
+                val,
+            )
             for tp_rank, val in enumerate(all_ranks_num_active_requests)
         ]
 
         all_ranks_new_requests_heap = [
             val
             for val in all_ranks_new_requests_heap
-            if val.num_requests < expected_num_active_requests
+            if val.num_admitted < expected_num_active_requests
         ]
 
         all_ranks_new_scheduled_requests = {
@@ -516,10 +581,11 @@ class DefaultADPRouter(ADPRouter):
             val = val._replace(
                 num_tokens=val.num_tokens + token_count,
                 num_requests=val.num_requests + 1,
+                num_admitted=val.num_admitted + 1,
             )
 
             val.request_list.append(req_item)
-            if val.num_requests < expected_num_active_requests:
+            if val.num_admitted < expected_num_active_requests:
                 heapq.heappush(all_ranks_new_requests_heap, val)
 
         for rank, reqs in all_ranks_new_scheduled_requests.items():
