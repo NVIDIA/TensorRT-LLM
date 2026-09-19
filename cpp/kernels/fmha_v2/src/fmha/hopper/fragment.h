@@ -483,7 +483,11 @@ struct Softmax_saver_tma
         softmax_sum_ptr_ += bh_offset + row0_ * softmax_stats_stride_in_bytes_ + sizeof(float);
     };
 
-    inline __device__ void store(float* p_sum, float* p_max, float sqrt_d, int row_offset, bool valid_run)
+    // `softmax_scale` must be the scale the softmax actually applied to the raw
+    // BMM1 output, i.e. 1/(sqrt(d) * q_scaling). Passing 1/sqrt(d) silently drops
+    // q_scaling and exports a max that no longer matches the exported sum, which
+    // breaks any consumer merging chunks via exp(max_i - max).
+    inline __device__ void store(float* p_sum, float* p_max, float softmax_scale, int row_offset, bool valid_run)
     {
         // Four threads process two rows in mma, each row has one softmax_sum and one softmax_max.
         // Here we use one thread to write one softmax element.
@@ -495,7 +499,7 @@ struct Softmax_saver_tma
         }
         else
         {
-            values = p_max[lane % 2] / sqrt_d;
+            values = p_max[lane % 2] * softmax_scale;
         }
         if (!valid_run && (lane % 4) < 2)
         {
