@@ -55,6 +55,7 @@ from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod, _import_deep_gemm
 from ..routing import BaseMoeRoutingMethod
+from ._symm_preflight import symm_buffer_preflight
 
 __all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
 
@@ -735,6 +736,11 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         )
         cached = _take_cached_symm_buffer(key, self._ep_pg)
         if cached is None:
+            # Drain any inherited CUDA fault and check the NVLink
+            # symmetric-memory prerequisites before entering DeepGEMM's
+            # unsynchronized allocate/rendezvous/zero_/barrier sequence.
+            # Diagnostic by default; see ``_symm_preflight`` and NVBug 6713426.
+            symm_buffer_preflight(self._ep_pg, layer_idx=self.layer_idx)
             cached = self._dg.get_symm_buffer_for_mega_moe(
                 self._ep_pg,
                 self.num_slots,
