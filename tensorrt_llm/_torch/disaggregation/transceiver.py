@@ -549,14 +549,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _validate_draft_history_range(req: LlmRequest, history: dict) -> None:
         # The shared transfer extent covers the complete prompt. Draft noise KV is scratch,
         # never valid history. A partial history needs per-group extents before it can be sent.
-        if (
-            not isinstance(history, dict)
-            or type(history.get("valid_length")) is not int
-            or type(history.get("position")) is not int
-            or not isinstance(history.get("layout"), dict)
-            or history["valid_length"] != req.prompt_len
-            or history["position"] != req.prompt_len
-        ):
+        if history["valid_length"] != req.prompt_len or history["position"] != req.prompt_len:
             raise ValueError(
                 "Standalone DSpark transfer requires valid draft history and sequence position "
                 f"covering the complete prompt ({req.prompt_len} tokens)."
@@ -573,7 +566,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return history
 
     def _received_draft_history(self, req: LlmRequest) -> Optional[dict]:
-        self._validate_draft_transfer(req)
         history = getattr(req, "py_draft_transfer_history", None)
         manager = getattr(self, "_kv_cache_manager", None)
         has_draft = getattr(manager, "draft_layout", None) is not None
@@ -589,12 +581,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 "Received standalone DSpark draft history without a manager-owned draft cache."
             )
         self._validate_draft_history_range(req, history)
-        if history["layout"] != self._kv_cache_manager.draft_layout.transfer_identity():
-            raise ValueError(
-                "Standalone DSpark draft cache layouts do not match between prefill and "
-                "generation workers. Matching draft dtype, backend, and per-rank geometry "
-                "are required."
-            )
         return history
 
     def _restore_draft_history(self, req: LlmRequest) -> None:

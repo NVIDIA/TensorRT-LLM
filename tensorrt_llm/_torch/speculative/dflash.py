@@ -564,7 +564,7 @@ class DFlashWorker(SpecWorkerBase):
         return True
 
     def _refresh_ctx_block_tables(
-        self, attn_metadata, num_seqs: int, request_ids: Optional[list[int]] = None
+        self, attn_metadata, num_seqs: int, request_ids: list[int]
     ) -> bool:
         """Decode this iteration's draft block table into the persistent buffer.
 
@@ -575,8 +575,6 @@ class DFlashWorker(SpecWorkerBase):
         if self._ctx_block_tables is None or num_seqs <= 0:
             return False
         if self._has_unified_draft_cache():
-            if request_ids is None:
-                raise ValueError("Unified DSpark draft pages require local request IDs")
             table = self._ctx_kv_manager.get_draft_block_table(request_ids[:num_seqs])
             self._ctx_block_tables[:num_seqs].copy_(table, non_blocking=True)
             return True
@@ -724,7 +722,7 @@ class DFlashWorker(SpecWorkerBase):
                 kv_shape = (num_slots, L, capacity, nkv, hd)
                 self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
                 self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
-            elif self._dflash_attention_backend == "TRTLLM":
+            else:  # TRTLLM; StandaloneDraftLayout validates the backend.
                 validate_dflash_trtllm_gen_runtime(
                     dtype=dtype,
                     num_heads=nh,
@@ -735,8 +733,6 @@ class DFlashWorker(SpecWorkerBase):
                         not draft_model._get_attention_mask_args(i)[0] for i in range(L)
                     ),
                 )
-            else:
-                raise ValueError("Unified DSpark supports VANILLA and TRTLLM draft attention")
         elif self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
             pool = (
                 self._managed_ctx_pool(draft_kv_cache_manager, L, nkv, hd, dtype)

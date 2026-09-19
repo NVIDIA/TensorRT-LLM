@@ -121,42 +121,31 @@ _DRAFT_BACKEND_CODES = {"VANILLA": 1, "TRTLLM": 2}
 
 
 def _encode_draft_history(history: dict[str, Any]) -> list[int]:
-    """Encode committed history and rank-local storage identity for the wire."""
-    if not isinstance(history, dict):
+    """Serialize the manager's validated history and rank-local storage identity."""
+    if history is None:
         raise ValueError("Standalone draft transfer requires draft history metadata")
-    layout = history.get("layout")
-    if not isinstance(layout, dict):
-        raise ValueError("Standalone draft transfer requires a storage layout")
-    integer_values = [
-        history.get("valid_length"),
-        history.get("position"),
-        layout.get("num_layers"),
-        layout.get("num_kv_heads"),
-        layout.get("head_dim"),
+    layout = history["layout"]
+    return [
+        _DRAFT_HISTORY_VERSION,
+        history["valid_length"],
+        history["position"],
+        layout["num_layers"],
+        layout["num_kv_heads"],
+        layout["head_dim"],
+        _DRAFT_DTYPE_CODES[layout["dtype"]],
+        _DRAFT_BACKEND_CODES[layout["attention_backend"]],
     ]
-    if any(type(value) is not int for value in integer_values):
-        raise ValueError(
-            "Standalone draft transfer metadata requires integer lengths and dimensions"
-        )
-    valid_length, position, num_layers, num_kv_heads, head_dim = integer_values
-    if valid_length < 0 or position < valid_length:
-        raise ValueError("Invalid standalone draft history length or position")
-    if min(num_layers, num_kv_heads, head_dim) <= 0:
-        raise ValueError("Standalone draft transfer dimensions must be positive")
-    dtype_code = _DRAFT_DTYPE_CODES.get(layout.get("dtype"))
-    backend_code = _DRAFT_BACKEND_CODES.get(layout.get("attention_backend"))
-    if dtype_code is None or backend_code is None:
-        raise ValueError("Unsupported standalone draft transfer dtype or attention backend")
-    return [_DRAFT_HISTORY_VERSION, *integer_values, dtype_code, backend_code]
 
 
 def _decode_draft_history(values: list[int]) -> dict[str, Any]:
-    if len(values) != _DRAFT_HISTORY_FIELDS or values[0] != _DRAFT_HISTORY_VERSION:
+    if values[0] != _DRAFT_HISTORY_VERSION:
         raise ValueError("Missing or unsupported standalone draft history metadata version")
     _, valid_length, position, num_layers, num_kv_heads, head_dim, dtype_code, backend_code = values
     dtypes = {code: name for name, code in _DRAFT_DTYPE_CODES.items()}
     backends = {code: name for name, code in _DRAFT_BACKEND_CODES.items()}
-    history = {
+    # The receiving transceiver validates prompt coverage and the manager checks
+    # storage identity and local allocation before publishing this history.
+    return {
         "valid_length": valid_length,
         "position": position,
         "layout": {
@@ -167,8 +156,6 @@ def _decode_draft_history(values: list[int]) -> dict[str, Any]:
             "attention_backend": backends.get(backend_code),
         },
     }
-    _encode_draft_history(history)
-    return history
 
 
 class AuxBufferBase(ABC):
@@ -409,7 +396,7 @@ class AuxBuffer(AuxBufferBase):
         return first_gen_tokens, draft_tokens, (int(prompt_tokens), int(cached_tokens))
 
     def get_slot_draft_history(self, slot: int) -> dict[str, Any]:
-        """Read transferred history, rejecting missing or unsupported metadata."""
+        """Decode transferred history for validation against the receiving request/cache."""
         if slot not in self._occupied_slots:
             raise ValueError(f"Cannot read slot {slot}: slot is not currently allocated.")
         if self._draft_history_buffer is None:

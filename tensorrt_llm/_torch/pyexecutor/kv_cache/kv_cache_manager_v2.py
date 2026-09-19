@@ -1187,18 +1187,8 @@ class KVCacheManagerV2(BaseResourceManager):
             standalone_draft_layout.extra_tokens if standalone_draft_layout is not None else 0
         )
         if standalone_draft_layout is not None:
-            if KV_CACHE_MANAGER_V2_BACKEND != "python":
-                raise ValueError(
-                    "Unified standalone draft KV requires TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"
-                )
-            if is_draft or mapping.pp_size != 1 or mapping.cp_size != 1:
-                raise ValueError(
-                    "Unified standalone draft KV requires one target manager and PP=CP=1"
-                )
             if kv_cache_config.enable_block_reuse:
                 raise ValueError("Unified standalone draft KV does not yet support prefix reuse")
-            if kv_connector_manager is not None:
-                raise ValueError("Unified standalone draft KV does not yet support KV connectors")
             if kv_cache_config.enable_swa_scratch_reuse:
                 raise ValueError(
                     "Unified standalone draft KV does not yet support SWA scratch reuse"
@@ -3193,8 +3183,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_draft_block_table(self, request_ids: List[int]) -> torch.Tensor:
         """Current rank-local page mappings; unused tail entries point to page zero."""
-        if self.draft_layout is None:
-            raise ValueError("No unified standalone draft cache is configured")
         layer_id = self.layer_offsets[self.draft_layer_ids[0]]
         pool_id = self.impl.get_layer_group_id(layer_id)
         scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
@@ -3217,8 +3205,6 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.draft_history.get(request_id)
 
     def set_draft_history(self, request_id: int, valid_length: int, position: int) -> None:
-        if self.draft_layout is None:
-            raise ValueError("No unified standalone draft cache is configured")
         cache = self.kv_cache_map.get(request_id)
         if cache is None or not cache.is_active:
             raise ValueError(
@@ -3251,10 +3237,6 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError("Standalone draft transfer layout does not match the receiving worker")
         valid_length = metadata.get("valid_length")
         position = metadata.get("position")
-        if type(valid_length) is not int or type(position) is not int:
-            raise ValueError(
-                "Standalone draft transfer history must use integer lengths and positions"
-            )
         # Accessing the receiving mapping here verifies ownership before the
         # worker can see this history. The sender's slot/page IDs are never used.
         self.get_draft_block_table([request_id])

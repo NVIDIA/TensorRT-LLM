@@ -1748,10 +1748,6 @@ class KvCacheCreator:
             raise ValueError(
                 "Standalone DSpark draft-state transfer requires the PYTHON "
                 "NIXL transceiver on both workers.")
-        if self._draft_config is None:
-            raise ValueError(
-                "Unified standalone DSpark KV cache requires the loaded "
-                "standalone draft model configuration.")
 
     def _get_standalone_draft_layout(self) -> StandaloneDraftLayout:
         """Describe distinct standalone layers without borrowing target shapes."""
