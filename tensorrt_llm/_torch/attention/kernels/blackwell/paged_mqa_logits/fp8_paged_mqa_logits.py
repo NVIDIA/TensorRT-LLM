@@ -192,6 +192,7 @@ class FP8MQALogitsKernel:
         num_heads: int = 64,
         head_dim: int = 128,
         next_n: int = 1,
+        num_next_n_atoms: int = 1,
         num_sms: int = 148,
         remove_kv_wait_in_epilogue: bool = False,
         early_tmem_copy: bool = False,
@@ -218,8 +219,16 @@ class FP8MQALogitsKernel:
         self.smem_subpartition_opt = smem_subpartition_opt
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.next_n = next_n
-        self.N = next_n * num_heads
+        self.next_n = next_n  # logical next-token count (drives output row layout)
+        # In-kernel atom split: next_n is decomposed into num_next_n_atoms atoms
+        # of next_n_atom positions each (1 => direct). The MMA/TMEM N tile is
+        # sized by the per-atom next_n; the logical next_n still drives out_row.
+        assert next_n % num_next_n_atoms == 0, (
+            f"num_next_n_atoms={num_next_n_atoms} must divide next_n={next_n}"
+        )
+        self.num_next_n_atoms = num_next_n_atoms
+        self.next_n_atom = next_n // num_next_n_atoms
+        self.N = self.next_n_atom * num_heads
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
@@ -294,6 +303,24 @@ class FP8MQALogitsKernel:
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
+
+    def _atom_seq(self, qa):
+        """Native sequence (block_table / context_lens row) of a q_atom_idx.
+        num_next_n_atoms == 1 => identity."""
+        return qa // self.num_next_n_atoms
+
+    def _atom_ctx_len(self, qa, context_lens):
+        """Per-atom context length: atom i (= qa % num_atoms, 0 = oldest) sees
+        ctx shortened by (num_atoms-1-i)*next_n_atom so the split's staggered
+        causal limits match the unsplit next_n. num_atoms == 1 => ctx[qa]."""
+        na = self.num_next_n_atoms
+        return context_lens[qa // na] - (na - 1 - qa % na) * self.next_n_atom
+
+    def _atom_out_row_base(self, qa):
+        """Output row base for a q_atom_idx: seq*next_n + atom*next_n_atom (the
+        +t within the atom is added by the caller). num_atoms == 1 => qa*next_n."""
+        na = self.num_next_n_atoms
+        return (qa // na) * self.next_n + (qa % na) * self.next_n_atom
 
     def _setup_mma(self, a_dtype, b_dtype, a_major, b_major):
         self.a_dtype = a_dtype
@@ -581,6 +608,10 @@ class FP8MQALogitsKernel:
         # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
         NUM_MATH_WG = 2  # kNumMathWarpGroups
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
+        # In-kernel atom-split addressing lives in the self._atom_* methods
+        # (identity when num_next_n_atoms == 1). qa is a q_atom_idx in
+        # [0, batch*num_atoms): seq = qa//num_atoms is the native block_table /
+        # context_lens row, atom = qa%num_atoms (0 = oldest, shortest context).
         sm_idx = bidz
         start_q = mScheduleMeta[(sm_idx, 0)]
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
@@ -592,7 +623,9 @@ class FP8MQALogitsKernel:
         # Note: zero-work CTAs get a stale current_num_kv (from the last batch
         # element), but it is never used because has_work will be False.
         start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
+        current_num_kv = (
+            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
+        ) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -605,7 +638,9 @@ class FP8MQALogitsKernel:
 
         block_kv_val = self.block_kv
         num_heads = self.num_heads
-        next_n = self.next_n
+        # Positions processed per kernel task = one atom (next_n_atom). The
+        # logical next_n only appears in the output row stride (_atom_out_row_base).
+        next_n = self.next_n_atom
         num_epi_subtiles = self.num_epi_subtiles
 
         # === Pipelines ===
@@ -1004,7 +1039,7 @@ class FP8MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[(self._atom_seq(q_idx), base_phys + i)]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1041,7 +1076,9 @@ class FP8MQALogitsKernel:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = (
+                            self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
+                        ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1073,7 +1110,7 @@ class FP8MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[(self._atom_seq(q_idx), base_phys + i)]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1110,7 +1147,9 @@ class FP8MQALogitsKernel:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = (
+                            self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
+                        ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1178,7 +1217,7 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1244,7 +1283,7 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1505,7 +1544,7 @@ class FP8MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
+                        out_row = self._atom_out_row_base(q_idx) + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             mLogits[(out_row, kv_pos)] = self.output_dtype(
                                 result_t * Float16(scale_val)
@@ -1524,7 +1563,7 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1755,7 +1794,7 @@ class FP8MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
+                        out_row = self._atom_out_row_base(q_idx) + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             mLogits[(out_row, kv_pos)] = self.output_dtype(
                                 result_t * Float16(scale_val)
@@ -1774,7 +1813,7 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
