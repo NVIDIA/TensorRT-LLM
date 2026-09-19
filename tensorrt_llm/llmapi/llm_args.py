@@ -2314,6 +2314,10 @@ class MooncakeStoreConfig(StrictBaseModel):
     Setting this makes `trtllm-serve` render the Mooncake client config and
     export `MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH`
     still wins, so an externally managed pool stays reachable.
+
+    Fields opt out of telemetry because they size and address one site's pool
+    rather than saying which features are in use; `kv_connector_config.connector`
+    already records that the store is on.
     """
     master_server_address: Optional[str] = Field(
         None,
@@ -2364,11 +2368,13 @@ class MooncakeStoreConfig(StrictBaseModel):
         "with protocol 'tcp'.")
     global_segment_size: Union[int, str] = Field(
         "16GiB",
+        telemetry=False,
         description="Host memory each worker process contributes to the pool. "
         "Pool capacity is this times the number of processes that open a "
         "store handle, so a prefill-only connector gives a prefill-only pool.")
     local_buffer_size: Union[int, str] = Field(
         "1GiB",
+        telemetry=False,
         description="Per-process Mooncake transfer buffer, not pool capacity.")
     transfer_batch_size: int = Field(64,
                                      telemetry=False,

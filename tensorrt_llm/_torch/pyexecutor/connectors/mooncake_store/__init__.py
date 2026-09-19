@@ -34,9 +34,11 @@ Mooncake Python bindings (`pip install mooncake-transfer-engine`).
 `keys.py` and `staging.py` hold what the store side shares with the connector
 that moves pages in and out of the pool: how a block of tokens becomes a store
 key, and how pages reach the fabric on hosts without GPUDirect RDMA.
+`connector.py` holds the connector classes, which are placeholders.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
+from .connector import MooncakeStoreConnectorScheduler, MooncakeStoreConnectorWorker
 from .donor import DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment, maybe_donate_segment
 from .master import (
     local_address,
@@ -52,6 +54,8 @@ from .master import (
 __all__ = [
     "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
     "MooncakeStoreConnectorConfig",
+    "MooncakeStoreConnectorScheduler",
+    "MooncakeStoreConnectorWorker",
     "StoreRole",
     "donate_segment",
     "local_address",

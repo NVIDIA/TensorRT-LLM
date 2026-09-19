@@ -1608,10 +1608,16 @@ def serve(
                         "https://buf.build/gen/python "
                         "\"tensorrt_llm[openengine]\"`.") from error
 
-                launch_grpc_server(host,
-                                   port,
-                                   llm_args,
-                                   served_model_name=served_model_name)
+                # launch_smg_server provisions from inside itself; OpenEngine's
+                # server is an optional package this repo does not own, so the
+                # pool is brought up around it here instead. Either way the
+                # context has to outlive engine construction, which happens
+                # inside the launch call.
+                with _provision_kv_cache_pool(llm_args):
+                    launch_grpc_server(host,
+                                       port,
+                                       llm_args,
+                                       served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

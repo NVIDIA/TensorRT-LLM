@@ -200,6 +200,15 @@ def mooncake_master(
     help="Mooncake metadata service. Defaults to --config's, else P2PHANDSHAKE.",
 )
 @click.option(
+    "--local_buffer_size",
+    type=str,
+    default=None,
+    help="Mooncake transfer buffer for this process. Deliberately "
+    "separate from a config's local_buffer_size, which is sized for "
+    "an engine worker: a donor never transfers, and only needs one "
+    "because setup rejects a zero-sized buffer. Defaults to 64MiB.",
+)
+@click.option(
     "--ready_file",
     type=str,
     default=None,
@@ -221,6 +230,7 @@ def mooncake_donor(
     protocol: Optional[str],
     device_name: Optional[str],
     metadata_server: Optional[str],
+    local_buffer_size: Optional[str],
     ready_file: Optional[str],
     heartbeat_seconds: int,
 ):
@@ -266,8 +276,8 @@ def mooncake_donor(
         protocol=protocol or raw.get("protocol", "rdma"),
         device_name=device_name or raw.get("device_name", "") or "",
         metadata_server=(metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER),
-        local_buffer_size=parse_size(
-            raw.get("local_buffer_size_donor", DEFAULT_DONOR_LOCAL_BUFFER_SIZE)
+        local_buffer_size=(
+            parse_size(local_buffer_size) if local_buffer_size else DEFAULT_DONOR_LOCAL_BUFFER_SIZE
         ),
     ) as host:
         if ready_file:
