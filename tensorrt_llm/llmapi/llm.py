@@ -1656,6 +1656,14 @@ class BaseLLM:
                 f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
                 f"to be passed explicitly to the `LLM()` constructor.")
 
+        if sampling_params.return_routed_experts and not (
+                self.args.backend == "pytorch"
+                and getattr(self.args, "enable_return_routed_experts", False)):
+            raise ValueError(
+                "`sampling_params.return_routed_experts=True` requires "
+                "`LLM(enable_return_routed_experts=True)` on the PyTorch backend "
+                "(Router Replay): routes are not captured otherwise.")
+
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,
                                          mpi_session=self.mpi_session,

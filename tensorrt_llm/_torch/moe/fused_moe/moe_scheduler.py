@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
@@ -350,8 +351,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
         workspace: Optional[dict] = None,
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        row_offset: Optional[int] = 0,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
+
+        ``row_offset`` is the first forward row this chunk covers (Router Replay
+        capture); ``None`` disables capture for the chunk (DP empty-chunk
+        substitution re-runs chunk 0's rows, which are already captured).
 
         Flow:
           1. EPLB - Start wait GPU stage (first call only, dynamic only)
@@ -406,6 +412,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 used_fused_route_quant = True
 
             token_selected_experts = token_selected_experts.to(torch.int32)
+            if row_offset is not None:
+                route_capture = get_active_route_capture()
+                if route_capture is not None:  # R3: in-graph device-buffer capture
+                    route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
 
             assert token_selected_experts.shape[1] == moe.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
@@ -704,11 +714,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Execute chunking with overlap ==========
         outputs_list = []
+        # Router Replay: chunk-local routing rows map to forward rows
+        # [row_offset, row_offset + chunk_size); substituted empty chunks
+        # (chunked_used False) recompute chunk 0 and must not be captured.
+        row_offset = 0
         for idx_chunk, (x_chunk, router_logits_chunk, input_ids_chunk) in enumerate(
             zip(x_list, router_logits_list, input_ids_list)
         ):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
+            chunk_row_offset = row_offset if chunked_used[idx_chunk] else None
 
             if use_multi_stream:
                 # Alternate streams; each chunk fully owns its (forward + reducescatter).
@@ -727,6 +742,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                             workspace=workspace_0,
                             input_ids=input_ids_chunk,
                             lora_params=lora_params,
+                            row_offset=chunk_row_offset,
                         )
                 else:
                     outputs = self._forward_chunk_impl(
@@ -741,6 +757,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         workspace=workspace_1,
                         input_ids=input_ids_chunk,
                         lora_params=lora_params,
+                        row_offset=chunk_row_offset,
                     )
             else:
                 outputs = self._forward_chunk_impl(
@@ -755,8 +772,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     workspace=workspace_0,
                     input_ids=input_ids_chunk,
                     lora_params=lora_params,
+                    row_offset=chunk_row_offset,
                 )
 
+            row_offset += chunk_size_list[idx_chunk]
             if chunked_used[idx_chunk]:
                 outputs_list.append(outputs)
 
@@ -1085,6 +1104,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         """
         moe = self.moe
         outputs: List[torch.Tensor] = []
+        row_offset = 0  # Router Replay: first forward row of the current chunk
         for idx_chunk in range(num_chunks):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
@@ -1114,7 +1134,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 is_first_call=is_first_call,
                 is_last_call=is_last_call,
                 input_ids=input_ids_chunk,
+                row_offset=row_offset,
             )
+            row_offset += x_chunk.shape[0]
             outputs.append(out_chunk)
         return outputs
 
@@ -1129,8 +1151,12 @@ class FusedCommMoEScheduler(MoEScheduler):
         is_first_call: bool = True,
         is_last_call: bool = True,
         input_ids: Optional[torch.Tensor] = None,
+        row_offset: int = 0,
     ) -> torch.Tensor:
         """Run a single chunk through the fused-comm backend.
+
+        ``row_offset`` is the first (ADP-stripped) forward row of this chunk,
+        used by Router Replay capture to place chunk-local routing rows.
 
         Inputs are already ADP-stripped by the caller; ``x.shape[0]`` is
         the true unpadded per-rank token count for this chunk.
@@ -1183,6 +1209,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 router_logits_chunk_real, input_ids_chunk_real
             )
             token_selected_experts = token_selected_experts.to(torch.int32)
+            route_capture = get_active_route_capture()
+            if route_capture is not None:  # R3: in-graph device-buffer capture
+                route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
             token_final_scales = token_final_scales.to(torch.float32)
         else:
             device = x.device
