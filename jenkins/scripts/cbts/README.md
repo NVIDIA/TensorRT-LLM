@@ -37,19 +37,20 @@ filter chain.
 
 ## Rules
 
-Nine rules, registered in `main.py::RULE_CLASSES`:
+Ten rules, registered in `main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
-| `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
-| `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
-| `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) |
-| `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) |
-| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
+| `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. docs; other suffixes incl. images kept as potential test fixtures) |
+| `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (excl. docs; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
+| `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. docs; other suffixes incl. images kept as potential test fixtures) |
+| `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) |
+| `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) |
+| `DocsRule` | `docsonly` | `docs/**`, `**/*.md`, `**/*.rst` → `CPU-Build_Docs` plus the complete `l0_cpu` suite |
+| `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, QA / dev test lists, `.test_durations`, `microbenchmarks/` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
 
 See `rules/README.md` for per-rule logic.
 
@@ -60,13 +61,14 @@ See `rules/README.md` for per-rule logic.
 | `waiveonly` | `WaivesRule` fired solo: PR only edits `waives.txt`. |
 | `testdefonly` | `TestsDefRule` fired solo: PR only edits files under `tests/**/*`. |
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
-| `autodeployonly` | `AutoDeployRule` fired solo: PR only touches AutoDeploy source paths (`examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**`; excl. `.md`). Narrows to AD-only blocks (`backend: autodeploy` plus blocks containing `test_llm_api_autodeploy.py` / `_autodeploy-` entries). |
-| `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`; excl. `.md`; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files under `tensorrt_llm/visual_gen/**` and `tensorrt_llm/media/**` (eagerly imported by `trtllm-serve`) force `null` fallback. |
-| `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. `.md`). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
-| `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. `.md`). Runs `CPU-AgentFlow-UnitTest`. |
-| `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. `.md`). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
-| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `autodeployonly`, `visualgenonly`, `specdeconly`, `agentflowonly`, `openengineonly`); their narrows union. |
-| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry, docs-only edits). Layer 2 still applies. |
+| `autodeployonly` | `AutoDeployRule` fired solo: PR only touches AutoDeploy source paths (`examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**`; excl. docs). Narrows to AD-only blocks (`backend: autodeploy` plus blocks containing `test_llm_api_autodeploy.py`, `_autodeploy-`, or `unittest/auto_deploy/standalone/` entries). |
+| `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`; excl. docs; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files under `tensorrt_llm/visual_gen/**` and `tensorrt_llm/media/**` (eagerly imported by `trtllm-serve`) force `null` fallback. |
+| `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. docs). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
+| `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
+| `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
+| `docsonly` | `DocsRule` fired solo: documentation changes run the dedicated `CPU-Build_Docs` Doxygen/Sphinx stage and the complete `l0_cpu` suite on the matching `CPU-Generic-*` stages. |
+| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `autodeployonly`, `visualgenonly`, `specdeconly`, `agentflowonly`, `openengineonly`, `docsonly`); their narrows union. |
+| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry). Layer 2 still applies. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 
 `_combine_scopes` (main.py): rules with `scope="noop"` give way to any
@@ -90,6 +92,7 @@ jenkins/scripts/cbts/
 │   ├── base.py            Rule ABC + PRInputs + RuleResult
 │   ├── _helpers.py        diff iteration + lookup-into-block_filters + stages_by_yaml_stem
 │   ├── waives_rule.py
+│   ├── docs_rule.py
 │   ├── tests_def_rule.py
 │   ├── test_list_rule.py
 │   ├── auto_deploy_rule.py

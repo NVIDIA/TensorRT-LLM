@@ -22,9 +22,9 @@ enforces AD's outbound import discipline.
 Block selection (see RULES_BACKLOG.md P1 Output):
 - Primary: `condition.terms.backend == 'autodeploy'`.
 - Supplementary: blocks containing entries with `test_llm_api_autodeploy.py`
-  in the path or `_autodeploy-` in the parametrize id. These cover the
-  3 entries that live in `backend: pytorch` blocks because Jenkins has
-  no `L40S-AutoDeploy-*` / `H100-Perf-AutoDeploy-*` stage.
+  in the path, `_autodeploy-` in the parametrize id, or tests under
+  `unittest/auto_deploy/standalone/`. These cover AD tests that live in
+  non-AD blocks because Jenkins has no matching AutoDeploy stage for them.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from blocks import Stage, YAMLIndex, _entry_target
 
 from ._helpers import is_perf_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 # Source paths AutoDeployRule claims. Tests under tests/unittest/auto_deploy/
 # and tests/integration/defs/accuracy/test_llm_api_autodeploy.py are left to
@@ -50,26 +51,28 @@ _AD_SRC_PREFIXES: tuple[str, ...] = (
 # - `_autodeploy-`: cross-codebase parametrize id used by trtllm-bench
 #   and the literal trigger string for AD's lazy imports in
 #   `commands/serve.py`.
-# Audit (2026-05): exactly 3 entries in 2 blocks rely on this match.
+# - `unittest/auto_deploy/standalone/`: standalone-package validation lives
+#   in a generic PyTorch block but directly consumes the AutoDeploy package.
 _AD_LEAKER_PATTERNS: tuple[str, ...] = (
     "test_llm_api_autodeploy.py",
     "_autodeploy-",
+    "unittest/auto_deploy/standalone/",
 )
 
 
 def _is_ad_claim(path: str) -> bool:
     """Decide whether AutoDeployRule claims `path`.
 
-    `*.md` files are excluded so docs-only PRs (e.g.
-    `examples/auto_deploy/README.md`) don't force AD stages —
-    `OutOfScopeRule` claims them as noop instead. Other suffixes
+    Documentation files are excluded so docs-only PRs (e.g.
+    `examples/auto_deploy/README.md`) don't force AD stages; `DocsRule`
+    routes them to the docs build instead. Other suffixes
     (`.png` / `.jpg` / etc.) are NOT excluded here: a binary asset
     under an AD path could be a test fixture, so the rule keeps
     claiming them and forces AD stages to re-run (safe over-run).
     """
     if not path.startswith(_AD_SRC_PREFIXES):
         return False
-    if path.endswith(".md"):
+    if is_docs_path(path):
         return False
     return True
 

@@ -62,6 +62,7 @@ from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.agent_flow_rule import AgentFlowRule  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult, format_reason  # noqa: E402
+from rules.docs_rule import DocsRule  # noqa: E402
 from rules.openengine_rule import OpenEngineRule  # noqa: E402
 from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
 from rules.spec_dec_rule import SpecDecRule  # noqa: E402
@@ -85,6 +86,7 @@ RULE_CLASSES: list[type[Rule]] = [
     SpecDecRule,
     AgentFlowRule,
     OpenEngineRule,
+    DocsRule,
     OutOfScopeRule,
 ]
 
@@ -103,6 +105,7 @@ def build_rules(
         SpecDecRule(yaml_index, stages),
         AgentFlowRule(yaml_index, stages),
         OpenEngineRule(yaml_index, stages),
+        DocsRule(yaml_index, stages),
         OutOfScopeRule(yaml_index, stages),
     ]
 
@@ -223,6 +226,7 @@ _TESTSONLY_FAMILY: frozenset[str] = frozenset(
         "specdeconly",
         "agentflowonly",
         "openengineonly",
+        "docsonly",
     }
 )
 
