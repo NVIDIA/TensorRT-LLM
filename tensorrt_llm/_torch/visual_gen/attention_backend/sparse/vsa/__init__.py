@@ -12,18 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-CuTe DSL attention backend family for visual generation models.
 
-  fmha.py      — CuTeDSLAttention  (dense and blockscaled JIT FMHA)
-  sol_attn.py  — SolAttention      (Sol-Attn dynamic block routing, CuTe JIT + SDPA fallback)
-"""
+"""Video Sparse Attention backends and shared prediction for VisualGen."""
 
-from .fmha import CuTeDSLAttention, _cute_dsl_import_error
-from .sol_attn import SolAttention
+from .metadata import (
+    VSA_TILE_SIZE,
+    VSAMetadata,
+    VSAMetadataBuilder,
+    get_vsa_forward_context,
+    set_vsa_forward_context,
+)
+from .predictor import VSAForwardInputs, VSAPredictor, VSAPreprocessor
 
 __all__ = [
-    "CuTeDSLAttention",
-    "_cute_dsl_import_error",
-    "SolAttention",
+    "VSA_TILE_SIZE",
+    "VSAForwardInputs",
+    "VSAMetadata",
+    "VSAMetadataBuilder",
+    "VSAPredictor",
+    "VSAPreprocessor",
+    "get_vsa_forward_context",
+    "set_vsa_forward_context",
 ]

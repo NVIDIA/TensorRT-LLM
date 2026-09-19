@@ -17,7 +17,7 @@ CuTe DSL (NVIDIA kernels) FMHA Backend for Visual Generation Models
 
 JIT-compiles dense or SkipSoftmax FMHA and caches the compiled artifact for each kernel
 configuration. Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16 inputs. The VSA
-sparse path uses VSAAttention from vsa.py instead.
+sparse backend uses `VSACuTeDSLAttention` in `attention_backend.sparse.vsa` instead.
 """
 
 import math
