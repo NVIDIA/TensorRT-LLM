@@ -684,6 +684,36 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.check_interval"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.cooldown_secs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.moving_average_decay"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.ratio_tolerance"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",

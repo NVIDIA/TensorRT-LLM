@@ -62,7 +62,11 @@ from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
+    CacheTransceiverConfig,
+    KvPoolRebalanceConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -115,6 +119,10 @@ class KvCacheConfigV2:
     enable_swa_scratch_reuse: bool = False
     disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
+    # Mirrors KvCacheConfig.kv_pool_rebalance_config in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads it unconditionally.
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
 
 
 class _Timeout(Exception):
