@@ -5730,7 +5730,6 @@ def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 // ordinary sanity-check build does not start failing the day a new branch is cut.
 def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, boolean boltRequired)
 {
-    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
     def llvmArch = (cpu_arch == AARCH64_TRIPLE) ? "ARM64" : "X64"
     // apply_latest.sh resolves exactly one branch, so try the build's own branch
     // and fall back to main. Profiles are function-name-keyed and applied with
@@ -5746,11 +5745,12 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, boolean bolt
             set -e
             export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
             if ! command -v llvm-bolt >/dev/null 2>&1; then
-                echo '[bolt-wheel] staging llvm-bolt ${llvmVer}'
-                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                . tensorrt_llm/scripts/bolt/internal/llvm_bolt_version.sh
+                echo "[bolt-wheel] staging llvm-bolt \${LLVM_BOLT_VERSION}"
+                tb=LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz
                 mkdir -p .bolt-llvm
                 curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
-                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                     -o /tmp/\$tb "https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\$tb"
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi
