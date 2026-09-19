@@ -1474,6 +1474,37 @@ class TestFailFastDuringBenchmarkFill:
         ex.dist.tp_allgather.assert_called_once_with((True, True, True))
         ex._handle_errors.assert_called_once()
 
+    def test_post_fill_peer_terminal_vote_does_not_kill_a_filling_rank(self):
+        """A post-fill rank's terminal vote must not fail-fast a filling peer.
+
+        The terminal vote asserts "this rank's fill cannot fit". A rank that has
+        already cleared ``_benchmark_fill_phase_active`` has no fill left to
+        declare unfittable, so counting its flag lets it kill a peer whose own
+        fill is still healthy (nvbug 17095).
+        """
+        fitting_req = _make_active_request(in_init=True)
+        ex = self._make_executor(fill_phase_active=True,
+                                 fitting_init_requests=[fitting_req])
+        ex.enable_attention_dp = True
+        ex.dist.tp_size = 2
+        ex.dist.world_size = 2
+        # rank 0: left the fill phase, votes terminal. rank 1 (this rank):
+        # still filling, healthy, all of its own flags benign.
+        ex.dist.tp_allgather.return_value = [
+            (False, True, True),
+            (True, True, False),
+        ]
+        ex.disagg.admit = Mock(return_value=([], True))
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None, (
+            "A post-fill rank's terminal vote must not fail-fast a peer that is "
+            "still in the fill phase with healthy requests"
+        )
+        ex.dist.tp_allgather.assert_called_once_with((True, True, False))
+        ex._handle_errors.assert_not_called()
+
     @pytest.mark.parametrize(
         "fill_active, is_warmup, expected_alive",
         [
