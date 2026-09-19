@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import os
 import platform
 import re
@@ -116,6 +118,96 @@ def get_build_dir(build_dir, build_type, build_root=None, out_of_tree=False):
     else:
         build_dir = Path(build_dir).resolve()
     return build_dir
+
+
+# Records the fingerprint of the cmake configure arguments used by the last
+# configure of a build dir, so a later invocation with different arguments
+# reconfigures instead of silently building the old configuration.
+CONFIGURE_FINGERPRINT_FILENAME = ".cmake_configure_args.sha256"
+
+
+def _cmake_define_name(arg: str) -> Optional[str]:
+    """Cache-variable name of a ``-D`` define, or ``None`` for other arguments.
+
+    Handles ``-DKEY=value``, ``-DKEY:TYPE=value``, and the surrounding quotes
+    that ``--extra-cmake-vars`` expansion adds (``"-DKEY=value"``).
+    """
+    token = arg.strip().strip('"')
+    if not token.startswith("-D"):
+        return None
+    name = token[2:].split("=", 1)[0].split(":", 1)[0]
+    return name or None
+
+
+def configure_args_fingerprint(args: Sequence[str]) -> str:
+    """Stable sha256 hex digest over the configure-affecting cmake arguments.
+
+    cmake applies repeated ``-DKEY=value`` definitions in order (the last one
+    wins), so the fingerprint is taken over the *effective* configuration: for
+    each cache variable only its last ``-D`` definition is kept, and the
+    remaining (non-``-D``) arguments are order-insensitive. Reordering distinct
+    flags then fingerprints the same (as it should), while two lists whose
+    winning value for some key differs fingerprint differently -- otherwise the
+    stale-configuration guard could miss a real configuration change (e.g. via
+    ``--extra-cmake-vars`` passing the same key twice).
+
+    The canonical list is JSON-serialized rather than newline-joined so that an
+    argument whose value contains a newline can't collide with the separator
+    (cmake flags/paths don't today, but the JSON form removes the ambiguity).
+    """
+    effective = {}
+    others = []
+    for arg in args:
+        name = _cmake_define_name(arg)
+        if name is None:
+            others.append(arg)
+        else:
+            effective[name] = arg  # last definition of a key wins, as in cmake
+    canonical = sorted(effective.values()) + sorted(others)
+    payload = json.dumps(canonical, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def stored_configure_fingerprint(build_dir) -> Optional[str]:
+    """Fingerprint recorded by the last cmake configure, or None.
+
+    None also covers build dirs created before fingerprints were recorded;
+    ``configure_reason`` turns that into a one-time reconfigure so a marker
+    gets recorded.
+    """
+    fingerprint_file = Path(build_dir) / CONFIGURE_FINGERPRINT_FILENAME
+    if not fingerprint_file.exists():
+        return None
+    return fingerprint_file.read_text().strip() or None
+
+
+def configure_reason(build_dir, configure_fingerprint: str, *,
+                     first_build: bool, configure_cmake: bool,
+                     configure_only: bool, clean: bool) -> Optional[str]:
+    """Why a fingerprint change requires a cmake reconfigure, or None.
+
+    Explicit modes (clean, first build, ``--configure_cmake``,
+    ``--configure_only``) configure on their own, so this returns None and
+    leaves them to the caller. Otherwise it compares the recorded fingerprint
+    against the current arguments:
+
+    - No recorded fingerprint on an already-configured build dir means the dir
+      predates fingerprinting; reconfigure once so a marker gets recorded.
+      Without this, the first flag change on such a dir would silently build
+      the old configuration.
+    - A recorded fingerprint that differs means the configure-affecting
+      arguments changed.
+    """
+    if clean or first_build or configure_cmake or configure_only:
+        return None
+    stored = stored_configure_fingerprint(build_dir)
+    if stored is None:
+        return ("no cmake configure fingerprint recorded; "
+                "reconfiguring once to record one")
+    if stored != configure_fingerprint:
+        return (f"cmake arguments changed since last configure "
+                f"({stored[:8]} -> {configure_fingerprint[:8]}); reconfiguring")
+    return None
 
 
 def clear_folder(folder_path):
@@ -925,8 +1017,10 @@ def main(*,
             expanded_args += var.split(";")
 
         extra_cmake_vars = ["\"-D{}\"".format(var) for var in expanded_args]
-        # Don't include duplicate conditions
-        cmake_def_args.extend(set(extra_cmake_vars))
+        # Drop exact-duplicate conditions while preserving order, so that when
+        # the same key is passed twice cmake's last-wins semantics stay
+        # deterministic (a set() would reorder them arbitrarily).
+        cmake_def_args.extend(dict.fromkeys(extra_cmake_vars))
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
@@ -1031,6 +1125,47 @@ def main(*,
         cmake_def_args.append(
             f"-DTRTLLM_VERSION_H_INCLUDE_DIR={build_dir}/generated-include")
 
+    # Fingerprint the configure-affecting arguments so a flag change (e.g.
+    # --cuda_architectures, --nvrtc_dynamic_linking, --extra-cmake-vars) on
+    # an already-configured build dir forces a reconfigure instead of
+    # silently building the old configuration. The source directory is
+    # included because an explicit build_dir can be reused across checkouts
+    # (shared build_root, --no_venv) with every other argument equal while
+    # -S changes. The conan toolchain path is excluded: it is derived from
+    # build_dir and constant per build dir.
+    #
+    # The arguments are listed in the same order the configure command below
+    # passes them (built-in definitions, then cmake_def_args, then the
+    # generator and source). cmake applies repeated -D definitions left to
+    # right, so a user override in cmake_def_args (e.g. --extra-cmake-vars
+    # BUILD_PYT=OFF) must come after the built-in default for the fingerprint's
+    # last-wins to match the configuration cmake actually caches.
+    configure_fingerprint = configure_args_fingerprint([
+        f'-DCMAKE_BUILD_TYPE="{build_type}"',
+        f'-DBUILD_PYT="{build_pyt}"',
+        f'-DBUILD_DEEP_EP="{build_deep_ep}"',
+        f'-DBUILD_DEEP_GEMM="{build_deep_gemm}"',
+        f'-DBUILD_FLASH_MLA="{build_flash_mla}"',
+        f'-DNVTX_DISABLE="{disable_nvtx}"',
+        f'-DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}',
+        f'-DBUILD_WHEEL_TARGETS="{";".join(targets)}"',
+        f'-DPython_EXECUTABLE={venv_python}',
+        f'-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}',
+        cmake_cuda_architectures,
+    ] + cmake_def_args + [
+        cmake_generator,
+        f'-S "{source_dir}"',
+    ])
+    reason = configure_reason(build_dir,
+                              configure_fingerprint,
+                              first_build=first_build,
+                              configure_cmake=configure_cmake,
+                              configure_only=configure_only,
+                              clean=clean)
+    if reason is not None:
+        print(reason)
+        configure_cmake = True
+
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
             # Conan writes a CMakeUserPresets.json convenience file next to
@@ -1061,6 +1196,9 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+            (build_dir /
+             CONFIGURE_FINGERPRINT_FILENAME).write_text(configure_fingerprint +
+                                                        "\n")
 
         if configure_only:
             return
