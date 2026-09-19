@@ -501,7 +501,25 @@ class BaseWorker(GenerationExecutor):
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=[] if request.sampling_params.ignore_eos else
                 request.sampling_params._get_stop_words(),
-                embedding_bias=request.sampling_params.embedding_bias,
+                embedding_bias=(
+                    None if request.sampling_params.embedding_bias is None
+                    or self._is_pytorch_backend else torch.zeros(
+                        self._runtime_model_config.vocab_size,
+                        dtype=torch.float32).scatter_(
+                            dim=0,
+                            index=torch.tensor([
+                                idx
+                                for (idx, val
+                                     ) in request.sampling_params.embedding_bias
+                            ],
+                                               dtype=torch.int32),
+                            src=torch.tensor([
+                                val
+                                for (idx, val
+                                     ) in request.sampling_params.embedding_bias
+                            ],
+                                             dtype=torch.float32),
+                        )),
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
@@ -527,6 +545,7 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
+            executor_request.py_embedding_bias = request.sampling_params.embedding_bias
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:

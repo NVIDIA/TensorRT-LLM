@@ -382,7 +382,9 @@ def create_sampling_params_from_proto(
             raise ValueError(
                 f"embedding_bias length ({len(embedding_bias)}) must match vocab_size ({vocab_size})"
             )
-        kwargs["embedding_bias"] = list(embedding_bias)
+        kwargs["embedding_bias"] = tuple(
+            [(idx, val) for idx, val in enumerate(embedding_bias) if val != 0]
+        )
 
     # Guided decoding
     if guided_decoding and guided_decoding.guide:
