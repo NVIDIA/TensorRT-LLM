@@ -5534,7 +5534,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # them through one nanobind call = one GIL hand-off + one API lock per
         # step instead of one per generation request. The pure-Python core has no
         # resize_many and keeps the scalar loop.
-        resize_many = getattr(self.impl, "resize_many", None)
+        # TLLM_KV_V2_BATCHED_CALLS=0 forces the scalar per-request loop (A/B knob).
+        resize_many = (getattr(self.impl, "resize_many", None)
+                       if os.environ.get("TLLM_KV_V2_BATCHED_CALLS", "1") != "0" else None)
         batch_caches: list = []
         batch_caps: list = []
         batch_hists: list = []
