@@ -148,6 +148,7 @@ class AttentionConfig(StrictBaseModel):
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 1)),
             ("nvfp4", "fp8", (0, 0, 0)),
