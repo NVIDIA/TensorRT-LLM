@@ -1702,6 +1702,13 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
                         snapshot_points.add(offset)
                 for offset in state_config.additional_snapshot_offsets_from_end:
                     point = request.prompt_len - offset
+                    if offset > 0:
+                        # An interior snapshot point is also a forced context-chunk
+                        # boundary, and the executor requires every non-final chunk
+                        # to end on a block boundary: align the point down to the
+                        # block grid (a duplicate prompt reuses it just the same).
+                        point = (point //
+                                 self.tokens_per_block) * self.tokens_per_block
                     if point > 0:
                         snapshot_points.add(point)
             request.py_recurrent_fold_point = None
