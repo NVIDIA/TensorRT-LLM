@@ -16,11 +16,47 @@
 import importlib.util
 import os
 import shutil
+import subprocess
+import time
 
 import pytest
-from defs.trt_test_alternative import check_call
+from defs.trt_test_alternative import check_call, print_warning
 
 # Fixtures shared by VisualGen example tests.
+
+
+def _install_ffmpeg_via_apt():
+    """Install ffmpeg via apt with a bounded timeout and bounded retries.
+
+    Installing at test time depends on external mirrors, which can stall or
+    briefly serve inconsistent metadata. Each attempt is guarded by a timeout so
+    a stalled mirror fails fast instead of hanging the whole session, and the
+    install is retried a few times with a backoff to ride out transient errors.
+    ``apt-get update`` is best-effort so an unrelated repo serving mid-sync
+    metadata (e.g. the NVIDIA CUDA repo right after a CUDA release) cannot block
+    the install; the ffmpeg install from Ubuntu is the real gate.
+    """
+    max_attempts = 3
+    # Bound apt's per-connection timeout so a stalled mirror fails within seconds;
+    # retries are owned by the loop below. `update` is best-effort, `install` gates.
+    install_cmd = (
+        "apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "
+        "update || true; "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg"
+    )
+
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # 240s per attempt: generous headroom over a normal install.
+            check_call(["bash", "-c", install_cmd], shell=False, timeout=240)
+            return
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as err:
+            last_err = err
+            print_warning(f"ffmpeg apt install attempt {attempt}/{max_attempts} failed: {err}")
+            if attempt < max_attempts:
+                time.sleep(15)  # backoff between attempts
+    pytest.fail(f"Failed to install ffmpeg via apt after {max_attempts} attempts: {last_err}")
 
 
 @pytest.fixture(scope="session")
@@ -43,8 +79,7 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
     if not av_available:
         llm_venv.run_cmd(["-m", "pip", "install", "av"])
     if not ffmpeg_available:
-        check_call(["apt-get", "update", "-y"], shell=False)
-        check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+        _install_ffmpeg_via_apt()
 
 
 @pytest.fixture(scope="session")
