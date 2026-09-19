@@ -132,16 +132,19 @@ class TestAttentionConfigQuantValidation:
             )
 
     def test_skip_softmax_and_sage_quantization_can_be_combined(self):
-        attention = AttentionConfig(
-            backend="TRTLLM",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="int8",
-                q_block_size=1,
-                k_block_size=4,
-                v_block_size=1,
-            ),
-            sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
-        )
+        # int8 Q/K SAGE has a compiled cubin only on SM100; pin the SM so this
+        # combination check is host-independent (CI CPU stages have no GPU).
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="int8",
+                    q_block_size=1,
+                    k_block_size=4,
+                    v_block_size=1,
+                ),
+                sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+            )
 
         assert attention.sparse_attention_config is not None
         assert attention.sparse_attention_config.algorithm == "skip_softmax"

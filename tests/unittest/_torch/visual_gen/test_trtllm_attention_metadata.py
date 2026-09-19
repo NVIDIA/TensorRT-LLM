@@ -7,7 +7,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseBackendForwardArgs,
@@ -221,29 +220,26 @@ def test_visual_gen_wrapper_does_not_define_its_own_prediction_lifecycle():
     assert getattr(visual_trtllm.TrtllmAttention, "__parameters__", ()) == ()
 
 
-def test_forward_rejects_unexpected_kwargs_before_metadata_or_core(monkeypatch):
-    prepare_metadata = Mock(return_value=object())
-    core_forward = Mock(return_value=torch.empty(4, 16))
-    monkeypatch.setattr(visual_trtllm.TrtllmAttention, "_prepare_metadata", prepare_metadata)
-    monkeypatch.setattr(visual_trtllm.BaseTrtllmAttention, "forward", core_forward)
+def test_forward_ignores_backend_specific_kwargs_like_other_backends(monkeypatch):
+    captured: dict = {}
+    _capture_core_forward(monkeypatch, captured)
     attention = _make_wrapper()
+    monkeypatch.setattr(attention, "support_fused_qkv", lambda: True, raising=False)
+    q = torch.randn(1, 4, 2, 8)
 
-    with pytest.raises(TypeError) as exc_info:
-        attention.forward(
-            torch.randn(1, 4, 6, 8),
-            None,
-            None,
-            batch_size=1,
-            seq_len=4,
-            attention_maks=PredefinedAttentionMask.FULL,
-            timstep=torch.tensor([12]),
-        )
-
-    assert str(exc_info.value) == (
-        "Unexpected TRTLLM attention forward keyword arguments: attention_maks, timstep"
+    output = attention.forward(
+        q,
+        q,
+        q,
+        batch_size=1,
+        seq_len=4,
+        key_padding_mask=torch.ones(1, 4, dtype=torch.bool),
+        gate_compress=torch.ones(1, 4, 2, 8),
     )
-    prepare_metadata.assert_not_called()
-    core_forward.assert_not_called()
+
+    assert output.shape == (1, 4, 16)
+    assert captured["kwargs"] == {}
+    assert not hasattr(captured["forward_args"], "key_padding_mask")
 
 
 def test_forward_flattens_fused_qkv_without_copy(monkeypatch):
