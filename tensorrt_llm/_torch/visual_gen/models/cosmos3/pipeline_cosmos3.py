@@ -755,7 +755,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     "Please run the following installation commands or "
                     "explicitly disable guardrails by setting TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 "
                     "(user is responsible for deploying the model without guardrails). "
-                    "- `pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python`"
+                    "- `pip install cosmos_guardrail==0.3.1 && pip uninstall opencv-python`"
                 )
             # Guardrails are only evaluated on rank 0; load them only there to avoid
             # dead model weights occupying GPU memory on every other rank.
