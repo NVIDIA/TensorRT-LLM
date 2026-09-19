@@ -3657,8 +3657,6 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             # A disaggregated generation worker must not replay context locally.
             enable_recompute_pause=not is_disagg,
-            max_input_len=max_seq_len
-            if max_seq_len is not None else 0x7fffffff,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

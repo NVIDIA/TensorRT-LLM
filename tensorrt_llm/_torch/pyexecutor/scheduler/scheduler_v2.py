@@ -163,12 +163,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
-        max_input_len: int = 0x7FFFFFFF,
     ) -> None:
         self.max_num_tokens = max_num_tokens
-        # Only read when preempting: LlmRequest.pause clamps the rewritten
-        # prompt, the original plus tokens generated so far, to this.
-        self.max_input_len = max_input_len
         self._stalled_schedules = 0
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -453,7 +449,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
             return self._try_preempt_for_pages(
-                requests_list, protected, inflight_request_ids, evicted, preempted_ids
+                requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -1362,7 +1358,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         requests_list: RequestList,
         protected_ids: set[int],
         inflight_request_ids: set[int],
-        evicted: RequestList,
+        recompute_paused: RequestList,
         preempted_ids: set[int],
     ) -> bool:
         """Release one started request's KV cache so another can allocate.
@@ -1371,9 +1367,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
         suspension is cheaper and keeps the pages, so that path is left alone.
 
+        The victim leaves on `recompute_paused`, the same channel the generation
+        side uses, because a re-prefill needs more teardown than the KV cache:
+        the executor frees the request's remaining resources, its sequence slot
+        included, and `reset_for_recompute` rewrites the prompt and resyncs the
+        Python-side mirrors of it. Pausing the request here instead would leave
+        the slot owned by SeqSlotManager while `py_seq_slot` is None, which
+        asserts on the next schedule.
+
         Returns True when pages became available in this iteration.
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
+            return False
+        # A disaggregated generation worker received its context KV rather
+        # than computing it, so it cannot replay a prefill at all.
+        if not self.enable_recompute_pause:
             return False
 
         # Newest first, so the requests closest to completing keep their
@@ -1382,9 +1390,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             victim = requests_list[i]
             if victim.py_request_id in protected_ids:
                 continue
-            if victim.request_id in inflight_request_ids:
-                continue
-            if not self._is_started_request(victim):
+            if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
                 continue
             if not self.kv_cache_manager.is_request_active(victim.py_request_id):
                 continue
@@ -1397,11 +1403,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._clear_request_runtime_state(victim)
             if self.draft_kv_cache_manager is not None:
                 self.draft_kv_cache_manager.free_resources(victim)
-            # Rewrites the prompt to include what was generated and resets
-            # state to CONTEXT_INIT, so the request re-enters as an ordinary
-            # prefill.
-            victim.pause(self.max_input_len)
-            evicted.append(victim)
+            recompute_paused.append(victim)
             preempted_ids.add(victim.py_request_id)
             return True
 

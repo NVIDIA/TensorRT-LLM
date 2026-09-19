@@ -243,7 +243,6 @@ def make_scheduler(
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
-    max_input_len: int | None = None,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -261,8 +260,6 @@ def make_scheduler(
             kwargs["draft_kv_cache_manager"] = draft_kv_cache_manager
         if cross_kv_cache_manager is not None:
             kwargs["cross_kv_cache_manager"] = cross_kv_cache_manager
-        if max_input_len is not None:
-            kwargs["max_input_len"] = max_input_len
         return KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1291,25 +1288,41 @@ class TestContextPreemption:
         out = sched.schedule_request(reqs, set())
 
         mgr.preempt_request.assert_called_once_with(victim)
-        assert ids(out.paused_requests) == [99]
+        assert ids(out.recompute_paused_requests) == [99]
         # Deferred to the next iteration: a failed resize leaves the first
         # chunk suspended, so the retry has to go back through
         # prepare_context.
         assert len(out.context_requests) == 0
 
-    def test_released_victim_is_reset_to_context_state(self):
+    def test_released_victim_is_left_for_the_executor_to_reset(self):
+        """The rest of the teardown belongs to the recompute-pause path."""
         mgr = make_kv_cache_manager(
             resize_context_fn=_out_of_pages_for(0),
             has_cache_tier_below_gpu=False,
         )
-        sched = make_scheduler(mgr, max_num_tokens=1000, max_input_len=4096)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
         victim = make_ctx_request(99, 100, is_first_context_chunk=False)
         victim.py_batch_idx = 7
 
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        victim.pause.assert_not_called()
+        victim.reset_for_recompute.assert_not_called()
+        assert ids(out.recompute_paused_requests) == [99]
+        assert victim.py_batch_idx is None
+
+    def test_disagg_generation_worker_never_preempts(self):
+        """It received its context KV, so it cannot replay a prefill."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000, enable_recompute_pause=False)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
         sched.schedule_request([make_ctx_request(0, 100), victim], set())
 
-        victim.pause.assert_called_once_with(4096)
-        assert victim.py_batch_idx is None
+        mgr.preempt_request.assert_not_called()
 
     def test_preempted_victim_not_scheduled_in_the_same_pass(self):
         """Re-admitting the victim would spend the pages it just released."""
@@ -1409,7 +1422,7 @@ class TestContextPreemption:
         out = sched.schedule_request([make_ctx_request(0, 500), victim], set())
 
         mgr.preempt_request.assert_called_once_with(victim)
-        assert ids(out.paused_requests) == [99]
+        assert ids(out.recompute_paused_requests) == [99]
 
 
 # ===========================================================================
