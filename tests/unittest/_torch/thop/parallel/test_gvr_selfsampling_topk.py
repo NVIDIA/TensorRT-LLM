@@ -1875,6 +1875,7 @@ def _check_bf16_varlen_exact(
     [
         pytest.param(1, 65536, 2048, 1, 1, "ties", id="hybrid128"),
         pytest.param(4, 131072, 1024, 1, 4, "infinities", id="regclus_cr4"),
+        pytest.param(4, 262144, 2048, 1, 1, "infinities", id="regclus_cs16"),
         pytest.param(4, 32768, 512, 4, 4, "ties", id="regclus_mtp4"),
         pytest.param(4, 8192, 2048, 4, 1, "infinities", id="reg_mtp4"),
         pytest.param(8, 4099, 512, 4, 4, "ties", id="reg_odd_width"),
