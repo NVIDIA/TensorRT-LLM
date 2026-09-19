@@ -68,7 +68,7 @@ def _load() -> list[dict]:
     for row in rows:
         old = lookup[(row["cell"], row["batch"])]
         for arm in TEMPORAL:
-            row[arm + "_us"] = float(old[arm + "_us"])
+            row[arm + "_us"] = float(old[arm + "_us"]) if old[arm + "_us"] else None
     return rows
 
 
@@ -1215,6 +1215,10 @@ def main() -> None:
         }
     )
     rows = _load()
+    if any(row[arm + "_us"] is None for row in rows for arm in COMPARISON_ARMS):
+        raise ValueError(
+            "Figure regeneration requires complete paired timings for all comparison arms"
+        )
     summary = {
         "copyright": COPYRIGHT,
         "reference": json.loads((ROOT / "provenance.json").read_text())["reference"],

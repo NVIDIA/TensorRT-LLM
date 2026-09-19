@@ -101,7 +101,7 @@ V1's prior also has a lifecycle outside the kernel. GVR V1 has no prefill engine
 | What guides admission? | A hint-derived pivot and rescue rung | Sample-derived primary threshold, lower safety floor, and upper anchor |
 | What does verification learn? | Exact counts at multiple admission thresholds | Exact bin populations and counts at many boundaries |
 | Where does exact refinement start? | The admitted candidate set, with path-specific local refinement | The crossing bin containing rank $K$ |
-| What state crosses decode steps? | Per-layer prior indices | No Top-K prior |
+| What state crosses decode steps? | Per-layer prior indices | No Top-K prior in the self-sampling path |
 | How do prefill and decode relate? | Radix prefill; its last selection can seed temporal decode | Shared streaming selection with phase-specific row adapters |
 | How does a bad guess affect the result? | More admission/refinement work or recovery; membership remains exact | Lower admission or exact recovery; membership remains exact |
 
@@ -446,7 +446,11 @@ The integration follows three boundaries: remove the Top-K prior lifecycle, adap
 
 A temporal prior carries state from an earlier selection. Its buffers, initialization, request alignment, and write-back must stay valid through CUDA Graph warmup and replay. Disaggregated prefill/decode also needs a policy for providing that prior at the phase handoff.
 
-V2 derives its bracket from the current scores in both phases. This removes the previous-step Top-K buffer, prefill-to-decode prior seeding, and prior write-back from the V2 call contract. Request metadata and launch preparation remain, but they no longer maintain a selection history. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) confines prior ownership to the temporal engine.
+With `use_self_sampling_topk: true`, the [`TopK` wrapper](https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/modules/top_k.py#L350-L392) selects V2's self-sampling decode [`run_varlen`](https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling_host.py#L1435-L1445) entry point. Its public signature takes score, sequence-length, and output-index tensors plus row/launch metadata; it has **no `pre_idx` parameter**. The wrapper's [`needs_gvr_prior`](https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/modules/top_k.py#L69-L75) property is false for this path.
+
+The separate V1 temporal dispatcher, [`tiered_topk`](https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_dispatch.py#L334-L357), still requires valid `pre_idx` for its supported heuristic routes. Setting `use_self_sampling_topk: false` selects that temporal engine; callers must retain its prior input.
+
+V2 derives its bracket from the current scores in both phases, removing the previous-step Top-K buffer, prefill-to-decode prior seeding, and prior write-back from the self-sampling path. Request metadata and launch preparation remain, but they no longer maintain a selection history. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) confines prior ownership to the temporal engine.
 
 #### One Selection Core, Two Row Interfaces
 
