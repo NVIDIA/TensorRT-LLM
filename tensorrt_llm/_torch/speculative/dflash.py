@@ -99,6 +99,9 @@ class DFlashSpecMetadata(SpecMetadata):
 
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
+        # Log the capture-dtype notice once per metadata object, not once per
+        # layer per forward.
+        self._warned_capture_dtype = False
 
         # Set up hidden state capture buffer
         if self.layers_to_capture is not None and len(self.layers_to_capture) > 0:
@@ -183,12 +186,28 @@ class DFlashSpecMetadata(SpecMetadata):
         pass the pre-add pair and this folds them, while K3 hands in an
         already-mixed aggregated stream value and passes ``residual=None``
         (see the DSpark tap in ``modeling_kimi_linear.py``).
+
+        The buffer is allocated in the target's ``torch_dtype``; a model may
+        tap a wider stream (e.g. an FP32 residual folded into a bf16 buffer),
+        so convert to the buffer dtype on capture. The drafter consumes
+        buffer-dtype-rounded values, so capturing anything wider would shift
+        acceptance length.
         """
         if self.captured_hidden_states is None:
             return
         i = self._layer_to_idx.get(layer_id)
         if i is not None:
             to_save = hidden_states + residual if residual is not None else hidden_states
+            if to_save.dtype != self.captured_hidden_states.dtype:
+                if not self._warned_capture_dtype:
+                    logger.info(
+                        f"DFlash: capture tap for layer {layer_id} is "
+                        f"{to_save.dtype}, buffer is "
+                        f"{self.captured_hidden_states.dtype}; converting on "
+                        f"capture."
+                    )
+                    self._warned_capture_dtype = True
+                to_save = to_save.to(self.captured_hidden_states.dtype)
             inplace_slice_copy(
                 self.captured_hidden_states,
                 to_save,
