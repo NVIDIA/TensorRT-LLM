@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import enum
@@ -27,7 +42,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import (QuantAlgo,
+                                            get_fp4_support_error_message,
+                                            is_fp4_supported)
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
     transform_k128_scales_to_cutedsl_mxfp8_layout,
@@ -135,6 +152,37 @@ def _uses_marlin_nvfp4_backend(module) -> bool:
             and not getattr(module, "use_fused_gemm_allreduce", False)
             and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
             and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
+
+
+def _validate_fp4_arch_support(quant_config: Optional[QuantConfig],
+                               marlin_available: bool) -> None:
+    """Reject an FP4 checkpoint this GPU has no kernel for, at layer
+    construction rather than from the first forward pass.
+
+    ``marlin_available`` is the same predicate ``get_quant_method`` reads, so
+    an NVFP4 layer that would resolve to the Marlin weight-only method is not
+    turned away for lacking FP4 tensor cores.
+    """
+    quant_algo = None if quant_config is None else quant_config.quant_algo
+    sm = get_sm_version()
+    if not is_fp4_supported(sm, quant_algo, marlin_available):
+        raise ValueError(
+            get_fp4_support_error_message(sm, quant_algo, marlin_available))
+
+
+def _require_fp4_metadata(tensor: Optional[torch.Tensor], metadata_name: str,
+                          quant_algo) -> torch.Tensor:
+    """The scale ``quant_algo`` cannot dequantize without.
+
+    Missing here means the checkpoint never carried it, so say that rather
+    than let the conversion a few lines down fail on ``None``.
+    """
+    if tensor is not None:
+        return tensor
+
+    raise ValueError(
+        f"{quant_algo} requires '{metadata_name}' in the checkpoint, but none "
+        f"of the loaded weights provide it.")
 
 
 def load_weight_shard(
@@ -2484,6 +2532,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
         module: Linear,
         weights: List[Dict],
         shard_keys: Optional[List[str]] = None,
+        quant_algo=None,
     ):
         # For concatenated weights (qkv_proj / up_gate_proj), the global scaling factors and input scaling factors should be shared.
         input_scale = None
@@ -2528,6 +2577,10 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}"
                     )
 
+        input_scale = _require_fp4_metadata(input_scale, "input_scale",
+                                            quant_algo)
+        weight_scale_2 = _require_fp4_metadata(weight_scale_2, "weight_scale_2",
+                                               quant_algo)
         # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
         input_scale = input_scale.to(torch.float32)
         weight_scale_2 = weight_scale_2.to(torch.float32)
@@ -2544,7 +2597,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
             elm_packing=elm_packing)
 
         input_scale, weight_scale, weight_scale_2, alpha = self.load_weight_scales(
-            module, weights)
+            module, weights, quant_algo=module.quant_config.quant_algo)
 
         assert len(weights) == 1
         weight_scale = weight_scale[0]
@@ -2566,7 +2619,10 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
 
         weight_mode = module.weights_loading_config.weight_mode
         input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
-            module, weights, shard_keys=weight_mode.shard_keys)
+            module,
+            weights,
+            shard_keys=weight_mode.shard_keys,
+            quant_algo=module.quant_config.quant_algo)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
         # Shuffle and Swizzle weight scale
@@ -2596,7 +2652,10 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
 
         weight_mode = module.weights_loading_config.weight_mode
         input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
-            module, weights, shard_keys=weight_mode.shard_keys)
+            module,
+            weights,
+            shard_keys=weight_mode.shard_keys,
+            quant_algo=module.quant_config.quant_algo)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
         # Shuffle and Swizzle weight scale
@@ -4008,6 +4067,9 @@ class Linear(nn.Module):
 
         self.rebuild_tensor_metadata = {}
 
+        _validate_fp4_arch_support(
+            self.quant_config,
+            marlin_available=_uses_marlin_nvfp4_backend(self))
         self.quant_method = self.get_quant_method(self.quant_config)
         self.quant_method.create_weights(self, self.in_features,
                                          self.out_features, self.has_bias,
