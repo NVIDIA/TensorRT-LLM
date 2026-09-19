@@ -18,7 +18,7 @@ CUBLAS_VER="13.7.0.27-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"
-CUDA_RUNTIME="13.4.49-1" # rockylinux only
+CUDA_RUNTIME="13.4.49-1"
 # Pin the cuda-compat that ships with CUDA_VER; the DLFW image reports a CUDA_DRIVER_VERSION
 # of its own that is typically never published as a package.
 CUDA_DRIVER_VERSION="615.71.09-1.el8" # rockylinux only
