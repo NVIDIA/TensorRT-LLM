@@ -621,15 +621,6 @@ class FP8MQALogitsKernel:
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
         end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
         end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
-        # Early mContextLens load: overlap ~200-cycle L2 latency with the
-        # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
-        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
-        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
-        # element), but it is never used because has_work will be False.
-        start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (
-            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
-        ) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -934,24 +925,35 @@ class FP8MQALogitsKernel:
         )
 
         # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
-        end_kv_idx = end_kv_half * NUM_MATH_WG
+        # Consumers of the early schedule-metadata loads, placed at their
+        # real use site. Known codegen limitation (not worked around):
+        # the compiler does not keep these global loads and their
+        # consumers apart — regardless of source
+        # placement, the clamp+add+shift chain is hoisted right after its
+        # load, exposing the two L2 round-trips instead of hiding them
+        # under the independent mbarrier-init work. ptxas trades exposed
+        # load latency for shorter register lifetimes and re-solves to that
+        # optimum no matter the IR order; getting the sink from source needs
+        # a scheduling barrier (cfence) or a latency-aware cost model fix.
+        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA
+        # sentinel). Zero-work CTAs get a stale current_num_kv, never used
+        # because has_work will be False.
+        start_q_clamped = min(start_q, batch_size - 1)
+        current_num_kv = (
+            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
+        ) // self.block_kv
 
-        # Convert start to KV block units (matching DeepGEMM)
-        current_q_idx = start_q
-        current_kv_idx = start_kv_half * NUM_MATH_WG
-
-        # ===== COMMON SCHEDULER STATE (before warp branches) =====
-        # Each warp role independently maintains its own copy of these
-        # variables (like DeepGEMM where each role creates its own scheduler).
-        # Pre-fetch first task (current_num_kv loaded early above for latency hiding)
-        next_q_idx = current_q_idx
-        next_kv_idx = current_kv_idx
-        next_num_kv = current_num_kv
-        # Sentinel: no previous batch (matches DeepGEMM's q_idx = batch_size)
-        q_idx = batch_size
-        # While-loop termination flag (matches DeepGEMM's fetch_next_task pattern).
-        # True if this CTA has work assigned (start != end in schedule_meta).
-        has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
+        # ===== SCHEDULER STATE: sunk into each warp-role branch =====
+        # Each warp role derives its own scheduler-state copy (end_kv_idx,
+        # next_q_idx/next_kv_idx/next_num_kv, q_idx sentinel, has_work) from
+        # the early-loaded schedule metadata AFTER its warpgroup_reg_alloc/
+        # dealloc call. Deriving it here (before the branches) placed the
+        # loop-carried values under the shared prologue register budget,
+        # where the register pressure before the setmaxnreg
+        # reallocation forced ptxas to spill the kv cursor + bound pair
+        # to local memory; deriving per role eliminates
+        # the spill. The block is pure arithmetic on already-loaded values,
+        # so per-branch duplication is semantics-preserving.
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
@@ -961,6 +963,15 @@ class FP8MQALogitsKernel:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
             # Matches DeepGEMM's TMA warp with kv_group_idx == 0
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             lane_idx = tidx % 32
 
             # Block table prefetch: 32 lanes cache block indices,
@@ -1090,6 +1101,15 @@ class FP8MQALogitsKernel:
             # TMA warp 1: loads KV + Scale for group 1 only
             # Matches DeepGEMM's TMA warp with kv_group_idx == 1
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             lane_idx = tidx % 32
 
             # Block table prefetch for group 1
@@ -1165,6 +1185,14 @@ class FP8MQALogitsKernel:
             # writes are visible.
             cute.arch.warpgroup_reg_dealloc(24)
 
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             # TMEM: wait for math warp 0's allocation, retrieve pointer
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1233,6 +1261,14 @@ class FP8MQALogitsKernel:
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
             cute.arch.warpgroup_reg_dealloc(24)
 
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1294,6 +1330,16 @@ class FP8MQALogitsKernel:
 
         elif is_math_warp:
             cute.arch.warpgroup_reg_alloc(240)
+
+            # Per-role scheduler state (see comment above the branch chain).
+            # Derived AFTER warpgroup_reg_alloc(240) so the loop-carried
+            # scheduler words live under the 240-register math budget.
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
             # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
             tmem.allocate(num_tmem_alloc_cols_total)
