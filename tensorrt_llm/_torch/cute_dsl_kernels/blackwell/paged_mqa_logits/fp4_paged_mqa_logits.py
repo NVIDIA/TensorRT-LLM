@@ -570,6 +570,7 @@ class FP4MQALogitsKernel:
         dynamic_sched: bool = False,
         ring_depth: int = 128,
         b_cap: int = 1024,
+        num_kv_stages: int = 6,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -740,11 +741,14 @@ class FP4MQALogitsKernel:
         # next_n == 1: two accumulator stages per math warpgroup so the next
         # tile's MMA overlaps this tile's epilogue; next_n > 1 keeps one (TMEM).
         self.num_umma_stages = 2 if next_n == 1 else 1
-        # KV pipeline depth
-        self.num_kv_stages = 6
-        # the fetcher throttles the work ring at D - 8 unpopped entries; the
-        # laggard roles trail it by at most kv + umma stages
-        assert self.num_kv_stages + self.num_umma_stages <= 8
+        # KV pipeline depth (op knob TRTLLM_DSL_FP4_KV_STAGES): 6 = 117 KB dynamic
+        # SMEM, each stage adds 17 KB (8 KB KV + 512 B SF per group), 10 = 185 KB
+        assert 2 <= num_kv_stages <= 10, f"num_kv_stages={num_kv_stages} must be in [2, 10]"
+        self.num_kv_stages = num_kv_stages
+        # the fetcher throttles the work ring at D - ring_slack unpopped entries;
+        # the laggard roles trail it by at most kv + umma stages
+        self.ring_slack = max(8, self.num_kv_stages + self.num_umma_stages)
+        assert self.ring_slack <= ring_depth // 2 - 4
         # Step 5.11: smem_pad_bytes (FP8 sub-partition opt knob) dropped.
 
         # acc_dtype is locked to fp32 for FP4 MXF4 SS (cannot be exposed).
@@ -1391,8 +1395,9 @@ class FP4MQALogitsKernel:
     @cute.jit
     def _dyn_drain(self, ring, ring_ent, s_P, s_ctx, s_ctl, batch_size, lane_idx, cons_count):
         """Publish up to 8 row segments of the pending range while the ring
-        holds fewer than ring_depth - 8 entries past the fetcher's own pop."""
+        holds fewer than ring_depth - ring_slack entries past the fetcher's own pop."""
         D = cutlass.const_expr(self.ring_depth)
+        SL = cutlass.const_expr(self.ring_slack)
         pf0 = s_ctl[6]
         pf1 = s_ctl[7]
         flag = s_ctl[8]
@@ -1400,7 +1405,7 @@ class FP4MQALogitsKernel:
         go = cutlass.Int32(1)
         while go == cutlass.Int32(1):
             pc = s_ctl[16]
-            if pf0 < pf1 and pc - cons_count < cutlass.Int32(D - 8) and k_it < cutlass.Int32(8):
+            if pf0 < pf1 and pc - cons_count < cutlass.Int32(D - SL) and k_it < cutlass.Int32(8):
                 row = self._row_of(s_P, batch_size, lane_idx, pf0)
                 pb = s_P[row]
                 pn = s_P[row + cutlass.Int32(1)]

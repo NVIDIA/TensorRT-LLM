@@ -10778,6 +10778,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
     _FP4_DYN_MODE = os.environ.get("TRTLLM_DSL_FP4_DYN_SCHED", "auto")
     _FP4_DYN_CHUNK = int(os.environ.get("TRTLLM_DSL_FP4_DYN_CHUNK", "16"))
     _FP4_DYN_NMIN = int(os.environ.get("TRTLLM_DSL_FP4_DYN_NMIN", "64"))
+    # TRTLLM_DSL_FP4_KV_STAGES: KV TMA pipeline depth of the FP4 scorer; unset =
+    # 5 for the static schedule, 6 for the work-stealing build (each measured
+    # optimum on distinct real rows; deeper pipelines lose 2-7 %)
+    _FP4_KV_STAGES_ENV = os.environ.get("TRTLLM_DSL_FP4_KV_STAGES")
+
+    def _fp4_kv_stages(dynamic_sched):
+        if _FP4_KV_STAGES_ENV:
+            return int(_FP4_KV_STAGES_ENV)
+        return 6 if dynamic_sched else 5
+
     _FP4_DYN_B_CAP = 1024
     _FP4_DYN_RING = 128
     _FP4_DYN_CHUNK_MAX = _FP4_DYN_RING // 2 - 4
@@ -10853,7 +10863,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state)
+                   emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state,
+                   _fp4_kv_stages(dynamic_sched))
             if key in cls.kernel_cache:
                 return
 
@@ -11016,6 +11027,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 dynamic_sched=dynamic_sched,
                 ring_depth=_FP4_DYN_RING,
                 b_cap=_FP4_DYN_B_CAP,
+                num_kv_stages=_fp4_kv_stages(dynamic_sched),
             )
             dyn_state_fake = None
             if has_dyn_state:
@@ -11362,7 +11374,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state)
+                   emit_cand_bucketed, accept_cap, dynamic_sched, has_dyn_state,
+                   _fp4_kv_stages(dynamic_sched))
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
