@@ -13,8 +13,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
-                    Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Literal,
+                    Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -88,6 +88,7 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import (HangDetector, hard_kill_on_rank_crash,
                             propagate_hard_kill, start_rank_crash_kill_watchdog)
+from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
@@ -877,6 +878,10 @@ class PyExecutor:
 
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)
+        (self._hang_diagnostics, self._hang_diagnostic_forward_event
+         ) = create_executor_hang_diagnostics(self.global_rank,
+                                              self.hang_detector,
+                                              torch.cuda.Event)
 
         # request fetcher initialization
         self._set_global_steady_clock_offset()
@@ -1590,6 +1595,67 @@ class PyExecutor:
                 for req_id in req_ids:
                     self.result_wait_queues[req_id] = result_wait_queue
         return req_ids
+
+    @staticmethod
+    def _non_dummy_request_ids(requests: Iterable[LlmRequest]) -> List[int]:
+        return [
+            request.py_request_id for request in requests
+            if not request.is_attention_dp_dummy
+        ]
+
+    def _maybe_record_hang_diagnostic_phase(
+        self,
+        phase: str,
+        scheduled_requests: Optional[ScheduledRequests] = None,
+        forward_completion: Literal["keep", "clear", "record"] = "keep",
+    ) -> None:
+        """Record one in-memory breadcrumb without emitting a success-path log.
+
+        `forward_completion` selects what happens to the last-recorded forward
+        CUDA-completion event: "keep" it as-is (default), "clear" it, or
+        "record" a fresh one on `self.execution_stream` now.
+        """
+        diagnostics = getattr(self, "_hang_diagnostics", None)
+        if diagnostics is None:
+            return
+
+        # Omit forward_completion_event entirely for "keep" so `record()` falls
+        # back to its own "leave the previous event untouched" default.
+        record_kwargs = {}
+        if forward_completion == "record":
+            forward_completion_event = getattr(
+                self, "_hang_diagnostic_forward_event", None)
+            if forward_completion_event is None:
+                record_kwargs["forward_completion_event"] = None
+            else:
+                record_kwargs[
+                    "forward_completion_event"] = diagnostics.record_forward_completion_event(
+                        forward_completion_event, self.execution_stream)
+        elif forward_completion == "clear":
+            record_kwargs["forward_completion_event"] = None
+
+        try:
+            active_ids = self._non_dummy_request_ids(self.active_requests)
+            details = (
+                f"active_request_ids={active_ids}, "
+                f"request_queue_size="
+                f"{self.executor_request_queue.get_request_queue_size()}")
+            if scheduled_requests is not None:
+                context_ids = self._non_dummy_request_ids(
+                    scheduled_requests.context_requests)
+                generation_ids = self._non_dummy_request_ids(
+                    scheduled_requests.generation_requests)
+                details += (
+                    f", scheduled_context_ids={context_ids}, "
+                    f"scheduled_generation_ids={generation_ids}, "
+                    f"scheduled_context_tokens="
+                    f"{sum(request.context_chunk_size for request in scheduled_requests.context_requests)}"
+                )
+        except Exception as error:  # noqa: BLE001 - diagnostics must not affect execution
+            details = (
+                f"request_snapshot_failed={type(error).__name__}: {error}")
+
+        diagnostics.record(phase, self.iter_counter, details, **record_kwargs)
 
     def await_responses(
         self,
@@ -2773,6 +2839,8 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._maybe_record_hang_diagnostic_phase(
+                        "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     # The generation requests that do not have batch_idx
@@ -4247,6 +4315,8 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._maybe_record_hang_diagnostic_phase(
+                        "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                 if self.kv_connector_manager:
@@ -5098,6 +5168,8 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._maybe_record_hang_diagnostic_phase(
+                        "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                 if self.kv_connector_manager:
@@ -6316,6 +6388,8 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        self._maybe_record_hang_diagnostic_phase("scheduling",
+                                                 forward_completion="clear")
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
@@ -6376,6 +6450,9 @@ class PyExecutor:
         scheduled_requests.scheduled_mm_encoder_items = (
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
+
+        self._maybe_record_hang_diagnostic_phase("scheduled",
+                                                 scheduled_requests)
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
@@ -7415,6 +7492,11 @@ class PyExecutor:
             scheduled_requests: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
+        self._maybe_record_hang_diagnostic_phase(
+            "forward_call",
+            scheduled_requests,
+            forward_completion="clear",
+        )
         ExpertStatistic.set_iter(self.iter_counter)
 
         num_ctx_tokens = sum(req.context_chunk_size
@@ -7453,6 +7535,11 @@ class PyExecutor:
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
                                   num_accepted_tokens_device)
+                self._maybe_record_hang_diagnostic_phase(
+                    "forward_returned",
+                    scheduled_requests,
+                    forward_completion="record",
+                )
                 self._mark_cross_kv_projection_consumed(scheduled_requests)
 
             # Ensure the default stream waits for execution_stream to complete
@@ -7461,8 +7548,13 @@ class PyExecutor:
 
             self._kv_connector_wait_for_save()
 
+            self._maybe_record_hang_diagnostic_phase("forward_complete",
+                                                     scheduled_requests)
+
             return outputs
         except Exception as e:
+            self._maybe_record_hang_diagnostic_phase("forward_error",
+                                                     scheduled_requests)
             traceback.print_exc()
             error_msg = str(e)
             logger.error(
@@ -7542,6 +7634,7 @@ class PyExecutor:
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
+        self._maybe_record_hang_diagnostic_phase("sampling", scheduled_batch)
         try:
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
@@ -7567,9 +7660,17 @@ class PyExecutor:
                                           batch_outputs, beam_width,
                                           num_context_tokens)
 
-                return self.sampler.sample_async(scheduled_batch, batch_outputs,
-                                                 num_context_logits_prefix_sum)
+                sample_state = self.sampler.sample_async(
+                    scheduled_batch, batch_outputs,
+                    num_context_logits_prefix_sum)
+                self._maybe_record_hang_diagnostic_phase(
+                    "sampling_returned", scheduled_batch)
+                return sample_state
+            self._maybe_record_hang_diagnostic_phase("sampling_skipped",
+                                                     scheduled_batch)
         except Exception as e:
+            self._maybe_record_hang_diagnostic_phase("sampling_error",
+                                                     scheduled_batch)
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
@@ -7948,7 +8049,9 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
+        self._maybe_record_hang_diagnostic_phase("enqueueing_responses")
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
+            self._maybe_record_hang_diagnostic_phase("response_enqueue_skipped")
             return
 
         if self.enable_attention_dp and self.dist.world_size != 1:
@@ -8000,6 +8103,7 @@ class PyExecutor:
                         self.result_wait_queues[req_id].put_response.remote(
                             resp.client_id, resp)
                 self.response_cv.notify_all()
+        self._maybe_record_hang_diagnostic_phase("responses_enqueued")
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
