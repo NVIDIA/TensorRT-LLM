@@ -41,18 +41,35 @@ def add_arguments(parser: ArgumentParser):
                         type=int,
                         default=60,
                         help="Timeout in minutes")
+    parser.add_argument("--bolted",
+                        "-b",
+                        action="store_true",
+                        help="Require the BOLT-optimized build "
+                        "(bolted-<tarfile>) that BoltProfileGen publishes "
+                        "alongside the plain one. The canonical tarfile "
+                        "appears as soon as the build stage finishes, long "
+                        "before BOLT has run, so an image that must ship "
+                        "optimized binaries has to wait on this distinct "
+                        "name instead. Never falls back.")
 
 
-def get_wheel_from_package(arch, artifact_path, timeout):
+def get_wheel_from_package(arch, artifact_path, timeout, bolted=False):
     if arch == "x86_64":
         tarfile_name = "TensorRT-LLM.tar.gz"
     else:
         tarfile_name = "TensorRT-LLM-GH200.tar.gz"
 
+    if bolted:
+        tarfile_name = f"bolted-{tarfile_name}"
+
     tarfile_link = f"https://urm.nvidia.com/artifactory/{artifact_path}/{tarfile_name}"
     for attempt in range(timeout):
         try:
-            subprocess.run(["wget", "-nv", tarfile_link], check=True)
+            # -O pins the output name: without it wget falls back to
+            # <name>.1 when a previous attempt left a partial file behind,
+            # and the extract below would then read stale bytes.
+            subprocess.run(["wget", "-nv", "-O", tarfile_name, tarfile_link],
+                           check=True)
             print(f"Tarfile is available at {tarfile_link}")
             break
         except Exception:
