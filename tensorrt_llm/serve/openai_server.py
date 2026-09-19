@@ -36,6 +36,7 @@ from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
@@ -3946,11 +3947,15 @@ class OpenAIServer(_VideoRoutesMixin):
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():
-            while not server.started:
-                await asyncio.sleep(0.1)
+            with _StartupTimer("http_server_start"):
+                while not server.started:
+                    await asyncio.sleep(0.1)
             if self.disagg_cluster_worker:
                 try:
-                    await self.disagg_cluster_worker.register_worker()
+                    with _StartupTimer(
+                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                    ):
+                        await self.disagg_cluster_worker.register_worker()
                 except Exception as e:
                     logger.error(f"Worker registration failed: {e}")
                     server.should_exit = True
