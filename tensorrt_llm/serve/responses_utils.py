@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import json
@@ -45,7 +46,10 @@ from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.inputs.utils import async_apply_chat_template
+from tensorrt_llm.inputs.chat_template_guard import \
+    unreferenced_chat_template_kwargs
+from tensorrt_llm.inputs.utils import (async_apply_chat_template,
+                                       rendered_hf_chat_template_source)
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
@@ -1107,7 +1111,22 @@ async def _create_input_tokens(
     # It matters beyond effort level: when thinking is not enabled the model
     # can still emit a stray closing think tag, and the reasoning parser -
     # which expects the thinking-mode framing - leaves it in the visible text.
-    chat_template_kwargs = reasoning_chat_template_kwargs(request)
+    #
+    # The injection is template-aware: templates differ in which reasoning
+    # kwargs they implement (some read reasoning_effort but have no thinking
+    # toggle), and the render-site guard rejects any kwarg the active
+    # template never reads. Passing the template source here drops the
+    # injected keys the template does not reference, so the serve's own
+    # injection cannot turn into a guard rejection; kwargs the client sent
+    # are forwarded untouched and stay subject to the guard.
+    chat_template_kwargs = reasoning_chat_template_kwargs(
+        request,
+        template_source=rendered_hf_chat_template_source(
+            tokenizer=tokenizer,
+            processor=processor,
+            tools=tools_dict,
+        ),
+    )
 
     token_task = async_apply_chat_template(
         model_type=resolve_top_level_model_type(model_config),
@@ -1218,7 +1237,9 @@ async def request_preprocess(
 
 
 # TODO(JunyiXu-nv): move to use the same function in postprocess_handlers after multiple post processors are supported
-def reasoning_chat_template_kwargs(request) -> dict:
+def reasoning_chat_template_kwargs(request,
+                                   template_source: Optional[str] = None
+                                   ) -> dict:
     """Chat-template kwargs implied by a request's reasoning configuration.
 
     Both the prompt and the reasoning parser need these. DeepSeek-V4's
@@ -1227,6 +1248,18 @@ def reasoning_chat_template_kwargs(request) -> dict:
     constructed with the same flag - otherwise it falls back to an identity
     parser and the reasoning, plus its closing tag, stays in the visible
     answer. Deriving both from one place keeps them from drifting apart.
+
+    ``template_source`` (the Jinja source about to be rendered, from
+    ``rendered_hf_chat_template_source``) makes the injection template-aware:
+    templates differ in which reasoning kwargs they implement, and injecting
+    one the active template never reads would be rejected at the render site
+    by the chat-template guard - a 400 the client cannot fix, since the serve
+    itself constructed the kwarg. Injected keys the template does not
+    reference are therefore dropped. Only injected keys are filtered: kwargs
+    the client sent are returned untouched and keep their render-site guard
+    semantics. Callers with no template to render (the reasoning-parser
+    sites, custom non-Jinja tokenizers) pass no source and get the full
+    injection.
     """
     # Check the type rather than the truthiness of each attribute. A caller
     # that passes a stand-in object - a Mock in a unit test, say - hands back a
@@ -1234,12 +1267,17 @@ def reasoning_chat_template_kwargs(request) -> dict:
     # `attr.keys()` and fail with a TypeError instead of falling back.
     raw = getattr(request, "chat_template_kwargs", None)
     kwargs = dict(raw) if isinstance(raw, Mapping) else {}
+    client_keys = frozenset(kwargs)
     reasoning = getattr(request, "reasoning", None)
     effort = getattr(reasoning, "effort",
                      None) if reasoning is not None else None
     if isinstance(effort, str) and effort:
         kwargs.setdefault("reasoning_effort", effort)
         kwargs.setdefault("thinking", True)
+    if template_source is not None:
+        injected = [key for key in kwargs if key not in client_keys]
+        for key in unreferenced_chat_template_kwargs(template_source, injected):
+            del kwargs[key]
     return kwargs
 
 

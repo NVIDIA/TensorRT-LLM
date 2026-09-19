@@ -223,6 +223,42 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "build that relays 'resolved_thinking'.")
 
 
+#: Efforts the MuseSpark chat template understands. The template reads
+#: `reasoning_effort` from its chat-template kwargs only; `max` and `none`
+#: have no MuseSpark equivalent and leave the template default in place.
+_MUSESPARK_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+
+def _apply_musespark_chat_extensions(request: ChatCompletionRequest,
+                                     model_type: Optional[str]) -> None:
+    """Route a request-level `reasoning_effort` to the MuseSpark template.
+
+    The musespark_open_omni chat template renders its reasoning-strength control
+    line from chat-template kwargs only, so a top-level `reasoning_effort` —
+    the field OpenAI-compatible clients actually send — was silently ignored
+    on this path (only the kimi/harmony paths consumed it). Derive the kwarg
+    from the request field; an explicit client-supplied
+    `chat_template_kwargs.reasoning_effort` wins over the derived value, and
+    the pydantic default (the field defaults to LOW) is never derived —
+    only an effort the client explicitly set.
+    """
+    if model_type != "musespark_open_omni":
+        return
+    if ("reasoning_effort" not in request.model_fields_set
+            or request.reasoning_effort is None):
+        return
+    effort = getattr(request.reasoning_effort, "value",
+                     request.reasoning_effort).lower()
+    if effort not in _MUSESPARK_EFFORTS:
+        # `max`/`none` (Kimi-style) have no MuseSpark equivalent; leave the
+        # template default rather than guessing a mapping.
+        return
+    request.chat_template_kwargs = {
+        "reasoning_effort": effort,
+        **(request.chat_template_kwargs or {}),
+    }
+
+
 def _configure_parser_special_token_decoding(
         sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
         tool_parser_name: Optional[str], has_tools: bool) -> None:
@@ -1902,6 +1938,7 @@ class OpenAIServer(_VideoRoutesMixin):
             model_type = resolve_top_level_model_type(self.model_config)
             is_kimi_k3 = model_type == "kimi_k3"
             apply_model_chat_extensions(request, model_type)
+            _apply_musespark_chat_extensions(request, model_type)
             if request.tool_choice == "required" and not is_kimi_k3:
                 # Schema-accepting "required" everywhere but enforcing it only
                 # for kimi_k3 would silently degrade to "auto" elsewhere;
