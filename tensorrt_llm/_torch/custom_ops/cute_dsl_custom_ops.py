@@ -11684,12 +11684,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             compiled_mla = CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[
                 cache_key]
+            page_table_arg = page_table
+            if page_table.shape[0] == 1 and page_table.shape[1] == 1:
+                # leading_dim=0 does not survive TensorAdapter's call-time re-adapt
+                # (cute/runtime.py:915), and a (1, 1) table has no extent > 1, so
+                # deduction raises "Can't deduce the leading dimension from layout".
+                page_table_arg = cute.runtime.from_dlpack(
+                    page_table,
+                    assumed_align=16).mark_layout_dynamic(leading_dim=0)
             runtime_args = [
                 q_latent,
                 q_rope,
                 c_latent,
                 c_rope,
-                page_table,
+                page_table_arg,
                 o,
                 lse,
             ]

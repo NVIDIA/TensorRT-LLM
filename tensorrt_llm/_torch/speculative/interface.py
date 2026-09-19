@@ -164,9 +164,15 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
         # its draft state at i is a function of tokens [0, i] like the target's.
         return 0
-    # Unestablished elsewhere: DraftTargetOneModel likely shifts by 1 but is
-    # unvalidated; DFlash/DSpark build context draft K/V from projected target
-    # hidden states into worker-owned buffers, which block reuse cannot restore.
+    if spec_mode.is_dflash() or spec_mode.is_dspark():
+        # precompute_context_kv(projected_hidden, positions) writes the drafter's
+        # OWN post-norm post-RoPE K/V, one entry per context token, and the
+        # target hidden at i already depends on exactly tokens [0, i]. Same
+        # dependency face as the target's own KV, so raw-prompt keys describe it
+        # and no chunk-tail lookahead token is needed. The paged pool then makes
+        # a matched prefix addressable again (dflash.py _store_prefill_context).
+        return 0
+    # DraftTargetOneModel likely shifts by 1 but is unvalidated upstream.
     return None
 
 
@@ -2073,6 +2079,43 @@ class SpecWorkerBase(nn.Module, ABC):
         from ..distributed.ops import allgather
         return allgather(logits, self.mapping, dim=-1)
 
+    @staticmethod
+    def _zero_padding_rows(logits: torch.Tensor, spec_metadata,
+                           num_contexts: int, batch_size: int,
+                           rows_per_request: int) -> torch.Tensor:
+        """Zero the logits rows belonging to CUDA-graph padding requests.
+
+        A padding request decodes from an uninitialized KV/hidden state, so its
+        logits can be non-finite and its probs degenerate. flashinfer's
+        ``chain_speculative_sampling`` then rejects at a position whose
+        ``relu(target - draft)`` residual has no mass, reads an uninitialized
+        shared-memory slot and emits an out-of-range token id. Zeroed logits are legal.
+
+        Padding requests are the ones ``populate_sampling_params_for_one_model``
+        routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
+        extra host-side state. Shapes are static: CUDA-graph safe. No-op while
+        ``dummy_slot_row`` is still 0, which is a live request's row rather than
+        a padding marker; ``prepare_rejection_sampling_buffers`` and
+        ``prepare_penalty_buffers`` are the two places that publish it.
+
+        Args:
+            logits: ``[(batch_size - num_contexts) * rows_per_request, vocab]``;
+                returned unchanged if the row count does not match.
+            rows_per_request: logits rows each request contributes.
+        Returns:
+            ``logits`` with the padding requests' rows zeroed.
+        """
+        slot_ids = getattr(spec_metadata, "batch_slot_ids", None)
+        dummy_slot_row = getattr(spec_metadata, "dummy_slot_row", 0)
+        num_gens = batch_size - num_contexts
+        if (slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0
+                or logits.shape[0] != num_gens * rows_per_request):
+            return logits
+        is_padding = slot_ids[num_contexts:batch_size] == dummy_slot_row
+        if rows_per_request > 1:
+            is_padding = is_padding.repeat_interleave(rows_per_request)
+        return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -2103,6 +2146,10 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1 +
                                                    (draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
+            # The proposal stored below is read back by next iteration's
+            # rejection kernel, so a padding row must not poison it either.
+            logits = self._zero_padding_rows(logits, spec_metadata, 0,
+                                             batch_size, 1)
             draft_tokens, probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(logits,
                                                                 temperatures,
@@ -2277,6 +2324,9 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.top_ks[gen_start:gen_end],
                 spec_metadata.top_ps[gen_start:gen_end])
 
+            gen_logits = self._zero_padding_rows(gen_logits, spec_metadata,
+                                                 num_contexts, batch_size,
+                                                 runtime_draft_len + 1)
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
             target_probs = target_probs_flat.reshape(num_gens,
@@ -2546,6 +2596,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
+            flat_logits = self._zero_padding_rows(flat_logits, spec_metadata,
+                                                  num_contexts, batch_size, K)
             flat_tokens, flat_probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(flat_logits,
                                                                 temps,
