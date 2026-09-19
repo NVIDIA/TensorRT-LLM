@@ -395,14 +395,20 @@ class TestStep3p7Helpers(unittest.TestCase):
                         return_value=moe_lora_enabled,
                     ),
                     patch.object(step3p7_module, "create_moe", return_value=experts) as create_moe,
-                    patch.object(Step3p7MoE, "_allocate_clamp_buffers"),
+                    patch.object(Step3p7MoE, "_allocate_clamp_buffers") as allocate_clamp_buffers,
                 ):
                     moe = Step3p7MoE(model_config, layer_idx=0, aux_stream_dict={})
 
                 routing_method = create_moe.call_args.kwargs["routing_method"]
+                activation = create_moe.call_args.kwargs["activation"]
+                self.assertEqual(activation.clamp, 1.0)
+                self.assertEqual(activation.clamp_after_silu, moe_lora_enabled)
+                if moe_lora_enabled:
+                    allocate_clamp_buffers.assert_not_called()
+                else:
+                    allocate_clamp_buffers.assert_called_once()
                 moe.router_bias.router_bias.data.zero_()
                 moe.gate.return_value = torch.zeros(1, text_config.moe_num_experts)
-                moe._clamp_weights_loaded = True
                 python_output = MagicMock(return_value=torch.ones(1, text_config.hidden_size))
                 moe._python_clamped_moe_forward = python_output
 
@@ -414,6 +420,18 @@ class TestStep3p7Helpers(unittest.TestCase):
                 experts.side_effect = separated_experts
                 hidden_states = torch.ones(1, text_config.hidden_size)
                 lora_params = {"active": True} if moe_lora_enabled else None
+                if not moe_lora_enabled:
+                    moe._clamp_weights_loaded = False
+                    with self.assertRaisesRegex(
+                        RuntimeError, "requires dequantized expert weights"
+                    ):
+                        moe(
+                            hidden_states,
+                            types.SimpleNamespace(all_rank_num_tokens=[1]),
+                        )
+                    experts.assert_not_called()
+
+                moe._clamp_weights_loaded = True
                 output = moe(
                     hidden_states,
                     types.SimpleNamespace(all_rank_num_tokens=[1]),
@@ -430,6 +448,49 @@ class TestStep3p7Helpers(unittest.TestCase):
                 else:
                     python_output.assert_called_once()
                     experts.assert_not_called()
+
+    @parameterized.expand(
+        [
+            (
+                "materialization_raises",
+                ValueError("invalid expert layout"),
+                "could not materialize",
+            ),
+            ("weights_remain_unloaded", None, "did not materialize"),
+        ]
+    )
+    def test_load_weights_fails_closed_when_required_clamp_weights_are_unavailable(
+        self, _name, materialization_error, expected_message
+    ):
+        """Clamp-active Python experts must fail closed on both loader failure modes."""
+        import tensorrt_llm._torch.models.modeling_step3p7 as step3p7_module
+
+        moe = types.SimpleNamespace(
+            layer_idx=3,
+            _use_python_experts=True,
+            _clamp_weights_loaded=False,
+            _requires_python_clamp_weights=lambda: True,
+            load_clamp_weights_from_fp8_experts=MagicMock(side_effect=materialization_error),
+        )
+        model = types.SimpleNamespace(
+            ignored_key_prefixes=(),
+            text_config=object(),
+            model=types.SimpleNamespace(layers=[types.SimpleNamespace(moe=moe)]),
+            _capture_bf16_clamp_weights=MagicMock(),
+        )
+
+        with (
+            patch.object(step3p7_module, "rewrite_language_model_keys"),
+            patch.object(step3p7_module, "rewrite_mtp_weights_for_step3p7"),
+            patch.object(step3p7_module, "split_stacked_moe_weights"),
+            patch.object(
+                step3p7_module.DecoderModelForCausalLM,
+                "load_weights",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(RuntimeError, f"{expected_message}.*dequantized expert weights"),
+        ):
+            step3p7_module.Step3p7ForCausalLM.load_weights(model, {})
 
     def test_mtp_head_normalizes_before_output_projection(self):
         """Step3p7 MTP applies shared-head norm only when producing draft logits."""
