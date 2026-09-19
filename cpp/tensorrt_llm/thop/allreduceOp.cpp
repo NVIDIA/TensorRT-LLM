@@ -1764,6 +1764,15 @@ void clearAllReduceTacticCache()
     cache.tactics.clear();
 }
 
+int64_t allReduceAutoStrategy(int64_t numTokens, int64_t hiddenSize, int64_t fusionOp, int64_t tpSize)
+{
+    TORCH_CHECK(numTokens > 0 && hiddenSize > 0 && tpSize > 0,
+        "allreduce_auto_strategy requires positive num_tokens, hidden_size and tp_size");
+    return static_cast<int64_t>(
+        tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(static_cast<size_t>(numTokens),
+            static_cast<size_t>(hiddenSize), static_cast<AllReduceFusionOp>(fusionOp), static_cast<int>(tpSize)));
+}
+
 std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
     torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
     torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace,
@@ -2347,6 +2356,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? workspace, int[] group, int op, int bucket, int tactic) -> ()");
     m.def("validate_allreduce_tuning_buckets(int[] buckets) -> ()");
     m.def("clear_allreduce_tactic_cache() -> ()");
+    m.def("allreduce_auto_strategy(int num_tokens, int hidden_size, int op, int tp_size) -> int");
     m.def(
         "allreduce_pg("
         "Tensor input,"
@@ -2430,6 +2440,7 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("validate_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::validateAllReduceTuningBuckets);
     m.impl("clear_allreduce_tactic_cache", &tensorrt_llm::torch_ext::clearAllReduceTacticCache);
+    m.impl("allreduce_auto_strategy", &tensorrt_llm::torch_ext::allReduceAutoStrategy);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

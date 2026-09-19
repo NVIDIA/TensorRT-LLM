@@ -91,7 +91,14 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
 {
     auto sm_version = tensorrt_llm::common::getSMVersion();
     auto tp_index = static_cast<size_t>(std::log2(tp_size) - 1);
-    auto fusion_op_index = static_cast<size_t>(mapFusionOpToIndex.find(fusionOp)->second);
+    // Fusion ops with no tuned rows (RMS_NORM, RESIDUAL_RMS_PREPOST_NORM, MOE_FINALIZE_*) are absent from
+    // the map, and the bounds check below runs too late to catch them, so fall back to NCCL as it does.
+    auto const fusion_op_entry = mapFusionOpToIndex.find(fusionOp);
+    if (fusion_op_entry == mapFusionOpToIndex.end())
+    {
+        return AllReduceStrategyType::NCCL;
+    }
+    auto fusion_op_index = static_cast<size_t>(fusion_op_entry->second);
     auto num_token_index = static_cast<size_t>(std::log2(num_tokens));
     auto hidden_size_index = static_cast<size_t>(std::log2(hidden_size) - 7);
 
