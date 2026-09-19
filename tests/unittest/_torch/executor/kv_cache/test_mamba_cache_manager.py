@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    _KDA_BETA_CACHE_ALIGNMENT_BYTES,
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     MambaCacheManager,
@@ -235,6 +236,43 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     assert params.num_mamba_layers == 2
     assert params.dtype is torch.bfloat16
     assert params.mamba_ssm_cache_dtype is torch.float32
+
+
+def _kimi_kda_hf_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=4,
+        linear_attn_config={
+            "head_dim": 8,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 3],
+            "full_attn_layers": [2, 4],
+        },
+        dtype=torch.bfloat16,
+    )
+
+
+def test_kimi_kda_state_dtype_bf16_is_opt_in() -> None:
+    """kv_cache_config.mamba_ssm_cache_dtype=bfloat16 reaches the state pool.
+
+    The bf16 staging paths in the KDA mixer and the fused decode kernel are
+    only reachable when the explicit request survives cache-param extraction.
+    """
+    params = extract_mamba_kv_cache_params(
+        _kimi_kda_hf_config(),
+        quant_config=SimpleNamespace(mamba_ssm_cache_dtype=torch.bfloat16),
+    )
+
+    assert params.mamba_ssm_cache_dtype is torch.bfloat16
+
+
+def test_kimi_kda_state_dtype_rejects_unsupported_request() -> None:
+    with pytest.raises(ValueError, match="float32 .default. or"):
+        extract_mamba_kv_cache_params(
+            _kimi_kda_hf_config(),
+            quant_config=SimpleNamespace(mamba_ssm_cache_dtype=torch.float16),
+        )
 
 
 def _kimi_model_config() -> SimpleNamespace:
@@ -2238,6 +2276,7 @@ def _build_v2_hybrid_with_mamba_layer(
     kv_cache_dtype="auto",
     conv_state_layout="x_b_c",
     mamba_d_conv=4,
+    mamba_num_heads=4,
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
@@ -2272,7 +2311,7 @@ def _build_v2_hybrid_with_mamba_layer(
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
         mamba_d_conv=mamba_d_conv,
-        mamba_num_heads=4,
+        mamba_num_heads=mamba_num_heads,
         mamba_n_groups=mamba_n_groups,
         mamba_head_dim=8,
         mamba_num_layers=num_mamba_layers,
@@ -3479,7 +3518,8 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         spec_config=spec_config,
         conv_state_layout="q_k_v",
         mamba_d_conv=5,
-        mamba_n_groups=4,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
         mamba_ssm_cache_dtype=torch.float32,
         kda_replay_num_spec=2,
     )
@@ -3491,14 +3531,25 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
 
         layer_cache = mgr.mamba_layer_cache(0)
         cache_size = layer_cache.temporal.shape[0]
-        assert layer_cache.kda_conv_q.shape == (cache_size, 32, 6)
-        assert layer_cache.kda_conv_k.shape == (cache_size, 32, 6)
-        assert layer_cache.kda_conv_v.shape == (cache_size, 32, 6)
+        assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_q.dtype is torch.float32
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 32)
-        assert layer_cache.kda_v_cache.shape == (cache_size, 2, 32)
-        assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 4)
+        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 48)
+        assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
+        # Six fp32 heads are 24 bytes, so the row is padded to 32 (stride 8)
+        # to keep every nested per-draft view 16-byte aligned for CuTe.
+        assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
+        assert layer_cache.kda_beta_cache.stride(-2) == 8
+        for layer_idx in range(2):
+            for slot_idx in range(cache_size):
+                for draft_idx in range(2):
+                    assert (
+                        mgr.kda_beta_cache[layer_idx, slot_idx, draft_idx].data_ptr()
+                        % _KDA_BETA_CACHE_ALIGNMENT_BYTES
+                        == 0
+                    )
         assert layer_cache.kda_qkg_cache.dtype is torch.float32
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             mgr.prev_num_accepted_tokens.data_ptr()
@@ -3757,6 +3808,78 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
             assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
             assert mgr.prev_num_accepted_tokens[slot] == 0
+    assert mgr.prev_num_accepted_tokens[0] == 5
+    assert mgr.prev_num_accepted_tokens[2] == 5
+
+
+def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
+    """The conv half of the KDA state crosses ctx->gen in bf16.
+
+    ``extract_mamba_kv_cache_params`` forces the KDA delta-rule (ssm) pool to
+    fp32 but leaves the short-convolution pool at the model dtype, so what the
+    context rank serializes and the generation rank restores for the conv slot
+    is bf16 while the SA replay caches the generation rank rebuilds from it are
+    fp32. Seeding must widen the restored rows losslessly, keep the logical
+    shape, leave the restored bf16 pool itself untouched so the decode path
+    reuses exactly what was transferred, and clear only the draft scratch of
+    the seeded slots.
+    """
+    torch.manual_seed(0)
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = True
+    mgr.local_num_mamba_layers = 2
+    mgr.conv_state_shape = [6, 4]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr._request_id_to_state_index = {101: 1, 202: 3}
+    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+    # The restored (transferred) conv pool, in the dtype the transceiver moves.
+    mgr.all_conv_states = [(torch.randn(4, 6, 4) * 0.1).to(torch.bfloat16) for _ in range(2)]
+    restored = [conv.clone() for conv in mgr.all_conv_states]
+
+    def dim_contiguous_conv_cache() -> torch.Tensor:
+        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+
+    mgr.kda_conv_q = dim_contiguous_conv_cache()
+    mgr.kda_conv_k = dim_contiguous_conv_cache()
+    mgr.kda_conv_v = dim_contiguous_conv_cache()
+    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
+    mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
+    mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+
+    mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    for layer_offset, conv_state in enumerate(mgr.all_conv_states):
+        assert conv_state.dtype is torch.bfloat16
+        for slot in (1, 3):
+            for replay_buffer, start in (
+                (mgr.kda_conv_q, 0),
+                (mgr.kda_conv_k, 2),
+                (mgr.kda_conv_v, 4),
+            ):
+                # fp32 replay cache, logical shape unchanged by the widening.
+                assert replay_buffer.dtype is torch.float32
+                seeded = replay_buffer[layer_offset, slot, :, :4]
+                assert seeded.shape == (2, 4)
+                # bf16 -> fp32 is lossless, so the restored values must survive
+                # the widening bit for bit.
+                torch.testing.assert_close(
+                    seeded,
+                    conv_state[slot, start : start + 2, :].float(),
+                    rtol=0,
+                    atol=0,
+                )
+                assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
+            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
+            assert mgr.prev_num_accepted_tokens[slot] == 0
+        # Slots no request restored keep their pre-seed contents.
+        for slot in (0, 2):
+            assert (mgr.kda_conv_q[layer_offset, slot] == 7.0).all()
+            assert (mgr.kda_qkg_cache[layer_offset, slot] == 7.0).all()
+        # The restored bf16 pool is read-only here: plain decode (speculation
+        # off) reuses exactly the state the transfer wrote.
+        torch.testing.assert_close(conv_state, restored[layer_offset], rtol=0, atol=0)
     assert mgr.prev_num_accepted_tokens[0] == 5
     assert mgr.prev_num_accepted_tokens[2] == 5
 
