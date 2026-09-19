@@ -50,6 +50,7 @@ from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
+from .checkpoints.hf.compressed_tensors import normalize_compressed_tensors_nvfp4_names
 from .checkpoints.hf.weight_mapper import HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, register_mapper
@@ -637,48 +638,14 @@ class LagunaHfWeightMapper(HfWeightMapper):
         #   weight_scale         (FP8, same)
         #   weight_scale_2       (FP32 scalar = amax_weight/(FP8_MAX*FP4_MAX))
         #   input_scale          (FP32 scalar = amax_input/(FP8_MAX*FP4_MAX))
-        # which is the reciprocal of the *_global_scale values.
+        # which is the reciprocal of the *_global_scale values. The rename and
+        # the zero-safe reciprocal live in
+        # ``checkpoints/hf/compressed_tensors.py`` so every mapper that has to
+        # read both producers shares one implementation.
         if self._config is not None and self._config.quant_config.quant_mode.has_nvfp4():
-
-            def _invert_global_scale(t: torch.Tensor) -> torch.Tensor:
-                """Convert compressed-tensors multiplier form to TRT-LLM
-                divisor form, protecting against uncalibrated experts.
-
-                llm-compressor stores global_scale=(FP8_MAX*FP4_MAX)/amax;
-                TRT-LLM expects {weight_scale_2, input_scale}=amax/(FP8_MAX*FP4_MAX),
-                i.e. the reciprocal. Some checkpoints store 0 for experts with
-                no calibration data (amax unavailable); a naive 1/x would
-                produce Inf which then contaminates the MoE per-layer
-                max-reduction over experts and zeroes out *every* expert's
-                input_scale. We preserve 0 -> 0 so those entries are harmless
-                in the max reduction and the corresponding expert's alpha
-                evaluates to 0 (silencing the dead expert).
-                """
-                t = t.to(torch.float32)
-                out = torch.where(
-                    t > 0,
-                    1.0 / torch.clamp(t, min=torch.finfo(torch.float32).tiny),
-                    torch.zeros_like(t),
-                )
-                # Belt-and-braces: any residual Inf/NaN becomes 0.
-                return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
-
-            renamed: dict = {}
-            for name, value in weights.items():
-                if name.endswith(".weight_packed"):
-                    new_name = name[: -len(".weight_packed")] + ".weight"
-                    renamed[new_name] = value
-                elif name.endswith(".weight_global_scale"):
-                    new_name = name[: -len(".weight_global_scale")] + ".weight_scale_2"
-                    t = value[...] if not isinstance(value, torch.Tensor) else value
-                    renamed[new_name] = _invert_global_scale(t)
-                elif name.endswith(".input_global_scale"):
-                    new_name = name[: -len(".input_global_scale")] + ".input_scale"
-                    t = value[...] if not isinstance(value, torch.Tensor) else value
-                    renamed[new_name] = _invert_global_scale(t)
-                else:
-                    renamed[name] = value
-            weights = renamed
+            weights = normalize_compressed_tensors_nvfp4_names(
+                weights, allow_zero_global_scales=True
+            )
 
         return weights
 
