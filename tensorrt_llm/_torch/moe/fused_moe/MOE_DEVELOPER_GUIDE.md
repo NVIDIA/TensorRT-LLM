@@ -163,8 +163,8 @@ The codebase is transitioning between two architectures:
 ConfigurableMoE currently supports these backends (`create_moe.py`):
 - `CutlassFusedMoE`, the `TrtllmGenFusedMoEBase` leaves,
   `DeepgemmCudaFp8BlockScalesImpl`, `CuteDslFusedMoE`, `CuteDslB12xFusedMoE`,
-  `DenseGEMMFusedMoE`, `DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `MegaMoECuteDsl`,
-  `MarlinFusedMoE`
+  `TrtllmCutedslFusedFc12Nvfp4Impl`, `DenseGEMMFusedMoE`,
+  `DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `MegaMoECuteDsl`, `MarlinFusedMoE`
 
 Still on old path (standalone, with embedded communication):
 - `TritonFusedMoE`, `VanillaMoE`
@@ -203,6 +203,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4 hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode — best perf on RTX PRO 6000 (SM120) and DGX Spark (SM121); select via the `CUTEDSL` backend path (it heads that family's candidate list, so it wins on SM120/121 when flashinfer is present and yields to `CuteDslFusedMoE` otherwise); single-GPU-shaped topology only — it rejects both `ep_size > 1` and attention-DP, because it has no dispatch/combine kernel and has never been exercised behind a DP allgather | `EXTERNAL_COMM` |
+| `fused_moe_cute_dsl_fc12.py` | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2: a `MoEImplBase` leaf sharing `CuteDslFusedMoE`'s NVFP4 weight layout and outer autotune runner, driving the single persistent `cute_dsl_nvfp4_fc12_fused_rubin` kernel (keeps the FC1->FC2 intermediate on-chip, removing the global round-trip and one launch); reachable through the `CUTEDSL_FC12` backend family or a pinned `impl_id`; requires CuTe DSL Rubin support (`MoEDep.CUTEDSL_RUBIN` in the collected environment); routing tile 128 (1-CTA) or 256 (2-CTA, cluster (2,1)), chosen by the autotuner per shape; non-uGPU | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects Blackwell, Rubin generic or Rubin genphase kernels. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models. | `FUSED_COMM` |
 | `fused_moe_marlin.py` | `MarlinFusedMoE` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, fused single-launch `marlin_nvfp4_moe_gemm` kernel); supports attention-DP + EP via external comm (scheduler precomputes routing; dispatch payload is plain BF16, no activation scales); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass in `resolve_moe_impl`, recorded in the layer's `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
@@ -444,12 +445,12 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103, BF16, needs FlashInfer)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | N‡ | N | N | N | N | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
+| NVFP4 | Y (SM100/103/107/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
 | W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121 via `CuteDslB12xFusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
 | W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
-| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
-| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | Y (SM100/103, requires `hidden_size % 512 == 0`) | N | N | N | N |
+| W4A8 MXFP4 FP8 | Y (SM100/103/107) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
+| W4A8 MXFP4 MXFP8 | Y (SM100/103/107/120/121) | Y (SM100/103) | N | N | N | Y (SM100/103, requires `hidden_size % 512 == 0`) | N | N | N | N |
 | W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | N | N | N | N | N | N |
 | W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |

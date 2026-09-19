@@ -31,6 +31,9 @@ llm_spark_func:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
   - test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
   - examples/serve/test_serve.py::test_nemotron3_super_120b_nvfp4
+  - accuracy/test_llm_api_pytorch.py::TestNemotron35Lightning::test_nvfp4_cutedsl_mtp3_chunked_prefill
+  - examples/serve/test_serve.py::test_nemotron35_lightning_30b[nvfp4]
+  - examples/serve/test_serve.py::test_nemotron35_lightning_30b[bf16]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_on]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_off]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_streaming]

@@ -79,7 +79,6 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
-_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
@@ -113,7 +112,8 @@ def Field(default: Any = ...,
             telemetry=TelemetryField.categorical(...) to opt an otherwise unsafe
             categorical branch in with exact allowed values, or telemetry=False
             to opt a type-safe field out.
-        **kwargs: All other arguments passed to the original Pydantic Field
+        **kwargs: All other arguments passed to the original Pydantic Field.
+            json_schema_extra must be a dict when status or telemetry is set.
 
     Returns:
         A Pydantic FieldInfo object with extra metadata added to
@@ -124,7 +124,9 @@ def Field(default: Any = ...,
 
     if status is not None or telemetry_requested or telemetry_explicit_exclude:
         trtllm_schema_extra: dict[str, Any] = {}
-        json_schema_extra = kwargs.get('json_schema_extra', {})
+        json_schema_extra = kwargs.get('json_schema_extra')
+        if json_schema_extra is None:
+            json_schema_extra = {}
         if status is not None:
             trtllm_schema_extra['status'] = status
         if telemetry_explicit_exclude:
@@ -142,35 +144,21 @@ def Field(default: Any = ...,
                 raise TypeError(
                     "telemetry must be bool, dict, or TelemetryField")
             trtllm_schema_extra['telemetry'] = telemetry_metadata
-        if isinstance(json_schema_extra, dict):
-            json_schema_extra = {**json_schema_extra, **trtllm_schema_extra}
-        elif callable(json_schema_extra):
-            original_json_schema_extra = json_schema_extra
-
-            def merged_json_schema_extra(schema: dict[str, Any]) -> None:
-                original_extra = original_json_schema_extra(schema)
-                if isinstance(original_extra, dict):
-                    schema.update(original_extra)
-                schema.update(trtllm_schema_extra)
-
-            setattr(merged_json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR,
-                    trtllm_schema_extra)
-            json_schema_extra = merged_json_schema_extra
-        else:
-            json_schema_extra = trtllm_schema_extra
-        kwargs['json_schema_extra'] = json_schema_extra
+        if not isinstance(json_schema_extra, dict):
+            raise TypeError(
+                "json_schema_extra must be a dict when status or telemetry metadata is set"
+            )
+        kwargs['json_schema_extra'] = {
+            **json_schema_extra,
+            **trtllm_schema_extra
+        }
 
     return PydanticField(default, **kwargs)
 
 
 def _get_trtllm_json_schema_extra(field_info: Any) -> dict[str, Any]:
     json_schema_extra = getattr(field_info, "json_schema_extra", None)
-    if callable(json_schema_extra):
-        json_schema_extra = getattr(json_schema_extra,
-                                    _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
-    if isinstance(json_schema_extra, dict):
-        return json_schema_extra
-    return {}
+    return json_schema_extra if isinstance(json_schema_extra, dict) else {}
 
 
 class BaseCudaGraphConfig(StrictBaseModel):
@@ -1444,6 +1432,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description="Target sparsity for prefill and/or decode phases. "
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
+    uses_spcompress: bool = Field(
+        default=False,
+        description="Whether to enable spcompress (context phase, SM107 only).")
 
     @field_validator("target_sparsity")
     @classmethod
@@ -1524,7 +1515,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             is not None else SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 ckpt_sparse_attention_config=ckpt_sparse_attention_config))
-        return SkipSoftmaxParams(scheduler=scheduler)
+        return SkipSoftmaxParams(scheduler=scheduler,
+                                 uses_spcompress=self.uses_spcompress)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1626,8 +1618,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
-_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
-                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
+                      "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
 
 

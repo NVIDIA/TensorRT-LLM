@@ -31,6 +31,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import ActivationParamShape, MoEActivation, activation_constant_names
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -97,6 +98,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
     CuteDslFusedMoE,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
     # flag unset every FlashInfer leaf rejects in ``check_flashinfer_provider``
@@ -131,6 +133,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinFusedMoE}),
     "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
+    "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
     # The coarse literal still names the whole family, so ``moe_backend:

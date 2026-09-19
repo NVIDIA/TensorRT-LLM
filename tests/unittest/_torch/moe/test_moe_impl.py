@@ -31,6 +31,9 @@ from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
+    TrtllmCutedslFusedFc12Nvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepgemmCudaFp8BlockScalesImpl,
@@ -144,7 +147,8 @@ def test_identity_matching_nothing_registered_raises():
     """Built as a query rather than parsed, to get past the token vocabulary.
 
     ``fp8`` because plain per-tensor FP8 has no registered MoE implementation,
-    which is what makes the query match nothing while staying well-formed.
+    which is what makes the query match nothing while staying well-formed
+    (``nvfp4`` is registered by TrtllmCutedslFusedFc12Nvfp4Impl).
     """
     with override_moe_environment(_deepgemm_environment()):
         with pytest.raises(ValueError, match="matches no registered implementation"):
@@ -718,6 +722,84 @@ def test_trtllm_gen_situ_admitted_only_by_the_leaves_with_a_fused_cubin(impl_id)
     else:
         assert not verdict.eligible
         assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+# =====================================================================
+# TrtllmCutedslFusedFc12Nvfp4Impl implementation identity
+# =====================================================================
+# Problem and deployment are passed explicitly, as for MegaMoE: the FC12 gates
+# read SM, the Rubin CuTe DSL dependency, quantization, dtype and finalize
+# fusion, and stating them keeps one variable per test.
+
+_FC12_IMPL_ID = "trtllm.cutedsl.fused_fc12.nvfp4"
+
+
+def _fc12_problem() -> MoEProblem:
+    """The DeepSeek-V4-Pro routed shape, which every FC12 gate admits."""
+    return MoEProblem(
+        quant=canonical_quant(QuantAlgo.NVFP4),
+        dtype_act=torch.bfloat16,
+        hidden_size=7168,
+        intermediate_size=3072,
+        num_experts=384,
+        top_k=6,
+        swiglu_gptoss_style=False,
+    )
+
+
+def _fc12_deployment(sm: int = 107) -> MoEDeployment:
+    """Single rank with the CuTe DSL Rubin helpers present; ``sm`` is the only variable."""
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=384,
+        env=MoEEnvironment(sm=sm, available_deps=(MoEDep.CUTEDSL_RUBIN.value,)),
+    )
+
+
+def test_fc12_identity_round_trips_through_registry():
+    """One class owns the id, the four methods, and the published contract."""
+    impl = TrtllmCutedslFusedFc12Nvfp4Impl
+    identity = impl.descriptor.identity
+    assert identity.canonical() == _FC12_IMPL_ID
+    assert MoEImplId.parse(_FC12_IMPL_ID) == identity
+    assert MOE_IMPL_REGISTRY.lookup(identity) is impl
+    assert "descriptor" in vars(impl)
+    for name in ("can_implement", "_get_quant_method", "quantize_input", "run_moe"):
+        assert name in vars(impl)
+    assert not impl.__abstractmethods__
+    assert impl.scheduler_kind is impl.descriptor.scheduler_kind
+    assert impl.capabilities is impl.descriptor.capabilities
+    assert impl.input_requirement is impl.descriptor.input_requirement
+
+
+def test_pinned_fc12_identity_fails_hard_where_the_backend_literal_degrades():
+    """On Rubin both tracks land on FC12; off Rubin the literal degrades and the pin does not."""
+    config = ModelConfig()
+    config.moe_backend = MoeBackendType.CUTEDSL_FC12.value
+    problem = _fc12_problem()
+
+    on_rubin = resolve_moe_impl(
+        config, problem=problem, deployment=_fc12_deployment(), impl_id=_FC12_IMPL_ID
+    )
+    assert impl_class_for(on_rubin) is TrtllmCutedslFusedFc12Nvfp4Impl
+    assert on_rubin.selected_by == "pinned"
+
+    off_rubin = _fc12_deployment(sm=100)
+    by_literal = resolve_moe_impl(config, problem=problem, deployment=off_rubin)
+    by_identity = resolve_moe_impl(
+        config, problem=problem, deployment=off_rubin, impl_id=_FC12_IMPL_ID
+    )
+    assert impl_class_for(by_literal) is not TrtllmCutedslFusedFc12Nvfp4Impl
+    assert by_literal.degraded
+    assert by_identity.winner is None
+    assert [rejection.reason for rejection in by_identity.rejected] == [
+        MoERejectReason.SM_UNSUPPORTED
+    ]
+    with pytest.raises(ValueError, match="no MoE implementation can serve"):
+        impl_class_for(by_identity)
 
 
 # =====================================================================

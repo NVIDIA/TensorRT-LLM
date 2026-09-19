@@ -1188,7 +1188,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
     bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
-    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold)
+    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold,
+    std::optional<bool> uses_spcompress)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1202,12 +1203,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     TLLM_CHECK_WITH_INFO(
         update_kv_cache || is_cross, "KV cache update cannot be disabled now (except for cross attention).");
     auto qkv_or_q = q;
-    if (is_fused_qkv)
+    // MLA validates its separate Q/K/V or latent-cache inputs in Runner::run.
+    if (!is_mla_enable && is_fused_qkv)
     {
         TLLM_CHECK_WITH_INFO(!k.has_value(), "The k tensor should be null if using fused QKV");
         TLLM_CHECK_WITH_INFO(!v.has_value(), "The v tensor should be null if using fused QKV");
     }
-    if (!is_fused_qkv && update_kv_cache && !is_cross)
+    if (!is_mla_enable && !is_fused_qkv && update_kv_cache && !is_cross)
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
@@ -1415,6 +1417,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         // For chunked prefill MLA, we need larger buffer size for k and v
         op->mChunkPrefillBufferBatchSize
             = chunked_prefill_buffer_batch_size.has_value() ? chunked_prefill_buffer_batch_size.value() : 1;
+    }
+
+    op->mUsesSpcompress = uses_spcompress.value_or(false);
+    if (op->mUsesSpcompress)
+    {
+        int const smVersionSpcompress = op->smVersion();
+        TORCH_CHECK(smVersionSpcompress == 107,
+            "uses_spcompress is only supported on SM107. Got SM version: ", smVersionSpcompress);
+        TORCH_CHECK(
+            op->mFP8ContextFMHA || op->mFP8ContextMLA, "uses_spcompress requires FP8 context FMHA or FP8 context MLA.");
     }
 
     op = get_attention_op(runner, op, local_layer_idx);
