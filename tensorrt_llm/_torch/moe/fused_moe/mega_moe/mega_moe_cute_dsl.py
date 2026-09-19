@@ -111,6 +111,7 @@ from ..impl_contract import (
     MoEStaticCapability,
 )
 from ..impl_environment import MoEDep
+from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
@@ -119,6 +120,7 @@ __all__ = [
     "MegaMoECuteDsl",
     "MegaMoeCuteDslUnavailable",
     "MegaMoECuteDslWeightView",
+    "TrtllmCutedslMegaMoeNvfp4Impl",
     "is_megamoe_cute_dsl_runtime_available",
 ]
 
@@ -363,8 +365,18 @@ class _MegaMoeBuffers:
 # ---------------------------------------------------------------------------
 
 
-class MegaMoECuteDsl(MoEImplBase):
-    """MoE backend wrapping the ported MegaMoE CuteDSL NVFP4 fused kernel.
+@register_moe_impl
+class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
+    """``trtllm.cutedsl.mega_moe.nvfp4``.
+
+    MoE backend wrapping the exported MegaMoE CuteDSL NVFP4 fused kernels;
+    ``MegaMoECuteDsl`` below is an alias onto this class.
+
+    The per-architecture kernel variants dispatch inside this one identity,
+    because architecture is not an id segment: all four segments hold whichever
+    kernel runs. The class name carries its ``kernel_name`` segment because
+    ``CuteDslFusedMoE``'s ``trtllm.cutedsl.grouped_gemm.nvfp4`` will differ from
+    this id in that field alone.
 
     Capability gate (``can_implement``): SM100/103/107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.
@@ -383,11 +395,28 @@ class MegaMoECuteDsl(MoEImplBase):
         allocated (e.g. ``torch.distributed`` not initialised).
     """
 
-    _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
+    descriptor = MoEImplDescriptor(
+        identity=MoEImplId("trtllm", "cutedsl", "mega_moe", "nvfp4"),
+        # Kernel owns dispatch + GEMM1 + SwiGLU + GEMM2 + combine via the
+        # CuteDSL three-stage dispatch primitives + NVLink barrier; the
+        # scheduler must skip host-side comm and lockstep every chunk.
+        scheduler_kind=MoESchedulerKind.FUSED_COMM,
+        # Static and dynamic EPLB both work: see ``_supports_load_balancer``
+        # below for why the MegaMoE-format derived parameters migrate
+        # atomically.
+        capabilities=MoEStaticCapability(supports_eplb=True),
+        doc="MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107.",
+    )
 
-    # Static and dynamic EPLB both work: see ``_supports_load_balancer`` below
-    # for why the MegaMoE-format derived parameters migrate atomically.
-    capabilities = MoEStaticCapability(supports_eplb=True)
+    # Read off the descriptor, not restated, so the published contract and the
+    # one the scheduler reads cannot drift apart.
+    scheduler_kind = descriptor.scheduler_kind
+
+    capabilities = descriptor.capabilities
+
+    input_requirement = descriptor.input_requirement
+
+    _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
     # The elementwise function and its constants are codegen-time literals, so
     # only a uniform per-layer value is representable.
@@ -400,11 +429,6 @@ class MegaMoECuteDsl(MoEImplBase):
     # Legal combine wire formats; must stay in sync with
     # ``CombineFormat.parse`` in the kernel package's token_comm.py.
     _SUPPORTED_COMBINE_FORMATS = frozenset({"bf16", "32e4m3xe8m0", "16e2m1xbf16"})
-
-    # Kernel owns dispatch + GEMM1 + SwiGLU + GEMM2 + combine via the
-    # CuteDSL three-stage dispatch primitives + NVLink barrier; the
-    # scheduler must skip host-side comm and lockstep every chunk.
-    scheduler_kind = MoESchedulerKind.FUSED_COMM
 
     # ------------------------------------------------------------------
     # Capability gating
@@ -1075,6 +1099,9 @@ class MegaMoECuteDsl(MoEImplBase):
         super().transform_weights()
 
     def cache_derived_state(self) -> None:
+        # A weights-removed reader runs materialize -> this hook and never
+        # ``post_load_weights``, so the guard cannot move there: this is the
+        # only place that pass can bind the quant method.
         if self.quant_method is None:
             self.create_weights()
         super().cache_derived_state()
@@ -1772,3 +1799,7 @@ class MegaMoECuteDsl(MoEImplBase):
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
         )
+
+
+# An alias, not a base class, so there is no second class to keep in step.
+MegaMoECuteDsl = TrtllmCutedslMegaMoeNvfp4Impl

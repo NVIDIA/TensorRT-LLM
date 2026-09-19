@@ -53,7 +53,7 @@ from .impl_contract import (
 from .impl_environment import collect_moe_environment
 from .impl_identity import MOE_IMPL_REGISTRY, MoEImplId, MoEImplQuery
 from .interface import MoE
-from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, MegaMoECuteDsl
+from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl
 from .moe_load_balancer import get_moe_load_balancer
 from .trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
@@ -90,13 +90,13 @@ MoEImplClass = type[MoE] | type[MoEImplBase] | type[VanillaMoE]
 # intersect their candidate set with this tuple -- ``_candidates_for`` against a
 # BACKEND_FAMILY entry, ``_candidates_for_impl_id`` against the registry -- so a
 # class missing from here resolves to an empty candidate list.
-# The DeepGEMM entries use the identity-derived names rather than the
-# ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` aliases, so what is ranked here
-# reads the same as what a resolution report prints.
+# The registered entries use the identity-derived names rather than the
+# ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` / ``MegaMoECuteDsl`` aliases, so
+# what is ranked here reads the same as what a resolution report prints.
 IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xFusedMoE,  # SM120/121 NVFP4 decode only -- narrowest, so first
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
-    MegaMoECuteDsl,
+    TrtllmCutedslMegaMoeNvfp4Impl,
     CuteDslFusedMoE,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
@@ -156,7 +156,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     ),
     "TRITON": frozenset({TritonFusedMoE}),
     "MEGAMOE_DEEPGEMM": frozenset({DeepgemmCudaW4a8Mxfp4Mxfp8Impl}),
-    "MEGAMOE_CUTEDSL": frozenset({MegaMoECuteDsl}),
+    "MEGAMOE_CUTEDSL": frozenset({TrtllmCutedslMegaMoeNvfp4Impl}),
 }
 
 # Catch table drift at import time.

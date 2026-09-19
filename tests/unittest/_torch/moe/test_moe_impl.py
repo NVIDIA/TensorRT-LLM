@@ -63,7 +63,9 @@ from tensorrt_llm._torch.moe.fused_moe.impl_identity import (
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,
+    MegaMoECuteDsl,
     MegaMoEDeepGemm,
+    TrtllmCutedslMegaMoeNvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod, RoutingMethodType
@@ -216,8 +218,12 @@ def _megamoe_model_config() -> ModelConfig:
     return cfg
 
 
-def test_pinned_kernel_token_alone_reaches_the_megamoe_leaf():
-    """``mega_moe`` belongs to one leaf, so the kernel segment is enough."""
+def test_pinned_kernel_token_reaches_the_megamoe_deepgemm_leaf():
+    """``mega_moe`` now spans two leaves, so the quant gate finishes the job.
+
+    The CuteDSL leaf publishes the same kernel segment and admits NVFP4 only,
+    so a W4A8_MXFP4_MXFP8 problem still arrives here.
+    """
     report = resolve_moe_impl(
         _megamoe_model_config(),
         problem=_megamoe_problem(),
@@ -270,6 +276,153 @@ def test_registering_megamoe_leaves_the_backend_literal_path_unchanged():
     assert impl_class_for(report) is DeepgemmCudaW4a8Mxfp4Mxfp8Impl
     assert report.selected_by == "pinned"
     assert report.requested == MoeBackendType.MEGAMOE_DEEPGEMM.value
+
+
+# =====================================================================
+# MegaMoE CuteDSL implementation identity
+# =====================================================================
+# The second ``mega_moe`` leaf. Its per-architecture kernel variants are
+# deliberately not separate identities, so nothing here parametrizes over
+# architecture; the SM only has to be one this backend accepts.
+
+_MEGAMOE_CUTEDSL_IMPL_ID = "trtllm.cutedsl.mega_moe.nvfp4"
+
+
+def _megamoe_cutedsl_problem(quant_algo=QuantAlgo.NVFP4) -> MoEProblem:
+    """A problem the CuteDSL leaf's non-quant gates all accept."""
+    return MoEProblem(
+        quant=canonical_quant(quant_algo),
+        dtype_act=torch.bfloat16,
+        # hidden % 32 covers the NVFP4 SF leg alignment, intermediate % 16 the
+        # Fc1GateUpInterleave the fused FC1 packs against.
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=False,
+    )
+
+
+def _megamoe_cutedsl_deployment() -> MoEDeployment:
+    """EP-only single rank on SM100, with both CuteDSL deps present."""
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(
+            sm=100,
+            available_deps=(
+                MoEDep.MEGAMOE_CUTEDSL_RUNTIME.value,
+                MoEDep.MEGAMOE_CUTEDSL_OP.value,
+            ),
+        ),
+    )
+
+
+def _megamoe_cutedsl_model_config() -> ModelConfig:
+    cfg = ModelConfig()
+    cfg.moe_backend = MoeBackendType.MEGAMOE_CUTEDSL.value
+    return cfg
+
+
+def test_pinned_megamoe_cutedsl_identity_resolves_to_the_leaf():
+    """The full id round-trips through the registry onto the class that runs it."""
+    report = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(),
+        deployment=_megamoe_cutedsl_deployment(),
+        impl_id=_MEGAMOE_CUTEDSL_IMPL_ID,
+    )
+    assert impl_class_for(report) is TrtllmCutedslMegaMoeNvfp4Impl
+    assert report.selected_by == "pinned"
+    assert report.requested == _MEGAMOE_CUTEDSL_IMPL_ID
+    assert not report.degraded
+
+
+def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
+    """A pin that cannot run must fail, not widen to the sibling that can.
+
+    The leaf admits NVFP4 only, and the sibling ``mega_moe`` leaf does run
+    W4A8_MXFP4_MXFP8, so substitution is the tempting failure here.
+    """
+    report = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=_megamoe_cutedsl_deployment(),
+        impl_id=_MEGAMOE_CUTEDSL_IMPL_ID,
+    )
+
+    assert report.winner is None
+    assert report.selected_by == "failed"
+    assert [rejection.reason for rejection in report.rejected] == [
+        MoERejectReason.QUANT_UNSUPPORTED
+    ]
+    with pytest.raises(ValueError, match="no MoE implementation can serve"):
+        impl_class_for(report)
+
+
+def test_the_two_mega_moe_leaves_are_separated_by_their_quant_gates():
+    """One kernel segment, two leaves, and the format is what chooses.
+
+    Both match ``*.*.mega_moe.*``, so the pin cannot tell them apart; their
+    ``quant`` segments are disjoint, which is why each lands on its own class.
+
+    One deployment carries every MegaMoE dep, so the loser has to decline on
+    ``quant`` and cannot be masked by a missing dep -- otherwise widening
+    either gate would leave this passing while testing nothing.
+    """
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(
+            sm=100,
+            available_deps=(
+                MoEDep.DEEPGEMM_MEGAMOE.value,
+                MoEDep.MEGAMOE_CUTEDSL_RUNTIME.value,
+                MoEDep.MEGAMOE_CUTEDSL_OP.value,
+            ),
+        ),
+    )
+    cutedsl = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(),
+        deployment=deployment,
+        impl_id="mega_moe",
+    )
+    deepgemm = resolve_moe_impl(
+        _megamoe_model_config(),
+        problem=_megamoe_problem(),
+        deployment=deployment,
+        impl_id="mega_moe",
+    )
+
+    assert impl_class_for(cutedsl) is TrtllmCutedslMegaMoeNvfp4Impl
+    assert impl_class_for(deepgemm) is DeepgemmCudaW4a8Mxfp4Mxfp8Impl
+    assert cutedsl.requested == deepgemm.requested == "*.*.mega_moe.*"
+
+    assert [(r.legacy_backend, r.reason) for r in cutedsl.rejected] == [
+        (DeepgemmCudaW4a8Mxfp4Mxfp8Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED)
+    ]
+    assert [(r.legacy_backend, r.reason) for r in deepgemm.rejected] == [
+        (TrtllmCutedslMegaMoeNvfp4Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED)
+    ]
+
+
+def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged():
+    """Registration must not move which kernel MEGAMOE_CUTEDSL picks."""
+    report = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(),
+        deployment=_megamoe_cutedsl_deployment(),
+    )
+    assert impl_class_for(report) is TrtllmCutedslMegaMoeNvfp4Impl
+    assert report.selected_by == "pinned"
+    assert report.requested == MoeBackendType.MEGAMOE_CUTEDSL.value
 
 
 # =====================================================================
@@ -805,14 +958,14 @@ def test_pinned_fc12_identity_fails_hard_where_the_backend_literal_degrades():
 # =====================================================================
 # One class per identity
 # =====================================================================
-# Each DeepGEMM identity is declared on the class that executes it: one class
-# owns the descriptor and all four abstract methods, and the pre-identity name
-# survives only as a module-level alias. So both request tracks and every
+# Each single-format identity is declared on the class that executes it: one
+# class owns the descriptor and all four abstract methods, and the pre-identity
+# name survives only as a module-level alias. So both request tracks and every
 # legacy call site land on that one class, and a run reports one name.
 
 # The legacy alias, the class that carries the identity, the id it publishes,
 # and the scheduler kind that class declares.
-_DEEPGEMM_IMPLS = (
+_SINGLE_FORMAT_IMPLS = (
     pytest.param(
         DeepGemmFusedMoE,
         DeepgemmCudaFp8BlockScalesImpl,
@@ -827,12 +980,19 @@ _DEEPGEMM_IMPLS = (
         MoESchedulerKind.FUSED_COMM,
         id="mega_moe",
     ),
+    pytest.param(
+        MegaMoECuteDsl,
+        TrtllmCutedslMegaMoeNvfp4Impl,
+        _MEGAMOE_CUTEDSL_IMPL_ID,
+        MoESchedulerKind.FUSED_COMM,
+        id="mega_moe_cutedsl",
+    ),
 )
 
-_IMPLS_ONLY = tuple(pytest.param(case.values[1], id=case.id) for case in _DEEPGEMM_IMPLS)
+_IMPLS_ONLY = tuple(pytest.param(case.values[1], id=case.id) for case in _SINGLE_FORMAT_IMPLS)
 
 
-@pytest.mark.parametrize("legacy, impl, impl_id, scheduler_kind", _DEEPGEMM_IMPLS)
+@pytest.mark.parametrize("legacy, impl, impl_id, scheduler_kind", _SINGLE_FORMAT_IMPLS)
 def test_the_identity_and_the_implementation_sit_on_one_class(
     legacy, impl, impl_id, scheduler_kind
 ):

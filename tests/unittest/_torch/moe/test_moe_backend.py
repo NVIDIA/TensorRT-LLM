@@ -93,7 +93,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
+    MegaMoECuteDsl,
+    MegaMoEDeepGemm,
+    TrtllmCutedslMegaMoeNvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     build_moe_deployment,
     impl_class_for,
@@ -1201,6 +1205,42 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
 
     backend._alloc_symm_buffer.assert_called_once_with()
     backend.quant_method.cache_derived_state.assert_called_once_with(backend)
+    wrapper.cache_derived_state.assert_not_called()
+
+
+def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk():
+    """The CuteDSL leaf's override has to be the one the walk reaches.
+
+    Same wrapper geometry as the DeepGEMM sibling above, but this override
+    guards a different thing: the base hook dereferences ``self.quant_method``
+    unguarded, and a weights-removed reader never reaches
+    ``post_load_weights``, so losing the override here leaves the derived
+    MegaMoE-format state silently never recomputed.
+    """
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    # ``__new__`` rather than the constructor: the real ``__init__`` would want
+    # a process group and the cuMem symmetric-memory rendezvous.
+    backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = None
+    quant_method = SimpleNamespace(cache_derived_state=MagicMock())
+    backend.create_weights = MagicMock(
+        side_effect=lambda: setattr(backend, "quant_method", quant_method)
+    )
+
+    wrapper = torch.nn.Module()
+    wrapper._weights_removed = True
+    wrapper.cache_derived_state = MagicMock()
+    wrapper.backend = backend
+
+    model = torch.nn.Module()
+    model.moe = wrapper
+
+    ModelLoader._walk_cache_state(model)
+
+    backend.create_weights.assert_called_once_with()
+    quant_method.cache_derived_state.assert_called_once_with(backend)
     wrapper.cache_derived_state.assert_not_called()
 
 
