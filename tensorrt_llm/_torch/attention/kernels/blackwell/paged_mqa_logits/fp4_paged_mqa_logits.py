@@ -429,7 +429,9 @@ def utccp_required_smem_warp_transpose(smem_ptr) -> None:
     for i in cutlass.range_constexpr(4):
         offset = (i ^ (lane_idx >> 3)) * 32 + lane_idx
         values[i] = ld_shared_b32(smem_ptr + offset)
-    cute.arch.sync_warp()
+    # Explicit -1 (all-lanes mask): the wrapper default 0xFFFFFFFF triggers a
+    # noisy Int32-truncation DSLWarning on every compile; -1 is the same bits.
+    cute.arch.sync_warp(-1)
     for i in cutlass.range_constexpr(4):
         offset = lane_idx * 4 + (i ^ (lane_idx >> 3))
         st_shared_b32(smem_ptr + offset, values[i])
