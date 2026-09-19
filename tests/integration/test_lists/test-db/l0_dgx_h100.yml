@@ -15,6 +15,10 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
+  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[True]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[True]
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
