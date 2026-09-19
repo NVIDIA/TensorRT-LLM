@@ -244,6 +244,10 @@ def isInfraDryRun() {
     return testFilter[(INFRA_DRY_RUN)] ?: false
 }
 
+def getJenkinsInstanceName() {
+    return trtllm_utils.getShortenedInstanceName(env.JENKINS_URL ?: Jenkins.instance.rootUrl)
+}
+
 def isCbtsStage(String stageName) {
     // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
@@ -1097,8 +1101,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
-    // Create a unique suffix for the node name and workspace
-    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    // Create a unique suffix for the instance, node name and workspace
+    String customSuffix = "${getJenkinsInstanceName()}-${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def nodeName = "${cluster.host}-test-${customSuffix}"
     def customWorkspace = "/tmp/${nodeName}"
     def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
@@ -1790,7 +1794,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 
     // Create a unique suffix for the job name
-    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    String customSuffix = "${getJenkinsInstanceName()}-${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
