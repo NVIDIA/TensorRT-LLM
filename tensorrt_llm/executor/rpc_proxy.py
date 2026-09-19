@@ -226,9 +226,9 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     ) -> List:
         """Execute a method call on the rank-0 RpcWorker via the RPC client.
 
-        Rank-0 RPC shim.  ``sleep`` and ``wakeup`` are allowed for
-        ``model_world_size > 1``; all other methods require
-        ``model_world_size == 1``.  See
+        Rank-0 RPC shim. ``sleep``, ``wakeup``, and rank-local prefill graph
+        diagnostics are allowed for ``model_world_size > 1``; all other
+        methods require ``model_world_size == 1``. See
         :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
         for details.
 
@@ -249,9 +249,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
         Raises:
             NotImplementedError: If ``model_world_size > 1`` and the method
-                is not in the allowed-methods set (currently ``sleep`` and
-                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
-                are provided.
+                is not in the allowed-methods set, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
         """
         _check_collective_rpc_guard(self.model_world_size,
                                     unique_reply_rank,

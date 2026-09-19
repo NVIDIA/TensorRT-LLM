@@ -38,6 +38,7 @@ class BreakableCUDAGraphRunner:
         self._state = BreakableCUDAGraphRunnerState.IDLE
         self._active_graph: Optional[BreakableCUDAGraph] = None
         self._active_num_tokens: Optional[int] = None
+        self._replay_counts: dict[int, int] = {}
 
     @property
     def state(self) -> BreakableCUDAGraphRunnerState:
@@ -53,6 +54,20 @@ class BreakableCUDAGraphRunner:
 
     def has_graph(self, num_tokens: int) -> bool:
         return num_tokens in self._graphs
+
+    @property
+    def captured_token_buckets(self) -> list[int]:
+        """Return the token buckets with a successfully captured graph."""
+        return sorted(self._graphs)
+
+    @property
+    def replay_counts(self) -> dict[int, int]:
+        """Return replay calls submitted without a synchronous error.
+
+        CUDA execution remains asynchronous; callers that require completion
+        must synchronize separately. Clearing the runner resets these counts.
+        """
+        return self._replay_counts.copy()
 
     def warmup(self, engine_forward: Callable[[], Any], steps: int = _WARMUP_STEPS) -> None:
         """Run the complete eager engine forward under the warmup state.
@@ -176,6 +191,7 @@ class BreakableCUDAGraphRunner:
         if num_tokens not in self._graphs:
             raise KeyError(f"No BCG captured for num_tokens={num_tokens}")
         self._graphs[num_tokens].replay()
+        self._replay_counts[num_tokens] = self._replay_counts.get(num_tokens, 0) + 1
         return self._outputs[num_tokens]
 
     def execute(self, num_tokens: int, outer_forward: Callable[[], Any]) -> Any:
@@ -209,5 +225,6 @@ class BreakableCUDAGraphRunner:
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
+        self._replay_counts.clear()
         self._shared_output = None
         self._memory_pool = None

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.modules.top_k import TopK
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm.logger import logger
 
 from ...interface import AttentionMask, PredefinedAttentionMask
@@ -403,6 +404,18 @@ def select_qsa_paged_tokens(
 class QSASparseHooks(AttentionSparseHooks):
     """Keep the QSA side cache current and replace dense attention when useful."""
 
+    def __init__(self) -> None:
+        self._num_sparse_prefill_dispatches = 0
+
+    @property
+    def num_sparse_prefill_dispatches(self) -> int:
+        """Return exact sparse prefill calls observed by this layer.
+
+        The count includes graph capture and warmup calls. Runtime diagnostics
+        should compare snapshots when attributing calls to live requests.
+        """
+        return self._num_sparse_prefill_dispatches
+
     def forward(
         self,
         attention: "Attention",
@@ -440,6 +453,11 @@ class QSASparseHooks(AttentionSparseHooks):
             raise NotImplementedError("QSA sparse attention does not support LoRA")
         # The model's QKNormRoPEAttention preprocesses q/k before this hook;
         # mrope_config is therefore backend state, not work for the QSA kernel.
+        mrope_rotary_cos_sin = None
+        mrope_position_deltas = None
+        if mrope_config is not None:
+            mrope_rotary_cos_sin = mrope_config.get("mrope_rotary_cos_sin")
+            mrope_position_deltas = mrope_config.get("mrope_position_deltas")
         del mrope_config
         if not isinstance(attn_metadata, QSAAttentionMetadata):
             raise TypeError("QSA sparse attention received incompatible metadata")
@@ -450,8 +468,39 @@ class QSASparseHooks(AttentionSparseHooks):
             return None
         hidden_states = kwargs.get("qsa_index_hidden_states")
         position_ids = kwargs.get("qsa_position_ids")
-        if hidden_states is None or position_ids is None:
+        index_projection = kwargs.get("qsa_index_projection")
+        if index_projection is None and (hidden_states is None or position_ids is None):
             raise ValueError("QSA sparse attention requires hidden states and position IDs")
+
+        needs_fixed_output = is_in_breakable_cuda_graph() or q.shape[0] > num_tokens
+        if needs_fixed_output and index_projection is None:
+            # Keep the token-wise index projection captured. Cache mutation and
+            # live batch dispatch execute in the eager bridge below. The same
+            # bridge preserves physical padding during graph warmup, which runs
+            # before capture and must still return a bucket-sized output.
+            q_index, token_k, position_coordinates = attention.indexer.project(
+                hidden_states, position_ids
+            )
+            output = q.new_empty((q.shape[0], attention.num_heads * attention.head_dim))
+            from . import custom_ops
+
+            custom_ops.maybe_bcg_qsa_attn_inplace(
+                q,
+                k,
+                v,
+                q_index,
+                token_k,
+                position_coordinates,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                output_gate,
+                attention.layer_idx_str,
+                output,
+            )
+            return output
+
+        if output_gate is not None:
+            output_gate = output_gate[:num_tokens]
 
         # The standard TRT-LLM backend owns quantized formats with auxiliary
         # scale pages, such as NVFP4. Use it until QSA kernels consume the data
@@ -478,13 +527,23 @@ class QSASparseHooks(AttentionSparseHooks):
             )
             return None
 
-        hidden_states = hidden_states[:num_tokens]
-        q_index = attention.indexer.project_and_update_cache(
-            hidden_states,
-            position_ids,
-            attention.layer_idx,
-            attn_metadata,
-        )
+        if index_projection is None:
+            hidden_states = hidden_states[:num_tokens]
+            q_index = attention.indexer.project_and_update_cache(
+                hidden_states,
+                position_ids,
+                attention.layer_idx,
+                attn_metadata,
+            )
+        else:
+            q_index, token_k, position_coordinates = index_projection
+            q_index = q_index[:num_tokens]
+            attention.indexer.update_cache_and_compress(
+                attention.layer_idx,
+                token_k[:num_tokens],
+                position_coordinates[:num_tokens],
+                attn_metadata,
+            )
 
         params = attention.sparse_params
         max_kv_len = int(attn_metadata.kv_lens_runtime[: attn_metadata.num_seqs].max())
@@ -613,6 +672,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 output = attention.apply_output_gate(output, output_gate)
             return output
 
+        self._num_sparse_prefill_dispatches += 1
         index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
         if index_cache is None:
             raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")

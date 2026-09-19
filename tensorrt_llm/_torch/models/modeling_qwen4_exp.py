@@ -14,6 +14,7 @@
 # limitations under the License.
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
+import weakref
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
@@ -45,9 +46,10 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.qwen4_exp.hyper_connection import HCResidual, Qwen4ExpHyperConnection
 from ..modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types, get_qwen4_exp_ple_layer_mask
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
+from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping, get_model_extra_attrs
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_qwen3_5 import _normalize_qwen35_exclude_modules, _normalize_qwen35_quant_config_dict
@@ -68,6 +70,67 @@ from .modeling_utils import (
 
 _PendingBlockOutput = torch.Tensor | _DeferredSharedExpertFinalize
 _PendingCombine = tuple[_PendingBlockOutput, HCResidual]
+
+
+def _extract_qwen4_exp_model(model_key: str):
+    extra_attrs = get_model_extra_attrs()
+    if extra_attrs is None:
+        raise RuntimeError("Model extra attrs are unavailable for Qwen4-Exp PLE")
+    model_refs = extra_attrs.get("qwen4_exp_models")
+    if model_refs is None or model_key not in model_refs:
+        raise RuntimeError(f"Qwen4-Exp model {model_key!r} is not registered")
+    model = model_refs[model_key]()
+    if model is None:
+        raise RuntimeError(f"Qwen4-Exp model {model_key!r} is no longer available")
+    metadata_ref = extra_attrs.get("attention_metadata")
+    if metadata_ref is None:
+        raise RuntimeError("Attention metadata is unavailable for Qwen4-Exp PLE")
+    return model, metadata_ref(), extra_attrs.get("spec_metadata")
+
+
+@torch.library.custom_op("trtllm::qwen4_exp_ple_inplace", mutates_args=("output",))
+def qwen4_exp_ple_inplace(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    model_key: str,
+    output: torch.Tensor,
+) -> None:
+    """Prepare live PLE state and write its fixed physical output in place."""
+    model, attn_metadata, spec_metadata = _extract_qwen4_exp_model(model_key)
+    ple_layer_idx = model.ple_layer_index
+    if ple_layer_idx is None:
+        raise RuntimeError("Qwen4-Exp PLE bridge requires a local PLE layer")
+    ple_module = model.layers[ple_layer_idx].ple
+    if ple_module is None:
+        raise RuntimeError("Qwen4-Exp PLE layer has no PLE module")
+    ple_state = model._prepare_ple_state(
+        attn_metadata,
+        input_ids,
+        getattr(attn_metadata, "mamba_metadata", None),
+        spec_metadata,
+    )
+    if ple_state is None:
+        raise RuntimeError("Qwen4-Exp PLE state preparation returned no state")
+    ple_meta, conv_state, ngram_context = ple_state
+
+    # Host-offload prefetch uses a side stream. Run the lookup synchronously in
+    # this eager bridge so replay does not depend on a dropped cross-stream wait.
+    output.zero_()
+    ple_output = ple_module(hidden_states, ple_meta, conv_state, ngram_context)
+    output[: ple_output.shape[0]].copy_(ple_output)
+
+
+@qwen4_exp_ple_inplace.register_fake
+def _qwen4_exp_ple_inplace_fake(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    model_key: str,
+    output: torch.Tensor,
+) -> None:
+    """Model the in-place output mutation during fake-tensor propagation."""
+
+
+maybe_bcg_qwen4_exp_ple_inplace = eager_on_graph(qwen4_exp_ple_inplace)
 
 
 def _qwen4_exp_tp_output_reduction_enabled(mapping) -> bool:
@@ -289,6 +352,8 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         mamba_metadata: Optional[Mamba2Metadata] = None,
         ple_state: Optional[tuple] = None,
+        ple_input_ids: Optional[torch.Tensor] = None,
+        ple_model_key: Optional[str] = None,
         spec_metadata=None,
         lora_params: Optional[dict] = None,
         pending_combine: Optional[_PendingCombine] = None,
@@ -336,11 +401,23 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
                 hidden_states = torch.cat([hidden_states] * self.hc_count, dim=-1)
 
             # PLE n-gram short-conv side path, injected into the bundle before mix.
-            if self.ple is not None and ple_state is not None:
-                ple_meta, conv_state, ngram_context = ple_state
-                hidden_states = hidden_states + self.ple(
-                    hidden_states, ple_meta, conv_state, ngram_context
-                )
+            if self.ple is not None:
+                if ple_state is not None:
+                    ple_meta, conv_state, ngram_context = ple_state
+                    hidden_states = hidden_states + self.ple(
+                        hidden_states, ple_meta, conv_state, ngram_context
+                    )
+                elif ple_input_ids is not None and is_in_breakable_cuda_graph():
+                    if ple_model_key is None:
+                        raise RuntimeError("Qwen4-Exp PLE bridge requires a registered model key")
+                    ple_output = torch.empty_like(hidden_states)
+                    maybe_bcg_qwen4_exp_ple_inplace(
+                        hidden_states,
+                        ple_input_ids,
+                        ple_model_key,
+                        ple_output,
+                    )
+                    hidden_states = hidden_states + ple_output
 
             # Attention block: mix -> mixer -> attn_tp_all_reduce -> combine.
             mixed, residual = self.attn_hyper_connection.mix(hidden_states)
@@ -410,6 +487,13 @@ class Qwen4ExpModel(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
+        model_refs = model_config.extra_attrs.setdefault("qwen4_exp_models", {})
+        self._bcg_model_key = "qwen4_exp"
+        suffix = 0
+        while self._bcg_model_key in model_refs:
+            self._bcg_model_key = f"qwen4_exp_{suffix}"
+            suffix += 1
+        model_refs[self._bcg_model_key] = weakref.ref(self)
         config = model_config.pretrained_config
         dtype = config.torch_dtype
 
@@ -660,7 +744,7 @@ class Qwen4ExpModel(DecoderModel):
             state_indices,
             is_decode=is_decode,
             eos_token_id=self.eos_token_id,
-            physical_tokens=attn_metadata.num_tokens,
+            physical_tokens=(attn_metadata.padded_num_tokens or attn_metadata.num_tokens),
             num_contexts=num_contexts,
             use_spec_decoding=use_spec_decoding,
             uniform_row_width=uniform_row_width,
@@ -816,9 +900,10 @@ class Qwen4ExpModel(DecoderModel):
             raise ValueError(
                 "Qwen4-Exp PLE requires original token IDs when inputs_embeds are provided"
             )
+        use_breakable_cuda_graph = is_in_breakable_cuda_graph()
         ple_state = (
             self._prepare_ple_state(attn_metadata, ple_input_ids, mamba_metadata, spec_metadata)
-            if ple_input_ids is not None
+            if ple_input_ids is not None and not use_breakable_cuda_graph
             else None
         )
         prefetched_ple_module = None
@@ -841,6 +926,12 @@ class Qwen4ExpModel(DecoderModel):
                     attn_metadata=attn_metadata,
                     mamba_metadata=mamba_metadata,
                     ple_state=ple_state if self.ple_layer_mask[layer_idx] else None,
+                    ple_input_ids=(
+                        ple_input_ids
+                        if use_breakable_cuda_graph and self.ple_layer_mask[layer_idx]
+                        else None
+                    ),
+                    ple_model_key=getattr(self, "_bcg_model_key", None),
                     spec_metadata=spec_metadata,
                     lora_params=lora_params,
                     pending_combine=pending_combine,
