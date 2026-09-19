@@ -56,8 +56,9 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import BFloat16, Float4E2M1FN, Float8E8M0FNU, Float16, Int32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -434,6 +435,20 @@ def utccp_required_smem_warp_transpose(smem_ptr) -> None:
         st_shared_b32(smem_ptr + offset, values[i])
 
 
+def _target_is_rubin() -> bool:
+    """Whether the JIT target is a Rubin arch (R100 sm_107 / R150 sm_109), which
+    natively supports FP4 next_n=4 (576/832-col TMEM). Blackwell (sm_100/sm_103,
+    512 cols) does not, so there next_n=4 is emulated by a caller-side 2+2 split.
+
+    TODO: how to robustly judge whether the target is Rubin? major==10 & minor>=7
+    is a heuristic (covers sm_107/sm_109); double check there isn't a canonical
+    Arch API for this -- Arch.is_family_of is suffix-sensitive (returns False for
+    the base sm_107/sm_109, True only for sm_107a/sm_109a).
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch.major == 10 and arch.minor >= 7
+
+
 class FP4MQALogitsKernel:
     """FP4 (MXFP4) paged MQA logits kernel for Blackwell (SM100).
 
@@ -474,8 +489,12 @@ class FP4MQALogitsKernel:
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
         assert head_dim == 128, "FP4 kernel hardcodes head_dim=128"
-        assert next_n in (1, 2, 3), (
-            f"FP4 supports next_n in {{1,2,3}}; got {next_n}. next_n=4 is out-of-scope (TMEM cap)."
+        # Max next_n is arch-dependent (TMEM capacity): Rubin supports next_n<=4,
+        # Blackwell only next_n<=3. See _target_is_rubin().
+        _max_next_n = 4 if _target_is_rubin() else 3
+        assert 1 <= next_n <= _max_next_n, (
+            f"FP4 next_n must be in 1..{_max_next_n}; got {next_n} "
+            f"(next_n=4 requires Rubin sm_107+; Blackwell max is 3)."
         )
         assert epi_dtype in (
             cutlass.Float32,
@@ -756,13 +775,25 @@ class FP4MQALogitsKernel:
             + self.num_sfa_tmem_cols * self.num_groups
             + self.num_sfb_tmem_cols
         )
-        # TMEM allocator requires num_columns to be a power of two AND a
-        # multiple of 32, between 32 and 512. Round up to next valid value.
-        # Equivalent to utils.get_num_tmem_alloc_cols(..., rounding=True) but
-        # without needing a tmem tensor handle (we already have raw_total).
-        self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_total)), 32)
-        assert self.num_tmem_alloc_cols_total <= 512, (
-            f"FP4 TMEM exceeds 512 cols: raw={raw_total}, "
+        # Arch-aware TMEM sizing. SM100 caps at 512 cols and requires a
+        # power-of-two, multiple-of-32 allocation. sm_107+ (Rubin, 576 cols /
+        # sm_109, 832) allow allocations >512 that are only multiple-of-32
+        # (non-power-of-two) via *exclusive* TMEM allocation; the DSL applies
+        # the exclusive flag automatically in alloc_tmem when arch + num_columns
+        # warrant it (see cute.arch.is_tmem_allocation_exclusive).
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        self.arch_str = f"sm_{arch.major}{arch.minor}"  # family key, e.g. "sm_107"
+        max_tmem_cols = get_max_tmem_alloc_cols(self.arch_str)
+        if raw_total <= 512:
+            # SM100 rule (also valid everywhere): round up to pow2, min 32.
+            self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_total)), 32)
+        else:
+            # >512: exclusive alloc, 32-col aligned (no pow2 rounding).
+            self.num_tmem_alloc_cols_total = ((raw_total + 31) // 32) * 32
+        assert self.num_tmem_alloc_cols_total <= max_tmem_cols, (
+            f"FP4 TMEM {self.num_tmem_alloc_cols_total} cols (raw={raw_total}) "
+            f"exceeds {self.arch_str} capacity {max_tmem_cols} for "
+            f"next_n={self.next_n}: "
             f"acc={self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages}, "
             f"sfa_per_wg={self.num_sfa_tmem_cols} x{self.num_groups}, "
             f"sfb={self.num_sfb_tmem_cols}, "
@@ -1418,6 +1449,9 @@ class FP4MQALogitsKernel:
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=0,  # math warp 0 does alloc+free (last TMEM consumer)
             is_two_cta=False,
+            # Arch-aware: sm_107 exposes 576 cols and needs exclusive alloc for
+            # >512 (next_n=4 -> 544). Defaults to sm_100 (512) otherwise.
+            arch=self.arch_str,
         )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -2190,7 +2224,10 @@ class FP4MQALogitsKernel:
                     # 2-byte weights (fp16 or bf16): next_n in {1,2,3} all fit
                     MAX_NUM_W_IN_REG = 64
                 else:  # fp32, 4-byte weights
-                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                    # next_n=4 (Rubin only): 40 is the largest multiple-of-4 that
+                    # is fully spill-free on the direct kernel (measured via ncu:
+                    # 40 -> 0 local ld/st; 44 -> ~8.5K spill STL in the hot loop).
+                    MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 if cutlass.const_expr(self.emit_block_meta):
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge.
@@ -2999,7 +3036,10 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                     MAX_NUM_W_IN_REG = 64
                 else:
-                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                    # next_n=4 (Rubin only): 40 is the largest multiple-of-4 that
+                    # is fully spill-free on the direct kernel (measured via ncu:
+                    # 40 -> 0 local ld/st; 44 -> ~8.5K spill STL in the hot loop).
+                    MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 if cutlass.const_expr(self.emit_block_meta):
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge.
