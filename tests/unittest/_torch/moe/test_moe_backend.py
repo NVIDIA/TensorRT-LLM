@@ -93,6 +93,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     build_moe_deployment,
@@ -777,6 +778,31 @@ def test_marlin_moe_repack_is_transform_stage():
     assert NVFP4MarlinFusedMoEMethod.post_load_weights is FusedMoEMethodBase.post_load_weights
 
 
+@pytest.mark.parametrize("act_scale", [None, torch.ones(1, 8)], ids=["absent", "present"])
+def test_marlin_refuses_a_pre_quant_activation_scale(act_scale):
+    """An AWQ-style checkpoint must be refused, not served with the scale dropped.
+
+    ``canonical_quant`` folds NVFP4_AWQ / NVFP4_ARC into ``nvfp4`` before the
+    ``MoEProblem`` is built, so no eligibility gate can see the distinction --
+    the guard has to sit where the evidence appears, which is after
+    ``load_quant_scales`` has materialized ``fc31_act_scale``.
+
+    ``__new__`` without ``__init__``: the check reads one attribute off the
+    module and a real constructor would need a GPU.
+    """
+    method = NVFP4MarlinFusedMoEMethod.__new__(NVFP4MarlinFusedMoEMethod)
+    module = SimpleNamespace(fc31_act_scale=act_scale)
+
+    if act_scale is None:
+        # Nothing to refuse; it falls through to the real repack, which needs
+        # loaded weights. Reaching past the guard is the assertion here.
+        with pytest.raises(AttributeError):
+            method.transform_weights(module)
+    else:
+        with pytest.raises(ValueError, match="pre-quant activation scale"):
+            method.transform_weights(module)
+
+
 def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
     cfg = ModelConfig()
     cfg.moe_backend = "MARLIN"
@@ -789,10 +815,19 @@ def _marlin_environment(sm: int = 90) -> MoEEnvironment:
     return MoEEnvironment(sm=sm)
 
 
-def test_marlin_is_selected_for_nvfp4():
+@pytest.mark.parametrize(
+    "quant_algo, expected_leaf",
+    [
+        pytest.param(QuantAlgo.NVFP4, MarlinCudaNvfp4Impl, id="nvfp4"),
+        pytest.param(QuantAlgo.W4A16_NVFP4, MarlinCudaW4a16Nvfp4Impl, id="w4a16_nvfp4"),
+    ],
+)
+def test_marlin_selects_the_leaf_that_publishes_the_format(quant_algo, expected_leaf):
+    """``moe_backend: MARLIN`` names the family; the quant picks which leaf."""
     with override_moe_environment(_marlin_environment()):
-        report = resolve_moe_impl(_marlin_model_config())
-    assert impl_class_for(report) is MarlinFusedMoE
+        report = resolve_moe_impl(_marlin_model_config(quant_algo))
+    assert impl_class_for(report) is expected_leaf
+    assert issubclass(impl_class_for(report), MarlinFusedMoE)
     assert report.selected_by == "pinned"
     assert not report.degraded
 
