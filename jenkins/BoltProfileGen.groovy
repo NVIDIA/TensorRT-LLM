@@ -407,15 +407,19 @@ def submitProfileGen(pipeline)
         // then every later run just does a local lustre extract from the cached
         // .tar.xz (no WAN). The one-time fetch reuses fetch_verified().
         def llvmArch = (TARGET_ARCH == AARCH64_TRIPLE) ? "ARM64" : "X64"
-        def llvmVer  = "21.1.5"   // keep in sync with internal/slurm_merge.sh LLVM_BOLT_VERSION
-        def llvmTb   = "LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz"
         // Cache lives OUTSIDE the bolt-ci retention root (purged at depth 4 after 7
         // days) so the per-run workspace reaper can't delete it.
         def llvmCacheDir = "${scratch}/users/svc_tensorrt/bolt-cache/llvm"
+        // The pin is read from the extracted tree (this stage runs after "Bootstrap:
+        // extract tarball"), so the collect hook, the merge job and this bootstrap
+        // all resolve the same llvm-bolt from one file. Tarball name and cache key
+        // are therefore built shell-side, where the version is known.
         def llvmStage = """
-            LLVM_URL='https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}'
+            . '${ws}/TensorRT-LLM/src/scripts/bolt/internal/llvm_bolt_version.sh'
+            LLVM_TB="LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz"
+            LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\${LLVM_TB}"
             LLVM_CACHE_DIR='${llvmCacheDir}'
-            LLVM_CACHE_TB='${llvmCacheDir}/${llvmTb}'
+            LLVM_CACHE_TB="${llvmCacheDir}/\${LLVM_TB}"
             LLVM_DIR='${ws}/builds/llvm'
             PARTS=16
         """.stripIndent() + boltFetchLib + '''
