@@ -1691,6 +1691,8 @@ def run_varlen(
             )
         if block_max.data_ptr() & 15:
             raise RuntimeError("block_max base must be 16-byte aligned")
+        if block_max.shape[1] & 3:
+            raise RuntimeError("block_max width must be a multiple of 4 (rows are read as float4)")
         # the skipping variant is a distinct engine and gets a tagged key
         key = (num_rows, npad, k, n_env, nn, cr, profile, "skip")
         bm = block_max
