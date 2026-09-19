@@ -241,6 +241,14 @@ def testFilter = [
     (INFRA_DRY_RUN): (params.InfraDryRun?.toString()?.toBoolean() ?: false),
 ]
 
+// TEMPORARY - revert before merge.
+// The --post-merge bot flag only reaches testFilter[IS_POST_MERGE], while the
+// multi-GPU gates below key off the raw job name, so on a PR they still block
+// multi-GPU. Publish the flag as a binding variable (gitlabParamsFromBot and
+// testFilter are script-local and invisible inside the functions) so that
+// /bot run --post-merge on this PR gets the official post-merge coverage.
+postMergeRequested = testFilter[(IS_POST_MERGE)]
+
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
 @Field
@@ -907,8 +915,9 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
         echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
         return false
     }
-    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-        echo "[requireMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
+    // TEMPORARY - revert before merge: honor --post-merge here as well.
+    if (postMergeRequested) {
+        echo "[requireMultiGpuApprovalLabel] Skipping label check: post-merge mode is exempt"
         return false
     }
 
@@ -2221,8 +2230,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (postMergeRequested) {
+                        echo "In post-merge mode, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
@@ -2237,8 +2246,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
                 // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
+                    if (postMergeRequested) {
+                        echo "In post-merge mode, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
@@ -2428,8 +2437,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (postMergeRequested) {
+                        echo "In post-merge mode, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
@@ -2444,8 +2453,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
                 // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
+                    if (postMergeRequested) {
+                        echo "In post-merge mode, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
