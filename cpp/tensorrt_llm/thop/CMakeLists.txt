@@ -107,7 +107,9 @@ add_th_common_family(
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp)
 
-# TODO This does not compile with internal cutlass MOE gemm
+# TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
+# because moeUtilOp.cpp depends on OSS-specific MoE utility types and function
+# signatures.
 add_th_common_family(
   th_common_moe
   moe/cuteDslMoeUtilsOp.cpp
