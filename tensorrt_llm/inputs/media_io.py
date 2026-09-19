@@ -108,12 +108,45 @@ _MAX_REDIRECTS = 5
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
+# Opt-in switch relaxing the requirement that media URLs resolve to global
+# (public) IP addresses. Set TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1 to allow
+# http(s) media URLs that resolve to private, loopback, or link-local
+# addresses — needed for airgapped / intranet deployments where media is
+# served from hosts that have no public address. Default OFF: with the
+# switch unset, non-global addresses are rejected as SSRF protection.
+# Enabling it lets clients steer server-side fetches at internal services
+# (including cloud metadata endpoints), so only set it when every client
+# of the server is trusted or egress is filtered at the network level.
+# Multicast addresses are rejected either way. Read per call so tests and
+# long-lived processes observe changes without re-import.
+_ALLOW_PRIVATE_URLS_ENV = "TRTLLM_MEDIA_ALLOW_PRIVATE_URLS"
+
+_warned_private_urls_allowed = False
+
+
+def _allow_private_urls() -> bool:
+    if os.environ.get(_ALLOW_PRIVATE_URLS_ENV, "0") != "1":
+        return False
+    global _warned_private_urls_allowed
+    if not _warned_private_urls_allowed:
+        _warned_private_urls_allowed = True
+        logger.warning(
+            "%s=1: media URLs resolving to private/loopback addresses are "
+            "allowed; server-side SSRF protection for media fetches is "
+            "relaxed.",
+            _ALLOW_PRIVATE_URLS_ENV,
+        )
+    return True
+
 
 def _validate_url(url: str) -> None:
     """Validate that *url* points to a public, non-internal HTTP(S) resource.
 
     Raises ``RuntimeError`` for URLs that target non-global addresses or that
-    use a scheme other than http / https.
+    use a scheme other than http / https. Setting
+    ``TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1`` skips the non-global-address
+    rejection (scheme, hostname, and multicast checks still apply); see
+    ``_ALLOW_PRIVATE_URLS_ENV`` above for the security tradeoff.
 
     Note: validation is performed at DNS-resolution time. A DNS-rebinding
     attack (TTL=0, resolves to a public IP during validation then a private IP
@@ -135,10 +168,17 @@ def _validate_url(url: str) -> None:
     except socket.gaierror as exc:
         raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
 
+    allow_private = _allow_private_urls()
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global or ip.is_multicast:
-            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
+        if ip.is_multicast:
+            raise RuntimeError(f"URL resolves to a multicast address ({ip})")
+        if not ip.is_global and not allow_private:
+            raise RuntimeError(
+                f"URL resolves to a non-public address ({ip}); set "
+                f"{_ALLOW_PRIVATE_URLS_ENV}=1 to allow private media URLs "
+                f"in trusted network environments"
+            )
 
 
 def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
