@@ -56,83 +56,15 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_EQ(llmReq.getTokens().size(), 1);
         EXPECT_EQ(llmReq.getTokens().at(0), inputTokens);
         EXPECT_EQ(llmReq.mMaxNewTokens, maxNewTokens);
-        EXPECT_EQ(llmReq.mSamplingConfig.numReturnSequences, execReq.getSamplingConfig().getNumReturnSequences());
+        EXPECT_EQ(llmReq.mSamplingConfig.getNumReturnSequences(), execReq.getSamplingConfig().getNumReturnSequences());
         EXPECT_EQ(llmReq.getOrigPromptLen(), inputTokens.size());
         EXPECT_EQ(llmReq.getMaxSentTokenLen(), inputTokens.size());
         EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kCONTEXT_INIT);
         EXPECT_FALSE(llmReq.mSeqSlot);
         // No speculative decoding config, draft tokens should be empty
         EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
-        EXPECT_FALSE(llmReq.getEmbeddingBias().has_value());
-        EXPECT_FALSE(llmReq.getBadWordsList().has_value());
-        EXPECT_FALSE(llmReq.getStopWordsList().has_value());
         EXPECT_FALSE(llmReq.getPromptEmbeddingTable().has_value());
         EXPECT_FALSE(llmReq.getPromptVocabSize().has_value());
-    }
-
-    // Embedding bias
-    {
-        texec::Request execReq(inputTokens, maxNewTokens);
-        SizeType32 vocabSize = 100;
-        // Try adding embedding bias
-        auto embeddingBias = texec::Tensor::cpu(texec::DataType::kFP32, {vocabSize});
-        execReq.setEmbeddingBias(embeddingBias);
-        tb::LlmRequest llmReq(requestId, execReq);
-        EXPECT_TRUE(llmReq.getEmbeddingBias().has_value());
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().nbDims, 2);
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[0], 1);
-        EXPECT_EQ(llmReq.getEmbeddingBias().value()->getShape().d[1], vocabSize);
-    }
-
-    // bad/stop words
-    {
-        texec::Request execReq(inputTokens, maxNewTokens);
-        SizeType32 vocabSize = 100;
-        // Try adding embedding bias
-        std::list<VecTokens> badWords{{1, 2, 3}, {4, 5}, {9}};
-        std::list<VecTokens> stopWords{{1, 3}, {4}};
-        execReq.setBadWords(badWords);
-        execReq.setStopWords(stopWords);
-        tb::LlmRequest llmReq(requestId, execReq);
-        EXPECT_TRUE(llmReq.getBadWordsList().has_value());
-        EXPECT_TRUE(llmReq.getStopWordsList().has_value());
-        {
-            auto badWordsTensor = llmReq.getBadWordsList().value();
-            EXPECT_EQ(badWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
-            EXPECT_EQ(badWordsTensor->getShape().nbDims, 3);
-            EXPECT_EQ(badWordsTensor->getShape().d[0], 1);
-            EXPECT_EQ(badWordsTensor->getShape().d[1], 2);
-            EXPECT_EQ(badWordsTensor->getShape().d[2], 6);
-            auto data = tr::bufferCast<int32_t>(*badWordsTensor);
-            EXPECT_EQ(data[0], 1);
-            EXPECT_EQ(data[1], 2);
-            EXPECT_EQ(data[2], 3);
-            EXPECT_EQ(data[3], 4);
-            EXPECT_EQ(data[4], 5);
-            EXPECT_EQ(data[5], 9);
-            EXPECT_EQ(data[6 + 0], 3);
-            EXPECT_EQ(data[6 + 1], 5);
-            EXPECT_EQ(data[6 + 2], 6);
-            EXPECT_EQ(data[6 + 3], -1);
-            EXPECT_EQ(data[6 + 4], -1);
-            EXPECT_EQ(data[6 + 5], -1);
-        }
-
-        {
-            auto stopWordsTensor = llmReq.getStopWordsList().value();
-            EXPECT_EQ(stopWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
-            EXPECT_EQ(stopWordsTensor->getShape().nbDims, 3);
-            EXPECT_EQ(stopWordsTensor->getShape().d[0], 1);
-            EXPECT_EQ(stopWordsTensor->getShape().d[1], 2);
-            EXPECT_EQ(stopWordsTensor->getShape().d[2], 3);
-            auto data = tr::bufferCast<int32_t>(*stopWordsTensor);
-            EXPECT_EQ(data[0], 1);
-            EXPECT_EQ(data[1], 3);
-            EXPECT_EQ(data[2], 4);
-            EXPECT_EQ(data[3 + 0], 2);
-            EXPECT_EQ(data[3 + 1], 3);
-            EXPECT_EQ(data[3 + 2], -1);
-        }
     }
 
     // Prompt tuning
@@ -192,18 +124,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             llmReq.validate(500, 1000, 0, 32000);
         };
         lambdaErrMsgs.emplace_back(lambda, "beamWidth > 0");
-    }
-    // Invalid input draft len
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(inputTokens, maxNewTokens);
-            execReq.setExternalDraftTokensConfig(texec::ExternalDraftTokensConfig({1, 2}));
-            tb::LlmRequest llmReq(requestId, execReq);
-
-            llmReq.validate(500, 1000, 1, 32000);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "exceeds maximum draft");
     }
 
     // Invalid ptable shape
@@ -332,7 +252,7 @@ TEST_F(LlmRequestTest, pause)
     SizeType32 maxNewTokens(66);
     tb::LlmRequest::RequestIdType requestId{77};
 
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tr::SamplingConfig(1), false);
+    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(1), false);
 
     llmReq.addNewToken(1, 0);
     llmReq.addNewToken(1, 0);
@@ -369,7 +289,7 @@ TEST_F(LlmRequestTest, testAllocateLogitsBuffer)
     SizeType32 maxNewTokens(60);
     tb::LlmRequest::RequestIdType requestId{77};
 
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tr::SamplingConfig(1), false);
+    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(1), false);
 
     EXPECT_EQ(llmReq.mPromptLen, 5);
 
@@ -421,7 +341,8 @@ TEST_F(LlmRequestTest, testLastTokensSetIndependence)
         = {{1, 2, 3, 4, 5, 10, 20}, {1, 2, 3, 4, 5, 11, 21}, {1, 2, 3, 4, 5, 12, 22}};
     tb::LlmRequest::BeamTokens expectedOverwrittenOutput
         = {{1, 2, 3, 4, 5, 100, 200}, {1, 2, 3, 4, 5, 101, 201}, {1, 2, 3, 4, 5, 102, 202}};
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tr::SamplingConfig(beamWidth), streaming);
+    tb::LlmRequest llmReq(
+        requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(beamWidth), streaming);
 
     // check individually set tokens
     llmReq.addNewToken(10, 0);
@@ -465,8 +386,8 @@ TEST_F(LlmRequestTest, testCreateRequests)
     SizeType32 vocabSize{32};
     tensorrt_llm::DataType dtype{tensorrt_llm::DataType::kHALF};
 
-    tr::SamplingConfig samplingConfig(1);
-    samplingConfig.randomSeed = std::vector<texec::RandomSeedType>{7};
+    tensorrt_llm::executor::SamplingConfig samplingConfig(1);
+    samplingConfig.setSeed(texec::RandomSeedType{7});
 
     tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, samplingConfig, false);
     try
@@ -479,7 +400,7 @@ TEST_F(LlmRequestTest, testCreateRequests)
         EXPECT_THAT(e.what(), testing::HasSubstr("Cannot create child requests more than"));
     }
 
-    samplingConfig.numReturnSequences = 3;
+    samplingConfig.setNumReturnSequences(3);
     tb::LlmRequest llmReq2(requestId, maxNewTokens, inputTokens, samplingConfig, false);
 
     auto childReq1 = llmReq2.createChildRequest(78);
@@ -492,8 +413,8 @@ TEST_F(LlmRequestTest, testCreateRequests)
         EXPECT_EQ(childReq1->getOrigPromptLen(), llmReq.getOrigPromptLen());
         EXPECT_EQ(childReq1->mMaxNewTokens, llmReq.mMaxNewTokens);
         EXPECT_EQ(childReq1->getState(), llmReq.getState());
-        EXPECT_EQ(childReq1->mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{8});
-        EXPECT_EQ(llmReq2.mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{7});
+        EXPECT_EQ(childReq1->mSamplingConfig.getSeed().value(), texec::RandomSeedType{8});
+        EXPECT_EQ(llmReq2.mSamplingConfig.getSeed().value(), texec::RandomSeedType{7});
         EXPECT_FALSE(childReq1->mSeqSlot);
     }
 
@@ -503,9 +424,9 @@ TEST_F(LlmRequestTest, testCreateRequests)
         EXPECT_EQ(childRequests.size(), 2);
         EXPECT_EQ(childRequests.at(0), childReq1);
         EXPECT_EQ(childRequests.at(1), childReq2);
-        EXPECT_EQ(childReq2->mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{9});
-        EXPECT_EQ(childReq1->mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{8});
-        EXPECT_EQ(llmReq2.mSamplingConfig.randomSeed.value(), std::vector<texec::RandomSeedType>{7});
+        EXPECT_EQ(childReq2->mSamplingConfig.getSeed().value(), texec::RandomSeedType{9});
+        EXPECT_EQ(childReq1->mSamplingConfig.getSeed().value(), texec::RandomSeedType{8});
+        EXPECT_EQ(llmReq2.mSamplingConfig.getSeed().value(), texec::RandomSeedType{7});
     }
 }
 
@@ -542,7 +463,7 @@ class ParamTest : public LlmRequestTest, public ::testing::WithParamInterface<Pa
 {
 };
 
-TEST_P(ParamTest, createResponse)
+TEST_P(ParamTest, createResult)
 {
     bool const streaming{std::get<0>(GetParam())};
     bool const excludeInputFromOutput{std::get<1>(GetParam())};
@@ -555,11 +476,11 @@ TEST_P(ParamTest, createResponse)
     SizeType32 maxNewTokens(66);
     tb::LlmRequest::RequestIdType requestId{77};
 
-    tr::SamplingConfig samplingConfig(beamWidth);
+    tensorrt_llm::executor::SamplingConfig samplingConfig(beamWidth);
     // numReturnSequences = nullopt, otherwise.
     if (beamWidth == 1 || numReturnSequences < beamWidth)
     {
-        samplingConfig.numReturnSequences = numReturnSequences;
+        samplingConfig.setNumReturnSequences(numReturnSequences);
     }
     auto numReturnBeams = samplingConfig.getNumReturnBeams();
     // Expect one sequence per request in beam search.
@@ -596,8 +517,8 @@ TEST_P(ParamTest, createResponse)
 
     for (auto& llmReq : llmRequests)
     {
-        auto response = llmReq->createResponse();
-        EXPECT_FALSE(response);
+        auto resultOpt = llmReq->createResult();
+        EXPECT_FALSE(resultOpt);
     }
 
     SizeType32 constexpr numIterations{5};
@@ -615,15 +536,14 @@ TEST_P(ParamTest, createResponse)
             }
 
             llmReq->setState(tb::LlmRequestState::kGENERATION_IN_PROGRESS);
-            auto response = llmReq->createResponse();
-            EXPECT_TRUE(streaming == response.has_value());
+            auto resultOpt = llmReq->createResult();
+            EXPECT_TRUE(streaming == resultOpt.has_value());
 
             for (int beamIdx = 0; beamIdx < numReturnBeams; ++beamIdx)
             {
                 if (streaming)
                 {
-                    EXPECT_EQ(response.value().getRequestId(), requestId);
-                    auto result = response.value().getResult();
+                    auto const& result = resultOpt.value();
                     EXPECT_EQ(result.outputTokenIds.size(), numReturnBeams);
                     auto const& beamTokens = result.outputTokenIds.at(beamIdx);
                     if (returnAllGeneratedTokens)
@@ -643,8 +563,8 @@ TEST_P(ParamTest, createResponse)
                 }
             }
 
-            response = llmReq->createResponse();
-            EXPECT_FALSE(response);
+            resultOpt = llmReq->createResult();
+            EXPECT_FALSE(resultOpt);
         }
     }
 
@@ -663,21 +583,17 @@ TEST_P(ParamTest, createResponse)
     for (auto seqIdx = 0; seqIdx < numSequences; seqIdx++)
     {
         auto llmReq = llmRequests.at(seqIdx);
-        auto response = llmReq->createResponse();
+        auto resultOpt = llmReq->createResult();
 
         if (!streaming && llmRequests.at(seqIdx)->getState() != tb::LlmRequestState::kGENERATION_COMPLETE)
         {
-            EXPECT_FALSE(response);
+            EXPECT_FALSE(resultOpt);
             continue;
         }
 
-        EXPECT_TRUE(response) << "seqIdx " << seqIdx;
-        EXPECT_FALSE(response.value().hasError()) << "seqIdx " << seqIdx;
+        EXPECT_TRUE(resultOpt) << "seqIdx " << seqIdx;
 
-        // All response should have the same request id of the original request.
-        EXPECT_EQ(response.value().getRequestId(), requestId);
-
-        auto result = response.value().getResult();
+        auto const& result = resultOpt.value();
         EXPECT_EQ(result.outputTokenIds.size(), numReturnBeams);
 
         // Only the first sequence has finished.
@@ -740,11 +656,10 @@ TEST_P(ParamTest, createResponse)
 
         for (auto seqIdx = 1; seqIdx < numSequences; seqIdx++)
         {
-            auto response = llmRequests.at(seqIdx)->createResponse();
-            EXPECT_TRUE(response) << "seqIdx " << seqIdx;
-            EXPECT_FALSE(response.value().hasError()) << "seqIdx " << seqIdx;
+            auto resultOpt = llmRequests.at(seqIdx)->createResult();
+            EXPECT_TRUE(resultOpt) << "seqIdx " << seqIdx;
 
-            auto result = response.value().getResult();
+            auto const& result = resultOpt.value();
             // All sequences have finished.
             EXPECT_TRUE(result.isSequenceFinal) << "seqIdx " << seqIdx;
             EXPECT_TRUE(result.isFinal) << "seqIdx " << seqIdx;
@@ -782,12 +697,12 @@ TEST_F(LlmRequestTest, createResultDisaggContextComplete)
     // This is the regression case — without the fix, createResult() returns nullopt
     // because DISAGG_CONTEXT_COMPLETE was not handled by createResult's early guard
     // or its context-phase branch.
-    auto response = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
-    ASSERT_TRUE(response.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
-    EXPECT_TRUE(response->contextPhaseParams.has_value())
+    auto resultOpt = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
+    ASSERT_TRUE(resultOpt.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
+    EXPECT_TRUE(resultOpt->contextPhaseParams.has_value())
         << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";
-    EXPECT_EQ(response->contextPhaseParams->getReqId(), requestId);
-    EXPECT_TRUE(response->isSequenceFinal);
+    EXPECT_EQ(resultOpt->contextPhaseParams->getReqId(), requestId);
+    EXPECT_TRUE(resultOpt->isSequenceFinal);
 }
 
 TEST_F(LlmRequestTest, generationOnlyRequestAdoptsContextPhaseDraftTokens)

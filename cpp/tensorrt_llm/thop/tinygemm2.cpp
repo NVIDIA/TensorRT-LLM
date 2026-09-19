@@ -33,8 +33,8 @@ namespace torch_ext
 torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias)
 {
     auto const smVersion = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(
-        smVersion == 90 || smVersion == 100 || smVersion == 103, "tinygemm2 only supports SM90, SM100, and SM103.");
+    TORCH_CHECK(smVersion == 90 || tensorrt_llm::common::isSM100Family(smVersion),
+        "tinygemm2 only supports SM90 and the SM100 family (SM100/SM103/SM107).");
     TORCH_CHECK(input.dim() == 2, "input must be 2D");
     TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
     TORCH_CHECK(bias.dim() == 1, "bias must be 1D");

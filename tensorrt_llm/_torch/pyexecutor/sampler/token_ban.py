@@ -271,7 +271,7 @@ class TokenBanHandler(ABC):
                 for step in range(num_steps[index]):
                     if (
                         r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                    ) + pending + step < r.py_min_length[0]:
+                    ) + pending + step < r.py_min_length:
                         bans.rows.append(request_offset + num_steps[index] * beam_idx + step)
                         bans.cols.append(end_id)
                     else:
@@ -292,7 +292,7 @@ class TokenBanHandler(ABC):
         For no-repeat-ngram size ``n``, the last ``n - 1`` tokens of the
         sequence (prompt + generated) form the current prefix; the final token
         of every existing n-gram whose first ``n - 1`` tokens equal that prefix
-        is masked to ``-inf`` (same semantics as the C++ ``banRepeatNgram``
+        is masked to ``-inf`` (same semantics as the former C++ ban-repeat-ngram
         kernel and HF's ``NoRepeatNGramLogitsProcessor``). ``n == 1`` bans every
         token already present. The restriction is per-beam.
 

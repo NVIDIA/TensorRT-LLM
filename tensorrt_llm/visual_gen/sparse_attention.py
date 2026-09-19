@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Literal, Optional
 
 from pydantic import Field as PydanticField
+from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
@@ -69,10 +70,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     )
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
-            skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
         )
 
         module_name = kwargs.get("module_name", None)
@@ -81,13 +81,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if module_name is not None and self._is_disabled(module_name, ckpt_sparse_attention_config):
             return None
 
-        disabled_until_timestep = self.disabled_until_timestep
-        if disabled_until_timestep is None:
-            disabled_until_timestep = (
-                skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
-                    ckpt_sparse_attention_config
-                )
-            )
+        disabled_until_timestep = self.resolve_disabled_until_timestep(
+            checkpoint_config=ckpt_sparse_attention_config,
+        )
 
         threshold_scale_factor = self.resolve_threshold_scale_factor(ckpt_sparse_attention_config)
         if threshold_scale_factor is None:
@@ -104,13 +100,40 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             return None
         return SkipSoftmaxParams(scheduler=scheduler)
 
+    def resolve_disabled_until_timestep(
+        self,
+        *,
+        checkpoint_config: Optional[Dict[str, Any]] = None,
+        pretrained_config: Any = None,
+    ) -> Optional[float]:
+        """Resolve the user override or checkpoint-provided timestep cutoff.
+
+        Exactly one of ``checkpoint_config`` (a raw checkpoint config dict) or
+        ``pretrained_config`` (the model's pretrained config object/dict) is
+        expected per call site; both default to ``None`` so a mistyped keyword
+        raises ``TypeError`` here instead of silently resolving to ``None``.
+        """
+        if self.disabled_until_timestep is not None:
+            return self.disabled_until_timestep
+
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
+            skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
+        )
+
+        ckpt_sparse_attention_config = self._ckpt_sparse_attention_config_from_kwargs(
+            {"checkpoint_config": checkpoint_config, "pretrained_config": pretrained_config}
+        )
+        return skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
+            ckpt_sparse_attention_config
+        )
+
     def _is_disabled(
         self,
         module_name: str,
         ckpt_sparse_attention_config: Optional[Dict[str, Any]],
     ) -> bool:
         """Return whether skip-softmax should be disabled for this layer."""
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_ignore_from_ckpt_sparse_attention_config,
         )
 
@@ -145,7 +168,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
         sparsity = self.target_sparsity
         if sparsity is None:
-            from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
                 skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
             )
 
@@ -162,7 +185,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if sparsity is None:
             return None
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_formula_from_ckpt_sparse_attention_config,
         )
 
@@ -196,6 +219,76 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             sparse_config = getattr(pretrained_config, "sparse_attention_config", None)
             if isinstance(sparse_config, dict):
                 return sparse_config
+        return None
+
+
+class SolAttentionConfig(BaseSparseAttentionConfig):
+    """Sol-Attn sparse attention configuration for visual generation.
+
+    Dynamic block routing + sparse computation + approximation correction in
+    one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL on
+    datacenter Blackwell -- sm100 (B200/GB200) and sm103 (B300/GB300) --
+    head_dim=128, bf16, MHA.
+
+    On an unsupported *shape, dtype, or architecture* the kernel falls back to
+    dense attention -- the configured backend's dense kernel where available,
+    torch SDPA otherwise -- and counts the fallback, so setting this config on the wrong GPU
+    degrades rather than fails. Two cases are not covered by that fallback and do raise: GQA/MQA
+    (num_kv_heads != num_heads) here at construction, and context parallelism
+    (cp_size > 1), rejected in visual_gen/modules/attention.py.
+    """
+
+    algorithm: Literal["sol_attn"] = "sol_attn"
+    tau: float = PydanticField(
+        1.0,
+        description="Per-block routing threshold; higher tau routes more blocks sparse.",
+    )
+    thresh_type: Literal["diag", "exact"] = PydanticField(
+        "diag",
+        description="Threshold policy forwarded to the kernel (kernel default: 'diag').",
+    )
+    disabled_until_timestep: Optional[float] = PydanticField(
+        None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Dense-prefix cutoff on the normalized denoising timestep, with the "
+            "same sense as skip_softmax's field of the same name: the layer runs "
+            "dense while timestep >= this value and switches to the sparse kernel "
+            "below it. Larger timesteps are earlier, noisier steps, so this "
+            "protects the high-noise prefix. Use None (not 0.0) to disable the "
+            "prefix; 0.0 is rejected because it would run dense on every step "
+            "and silently turn Sol-Attn off entirely. "
+            "Read from the `timestep` forward kwarg, which must be the normalized "
+            "scheduler time (larger = noisier). WAN and LTX-2 pass it; a pipeline "
+            "that does not, or that passes something else, gets a one-time warning "
+            "and runs sparse on every step (fail-open)."
+        ),
+    )
+    dense_layers: Optional[list[int]] = PydanticField(
+        None,
+        description=(
+            "Layer indices forced dense regardless of the dense prefix, e.g. "
+            "[0, 2, 3]. Evaluated per layer at construction time; no pipeline "
+            "wiring required."
+        ),
+    )
+
+    @field_validator("dense_layers")
+    @classmethod
+    def _validate_dense_layers(cls, layers: Optional[list[int]]) -> Optional[list[int]]:
+        if layers is None:
+            return None
+        for index in layers:
+            if index < 0:
+                raise ValueError(f"dense_layers contains a negative layer index: {index}")
+        return sorted(set(layers))
+
+    def to_sparse_params(self, **kwargs):
+        # Sol-Attn's knobs are consumed directly by SolAttention.__init__
+        # (constructed via CUTEDSL backend dispatch in create_attention), not
+        # lowered into a shared SparseParams -- the vendored kernel has no
+        # checkpoint-calibration step to resolve here, unlike skip_softmax.
         return None
 
 

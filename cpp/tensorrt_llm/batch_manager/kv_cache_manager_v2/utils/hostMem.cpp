@@ -159,24 +159,28 @@ void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, Hos
 
 bool HostMem::shouldUseChunkedRegistration()
 {
-    struct utsname u
+    static bool const chunked = []()
     {
-    };
-
-    if (::uname(&u) != 0)
-    {
-        return false;
-    }
-    // Check for Linux kernel 6.11, 6.12, 6.13 prefix.
-    std::string_view rel{u.release};
-    for (auto prefix : {"6.11", "6.12", "6.13"})
-    {
-        if (rel.substr(0, 4) == prefix)
+        struct utsname u
         {
-            return true;
+        };
+
+        if (::uname(&u) != 0)
+        {
+            return false;
         }
-    }
-    return false;
+        // Check for Linux kernel 6.11, 6.12, 6.13 prefix.
+        std::string_view rel{u.release};
+        for (auto prefix : {"6.11", "6.12", "6.13"})
+        {
+            if (rel.substr(0, 4) == prefix)
+            {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return chunked;
 }
 
 HostMem::HostMem(size_t size)
@@ -211,7 +215,7 @@ HostMem::HostMem(size_t size)
 
 HostMem::~HostMem()
 {
-    destroy();
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 void HostMem::resize(size_t newSize)

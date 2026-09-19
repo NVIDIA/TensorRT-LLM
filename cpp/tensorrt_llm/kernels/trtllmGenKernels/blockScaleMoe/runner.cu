@@ -416,8 +416,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 namespace PermuteGemm1
 {
 
-tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType)
+// PermuteGemm1 produces the buffer Gemm2 consumes. useFineGrained is resolved by the thop layer;
+// this layer never reads the env var.
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights,
+    int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType, bool useFineGrained)
 {
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(actType);
     // DeepSeek FP8 runs the gated activation as a standalone kernel (see moe::dev::activation),
@@ -428,7 +430,8 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
 
     if (is_gated_activation)
     {
-        options = {.dtypeA = dtypeAct,
+        options = {
+            .dtypeA = dtypeAct,
             .dtypeB = dtypeWeights,
             .dtypeC = dtypeAct,
             .actType = actType,
@@ -437,7 +440,12 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
             .routeAct = true,
             .staticBatch = false,
             .tileSize = tileTokensDim,
-            .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+            .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
+            .fineGrainedConsumerA = false,
+            .fineGrainedConsumerB = false,
+            .fineGrainedForceValid = useFineGrained,
+            .fineGrainedProducer = useFineGrained,
+        };
     }
     else
     {
@@ -459,17 +467,22 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
             .staticBatch = false,
             .tileSize = tileTokensDim,
             .epilogueTileM = 128,
+            .fineGrainedConsumerA = false,
+            .fineGrainedConsumerB = false,
+            .fineGrainedForceValid = useFineGrained,
+            .fineGrainedProducer = useFineGrained,
         };
     }
     return options;
 }
 
-Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType)
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType,
+    bool useFineGrained)
     : mDtypeAct(dtypeAct)
     , mDtypeWeights(dtypeWeights)
     , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType)))
+          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useFineGrained)))
     , mActType(actType)
 {
 }
@@ -487,7 +500,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
         // FIXME: enforce valid hidden dim to be multiple of 512 due to unhandled OOB read in routeAct. Please keep this
         // in sync with
-        // tensorrt_llm/_torch/modules/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
+        // tensorrt_llm/_torch/moe/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
         validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
     }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
@@ -515,6 +528,11 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
+    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
+    {
+        // Keep in sync with run(): the kernel is launched with the 512-rounded valid hidden size.
+        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
+    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
@@ -525,6 +543,10 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
+    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
+    {
+        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
+    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
@@ -548,10 +570,12 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
 
 namespace Gemm2
 {
-tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8)
+// Gemm2 consumes PermuteGemm1's output as operand B. useFineGrained is resolved by the thop layer.
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights,
+    btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8, bool useFineGrained)
 {
-    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.dtypeA = dtypeAct,
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
+        .dtypeA = dtypeAct,
         .dtypeB = dtypeWeights,
         .dtypeC = dtypeOut,
         .eltwiseActType = EltwiseActType::None,
@@ -560,18 +584,23 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .routeAct = false,
         .staticBatch = false,
         .tileSize = tileTokensDim,
-        .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+        .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
+        .fineGrainedConsumerA = false,
+        .fineGrainedConsumerB = useFineGrained,
+        .fineGrainedForceValid = false,
+        .fineGrainedProducer = false,
+    };
     return options;
 }
 
-Runner::Runner(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8, int tileTokensDim)
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8,
+    int tileTokensDim, bool useFineGrained)
     : mDtypeAct(dtypeAct)
     , mDtypeWeights(dtypeWeights)
     , mDtypeOut(dtypeOut)
     , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8)))
+          getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8, useFineGrained)))
 {
 }
 
@@ -639,10 +668,11 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
 
 namespace MoE
 {
-Runner::Runner(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim, ActType actType)
-    : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType))
-    , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim,
+    ActType actType, bool useFineGrained)
+    : mPermuteGemm1(
+        PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType, useFineGrained))
+    , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim, useFineGrained))
     , mActType(actType)
     , mTileTokensDim(tileTokensDim)
 {
@@ -663,8 +693,8 @@ Runner::Runner(
     TLLM_CHECK_WITH_INFO(!mPassingConfigs.empty(), "No compatible configs found for the fp8 block scale MoE runner.");
 }
 
-Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim)
-    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActType::SwiGlu)
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim, bool useFineGrained)
+    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActType::SwiGlu, useFineGrained)
 {
 }
 

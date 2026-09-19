@@ -18,7 +18,6 @@ Each test allocates an output tensor with DEFAULT / USERBUFFERS / NCCL_WINDOW,
 fills it with known values, runs an AllReduce, and verifies correctness.
 """
 
-import os
 import pickle
 import sys
 import traceback
@@ -39,7 +38,6 @@ from tensorrt_llm._torch.distributed import (
 )
 from tensorrt_llm.mapping import Mapping
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
     cloudpickle.dumps,

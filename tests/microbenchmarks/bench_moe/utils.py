@@ -74,6 +74,14 @@ def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> No
         raise RuntimeError("CUDA required for MegaMoE backend")
     if dist.is_initialized():
         return
+    if world_size == 1:
+        dist.init_process_group(
+            backend="nccl",
+            store=dist.HashStore(),
+            rank=rank,
+            world_size=world_size,
+        )
+        return
     rendezvous = None
     if rank == 0:
         master_addr = os.environ.get("MASTER_ADDR") or "127.0.0.1"

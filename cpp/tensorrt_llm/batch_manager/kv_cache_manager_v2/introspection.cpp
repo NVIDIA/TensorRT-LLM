@@ -95,23 +95,10 @@ std::optional<bool> KvCacheIntrospection::committedPageIsLinked(KvCache const& k
     return committed->block != nullptr;
 }
 
-TypedVec<PoolGroupIndex, StorageStatistics> KvCacheIntrospection::storageStatistics(
-    KvCacheManager& manager, CacheLevel level)
-{
-    TypedVec<PoolGroupIndex, StorageStatistics> result;
-    PoolGroupIndex const numPoolGroups = manager.storage().numPoolGroups();
-    result.reserve(numPoolGroups);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups; ++pgIdx)
-    {
-        result.push_back(manager.storage().getStatistics(level, pgIdx));
-    }
-    return result;
-}
-
 TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::computeSlotsForBatch(KvCacheManager& manager,
     BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse)
 {
-    return manager.storage().computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+    return manager.storage().computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
 }
 
 bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)
@@ -141,7 +128,7 @@ void KvCacheIntrospection::setLastAdjustmentTime(KvCacheManager& manager, double
 
 void KvCacheIntrospection::setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value)
 {
-    manager.mTargetRatioListGpu = std::move(value);
+    manager.mTargetRatioListHot = std::move(value);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

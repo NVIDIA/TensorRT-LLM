@@ -63,11 +63,11 @@ from ...inputs import (
     register_input_processor,
 )
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
-from ..attention_backend.utils import get_attention_backend
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
+from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
@@ -355,16 +355,47 @@ def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
-def _get_vision_tp_mapping(model_config: ModelConfig) -> Mapping:
-    if not model_config.mapping.enable_attention_dp:
+def _vision_requires_replication(model_config: ModelConfig, num_heads: int) -> bool:
+    """Whether the MoonViT vision tower must run replicated (tp=1) rather than
+    tensor-parallel sharded across the attention-TP ranks.
+
+    Replication is required when either:
+
+    * attention data-parallelism is enabled (attention weights are already
+      replicated per rank), or
+    * ``num_heads`` — the tower's attention head count, resolved by the caller
+      with its per-model default (16 for K2.5, 12 for K3) — is not divisible
+      by the attention-TP degree (e.g. Kimi K3's 12 heads under TP16). Such a
+      tower cannot be TP-sharded at all, so it must be replicated instead of
+      tripping the ``num_heads % tp_size`` assertion in :class:`Attention`.
+    """
+    mapping = model_config.mapping
+    if mapping.enable_attention_dp:
+        return True
+    # Helix carries its parallelism in cp with tp_size=1, so a tp-only test
+    # never trips; the tower has no context-parallel form, so any cp > 1
+    # must replicate.
+    if mapping.cp_size > 1:
+        return True
+    return (num_heads % mapping.tp_size) != 0
+
+
+def _get_vision_tp_mapping(model_config: ModelConfig, num_heads: int) -> Mapping:
+    if not _vision_requires_replication(model_config, num_heads):
         return model_config.mapping
 
+    # Fold every parallel dimension (incl. helix cp) into pp so each rank
+    # runs the tower replicated; without cp the world size collapses below
+    # the rank range under helix.
+    attn_ranks = (
+        model_config.mapping.pp_size * model_config.mapping.tp_size * model_config.mapping.cp_size
+    )
     return Mapping(
-        world_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        world_size=attn_ranks,
         rank=model_config.mapping.rank,
         gpus_per_node=model_config.mapping.gpus_per_node,
         tp_size=1,
-        pp_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        pp_size=attn_ranks,
     )
 
 
@@ -694,6 +725,7 @@ class PatchMergerMLP(nn.Module):
         model_config: ModelConfig,
         mm_hidden_size: int,
         text_hidden_size: int,
+        num_heads: int,
         merge_kernel_size: Tuple[int, int] = (2, 2),
         ln_eps: float = 1e-5,
     ) -> None:
@@ -705,7 +737,7 @@ class PatchMergerMLP(nn.Module):
             eps=ln_eps,
             dtype=model_config.torch_dtype,
         )
-        mapping = _get_vision_tp_mapping(model_config)
+        mapping = _get_vision_tp_mapping(model_config, num_heads)
         self.proj = nn.Sequential(
             Linear(
                 self.merged_dim,
@@ -770,6 +802,28 @@ class KimiK25VisionModel(nn.Module):
             kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
         )
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
+
+        # Extract vision config dict (num_heads is resolved here, with this
+        # model's default of 16 heads, because the TP-replication decision
+        # below must use the same head count the tower is built with).
+        vision_cfg = getattr(self.model_config.pretrained_config, "vision_config", {})
+        if vision_cfg is None:
+            vision_cfg = {}
+        if not isinstance(vision_cfg, dict):
+            vision_cfg = (
+                vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg)
+            )
+        num_heads = vision_cfg.get(
+            "vt_num_attention_heads", vision_cfg.get("num_attention_heads", 16)
+        )
+
+        # The MoonViT tower cannot be tensor-parallel sharded when its attention
+        # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
+        # 12 heads under TP16); run the whole tower replicated (tp=1) in that
+        # case so module construction and weight loading agree. Attention-DP
+        # already replicates the vision tower via its own path, so leave it be.
+        if not model_config.mapping.enable_attention_dp:
+            self.model_config.mapping = _get_vision_tp_mapping(model_config, num_heads)
         pretrained_config = self.model_config.pretrained_config
         model_dtype = (
             getattr(pretrained_config, "torch_dtype", None)
@@ -780,21 +834,9 @@ class KimiK25VisionModel(nn.Module):
             model_dtype = getattr(torch, model_dtype, torch.bfloat16)
         pretrained_config.torch_dtype = model_dtype
 
-        # Extract vision config dict
-        vision_cfg = getattr(pretrained_config, "vision_config", {})
-        if vision_cfg is None:
-            vision_cfg = {}
-        if not isinstance(vision_cfg, dict):
-            vision_cfg = (
-                vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg)
-            )
-
         # Read HF-prefixed names with unprefixed fallback
         hidden_dim = vision_cfg.get("vt_hidden_size", vision_cfg.get("hidden_size", 1152))
         num_layers = vision_cfg.get("vt_num_hidden_layers", vision_cfg.get("num_hidden_layers", 27))
-        num_heads = vision_cfg.get(
-            "vt_num_attention_heads", vision_cfg.get("num_attention_heads", 16)
-        )
         self.model_config.pretrained_config.head_dim = hidden_dim // num_heads
         self.model_config._frozen = True
         mlp_dim = vision_cfg.get("vt_intermediate_size", vision_cfg.get("intermediate_size", 4304))
@@ -845,6 +887,7 @@ class KimiK25VisionModel(nn.Module):
             self.model_config,
             mm_hidden_size,
             self.text_hidden_size,
+            num_heads,
             self.merge_kernel_size,
             ln_eps,
         )
@@ -883,6 +926,17 @@ class KimiK25VisionModel(nn.Module):
 
         converted: Dict[str, torch.Tensor] = {}
         for name, weight in mapped.items():
+            # The runtime HF loader streams weights as lazy safetensors
+            # ``PySafeSlice`` objects (``safe_open(...).get_slice(name)``), which
+            # support slicing but none of the torch.Tensor attributes/methods the
+            # downstream consume path touches (``.chunk`` here, and ``.device`` /
+            # ``.dtype`` / ``.shape`` inside the child ``Linear.load_weights`` ->
+            # ``load_weight_shard``). Materialize EVERY value once, up front, so
+            # no raw PySafeSlice can leak into any child module. The vision tower
+            # + projector is small (168 tensors, non-quantized, tp=1 replicated),
+            # so full materialization is cheap; ``[:]`` on an already-real tensor
+            # is a harmless view, so the module-parity path is unaffected.
+            weight = weight[:]
             if ".wqkv." in name:
                 prefix, suffix = name.split(".wqkv.", 1)
                 q_weight, k_weight, v_weight = weight.chunk(3, dim=0)
@@ -1516,6 +1570,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     """
 
     _LANG_PREFIX = "language_model."
+    # Vision tower class. Subclasses (Kimi K3) override this so the shared
+    # __init__/load_weights MetaInitMode deferral-and-recreation logic
+    # constructs their tower without re-implementing either method.
+    _VISION_MODEL_CLS = KimiK25VisionModel
 
     @classmethod
     def get_preferred_kv_cache_manager_version(
@@ -1567,7 +1625,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         self.mm_encoder = None
         if not DISAGG:
             try:
-                mm_encoder = KimiK25VisionModel(model_config)
+                mm_encoder = self._VISION_MODEL_CLS(model_config)
                 if _has_meta_tensors(mm_encoder):
                     logger.info("Vision encoder deferred to load_weights() (MetaInitMode active)")
                 else:
@@ -1658,7 +1716,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     @property
     def mm_token_ids(self) -> torch.Tensor:
         """Surface the in-vocab media placeholder to the model engine so
-        ``_prepare_multimodal_indices`` selects the ``torch.isin`` predicate
+        ``runners.prepare_multimodal_indices`` selects the ``torch.isin`` predicate
         instead of the OOV (``>= vocab_size``) fallback (which would miss
         Kimi's placeholder and force ``fuse_input_embeds`` through the
         ``torch.where`` host-sync path on GPU input_ids).
@@ -1679,13 +1737,17 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             vision_model_config._frozen = False
             vision_model_config.pretrained_config = self._vlm_pretrained_config
             vision_model_config._frozen = True
-            self.mm_encoder = KimiK25VisionModel(vision_model_config)
+            self.mm_encoder = self._VISION_MODEL_CLS(vision_model_config)
         if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         if any(k.startswith(self._LANG_PREFIX) for k in weights):
             lm_weights = filter_weights("language_model", weights)
             lm_weights = ConsumableWeightsDict(lm_weights)
+            checkpoint_dir = getattr(weights, "checkpoint_dir", None)
+            if checkpoint_dir is not None:
+                lm_weights.checkpoint_dir = checkpoint_dir
+            lm_weights.checkpoint_prefix = self._LANG_PREFIX
         else:
             lm_weights = weights
         self.llm.load_weights(lm_weights)
@@ -1718,7 +1780,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
-            # The executor's ``_prepare_multimodal_indices`` now sees Kimi's
+            # ``runners.prepare_multimodal_indices`` now sees Kimi's
             # in-vocab placeholder via ``self.mm_token_ids`` and emits indices
             # that match ``find_input_mm_embeds``'s active-chunk slice. The
             # previous ``(input_ids == placeholder).sum().item()`` guard was a

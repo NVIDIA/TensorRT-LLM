@@ -12,20 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
-
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -58,10 +45,12 @@ def _worker(rank, world_size, test_fn, port):
 
 
 def _run_multi_gpu(world_size, test_fn):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} GPUs, have {torch.cuda.device_count()}")
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _worker,
@@ -77,6 +66,7 @@ def _run_multi_gpu(world_size, test_fn):
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 class TestConstruction:
     def test_single_gpu_defaults(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -191,6 +181,7 @@ class TestConstruction:
             )
 
 
+@pytest.mark.cpu_only
 class TestFlattenCfgRanks:
     """flatten_cfg_ranks is pure layout arithmetic: one rank list per combined
     coordinate of every non-(cfg, ulysses) mesh dim, cfg outermost / ulysses
@@ -217,6 +208,7 @@ class TestFlattenCfgRanks:
         assert vgm.flatten_cfg_ranks() == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
+@pytest.mark.cpu_only
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -248,6 +240,7 @@ class TestSingleGPURanksAndGroups:
         assert vgm.attn2d_col_group is None
 
 
+@pytest.mark.cpu_only
 class TestToLlmMapping:
     def test_single_gpu(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -596,7 +589,6 @@ def _logic_tp2_attn2d_2x1_groups(rank, world_size):
     assert x.item() == 2.0, f"Rank {rank}: attn2d_col all_reduce expected 2, got {x.item()}"
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
         _run_multi_gpu(4, _logic_default_order_cfg2_ulysses2)

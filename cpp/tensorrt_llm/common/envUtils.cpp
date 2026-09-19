@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -274,6 +275,20 @@ bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
     return enabled;
 }
 
+static std::atomic<bool> gFineGrainedSyncDisabledOverride{false};
+
+void setFineGrainedSyncDisabledOverride(bool disabled)
+{
+    gFineGrainedSyncDisabledOverride.store(disabled, std::memory_order_relaxed);
+}
+
+bool getEnvUseFineGrainedSync()
+{
+    // Deliberately uncached: tests flip the env var between cases within one process.
+    return !gFineGrainedSyncDisabledOverride.load(std::memory_order_relaxed)
+        && getBoolEnv("TLLM_USE_FINE_GRAINED_SYNC");
+}
+
 bool getEnvUseUCXKvCache()
 {
     static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
@@ -509,12 +524,6 @@ bool getEnvKVCachePoolUseFabricMemory()
 {
     static bool const useFabricMemory = getBoolEnv("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY");
     return useFabricMemory;
-}
-
-uint16_t getEnvNixlPort()
-{
-    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
-    return nixlPort;
 }
 
 bool getEnvNixlDisableCoalesce()

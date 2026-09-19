@@ -12,6 +12,14 @@ This script is a shorthand to launch a single-GPU context and generation server,
 bash -e disagg_serving_local.sh
 ```
 
+KV cache transfer between the context and generation servers uses the NIXL backend by default. Pass `--transceiver_backend UCX` to use UCX instead. The C++ cache-transceiver runtime is used by default; with NIXL, pass `--transceiver_runtime PYTHON` to use the Python runtime instead:
+```bash
+bash -e disagg_serving_local.sh --transceiver_backend UCX
+bash -e disagg_serving_local.sh --transceiver_runtime PYTHON
+```
+
+Run `bash disagg_serving_local.sh --help` for the full list of options (executor backend, model, tensor-parallel size, etc.).
+
 Once the disaggregated server is ready, you can send requests to the disaggregated server using curl:
 ```bash
 curl http://localhost:8000/v1/completions \

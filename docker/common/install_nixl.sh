@@ -1,10 +1,13 @@
 #!/bin/bash
 set -ex
 
+# Authenticate the github.com clone below; no-op when no token is available.
+source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="v1.3.1"
+NIXL_VERSION="v1.4.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 

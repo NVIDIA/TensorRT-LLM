@@ -9,9 +9,6 @@ mamba ownership pattern rather than the paged-KV FMHA attention-backend
 interface.
 """
 
-from .kimi_kda_mixer import KimiKDAKernelPath, KimiKDALinearAttention
+from .kimi_kda_mixer import KimiKDALinearAttention
 
-__all__ = [
-    "KimiKDAKernelPath",
-    "KimiKDALinearAttention",
-]
+__all__ = ["KimiKDALinearAttention"]

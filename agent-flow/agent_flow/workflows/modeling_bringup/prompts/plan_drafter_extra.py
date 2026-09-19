@@ -345,6 +345,73 @@ the original criterion no longer reflects `task.yaml`, say so
 explicitly in your gap-fix Stage's summary and cite the conflict.
 """
 
+_STAGE_GOAL_FEEDBACK_REPLAN_OVERRIDE = """\
+## Feedback-triggered replan — Stage interrupt override (Stage/Goal mode)
+
+When the orchestrator's replan prompt declares the turn
+**feedback-triggered** (`--trigger-replan-with-feedback`), the human's
+fresh feedback — not a QA verdict — is the driver, and it must be acted
+on by the very next Coder turn. The lock matrix above is amended for
+this turn only:
+
+**You may interrupt the `— IN_PROGRESS` Stage.** If the feedback cannot
+be served by the current `[Doing]` Goal's scope, perform the interrupt
+bookkeeping below in `status.md` (overwrite via the generic `Write`
+tool, preserving all non-table content):
+
+1. Flip the active Stage's header from `— IN_PROGRESS` to
+   `— INTERRUPTED (superseded by feedback iter <n>)`.
+2. Mark its `[Doing]` Goal and every remaining `[Undo]` Goal
+   `[Skipped] — superseded by feedback iter <n>`. `[Done]` and
+   `[Failed]` rows stay locked (execution record).
+3. Insert a new **feedback Stage** immediately after the interrupted
+   Stage in `plan.md`'s `## Implementation Steps`, with a matching
+   `## Stage <N+1> — <label>` subsection in `acceptance-criteria.md`.
+   Downstream `— PENDING` Stages shift down by one and are renumbered —
+   the same mechanical rule as the QA-REJECT gap-fix insert. Mark the
+   feedback Stage `— IN_PROGRESS` and its first Goal
+   `[Doing] (iterations=0)`.
+4. Annotate the interrupted Stage's subsection header in
+   `acceptance-criteria.md` as
+   `## Stage <N> — <label> (INTERRUPTED iter <n> — superseded by
+   feedback)`. Its checklist items themselves stay untouched.
+
+**Skipped-Goal triage is your call.** For each `[Skipped]` Goal decide
+whether its work is still required under the feedback:
+
+- Still required → re-plan it as a Goal inside the feedback Stage or a
+  downstream `— PENDING` Stage, and carry the interrupted Stage's
+  corresponding unmet acceptance items forward as new items in that
+  Stage's subsection (re-worded to fit the new context is fine — they
+  are new items, not edits to locked ones).
+- Obsoleted by the feedback → drop it, justifying the drop in your
+  `summary` (name the Goal, the feedback entry that supersedes it, and
+  why the work is no longer needed).
+
+Every skipped Goal must be dispatched one way or the other in your
+`summary`; a Goal that silently vanishes is a hard no.
+
+**Scope limits.** This override extends only to the interrupt shape
+described above: `— CLOSED` Stages remain fully locked, `[Done]` /
+`[Failed]` rows remain locked, and the no-silent-relaxation rule still
+applies to every acceptance item. If the feedback can be served without
+interrupting (e.g. it purely concerns a future Stage, or the current
+`[Doing]` Goal already covers it), prefer the ordinary lock-matrix
+paths — do not interrupt gratuitously.
+
+**Decision:** an interrupt turn is always substantive — return
+`DRAFT_READY` so the replan PlanReviewer audits the interrupt against
+these rules.
+
+**DONE mapping amendment:** an `— INTERRUPTED` Stage is terminal, like
+a CLOSED Stage answered by a gap-fix: `DONE` additionally requires that
+every `— INTERRUPTED` Stage's superseding feedback Stage (and any Stage
+that received its re-planned Goals) has itself been QA-APPROVE'd, and
+that the interrupt turn's `summary` dispatched all of its `[Skipped]`
+Goals. Never flip an `— INTERRUPTED` Stage back to `— IN_PROGRESS` or
+`— CLOSED`; it is an immutable record once written.
+"""
+
 _STAGE_GOAL_REPLAN_DECISION_MAPPING = """\
 ## Replan decision mapping in Stage/Goal mode
 
@@ -489,6 +556,7 @@ STAGE_GOAL_EXTENSION = "\n".join(
     [
         _STAGE_GOAL_PLAN_SCHEMA,
         _STAGE_GOAL_REPLAN_LOCK_MATRIX,
+        _STAGE_GOAL_FEEDBACK_REPLAN_OVERRIDE,
         _STAGE_GOAL_REPLAN_DECISION_MAPPING,
     ]
 )

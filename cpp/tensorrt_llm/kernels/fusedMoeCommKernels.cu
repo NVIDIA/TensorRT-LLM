@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -684,8 +684,13 @@ __device__ __forceinline__ void s2gAllFields(FusedMoeFieldInfo const& recvFieldI
     if (HAS_BASIC_FIELDS)
     {
         s2gBasicFields(recvFieldInfo, expertParallelInfo, dataIndex, sharedMemoryBase, warpId, laneId);
-        __syncwarp();
     }
+
+    // unpackAllFields (and the low-precision dequantization before it) populate
+    // shared memory through the generic proxy. Make those writes visible to
+    // the async proxy before cp.async.bulk reads the same buffer for S2G.
+    tensorrt_llm::common::fence_view_async_shared();
+    __syncwarp();
 #pragma unroll
     for (int i = 0; i < FIELD_COUNT; i++)
     {

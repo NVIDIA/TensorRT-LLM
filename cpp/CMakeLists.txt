@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -158,9 +158,29 @@ else()
   message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
+# Where the configured executor/version.h is written. Out-of-tree builds point
+# this at the build tree so the source tree is never written (it may be mounted
+# read-only); the default keeps the in-source location.
+set(TRTLLM_VERSION_H_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    CACHE PATH "Include root for the configured executor/version.h")
 configure_file(
   cmake/templates/version.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
+  "${TRTLLM_VERSION_H_INCLUDE_DIR}/tensorrt_llm/executor/version.h")
+if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
+   "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  # BEFORE: the configured header must win over a stale in-source copy.
+  include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
+endif()
+
+# Generated FMHA sources (see contextFusedMultiHeadAttention/CMakeLists.txt for
+# the full definition and default). fmha_cubin.h is included transitively by
+# headers used across several targets, so when generation is redirected out of
+# the source tree the directory must be on every target's include path, not just
+# the FMHA target's.
+if(DEFINED TRTLLM_FMHA_GEN_DIR AND NOT "${TRTLLM_FMHA_GEN_DIR}" STREQUAL "")
+  include_directories("${TRTLLM_FMHA_GEN_DIR}")
+endif()
 
 setup_cuda_compiler()
 
@@ -258,10 +278,17 @@ endif()
 FetchContent_MakeAvailable(nanobind)
 include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
-FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
+FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
 
+# cppzmq (header-only) is the bounce v2 control-plane dependency AND the UCX
+# bootstrap dependency. Make it available whenever NIXL (-> bounce) or UCX is
+# enabled, so bounce does NOT require UCX (its real deps are NIXL + zmq,
+# orthogonal to UCX). ucxx stays UCX-only.
+if(NIXL_ROOT OR ENABLE_UCX)
+  FetchContent_MakeAvailable(cppzmq)
+endif()
 if(ENABLE_UCX)
-  FetchContent_MakeAvailable(cppzmq ucxx)
+  FetchContent_MakeAvailable(ucxx)
 endif()
 
 if(NOT NVTX_DISABLE)

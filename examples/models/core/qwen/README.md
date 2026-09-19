@@ -48,19 +48,19 @@ python3 examples/llm-api/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_
 1. Evaluate accuracy on the MMLU dataset:
 
 ```bash
-trtllm-eval --model=Qwen3-32B/ --tokenizer=Qwen3-32B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
+trtllm-eval --model=Qwen3-32B/ --tokenizer=Qwen3-32B/ mmlu --dataset_path=./datasets/mmlu/
 [05/01/2025-13:56:15] [TRT-LLM] [I] MMLU weighted average accuracy: 79.09 (14042)
 ```
 
 ```bash
-trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
+trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ mmlu --dataset_path=./datasets/mmlu/
 [05/05/2025-11:33:02] [TRT-LLM] [I] MMLU weighted average accuracy: 79.44 (14042)
 ```
 
 2. Evaluate accuracy on GSM8K dataset:
 
 ```bash
-trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch gsm8k --dataset_path=./datasets/openai/gsm8k/
+trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ gsm8k --dataset_path=./datasets/openai/gsm8k/
 [05/05/2025-12:05:40] [TRT-LLM] [I] lm-eval gsm8k results (scores normalized to range 0~100):
 |Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
@@ -71,7 +71,7 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 
 ### Model Quantization
 
-To quantize the Qwen3 model for use with the PyTorch backend, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
+To quantize the Qwen3 model, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
 
 ```bash
 # Clone the Model Optimizer (ModelOpt)
@@ -188,22 +188,32 @@ To serve the model in disaggregated mode, you should launch context and generati
 For example, you can launch a single context server on port 8001 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml"
 
-trtllm-serve Qwen3-30B-A3B/ --port 8001 --config ${EXTRA_LLM_API_FILE} &> output_ctx &
+# The curated configs set no cache_transceiver_config, and backend has no default,
+# so without this the transceiver stays disabled and the worker rejects requests.
+cat "${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml" > ./ctx_config.yaml
+cat >>./ctx_config.yaml <<EOF
+cache_transceiver_config:
+  backend: NIXL
+EOF
+
+trtllm-serve Qwen3-30B-A3B/ --port 8001 --config ./ctx_config.yaml &> output_ctx &
 ```
 
 And you can launch two generation servers on port 8002 and 8003 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml"
+
+cat "${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml" > ./gen_config.yaml
+cat >>./gen_config.yaml <<EOF
+cache_transceiver_config:
+  backend: NIXL
+EOF
 
 for port in {8002..8003}; do \
-trtllm-serve Qwen3-30B-A3B/ --port ${port} --config ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
+trtllm-serve Qwen3-30B-A3B/ --port ${port} --config ./gen_config.yaml &> output_gen_${port} & \
 done
 ```
 
@@ -211,7 +221,7 @@ Finally, you can launch the disaggregated server which will accept requests from
 the orchestration between the context and generation servers with:
 
 ```bash
-cat >./disagg-config.yml <<EOF
+cat >./disagg-config.yaml <<EOF
 hostname: localhost
 port: 8000
 backend: pytorch
@@ -279,7 +289,7 @@ For further details, please refer to [speculative-decoding.md](../../../../docs/
 ### Dynamo
 
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
-Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/components/src/dynamo/trtllm/README.md)
 
 ## Qwen3-Next
 

@@ -2,6 +2,23 @@
 
 Separated from test_disaggregated_serving.py to isolate MPI-dependent test
 infrastructure for easier maintenance.
+
+NOTE: these tests no longer gate pre-merge CI. DWDP accuracy is gated by
+test_dwdp_aggregated.py, which exercises the same expert-sharing paths without
+the disaggregated KV cache transceiver and is therefore not exposed to
+per-cluster transport configuration. The tests here stay registered in the QA
+list, waived under nvbugs/6276923, so that the file keeps being collected --
+it imports helpers from test_disaggregated_serving.py and would otherwise rot
+unnoticed -- and so that dropping the waive is the natural signal once the
+disaggregated path is healthy again. They also remain useful as a manual
+reproduction of the disaggregated DWDP path.
+
+When running it manually, check the launcher's UCX settings first: SLURM
+enroot/pyxis injects ``UCX_TLS=tcp`` from the host MPI stack on some clusters,
+which pins the KV cache transceiver to a transport that can fail there and hang
+the run in ``check_gen_transfer_status``. Clear or pin ``UCX_TLS`` for the
+cluster before running -- see jenkins/scripts/slurm_env_setup.sh and
+examples/disaggregated/slurm/benchmark/start_worker_dwdp.sh.
 """
 
 import contextlib
@@ -212,6 +229,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -244,6 +262,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -327,6 +346,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -360,6 +380,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -462,6 +483,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -498,6 +520,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {

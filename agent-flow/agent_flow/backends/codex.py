@@ -429,6 +429,20 @@ class CodexClient(BackendClient):
         self._session_init = session_init
         self._session_init_emitted = False
 
+    async def list_available_skills(self) -> list[str] | None:
+        """Skill names from the session init built at client creation.
+
+        ``_build_session_init_event`` already asked the Codex client for
+        ``skills_list`` when this client was created, so the answer is in
+        hand before any turn — the event that ``send_message`` replays is
+        only the same cached value. ``None`` when that call came back
+        empty or failed, which is the backend declining to say rather
+        than reporting an empty environment.
+        """
+        if self._session_init is None:
+            return None
+        return list(self._session_init.skills)
+
     async def send_message(self, message: str) -> AsyncIterator[BackendEvent]:
         TextInput = _symbol("openai_codex", "TextInput")
 
@@ -727,7 +741,7 @@ def _codex_backend_version() -> str:
     return _VERSION_CACHE
 
 
-_REASONING_EFFORT = "xhigh"
+_REASONING_EFFORT = "max"
 
 _SDK_PATCHED = False
 
@@ -874,6 +888,7 @@ class CodexBackend(Backend):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        cwd: Path | None = None,
     ) -> AsyncIterator[BackendClient]:
         # ``disallowed_tools`` and ``extra_mcp_servers`` are currently
         # Claude-Code-only concepts (they map onto
@@ -892,6 +907,7 @@ class CodexBackend(Backend):
         SandboxMode = _symbol("openai_codex.generated.v2_all", "SandboxMode")
         ThreadStartParams = _symbol("openai_codex.generated.v2_all", "ThreadStartParams")
 
+        session_cwd = cwd or Path.cwd()
         params = ThreadStartParams(
             model=model,
             developer_instructions=system_prompt or None,
@@ -899,7 +915,7 @@ class CodexBackend(Backend):
                 "model_reasoning_effort": _REASONING_EFFORT,
                 "model_context_window": 1000000,
             },
-            cwd=str(Path.cwd()),
+            cwd=str(session_cwd),
             sandbox=SandboxMode.danger_full_access,
             approval_policy=AskForApproval(root=AskForApprovalValue.never),
         )
@@ -908,7 +924,7 @@ class CodexBackend(Backend):
             start_payload["dynamicTools"] = [_dynamic_tool_spec(t) for t in tools]
 
         await self._codex._ensure_initialized()
-        session_init = await _build_session_init_event(self._codex._client, Path.cwd())
+        session_init = await _build_session_init_event(self._codex._client, session_cwd)
         started = await self._codex._client.thread_start(start_payload)
         thread_id = started.thread.id
 

@@ -147,6 +147,7 @@ bool FmhaDispatcher::isSupported()
             // Generation-style kernels on long KV can pick MultiCtasKv cubins
             tllmRunnerParams.mMultiCtasKvMode = true;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
@@ -266,6 +267,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         // For skip softmax
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
+        tllmRunnerParams.mSkipCorrThreshold = runnerParams.skipCorrectionThreshold;
 
         tllmRunnerParams.stream = runnerParams.stream;
         // Sparse context attention: reuse the generation-style kernel with per-token sparse indices.
@@ -303,6 +305,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.multiCtasKvScratchPtr = runnerParams.multiCtasKvScratchPtr;
             tllmRunnerParams.multiCtasKvCounterPtr = runnerParams.multiCtasKvCounterPtr;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

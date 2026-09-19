@@ -104,10 +104,10 @@ DOMAIN_PRIMING = """\
   implementation reference. Verify whether cited TensorRT-LLM classes/functions are
   real definitions, wrappers, import aliases, or bindings before relying on them.
 - For attention work, read
-  `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` and reason across
+  `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` and reason across
   module, backend, runtime contract, and KV-cache semantics.
 - For MoE work, read
-  `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
+  `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
   across routing, expert parallelism, quantization, and fused-kernel contracts.
 - Use `KVCacheManagerV2` for new-model bring-up. The TRTLLM and FlashInfer
   attention backends are both valid targets when the plan tests the selected
@@ -590,7 +590,7 @@ STATUS_DONE_TODO_RUBRIC = """\
 In addition to the rolling-state sections (current status, execution
 path, what was tried, pointers for the next step), `status.md` must
 carry a `## Done / TODO` section that both the Coder and the Reviewer
-keep current when they call `update_status`. It is the cheap signal
+keep current when they update it. It is the cheap signal
 the next agent uses to pick up where this iteration left off and the
 human uses to read out progress at a glance.
 
