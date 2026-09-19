@@ -14,6 +14,7 @@ l0_gb200_multi_gpus:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ---- curated pre-merge smoke set: diversify moe_backend across CUTLASS/TRTLLM/CUTEDSL ----
