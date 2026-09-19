@@ -390,7 +390,12 @@ class CachedModelLoader:
         *args,
         **kwargs,
     ) -> List[Any]:
-        if self.llm_args.parallel_config.is_multi_gpu:
+        # An attached serving frontend (trtllm-serve num_serve_frontends > 1)
+        # is multi-GPU by configuration but owns no MPI session: the launcher
+        # already ran the task on every node, so running it locally is
+        # enough (e.g. a hub download resolves from the populated cache).
+        if (self.llm_args.parallel_config.is_multi_gpu
+                and self.mpi_session is not None):
             return self.mpi_session.submit_sync(task, *args, **kwargs)
         else:
             return [task(*args, **kwargs)]

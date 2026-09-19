@@ -91,6 +91,10 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
+                                               AttachedFrontendWatchdog,
+                                               LauncherForwarder,
+                                               MultiFrontendServing)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionMessageParam, ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
@@ -718,7 +722,8 @@ class OpenAIServer(_VideoRoutesMixin):
             media_load_workers: int = 8,
             internal_disagg_auth_key: Optional[str] = None,
             enable_rl_control_endpoints: bool = False,
-            rl_control_api_key: Optional[str] = None):
+            rl_control_api_key: Optional[str] = None,
+            multi_frontend_serving: Optional[MultiFrontendServing] = None):
         if enable_rl_control_endpoints and not rl_control_api_key:
             raise ValueError(
                 "rl_control_api_key is required when RL control endpoints are enabled"
@@ -793,6 +798,22 @@ class OpenAIServer(_VideoRoutesMixin):
         ) if server_role is not None else "server"
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             perf_metrics_output_dir, server_kind)
+        # Multi-frontend serving (num_serve_frontends > 1): the launcher is
+        # the sole consumer of the engine's iteration stats / KV events and
+        # the only owner of profiling and the batch store; attached
+        # frontends forward those routes to it over its Unix socket and
+        # watch it for engine or launcher death (see serve/multi_frontend.py).
+        self._multi_frontend = multi_frontend_serving
+        self._launcher_forwarder: Optional[LauncherForwarder] = None
+        self._launcher_watchdog_task: Optional[asyncio.Task] = None
+        if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
+            self._launcher_forwarder = LauncherForwarder(
+                multi_frontend_serving.launcher_uds)
+        # Requests finishing on attached frontends never wake the launcher's
+        # collector, so the launcher also polls on a fixed cadence.
+        self._iteration_stats_poll_interval: Optional[float] = (
+            1.0 if multi_frontend_serving is not None
+            and multi_frontend_serving.is_launcher else None)
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.
@@ -861,7 +882,18 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Start background iteration stats collector if metrics are enabled
                 # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
                 # tensorrt backend does not have this attribute but it always has iter stats enabled.
-                if self.metrics_collector and getattr(
+                # An attached frontend never drains the engine queue: the
+                # launcher owns it and /metrics is forwarded there.
+                if self._launcher_forwarder is not None:
+                    self._launcher_watchdog_task = asyncio.create_task(
+                        AttachedFrontendWatchdog(
+                            self._launcher_forwarder,
+                            self._multi_frontend.launcher_pid,
+                            self._on_launcher_lost).run())
+                    logger.info(
+                        "Attached frontend: forwarding launcher-owned routes "
+                        f"to {self._multi_frontend.launcher_uds}")
+                elif self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
                     # The background loop becomes the sole consumer of the
                     # engine stats queue; /metrics reads from a tee buffer
@@ -894,6 +926,14 @@ class OpenAIServer(_VideoRoutesMixin):
             yield
 
             await self._perf_metrics_writer.close()
+            if self._launcher_watchdog_task is not None:
+                self._launcher_watchdog_task.cancel()
+                try:
+                    await self._launcher_watchdog_task
+                except asyncio.CancelledError:
+                    pass
+            if self._launcher_forwarder is not None:
+                await self._launcher_forwarder.close()
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -954,6 +994,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_embedding_batcher()
             self.register_embedding_routes()
         else:
+            if self._launcher_forwarder is not None:
+                # Registered first so they shadow the local handlers below
+                # (FastAPI matches in registration order).
+                for method, path in FORWARDED_ROUTES:
+                    self.app.add_api_route(path,
+                                           self._launcher_forwarder.forward,
+                                           methods=[method],
+                                           include_in_schema=False)
             self.register_routes()
 
         if self._collect_perf_metrics:
@@ -1085,7 +1133,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 request_inference_time_buckets=(
                     pmc.request_inference_time_buckets if pmc else None),
             )
-            self._log_config_info_metrics()
+            # With a shared PROMETHEUS_MULTIPROC_DIR every process would
+            # export its own per-pid config-info series; the launcher's
+            # suffices (attached frontends share its engine and config).
+            if self._launcher_forwarder is None:
+                self._log_config_info_metrics()
 
     @staticmethod
     def _ensure_post_processor_hook_supported(
@@ -1709,6 +1761,22 @@ class OpenAIServer(_VideoRoutesMixin):
             base64.b64encode(state).decode("utf-8")
         })
 
+    def _on_launcher_lost(self, error: BaseException) -> None:
+        """Watchdog callback of an attached frontend: fail fast, then shut down.
+
+        Mirrors the fatal-error branch of ``health``: record the error on the
+        executor so in-flight and new requests raise EngineDeadError instead
+        of hanging, then raise SIGINT once for uvicorn's graceful shutdown.
+        """
+        executor = getattr(self.generator, '_executor', None)
+        if executor is None:
+            return
+        if getattr(executor, '_fatal_error', None) is None:
+            executor._set_fatal_error(error)
+        if not getattr(executor, 'doing_shutdown', True):
+            _record_generator_termination(self.generator)
+            signal.raise_signal(signal.SIGINT)
+
     async def health(self) -> Response:
         if self._check_health():
             return Response(status_code=200)
@@ -1890,8 +1958,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.metrics_collector.log_request_metrics_dict(
                     res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
-            # Wake up the stats collector to drain iteration stats
-            if getattr(self.generator.args, "enable_iter_perf_stats", True):
+            # Wake up the stats collector to drain iteration stats (an
+            # attached frontend has no collector: the launcher drains).
+            if self._iteration_stats_collector_task is not None and getattr(
+                    self.generator.args, "enable_iter_perf_stats", True):
                 self._iteration_stats_wakeup_event.set()
 
     async def _create_chat_response(
@@ -1942,22 +2012,37 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             logger.info("Iteration stats collector loop started")
             while True:
-                # Wait for signal that requests have completed and stats may be available
-                await self._iteration_stats_wakeup_event.wait()
+                # Wait for signal that requests have completed and stats may
+                # be available. A multi-frontend launcher also wakes on a
+                # fixed cadence: requests finishing on attached frontends
+                # never set this event, yet their iterations land in the
+                # engine queue this loop alone drains.
+                woken_by_timer = False
+                try:
+                    await asyncio.wait_for(
+                        self._iteration_stats_wakeup_event.wait(),
+                        timeout=getattr(self, "_iteration_stats_poll_interval",
+                                        None))
+                except asyncio.TimeoutError:
+                    woken_by_timer = True
 
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
-                        self.metrics_collector.log_iteration_stats(llm_stat)
-                        # Tee into the /metrics snapshot buffer so the HTTP
-                        # handler can serve without competing for the engine
-                        # queue (nvbug 6102381).
-                        if self._iteration_stats_buffer is not None:
-                            self._iteration_stats_buffer.append(llm_stat)
+                    if woken_by_timer:
+                        # Idle poll: the stats RPC would otherwise wait out
+                        # its timeout inside a synchronous .remote() call and
+                        # stall this event loop, so fetch once without
+                        # waiting, off the loop.
+                        for llm_stat in await asyncio.to_thread(
+                                self.generator.get_stats, 0):
+                            self._record_iteration_stat(llm_stat)
+                    else:
+                        async for llm_stat in self.generator.get_stats_async(
+                                timeout=0.5):
+                            self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -1967,6 +2052,13 @@ class OpenAIServer(_VideoRoutesMixin):
         except asyncio.CancelledError:
             logger.info("Iteration stats collector loop cancelled")
             raise
+
+    def _record_iteration_stat(self, llm_stat: dict) -> None:
+        self.metrics_collector.log_iteration_stats(llm_stat)
+        # Tee into the /metrics snapshot buffer so the HTTP handler can serve
+        # without competing for the engine queue (nvbug 6102381).
+        if self._iteration_stats_buffer is not None:
+            self._iteration_stats_buffer.append(llm_stat)
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
