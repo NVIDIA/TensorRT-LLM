@@ -32,6 +32,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# This is a standalone project, so the .cu files pulling in the ATen headers do
+# not inherit the CUDA standard the main build sets.
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # add_compile_definitions(FMHA_TRAIN_OPS_DEBUG_HOPPER_FPROP)
