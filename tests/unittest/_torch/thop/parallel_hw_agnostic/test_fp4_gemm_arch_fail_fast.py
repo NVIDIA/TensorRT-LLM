@@ -65,14 +65,43 @@ def test_w4a8_mxfp4_fp8_gemm_rejects_hopper_before_autotuning():
 
 
 def test_w4a8_mxfp4_fp8_gemm_error_names_its_architectures():
-    """SM120 is newer than the SM100/SM103 this mode needs, so "newer
+    """SM120 is newer than the SM100 family this mode needs, so "newer
     architectures only" was the wrong thing to tell the operator."""
     with (
         patch(f"{MODULE}.get_sm_version", return_value=120),
         patch(f"{MODULE}.AutoTuner.get"),
-        pytest.raises(RuntimeError, match="SM100, SM103"),
+        pytest.raises(RuntimeError, match="SM100-SM109"),
     ):
         torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(*w4a8_mxfp4_fp8_gemm_args())
+
+
+@pytest.mark.parametrize("sm_version", [100, 103, 107])
+def test_w4a8_mxfp4_fp8_gemm_admits_the_whole_sm100_family(sm_version):
+    """SM107 (Rubin) ships no arch-specific cubin and runs the sm_100f build,
+    so the check has to clear it rather than stop at the architectures that
+    happen to have their own. The sentinel stands in for "got past the gate"."""
+    sentinel = RuntimeError("reached the autotuner")
+    with (
+        patch(f"{MODULE}.get_sm_version", return_value=sm_version),
+        patch(f"{MODULE}.AutoTuner.get", side_effect=sentinel),
+        pytest.raises(RuntimeError) as excinfo,
+    ):
+        torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(*w4a8_mxfp4_fp8_gemm_args())
+
+    assert "not supported" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("sm_version", [100, 103, 107, 120, 121])
+def test_nvfp4_gemm_admits_every_architecture_with_fp4_tensor_cores(sm_version):
+    sentinel = RuntimeError("reached backend selection")
+    with (
+        patch(f"{MODULE}.get_sm_version", return_value=sm_version),
+        patch(f"{MODULE}.AutoTuner.get", side_effect=sentinel),
+        pytest.raises(RuntimeError) as excinfo,
+    ):
+        torch_custom_ops.nvfp4_gemm.python_impl(**nvfp4_gemm_kwargs())
+
+    assert excinfo.value is sentinel
 
 
 @pytest.mark.parametrize(

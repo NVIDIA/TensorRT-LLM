@@ -122,6 +122,18 @@ def test_nvfp4_rejection_on_hopper_points_at_the_marlin_opt_in():
             linear.create_weights()
 
 
+@pytest.mark.parametrize("sm_version", [100, 103, 107, 120, 121])
+def test_nvfp4_linear_builds_on_every_architecture_with_fp4_tensor_cores(sm_version):
+    """SM107 (Rubin) ships no arch-specific FP4 build and runs the sm_100f
+    one, so the check has to clear the whole SM100 family rather than stop at
+    the architectures that happen to have their own."""
+    with running_on(sm_version):
+        linear = deferred_linear(QuantAlgo.NVFP4)
+        linear.create_weights()
+
+    assert linear._weights_created
+
+
 def test_unknown_architecture_still_builds_the_layer():
     """``get_sm_version`` reports -1 with no visible device, which is not
     evidence of a rejection -- the layer still has to build."""

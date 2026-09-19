@@ -502,22 +502,38 @@ class GroupwiseQuantAlgo:
     INT8_WEIGHT = 16
 
 
+#: The Blackwell SM100 family, matching ``_utils.is_sm_100f``. The TRTLLM-Gen
+#: cubin drop is sm_100f (family-compatible) plus arch-specific sm_100a /
+#: sm_103a builds, so a family member without its own arch build -- SM107
+#: (Rubin), say -- still runs the family kernel. Enumerating only the
+#: architectures that happen to have their own build would reject the rest.
+SM100_FAMILY_SM_VERSIONS: Tuple[int, ...] = tuple(range(100, 110))
+
 #: SM architectures each FP4 quantization algorithm ships kernels for, keyed by
-#: :class:`QuantAlgo`. These mirror the per-algorithm tables the backends
-#: enforce (``CutlassFusedMoE._QUANT_SUPPORT_TABLE`` and its peers); an
-#: algorithm that is absent has no architecture restriction to fail fast on.
+#: :class:`QuantAlgo`. Union of what the backends accept -- TRTLLM-Gen serves
+#: the whole SM100 family, Cutlass the architectures in its own
+#: ``_QUANT_SUPPORT_TABLE`` -- because any one of them running is enough for
+#: the layer to build. An algorithm that is absent has no architecture
+#: restriction to fail fast on.
 #:
 #: ``W4A16_NVFP4`` is deliberately absent: its weights are dequantized to the
 #: activation dtype before the GEMM, so what finally runs is the
 #: high-precision kernel, which every supported architecture has.
 FP4_SUPPORTED_SM_VERSIONS: Dict[str, Tuple[int, ...]] = {
-    QuantAlgo.NVFP4: (100, 103, 120, 121),
-    QuantAlgo.NVFP4_AWQ: (100, 103, 120, 121),
-    QuantAlgo.NVFP4_ARC: (100, 103, 120, 121),
-    QuantAlgo.W4A8_NVFP4_FP8: (100, 103, 120, 121),
-    QuantAlgo.W4A8_MXFP4_FP8: (100, 103),
-    QuantAlgo.W4A8_MXFP4_MXFP8: (100, 103, 120, 121),
-    QuantAlgo.W4A16_MXFP4: (90, ),
+    QuantAlgo.NVFP4:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.NVFP4_AWQ:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.NVFP4_ARC:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.W4A8_NVFP4_FP8:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.W4A8_MXFP4_FP8:
+    SM100_FAMILY_SM_VERSIONS,
+    QuantAlgo.W4A8_MXFP4_MXFP8:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    # Hopper through Cutlass and Triton, the SM100 family through TRTLLM-Gen.
+    QuantAlgo.W4A16_MXFP4: (90, ) + SM100_FAMILY_SM_VERSIONS,
 }
 
 #: Architectures the Marlin weight-only NVFP4 kernels reach, on top of the

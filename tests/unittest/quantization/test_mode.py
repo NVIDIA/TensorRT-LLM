@@ -19,6 +19,7 @@ import pytest
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.quantization.mode import (
     NVFP4_MARLIN_SM_VERSIONS,
+    SM100_FAMILY_SM_VERSIONS,
     QuantAlgo,
     get_fp4_support_error_message,
     get_fp4_supported_sm_versions,
@@ -200,6 +201,9 @@ class TestQuantMode(unittest.TestCase):
         # which serves the same checkpoint weight-only on Ada and Hopper.
         (100, QuantAlgo.NVFP4, False, True),
         (103, QuantAlgo.NVFP4, False, True),
+        # SM107 (Rubin) has no arch-specific cubin build, so it runs the
+        # family kernel -- enumerating only 100/103 would reject it.
+        (107, QuantAlgo.NVFP4, False, True),
         (120, QuantAlgo.NVFP4, False, True),
         (121, QuantAlgo.NVFP4, False, True),
         (89, QuantAlgo.NVFP4, False, False),
@@ -220,17 +224,26 @@ class TestQuantMode(unittest.TestCase):
         # The W4A8 modes have no weight-only fallback at all.
         (90, QuantAlgo.W4A8_NVFP4_FP8, True, False),
         (100, QuantAlgo.W4A8_NVFP4_FP8, False, True),
+        (107, QuantAlgo.W4A8_NVFP4_FP8, False, True),
         (121, QuantAlgo.W4A8_NVFP4_FP8, False, True),
         (100, QuantAlgo.W4A8_MXFP4_FP8, False, True),
         (103, QuantAlgo.W4A8_MXFP4_FP8, False, True),
+        (107, QuantAlgo.W4A8_MXFP4_FP8, False, True),
         (90, QuantAlgo.W4A8_MXFP4_FP8, False, False),
+        # The MXFP4 W4A8 pair is the SM100 family and nothing outside it, so
+        # SM120/SM121 stay rejected even though they are newer.
         (120, QuantAlgo.W4A8_MXFP4_FP8, False, False),
         (100, QuantAlgo.W4A8_MXFP4_MXFP8, False, True),
+        (107, QuantAlgo.W4A8_MXFP4_MXFP8, False, True),
         (121, QuantAlgo.W4A8_MXFP4_MXFP8, False, True),
         (90, QuantAlgo.W4A8_MXFP4_MXFP8, False, False),
-        # W4A16_MXFP4 is the one FP4 mode that runs on Hopper and nothing newer.
+        # W4A16_MXFP4 spans Hopper (Cutlass, Triton) and the SM100 family
+        # (TRTLLM-Gen) -- gpt-oss runs it on both.
         (90, QuantAlgo.W4A16_MXFP4, False, True),
-        (100, QuantAlgo.W4A16_MXFP4, False, False),
+        (100, QuantAlgo.W4A16_MXFP4, False, True),
+        (107, QuantAlgo.W4A16_MXFP4, False, True),
+        (89, QuantAlgo.W4A16_MXFP4, False, False),
+        (120, QuantAlgo.W4A16_MXFP4, False, False),
         # Nothing to restrict: not an FP4 algorithm, or no algorithm at all.
         (90, QuantAlgo.FP8, False, True),
         (90, QuantAlgo.MXFP8, False, True),
@@ -266,14 +279,36 @@ def test_marlin_only_widens_the_algorithms_it_can_serve():
 
 
 @pytest.mark.parametrize(
+    "quant_algo",
+    [
+        QuantAlgo.NVFP4,
+        QuantAlgo.NVFP4_AWQ,
+        QuantAlgo.W4A8_NVFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+        QuantAlgo.W4A16_MXFP4,
+    ],
+)
+def test_every_blackwell_family_member_is_in_range(quant_algo):
+    """Listing only the architectures with their own cubin rejects the rest.
+
+    A family member without an arch-specific build still runs the sm_100f
+    one -- SM107 (Rubin) first among them.
+    """
+    supported = set(get_fp4_supported_sm_versions(quant_algo))
+    assert set(SM100_FAMILY_SM_VERSIONS).issubset(supported)
+    assert 107 in supported
+
+
+@pytest.mark.parametrize(
     ("sm", "quant_algo", "expected_fragments"),
     [
         # "newer architectures only" was false here: SM120/SM121 are newer
         # than the SM100/SM103 this mode needs.
-        (120, QuantAlgo.W4A8_MXFP4_FP8, ["SM120", "SM100, SM103"]),
-        # ... and false the other way for the one Hopper-only mode.
-        (100, QuantAlgo.W4A16_MXFP4, ["SM100", "SM90"]),
-        (90, QuantAlgo.W4A8_NVFP4_FP8, ["SM90", "SM100, SM103, SM120, SM121"]),
+        (120, QuantAlgo.W4A8_MXFP4_FP8, ["SM120", "SM100-SM109"]),
+        # ... and false the other way for the mode that starts at Hopper.
+        (89, QuantAlgo.W4A16_MXFP4, ["SM89", "SM90, SM100-SM109"]),
+        (90, QuantAlgo.W4A8_NVFP4_FP8, ["SM90", "SM100-SM109, SM120, SM121"]),
     ],
 )
 def test_error_message_names_the_supported_architectures(sm, quant_algo, expected_fragments):
