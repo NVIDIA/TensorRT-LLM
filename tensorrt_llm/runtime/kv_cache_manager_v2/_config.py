@@ -112,6 +112,12 @@ class AttentionLayerConfig:
     # Note that we use None to represent "no sliding window". Sink tokens are excluded.
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    cache_domain: str = "target"
+    """Ownership domain for layers that can share a lifecycle and physical pools.
+
+    Standalone draft layers use a separate domain because their valid history and
+    speculative scratch need not advance with the target, even for identical layouts.
+    """
 
     @property
     def window_size(self) -> int | None:

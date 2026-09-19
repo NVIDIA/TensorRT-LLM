@@ -20,7 +20,13 @@ from typing import NamedTuple, cast
 
 from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
-from .._life_cycle_registry import LayerGroupId, LifeCycleId, LifeCycleRegistry, make_life_cycle
+from .._life_cycle_registry import (
+    AttnLifeCycle,
+    LayerGroupId,
+    LifeCycleId,
+    LifeCycleRegistry,
+    make_life_cycle,
+)
 from .._storage._core import PoolGroupIndex, PoolIndex
 from .._utils import (
     HomoTuple,
@@ -225,15 +231,20 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         slot_groups.append(
             SlotDescVariant(life_cycle_id, cast(TypedIndexList[PoolIndex, CoalescedBuffer], slots))
         )
-    # Merge slot groups with the same slot_size_list
-    pool_groups_by_slot_size_list = defaultdict[HomoTuple[int], list[SlotDescVariant]](
+    # Equal storage sizes permit merging only within a compatible ownership domain.
+    # Existing target attention/SSM groups retain their shared physical pool behavior.
+    pool_groups_by_layout = defaultdict[tuple[str, HomoTuple[int]], list[SlotDescVariant]](
         list[SlotDescVariant]
     )
     for slot_group in slot_groups:
-        pool_groups_by_slot_size_list[tuple(slot_group.slot_size_list)].append(slot_group)
+        life_cycle = life_cycle_registry[slot_group.life_cycle_id]
+        cache_domain = (
+            life_cycle.cache_domain if isinstance(life_cycle, AttnLifeCycle) else "target"
+        )
+        pool_groups_by_layout[(cache_domain, tuple(slot_group.slot_size_list))].append(slot_group)
     slot_desc_list = cast(
         TypedIndexList[PoolGroupIndex, SlotDesc],
-        [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_slot_size_list.values()],
+        [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_layout.values()],
     )
     return StorageConfig(
         cache_tiers=tuple(config.cache_tiers),

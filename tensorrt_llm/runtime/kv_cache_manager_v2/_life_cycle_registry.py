@@ -23,17 +23,21 @@ from ._utils import HalfOpenRange, TypedIndexList, div_up, intersect, typed_enum
 class AttnLifeCycle(NamedTuple):
     window_size: SlidingWindowSize
     num_sink_blocks: int  # div_up(num_sink_tokens, tokens_per_block)
+    cache_domain: str = "target"
 
     @staticmethod
     def make(
-        window_size: SlidingWindowSize, num_sink_tokens: int | None, tokens_per_block: int
+        window_size: SlidingWindowSize,
+        num_sink_tokens: int | None,
+        tokens_per_block: int,
+        cache_domain: str = "target",
     ) -> "AttnLifeCycle":
         assert tokens_per_block > 0
         assert window_size is None or window_size > 0
         assert num_sink_tokens is None or num_sink_tokens >= 0
         assert num_sink_tokens in (None, 0) or window_size is not None
         num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
-        return AttnLifeCycle(window_size, num_sink_blocks)
+        return AttnLifeCycle(window_size, num_sink_blocks, cache_domain)
 
     def get_stale_range(
         self, history_length: int, tokens_per_block: int
@@ -73,7 +77,9 @@ def make_life_cycle(layer: LayerConfig, tokens_per_block: int) -> LifeCycle:
         return ssm_life_cycle
     else:
         assert isinstance(layer, AttentionLayerConfig)
-        return AttnLifeCycle.make(layer.window_size, layer.num_sink_tokens, tokens_per_block)
+        return AttnLifeCycle.make(
+            layer.window_size, layer.num_sink_tokens, tokens_per_block, layer.cache_domain
+        )
 
 
 class LifeCycleRegistry:

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from collections import deque, namedtuple
 from dataclasses import dataclass, field
@@ -111,6 +114,62 @@ def build_aux_transfer_layout(
 
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
+_DRAFT_HISTORY_VERSION = 1
+_DRAFT_HISTORY_FIELDS = 8
+_DRAFT_DTYPE_CODES = {"torch.float16": 1, "torch.bfloat16": 2}
+_DRAFT_BACKEND_CODES = {"VANILLA": 1, "TRTLLM": 2}
+
+
+def _encode_draft_history(history: dict[str, Any]) -> list[int]:
+    """Encode committed history and rank-local storage identity for the wire."""
+    if not isinstance(history, dict):
+        raise ValueError("Standalone draft transfer requires draft history metadata")
+    layout = history.get("layout")
+    if not isinstance(layout, dict):
+        raise ValueError("Standalone draft transfer requires a storage layout")
+    integer_values = [
+        history.get("valid_length"),
+        history.get("position"),
+        layout.get("num_layers"),
+        layout.get("num_kv_heads"),
+        layout.get("head_dim"),
+    ]
+    if any(type(value) is not int for value in integer_values):
+        raise ValueError(
+            "Standalone draft transfer metadata requires integer lengths and dimensions"
+        )
+    valid_length, position, num_layers, num_kv_heads, head_dim = integer_values
+    if valid_length < 0 or position < valid_length:
+        raise ValueError("Invalid standalone draft history length or position")
+    if min(num_layers, num_kv_heads, head_dim) <= 0:
+        raise ValueError("Standalone draft transfer dimensions must be positive")
+    dtype_code = _DRAFT_DTYPE_CODES.get(layout.get("dtype"))
+    backend_code = _DRAFT_BACKEND_CODES.get(layout.get("attention_backend"))
+    if dtype_code is None or backend_code is None:
+        raise ValueError("Unsupported standalone draft transfer dtype or attention backend")
+    return [_DRAFT_HISTORY_VERSION, *integer_values, dtype_code, backend_code]
+
+
+def _decode_draft_history(values: list[int]) -> dict[str, Any]:
+    if len(values) != _DRAFT_HISTORY_FIELDS or values[0] != _DRAFT_HISTORY_VERSION:
+        raise ValueError("Missing or unsupported standalone draft history metadata version")
+    _, valid_length, position, num_layers, num_kv_heads, head_dim, dtype_code, backend_code = values
+    dtypes = {code: name for name, code in _DRAFT_DTYPE_CODES.items()}
+    backends = {code: name for name, code in _DRAFT_BACKEND_CODES.items()}
+    history = {
+        "valid_length": valid_length,
+        "position": position,
+        "layout": {
+            "num_layers": num_layers,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "dtype": dtypes.get(dtype_code),
+            "attention_backend": backends.get(backend_code),
+        },
+    }
+    _encode_draft_history(history)
+    return history
+
 
 class AuxBufferBase(ABC):
     """
@@ -166,8 +225,15 @@ class AuxBufferBase(ABC):
 
 
 class AuxBuffer(AuxBufferBase):
-    def __init__(self, max_slot_num: int, beam_width: int, max_draft_len: int, device: str = "cpu"):
-        # public constructor args remain the same, internals are private
+    def __init__(
+        self,
+        max_slot_num: int,
+        beam_width: int,
+        max_draft_len: int,
+        device: str = "cpu",
+        *,
+        draft_history: bool = False,
+    ) -> None:
         self._max_slot_num = int(max_slot_num)
         self._beam_width = int(beam_width)
         self._max_draft_len = int(max_draft_len)
@@ -196,35 +262,33 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
+        # This participates in the existing auxiliary memory registration and
+        # transfer. Version zero denotes an unfilled or newly allocated slot.
+        self._draft_history_buffer = (
+            torch.zeros(
+                self._max_slot_num, _DRAFT_HISTORY_FIELDS, dtype=torch.int64, device=self._device
+            )
+            if draft_history
+            else None
+        )
+
+        buffers = [
+            self._first_tokens_buffer,
+            self._draft_tokens_buffer,
+            self._token_counts_buffer,
+            self._prompt_token_counts_buffer,
+        ]
+        if self._draft_history_buffer is not None:
+            buffers.append(self._draft_history_buffer)
 
         self._meta = AuxBufferMeta(
-            ptrs=np.array(
-                [
-                    self._first_tokens_buffer.data_ptr(),
-                    self._draft_tokens_buffer.data_ptr(),
-                    self._token_counts_buffer.data_ptr(),
-                    self._prompt_token_counts_buffer.data_ptr(),
-                ],
-                dtype=np.int64,
-            ),
+            ptrs=np.array([buffer.data_ptr() for buffer in buffers], dtype=np.int64),
             size=np.array(
-                [
-                    self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
-                    self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
-                    self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
-                    self._prompt_token_counts_buffer.numel()
-                    * self._prompt_token_counts_buffer.element_size(),
-                ],
+                [buffer.numel() * buffer.element_size() for buffer in buffers],
                 dtype=np.int64,
             ),
             item_sizes=np.array(
-                [
-                    self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
-                    self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
-                    self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
-                    self._prompt_token_counts_buffer[0].numel()
-                    * self._prompt_token_counts_buffer.element_size(),
-                ],
+                [buffer[0].numel() * buffer.element_size() for buffer in buffers],
                 dtype=np.int64,
             ),
             device=self._device,
@@ -245,6 +309,8 @@ class AuxBuffer(AuxBufferBase):
             )
         self._occupied_slots.add(slot_id)
         self._slot_token_counts[slot_id] = (0, 0)
+        if self._draft_history_buffer is not None:
+            self._draft_history_buffer[slot_id].zero_()
         return AuxSlot(slot_id, self)
 
     def free_slot(self, slot: int) -> None:
@@ -264,6 +330,11 @@ class AuxBuffer(AuxBufferBase):
     @property
     def meta(self) -> AuxBufferMeta:
         return self._meta
+
+    @property
+    def has_draft_history(self) -> bool:
+        """Whether this buffer transfers standalone drafter history metadata."""
+        return self._draft_history_buffer is not None
 
     def fill_slot(self, slot: int, request: LlmRequest) -> None:
         if slot not in self._occupied_slots:
@@ -301,6 +372,11 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer[slot].copy_(
             torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
         )
+        if self._draft_history_buffer is not None:
+            values = _encode_draft_history(request.py_draft_transfer_history)
+            self._draft_history_buffer[slot].copy_(
+                torch.tensor(values, dtype=torch.int64, device=self._device)
+            )
 
     @staticmethod
     def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
@@ -331,3 +407,11 @@ class AuxBuffer(AuxBufferBase):
         first_gen_tokens, draft_tokens = self.get_slot_tokens(slot)
         prompt_tokens, cached_tokens = self._prompt_token_counts_buffer[slot].tolist()
         return first_gen_tokens, draft_tokens, (int(prompt_tokens), int(cached_tokens))
+
+    def get_slot_draft_history(self, slot: int) -> dict[str, Any]:
+        """Read transferred history, rejecting missing or unsupported metadata."""
+        if slot not in self._occupied_slots:
+            raise ValueError(f"Cannot read slot {slot}: slot is not currently allocated.")
+        if self._draft_history_buffer is None:
+            raise ValueError("Standalone draft history transfer is not enabled for this buffer")
+        return _decode_draft_history(self._draft_history_buffer[slot].tolist())

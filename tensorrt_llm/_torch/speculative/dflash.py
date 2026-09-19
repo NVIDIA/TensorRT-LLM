@@ -28,7 +28,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.backends import AttentionMetadata
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManagerType
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
     get_dflash_paged_append,
@@ -43,6 +43,7 @@ _PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
+    from ..pyexecutor.resource_manager import ResourceManager
 
 
 def dflash_draft_slot_ids(
@@ -335,6 +336,95 @@ class DFlashWorker(SpecWorkerBase):
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
 
+    def get_draft_kv_cache_manager(
+        self, resource_manager: Optional["ResourceManager"]
+    ) -> Optional[BaseResourceManager]:
+        if resource_manager is not None:
+            manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+            if getattr(manager, "draft_layout", None) is not None:
+                return manager
+        return super().get_draft_kv_cache_manager(resource_manager)
+
+    def _has_unified_draft_cache(self) -> bool:
+        return getattr(getattr(self, "_ctx_kv_manager", None), "draft_layout", None) is not None
+
+    def _restore_managed_slots(self, request_ids: list[int], num_contexts: int) -> None:
+        """Bind generation requests after initialization or a manager replacement.
+
+        Metadata preparation precedes lazy buffer binding. That binding can
+        replace an estimation manager and clear its staging slots, so generation
+        must rebind here even when metadata preparation already assigned slots.
+        """
+        updates = {self._dummy_slot: 0}
+        for request_id in request_ids[num_contexts:]:
+            if (
+                request_id != ATTENTION_DP_DUMMY_REQUEST_ID
+                and request_id < self._graph_dummy_id_floor
+            ):
+                self._assign_slot(request_id)
+            slot = self._req_to_slot.get(request_id)
+            if slot is not None:
+                history = self._ctx_kv_manager.get_draft_history(request_id)
+                # Request IDs can be recycled by startup probes or restarted
+                # requests. Only the manager knows whether pages survived.
+                updates[slot] = history.valid_length if history is not None else 0
+                self._req_ctx_pos[request_id] = history.position if history is not None else 0
+        self._write_ctx_len(updates)
+        self._batch_to_slot[: len(request_ids)].copy_(
+            torch.tensor(
+                [self._req_to_slot.get(request_id, self._dummy_slot) for request_id in request_ids],
+                dtype=torch.long,
+                device=self._batch_to_slot.device,
+            )
+        )
+
+    def _store_managed_context_kv(
+        self, k: torch.Tensor, v: torch.Tensor, rows: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        """Write projected accepted features to the authoritative draft pages.
+
+        K/V have shape [tokens, layers, heads, head_dim]. Rows address this
+        iteration's request table, independently of the worker's staging slots.
+        """
+        pages = self._ctx_block_tables[rows, positions // self._ctx_page_size].long()
+        offsets = positions % self._ctx_page_size
+        for layer_idx, pool in enumerate(self._ctx_kv_buf):
+            pool[pages, 0, :, offsets, :] = k[:, layer_idx]
+            pool[pages, 1, :, offsets, :] = v[:, layer_idx]
+
+    def _gather_managed_context(self, request_ids: list[int]) -> None:
+        """Refresh VANILLA's dense input staging from manager-owned history.
+
+        The dense tensors are forward workspaces: they are never exported or
+        used to recover request history. Noise K/V may overwrite their suffix.
+        """
+        if self._dflash_attention_backend != "VANILLA":
+            return
+        for row, request_id in enumerate(request_ids):
+            slot = self._req_to_slot.get(request_id)
+            if slot is None:
+                continue
+            length = self._ctx_len_host[slot]
+            positions = torch.arange(length, device=self._ctx_k_buf.device)
+            pages = self._ctx_block_tables[row, positions // self._ctx_page_size].long()
+            offsets = positions % self._ctx_page_size
+            for layer_idx, pool in enumerate(self._ctx_kv_buf):
+                self._ctx_k_buf[slot, layer_idx, :length] = pool[pages, 0, :, offsets, :]
+                self._ctx_v_buf[slot, layer_idx, :length] = pool[pages, 1, :, offsets, :]
+
+    def _publish_managed_history(self, request_ids: list[int]) -> None:
+        """Commit draft validity after a successful eager worker forward."""
+        lengths = self._ctx_len.tolist()
+        for request_id in request_ids:
+            slot = self._req_to_slot.get(request_id)
+            if slot is None:
+                continue
+            length = lengths[slot]
+            position = self._req_ctx_pos.get(request_id, 0) + length - self._ctx_len_host[slot]
+            self._ctx_len_host[slot] = length
+            self._req_ctx_pos[request_id] = position
+            self._ctx_kv_manager.set_draft_history(request_id, length, position)
+
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype):
         """Fail with the arithmetic before allocating the drafter context arena.
 
@@ -473,7 +563,9 @@ class DFlashWorker(SpecWorkerBase):
         )
         return True
 
-    def _refresh_ctx_block_tables(self, attn_metadata, num_seqs: int) -> bool:
+    def _refresh_ctx_block_tables(
+        self, attn_metadata, num_seqs: int, request_ids: Optional[list[int]] = None
+    ) -> bool:
         """Decode this iteration's draft block table into the persistent buffer.
 
         In place and fixed-shape so a captured graph keeps reading the same
@@ -482,6 +574,12 @@ class DFlashWorker(SpecWorkerBase):
         """
         if self._ctx_block_tables is None or num_seqs <= 0:
             return False
+        if self._has_unified_draft_cache():
+            if request_ids is None:
+                raise ValueError("Unified DSpark draft pages require local request IDs")
+            table = self._ctx_kv_manager.get_draft_block_table(request_ids[:num_seqs])
+            self._ctx_block_tables[:num_seqs].copy_(table, non_blocking=True)
+            return True
         src = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
         if src is None:
             # The table is bound but unfillable. Leaving it at zeros would send
@@ -507,8 +605,11 @@ class DFlashWorker(SpecWorkerBase):
         # Only TrtllmAttentionMetadata builds draft_kv_cache_block_offsets.
         # Without it the table stays all-zero and every request would read and
         # write pool block 0 -- silently, at acceptance 1.0.
-        if draft_kv_cache_manager is not None and not hasattr(
-            attn_metadata, "draft_kv_cache_block_offsets"
+        unified = getattr(draft_kv_cache_manager, "draft_layout", None) is not None
+        if (
+            not unified
+            and draft_kv_cache_manager is not None
+            and not hasattr(attn_metadata, "draft_kv_cache_block_offsets")
         ):
             logger.warning(
                 f"DFlash: {type(attn_metadata).__name__} carries no draft KV block offsets; "
@@ -601,7 +702,42 @@ class DFlashWorker(SpecWorkerBase):
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
         capacity = self._max_ctx + self._compute_block_size
-        if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
+        if unified:
+            self._ctx_kv_buf = [
+                draft_kv_cache_manager.get_draft_buffers(i, kv_layout="HND") for i in range(L)
+            ]
+            self._ctx_page_size = draft_kv_cache_manager.tokens_per_block
+            expected = (2, nkv, self._ctx_page_size, hd)
+            if any(
+                tuple(pool.shape[1:]) != expected or pool.dtype != dtype
+                for pool in self._ctx_kv_buf
+            ):
+                raise ValueError("Unified DSpark draft pool does not match the drafter KV layout")
+            self._ctx_block_tables = torch.zeros(
+                (num_slots, draft_kv_cache_manager.max_blocks_per_seq),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            if self._dflash_attention_backend == "VANILLA":
+                # Dense FlashAttention inputs are transient forward staging;
+                # every history read is refreshed from the authoritative pool.
+                kv_shape = (num_slots, L, capacity, nkv, hd)
+                self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+                self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+            elif self._dflash_attention_backend == "TRTLLM":
+                validate_dflash_trtllm_gen_runtime(
+                    dtype=dtype,
+                    num_heads=nh,
+                    num_kv_heads=nkv,
+                    head_dim=hd,
+                    tokens_per_block=self._ctx_page_size,
+                    has_context_attention=any(
+                        not draft_model._get_attention_mask_args(i)[0] for i in range(L)
+                    ),
+                )
+            else:
+                raise ValueError("Unified DSpark supports VANILLA and TRTLLM draft attention")
+        elif self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
             pool = (
                 self._managed_ctx_pool(draft_kv_cache_manager, L, nkv, hd, dtype)
                 if self._dflash_attention_backend == "TRTLLM"
@@ -714,10 +850,27 @@ class DFlashWorker(SpecWorkerBase):
             self._free_slots.append(old_slot)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
+                if self._has_unified_draft_cache():
+                    raise RuntimeError("Unified DSpark has no free request staging slot")
                 return None
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            clear(slot)
+            history = (
+                self._ctx_kv_manager.get_draft_history(req_id)
+                if self._has_unified_draft_cache() and not reset
+                else None
+            )
+            if history is None:
+                clear(slot)
+            else:
+                # The receiving manager owns validity. A new local staging
+                # slot must preserve it, regardless of the sender's slot ID.
+                if updates is None:
+                    self._write_ctx_len({slot: history.valid_length})
+                else:
+                    updates[slot] = history.valid_length
+                    self._ctx_len_host[slot] = history.valid_length
+                self._req_ctx_pos[req_id] = history.position
         return self._req_to_slot[req_id]
 
     def _get_ctx_paged_append(self) -> Callable[..., None]:
@@ -879,7 +1032,12 @@ class DFlashWorker(SpecWorkerBase):
             # where the previous one ended. Everything else -- a fresh request, a
             # request id reused after completion, a prefill restarted after
             # preemption -- has to start from a clean slot.
-            reset = self._req_ctx_pos.get(req_id) != first_pos
+            previous_position = self._req_ctx_pos.get(req_id)
+            if self._has_unified_draft_cache():
+                history = self._ctx_kv_manager.get_draft_history(req_id)
+                if history is not None:
+                    previous_position = history.position
+            reset = previous_position != first_pos
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
                 self._req_ctx_pos.pop(req_id, None)
@@ -889,6 +1047,8 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._req_to_slot[req_id]
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             if cur + slen > self._max_ctx:
+                if self._has_unified_draft_cache():
+                    raise ValueError("Unified DSpark prompt history exceeds the drafter context")
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
                 # forward would take every other in-flight request with it.
@@ -923,7 +1083,14 @@ class DFlashWorker(SpecWorkerBase):
                     chunk_proj_cast, chunk_pos[:actual]
                 )
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
+                if self._has_unified_draft_cache():
+                    self._store_managed_context_kv(
+                        chunk_k,
+                        chunk_v,
+                        torch.full((actual,), i, dtype=torch.long, device="cuda"),
+                        torch.arange(cur, end, dtype=torch.long, device="cuda"),
+                    )
+                elif self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
                     # Manager block tables are keyed by batch position, the
                     # private arena's by slot. See _ctx_paged_index_args.
                     row = i if self._ctx_block_tables is not None else slot
@@ -997,8 +1164,14 @@ class DFlashWorker(SpecWorkerBase):
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )
         spec_metadata._dflash_worker = self
+        if self._has_unified_draft_cache():
+            self._restore_managed_slots(spec_metadata.request_ids, num_contexts)
         # Before any store: prefill and decode both address pages through it.
-        self._refresh_ctx_block_tables(attn_metadata, batch_size)
+        self._refresh_ctx_block_tables(attn_metadata, batch_size, spec_metadata.request_ids)
+        if self._has_unified_draft_cache():
+            # Refresh before appending accepted features; the first generation
+            # iteration therefore consumes the transferred prompt history.
+            self._gather_managed_context(spec_metadata.request_ids)
 
         # Save context lengths so both warmup and a failed forward can roll
         # back the in-place _ctx_len updates made during drafting.
@@ -1092,7 +1265,9 @@ class DFlashWorker(SpecWorkerBase):
         )
 
         if num_gens > 0:
-            with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            with self.draft_kv_cache_context(
+                attn_metadata, None if self._has_unified_draft_cache() else draft_kv_cache_manager
+            ):
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
@@ -1202,6 +1377,8 @@ class DFlashWorker(SpecWorkerBase):
         if is_warmup:
             self._ctx_len.copy_(self._saved_ctx_len)
             self._restore_ctx_len_host()
+        elif self._has_unified_draft_cache():
+            self._publish_managed_history(spec_metadata.request_ids)
         self._ctx_len_restore_pending = False
 
         return {
@@ -1419,15 +1596,32 @@ class DFlashWorker(SpecWorkerBase):
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
             ctx_len_gen = self._ctx_len[slots]
+            if (
+                self._has_unified_draft_cache()
+                and torch.any(ctx_len_gen + gen_num_accepted > self._max_ctx).item()
+            ):
+                raise ValueError("Unified DSpark accepted history exceeds the drafter context")
+            ctx_position_gen = ctx_len_gen
+            if self._has_unified_draft_cache():
+                ctx_position_gen = torch.tensor(
+                    [
+                        self._req_ctx_pos.get(request_id, 0)
+                        for request_id in spec_metadata.request_ids[
+                            num_contexts : num_contexts + num_gens
+                        ]
+                    ],
+                    dtype=torch.long,
+                    device=ctx_len_gen.device,
+                )
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
             query_position_ids = (
-                ctx_len_gen.unsqueeze(1)
+                ctx_position_gen.unsqueeze(1)
                 + gen_num_accepted.long().unsqueeze(1)
                 + j_block.unsqueeze(0)
             )
-            ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+            ctx_position_ids = ctx_position_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
             # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
             # vocabs mask out ranks that don't own the token id and all-reduce.
@@ -1483,7 +1677,13 @@ class DFlashWorker(SpecWorkerBase):
                 v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
-                if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
+                if self._has_unified_draft_cache():
+                    rows_long = gen_rows_out.unsqueeze(1).expand(-1, K + 1).reshape(-1)
+                    self._store_managed_context_kv(k_new, v_new, rows_long, col_long)
+                    if self._dflash_attention_backend == "VANILLA":
+                        self._ctx_k_buf[slot_long, :, col_long] = k_new
+                        self._ctx_v_buf[slot_long, :, col_long] = v_new
+                elif self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
                     if self._ctx_block_tables is not None:
                         # Batch positions of the gen requests, matching the
                         # per-request block table's row order.
@@ -1524,7 +1724,12 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_v_cache": self._ctx_v_buf,
             # Slots index the private arena; the manager's block table is keyed
             # by batch position, so the drafter reads its own rows there.
-            "ctx_cache_batch_idx": gen_rows_out if self._ctx_block_tables is not None else slots,
+            "ctx_cache_batch_idx": (
+                gen_rows_out
+                if self._ctx_block_tables is not None
+                and self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS
+                else slots
+            ),
             # Anchor token per gen request (block slot 0): last accepted
             # token. The dspark Markov chain conditions its first step on it.
             "first_prev_tokens": bonus,

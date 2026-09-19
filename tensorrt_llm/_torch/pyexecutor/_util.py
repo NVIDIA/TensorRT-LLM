@@ -67,6 +67,7 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
+from .kv_cache.standalone_draft_cache import StandaloneDraftLayout
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -781,6 +782,7 @@ class KvCacheCreator:
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
+        self._validate_standalone_draft_cache()
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
@@ -933,6 +935,15 @@ class KvCacheCreator:
             model_config,
             kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+        if self._uses_unified_standalone_draft_cache():
+            draft_layout = self._get_standalone_draft_layout()
+            # The unified allocator reserves an envelope for draft capture and
+            # noise in every attention group. Include its fixed cost as well
+            # as the distinct BF16 draft layers in the common byte budget.
+            total += CacheCost(
+                slope=draft_layout.bytes_per_token,
+                intercept=(total.slope + draft_layout.bytes_per_token) *
+                draft_layout.extra_tokens * self._max_batch_size)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
         draft_cost = self._get_draft_cache_cost(
@@ -1176,6 +1187,9 @@ class KvCacheCreator:
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
+            if self._uses_unified_standalone_draft_cache():
+                draft_layout = self._get_standalone_draft_layout()
+                num_extra_tokens_per_seq += draft_layout.extra_tokens
 
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
@@ -1220,6 +1234,8 @@ class KvCacheCreator:
                 self._model_engine.max_seq_len,
                 self._kv_cache_config.max_attention_window,
             )
+            if self._uses_unified_standalone_draft_cache():
+                num_pool_groups += 1
         num_cache_blocks *= num_pool_groups
 
         # Dummy context requests use the configured maximum beam width. Scale
@@ -1589,12 +1605,16 @@ class KvCacheCreator:
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine, kv_cache_config)
 
-        # When using separate draft KV cache in one-model speculative decoding,
-        # use layer_mask to include only target layers. The draft layers should
-        # only be in the separate draft KV cache manager.
+        # Keep the target layer layout separate from standalone draft layouts.
+        # Legacy modes construct a separate manager; unified standalone DSpark
+        # passes an explicit draft layout to the target's owner instead.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
         spec_dec_layer_mask = None
-        if self._should_create_separate_draft_kv_cache():
+        standalone_draft_layout = (self._get_standalone_draft_layout() if
+                                   self._uses_unified_standalone_draft_cache()
+                                   else None)
+        if (self._should_create_separate_draft_kv_cache()
+                or standalone_draft_layout is not None):
             num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
@@ -1624,6 +1644,7 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            standalone_draft_layout=standalone_draft_layout,
         )
 
         if not self._skip_est:
@@ -1651,6 +1672,103 @@ class KvCacheCreator:
 
         return kv_cache_manager
 
+    def _is_standalone_dspark(self) -> bool:
+        spec_config = self._speculative_config
+        return (spec_config is not None
+                and spec_config.spec_dec_mode.is_dspark()
+                and not spec_config.draft_is_embedded_in_target
+                and not spec_config._use_shared_kv_cache)
+
+    def _uses_unified_standalone_draft_cache(self) -> bool:
+        return self._is_standalone_dspark() and self._is_kv_cache_manager_v2
+
+    def _validate_standalone_draft_cache(self) -> None:
+        """Reject unsupported standalone state ownership before profiling."""
+        if not self._is_standalone_dspark():
+            return
+        if not self._is_kv_cache_manager_v2:
+            if self._kv_cache_config.use_kv_cache_manager_v2 is True:
+                raise ValueError(
+                    "Standalone DSpark requested KVCacheManagerV2 but its "
+                    "configuration resolved to V1. Remove unsupported V2 "
+                    "features, including beam search, instead of falling "
+                    "back to private draft state.")
+            if self._is_disagg:
+                raise ValueError(
+                    "Standalone DSpark disaggregation requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True and "
+                    "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python on both workers.")
+            return
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND
+
+        if BACKEND != "python":
+            raise ValueError("Unified standalone DSpark KV cache requires "
+                             "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python.")
+        if (self._speculative_config.draft_len_schedule is not None
+                or self._speculative_config.max_concurrency is not None):
+            raise ValueError(
+                "Unified standalone DSpark KV cache does not yet support "
+                "draft_len_schedule or max_concurrency: skipped drafting "
+                "would lose accepted-token history before speculation resumes.")
+        if self._llm_args.cuda_graph_config is not None:
+            raise ValueError(
+                "Unified standalone DSpark KV cache currently requires eager "
+                "execution; set cuda_graph_config=None.")
+        if not self._disable_overlap_scheduler:
+            raise ValueError("Unified standalone DSpark KV cache requires "
+                             "disable_overlap_scheduler=True.")
+        if self._llm_args.enable_chunked_prefill:
+            raise ValueError(
+                "Unified standalone DSpark KV cache does not yet support "
+                "chunked prefill; set enable_chunked_prefill=False.")
+        if self._mapping.pp_size != 1 or self._mapping.cp_size != 1:
+            raise ValueError(
+                "Unified standalone DSpark KV cache requires PP=1 and CP=1.")
+        if self._mapping.enable_attention_dp:
+            raise ValueError(
+                "Unified standalone DSpark KV cache does not yet support "
+                "attention data parallelism; set enable_attention_dp=False.")
+        if self._kv_connector_manager is not None:
+            raise ValueError(
+                "Unified standalone DSpark KV cache does not yet support "
+                "KV cache connectors.")
+        transceiver_config = self._cache_transceiver_config
+        if self._is_disagg and (transceiver_config is None
+                                or transceiver_config.transceiver_runtime
+                                != "PYTHON"
+                                or transceiver_config.backend != "NIXL"):
+            raise ValueError(
+                "Standalone DSpark draft-state transfer requires the PYTHON "
+                "NIXL transceiver on both workers.")
+        if self._draft_config is None:
+            raise ValueError(
+                "Unified standalone DSpark KV cache requires the loaded "
+                "standalone draft model configuration.")
+
+    def _get_standalone_draft_layout(self) -> StandaloneDraftLayout:
+        """Describe distinct standalone layers without borrowing target shapes."""
+        config = self._draft_config.pretrained_config
+        num_heads = config.num_attention_heads
+        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            head_dim = config.hidden_size // num_heads
+        attention_tp_size = (1 if self._mapping.enable_attention_dp else
+                             self._mapping.tp_size)
+        if (num_kv_heads % attention_tp_size != 0
+                and attention_tp_size % num_kv_heads != 0):
+            raise ValueError(
+                "Standalone DSpark KV heads must divide attention TP or be "
+                "divisible by it.")
+        return StandaloneDraftLayout(
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=max(1, num_kv_heads // attention_tp_size),
+            head_dim=head_dim,
+            dtype=torch.bfloat16,
+            extra_tokens=self._speculative_config.max_draft_len + 1,
+            attention_backend=self._speculative_config.attention_backend,
+        )
+
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
@@ -1662,6 +1780,8 @@ class KvCacheCreator:
         """
         if self._speculative_config is None:
             # No drafter at all, so there is nothing to give a manager to.
+            return False
+        if self._uses_unified_standalone_draft_cache():
             return False
         # Narrower than is_external_drafter(): PARD and DRAFT_TARGET_ONE_MODEL
         # never reach the arena this carve-out exists for.
@@ -2519,39 +2639,44 @@ def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
 
 
 def _create_kv_cache_manager(
-        model_engine: Optional[PyTorchModelEngine],
-        kv_cache_manager_cls,
-        mapping: Mapping,
-        kv_cache_config: KvCacheConfig,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-        spec_config: Optional[SpeculativeConfig],
-        sparse_attention_config: Optional[SparseAttentionConfig],
-        max_num_tokens: int,
-        max_beam_width: int,
-        kv_connector_manager: Optional[KvCacheConnectorManager],
-        estimating_kv_cache: bool = False,
-        enable_kv_cache_stats: bool = False,
-        execution_stream: Optional[torch.cuda.Stream] = None,
-        # Optional overrides for one-model draft case (when model_engine is None)
-        model_config: Optional[ModelConfig] = None,
-        dtype: Optional[torch.dtype] = None,
-        is_draft: Optional[bool] = None,
-        layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None,
-        num_kv_heads: Optional[Union[int, List[int]]] = None,
-        head_dim: Optional[int] = None,
-        kv_cache_type=None,
-        is_disagg: bool = False,
-        disable_overlap_scheduler: bool = False,
-        cold_page_codec_provider: Optional[object] = None,
-        kv_events_config: Optional[KVEventsConfig] = None,
-        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
+    model_engine: Optional[PyTorchModelEngine],
+    kv_cache_manager_cls,
+    mapping: Mapping,
+    kv_cache_config: KvCacheConfig,
+    tokens_per_block: int,
+    max_seq_len: int,
+    max_batch_size: int,
+    spec_config: Optional[SpeculativeConfig],
+    sparse_attention_config: Optional[SparseAttentionConfig],
+    max_num_tokens: int,
+    max_beam_width: int,
+    kv_connector_manager: Optional[KvCacheConnectorManager],
+    estimating_kv_cache: bool = False,
+    enable_kv_cache_stats: bool = False,
+    execution_stream: Optional[torch.cuda.Stream] = None,
+    # Optional overrides for one-model draft case (when model_engine is None)
+    model_config: Optional[ModelConfig] = None,
+    dtype: Optional[torch.dtype] = None,
+    is_draft: Optional[bool] = None,
+    layer_mask: Optional[List[bool]] = None,
+    num_layers: Optional[int] = None,
+    num_kv_heads: Optional[Union[int, List[int]]] = None,
+    head_dim: Optional[int] = None,
+    kv_cache_type=None,
+    is_disagg: bool = False,
+    disable_overlap_scheduler: bool = False,
+    cold_page_codec_provider: Optional[object] = None,
+    kv_events_config: Optional[KVEventsConfig] = None,
+    joint_kv_cache_reuse: bool = False,
+    standalone_draft_layout: Optional[StandaloneDraftLayout] = None
+) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
+    if standalone_draft_layout is not None and not issubclass(
+            kv_cache_manager_cls, KVCacheManagerV2):
+        raise ValueError("Standalone draft layouts require KVCacheManagerV2.")
     if cold_page_codec_provider is not None and not issubclass(
             kv_cache_manager_cls, KVCacheManagerV2):
         raise ValueError(
@@ -2716,6 +2841,9 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        if standalone_draft_layout is not None:
+            manager_extra_kwargs[
+                "standalone_draft_layout"] = standalone_draft_layout
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         # V2 builds the block-reuse cache key of a multimodal token run from

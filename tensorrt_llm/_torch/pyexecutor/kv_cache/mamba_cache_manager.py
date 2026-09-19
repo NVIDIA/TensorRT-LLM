@@ -3779,7 +3779,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
-        return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+        layer_id = self.pp_layers[local_layer_idx]
+        return layer_id < len(
+            self._mamba_layer_mask) and self._mamba_layer_mask[layer_id]
 
     def _get_pool_roles(self,
                         pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
@@ -4194,7 +4196,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             else:
                 attention_pages.append(
                     self.impl.get_page_index_upper_bound(layer_id, Role.KEY) //
-                    self.kv_factor)
+                    self.get_layer_kv_factor(self.pp_layers[local_layer_idx]))
         if attention_pages:
             return max(attention_pages)
         return max(ssm_pages) if ssm_pages else 0
