@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import array
+import ctypes
 import struct
 import sys
 from typing import List, Tuple
@@ -117,19 +118,18 @@ class IpcMemory:
             _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
         _raise_if_error(error)
-        handles_reserved = dist.tp_allgather(local_handle.reserved)
-
-        handles = []
-        for reserved in handles_reserved:
-            handle = cudart.cudaIpcMemHandle_t()
-            handle.reserved = reserved
-            handles.append(handle)
+        # Exchange the handle as its raw struct bytes: cuda-python 13.4 removed the
+        # `reserved` field, leaving `getPtr()` as the only accessor on every version.
+        handle_size = cudart.CUDA_IPC_HANDLE_SIZE
+        handles_bytes = dist.tp_allgather(ctypes.string_at(local_handle.getPtr(), handle_size))
 
         peer_ptrs = []
-        for node, handle in enumerate(handles):
+        for node, handle_bytes in enumerate(handles_bytes):
             if node == mapping.tp_rank:
                 peer_ptrs.append(local_ptr)
             else:
+                handle = cudart.cudaIpcMemHandle_t()
+                ctypes.memmove(handle.getPtr(), handle_bytes, handle_size)
                 error, ptr = cudart.cudaIpcOpenMemHandle(
                     handle, cudart.cudaIpcMemLazyEnablePeerAccess
                 )
