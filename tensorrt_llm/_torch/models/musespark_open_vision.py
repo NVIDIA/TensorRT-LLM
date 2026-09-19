@@ -727,6 +727,14 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
             return self._window_attn_max_seq_len
         return self._attn_max_seq_len
 
+    @property
+    def attn_max_seq_len(self) -> int:
+        """Longest full-attention segment (one clip, ``grid_h * grid_w``
+        patches) this tower accepts. Exposed so request admission can reject
+        an oversized item with a request-scoped error instead of the same
+        check raising mid-forward and failing the whole batch."""
+        return self._attn_max_seq_len
+
     def prepare_attn_metadata(
         self, seq_lens: Sequence[int], attn_metadata: AttentionMetadata
     ) -> AttentionMetadata:

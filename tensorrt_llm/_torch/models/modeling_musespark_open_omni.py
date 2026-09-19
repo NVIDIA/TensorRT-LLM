@@ -877,6 +877,36 @@ _VISION_MODALITIES: Tuple[Tuple[str, str], ...] = (
 )
 
 
+def validate_vision_segment_lengths(mm_data: Dict[str, Any], max_seq_len: int) -> None:
+    """Reject, at admission, any clip whose full-attention segment cannot run.
+
+    The tower presents each temporal clip to full attention as one segment of
+    ``grid_h * grid_w`` patches, and ``prepare_attn_metadata`` raises when a
+    segment exceeds the configured maximum. That check fires mid-forward,
+    where the executor's error handling fails every request in the scheduled
+    batch, so the same arithmetic runs here too, per request, before
+    scheduling. The grids are host tensors the input processor computed, so
+    this is a cheap host read. The message matches the tower's so clients see
+    the same error text wherever the condition is caught.
+    """
+    if not isinstance(mm_data, dict) or max_seq_len <= 0:
+        return
+    for modality, grid_key in _VISION_MODALITIES:
+        item = mm_data.get(modality)
+        if not isinstance(item, dict) or item.get("pixel_values") is None:
+            continue
+        grid = item.get(grid_key)
+        if grid is None:
+            continue
+        for row in grid:
+            segment = int(row[1]) * int(row[2])
+            if segment > max_seq_len:
+                raise ValueError(
+                    f"vision attention segment length {segment} exceeds the configured maximum "
+                    f"{max_seq_len}; raise the encoder token budget or lower max_pixels"
+                )
+
+
 def _per_item_chunks(
     item: Dict[str, Any], grid_key: str
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
@@ -1455,3 +1485,19 @@ class MuseSparkOpenOmniForConditionalGeneration(MultimodalModelMixin, PreTrained
         if self.mm_encoder is None:
             return None
         return self.mm_encoder.audio_tower
+
+    def validate_multimodal_request_data(self, mm_data: Dict[str, Any]) -> None:
+        """Admission check: every vision clip must fit the tower's segment cap.
+
+        This model opts out of item scheduling, so the executor's only other
+        multimodal admission check (``initialize_multimodal_encoder_request``)
+        never runs for it. Without this hook an over-budget image is caught
+        only by ``prepare_attn_metadata`` inside the tower forward, which
+        fails every request in the scheduled batch instead of just this one.
+        """
+        if self.mm_encoder is None:
+            return
+        tower = getattr(self.mm_encoder, "tower", None)
+        if tower is None:
+            return
+        validate_vision_segment_lengths(mm_data, tower.attn_max_seq_len)
