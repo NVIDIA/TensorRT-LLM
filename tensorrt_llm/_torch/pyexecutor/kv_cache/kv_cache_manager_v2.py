@@ -3652,6 +3652,15 @@ class KVCacheManagerV2(BaseResourceManager):
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
+    def synchronize_for_disagg_receive(self) -> None:
+        """Finish local cache operations before publishing RDMA destinations.
+
+        Admission can enqueue partial-reuse copies and waits for recycled slots
+        on the cache stream. RDMA does not observe that stream's ordering, so
+        those operations must complete before a peer can write the slots.
+        """
+        self._stream.synchronize()
+
     def get_history_length(self, req: LlmRequest) -> int | None:
         """Return the cache's current history_length, or None if no cache.
 

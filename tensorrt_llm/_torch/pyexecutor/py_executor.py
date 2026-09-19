@@ -7094,6 +7094,9 @@ class PyExecutor:
             kv_cache_manager.report_batch_to_connector(
                 disagg_gen_init_to_prepare)
 
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
+            kv_cache_manager.synchronize_for_disagg_receive()
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         cache_trans_complete_requests = self.disagg.completed_gen_receives(
