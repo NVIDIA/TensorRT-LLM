@@ -252,8 +252,12 @@ class FP8MQALogitsKernel:
         # q-change, so recomputing the row term there leaves the hot path a
         # single add. Auto-off on Rubin, where it regresses (the backend
         # schedules the UMMA consumer-release late in the math loop).
+        # next_n>=4 measured slower on GB200 with this (scalar) epilogue:
+        # the per-t row multiply is paid 4x per task and is not amortised
+        # the way DKG's two-level task loop amortises it [job 3107812:
+        # 1.05x-1.28x slower at next_n=4, 0.93x-0.99x faster at next_n<=2].
         if use_flat_logits_view is None:
-            use_flat_logits_view = not _target_is_rubin()
+            use_flat_logits_view = not _target_is_rubin() and next_n < 4
         self.use_flat_logits_view = use_flat_logits_view
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
