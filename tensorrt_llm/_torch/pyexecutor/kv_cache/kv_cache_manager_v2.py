@@ -4862,6 +4862,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 token_num = max(token_num, 2)
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
+            # Materializing history keeps SWA scratch reuse on, which rejects a
+            # second resize, so reserve the generation slot in the first one.
+            preallocate_gen = is_gen and materialize_history
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
             encoder_input_tokens = (
                 [1] * encoder_output_len if encoder_output_len is not None else None
@@ -4899,6 +4902,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens
+                if preallocate_gen:
+                    dummy_capacity += _kv_draft + 1
                 if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
@@ -4945,7 +4950,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.seqlen_this_rank_cp = req.prompt_len
                     req.total_input_len_cp = token_num * self._helix_cp_size - 1
                     req.py_decoding_iter = 1
-                if prepare_resource:
+                if prepare_resource and not preallocate_gen:
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
