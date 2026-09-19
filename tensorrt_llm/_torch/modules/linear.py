@@ -2985,6 +2985,75 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, fused_scale)
 
 
+class W4A16_GPTQ_LinearMethod(W4A16_AWQ_LinearMethod):
+    """Grouped INT4 weights with additive zero offsets and FP16/BF16 GEMM."""
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool,
+                       dtype: torch.dtype) -> None:
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("GPTQ Linear requires float16 or bfloat16")
+        if module.quant_config.group_size not in (64, 128):
+            raise ValueError("GPTQ Linear requires group_size=64 or 128")
+        super().create_weights(module, in_features, out_features, bias, dtype)
+        module.weight_zero = Parameter(torch.empty_like(module.weight_scale),
+                                       requires_grad=False)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
+        return torch.ops.trtllm.finegrained_mixed_dtype_gemm(
+            input=input.to(module.dtype).contiguous(),
+            weight=module.weight,
+            scales=module.weight_scale,
+            group_size=module.quant_config.group_size,
+            has_zero_point=True,
+            output_dtype=module.dtype,
+            bias=bias.contiguous() if bias is not None else None,
+            zeros=module.weight_zero)
+
+    def _load_group_parameters(self, module: Linear,
+                               weights: List[Dict]) -> None:
+        shard_keys = module.weights_loading_config.weight_mode.shard_keys
+        if shard_keys is None:
+            shard_keys = [None]
+        scale_span = module.quant_config.group_size if module.tp_mode == TensorParallelMode.ROW else 1
+        for key in ("weight_scale", "weight_zero"):
+            shards = [
+                module.load_shard(w,
+                                  key,
+                                  device=module.weight.device,
+                                  name=name,
+                                  scale_span=scale_span)
+                for name, w in zip(shard_keys, weights)
+            ]
+            copy_weight(getattr(module, key),
+                        torch.cat(shards, dim=0).T.contiguous())
+
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
+        elm_packing = 2 if module.tp_mode == TensorParallelMode.COLUMN else 1
+        load_weights_vanilla_helper(module, weights, elm_packing=elm_packing)
+        self._load_group_parameters(module, weights)
+
+    def _load_fused_weights(self, module: Linear, weights: List[Dict],
+                            helper) -> None:
+        elm_packing = 2 if module.tp_mode == TensorParallelMode.COLUMN else 1
+        shards = helper(module, weights, elm_packing=elm_packing)
+        fused = torch.cat(shards, dim=0).T.contiguous().cpu()
+        packed = preprocess_weights_for_mixed_gemm(
+            fused, torch.quint4x2, module.dtype).to(module.weight.device)
+        copy_weight(module.weight, packed)
+        self._load_group_parameters(module, weights)
+
+    def load_weights_fused_qkv_linear(self, module: Linear,
+                                      weights: List[Dict]) -> None:
+        self._load_fused_weights(module, weights, load_weights_fused_qkv_helper)
+
+    def load_weights_fused_gate_up_linear(self, module: Linear,
+                                          weights: List[Dict]) -> None:
+        self._load_fused_weights(module, weights,
+                                 load_weights_fused_gate_up_helper)
+
+
 class W4A8_AWQ_LinearMethod(LinearMethodBase):
 
     def get_tp_alignment(self, tp_mode, quant_config=None):
@@ -3626,6 +3695,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.is_weight_only(
     ) and not quant_config.layer_quant_mode.has_per_group_scaling():
         return WeightOnlyQuantLinearMethod()
+    if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
+        return W4A16_GPTQ_LinearMethod()
     if quant_config.layer_quant_mode.is_int4_weight_only_per_group(
     ) and quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
         return W4A16_AWQ_LinearMethod()

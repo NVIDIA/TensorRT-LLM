@@ -655,6 +655,27 @@ class ModelConfig(Generic[TConfig]):
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
 
+        if hf_quant_config.get("quant_method") == "gptq":
+            if hf_quant_config.get("bits") != 4:
+                raise ValueError("PyTorch GPTQ only supports bits=4")
+            if hf_quant_config.get("group_size") not in (64, 128):
+                raise ValueError("PyTorch GPTQ requires group_size=64 or 128")
+            if hf_quant_config.get("desc_act", False):
+                raise ValueError("PyTorch GPTQ does not support desc_act=True")
+            if hf_quant_config.get("checkpoint_format",
+                                   "gptq") not in ("gptq", "gptq_v2"):
+                raise ValueError("Unsupported GPTQ checkpoint_format")
+            for option in ("dynamic", "modules_in_block_to_quantize",
+                           "lm_head"):
+                if hf_quant_config.get(option):
+                    raise ValueError(f"PyTorch GPTQ does not support {option}")
+            quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+            quant_config.group_size = hf_quant_config["group_size"]
+            quant_config.has_zero_point = True
+            quant_config.exclude_modules = list(
+                dict.fromkeys((hf_exclude_modules or []) + ["lm_head"]))
+            return quant_config, layer_quant_config
+
         # FP8 ckpt: DeepSeek V3 style (weight_block_size) or
         # per-tensor static activation scale style (activation_scheme="static",
         # e.g. Ministral / Pixtral).
