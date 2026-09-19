@@ -51,6 +51,7 @@ l0_l40s:
   # The encoder-graphs case also exercises decoder graphs, so it stands in for
   # a decoder-only case rather than adding to it; KV-v2 stays covered on H100.
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_block_reuse_enabled
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-encoder-graphs-on-greedy]
 - condition:
     ranges:

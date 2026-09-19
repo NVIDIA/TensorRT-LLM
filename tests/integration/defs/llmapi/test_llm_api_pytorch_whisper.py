@@ -116,6 +116,7 @@ def _make_llm(
     cuda_graph_batch_sizes: list[int] | None = None,
     tensor_parallel_size: int = 1,
     encoder_graphs: bool = False,
+    enable_block_reuse: bool = False,
 ) -> LLM:
     """Build a Whisper LLM for the test matrix, optionally with encoder CUDA graphs."""
     # CudaGraphConfig captures the decode step; the enc-dec encoder step opts in
@@ -154,7 +155,7 @@ def _make_llm(
         disable_overlap_scheduler=True,  # overlap scheduler unsupported
         enable_chunked_prefill=False,
         kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
+            enable_block_reuse=enable_block_reuse,
             free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
@@ -246,6 +247,33 @@ _BEAM_SEARCH_CASES = [
     pytest.param(None, None, False, id="fp32-kv-v1-graphs-off-beam2"),
     pytest.param("bfloat16", [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
 ]
+
+
+def test_whisper_pytorch_block_reuse_enabled(monkeypatch):
+    """Greedy transcription with KV block reuse left at its default (enabled).
+
+    Whisper requests carry encoder features, not encoder token ids, so the
+    cross-KV pool has nothing to key reuse on; the executor must still admit
+    and run them (https://nvbugs/6713231). Batch 2 co-schedules two
+    encoder-init requests, the shape that reached the unguarded cross-reuse
+    lookup in the C++ capacity scheduler.
+    """
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_whisper_model_path()
+    wave, sample_rate = soundfile.read(_get_audio_path())
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW_TOKENS)
+
+    with _make_llm(model_path, enable_block_reuse=True) as llm:
+        for batch_size in (1, 2):
+            outputs = llm.generate(
+                [_audio_prompt(wave, sample_rate) for _ in range(batch_size)],
+                sampling_params,
+            )
+            for output in outputs:
+                completion = output.outputs[0]
+                assert list(completion.token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+                assert _EXPECTED_TRANSCRIPT_FRAGMENT in completion.text.lower()
 
 
 @pytest.mark.parametrize("torch_dtype,cuda_graph_batch_sizes,graphs_captured", _BEAM_SEARCH_CASES)
