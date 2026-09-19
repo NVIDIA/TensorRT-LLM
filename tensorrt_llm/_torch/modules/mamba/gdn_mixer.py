@@ -24,7 +24,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
-from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch, is_sm_100f
+from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -51,16 +51,16 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
-# to force the vendored Triton chunk_gated_delta_rule everywhere. FlashInfer only
-# ships the GDN prefill kernel for Hopper (SM90) and datacenter Blackwell
-# (SM100/SM103); on consumer Blackwell (SM120) and other archs it aborts at
+# to force the vendored Triton chunk_gated_delta_rule everywhere. FlashInfer
+# ships the GDN prefill kernel for Hopper (SM90), datacenter Blackwell
+# (SM100/SM103) and consumer Blackwell (SM120); on other archs it aborts at
 # launch, so we fall back to Triton there. Resolution is deferred to first call
 # (and cached) so importing this module never initializes CUDA.
 def _use_flashinfer_gdn_prefill() -> bool:
     """Check the prefill backend setting and supported GPU architecture."""
     return (
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
-        and is_flashinfer_gdn_supported_arch()
+        and is_flashinfer_gdn_prefill_supported_arch()
     )
 
 
