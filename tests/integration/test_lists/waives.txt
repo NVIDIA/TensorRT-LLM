@@ -260,8 +260,6 @@ test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert
 unittest/_torch/attention/sparse/dsa/test_req_idx_per_token.py::test_on_update_kv_lens_rebuilds_stale_map SKIP (https://nvbugs/6574939)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[exaone_moe_gqa_swa128-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6668773)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6641268)
-unittest/_torch/executor SKIP (https://nvbugs/6800103)
-unittest/_torch/executor/kv_cache/test_kv_cache_budget_split.py::TestSplitGpuBudgetForDraft::test_target_cost_uses_derived_layer_type_windows SKIP (https://nvbugs/6800223)
 unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy SKIP (https://nvbugs/6607482)
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp1" SKIP (https://nvbugs/6797747)
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp2" SKIP (https://nvbugs/6797215)
