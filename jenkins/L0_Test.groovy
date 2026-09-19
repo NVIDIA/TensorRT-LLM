@@ -1778,6 +1778,45 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
+// Resolve which build of <tarName> a test stage should pull from artifactPath.
+//
+// BoltProfileGen publishes the optimized SBSA build alongside the plain one, as
+// a distinct object (bolted-<tarName>) rather than an overwrite of the canonical
+// name. That leaves no window in which a consumer can pick up un-BOLTed bytes
+// believing they are optimized, and it means the object's existence IS the
+// signal that BOLT published. Prefer it: the SBSA test stages are sequenced
+// after BOLT-Profile-Gen, so on a healthy post-merge they exercise the very
+// build the run promotes.
+//
+// Falling back to the canonical name is an expected path, not an error -- it is
+// all that exists on x86, on pre-merge, and on any run whose producer did not
+// publish. Tests are not a release artifact, so degrading here is correct; the
+// consumers that must NOT degrade (the release image in BuildDockerImage.groovy)
+// require the bolted object explicitly instead.
+def boltedTarUrlIfPublished(String tarName)
+{
+    def base = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}"
+    // curl-or-wget: the test pods are not uniform (the K8s ones ship wget, the
+    // SLURM dispatcher curl), and artifactory.sh already learned this the hard
+    // way. Retries so a transient blip is not misread as "not published".
+    def status = sh(returnStdout: true, script: """
+        if command -v curl >/dev/null 2>&1; then
+            curl -sI -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors \
+                 --connect-timeout 30 '${base}/bolted-${tarName}' || echo 000
+        elif wget -q --spider --tries=3 --timeout=30 '${base}/bolted-${tarName}'; then
+            echo 200
+        else
+            echo 404
+        fi
+    """).trim()
+    if (status == "200") {
+        echo "[BOLT] found bolted-${tarName}; testing the BOLTed build"
+        return "${base}/bolted-${tarName}"
+    }
+    echo "[BOLT] no bolted-${tarName} under ${ARTIFACT_PATH} (HTTP ${status}); testing the canonical un-BOLTed build"
+    return "${base}/${tarName}"
+}
+
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
@@ -1821,7 +1860,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
-            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmTarfile = boltedTarUrlIfPublished(tarName)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
@@ -5077,7 +5116,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+        def llmTarfile = boltedTarUrlIfPublished(tarName)
         timeout(time: 30, unit: 'MINUTES') {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${tarName}' '${llmTarfile}'")
         }
