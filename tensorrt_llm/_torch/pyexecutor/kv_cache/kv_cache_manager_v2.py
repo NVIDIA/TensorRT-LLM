@@ -5530,6 +5530,15 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         # Context request KV cache updates are handled by
         # update_context_resources, called separately from the executor loop.
+        # Batched path (native core): collect every per-request resize and issue
+        # them through one nanobind call = one GIL hand-off + one API lock per
+        # step instead of one per generation request. The pure-Python core has no
+        # resize_many and keeps the scalar loop.
+        resize_many = getattr(self.impl, "resize_many", None)
+        batch_caches: list = []
+        batch_caps: list = []
+        batch_hists: list = []
+        batch_ids: list = []
         for req in scheduled_batch.generation_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
@@ -5572,16 +5581,31 @@ class KVCacheManagerV2(BaseResourceManager):
             ):
                 self._allocated_draft_lens.pop(req.py_request_id, None)
                 continue
-            success = kv_cache.resize(new_capacity, history_length)
-            if not success:
-                raise ValueError(
-                    f"Failed to resize KV cache for request {req.py_request_id} "
-                    f"to capacity {new_capacity} and history length "
-                    f"{history_length} tokens at generation update"
-                )
+            if resize_many is not None:
+                batch_caches.append(kv_cache)
+                batch_caps.append(new_capacity)
+                batch_hists.append(history_length)
+                batch_ids.append(req.py_request_id)
+            else:
+                success = kv_cache.resize(new_capacity, history_length)
+                if not success:
+                    raise ValueError(
+                        f"Failed to resize KV cache for request {req.py_request_id} "
+                        f"to capacity {new_capacity} and history length "
+                        f"{history_length} tokens at generation update"
+                    )
             if lazy_history and history_length is not None:
                 self._last_history_resize[req.py_request_id] = history_length
             self._allocated_draft_lens.pop(req.py_request_id, None)
+        if batch_caches:
+            results = resize_many(batch_caches, batch_caps, batch_hists)
+            for ok, rid, cap, hist in zip(results, batch_ids, batch_caps, batch_hists):
+                if not ok:
+                    raise ValueError(
+                        f"Failed to resize KV cache for request {rid} "
+                        f"to capacity {cap} and history length "
+                        f"{hist} tokens at generation update"
+                    )
 
     def _history_resize_can_wait(self, req, kv_cache, new_capacity, history_length) -> bool:
         """Whether this step's resize() would only move the history within the block it was last

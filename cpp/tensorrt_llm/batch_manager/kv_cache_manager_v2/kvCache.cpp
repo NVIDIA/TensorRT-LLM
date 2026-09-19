@@ -1822,6 +1822,17 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
         stopCommitting();
 }
 
+void KvCache::markReuseStateStale()
+{
+    if (mCommitState != CommitState::ALLOWED)
+        return;
+    mCommitState = CommitState::VIRTUAL_STOP;
+    // Same bookkeeping as the commit path's own VIRTUAL_STOP transition (_commitBlock): with commit_min_snapshot off,
+    // the out-of-window SWA pages of uncommitted blocks were held only for the commit that would publish them. No
+    // commit follows, so release them now. Unlike stopCommitting() this takes no partial-block snapshot.
+    _onStopCommitting();
+}
+
 void KvCache::stopCommitting()
 {
     KVCM2_API_GUARD();

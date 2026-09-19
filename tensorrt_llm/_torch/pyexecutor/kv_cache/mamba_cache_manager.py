@@ -4822,7 +4822,28 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             f"State-index batch size {n} exceeds max_batch_size "
             f"{self._host_state_indices.shape[0]}")
         self._host_state_indices.zero_()
-        if n > 0:
+        get_many = getattr(self.impl, "get_ssm_block_base_indices", None)
+        if n > 0 and get_many is not None:
+            # Native core: one nanobind call fills the pinned host buffer in
+            # place (no per-request GIL hand-off, no per-element tensor
+            # __setitem__ of ~3-5 us each).
+            caches = []
+            for req in requests:
+                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                if kv_cache is None:
+                    raise RuntimeError(
+                        f"Missing V2 KV cache for request {req.py_request_id}")
+                caches.append(kv_cache)
+            host_view = self._host_state_indices[:n].numpy()
+            get_many(caches, self.ssm_layer_group_id, host_view)
+            bad = int((host_view < 0).sum())
+            if bad:
+                for req, base_index in zip(requests, host_view.tolist()):
+                    if base_index < 0:
+                        raise RuntimeError(
+                            f"Invalid SSM state block index {base_index} for "
+                            f"request {req.py_request_id}")
+        elif n > 0:
             for i, req in enumerate(requests):
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
