@@ -1299,6 +1299,11 @@ def _out_of_pages_for(request_id):
     return lambda req, n: req.py_request_id != request_id
 
 
+#: What the executor passes to reset_for_recompute. Its choice, not the
+#: scheduler's, so the exact value does not matter here.
+UNBOUNDED_MAX_INPUT_LEN = 0x7FFFFFFF
+
+
 class TestContextPreemption:
     """Releasing a started request's pages when suspension cannot help.
 
@@ -1341,6 +1346,56 @@ class TestContextPreemption:
         victim.reset_for_recompute.assert_not_called()
         assert ids(out.recompute_paused_requests) == [99]
         assert victim.py_batch_idx is None
+
+    def test_preemption_releases_the_draft_pool_too(self):
+        """The draft pool mirrors the target, so a half-released victim leaks."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1000, draft_kv_cache_manager=draft_mgr)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        mgr.preempt_request.assert_called_once_with(victim)
+        draft_mgr.free_resources.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [99]
+
+    def test_blocked_request_is_admitted_after_the_executor_recomputes(self):
+        """The whole handoff, not just the scheduler's half of it.
+
+        A preemption is only worth anything if the blocked request gets in on a
+        later pass, and that depends on the executor freeing the victim and
+        resetting it for recompute in between.
+        """
+        out_of_pages = {0}
+
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id not in out_of_pages,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        blocked = make_ctx_request(0, 100)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        first = sched.schedule_request([blocked, victim], set())
+        assert ids(first.context_requests) == []
+        assert ids(first.recompute_paused_requests) == [99]
+
+        # Stand in for the executor: free the victim's resources, reset it for
+        # recompute, and let the pages it gave up satisfy the blocked request.
+        for req in first.recompute_paused_requests:
+            mgr.free_resources(req)
+            req.reset_for_recompute(UNBOUNDED_MAX_INPUT_LEN)
+            req.is_first_context_chunk = True
+        out_of_pages.clear()
+
+        second = sched.schedule_request([blocked, victim], set())
+
+        assert 0 in ids(second.context_requests)
+        victim.reset_for_recompute.assert_called_once()
 
     def test_disagg_generation_worker_never_preempts(self):
         """It received its context KV, so it cannot replay a prefill."""
@@ -3645,6 +3700,24 @@ class TestPrefixAwareSkip:
         # Both attempted, neither deferred on behalf of a failed contributor.
         assert ids(out.context_requests) == []
         assert mgr.resize_context.call_count == 2
+
+    def test_deferral_behind_an_inflight_contributor_is_not_a_stall(self):
+        """Deferring is progress when the contributor is the one in flight.
+
+        Nothing reaches a scheduled list on such a pass, but the duplicate
+        stays in pending_ctx and still counts as a candidate, so without an
+        explicit signal the detector reads a working engine as hung.
+        """
+        mgr = self._keyed_manager({5: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        contributor = make_ctx_request(5, 100, is_first_context_chunk=False)
+        duplicate = make_ctx_request(1, 500)
+        reqs = [duplicate, contributor]
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 1):
+            out = sched.schedule_request(reqs, {5})
+            assert ids(out.context_requests) == []
 
     def test_registered_contributor_cannot_be_evicted(self):
         """Eviction and deferral cannot collide.
