@@ -961,7 +961,10 @@ def _varlen_launcher(
     return lc
 
 
-BLOCK_SKIP_MIN_N = 131072  # compressed positions (512k raw @ cr=4)
+# Length floor of the streaming-main skip, relative to K: the block line keeps K of the
+# row's n/32 blocks, so the scan reads K*32/n of the row; the skip pays below ~27 %
+# (n >= 120 K: pro K=1024 -> 122880, flash K=512 -> 61440) and loses at 50 %.
+BLOCK_SKIP_MIN_N_PER_K = int(os.environ.get("TRTLLM_GVR_BLOCK_SKIP_MIN_N_PER_K", "120"))
 BLOCK_SKIP_CLUS_MIN_N = 262144  # 2-CTA cluster family: 1M raw @ cr=4
 BLOCK_SKIP_MAX_N = 262144  # skip table covers SKIP_BLOCKS * 32 compressed positions
 # The scorer writes the logits right before the top-k reads them; below this
@@ -978,8 +981,8 @@ def block_skip_useful(
     sm_version: int = 100,
 ) -> bool:
     """True when the varlen dispatch for this geometry lands on the single-CTA
-    streaming main (R == 1) at an envelope of >= BLOCK_SKIP_MIN_N compressed
-    positions or on the 2-CTA cluster family at >= BLOCK_SKIP_CLUS_MIN_N, and
+    streaming main (R == 1) at an envelope of >= BLOCK_SKIP_MIN_N_PER_K * k
+    compressed positions or on the 2-CTA cluster family at >= BLOCK_SKIP_CLUS_MIN_N, and
     the launch's logits (rows x positions x 4 B) exceed BLOCK_SKIP_MIN_LOGITS_MB
     (scorer -> top-k chain, real DSv4 rows, B200: 64 MB launches lose 5-10 % of
     the top-k, >= 128 MB gain 15-42 %). The register families (row loaded
@@ -987,7 +990,7 @@ def block_skip_useful(
     launch) do not pay for the table build and the per-tile gating. Pure host
     function (mirrors _varlen_launcher's tiers)."""
     n_kernel = min(int(n_env), int(npad))
-    if n_kernel < BLOCK_SKIP_MIN_N or n_kernel > BLOCK_SKIP_MAX_N:
+    if n_kernel < BLOCK_SKIP_MIN_N_PER_K * int(k) or n_kernel > BLOCK_SKIP_MAX_N:
         return False
     if int(num_rows) * n_kernel * 4 < (BLOCK_SKIP_MIN_LOGITS_MB << 20):
         return False

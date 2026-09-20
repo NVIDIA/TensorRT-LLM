@@ -2139,6 +2139,11 @@ def test_selfsampling_block_skip_useful_families():
     k = 1024
     assert ss_host.block_skip_useful(256, 131072, k, 131072)  # main R=1, 512k, 128 MB
     assert not ss_host.block_skip_useful(128, 131072, k, 131072)  # main R=1, 512k, 64 MB
+    # length floor relative to K (n >= 120 K): a 512k prompt pads to 128144 positions
+    assert ss_host.block_skip_useful(256, 128144, 1024, 128144)  # pro 512k, 125 MB
+    assert ss_host.block_skip_useful(512, 64144, 512, 64144)  # flash 256k, 125 MB (K/nb 26 %)
+    assert not ss_host.block_skip_useful(512, 64144, 1024, 64144)  # pro 256k (K/nb 51 %)
+    assert not ss_host.block_skip_useful(1024, 32144, 512, 32144)  # flash 128k (K/nb 51 %)
     assert ss_host.block_skip_useful(128, 262144, k, 262144)  # main R=1, 1M, 128 MB
     assert not ss_host.block_skip_useful(128, 65536, k, 65536)  # main R=1 but 256k
     # clus cs=2 at 1M (B 33..74) tops out at 77 MB: below the footprint floor
