@@ -3861,10 +3861,10 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         default=False,
         description=
         "Off (default): whole K and V vectors become NVFP4 in the compressed "
-        "cache tier. On: only the part of each K vector without position "
-        "information (NoPE) becomes NVFP4; the position-encoded (RoPE) part is "
-        "copied unchanged, which gains a little accuracy for a lower "
-        "compression ratio.")
+        "cache tier. On: the position-encoded (RoPE) part of each K vector is "
+        "copied unchanged and the rest becomes NVFP4, at a lower compression "
+        "ratio. An option to explore; measure its accuracy effect on your model."
+    )
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,

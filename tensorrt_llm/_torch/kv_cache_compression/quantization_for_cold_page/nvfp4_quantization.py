@@ -48,8 +48,7 @@ _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
 
-# Models whose K vectors have a known position-free (NoPE) part and whose accuracy
-# with skip_rope_quantization has been checked. Other models ignore the switch.
+# Models whose RoPE layout the codec knows. Other models ignore the switch.
 _SKIP_ROPE_QUANTIZATION_MODEL_TYPES = frozenset(
     {"deepseek_v4", "glm_moe_dsa", "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
 )
@@ -209,7 +208,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         model_type = getattr(pretrained_config, "model_type", None)
         if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
             logger.warning(
-                "skip_rope_quantization is validated for model types "
+                "skip_rope_quantization is supported for model types "
                 f"{sorted(_SKIP_ROPE_QUANTIZATION_MODEL_TYPES)} only; ignoring it for "
                 f"{model_type!r} and turning whole K and V vectors into NVFP4."
             )

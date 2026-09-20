@@ -317,8 +317,8 @@ The codec refuses what the kernel cannot express: a K vector that is entirely
 RoPE (nothing left to quantize), RoPE in the middle of the vector (two pieces),
 or a piece whose start or length is not a multiple of 16 numbers (the scale
 group). The switch only takes effect for the model types in
-`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES`, whose RoPE layout and accuracy have been
-checked; other models log a warning and quantize whole vectors. Draft-model KV
+`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES`, whose RoPE layout the codec knows; other
+models log a warning and quantize whole vectors. Draft-model KV
 caches always quantize whole vectors because the codec holds only the target
 model's config.
 

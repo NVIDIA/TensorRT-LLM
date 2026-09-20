@@ -209,29 +209,25 @@ For complete single-GPU and disaggregated-serving configurations, see the
 
 #### Skipping RoPE Quantization
 
-For every token and KV head, the KV cache stores one K vector and one V vector
-of `head_dim` numbers. In some models only part of the K vector carries the
-token's position (the RoPE part); the rest does not (the NoPE part). GLM-5 and
-other MLA models store one 576-number vector per token instead of separate K and
-V, and its last 64 numbers are RoPE; Qwen3.5 rotates the first 64 of its 256
-numbers; a DeepSeek-V4 compressed entry has 512 numbers of which the last 64 are
-RoPE. Quantizing this part costs more accuracy than the rest in the models
-checked so far; the option lets a deployment leave it out.
+For every token and KV head, the KV cache stores one K vector and one V vector.
+In some models only part of the K vector carries the token's position (the RoPE
+part): the last 64 numbers of an MLA vector (GLM-5), the first 64 of a Qwen3.5
+head, the last 64 of a DeepSeek-V4 compressed entry. `skip_rope_quantization`
+lets you leave that part out of the NVFP4 conversion:
 
-`skip_rope_quantization` controls this:
+- Off (default): the whole K vector and the whole V vector become NVFP4. Highest
+  compression ratio.
+- On: the RoPE part of the K vector is copied unchanged and keeps the hot cache's
+  precision; the rest of K and the whole V vector become NVFP4. The compression
+  ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
 
-- Off (default): the whole K vector and the whole V vector become NVFP4. This
-  gives the highest compression ratio.
-- On: only the NoPE part of the K vector becomes NVFP4. The RoPE part is copied
-  into the cold page unchanged, so it keeps the hot cache's precision (FP8 or
-  BF16). The V vector still becomes NVFP4 in full. Accuracy improves a little and
-  the compression ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
-
-The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
-series. Any other model ignores it with a warning and quantizes whole vectors; to
-support a new model, check its accuracy and add its `model_type` to
-`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of a
-draft model (speculative decoding) always quantizes whole vectors.
+This is an option to explore, not a tuned default. Whether keeping the RoPE part
+changes accuracy depends on the model and the workload, so measure it on yours.
+The option is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
+series, whose RoPE layout the codec knows; any other model ignores it with a
+warning. To add a model, add its `model_type` to
+`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of
+a draft model (speculative decoding) always quantizes whole vectors.
 
 ```yaml
 kv_cache_compression_config:

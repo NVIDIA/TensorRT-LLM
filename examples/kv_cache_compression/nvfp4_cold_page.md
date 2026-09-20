@@ -374,21 +374,18 @@ Pages currently use identity global scales.
 
 ## Skipping RoPE Quantization
 
-Every token's K vector has a part that carries the token's position (RoPE) and,
-in some models, a part that does not (NoPE): the last 64 of the 576 numbers an
-MLA model stores per token, the first 64 of the 256 numbers of a Qwen3.5 head,
-the last 64 of the 512 numbers of a DeepSeek-V4 compressed entry. By default the cold
-page turns the whole K vector and the whole V vector into NVFP4. With
-`skip_rope_quantization: true`, only the NoPE part of the K vector becomes NVFP4 and
-the RoPE part is copied unchanged, keeping the hot cache's precision; the V
-vector still becomes NVFP4 in full. Accuracy improves a little and the
-compression ratio drops. For FP8 hot caches: MLA 1.78x to 1.64x, DeepSeek-V4 compressed entry 1.78x
-to 1.62x, Qwen3.5 K+V 1.78x to 1.62x; for BF16 hot caches Qwen3.5 goes from 3.56x
-to 2.69x. The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the
-Qwen3.5 series only; other models log a warning and keep quantizing whole
-vectors, and the KV cache of a draft model always quantizes whole vectors. To add
-a model, check its accuracy and add its `model_type` to
-`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`.
+In some models only part of each K vector carries the token's position (RoPE):
+the last 64 of the 576 numbers of an MLA vector, the first 64 of the 256 numbers
+of a Qwen3.5 head, the last 64 of the 512 numbers of a DeepSeek-V4 compressed
+entry. By default the whole K vector and the whole V vector become NVFP4. With
+`skip_rope_quantization: true` the RoPE part is copied unchanged and the rest
+becomes NVFP4, at a lower compression ratio: for FP8 hot caches MLA 1.78x to 1.64x,
+DeepSeek-V4 1.78x to 1.62x, Qwen3.5 K+V 1.78x to 1.62x; for BF16 hot caches Qwen3.5
+3.56x to 2.69x. This is an option to explore; measure the accuracy effect on your
+own model and workload. It is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`),
+and the Qwen3.5 series; other models ignore it with a warning, and the KV cache of
+a draft model always quantizes whole vectors. To add a model, add its `model_type`
+to `_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`.
 
 ```yaml
 kv_cache_compression_config:

@@ -1540,7 +1540,7 @@ def test_skip_rope_quantization_rejects_fully_rotated_keys() -> None:
 
 
 @pytest.mark.parametrize("model_type", ("qwen3", "deepseek_v3", None))
-def test_skip_rope_quantization_is_ignored_with_a_warning_outside_the_validated_models(
+def test_skip_rope_quantization_is_ignored_with_a_warning_outside_the_supported_models(
     model_type,
 ) -> None:
     native, _ = _native()
@@ -1565,7 +1565,7 @@ def test_skip_rope_quantization_is_ignored_with_a_warning_outside_the_validated_
             head_dim_per_layer=(576,),
         )
     mock_logger.warning.assert_called_once()
-    assert "validated for model types" in mock_logger.warning.call_args.args[0]
+    assert "supported for model types" in mock_logger.warning.call_args.args[0]
     assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 576)]
 
 
