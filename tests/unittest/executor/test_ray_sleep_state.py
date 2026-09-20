@@ -19,6 +19,8 @@ import pytest
 
 from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Args:
     sleep_config = object()
@@ -94,3 +96,36 @@ def test_ray_worker_fails_closed_after_mutation(method, operation):
 
     worker.engine.fail_sleep_wakeup_transition.assert_called_once_with()
     getattr(worker.engine, f"abort_{method}_transition").assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "method, operation",
+    [
+        ("sleep", "release_with_tag"),
+        ("wakeup", "materialize_with_tag"),
+    ],
+)
+def test_ray_worker_aborts_transition_before_mutation(method, operation):
+    state = "running" if method == "sleep" else "parked"
+    parked_tags = [] if method == "sleep" else ["model"]
+    worker = _make_worker(state, parked_tags)
+
+    with (
+        patch("tensorrt_llm.executor.ray.gpu_worker.TorchLlmArgs", _Args),
+        patch("tensorrt_llm.executor.ray.gpu_worker.logger", MagicMock(), create=True),
+        patch(f"tensorrt_llm.executor.ray.gpu_worker.{operation}") as mutate_memory,
+        patch(
+            "tensorrt_llm.executor.ray.gpu_worker.torch.cuda.synchronize",
+            side_effect=RuntimeError("pre-mutation failure"),
+        ),
+        patch("tensorrt_llm.executor.ray.gpu_worker.gc.collect"),
+        patch("tensorrt_llm.executor.ray.gpu_worker.torch.cuda.empty_cache"),
+        pytest.raises(RuntimeError, match="pre-mutation failure"),
+    ):
+        _run_unwrapped(method, worker, ["model"])
+
+    getattr(worker.engine, f"begin_{method}_transition").assert_called_once()
+    getattr(worker.engine, f"abort_{method}_transition").assert_called_once_with()
+    getattr(worker.engine, f"complete_{method}_transition").assert_not_called()
+    worker.engine.fail_sleep_wakeup_transition.assert_not_called()
+    mutate_memory.assert_not_called()
