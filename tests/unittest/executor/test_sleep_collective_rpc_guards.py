@@ -199,6 +199,40 @@ class TestBaseWorkerRetrySemantics:
 
         w.engine.begin_wakeup_transition.assert_not_called()
 
+    def test_resuming_mixed_parked_and_active_tags_restores_only_parked(self):
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi import ExecutorMemoryType
+
+        w = _make_worker()
+        w.doing_shutdown = True
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parked",
+                "parked_tags": ["model"],
+            }
+        )
+
+        @contextmanager
+        def _noop_control_action():
+            yield None
+
+        w.engine._sleep_wakeup_lock = threading.Lock()
+        w.engine.control_action = _noop_control_action
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag") as materialize,
+            patch("torch.cuda.synchronize"),
+        ):
+            w.wakeup(["model", "kv_cache"])
+
+        expected = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        w.engine.begin_wakeup_transition.assert_called_once_with(expected)
+        materialize.assert_called_once_with(*expected)
+        w.engine.complete_wakeup_transition.assert_called_once_with()
+
     def test_transitional_state_rejects_operations(self):
         w = _make_worker()
         w.engine.get_memory_status = MagicMock(
