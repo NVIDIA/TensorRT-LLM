@@ -2178,8 +2178,11 @@ def _bm_line_row(kind, n, seed):
     taken).  'tiepile': thousands of block maxima tied at the K-th boundary
     (S > 4096 -> sampling fallback; smaller piles keep the line with S > K).
     'allequal' / 'allzero': degenerate histogram -> sampling fallback.  'spiky':
-    300 blocks entirely high -> > 4096 candidates (overflow re-sweep on the
-    BLK=512/256 arms).  'tinyspread': block maxima within 2^-10 of 1.0 (bin
+    400 blocks entirely high -> 12800 candidates > SCPB (overflow re-sweep on
+    the BLK=512/256 arms).  'midpile<H>': H blocks entirely high plus 1024
+    block maxima tied at 2.0 -> exactly 32 H + 1024 candidates, sized into
+    (4096, SCPB] of the small arms (staging slots >= 4096 written and consumed
+    by the coalesced path).  'tinyspread': block maxima within 2^-10 of 1.0 (bin
     edges below fp32 resolution).  'posinf': one +inf logit (hi not finite ->
     fallback).  'tailmax': row maximum in the scalar tail (n % 4 != 0)."""
     g = torch.Generator(device=_DEV).manual_seed(seed)
@@ -2196,8 +2199,14 @@ def _bm_line_row(kind, n, seed):
         x.zero_()
     elif kind == "spiky":
         perm = torch.randperm(nb, generator=g, device=_DEV)
-        for j in perm[:300].tolist():
+        for j in perm[:400].tolist():
             x[j * 32 : j * 32 + 32] += 5.0
+    elif kind.startswith("midpile"):
+        high = int(kind[len("midpile") :])
+        perm = torch.randperm(nb, generator=g, device=_DEV)
+        for j in perm[:high].tolist():
+            x[j * 32 : j * 32 + 32] += 5.0
+        x[perm[high : high + 1024] * 32 + 5] = 2.0
     elif kind == "tinyspread":
         x = 1.0 + torch.rand(n, generator=g, dtype=torch.float32, device=_DEV) * (2.0**-10)
     elif kind == "posinf":
@@ -2259,10 +2268,12 @@ def _bm_line_case(rows, msl_c, k, kind, n_valid, seed=0, next_n=1, bm_mode="exac
         (128, 262144, 1024, "tinyspread", 262144),
         (128, 262144, 1024, "posinf", 262144),  # hi = +inf -> fallback
         (200, 131072, 1024, "spread", 131059),  # (512, 8, 2) arm, 512k
-        (200, 131072, 1024, "spiky", 131072),  # > 4096 candidates: list re-sweep
+        (200, 131072, 1024, "spiky", 131072),  # > SCPB candidates: list re-sweep
+        (200, 131072, 1024, "midpile160", 131072),  # 6144 candidates in (4096, 8192]
         (200, 131072, 1024, "tiepile3000", 131072),
         (300, 131072, 1024, "spread", 131072),  # (256, 8, 4) arm, 512k
         (300, 131072, 1024, "spiky", 131063),
+        (300, 131072, 1024, "midpile120", 131072),  # 4864 candidates in (4096, 5120]
         (300, 131072, 512, "tiepile3000", 131063),
         (300, 131072, 512, "spiky", 131072),
     ],
@@ -2271,16 +2282,71 @@ def _bm_line_case(rows, msl_c, k, kind, n_valid, seed=0, next_n=1, bm_mode="exac
 def test_selfsampling_block_skip_bm_line(rows, msl_c, k, kind, n_valid):
     """Compacted-skip rows derive the first line from the block maxima; the
     result must stay tie-aware exact whether the line is taken (spread rows,
-    odd valid lengths with -FLT_MAX padded records, > SCPB candidates on the
-    small-CTA arms) or the sampling path is kept (fewer than K blocks, tie
-    piles, all-equal / all-zero rows, +inf).  The default build must compile
-    the skip engine with the block line (knob on)."""
+    odd valid lengths with -FLT_MAX padded records, candidate counts inside
+    (4096, SCPB] and above SCPB on the small-CTA arms) or the sampling path is
+    kept (fewer than K blocks, tie piles, all-equal / all-zero rows, +inf).
+    The default build must compile the skip engine with the block line (knob
+    on)."""
     plan = ss_host.route(rows, msl_c, msl_c, k)
     assert plan["kernel"] == "main" and plan["tpl"][5] is False, plan
+    if kind.startswith("midpile"):
+        cnt = 32 * int(kind[len("midpile") :]) + 1024
+        assert 4096 < cnt <= plan["rt"]["SCAP_"], (cnt, plan["rt"])
     _bm_line_case(rows, msl_c, k, kind, n_valid)
     assert ss_dev.BM_LINE is True
     keys = [key for key in ss_dev._COMPILE_CACHE if key[4] is True]
     assert keys and all(key[-1] is True for key in keys), keys
+
+
+@pytest.mark.parametrize(
+    "rows,k,blk,minb,scpb",
+    [
+        (128, 1024, 1024, 1, 16384),
+        (296, 64, 512, 2, 4096),  # 8 K < 4096: the historical floor
+        (296, 256, 512, 2, 4096),
+        (296, 512, 512, 2, 4096),  # k <= 512: 8 K = the historical 4096
+        (296, 1024, 512, 2, 8192),
+        (297, 64, 256, 4, 4096),  # 8 K < 4096: the historical floor
+        (297, 256, 256, 4, 4096),
+        (297, 512, 256, 4, 4096),
+        (297, 1024, 256, 4, 5120),  # 8 K = 8192 capped by the 196 KB tier
+        (296, 2048, 512, 2, 8192),
+        (297, 2048, 256, 4, 8192),
+    ],
+    ids=lambda v: str(v),
+)
+def test_selfsampling_main_scpb_arms(rows, k, blk, minb, scpb):
+    """The single-CTA main arms' staging capacity (8 entries per K of the KPT
+    rung, floored at the historical 4096, capped per arm): host SCAP == kernel
+    SCPB (the sampling ladder and the plan smem are derived from it on both
+    sides), and every engine (skip / dense) keeps its MINB CTAs per SM inside
+    the 196 KB shared-memory carveout (1 KB reserved per CTA): the 228 KB tier
+    leaves 28 KB of L1 and slows the skip scan by 15-20 %."""
+    assert ss_host.SCPB_SMALL_CAP == ss_dev.SCPB_SMALL_CAP
+    assert ss_host.SCPB_SMALL_MIN == ss_dev.SCPB_SMALL_MIN == 4096
+    n = 262144
+    plan = ss_host.route(rows, n, n, k)
+    assert plan["kernel"] == "main" and plan["tpl"][0] == blk and plan["tpl"][2] == minb, plan
+    assert plan["rt"]["SCAP_"] == scpb, plan["rt"]
+    tpl = plan["tpl"]
+    for block_skip in (False, True):
+        kern = ss_dev.GvrMainKernel(
+            *tpl[:6],
+            varlen=True,
+            next_n=1,
+            cr_shift=2,
+            r_const=1,
+            hint_free=True,
+            block_skip=block_skip,
+        )
+        assert kern.scpb == scpb
+        assert kern.dyn_bytes == plan["smem"]
+        static = 2048 + (2 * ss_dev.SKIP_BLOCKS if block_skip else 0)  # hist/scalars + s_list
+        if k <= 1024:  # the k > 1024 BLK=256 skip engine predates this budget (228 KB tier)
+            assert minb * (kern.dyn_bytes + static + 1024) <= 196 * 1024, (
+                block_skip,
+                kern.dyn_bytes,
+            )
 
 
 @pytest.mark.parametrize("bm_mode", ["+1e-4", "+0.5", "*4+0.5", "+3e38rec"], ids=lambda v: v)

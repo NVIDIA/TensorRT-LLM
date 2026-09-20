@@ -83,6 +83,22 @@ GVR_WS_BUF_OFF = 2048  # workspace g_buf byte offset
 SKIP_BLOCKS = (
     8192  # block-max skip: 32-position blocks per row the smem skip table covers (1M raw @ cr=4)
 )
+# gvr_main candidate staging capacity (entries) on the single-CTA small arms: eight
+# entries per K of the KPT rung (8*KPT*BLK), never below the historical 4096, capped so
+# MINB CTAs per SM stay inside the 196 KB shared-memory carveout with the compacted-skip
+# engine's static smem (1 KB reserved per CTA; the 228 KB tier leaves 28 KB of L1 and
+# costs the skip scan 15-20 %).  BLK=512: MINB=2, u64 entries; BLK=256: MINB=4, i32
+# entries.  Host mirror: gvr_topk_decode_self_sampling_host.scpb_small.
+SCPB_SMALL_CAP = {512: 8192, 256: 5120}
+SCPB_SMALL_MIN = 4096
+
+
+def scpb_small(blk: int, kpt: int) -> int:
+    return max(
+        min(8 * kpt * blk, SCPB_SMALL_CAP[blk]), SCPB_SMALL_MIN, 8192 if kpt * blk >= 2048 else 0
+    )
+
+
 SKIP_GROUPS = 136  # skip-table bytes per tile: 129 lane groups (segment start may be block-misaligned), padded
 # single-CTA main: scan a compacted list of the surviving blocks as dense tiles
 # (1) instead of gating the dense tiles by the byte table (0)
@@ -1396,9 +1412,11 @@ def gather_hint(
 Ctor knobs (compile-time, mirror of the CUDA template params):
     BLK ∈ {1024, 512, 256}, U ∈ {1,2,4,8}, MINB ∈ {1,2,4}, NBS = 256,
     KPT ∈ {1,2,4,8}, SPLIT ∈ {True, False}
-Derived constexprs (bit-identical to the CUDA):
+Derived constexprs (bit-identical to the CUDA except SCPB on the BLK<1024 arms,
+raised from KBIG?8192:4096 to scpb_small(BLK, KPT)):
     HB=NBS; KBIG=(KPT>=2 && KPT*BLK>=2048); SCPB=(BLK>=1024)?(SPLIT?8192:16384)
-    :(KBIG?8192:4096); CMPB=(BLK>=1024)?(KBIG?4096:2048):1024; SHD=!SPLIT;
+    :max(min(8*KPT*BLK, SCPB_SMALL_CAP[BLK]), 4096, KBIG?8192:0);
+    CMPB=(BLK>=1024)?(KBIG?4096:2048):1024; SHD=!SPLIT;
     VSTG=SPLIT||BLK>=512; PFD=(MINB<=2)?min(U,4):0; PF=PFD>0; NATT=SPLIT?1:3.
 
 Signature (ABI parity with the CUDA form incl. dead SCAP_/CMP_):
@@ -1665,10 +1683,10 @@ class GvrMainKernel:
             self.tshg = bool(split)
         else:
             self.tshg = bool(tshg) and bool(split)
-        # derived constexprs (bit-identical to the CUDA)
+        # derived constexprs (bit-identical to the CUDA; SCPB of the small arms raised)
         self.hb = nbs
         self.kbig = (kpt >= 2) and (kpt * blk >= 2048)
-        self.scpb = (8192 if split else 16384) if blk >= 1024 else (8192 if self.kbig else 4096)
+        self.scpb = (8192 if split else 16384) if blk >= 1024 else scpb_small(blk, kpt)
         self.cmpb = (4096 if self.kbig else 2048) if blk >= 1024 else 1024
         self.shd = not split
         self.vstg = split or blk >= 512

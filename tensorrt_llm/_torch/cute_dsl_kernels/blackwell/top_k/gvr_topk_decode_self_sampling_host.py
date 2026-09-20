@@ -117,6 +117,17 @@ QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths, every registe
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
+# gvr_main staging capacity on the single-CTA small arms (rows 149..296 -> BLK 512,
+# rows > 296 -> BLK 256): 8 entries per K of the KPT rung, at least 4096, capped per
+# arm; mirror of the device module's scpb_small
+SCPB_SMALL_CAP = {512: 8192, 256: 5120}
+SCPB_SMALL_MIN = 4096
+
+
+def scpb_small(b: int, k: int) -> int:
+    blk = 512 if b <= 296 else 256
+    kpt = 1 if k <= blk else (2 if k <= 2 * blk else (4 if k <= 4 * blk else 8))
+    return max(min(8 * kpt * blk, SCPB_SMALL_CAP[blk]), SCPB_SMALL_MIN, 8192 if k > 1024 else 0)
 
 
 def route(
@@ -299,7 +310,7 @@ def route(
         useclus = True
 
     big = b * R <= 148
-    SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
+    SCAP = (16384 if R == 1 else 8192) if big else scpb_small(b, k)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
     aim = (
@@ -643,7 +654,7 @@ def route_streaming(
         R = p2
         useclus = True
     big = b * R <= 148
-    scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
+    scap = (16384 if R == 1 else 8192) if big else scpb_small(b, k)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
