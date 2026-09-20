@@ -38,6 +38,7 @@ from tensorrt_llm._torch.locality_domain_utils import (
     locality_domain_device,
     start_for_all_locality_domain,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoECommPlan, MoERunContext
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     _expert_count_tile_plan,
@@ -3939,6 +3940,30 @@ def test_bf16_grouped_gemm_finalize_locality_domain_rubin(top_k: int, ep_size: i
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
 
 
+def _run_moe_module(backend, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+    """Drive a MoE impl the way ExternalCommMoEScheduler does on one rank.
+
+    The impl owns no routing: apply the routing method, quantize the input on
+    the no-communication path (scale factors stay swizzled), and hand run_moe
+    the no-comm plan.
+    """
+    token_selected_experts, token_final_scales = backend.routing_method.apply(router_logits)
+    x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+    ctx = MoERunContext(
+        x=x_quantized,
+        x_sf=x_sf,
+        token_selected_experts=token_selected_experts.to(torch.int32),
+        token_final_scales=token_final_scales.to(torch.float32),
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+    return backend.run_moe(ctx)
+
+
 @pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
@@ -4049,9 +4074,9 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
             assert locality_domain_backend.quant_scales.fc2_weight_block.numel() == 0
 
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
+            base_output = _run_moe_module(base_backend, input_tensor, router_logits)
+            locality_domain_output = _run_moe_module(
+                locality_domain_backend, input_tensor, router_logits
             )
 
         torch.cuda.synchronize()
@@ -4062,7 +4087,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
+def test_moe_module_bf16_locality_domain_lifecycle_and_run_moe_rubin():
     _skip_if_no_locality_domain()
 
     from _torch.moe.quantize_utils import get_test_quant_params
@@ -4164,13 +4189,13 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         assert locality_domain_backend.w3_w1_weight.numel() == 0
         assert locality_domain_backend.w2_weight.numel() == 0
 
-        # Keep the production-shape lifecycle and public forward_chunk
+        # Keep the production-shape lifecycle and run_moe
         # integration here. Broad accuracy, autotune, capture, and outer-tile
         # replay are covered by the unified backend matrix.
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
+            base_output = _run_moe_module(base_backend, input_tensor, router_logits)
+            locality_domain_output = _run_moe_module(
+                locality_domain_backend, input_tensor, router_logits
             )
 
         torch.cuda.synchronize()
