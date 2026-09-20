@@ -921,7 +921,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             if encoding != "base64":
                 raise NotImplementedError("Only base64 data URLs are supported for now.")
             prefix = self._data_uri_mime_prefix
-            if prefix and media_type and not media_type.startswith(prefix):
+            if prefix and media_type and not media_type.lower().startswith(prefix):
                 raise ValueError(
                     f"data URI declares media type {media_type!r}, which does not "
                     f"match the expected {prefix}* type for this content part"
