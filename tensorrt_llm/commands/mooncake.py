@@ -265,7 +265,21 @@ def mooncake_donor(
             f"naming one (or set {CONFIG_PATH_ENV})."
         )
 
-    donating = parse_size(segment_size)
+    def size_option(name: str, value: str) -> int:
+        """Parse a size option, reporting a bad one as a usage error."""
+        try:
+            return parse_size(value)
+        except ValueError as exc:
+            raise click.UsageError(f"{name}: {exc}") from exc
+
+    donating = size_option("--segment_size", segment_size)
+    # None means the option was left off. An empty string was passed, so it goes
+    # to parse_size and is rejected rather than silently taking the default.
+    buffer_size = (
+        DEFAULT_DONOR_LOCAL_BUFFER_SIZE
+        if local_buffer_size is None
+        else size_option("--local_buffer_size", local_buffer_size)
+    )
     resolved = resolve_master_address(master, master_timeout())
     wait_for_master(resolved)
 
@@ -276,9 +290,7 @@ def mooncake_donor(
         protocol=protocol or raw.get("protocol", "rdma"),
         device_name=device_name or raw.get("device_name", "") or "",
         metadata_server=(metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER),
-        local_buffer_size=(
-            parse_size(local_buffer_size) if local_buffer_size else DEFAULT_DONOR_LOCAL_BUFFER_SIZE
-        ),
+        local_buffer_size=buffer_size,
     ) as host:
         if ready_file:
             with open(ready_file, "w") as handle:

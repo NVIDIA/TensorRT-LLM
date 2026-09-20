@@ -470,6 +470,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         contributed_blocks = self._collect_contributed_blocks(
             requests_list, pending_ctx, inflight_request_ids
         )
+        # A deferral behind an in-flight contributor leaves nothing on any of
+        # the scheduled lists, so the deadlock detector below would read the
+        # iteration as a stall even though the contributor is running. Deferring
+        # is itself the progress in that case.
+        deferred_behind_contributor = False
 
         for req in pending_ctx:
             if budget.requests_full:
@@ -504,6 +509,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                         f"Deferring context request {req.py_request_id}: its first new "
                         "block is already contributed by a request that runs this iteration"
                     )
+                    deferred_behind_contributor = True
                     continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
@@ -551,6 +557,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or disagg_candidates
                 or evicted
                 or recompute_paused
+                or deferred_behind_contributor
             ),
         )
 
