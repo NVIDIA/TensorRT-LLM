@@ -918,14 +918,37 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
 # grammar compiled for strict tool calls.
 TOOL_PARAM_MAX_ENUM_VALUES = 1000
 
+# JSON Schema keywords whose value is instance data rather than a subschema.
+# An `enum` key nested inside these is a value (e.g. a default that happens to
+# be `{"enum": [...]}`), not an enum constraint, so it must not count.
+_SCHEMA_INSTANCE_KEYWORDS = frozenset({"default", "const", "examples"})
+# JSON Schema keywords whose value is a map of {name: subschema}. The names are
+# user-controlled (a property can be literally named `default` or `enum`), so
+# recurse into the values as subschemas without treating the names as keywords.
+_SCHEMA_MAP_KEYWORDS = frozenset({
+    "properties", "patternProperties", "$defs", "definitions",
+    "dependentSchemas"
+})
+
 
 def _count_schema_enum_values(schema: Any) -> int:
-    """Recursively count `enum` entries in a JSON-schema fragment."""
+    """Recursively count `enum` *constraint* entries in a JSON-schema fragment.
+
+    Only `enum` keywords in schema positions are counted. `enum` keys that are
+    instance data -- nested under `default`/`const`/`examples`, or the name of a
+    property -- are ignored, so a valid schema is not rejected for values that
+    are not enum constraints.
+    """
     count = 0
     if isinstance(schema, dict):
         for key, value in schema.items():
             if key == "enum" and isinstance(value, list):
                 count += len(value)
+            elif key in _SCHEMA_INSTANCE_KEYWORDS:
+                continue
+            elif key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+                for subschema in value.values():
+                    count += _count_schema_enum_values(subschema)
             else:
                 count += _count_schema_enum_values(value)
     elif isinstance(schema, list):

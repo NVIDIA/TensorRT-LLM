@@ -93,3 +93,36 @@ class TestToolEnumValueCap:
         under = TOOL_PARAM_MAX_ENUM_VALUES - 1
         req = _request(tools=[_enum_tool(under, "one"), _enum_tool(under, "two")])
         assert len(req.tools) == 2
+
+    def test_enum_in_instance_data_not_counted(self):
+        # An `enum` key that is instance data -- here the `default` value of a
+        # property happens to be a dict with an `enum` list -- is not an enum
+        # constraint and must not count against the cap.
+        over = TOOL_PARAM_MAX_ENUM_VALUES + 1
+        parameters = {
+            "type": "object",
+            "properties": {
+                "cfg": {
+                    "type": "object",
+                    "default": {"enum": [f"v{i}" for i in range(over)]},
+                },
+            },
+        }
+        FunctionDefinition(name="instance_data", parameters=parameters)
+
+    def test_property_named_like_keyword_still_counted(self):
+        # A property literally named `default` still carries a real enum
+        # constraint, so it must count -- the instance-data skip must not open a
+        # bypass through the property name.
+        over = TOOL_PARAM_MAX_ENUM_VALUES + 1
+        parameters = {
+            "type": "object",
+            "properties": {
+                "default": {
+                    "type": "string",
+                    "enum": [f"v{i}" for i in range(over)],
+                },
+            },
+        }
+        with pytest.raises(ValidationError, match="enum values"):
+            FunctionDefinition(name="named_default", parameters=parameters)
