@@ -319,6 +319,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         tags = self._prepare_sleep_tags(tags)
         if not tags:
             return
+        self._validate_sleep_tags(tags)
 
         logger.info(f"Sleep: {tags}")
         self.engine.begin_sleep_transition(tags)
