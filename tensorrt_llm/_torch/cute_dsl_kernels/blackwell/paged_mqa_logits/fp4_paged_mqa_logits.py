@@ -1681,6 +1681,18 @@ class FP4MQALogitsKernel:
             tma_bar_ptr=q_bar,
         )
 
+    @cute.jit
+    def _load_schedule_row(self, mScheduleMeta, s_sched, sm_idx, num_math_wg):
+        # s_sched = [start tile, start row, end tile, end row] (tiles = half-units x num_math_wg)
+        start_q = mScheduleMeta[(sm_idx, 0)]
+        start_kv_half = mScheduleMeta[(sm_idx, 1)]
+        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
+        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
+        s_sched[0] = start_kv_half * num_math_wg
+        s_sched[1] = start_q
+        s_sched[2] = end_kv_half * num_math_wg
+        s_sched[3] = end_q_idx
+
     @cute.kernel
     def kernel(
         self,
@@ -1761,17 +1773,6 @@ class FP4MQALogitsKernel:
             griddepcontrol_wait()
             if cutlass.const_expr(self.pdl_trigger == 1):
                 griddepcontrol_launch_dependents()
-        start_q = mScheduleMeta[(sm_idx, 0)]
-        start_kv_half = mScheduleMeta[(sm_idx, 1)]
-        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
-        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
-        # Early mContextLens load: overlap ~200-cycle L2 latency with the
-        # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
-        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
-        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
-        # element), but it is never used because has_work will be False.
-        start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -1846,6 +1847,13 @@ class FP4MQALogitsKernel:
                         s_P[row + 1] = base + strip_incl[s_i]
             if tidx == cutlass.Int32(0):
                 s_P[0] = cutlass.Int32(0)
+
+        # Schedule row: one thread loads it and broadcasts it through smem, so
+        # no other warp consumes a global load before the block barrier (warp 0's
+        # mbarrier init overlaps the load). Every role reads s_sched after it.
+        s_sched = cute.make_tensor(storage.sched_state.data_ptr(), cute.make_layout((4,)))
+        if tidx == cutlass.Int32(11 * 32):
+            self._load_schedule_row(mScheduleMeta, s_sched, sm_idx, NUM_MATH_WG)
 
         block_kv_val = self.block_kv
         num_heads = self.num_heads
@@ -2005,6 +2013,9 @@ class FP4MQALogitsKernel:
         )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+        # tcgen05.alloc by math warp 0; the 320-thread retrieve barrier stays
+        # in the math / UMMA branches.
+        tmem.allocate(self.num_tmem_alloc_cols_total)
 
         # SMEM allocation: per-group KV + shared Q
         sKV_0 = smem.allocate_tensor(
@@ -2178,7 +2189,6 @@ class FP4MQALogitsKernel:
 
         # TMEM layout info (allocation deferred to UMMA/Math warp branches)
         cols_per_group = cols * us * (32 // self.acc_dtype.width)
-        num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
 
         # Epilogue setup
         c_layout = utils.LayoutEnum.ROW_MAJOR
@@ -2192,36 +2202,10 @@ class FP4MQALogitsKernel:
             use_2cta_instrs,
         )
 
-        # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
-        end_kv_idx = end_kv_half * NUM_MATH_WG
-
-        # Convert start to KV block units
-        current_q_idx = start_q
-        current_kv_idx = start_kv_half * NUM_MATH_WG
-
-        # ===== COMMON SCHEDULER STATE (before warp branches) =====
-        # Each warp role independently maintains its own copy of these
-        # variables (like DeepGEMM where each role creates its own scheduler).
-        # Pre-fetch first task (current_num_kv loaded early above for latency hiding)
-        next_q_idx = current_q_idx
-        next_kv_idx = current_kv_idx
-        next_num_kv = current_num_kv
+        # Scheduler state is derived per role from s_sched after the barrier
+        # (a prologue value carried across setmaxnreg is spilled function-wide).
         # Sentinel: no previous batch (q_idx = batch_size)
         q_idx = batch_size
-        # While-loop termination flag (fetch_next_task pattern).
-        # True if this CTA has work assigned (start != end in schedule_meta).
-        has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
-        s_sched = cute.make_tensor(storage.sched_state.data_ptr(), cute.make_layout((4,)))
-        if tidx == cutlass.Int32(0):
-            s_sched[0] = current_kv_idx
-            s_sched[1] = current_num_kv
-            s_sched[2] = end_kv_idx
-        if cutlass.const_expr(self.dynamic_sched):
-            if tidx == cutlass.Int32(0):
-                s_ctl[12] = start_q
-                s_ctl[13] = start_kv_half
-                s_ctl[14] = end_q_idx
-                s_ctl[15] = end_kv_half
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
@@ -2231,9 +2215,15 @@ class FP4MQALogitsKernel:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
             cute.arch.warpgroup_reg_dealloc(self.prod_regs)
             next_kv_idx = s_sched[0]
-            next_num_kv = s_sched[1]
+            next_q_idx = s_sched[1]
             end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
             lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            blk_row = min(next_q_idx, batch_size - 1)
+            # num_kv of the first tile is derived in the advance step, after its
+            # KV burst (a load here would be consumed before the first TMA issue).
+            next_num_kv = cutlass.Int32(0)
 
             # Block table prefetch: 32 lanes cache block indices,
             # distributed via shuffle. Each lane holds num_blocks_per_mma
@@ -2247,8 +2237,8 @@ class FP4MQALogitsKernel:
             if cutlass.const_expr(self.dynamic_sched):
                 dyn_base = mDynState.iterator.toint()
                 chunk_c = dyn_chunk
-                own_s = s_P[s_ctl[12]] + s_ctl[13]
-                own_e = s_P[s_ctl[14]] + s_ctl[15]
+                own_s = s_P[next_q_idx] + (next_kv_idx >> 1)
+                own_e = s_P[end_q_idx] + (end_kv_idx >> 1)
                 total_pairs = s_P[batch_size]
                 lim_i = (own_e - own_s + chunk_c - cutlass.Int32(1)) // chunk_c
                 dyn_on = total_pairs >= dyn_nmin * cutlass.Int32(self.num_sms)
@@ -2321,6 +2311,14 @@ class FP4MQALogitsKernel:
                     q_prod_state.advance()
                     q_row = next_q_idx
             else:
+                # First tile pair's page indices: issued before the Q TMA so the
+                # load overlaps the TMA issue and the KV producer_acquire.
+                kv_blk_ptr = cutlass.Int32(0)
+                # Lanes past the row read in-bounds entries that are never consumed.
+                pf_base = (next_kv_idx + lane_idx * NUM_MATH_WG) * NUM_BLOCKS_PER_MMA
+                pf_last = cute.size(mBlockTable, mode=[1]) - 1
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    cached_blks[i] = mBlockTable[(blk_row, min(pf_base + i, pf_last))]
                 # Prefetch first Q before loop
                 q_pipeline.producer_acquire(q_prod_state)
                 q_bar = q_pipeline.producer_get_barrier(q_prod_state)
@@ -2353,10 +2351,49 @@ class FP4MQALogitsKernel:
                 kv_idx = next_kv_idx
                 num_kv = next_num_kv
 
-                # Q prefetch: when batch changes, load Q for NEXT batch
+                # Block table prefetch for group 0.
+                # Each lane loads num_blocks_per_mma physical block indices
+                # for one compute tile (kv_idx counts compute tiles).
+                if kv_blk_ptr == 32:
+                    kv_blk_ptr = cutlass.Int32(0)
+                    prefetch_kv = kv_idx + lane_idx * NUM_MATH_WG
+                    if prefetch_kv < num_kv:
+                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
+                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                    else:
+                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                            cached_blks[i] = cutlass.Int32(0)
+
+                # Get block indices via shuffle before barrier.
+                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
+                kv_blk_ptr = kv_blk_ptr + 1
+
+                # Load KV + Scale for group 0: num_blocks_per_mma TMAs per tile.
+                kv_pipeline_0.producer_acquire(kv_prod_state_0)
+                bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
+                stage = kv_prod_state_0.index
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_0[(None, 0, 0, phys_blks[i])],
+                        tAsA_0[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sf_kv,
+                        tSgSF_KV_0[(None, 0, phys_blks[i])],
+                        tSsSF_KV_0[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                    )
+                kv_prod_state_0.advance()
+
+                # Q prefetch for the next row, after this tile's KV burst.
                 if cutlass.const_expr(not self.dynamic_sched):
                     if q_idx != q_idx_old:
-                        kv_blk_ptr = cutlass.Int32(32)  # force re-prefetch
                         prefetch_next = q_idx + 1
                         if prefetch_next < end_q_idx:
                             q_pipeline.producer_acquire(q_prod_state)
@@ -2407,46 +2444,6 @@ class FP4MQALogitsKernel:
                                     tma_bar_ptr=q_bar,
                                 )
                                 q_prod_state.advance()
-
-                # Block table prefetch for group 0.
-                # Each lane loads num_blocks_per_mma physical block indices
-                # for one compute tile (kv_idx counts compute tiles).
-                if kv_blk_ptr == 32:
-                    kv_blk_ptr = cutlass.Int32(0)
-                    prefetch_kv = kv_idx + lane_idx * NUM_MATH_WG
-                    if prefetch_kv < num_kv:
-                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
-                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
-                    else:
-                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = cutlass.Int32(0)
-
-                # Get block indices via shuffle before barrier.
-                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
-                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
-                kv_blk_ptr = kv_blk_ptr + 1
-
-                # Load KV + Scale for group 0: num_blocks_per_mma TMAs per tile.
-                kv_pipeline_0.producer_acquire(kv_prod_state_0)
-                bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
-                stage = kv_prod_state_0.index
-                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_0[(None, 0, 0, phys_blks[i])],
-                        tAsA_0[(None, i, stage)],
-                        tma_bar_ptr=bar,
-                        mcast_mask=a_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_sf_kv,
-                        tSgSF_KV_0[(None, 0, phys_blks[i])],
-                        tSsSF_KV_0[(None, i, stage)],
-                        tma_bar_ptr=bar,
-                    )
-                kv_prod_state_0.advance()
 
                 if cutlass.const_expr(self.dynamic_sched):
                     left = left - cutlass.Int32(1)
@@ -2556,10 +2553,14 @@ class FP4MQALogitsKernel:
                                 q_row = n_row
                 else:
                     # Advance: inline fetch_next_task
+                    if q_idx_old == batch_size:
+                        num_kv = (mContextLens[q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = num_kv
                     next_kv_idx = kv_idx + NUM_MATH_WG
                     if next_kv_idx >= num_kv:
                         next_q_idx = q_idx + 1
                         next_kv_idx = 0
+                        kv_blk_ptr = cutlass.Int32(32)
                         if next_q_idx < batch_size:
                             next_num_kv = (
                                 mContextLens[next_q_idx] + block_kv_val - 1
@@ -2571,9 +2572,15 @@ class FP4MQALogitsKernel:
             # TMA warp 1: loads KV + Scale for group 1 only
             cute.arch.warpgroup_reg_dealloc(self.prod_regs)
             next_kv_idx = s_sched[0]
-            next_num_kv = s_sched[1]
+            next_q_idx = s_sched[1]
             end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
             lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            blk_row = min(next_q_idx, batch_size - 1)
+            # num_kv of the first tile is derived in the advance step, after its
+            # KV burst (a load here would be consumed before the first TMA issue).
+            next_num_kv = cutlass.Int32(0)
 
             # Block table prefetch for group 1
             cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
@@ -2587,6 +2594,13 @@ class FP4MQALogitsKernel:
                 left = re2
                 next_num_kv = (re3 + cutlass.Int32(127)) >> 7
                 has_work = re2 > cutlass.Int32(0)
+            else:
+                # First tile pair's page indices, issued at role entry.
+                kv_blk_ptr = cutlass.Int32(0)
+                pf_base = (next_kv_idx + 1 + lane_idx * NUM_MATH_WG) * NUM_BLOCKS_PER_MMA
+                pf_last = cute.size(mBlockTable, mode=[1]) - 1
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    cached_blks[i] = mBlockTable[(blk_row, min(pf_base + i, pf_last))]
 
             while has_work:
                 # fetch_next_task: commit next → current
@@ -2595,9 +2609,10 @@ class FP4MQALogitsKernel:
                 kv_idx = next_kv_idx
                 num_kv = next_num_kv
 
-                # New q_idx → force block table re-prefetch
-                if q_idx != q_idx_old:
-                    kv_blk_ptr = cutlass.Int32(32)
+                if cutlass.const_expr(self.dynamic_sched):
+                    # New q_idx → force block table re-prefetch
+                    if q_idx != q_idx_old:
+                        kv_blk_ptr = cutlass.Int32(32)
 
                 # Block table prefetch for group 1
                 if kv_blk_ptr == 32:
@@ -2652,10 +2667,14 @@ class FP4MQALogitsKernel:
                         kv_blk_ptr = cutlass.Int32(32)
                 else:
                     # Advance: inline fetch_next_task
+                    if q_idx_old == batch_size:
+                        num_kv = (mContextLens[q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = num_kv
                     next_kv_idx = kv_idx + NUM_MATH_WG
                     if next_kv_idx >= num_kv:
                         next_q_idx = q_idx + 1
                         next_kv_idx = 0
+                        kv_blk_ptr = cutlass.Int32(32)
                         if next_q_idx < batch_size:
                             next_num_kv = (
                                 mContextLens[next_q_idx] + block_kv_val - 1
@@ -2671,9 +2690,14 @@ class FP4MQALogitsKernel:
             # writes are visible.
             cute.arch.warpgroup_reg_dealloc(self.prod_regs)
             next_kv_idx = s_sched[0]
-            next_num_kv = s_sched[1]
+            next_q_idx = s_sched[1]
             end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
             lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            next_num_kv = (
+                mContextLens[min(next_q_idx, batch_size - 1)] + block_kv_val - 1
+            ) // block_kv_val
 
             # TMEM: wait for math warp 0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -2865,9 +2889,14 @@ class FP4MQALogitsKernel:
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
             cute.arch.warpgroup_reg_dealloc(self.prod_regs)
             next_kv_idx = s_sched[0]
-            next_num_kv = s_sched[1]
+            next_q_idx = s_sched[1]
             end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
             lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            next_num_kv = (
+                mContextLens[min(next_q_idx, batch_size - 1)] + block_kv_val - 1
+            ) // block_kv_val
 
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -3020,11 +3049,15 @@ class FP4MQALogitsKernel:
             cute.arch.warpgroup_reg_alloc(self.math_regs)
             lane_idx = tidx % 32
             next_kv_idx = s_sched[0]
-            next_num_kv = s_sched[1]
+            next_q_idx = s_sched[1]
             end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            next_num_kv = (
+                mContextLens[min(next_q_idx, batch_size - 1)] + block_kv_val - 1
+            ) // block_kv_val
 
-            # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
-            tmem.allocate(num_tmem_alloc_cols_total)
+            # TMEM: allocated by math warp 0 in the prologue; wait + retrieve
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
