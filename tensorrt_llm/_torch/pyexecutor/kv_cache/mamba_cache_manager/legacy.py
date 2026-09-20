@@ -91,7 +91,7 @@ def _estimate_mamba_hybrid_cache_cost(model_config, mapping, **kwargs):
 def warn_legacy_mamba_cache_manager(
     implementation: Literal["python", "cpp"], manager_name: str
 ) -> None:
-    """Warn once when a V1 implementation is selected or constructed."""
+    """Warn once when a V1 implementation is constructed."""
     display_name = "Python" if implementation == "python" else "C++"
     logger.warning_once(
         f"{manager_name} uses the deprecated {display_name} Mamba cache "
@@ -99,6 +99,50 @@ def warn_legacy_mamba_cache_manager(
         "V1 remains available only for compatibility.",
         key=f"deprecated_mamba_cache_manager_{implementation}_v1",
     )
+
+
+def _resolve_legacy_replay_options(
+    manager_cls: type,
+    model_type: str,
+    spec_config: object | None,
+    ssm_cache_dtype: torch.dtype,
+    stochastic_rounding: bool,
+    use_replay: bool | None,
+    kda_num_spec: int | None = None,
+) -> tuple[str, bool, int | None]:
+    """Resolve legacy replay policy before allocating model state.
+
+    Kimi uses the Qwen convolution layout but needs its own replay selection.
+    An explicit Mamba2 replay flag retains the existing caller override.
+    """
+    if model_type == "kimi_linear":
+        from tensorrt_llm._torch.modules.kimi_kda.cache_manager import select_kda_replay_state
+
+        if kda_num_spec is None:
+            state = select_kda_replay_state(spec_config=spec_config, manager_cls=manager_cls)
+            if state is not None:
+                kda_num_spec = state.num_speculative_tokens
+        model_type = "qwen3_next"
+    elif model_type == "nemotron_hybrid" and use_replay is None:
+        from tensorrt_llm._torch.modules.mamba.cache_manager import select_mamba2_state
+
+        use_replay = select_mamba2_state(
+            spec_config=spec_config,
+            ssm_cache_dtype=ssm_cache_dtype,
+            stochastic_rounding=stochastic_rounding,
+        ).uses_replay
+    elif model_type == "qwen3_next" and use_replay is None:
+        from tensorrt_llm._torch.modules.fla.cache_manager import select_gdn_replay_state
+
+        use_replay = (
+            select_gdn_replay_state(
+                spec_config=spec_config,
+                ssm_cache_dtype=ssm_cache_dtype,
+                manager_cls=manager_cls,
+            )
+            is not None
+        )
+    return model_type, bool(use_replay), kda_num_spec
 
 
 class PythonMambaCacheManager(BaseResourceManager):
@@ -1397,7 +1441,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
         execution_stream: Optional[torch.cuda.Stream] = None,
         model_type: str = "nemotron_hybrid",
         is_draft: bool = False,
-        use_replay_state_update: bool = False,
+        use_replay_state_update: bool | None = False,
         mamba_ssm_stochastic_rounding: bool = False,
         kda_replay_num_spec: Optional[int] = None,
         # Per-pool configurations forwarded to the C++ KVCacheManager ctor.
@@ -1407,6 +1451,15 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
     ) -> None:
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         warn_legacy_mamba_cache_manager("python", type(self).__name__)
+        model_type, use_replay_state_update, kda_replay_num_spec = _resolve_legacy_replay_options(
+            type(self),
+            model_type,
+            spec_config,
+            mamba_ssm_cache_dtype,
+            mamba_ssm_stochastic_rounding,
+            use_replay_state_update,
+            kda_replay_num_spec,
+        )
         assert not kv_cache_config.enable_block_reuse, (
             "mamba hybrid cache requires block reuse to be disabled in KV cache config"
         )
@@ -1593,7 +1646,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         layer_mask: Optional[List[bool]] = None,  # this is the full attention layer mask
         is_estimating_kv_cache: bool = False,
         is_draft: bool = False,
-        use_replay_state_update: bool = False,
+        use_replay_state_update: bool | None = False,
         mamba_ssm_stochastic_rounding: bool = False,
         model_type: str = "nemotron_hybrid",
         **kwargs,
@@ -1603,6 +1656,14 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         # 2) Full attention layers (full_attention_layer_mask is True)
         # 3) Not managed layers (both masks are False)
         warn_legacy_mamba_cache_manager("cpp", type(self).__name__)
+        model_type, use_replay_state_update, _ = _resolve_legacy_replay_options(
+            type(self),
+            model_type,
+            spec_config,
+            mamba_ssm_cache_dtype,
+            mamba_ssm_stochastic_rounding,
+            use_replay_state_update,
+        )
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers

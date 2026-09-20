@@ -301,6 +301,8 @@ class ReplayHistory:
         )
 
     def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        if self.prev_num_accepted_tokens is None:
+            return
         self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
         self.cache_buf_idx.index_fill_(0, slots, 0)
         for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):

@@ -7,7 +7,6 @@ from importlib import import_module
 
 _EXPORTS = {
     "QSATrtllmAttention": "backend",
-    "QSAMambaHybridCacheManagerV2": "cache_manager",
     "QSAAttentionMetadata": "metadata",
     "QSASparseMetadataParams": "params",
     "QSASparseParams": "params",

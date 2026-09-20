@@ -25,7 +25,7 @@ from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     Qwen4ExpHybridCacheManagerV2,
     Qwen4ExpPLECacheParams,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     IntermediateState,
@@ -592,9 +592,12 @@ def test_gdn_bind_accepts_affine_and_indirect_views(affine):
     assert all(not owner.use_gdn_cached_replay_all_layer_commit for owner in owners)
 
 
-@pytest.mark.parametrize("state", [IntermediateState(), GDNReplayState(3), KDAReplayState(2)])
+@pytest.mark.parametrize(
+    "state", [IntermediateState(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)]
+)
 def test_no_local_recurrent_layers_allocate_no_algorithm_buffers(state):
     state.bind(_layout(layers=(), slot_capacity=0), [], [])
+    state.reset_slots(torch.tensor([0]), [0])
     assert not any(isinstance(value, torch.Tensor) for value in vars(state).values())
 
 
@@ -803,14 +806,6 @@ def test_algorithm_methods_do_not_depend_on_manager(cls):
         }.intersection(code.co_names)
 
 
-def test_qwen4_methods_do_not_access_raw_pool():
-    for function in vars(Qwen4ExpHybridCacheManagerV2).values():
-        if isinstance(function, FunctionType):
-            assert not {"impl", "TensorWrapper", "convert_to_torch_tensor"}.intersection(
-                function.__code__.co_names
-            )
-
-
 @pytest.mark.parametrize(
     "manager_cls",
     [
@@ -885,7 +880,7 @@ def test_k3_host_acceptance_handles_empty_mixed_and_completed_requests(draft_len
 def _slot_view_manager(
     monkeypatch, *, scale=6, role_count=2, page_shape=(4, 2, 3), dtype=torch.float32
 ):
-    manager = object.__new__(KVCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
     manager.layer_offsets = {42: 0}
     page_elements = 1
     for dim in page_shape:
@@ -907,7 +902,7 @@ def _slot_view_manager(
         get_page_index_converter=lambda layer, role: converter,
         get_page_index_upper_bound=lambda layer, role: 3 * scale - layer_offset,
     )
-    globals_ = KVCacheManagerV2._get_slot_role_view.__globals__
+    globals_ = Qwen4ExpHybridCacheManagerV2._get_view_by_role_and_layer.__globals__
     monkeypatch.setitem(globals_, "TensorWrapper", lambda address, dtype, shape: (address, shape))
 
     def convert(wrapper):
@@ -932,7 +927,7 @@ def test_slot_role_view_preserves_coalesced_stride(
     manager, roles, shape, converter, backing = _slot_view_manager(
         monkeypatch, scale=scale, role_count=role_count, page_shape=page_shape, dtype=dtype
     )
-    view = manager._get_slot_role_view(42, roles, dtype=dtype, page_shape=shape)
+    view = manager._get_view_by_role_and_layer(42, roles, dtype=dtype, page_shape=shape)
     assert view.shape == (3, role_count, *page_shape)
     assert view.stride(0) == scale * 24
     assert view.stride(1) == 24
@@ -956,20 +951,22 @@ def test_slot_role_view_rejects_incompatible_physical_layout(monkeypatch, invali
     else:
         manager.impl.get_page_index_upper_bound = lambda layer, role: 1
     with pytest.raises(RuntimeError):
-        manager._get_slot_role_view(42, roles, dtype=torch.float32, page_shape=shape)
+        manager._get_view_by_role_and_layer(42, roles, dtype=torch.float32, page_shape=shape)
 
 
-def test_qwen4_uses_kv_owned_slot_views(monkeypatch):
+def test_qwen4_position_uses_model_owned_slot_view(monkeypatch):
     manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
     manager.qsa_position_layer_id = 42
     manager.tokens_per_block = 4
-    manager._get_slot_role_view = Mock(return_value=torch.zeros(3, 1, 4, 3, dtype=torch.int32))
+    manager._get_view_by_role_and_layer = Mock(
+        return_value=torch.zeros(3, 1, 4, 3, dtype=torch.int32)
+    )
     assert manager.get_qsa_position_buffer().shape == (3, 4, 3)
-    manager._get_slot_role_view.assert_called_once()
+    manager._get_view_by_role_and_layer.assert_called_once()
     manager.qsa_position_layer_id = None
-    manager._get_slot_role_view.reset_mock()
+    manager._get_view_by_role_and_layer.reset_mock()
     assert manager.get_qsa_position_buffer() is None
-    manager._get_slot_role_view.assert_not_called()
+    manager._get_view_by_role_and_layer.assert_not_called()
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
@@ -985,9 +982,9 @@ def test_qwen4_main_kv_view_supplies_only_logical_geometry(monkeypatch, kv_layou
     manager.tokens_per_block = 4
     monkeypatch.setitem(namespace, "binding_to_torch_dtype", lambda dtype: torch.bfloat16)
     sentinel = object()
-    manager._get_slot_role_view = Mock(return_value=sentinel)
+    manager._get_view_by_role_and_layer = Mock(return_value=sentinel)
     assert manager.get_buffers(42, kv_layout) is sentinel
-    manager._get_slot_role_view.assert_called_once_with(
+    manager._get_view_by_role_and_layer.assert_called_once_with(
         42,
         (Role.KEY, Role.VALUE),
         dtype=torch.bfloat16,
@@ -1000,9 +997,11 @@ def test_qwen4_main_kv_view_supplies_only_logical_geometry(monkeypatch, kv_layou
 
 
 @pytest.mark.parametrize("invalid", [None, "pool", "scale", "expansion"])
-def test_attention_slot_mapping_validates_backend_contract(invalid):
-    manager = object.__new__(KVCacheManagerV2)
+def test_qwen4_attention_pool_layout_validates_backend_contract(invalid):
+    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
     manager.layer_offsets = {42: 0}
+    manager.qsa_position_layer_id = 42
+    manager.qsa_sparse_layer_ids = [42]
     manager.layer_to_pool_mapping_dict = {0: 0}
     manager.num_attention_op_pools = 1
     converter = SimpleNamespace(scale=6, expansion=1)
@@ -1014,21 +1013,29 @@ def test_attention_slot_mapping_validates_backend_contract(invalid):
     elif invalid == "expansion":
         converter.expansion = 2
     if invalid is None:
-        assert manager._get_attention_slot_mapping(42) == (0, 6)
+        assert manager.get_qsa_attention_pool_layout() == (0, 6)
     else:
         with pytest.raises(RuntimeError):
-            manager._get_attention_slot_mapping(42)
+            manager.get_qsa_attention_pool_layout()
 
 
-def test_qwen4_requires_one_mapping_but_does_not_read_physical_pool():
+def test_qwen4_requires_one_mapping_and_skips_nonlocal_layers():
     manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
     manager.qsa_position_layer_id = 42
     manager.qsa_sparse_layer_ids = [42, 43, 99]
     manager.layer_offsets = {42: 0, 43: 1}
-    manager._get_attention_slot_mapping = Mock(return_value=(0, 6))
+    manager.layer_to_pool_mapping_dict = {0: 0, 1: 0}
+    manager.num_attention_op_pools = 1
+    converters = {
+        0: SimpleNamespace(scale=6, expansion=1),
+        1: SimpleNamespace(scale=6, expansion=1),
+    }
+    manager.impl = SimpleNamespace(
+        get_page_index_converter=Mock(side_effect=lambda layer, role: converters[layer])
+    )
     assert manager.get_qsa_attention_pool_layout() == (0, 6)
-    assert all(call.args != (99,) for call in manager._get_attention_slot_mapping.call_args_list)
-    manager._get_attention_slot_mapping = lambda layer: (0, 6 if layer == 42 else 4)
+    assert {call.args[0] for call in manager.impl.get_page_index_converter.call_args_list} == {0, 1}
+    converters[1].scale = 4
     with pytest.raises(RuntimeError, match="do not share"):
         manager.get_qsa_attention_pool_layout()
 
@@ -1124,3 +1131,98 @@ def test_constructor_validates_before_pool_and_binds_after_slot_capacity(monkeyp
         PLE_NGRAM_CONTEXT,
     ]
     assert manager.ple_layer_cache(0)[0].shape == (5, 16, 6)
+
+
+@pytest.mark.parametrize("model_type", ["nemotron_hybrid", "qwen3_next", "kimi_linear"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_legacy_constructor_resolves_model_replay(monkeypatch, model_type, enabled):
+    from tensorrt_llm._torch.modules.fla import cache_manager as gdn
+    from tensorrt_llm._torch.modules.kimi_kda import cache_manager as kda
+    from tensorrt_llm._torch.modules.mamba import cache_manager as mamba
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import legacy
+
+    spec = SimpleNamespace(tokens_per_gen_step=4)
+    selectors = [
+        Mock(return_value=SimpleNamespace(uses_replay=enabled)),
+        Mock(return_value=object() if enabled else None),
+        Mock(return_value=SimpleNamespace(num_speculative_tokens=3) if enabled else None),
+    ]
+    monkeypatch.setattr(mamba, "select_mamba2_state", selectors[0])
+    monkeypatch.setattr(gdn, "select_gdn_replay_state", selectors[1])
+    monkeypatch.setattr(kda, "select_kda_replay_state", selectors[2])
+    mamba_init, kv_init = Mock(), Mock()
+    monkeypatch.setattr(legacy.MambaCacheManager, "__init__", mamba_init)
+    monkeypatch.setattr(legacy.KVCacheManager, "__init__", kv_init)
+    legacy.MixedMambaHybridCacheManager(
+        4,
+        4,
+        2,
+        2,
+        4,
+        1,
+        [True, False],
+        torch.float32,
+        torch.float32,
+        SimpleNamespace(enable_block_reuse=False),
+        legacy.CacheTypeCpp.SELF,
+        num_layers=1,
+        layer_mask=[False, True],
+        num_kv_heads=2,
+        head_dim=4,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        spec_config=spec,
+        model_type=model_type,
+        use_replay_state_update=None,
+    )
+    expected_selector = ["nemotron_hybrid", "qwen3_next", "kimi_linear"].index(model_type)
+    assert [selector.call_count for selector in selectors] == [
+        int(i == expected_selector) for i in range(3)
+    ]
+    kwargs = mamba_init.call_args.kwargs
+    assert kwargs["model_type"] == (
+        "nemotron_hybrid" if model_type == "nemotron_hybrid" else "qwen3_next"
+    )
+    assert kwargs["use_replay_state_update"] == (enabled and model_type != "kimi_linear")
+    assert kwargs["kda_replay_num_spec"] == (3 if enabled and model_type == "kimi_linear" else None)
+    kv_init.assert_called_once()
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_legacy_replay_explicit_override_bypasses_auto_selection(monkeypatch, requested):
+    from tensorrt_llm._torch.modules.mamba import cache_manager as mamba
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import legacy
+
+    selector = Mock(side_effect=AssertionError("Explicit replay flag must bypass selection"))
+    monkeypatch.setattr(mamba, "select_mamba2_state", selector)
+    assert legacy._resolve_legacy_replay_options(
+        legacy.CppMambaHybridCacheManager,
+        "nemotron_hybrid",
+        object(),
+        torch.float32,
+        False,
+        requested,
+    ) == ("nemotron_hybrid", requested, None)
+    selector.assert_not_called()
+
+
+def test_legacy_kda_replay_retains_cpp_manager_gate(monkeypatch):
+    from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import legacy
+
+    monkeypatch.setattr(_kda_kernels, "is_kda_mtp_verify_available", lambda: True)
+    spec = SimpleNamespace(tokens_per_gen_step=4)
+    for manager_cls, expected in (
+        (legacy.MixedMambaHybridCacheManager, 3),
+        (legacy.CppMambaHybridCacheManager, None),
+    ):
+        assert legacy._resolve_legacy_replay_options(
+            manager_cls,
+            "kimi_linear",
+            spec,
+            torch.float32,
+            False,
+            False,
+        ) == ("qwen3_next", False, expected)

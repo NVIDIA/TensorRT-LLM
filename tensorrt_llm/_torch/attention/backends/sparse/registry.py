@@ -27,7 +27,6 @@ def get_sparse_attn_kv_cache_manager(
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager, DSACacheManagerV2
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
-    from .qsa import QSAMambaHybridCacheManagerV2
     from .rocket import RocketKVCacheManager
 
     if sparse_attention_config.algorithm == "rocket":
@@ -43,7 +42,9 @@ def get_sparse_attn_kv_cache_manager(
     elif sparse_attention_config.algorithm == "qsa":
         if not use_kv_cache_manager_v2:
             raise ValueError("QSA sparse attention requires KV cache manager V2")
-        return QSAMambaHybridCacheManagerV2
+        from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManagerV2
+
+        return Qwen4ExpHybridCacheManagerV2
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm: {sparse_attention_config.algorithm}"

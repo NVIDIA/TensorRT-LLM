@@ -37,10 +37,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _get_local_mamba_cache_layout,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
-from tensorrt_llm._utils import binding_to_torch_dtype
+from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
 if TYPE_CHECKING:
@@ -265,6 +265,60 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
             kv_layout=kv_layout,
         )
 
+    def _get_view_by_role_and_layer(
+        self,
+        layer_idx: int,
+        roles: tuple[DataRole, ...],
+        *,
+        dtype: torch.dtype,
+        page_shape: list[int],
+    ) -> torch.Tensor:
+        """Return a zero-copy strided view of one layer's selected roles across the pool.
+
+        The view has shape [slots, roles, *page_shape] and preserves the physical
+        slot stride when layers or roles share a pool, e.g. Qwen DSA. Selected
+        roles must be adjacent and equal-sized; expanded page mappings are unsupported.
+        """
+        if not roles:
+            raise ValueError("A slot view requires at least one role")
+        layer_offset = self.layer_offsets[layer_idx]
+        first_role = roles[0]
+        address = self.impl.get_mem_pool_base_address(
+            layer_offset, first_role, PageIndexMode.SHARED
+        )
+        page_stride = self.impl.get_page_stride(layer_offset, first_role)
+        expected_stride = math.prod(page_shape) * dtype.itemsize
+        if page_stride != expected_stride:
+            raise RuntimeError(
+                f"Slot-view page stride mismatch: expected {expected_stride}, got {page_stride}"
+            )
+        for offset, role in enumerate(roles[1:], start=1):
+            role_address = self.impl.get_mem_pool_base_address(
+                layer_offset, role, PageIndexMode.SHARED
+            )
+            if (
+                role_address != address + offset * page_stride
+                or self.impl.get_page_stride(layer_offset, role) != page_stride
+            ):
+                raise RuntimeError(f"Slot-view roles are not adjacent equal-sized pages: {roles}")
+
+        converter = self.impl.get_page_index_converter(layer_offset, first_role)
+        scale = int(converter.scale)
+        if scale < len(roles):
+            raise RuntimeError(
+                f"Invalid slot-view page-index scale: {scale} for {len(roles)} roles"
+            )
+        if int(converter.expansion) != 1:
+            raise RuntimeError("Slot views do not support expanded page indices")
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, first_role)
+        num_pages_with_offset = page_upper + int(converter.layer_offset)
+        if num_pages_with_offset % scale != 0:
+            raise RuntimeError("Slot-view page mapping is inconsistent")
+        view = convert_to_torch_tensor(
+            TensorWrapper(address, dtype, [num_pages_with_offset // scale, scale, *page_shape])
+        )
+        return view[:, : len(roles)]
+
     @override
     def get_buffers(
         self,
@@ -295,7 +349,7 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
             page_shape = [self.tokens_per_block, num_heads, head_dim]
         else:
             page_shape = [num_heads, self.tokens_per_block, head_dim]
-        return self._get_slot_role_view(
+        return self._get_view_by_role_and_layer(
             layer_idx, (Role.KEY, Role.VALUE), dtype=torch_dtype, page_shape=page_shape
         )
 
@@ -304,7 +358,7 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
         """Return per-token three-axis RoPE/mRoPE position coordinates."""
         if self.qsa_position_layer_id is None:
             return None
-        return self._get_slot_role_view(
+        return self._get_view_by_role_and_layer(
             self.qsa_position_layer_id,
             (QSA_INDEX_POSITION,),
             dtype=QSA_POSITION_CACHE_DTYPE,
@@ -315,11 +369,26 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
         """Require one block-table mapping for all local sparse layers."""
         if self.qsa_position_layer_id is None:
             raise RuntimeError("QSA cache manager has no local sparse layer")
-        mapping = self._get_attention_slot_mapping(self.qsa_position_layer_id)
+        local_idx = self.layer_offsets[self.qsa_position_layer_id]
+        pool_id = self.layer_to_pool_mapping_dict[local_idx]
+        converter = self.impl.get_page_index_converter(local_idx, Role.KEY)
+        mapping = (pool_id, int(converter.scale))
         for layer_id in self.qsa_sparse_layer_ids:
             if layer_id not in self.layer_offsets:
                 continue
-            candidate = self._get_attention_slot_mapping(layer_id)
+            local_idx = self.layer_offsets[layer_id]
+            pool_id = self.layer_to_pool_mapping_dict[local_idx]
+            if pool_id >= self.num_attention_op_pools:
+                raise RuntimeError(
+                    f"KV pool {pool_id} is not represented in the attention block table"
+                )
+            converter = self.impl.get_page_index_converter(local_idx, Role.KEY)
+            scale = int(converter.scale)
+            if scale <= 0:
+                raise RuntimeError(f"Invalid attention page-index scale: {scale}")
+            if int(converter.expansion) != 1:
+                raise RuntimeError("Attention slot mapping does not support expanded page indices")
+            candidate = (pool_id, scale)
             if candidate != mapping:
                 raise RuntimeError(
                     "QSA local layers do not share one attention page mapping: "

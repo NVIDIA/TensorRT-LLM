@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.qsa import (
-    QSAMambaHybridCacheManagerV2,
     QSASparseMetadataParams,
     QSASparseParams,
 )
@@ -35,6 +34,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.module import (
     select_qsa_paged_tokens,
     select_qsa_tokens,
 )
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManagerV2
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 
@@ -1247,7 +1247,8 @@ def test_fused_qsa_prefill_bounds_sparse_attention_to_visible_tokens() -> None:
 
 
 def test_qsa_side_buffers_use_exact_geometry_and_one_position_role() -> None:
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager._qsa_enabled = True
     manager.qsa_index_dim = 128
     manager.qsa_index_kv_heads = 1
     manager.qsa_sparse_layer_ids = [7, 11]
@@ -1272,13 +1273,13 @@ def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
             del layer_idx, role
             return 0
 
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
     manager.qsa_position_layer_id = 7
     manager.layer_offsets = {7: 2}
     manager.impl = _Impl()
     manager.tokens_per_block = 128
 
-    with pytest.raises(RuntimeError, match="position-cache page stride mismatch"):
+    with pytest.raises(RuntimeError, match="Slot-view page stride mismatch"):
         manager.get_qsa_position_buffer()
 
     assert len(calls) == 1

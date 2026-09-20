@@ -65,7 +65,6 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
-from .kv_cache.mamba_cache_manager.legacy import warn_legacy_mamba_cache_manager
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -118,13 +117,6 @@ def _resolve_disagg_transceiver_route(
         # defaults use the global C++ fallback, matching transceiver creation.
         runtime = None
     return backend, runtime
-
-
-def _select_legacy_mamba_manager(manager_cls):
-    implementation = ("python" if issubclass(
-        manager_cls, MixedMambaHybridCacheManager) else "cpp")
-    warn_legacy_mamba_cache_manager(implementation, manager_cls.__name__)
-    return manager_cls
 
 
 def get_kv_cache_manager_cls(
@@ -199,10 +191,10 @@ def get_kv_cache_manager_cls(
                 logger.info(
                     "Using CppMambaHybridCacheManager for Kimi K3 hybrid "
                     "model (block reuse enabled)")
-                return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
+                return CppMambaHybridCacheManager
             logger.info(
                 "Using MixedMambaHybridCacheManager for Kimi K3 hybrid model")
-            return _select_legacy_mamba_manager(MixedMambaHybridCacheManager)
+            return MixedMambaHybridCacheManager
 
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
@@ -238,14 +230,12 @@ def get_kv_cache_manager_cls(
                         "and transceiver_runtime='PYTHON' requires "
                         "use_kv_cache_manager_v2=True.")
                 if kv_cache_config.enable_block_reuse:
-                    return _select_legacy_mamba_manager(
-                        CppMambaHybridCacheManager)
+                    return CppMambaHybridCacheManager
                 if runtime == "PYTHON" and backend == "NIXL":
                     logger.info("Python transceiver detected; using "
                                 "MixedMambaHybridCacheManager for hybrid model")
-                    return _select_legacy_mamba_manager(
-                        MixedMambaHybridCacheManager)
-                return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
+                    return MixedMambaHybridCacheManager
+                return CppMambaHybridCacheManager
 
         if use_py_mamba_cache_manager() and not is_disagg:
             if use_v2:
@@ -260,7 +250,7 @@ def get_kv_cache_manager_cls(
                     "TRTLLM_USE_PY_MAMBA to use the configured cache manager.")
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
-            return _select_legacy_mamba_manager(MixedMambaHybridCacheManager)
+            return MixedMambaHybridCacheManager
         env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
         if env_override is not None:
             env_override = env_override.upper()
@@ -280,8 +270,7 @@ def get_kv_cache_manager_cls(
                     "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED "
                     "overrides the default Mamba cache manager to "
                     "MixedMambaHybridCacheManager.")
-                return _select_legacy_mamba_manager(
-                    MixedMambaHybridCacheManager)
+                return MixedMambaHybridCacheManager
             if env_override == 'CPP':
                 if use_v2:
                     raise ValueError(
@@ -291,14 +280,14 @@ def get_kv_cache_manager_cls(
                     "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP "
                     "overrides the default Mamba cache manager to "
                     "CppMambaHybridCacheManager.")
-                return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
+                return CppMambaHybridCacheManager
             logger.warning(
                 f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
                 "Expected 'CPP' or 'MIXED'. Using the configured "
                 "KV cache manager default.")
 
         if not use_v2:
-            return _select_legacy_mamba_manager(CppMambaHybridCacheManager)
+            return CppMambaHybridCacheManager
 
         if (kv_cache_config.enable_block_reuse
                 and kv_cache_config.enable_kv_pool_rebalance):
@@ -2389,6 +2378,7 @@ def _get_mamba_cache_layer_masks(
 _CONV_STATE_LAYOUT_BY_MODEL_TYPE = {
     "nemotron_hybrid": "x_b_c",
     "qwen3_next": "q_k_v",
+    "kimi_linear": "q_k_v",
 }
 
 
@@ -2640,19 +2630,8 @@ def _create_kv_cache_manager(
         # manager's own internal gate (`tp_size = 1 if enable_attention_dp
         # else tp_size`, then num_heads / n_groups / conv_dim divide by
         # it), so the params pass through unscaled.
-        from ..modules.kimi_kda.cache_manager import select_kda_replay_state
-
-        kimi_extra_kwargs = {}
-        if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            replay = select_kda_replay_state(spec_config=spec_config,
-                                             manager_cls=kv_cache_manager_cls)
-            if replay is not None:
-                kimi_extra_kwargs[
-                    "kda_replay_num_spec"] = replay.num_speculative_tokens
-        # KDA's conv state is a [Q | K | V] concatenation whose three sections
-        # have identical width, i.e. the qwen3_next section layout.
-        kimi_extra_kwargs.update(
-            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        kimi_extra_kwargs = _mamba_conv_layout_kwargs(kv_cache_manager_cls,
+                                                      "kimi_linear")
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -2738,15 +2717,6 @@ def _create_kv_cache_manager(
         stochastic_rounding = getattr(
             quant_config, 'mamba_ssm_stochastic_rounding',
             False) if quant_config is not None else False
-        from ..modules.mamba.cache_manager import select_mamba2_state
-
-        use_replay = None
-        if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            use_replay = select_mamba2_state(
-                spec_config=spec_config,
-                ssm_cache_dtype=mamba_params.mamba_ssm_cache_dtype,
-                stochastic_rounding=stochastic_rounding).uses_replay
-
         # Stochastic-rounding seeds must live on the cache manager (not be
         # re-created with torch.randint per forward) whenever SR can fire
         # on the fp16 SSM cache.  This mirrors the predicate the mixer uses
@@ -2786,7 +2756,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            use_replay_state_update=use_replay,
+            use_replay_state_update=None,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
@@ -2813,15 +2783,6 @@ def _create_kv_cache_manager(
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
-        from ..modules.fla.cache_manager import select_gdn_replay_state
-
-        use_replay = None
-        if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            use_replay = select_gdn_replay_state(
-                spec_config=spec_config,
-                ssm_cache_dtype=mamba_params.mamba_ssm_cache_dtype,
-                manager_cls=kv_cache_manager_cls) is not None
-
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
@@ -2858,7 +2819,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            use_replay_state_update=use_replay,
+            use_replay_state_update=None,
             **mamba_manager_extra_kwargs,
         )
     else:

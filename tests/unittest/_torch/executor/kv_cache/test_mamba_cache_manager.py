@@ -375,12 +375,10 @@ def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
     assert "model_type" not in kwargs
 
 
-def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
+def test_kimi_v1_manager_receives_model_identity_for_replay_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The V1 managers have no `conv_state_layout` parameter; they must keep
-    getting `model_type='qwen3_next'` and must not receive V2 KDA replay
-    parameters (TRTLLM-15216 regression guard)."""
+    """V1 resolves Kimi replay and its Q/K/V layout inside the constructor."""
     captured: dict[str, object] = {}
 
     class RecordingV1Manager(CppMambaHybridCacheManager):
@@ -410,7 +408,7 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
         is_draft=False,
     )
     kwargs = captured["kwargs"]
-    assert kwargs["model_type"] == "qwen3_next"
+    assert kwargs["model_type"] == "kimi_linear"
     assert "conv_state_layout" not in kwargs
     assert "kda_replay_num_spec" not in kwargs
 
@@ -553,10 +551,10 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         **common_kwargs,
     )
 
-    assert captured_cpp["use_replay_state_update"] is True
+    assert captured_cpp["use_replay_state_update"] is None
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_cpp["max_num_tokens"] == 256
-    assert captured_mixed["use_replay_state_update"] is False
+    assert captured_mixed["use_replay_state_update"] is None
     assert captured_mixed["model_type"] == "qwen3_next"
     assert captured_mixed["max_num_tokens"] == 256
     assert captured_v2["use_replay_state_update"] is None
@@ -574,6 +572,19 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert captured_v2["max_num_tokens"] == 256
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.legacy import (
+        _resolve_legacy_replay_options,
+    )
+
+    for manager_cls, enabled in ((RecordingCppManager, True), (RecordingMixedManager, False)):
+        assert _resolve_legacy_replay_options(
+            manager_cls,
+            "qwen3_next",
+            common_kwargs["spec_config"],
+            torch.bfloat16,
+            False,
+            None,
+        ) == ("qwen3_next", enabled, None)
     fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
     assert any("RecordingMixedManager was selected" in log for log in fallback_logs)
     assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
