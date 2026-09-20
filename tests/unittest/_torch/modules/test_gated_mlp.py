@@ -43,7 +43,7 @@ def _make_down_proj() -> nn.Module:
     return down_proj
 
 
-def test_locality_domain_gate_up_partition_falls_back_to_swiglu(
+def test_gate_up_partition_falls_back_to_swiglu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mlp = GatedMLP(hidden_size=2, intermediate_size=2, bias=False)

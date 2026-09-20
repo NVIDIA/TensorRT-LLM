@@ -4101,7 +4101,8 @@ class Linear(nn.Module):
                 and self.use_cute_dsl_blockscaling_mm
                 and IS_CUTLASS_DSL_AVAILABLE
                 and self.has_nvfp4_activation_quantization
-                and get_sm_version() in (100, 103) and not self.has_bias)
+                and get_sm_version() in (100, 103) and not self.has_bias
+                and not self.partition_plan.enabled)
 
     @property
     def has_nvfp4_activation_quantization(self):
@@ -4400,19 +4401,6 @@ class Linear(nn.Module):
             plan.num_partitions) if plan.enabled else None)
         self._locality_domain_planned_quant_config = self.quant_config
         self._refresh_fused_gemm_allreduce()
-
-    def can_use_cute_dsl_nvfp4_swiglu_blackwell(self) -> bool:
-        """Return whether this layer can use the Blackwell NVFP4 SwiGLU op.
-
-        Keep this predicate shared by weight transformation and forward
-        dispatch so a fallback backend never consumes the fused layout.
-        """
-        return (self.use_cute_dsl_nvfp4_swiglu_blackwell
-                and self.use_cute_dsl_blockscaling_mm
-                and IS_CUTLASS_DSL_AVAILABLE
-                and self.has_nvfp4_activation_quantization
-                and get_sm_version() in (100, 103) and not self.has_bias
-                and not self.partition_plan.enabled)
 
     def _run_linear_locality_domain(self, input, bias):
         if self.partition_plan.op_kind == "nvfp4_linear":
