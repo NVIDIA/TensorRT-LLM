@@ -73,6 +73,27 @@ async def test_async_resume_defaults_to_currently_parked_tags():
 
 
 @pytest.mark.asyncio
+async def test_async_resume_normalizes_explicit_tags_after_status_rpc():
+    llm = _make_async_llm()
+    reply = {"state": "parked", "parked_tags": ["model", "kv_cache"]}
+    llm.collective_rpc.side_effect = [[reply, reply], None]
+
+    result = await llm.resume(
+        [
+            "model",
+            ExecutorMemoryType.KV_CACHE,
+            "model",
+        ]
+    )
+
+    assert result is None
+    assert llm.collective_rpc.await_args_list == [
+        call("get_memory_status"),
+        call("wakeup", args=(["model", "kv_cache"],)),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_async_resume_is_noop_when_nothing_is_parked():
     llm = _make_async_llm()
     llm.collective_rpc.return_value = [{"state": "running", "parked_tags": []}]
@@ -192,6 +213,25 @@ def test_resume_defaults_to_currently_parked_tags():
     llm.resume()
 
     llm._collective_rpc.assert_called_once_with("wakeup", (["kv_cache", "model"],))
+
+
+def test_resume_normalizes_explicit_tags_after_status_rpc():
+    llm = _make_llm()
+    reply = {"state": "parked", "parked_tags": ["model", "kv_cache"]}
+    llm._collective_rpc.side_effect = [[reply, reply], None]
+
+    llm.resume(
+        [
+            "model",
+            ExecutorMemoryType.KV_CACHE,
+            "model",
+        ]
+    )
+
+    assert llm._collective_rpc.call_args_list == [
+        call("get_memory_status"),
+        call("wakeup", (["model", "kv_cache"],)),
+    ]
 
 
 def test_resume_is_noop_when_nothing_is_parked():
