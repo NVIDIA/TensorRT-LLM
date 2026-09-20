@@ -4007,9 +4007,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # The recurrent (SSM) state pool must hold one slot per resident
         # sequence plus every reserved dummy slot. Unlike attention pages, a
         # Mamba state is fixed-size per sequence, so this floor is independent
-        # of sequence length. The base config only emits constraints when
-        # ``avg_seq_len`` is set, and speculative decoding inflates the reserved
-        # dummy slots (CUDA-graph padding), so without an explicit floor the SSM
+        # of sequence length. Speculative decoding inflates the reserved dummy
+        # slots (CUDA-graph padding), so without this explicit floor the SSM
         # pool can be undersized (see the live/dummy-slot check in _setup_states
         # / __init__). Add a min-slots constraint of zero-capacity requests:
         # these cost no attention pages but reserve one SSM slot each.

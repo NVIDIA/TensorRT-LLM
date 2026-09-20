@@ -159,7 +159,6 @@ def _make_cache_config_for_test(
     cache_manager.enable_joint_kv_cache_reuse = False
     cache_manager.reuse_match_backoff = 0
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
-    cache_manager._get_max_tokens_from_quota = lambda _: max_seq_len
     # Mirrors __init__: without helix the ledger block equals the physical
     # page (the helper re-enacts construction for partial instances).
     cache_manager._ledger_tokens_per_block = 128
@@ -837,10 +836,16 @@ def test_default_uses_allocator_fallback() -> None:
     [CacheType.SELF, CacheType.SELFKONLY],
     ids=["full_attention", "key_only"],
 )
-def test_avg_seq_len_builds_warmup_constraints(kv_cache_type: CacheType) -> None:
+@pytest.mark.parametrize(
+    "max_attention_window_vec", [[None], [128, None]], ids=["uniform", "mixed"]
+)
+def test_avg_seq_len_does_not_require_max_length_warmup(
+    kv_cache_type: CacheType, max_attention_window_vec: list[int | None]
+) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(use_kv_cache_manager_v2=True, host_cache_size=0, avg_seq_len=1024),
         kv_cache_type=kv_cache_type,
+        max_attention_window_vec=max_attention_window_vec,
         max_batch_size=3,
         max_seq_len=1024,
         max_num_tokens=2048,
@@ -851,15 +856,7 @@ def test_avg_seq_len_builds_warmup_constraints(kv_cache_type: CacheType) -> None
         [KVCacheDesc(capacity=2048, history_length=0)]
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
     )
-    assert config.constraints == [
-        BatchDesc(
-            [
-                KVCacheDesc(capacity=1024, history_length=1023),
-            ]
-        ),
-        BatchDesc([KVCacheDesc(capacity=3, history_length=0)] * 3),
-        BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
-    ]
+    assert config.constraints == []
 
 
 @pytest.fixture(
@@ -913,6 +910,7 @@ def test_full_attention_warmup_respects_allocated_budget(
     # These small quotas round up to a 2 MiB GPU allocation grain. The model's
     # full context requires at least 256 MiB, far beyond either configured budget.
     assert 0 < allocated_bytes <= requested_quota + (2 << 20)
+    assert manager.kv_cache_manager_py_config.constraints == []
     assert manager.max_num_tokens < manager.max_seq_len < 131072
 
     requests = manager.add_dummy_requests(
@@ -1248,7 +1246,7 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     )
 
     assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
-    assert config.constraints[2] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
+    assert config.constraints == []
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
