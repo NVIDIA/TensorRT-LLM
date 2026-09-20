@@ -100,7 +100,9 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 
-CONNECTOR_CACHE_FOLDER_KEY = "CONNECTOR_CACHE_FOLDER"
+# The TLLM_ prefix is load-bearing: MpiPoolSession forwards only TRTLLM*/TLLM*
+# variables to spawned workers, and the scheduler reads this key inside them.
+CONNECTOR_CACHE_FOLDER_KEY = "TLLM_CONNECTOR_CACHE_FOLDER"
 
 
 @dataclass

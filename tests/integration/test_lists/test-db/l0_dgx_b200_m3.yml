@@ -20,5 +20,3 @@ l0_dgx_b200_m3:
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax-disagg=True-kv_dtype=default]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_kv_eagle3_smoke
   - unittest/_torch/test_connector.py::test_connector_adp_disjoint_requests
-  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[False]
-  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[True]

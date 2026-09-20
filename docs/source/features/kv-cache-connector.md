@@ -344,8 +344,10 @@ This example implements a file-system based KV cache.
     It writes a temporary file in the same directory and atomically publishes
     the completed file so concurrent owners cannot read a partial write.
 
-For an ADP demonstration, point `CONNECTOR_CACHE_FOLDER` at the same shared
-filesystem directory on every rank. Use a dedicated directory for each model
+For an ADP demonstration, point `TLLM_CONNECTOR_CACHE_FOLDER` at the same shared
+filesystem directory on every rank. The `TLLM_` prefix matters: only `TRTLLM*`
+and `TLLM*` variables are forwarded to spawned MPI workers, and the scheduler
+reads this variable inside them. Use a dedicated directory for each model
 revision and KV representation. The example supports unsharded attention KV
 (single rank or ADP); it does not support sharded attention TP or chunked prefill.
 This filesystem example demonstrates sharing, not elastic HBM placement or

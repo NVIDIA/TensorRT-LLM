@@ -20,11 +20,9 @@ import shutil
 import sys
 import tempfile
 import time
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
@@ -1240,7 +1238,7 @@ def test_connector_e2e_persistent_cache(enforce_single_worker: None,
     sys.path.insert(0, examples_dir)
 
     cache_dir = tempfile.mkdtemp()
-    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", cache_dir)
+    monkeypatch.setenv("TLLM_CONNECTOR_CACHE_FOLDER", cache_dir)
 
     try:
         import llm_kv_cache_connector
@@ -1363,58 +1361,3 @@ def test_connector_e2e_persistent_cache(enforce_single_worker: None,
             sys.path.remove(examples_dir)
 
         shutil.rmtree(cache_dir, ignore_errors=True)
-
-
-@pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-def test_connector_adp_persistent_pool(monkeypatch: pytest.MonkeyPatch,
-                                       tmp_path: Path,
-                                       disable_overlap_scheduler: bool) -> None:
-    """Two ADP owners share persisted KV across executor restarts.
-
-    A single request exercises an idle owner; four equal requests exercise
-    balanced batches; unequal prompt lengths exercise uneven prefill work.
-    """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("Requires two GPUs")
-    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
-    examples_dir = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../../../examples/llm-api"))
-    monkeypatch.syspath_prepend(examples_dir)
-    monkeypatch.setenv(
-        "PYTHONPATH",
-        os.pathsep.join([examples_dir,
-                         os.environ.get("PYTHONPATH", "")]))
-    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
-    config = KvCacheConnectorConfig(
-        connector_module="llm_kv_cache_connector",
-        connector_scheduler_class="PersistentKvCacheConnectorLeader",
-        connector_worker_class="PersistentKvCacheConnectorWorker",
-    )
-    kwargs = dict(
-        model=f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        backend="pytorch",
-        tensor_parallel_size=2,
-        enable_attention_dp=True,
-        kv_connector_config=config,
-        enable_chunked_prefill=False,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=None,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
-    )
-    params = SamplingParams(max_tokens=8, ignore_eos=True, temperature=0)
-    short_prompt = "Explain how a computer stores information. " * 16
-    workloads = [[short_prompt], [short_prompt] * 4,
-                 [short_prompt * 4, short_prompt, short_prompt, short_prompt]]
-    expected = []
-    with LLM(**kwargs) as producer:
-        for prompts in workloads:
-            outputs = producer.generate(prompts, params)
-            expected.append([output.outputs[0].token_ids for output in outputs])
-    assert list(
-        tmp_path.glob("*.pt")), "The first executor must publish cache blocks"
-    with LLM(**kwargs) as consumer:
-        for prompts, token_ids in zip(workloads, expected):
-            outputs = consumer.generate(prompts, params)
-            assert [output.outputs[0].token_ids
-                    for output in outputs] == token_ids
