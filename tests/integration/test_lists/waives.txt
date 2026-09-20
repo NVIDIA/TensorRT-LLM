@@ -293,6 +293,7 @@ unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP
 unittest/llmapi/test_memory_profiling.py::test_profile_kvcache SKIP (https://nvbugs/5580781)
 unittest/llmapi/test_mpi_session.py::test_remote_mpi_session[flashinfer_workspace] SKIP (https://nvbugs/6758990)
 unittest/others/test_vendor_sources.py::test_exact_create_check_digest_and_sync SKIP (https://nvbugs/6746167)
+unittest/usage/test_llmapi_config_telemetry_docs.py::test_build_capture_manifest_matches_committed_golden SKIP (https://nvbugs/6811958)
 verl/test_verl_cases.py::test_async_generate SKIP (https://nvbugs/6683838)
 verl/test_verl_cases.py::test_async_memory_management SKIP (https://nvbugs/6683838)
 verl/test_verl_cases.py::test_init_without_device_mesh SKIP (https://nvbugs/6683838)
