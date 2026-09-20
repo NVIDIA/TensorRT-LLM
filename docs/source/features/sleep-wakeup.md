@@ -215,25 +215,61 @@ The POST body is optional. An omitted body or `{}` selects the defaults
 described in the Python API. To select specific resources, send
 `{"tags":["model","model_weights"]}`.
 
-Every request must include `x-trtllm-runtime-control-auth` containing
-`sha256=<hex digest>`, where the digest is HMAC-SHA256 of the exact transmitted
-body. Sign an empty byte string for a GET or a body-less POST. This Python
-example signs and sends matching bytes:
+Every request must include these headers:
+
+- `x-trtllm-runtime-control-auth: sha256=<hex digest>`
+- `x-trtllm-runtime-control-timestamp: <Unix seconds>`
+- `x-trtllm-runtime-control-nonce: <32 lowercase hexadecimal characters>`
+
+The digest is HMAC-SHA256 over this byte sequence:
+
+```text
+b"trtllm-runtime-control-v1\n"
++ uppercase_method_ascii + b"\n"
++ registered_route_path_utf8 + b"\n"
++ decimal_timestamp_ascii + b"\n"
++ lowercase_hex_nonce_ascii + b"\n"
++ exact_transmitted_body
+```
+
+The route path has one leading slash, no trailing slash, and excludes any
+deployment root path and query string. Sign an empty byte string for a GET or a
+body-less POST. This Python example signs and sends matching bytes:
 
 ```python
 import hashlib
 import hmac
 import json
 import os
+import secrets
+import time
 
 import requests
 
 key = os.environ["TRTLLM_RUNTIME_CONTROL_API_KEY"].encode()
 
 
-def auth(body: bytes) -> dict[str, str]:
-    digest = hmac.new(key, body, hashlib.sha256).hexdigest()
-    return {"x-trtllm-runtime-control-auth": f"sha256={digest}"}
+def auth(method: str, path: str, body: bytes) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    payload = (
+        b"trtllm-runtime-control-v1\n"
+        + method.upper().encode("ascii")
+        + b"\n"
+        + path.encode()
+        + b"\n"
+        + timestamp.encode("ascii")
+        + b"\n"
+        + nonce.encode("ascii")
+        + b"\n"
+        + body
+    )
+    digest = hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return {
+        "x-trtllm-runtime-control-auth": f"sha256={digest}",
+        "x-trtllm-runtime-control-timestamp": timestamp,
+        "x-trtllm-runtime-control-nonce": nonce,
+    }
 
 
 body = json.dumps(
@@ -243,13 +279,16 @@ body = json.dumps(
 response = requests.post(
     "http://localhost:8000/release_memory",
     data=body,
-    headers={"content-type": "application/json", **auth(body)},
+    headers={
+        "content-type": "application/json",
+        **auth("POST", "/release_memory", body),
+    },
 )
 response.raise_for_status()
 
 status = requests.get(
     "http://localhost:8000/memory_status",
-    headers=auth(b""),
+    headers=auth("GET", "/memory_status", b""),
 )
 print(status.json())
 
@@ -258,7 +297,10 @@ resume_body = json.dumps({"tags": ["model_weights"]},
 requests.post(
     "http://localhost:8000/resume_memory",
     data=resume_body,
-    headers={"content-type": "application/json", **auth(resume_body)},
+    headers={
+        "content-type": "application/json",
+        **auth("POST", "/resume_memory", resume_body),
+    },
 ).raise_for_status()
 ```
 

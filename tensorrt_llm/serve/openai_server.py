@@ -1523,8 +1523,17 @@ class OpenAIServer(_VideoRoutesMixin):
     async def _require_runtime_control_auth(self, raw_request: Request) -> None:
         body = await raw_request.body()
         try:
-            validate_runtime_control_request(self._runtime_control_api_key,
-                                             body, raw_request.headers)
+            route = raw_request.scope.get("route")
+            route_path = getattr(route, "path", None)
+            if route_path is None:
+                raise ValueError("Runtime control route is unavailable.")
+            validate_runtime_control_request(
+                self._runtime_control_api_key,
+                raw_request.method,
+                route_path,
+                body,
+                raw_request.headers,
+            )
         except ValueError as error:
             raise HTTPException(
                 status_code=HTTPStatus.UNAUTHORIZED,
