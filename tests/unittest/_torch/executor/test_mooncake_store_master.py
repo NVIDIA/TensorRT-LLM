@@ -185,15 +185,24 @@ def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
     with pytest.raises(ValueError, match="mooncake_store describes a Mooncake pool"):
         KvCacheConnectorConfig(
             connector="lmcache",
-            mooncake_store=MooncakeStoreConfig(launch_master=True),
+            mooncake_store=MooncakeStoreConfig(launch_master=True, model_key="m"),
         )
     # Naming the module rather than the preset selects the same connector.
     KvCacheConnectorConfig(
         connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
         connector_scheduler_class="MooncakeStoreConnectorScheduler",
         connector_worker_class="MooncakeStoreConnectorWorker",
-        mooncake_store=MooncakeStoreConfig(launch_master=True),
+        mooncake_store=MooncakeStoreConfig(launch_master=True, model_key="m"),
     )
+
+
+def test_a_described_pool_needs_a_model_key():
+    """Two checkpoints that agree on the namespace read each other's pages."""
+    with pytest.raises(ValueError, match="mooncake_store.model_key is required"):
+        KvCacheConnectorConfig(
+            connector="mooncake-store",
+            mooncake_store=MooncakeStoreConfig(launch_master=True),
+        )
 
 
 # ---- the rendered client config ----
@@ -208,6 +217,7 @@ def test_client_config_is_what_the_connector_reads_back(tmp_path):
         global_segment_size="64GiB",
         local_buffer_size="4GiB",
         cache_prefix="trtllm-m3",
+        model_key="minimax-m3@rev7",
         stage_through_host=True,
         transfer_batch_size=32,
     )
@@ -222,6 +232,9 @@ def test_client_config_is_what_the_connector_reads_back(tmp_path):
     assert parsed.global_segment_size == 64 * 1024**3
     assert parsed.local_buffer_size == 4 * 1024**3
     assert parsed.cache_prefix == "trtllm-m3"
+    # Reaches the ranks the server spawns, which otherwise have no model key
+    # and would refuse to name a page.
+    assert parsed.resolve_model_key("/models/ignored") == "minimax-m3@rev7"
     assert parsed.stage_through_host is True
     assert parsed.transfer_batch_size == 32
 
@@ -231,6 +244,7 @@ def test_client_config_omits_the_fields_the_pool_left_unset():
     pool = MooncakeStoreConfig(master_server_address="host:50051")
     written = master_module._client_config(pool, "host:50051")
     assert "cache_prefix" not in written
+    assert "model_key" not in written
     assert "staging_buffer_bytes" not in written
 
 
@@ -424,7 +438,9 @@ def test_provisioning_is_a_no_op_unless_a_pool_is_described(config):
 def test_a_described_pool_is_provisioned(running_master):
     config = KvCacheConnectorConfig(
         connector="mooncake-store",
-        mooncake_store=MooncakeStoreConfig(master_server_address=running_master),
+        mooncake_store=MooncakeStoreConfig(
+            master_server_address=running_master, model_key="test-model"
+        ),
     )
     with maybe_provision_pool(config):
         written = json.loads(open(os.environ[CONFIG_PATH_ENV]).read())

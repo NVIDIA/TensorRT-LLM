@@ -2383,6 +2383,15 @@ class MooncakeStoreConfig(StrictBaseModel):
         None,
         description="Key namespace for the pool. Bump it after any change to "
         "page layout or contents. Defaults to 'trtllm'.")
+    model_key: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Identity the keys are namespaced by. Required whenever a "
+        "pool is described here, because engines sharing a pool read each "
+        "other's pages exactly when they agree on this. Give checkpoints that "
+        "differ in weights, revision, quantization, or anything else that "
+        "changes the KV distinct values. TRTLLM_MOONCAKE_STORE_MODEL_KEY "
+        "overrides it for a single process.")
     stage_through_host: bool = Field(
         False,
         telemetry=False,
@@ -2531,6 +2540,16 @@ class KvCacheConnectorConfig(StrictBaseModel):
                 "mooncake_store describes a Mooncake pool, but this config "
                 f"resolves to connector_module={self.connector_module!r}. "
                 "Set connector: mooncake-store, or drop mooncake_store.")
+        if (self.mooncake_store is not None
+                and self.mooncake_store.model_key is None):
+            raise ValueError(
+                "mooncake_store.model_key is required. Engines sharing a pool "
+                "read each other's pages exactly when they agree on this, so "
+                "there is no safe default: deriving one from the model path "
+                "would give org-a/model and org-b/model, or two revisions "
+                "mounted under one directory name, the same namespace for "
+                "different weights. Set it to a value that separates this "
+                "checkpoint from any other an engine on this pool may load.")
         return self
 
 

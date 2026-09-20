@@ -340,6 +340,8 @@ def _client_config(
     }
     if pool.cache_prefix is not None:
         config["cache_prefix"] = pool.cache_prefix
+    if pool.model_key is not None:
+        config["model_key"] = pool.model_key
     # Left out when unset so the connector's own default applies instead of a
     # second copy of it here.
     if pool.staging_buffer_bytes is not None:

@@ -309,12 +309,15 @@ def test_config_metadata_server_falls_back_to_the_handshake(tmp_path, monkeypatc
     assert MooncakeStoreConnectorConfig.from_env().metadata_server == "P2PHANDSHAKE"
 
 
-def test_config_model_key_defaults_to_basename(store_config, tmp_path, monkeypatch):
+def test_config_requires_an_explicit_model_key(store_config, tmp_path, monkeypatch):
+    # A default derived from the path would let org-a/model and org-b/model
+    # agree on a namespace while disagreeing on what the pages mean.
     path = tmp_path / "no_model_key.json"
     path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051"}))
     monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
     config = MooncakeStoreConnectorConfig.from_env()
-    assert config.resolve_model_key("/models/MiniMax-M3/") == "MiniMax-M3"
+    with pytest.raises(ValueError, match="needs a model key"):
+        config.resolve_model_key("/models/MiniMax-M3/")
 
 
 @pytest.mark.parametrize(
@@ -335,7 +338,7 @@ def test_config_namespace_env_overrides(store_config, monkeypatch):
     config = MooncakeStoreConnectorConfig.from_env()
 
     assert config.cache_prefix == "tenant-a"
-    # Overrides the JSON's model_key, not just the basename default.
+    # Overrides the JSON's model_key rather than only supplying a missing one.
     assert config.resolve_model_key("/models/test-model") == "llama-3.1-8b@rev7"
 
 
