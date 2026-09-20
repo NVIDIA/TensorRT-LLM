@@ -27,6 +27,8 @@ Checks per case:
     values — any kernel read past ``n_valid`` fails the value comparison.
 """
 
+import os
+
 import pytest
 import torch
 from utils.util import getSMVersion
@@ -48,6 +50,9 @@ if getSMVersion() not in (100, 103):
         allow_module_level=True,
     )
 
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+    gvr_topk_decode_self_sampling as ss_dev,
+)
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
     gvr_topk_decode_self_sampling_host as ss_host,
 )
@@ -2161,3 +2166,173 @@ def test_selfsampling_warmup_block_skip_populates_launchers():
     key = (*_varlen_cache_key(128, msl_c, k, msl_c, 1, cr), "skip")
     assert key in ss_host._VARLEN_CACHE
     assert ss_host._VARLEN_CACHE[key][0] == "main"
+
+
+def _bm_line_row(kind, n, seed):
+    """Row shapes that steer the block-max line.  'spread': ordinary (line
+    taken).  'tiepile': thousands of block maxima tied at the K-th boundary
+    (S > 4096 -> sampling fallback; smaller piles keep the line with S > K).
+    'allequal' / 'allzero': degenerate histogram -> sampling fallback.  'spiky':
+    300 blocks entirely high -> > 4096 candidates (overflow re-sweep on the
+    BLK=512/256 arms).  'tinyspread': block maxima within 2^-10 of 1.0 (bin
+    edges below fp32 resolution).  'posinf': one +inf logit (hi not finite ->
+    fallback).  'tailmax': row maximum in the scalar tail (n % 4 != 0)."""
+    g = torch.Generator(device=_DEV).manual_seed(seed)
+    x = torch.randn(n, generator=g, dtype=torch.float32, device=_DEV) * 0.05
+    nb = n // 32
+    if kind.startswith("tiepile"):
+        pile = int(kind[len("tiepile") :])
+        perm = torch.randperm(nb, generator=g, device=_DEV)
+        x[perm[:200] * 32] = 6.0
+        x[perm[200 : 200 + pile] * 32 + 5] = 4.0
+    elif kind == "allequal":
+        x[torch.arange(nb, device=_DEV) * 32 + 7] = 3.0
+    elif kind == "allzero":
+        x.zero_()
+    elif kind == "spiky":
+        perm = torch.randperm(nb, generator=g, device=_DEV)
+        for j in perm[:300].tolist():
+            x[j * 32 : j * 32 + 32] += 5.0
+    elif kind == "tinyspread":
+        x = 1.0 + torch.rand(n, generator=g, dtype=torch.float32, device=_DEV) * (2.0**-10)
+    elif kind == "posinf":
+        x[n // 3] = float("inf")
+    return x
+
+
+def _bm_line_case(rows, msl_c, k, kind, n_valid, seed=0, next_n=1, bm_mode="exact"):
+    cr = 4
+    lg = torch.empty(rows, msl_c, dtype=torch.float32, device=_DEV)
+    for r in range(rows):
+        lg[r] = _bm_line_row(kind, msl_c, seed=1000 * rows + 7 * r + k + seed)
+    if kind == "tailmax":
+        lg[:, n_valid - 1] = 100.0  # tail position: n_valid % 4 != 0
+    lg[:, n_valid:] = 1.0e9  # garbage beyond the valid prefix (never a candidate)
+    batch = rows // next_n
+    kv = torch.full((batch,), n_valid * cr, dtype=torch.int32, device=_DEV)
+    if next_n > 1:
+        # kv % 4 in 1..3: rows rr < next_n-1 see one position fewer than the
+        # request-level block_max the scorer emits (inflated last block)
+        kv -= torch.arange(batch, device=_DEV, dtype=torch.int32) % 3 + 1
+        bm = _host_block_max(lg, (kv // cr * cr).repeat_interleave(next_n), 1, cr)
+    else:
+        bm = _host_block_max(lg, kv, 1, cr)
+    if bm_mode == "+1e-4":
+        bm = bm + 1.0e-4
+    elif bm_mode == "+0.5":
+        bm = bm + 0.5
+    elif bm_mode == "*4+0.5":
+        bm = bm * 4.0 + 0.5
+    elif bm_mode == "+3e38rec":
+        bm[:, 5] = 3.0e38
+    jlim = ((n_valid >> 2) + 7) >> 3
+    bm[:, jlim:] = 3.0e38  # stale records past the row's last block: never read
+    ref = _reference_varlen_indices(lg, kv, next_n, cr, k)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        lg, kv, out, next_n=next_n, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+    )
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out, ref, f"{kind}/{bm_mode}/nn{next_n}")
+
+
+@pytest.mark.parametrize(
+    "rows,msl_c,k,kind,n_valid",
+    [
+        (128, 262144, 1024, "spread", 262144),  # (1024, 8, 1) arm, 1M, full row
+        (128, 262144, 1024, "spread", 262127),  # valid length not a multiple of 32
+        (128, 262144, 512, "spread", 262127),
+        (128, 262144, 1024, "spread", 10000),  # nb = 313 < K inside a 1M envelope
+        (128, 262144, 1024, "spread", 32 * 1023),  # nb = K - 1
+        (128, 262144, 1024, "spread", 32 * 1024),  # nb = K
+        (128, 262144, 1024, "spread", 32 * 1025),  # nb = K + 1
+        (128, 262144, 1024, "tailmax", 262114),  # n4 % 8 == 0: row max in the tail
+        (128, 262144, 1024, "tiepile5000", 262144),  # S > 4096 -> sampling fallback
+        (128, 262144, 1024, "tiepile1500", 262144),  # S = 1700 > K, line kept
+        (128, 262144, 1024, "allequal", 262144),  # max == min -> fallback
+        (128, 262144, 1024, "allzero", 262144),
+        (128, 262144, 1024, "tinyspread", 262144),
+        (128, 262144, 1024, "posinf", 262144),  # hi = +inf -> fallback
+        (200, 131072, 1024, "spread", 131059),  # (512, 8, 2) arm, 512k
+        (200, 131072, 1024, "spiky", 131072),  # > 4096 candidates: list re-sweep
+        (200, 131072, 1024, "tiepile3000", 131072),
+        (300, 131072, 1024, "spread", 131072),  # (256, 8, 4) arm, 512k
+        (300, 131072, 1024, "spiky", 131063),
+        (300, 131072, 512, "tiepile3000", 131063),
+        (300, 131072, 512, "spiky", 131072),
+    ],
+    ids=lambda v: str(v),
+)
+def test_selfsampling_block_skip_bm_line(rows, msl_c, k, kind, n_valid):
+    """Compacted-skip rows derive the first line from the block maxima; the
+    result must stay tie-aware exact whether the line is taken (spread rows,
+    odd valid lengths with -FLT_MAX padded records, > SCPB candidates on the
+    small-CTA arms) or the sampling path is kept (fewer than K blocks, tie
+    piles, all-equal / all-zero rows, +inf).  The default build must compile
+    the skip engine with the block line (knob on)."""
+    plan = ss_host.route(rows, msl_c, msl_c, k)
+    assert plan["kernel"] == "main" and plan["tpl"][5] is False, plan
+    _bm_line_case(rows, msl_c, k, kind, n_valid)
+    assert ss_dev.BM_LINE is True
+    keys = [key for key in ss_dev._COMPILE_CACHE if key[4] is True]
+    assert keys and all(key[-1] is True for key in keys), keys
+
+
+@pytest.mark.parametrize("bm_mode", ["+1e-4", "+0.5", "*4+0.5", "+3e38rec"], ids=lambda v: v)
+@pytest.mark.parametrize(
+    "rows,msl_c", [(128, 262144), (200, 131072), (300, 131072)], ids=lambda v: str(v)
+)
+def test_selfsampling_block_skip_bm_line_overestimated(rows, msl_c, bm_mode):
+    """Over-estimated block maxima (still valid upper bounds) can push the
+    block line above the K-th logit: `+1e-4` (below one level-1 bin) is
+    repaired by the TSH rung, `+0.5` / `*4+0.5` by the floor retry; a `+3e38`
+    record makes the histogram range non-finite -> sampling fallback with a
+    permanently surviving block."""
+    _bm_line_case(rows, msl_c, 1024, "spread", msl_c - 9, bm_mode=bm_mode)
+
+
+@pytest.mark.parametrize(
+    "rows,msl_c,k", [(128, 262144, 1024), (200, 131072, 512)], ids=lambda v: str(v)
+)
+def test_selfsampling_block_skip_bm_line_mtp_rows(rows, msl_c, k):
+    """next_n = 4 with kv % 4 in 1..3: the request-level block_max includes a
+    position the shorter rows exclude (inflated last block) -> exact."""
+    _bm_line_case(rows, msl_c, k, "spread", msl_c - 40, next_n=4)
+
+
+def test_selfsampling_block_skip_bm_line_env_off():
+    """TRTLLM_GVR_BM_LINE=0 compiles the skip engine with the sampling line
+    (bm_line False, distinct compile key) and stays exact on a skip-armed row."""
+    import subprocess
+    import sys
+
+    code = r"""
+import os, torch
+assert os.environ["TRTLLM_GVR_BM_LINE"] == "0"
+import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import gvr_topk_decode_self_sampling as ss
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import gvr_topk_decode_self_sampling_host as ss_host
+assert ss.BM_LINE is False
+rows, msl_c, k, cr = 128, 65536, 1024, 4
+torch.manual_seed(11)
+lg = torch.randn(rows, msl_c, dtype=torch.float32, device="cuda")
+kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device="cuda")
+nb = msl_c // 32
+bm = lg.view(rows, nb, 32).amax(2).contiguous()
+out = torch.full((rows, k), -7, dtype=torch.int32, device="cuda")
+ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm)
+torch.cuda.synchronize()
+keys = [key for key in ss._COMPILE_CACHE if key[4] is True]
+assert keys and all(key[-1] is False for key in keys), keys
+ref = torch.topk(lg, k, dim=1).values.sort(dim=1).values
+got = lg.gather(1, out.long()).sort(dim=1).values
+assert torch.equal(got, ref)
+print("BM_LINE_OFF_OK")
+"""
+    env = dict(os.environ, TRTLLM_GVR_BM_LINE="0")
+    res = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=900
+    )
+    assert res.returncode == 0 and "BM_LINE_OFF_OK" in res.stdout, (
+        res.stdout[-2000:] + res.stderr[-4000:]
+    )
