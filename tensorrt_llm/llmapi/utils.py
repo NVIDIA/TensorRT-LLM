@@ -263,8 +263,8 @@ def download_hf_partial(model: str,
 
 def use_modelscope() -> bool:
     """Return whether remote model IDs should resolve through ModelScope."""
-    return os.environ.get("TRTLLM_USE_MODELSCOPE", "false").strip().lower(
-    ) in ("1", "true")
+    return os.environ.get("TRTLLM_USE_MODELSCOPE",
+                          "false").strip().lower() in ("1", "true")
 
 
 def _snapshot_download(model: str,
@@ -273,9 +273,8 @@ def _snapshot_download(model: str,
                        allow_patterns: Optional[List[str]] = None) -> str:
     """Download a snapshot from ModelScope or Hugging Face.
 
-    ModelScope uses different names for its file filters. Keep the optional
-    import in this boundary so standard TensorRT-LLM installations do not need
-    the ``modelscope`` package.
+    Keep the optional import in this boundary so standard TensorRT-LLM
+    installations do not need the ``modelscope`` package.
     """
     local_files_only = huggingface_hub.constants.HF_HUB_OFFLINE
     if use_modelscope():
@@ -284,7 +283,8 @@ def _snapshot_download(model: str,
         except ImportError as error:
             raise ImportError(
                 "TRTLLM_USE_MODELSCOPE is enabled, but ModelScope is not "
-                "installed. Install it with `pip install modelscope`.") from error
+                "installed. Install it with `pip install 'modelscope>=1.20'`."
+            ) from error
 
         kwargs = {
             "model_id": model,
@@ -292,18 +292,17 @@ def _snapshot_download(model: str,
             "revision": revision,
         }
         if ignore_patterns:
-            kwargs["ignore_file_pattern"] = ignore_patterns
+            kwargs["ignore_patterns"] = ignore_patterns
         if allow_patterns:
-            kwargs["allow_file_pattern"] = allow_patterns
+            kwargs["allow_patterns"] = allow_patterns
         return snapshot_download(**kwargs)
 
-    return hf_snapshot_download(
-        model,
-        local_files_only=local_files_only,
-        ignore_patterns=ignore_patterns,
-        allow_patterns=allow_patterns,
-        revision=revision,
-        tqdm_class=DisabledTqdm)
+    return hf_snapshot_download(model,
+                                local_files_only=local_files_only,
+                                ignore_patterns=ignore_patterns,
+                                allow_patterns=allow_patterns,
+                                revision=revision,
+                                tqdm_class=DisabledTqdm)
 
 
 def download_hf_pretrained_config(model: str,

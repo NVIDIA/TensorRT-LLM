@@ -13,8 +13,7 @@ from tensorrt_llm.llmapi import LlmArgs
 from tensorrt_llm.llmapi.utils import (ApiStatusRegistry,
                                        _set_affinity_all_threads,
                                        configure_cpu_affinity,
-                                       download_hf_model,
-                                       download_hf_partial,
+                                       download_hf_model, download_hf_partial,
                                        generate_api_docs_as_docstring)
 
 _TASK_DIR = "/proc/self/task"
@@ -53,7 +52,7 @@ def test_modelscope_download_maps_snapshot_filters(monkeypatch, tmp_path):
         "model_id": "Qwen/Qwen3-0.6B",
         "local_files_only": True,
         "revision": "v1",
-        "allow_file_pattern": ["*.json"],
+        "allow_patterns": ["*.json"],
     }]
 
 
@@ -70,7 +69,7 @@ def test_modelscope_download_maps_ignored_files(monkeypatch, tmp_path):
     downloaded = download_hf_model("Qwen/Qwen3-0.6B")
 
     assert downloaded == tmp_path
-    assert calls[0]["ignore_file_pattern"] == ["original/**/*"]
+    assert calls[0]["ignore_patterns"] == ["original/**/*"]
 
 
 def test_hugging_face_download_remains_the_default(monkeypatch, tmp_path):
@@ -81,8 +80,7 @@ def test_hugging_face_download_remains_the_default(monkeypatch, tmp_path):
         return str(tmp_path)
 
     monkeypatch.delenv("TRTLLM_USE_MODELSCOPE", raising=False)
-    monkeypatch.setattr(llmapi_utils, "hf_snapshot_download",
-                        snapshot_download)
+    monkeypatch.setattr(llmapi_utils, "hf_snapshot_download", snapshot_download)
 
     downloaded = download_hf_partial("Qwen/Qwen3-0.6B", ["config.json"])
 
@@ -98,7 +96,7 @@ def test_modelscope_download_requires_optional_dependency(monkeypatch):
                         "modelscope.hub.snapshot_download",
                         raising=False)
 
-    with pytest.raises(ImportError, match="pip install modelscope"):
+    with pytest.raises(ImportError, match="modelscope>=1.20"):
         download_hf_model("Qwen/Qwen3-0.6B")
 
 

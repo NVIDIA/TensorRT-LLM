@@ -38,7 +38,7 @@ instead of the Hugging Face Hub, install the optional client and enable the
 ModelScope download path before starting TensorRT-LLM:
 
 ```console
-pip install modelscope
+pip install 'modelscope>=1.20'
 export TRTLLM_USE_MODELSCOPE=true
 trtllm-serve Qwen/Qwen3-0.6B
 ```
