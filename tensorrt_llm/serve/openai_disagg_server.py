@@ -562,15 +562,15 @@ class OpenAIDisaggServer:
         """Return model list compatible with OpenAI API /v1/models endpoint.
 
         The workers are the source of truth for the served model name, so
-        ``/v1/models`` is proxied from the first reachable ctx/gen worker. When
-        no worker answers -- e.g. none is up yet -- fall back to the model named
-        in the disagg config, and to ``"unknown"`` only when the config carries
-        no worker entries either (service discovery).
+        ``/v1/models`` is proxied from the first reachable ctx/gen worker. Every
+        worker is tried in turn, so one unhealthy worker does not hide the name
+        served by its healthy peers. When no worker answers -- e.g. none is up
+        yet -- fall back to the model named in the disagg config, and to
+        ``"unknown"`` only when the config carries no worker entries either
+        (service discovery).
         """
         for router in (self._ctx_router, self._gen_router):
-            servers = router.servers
-            if servers:
-                server = servers[0]
+            for server in router.servers:
                 server_scheme = "http://" if not server.startswith("http://") else ""
                 url = f"{server_scheme}{server}/v1/models"
                 try:

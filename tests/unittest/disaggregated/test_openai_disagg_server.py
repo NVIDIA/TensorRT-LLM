@@ -396,6 +396,29 @@ async def test_get_models_falls_back_to_the_generation_worker(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_models_tries_every_worker_of_a_router(monkeypatch):
+    """An unhealthy worker must not hide the name served by its healthy peer."""
+    payload = {"object": "list", "data": [{"id": "TinyLlama-1.1B-Chat-v1.0"}]}
+    server, requested_urls = _disagg_server_with_workers(
+        monkeypatch,
+        ctx_servers=["localhost:8001", "localhost:8002"],
+        gen_servers=["localhost:8003"],
+        responses={
+            "http://localhost:8001/v1/models": aiohttp.ClientConnectionError("worker is down"),
+            "http://localhost:8002/v1/models": _FakeWorkerResponse(200, payload),
+        },
+    )
+
+    response = await server.get_models()
+
+    assert requested_urls == [
+        "http://localhost:8001/v1/models",
+        "http://localhost:8002/v1/models",
+    ]
+    assert json.loads(response.body) == payload
+
+
+@pytest.mark.asyncio
 async def test_get_models_falls_back_to_the_configured_model(monkeypatch):
     config = extract_disagg_cfg(
         context_servers={
