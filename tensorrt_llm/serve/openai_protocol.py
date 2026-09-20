@@ -1008,6 +1008,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    # Standard OpenAI field, accepted for compatibility. `false` is not
+    # enforced: the engine does not restrict how many tool calls the model
+    # emits per turn, so parallel emission remains model behavior either way.
+    parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
