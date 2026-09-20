@@ -332,7 +332,6 @@ class TestDeepseekV4CacheManager:
         enable_swa_scratch_reuse: bool = True,
         cold_page_codec_provider: object | None = None,
         host_cache_size: int | None = None,
-        avg_seq_len: int | None = None,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -356,7 +355,6 @@ class TestDeepseekV4CacheManager:
             event_buffer_max_size=0,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
             host_cache_size=host_cache_size,
-            avg_seq_len=avg_seq_len,
         )
 
         # Create mapping (single GPU, no parallelism)
@@ -1205,10 +1203,7 @@ class TestDeepseekV4CacheManager:
                     msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.name} (scales)",
                 )
 
-    @pytest.mark.parametrize("avg_seq_len", [None, 256], ids=["default", "explicit_avg"])
-    def test_warmup_constraints_preserve_deepseek_v4_capacity(
-        self, scratch_reuse_enabled: bool, avg_seq_len: int | None
-    ) -> None:
+    def test_max_num_tokens_is_used_by_base_config(self):
         max_batch_size = 2
         max_seq_len = 1024
         max_input_len = 127
@@ -1221,54 +1216,14 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[1, 4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
-            enable_swa_scratch_reuse=scratch_reuse_enabled,
-            avg_seq_len=avg_seq_len,
         )
 
-        requests = []
-        try:
-            config = cache_manager.kv_cache_manager_py_config
-            typical_seq_len = max_seq_len if avg_seq_len is None else avg_seq_len
-            assert config.typical_step == BatchDesc(
-                [
-                    KVCacheDesc(capacity=max_num_tokens, history_length=0),
-                    KVCacheDesc(capacity=typical_seq_len, history_length=typical_seq_len - 1),
-                ]
-            )
-            assert config.constraints == [
-                BatchDesc(
-                    [
-                        KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1),
-                        KVCacheDesc(capacity=1, history_length=0),
-                    ]
-                ),
-                BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)]),
+        assert cache_manager.kv_cache_manager_py_config.typical_step == BatchDesc(
+            [
+                KVCacheDesc(capacity=max_num_tokens, history_length=0),
+                KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1),
             ]
-
-            # Both V4 workloads must fit the native pools after the constraints
-            # move to the specialized manager.
-            generation_requests = cache_manager.add_dummy_requests(
-                request_ids=[0, 1], token_nums=[1, max_seq_len - 1], is_gen=True
-            )
-            assert generation_requests is not None
-            requests.extend(generation_requests)
-            long_cache = cache_manager.kv_cache_map[requests[1].py_request_id]
-            assert long_cache.capacity == max_seq_len
-            for request in requests:
-                cache_manager.free_resources(request)
-            requests.clear()
-
-            context_requests = cache_manager.add_dummy_requests(
-                request_ids=[0], token_nums=[max_num_tokens], is_gen=False
-            )
-            assert context_requests is not None
-            requests.extend(context_requests)
-            context_cache = cache_manager.kv_cache_map[requests[0].py_request_id]
-            assert context_cache.capacity == max_num_tokens
-        finally:
-            for request in requests:
-                cache_manager.free_resources(request)
-            cache_manager.shutdown()
+        )
 
     def test_indexer_cache_layout_default(self):
         """DeepSeek-V4 defaults to FP4 indexer K cache on Blackwell+."""
