@@ -260,6 +260,8 @@ def test_runner_warmup_capture_execute_and_shared_output():
     assert body.forward_calls == 6
     assert logits_processor.forward_calls == 6
     assert runner._shared_output is first_shared_output
+    assert runner.captured_token_buckets == [4, 8]
+    assert runner.replay_counts == {}
 
     original_forward = body.forward
     inputs["value"].fill_(3)
@@ -270,6 +272,11 @@ def test_runner_warmup_capture_execute_and_shared_output():
     assert body.forward_calls == 6
     assert logits_processor.forward_calls == 7
     assert body.forward == original_forward
+    assert runner.replay_counts == {4: 1}
+
+    runner.clear()
+    assert runner.captured_token_buckets == []
+    assert runner.replay_counts == {}
 
 
 def test_runner_first_bucket_segments_share_one_memory_pool():
@@ -311,9 +318,18 @@ def test_runner_graph_miss_nested_execute_and_exception_recovery():
     with pytest.raises(KeyError, match="No BCG captured"):
         runner.execute(4, lambda: None)
 
-    runner._graphs[4] = object()
+    class FailingGraph:
+        @staticmethod
+        def replay():
+            raise RuntimeError("replay failed")
+
+    runner._graphs[4] = FailingGraph()
     runner._outputs[4] = torch.zeros(1, device="cuda")
     original_forward = body.forward
+
+    with pytest.raises(RuntimeError, match="replay failed"):
+        runner.replay(4)
+    assert runner.replay_counts == {}
 
     def nested():
         return runner.execute(4, lambda: None)

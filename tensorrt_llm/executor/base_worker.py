@@ -1084,6 +1084,39 @@ class BaseWorker(GenerationExecutor):
 
         return startup_metrics
 
+    def get_prefill_cuda_graph_stats(self) -> dict:
+        """Return rank-local breakable prefill CUDA graph diagnostics.
+
+        The snapshot covers the primary model only and is not atomic with
+        inference. QSA dispatches are summed across layers and include capture
+        and warmup, so callers should use snapshot deltas for live requests.
+        """
+        stats = {
+            "captured_token_buckets": [],
+            "replay_counts": {},
+            "qsa_sparse_prefill_dispatches": 0,
+        }
+        if not self._is_pytorch_backend or self.engine is None:
+            return stats
+
+        model_engine = getattr(self.engine, "model_engine", None)
+        runner = getattr(model_engine, "breakable_cuda_graph_runner", None)
+        if runner is None:
+            return stats
+
+        sparse_prefill_dispatches = 0
+        model = getattr(model_engine, "model", None)
+        if model is not None:
+            for module in model.modules():
+                hooks = getattr(module, "sparse_attn_hooks", None)
+                sparse_prefill_dispatches += getattr(
+                    hooks, "num_sparse_prefill_dispatches", 0)
+
+        stats["captured_token_buckets"] = runner.captured_token_buckets
+        stats["replay_counts"] = runner.replay_counts
+        stats["qsa_sparse_prefill_dispatches"] = sparse_prefill_dispatches
+        return stats
+
     def start_profile(self,
                       output_dir: Optional[str] = None,
                       num_steps: Optional[int] = None,

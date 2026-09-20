@@ -1048,6 +1048,12 @@ class Qwen4ExpPLE(nn.Module):
         """Build recurrent contexts and the hashed per-head global row IDs."""
         history = ngram_context.index_select(0, metadata.state_indices).to(torch.long)
         combined = torch.cat([history, metadata.padded_tokens.to(torch.long)], dim=1)
+        if metadata.processed_tokens == 0:
+            # An attention-DP rank can have no live requests while another rank
+            # selects a prefill graph bucket. It must still enter the row-sharded
+            # embedding collectives, but there are no local contexts to hash.
+            ngram_ids = combined.new_empty((0, self.ple_embedding.ngram_heads))
+            return combined, ngram_ids
         windows = combined.unfold(1, self.ngram_size, 1)
         contexts = windows[metadata.req_indices, metadata.token_offsets]
         return combined, self.ple_embedding.hash_contexts(
@@ -1379,7 +1385,7 @@ class Qwen4ExpPLE(nn.Module):
         ):
             raise RuntimeError("PLE activations and recurrent-state pools must share a device")
         hidden_states = hidden_states[: m.processed_tokens]
-        if m.processed_tokens == 0:
+        if m.processed_tokens == 0 and not self.ple_embedding.use_attention_dp_sharding:
             # No recurrent state advances on an empty logical step. Preserve
             # the graph's physical row count with zero PLE contributions.
             return hidden_states.new_zeros((m.physical_tokens, hc_dim))
@@ -1393,6 +1399,12 @@ class Qwen4ExpPLE(nn.Module):
                 physical_tokens=m.physical_tokens,
                 all_rank_num_tokens=m.all_rank_num_tokens,
             ).flatten(start_dim=-2)
+
+        if m.processed_tokens == 0:
+            # The lookup above pairs this empty rank with its attention-DP peers'
+            # AllGather/ReduceScatter. Discard the empty local result without
+            # advancing recurrent state.
+            return hidden_states.new_zeros((m.physical_tokens, hc_dim))
 
         key = self.key_proj(embeddings)
         value = self.value_proj(embeddings)
