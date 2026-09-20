@@ -22,6 +22,7 @@
 #include <cute/int_tuple.hpp>
 #include <cute/layout.hpp>
 #include <cutlass/cutlass.h>
+#include <type_traits>
 
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
@@ -30,6 +31,7 @@
 
 using namespace cute;
 using namespace cutlass;
+using namespace cutlass::gemm;
 
 namespace sm120_blockscaled_gemm
 {
@@ -41,7 +43,7 @@ CUTE_HOST_DEVICE static T_offset compute_padded_offset(T_offset offset, T_index 
     return (offset + problem_idx * (alignment - 1)) / alignment * alignment;
 }
 
-template <int TileM_ = 32, int TileN_ = 128, int Stages_ = 4>
+template <int TileM_ = 32, int TileN_ = 128, int TileK_ = 128, int Stages_ = 4>
 struct SM120BlockScaledBuilder
 {
 
@@ -58,11 +60,12 @@ struct SM120BlockScaledBuilder
     static constexpr int kTileN = TileN_;
     static constexpr int kSFVecSize = 128; // fixed for 1x128 quantization
     static constexpr int kTileSF = 1;      // 1 sf block contains 4 e8m0 per 512 k elements
-    static constexpr int kTileK = 128;
+    static constexpr int kTileK = TileK_;
+    static_assert(kTileK == 64 || kTileK == 128, "kTileK must be 64 or 128");
     static constexpr int kNumTileKPerSF = 512 / kTileK;
     static constexpr int kNumStagePerSF = kNumTileKPerSF / AB_Stages;
-    static_assert(kNumStagePerSF > 0 && kNumStagePerSF <= 2, "kNumStagePerSF must be 1 or 2 ");
-    static_assert(kNumTileKPerSF % AB_Stages == 0, "kNumTileKPerSF must be divisible by AB_Stages");
+    static_assert(
+        kNumStagePerSF > 0 && kNumTileKPerSF % AB_Stages == 0, "kNumTileKPerSF must be divisible by AB_Stages");
     using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
     using ScaleTileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileSF>>;
     using ClusterShape = Shape<_1, _1, _1>;
@@ -70,18 +73,16 @@ struct SM120BlockScaledBuilder
 
     // ====== mma ======
     using PermMmaTileM = Int<32>;
-    // using PermMmaTileN = Int<64>;
-    // using PermMmaTileM = Layout<Shape<_16,_2,_2>, Stride<_1, _32, _16>>;
     using PermMmaTileN = Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>;
-    using PermMmaTileK = Underscore;
-    using MMA_Atom = MMA_Atom<SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<float_e4m3_t, float_e4m3_t, float, float_ue8m0_t,
-        32>>; // sm120 16x8x32 fp8 mma
-    using TiledMma = TiledMMA<MMA_Atom, Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>,
-        Tile<PermMmaTileM, PermMmaTileN, PermMmaTileK>>;
-    static_assert(kTileM % cute::size(PermMmaTileM{}) == 0, "size<0>(TileShape{}) % size(PermMmaTileM{}) == 0");
-    static_assert(kTileN % cute::size(PermMmaTileN{}) == 0, "size<1>(TileShape{}) % size(PermMmaTileN{}) == 0");
+    using MMA_Atom_t
+        = MMA_Atom<SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<float_e4m3_t, float_e4m3_t, float, float_ue8m0_t, 32>>;
+    using TiledMma = TiledMMA<MMA_Atom_t, Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>,
+        Tile<PermMmaTileM, PermMmaTileN, Underscore>>;
+    static_assert(kTileM % cute::size(PermMmaTileM{}) == 0);
+    static_assert(kTileN % cute::size(PermMmaTileN{}) == 0);
     static constexpr int kNumMathThreads = size(TiledMma::ThrLayoutVMNK{});
     static constexpr int kNumMathWarps = kNumMathThreads / 32;
+    static constexpr int kNumMathWG = kNumMathThreads / 128;
 
     CUTE_HOST_DEVICE
     static auto ceil_div(int const& x, int const& y)
@@ -107,10 +108,7 @@ struct SM120BlockScaledBuilder
     CUTE_HOST_DEVICE
     static auto deduce_sfa_layout(ProblemShape const& problem_shape)
     {
-        auto M = cute::get<0>(problem_shape);
-        auto N = cute::get<1>(problem_shape);
-        auto K = cute::get<2>(problem_shape);
-        auto L = cute::get<3>(problem_shape);
+        auto [M, N, K, L] = problem_shape;
         int64_t scale_m = static_cast<int64_t>(get_tma_aligned_size(M));
         int64_t scale_k = static_cast<int64_t>(ceil_div(K, 128 * 4));
         return make_layout(
@@ -120,10 +118,7 @@ struct SM120BlockScaledBuilder
     CUTE_HOST_DEVICE
     static auto deduce_sfb_layout(ProblemShape const& problem_shape)
     {
-        auto M = cute::get<0>(problem_shape);
-        auto N = cute::get<1>(problem_shape);
-        auto K = cute::get<2>(problem_shape);
-        auto L = cute::get<3>(problem_shape);
+        auto [M, N, K, L] = problem_shape;
         int64_t scale_n = static_cast<int64_t>(get_tma_aligned_size(N));
         int64_t scale_k = static_cast<int64_t>(ceil_div(K, 128 * 4));
         return make_layout(
@@ -174,13 +169,13 @@ struct SM120BlockScaledBuilder
         auto tile_shape_mnk = tile_shape(mma);
         auto ref_A = make_layout(make_shape(size<0>(tile_shape_mnk), _1{}));
         auto thr_tensor = thrfrg_SFA(ref_A, mma);
-        auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+        auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
         auto atile = make_tile(_,
             make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                           make_stride(Int<1>{}, Int<0>{})),
-                _));
-        auto tv_sfa = thr_tensor.compose(atile, _);
-        auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
+                _));                                          // (_,((_1,_4):(_1,_0),_))
+        auto tv_sfa = thr_tensor.compose(atile, _);           // mma_sfa_tv_layout
+        auto thridx_2_thrid = right_inverse(thr_layout_vmnk); // (_128:_1)
         auto tv_layout = tv_sfa.compose(thridx_2_thrid, _);
         return tv_layout;
     }
@@ -229,16 +224,19 @@ struct SM120BlockScaledBuilder
         auto tile_shape_mnk = tile_shape(mma);
         auto ref_B = make_layout(make_shape(size<1>(tile_shape_mnk), _1{}));
         auto thr_tensor = thrfrg_SFB(ref_B, mma);
-        auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+        auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
         auto btile = make_tile(_,
             make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                           make_stride(Int<0>{}, Int<1>{})),
-                _));
-        auto tv_sfb = thr_tensor.compose(btile, _);
-        auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
+                _));                                          // (_,((_4,_1):(_0,_1),_))
+        auto tv_sfb = thr_tensor.compose(btile, _);           // mma_sfb_tv_layout
+        auto thridx_2_thrid = right_inverse(thr_layout_vmnk); // (_128:_1)
         auto tv_layout = tv_sfb.compose(thridx_2_thrid, _);
         return tv_layout;
     }
+
+    // Number of K-tiles sharing one UE8M0 scale value (128/kTileK: 1 for K=128, 2 for K=64)
+    static constexpr int kKTilesPerScale = kSFVecSize / kTileK;
 
     template <class Tensor>
     CUTE_HOST_DEVICE static constexpr auto transform_fragment_for_qmma(Tensor&& tensor)
@@ -259,8 +257,11 @@ struct SM120BlockScaledBuilder
     using SmemCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, ElementB>;
 
     // ====== smem layout ======
-    using SmemLayoutAtomA = GMMA::Layout_K_SW128_Atom<ElementA>; // ((_8,_16),(_128,_1)):((_128,_1024),(_1,_0))
-    using SmemLayoutAtomB = GMMA::Layout_K_SW128_Atom<ElementB>; // ((_8,_16),(_128,_1)):((_128,_1024),(_1,_0))
+    // Select swizzle atom based on kTileK: SW128 for K=128, SW64 for K=64
+    using SmemLayoutAtomA
+        = std::conditional_t<kTileK == 128, GMMA::Layout_K_SW128_Atom<ElementA>, GMMA::Layout_K_SW64_Atom<ElementA>>;
+    using SmemLayoutAtomB
+        = std::conditional_t<kTileK == 128, GMMA::Layout_K_SW128_Atom<ElementB>, GMMA::Layout_K_SW64_Atom<ElementB>>;
 
     using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{},
         make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<AB_Stages>{}), Step<_1, _2, _3>{}));
@@ -319,17 +320,24 @@ struct SM120BlockScaledBuilder
 
     // ====== TMA store ======
     using StrideD = Stride<int64_t, Int<1>, int64_t>;
-    using EpilogueTile_MN = Shape<Int<kTileM>, Int<kTileN>>;
 
-    using CopyAtomC = Copy_Atom<SM90_U32x2_STSM_N, cutlass::half_t>;
+    // Subtile epilogue: 32xN per subtile, StagesD = number of subtiles (= TileM/32)
+    static constexpr int kEpiTileM = 32;
+    static constexpr int kEpiTileN = kTileN;
+    static constexpr int StagesD = kTileM / kEpiTileM; // 1 for TileM=32, 2 for 64, 4 for 128
+    using EpilogueTile_MN = Shape<Int<kEpiTileM>, Int<kEpiTileN>>;
+    static constexpr int kNumEpiM = kTileM / kEpiTileM;
+    static constexpr int kNumEpiN = kTileN / kEpiTileN; // always 1
 
-    using SmemLayoutAtomD = GMMA::Layout_K_SW128_Atom<ElementD>; // ((_8,_16),(_128,_1)):((_128,_1024),(_1,_0))
+    // CUTLASS selects x4 when EpiTileN % 16 == 0, x2 when % 8 == 0
+    using CopyAtomC = Copy_Atom<SM90_U32x4_STSM_N, cutlass::half_t>;
 
-    static constexpr int StagesD = 1;
-    using SmemLayoutD = decltype(tile_to_shape(SmemLayoutAtomD{},
-        make_shape(size<0>(EpilogueTile_MN{}), size<1>(EpilogueTile_MN{}), Int<StagesD>{}), Step<_1, _2, _3>{}));
+    using SmemLayoutAtomD = GMMA::Layout_K_SW128_Atom<ElementD>;
 
-    using CopyOpR2S = SM90_U32x2_STSM_N;
+    using SmemLayoutD = decltype(tile_to_shape(
+        SmemLayoutAtomD{}, make_shape(Int<kEpiTileM>{}, Int<kEpiTileN>{}, Int<StagesD>{}), Step<_1, _2, _3>{}));
+
+    using CopyOpR2S = SM90_U32x4_STSM_N;
     using CopyOpS2G = SM90_TMA_STORE;
     using TMA_D = decltype(make_tma_copy_C_sm90(CopyOpS2G{},
         make_tensor(make_gmem_ptr(static_cast<ElementD*>(nullptr)), repeat_like(StrideD{}, int64_t(0)), StrideD{}),
@@ -348,7 +356,7 @@ struct SM120BlockScaledBuilder
     using GmemCopyAtomR2G = SmemCopyAtomS2R;
 
     using TiledCopyS2G = decltype(make_tiled_copy(
-        SmemCopyAtomS2R{}, Layout<Shape<_32, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{})); // 32x64
+        SmemCopyAtomS2R{}, Layout<Shape<_32, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{})); // 16x64
 
     struct SharedStorageLoad : cute::aligned_struct<128, _0>
     {
@@ -368,18 +376,6 @@ struct SM120BlockScaledBuilder
         alignas(1024) cute::ArrayEngine<ElementD, cute::cosize_v<SmemLayoutO>> smem_O;
     };
 
-    union TensorStorage
-    {
-        SharedStorageLoad load;
-        SharedStorageStore store;
-    };
-
-    union TensorStorageMoe
-    {
-        SharedStorageLoad load;
-        SharedStorageMoeStore store;
-    };
-
     using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
     using EmptyBarrier = cutlass::arch::ClusterBarrier;
     using ProducerBarrierType = FullBarrier::ValueType;
@@ -391,12 +387,25 @@ struct SM120BlockScaledBuilder
         EmptyBarrier ab_empty_mbar[AB_Stages];
         FullBarrier sf_full_mbar[SF_Stages];
         EmptyBarrier sf_empty_mbar[SF_Stages];
-        EmptyBarrier store_full_mbar[SF_Stages];
-        EmptyBarrier store_empty_mbar[SF_Stages];
+        EmptyBarrier store_full_mbar[StagesD];
+        EmptyBarrier store_empty_mbar[StagesD];
+    };
+
+    // Load and store use independent SMEM regions (struct, no union)
+    struct TensorStorage
+    {
+        SharedStorageLoad load;
+        SharedStorageStore store;
+    };
+
+    union TensorStorageMoe
+    {
+        SharedStorageLoad load;
+        SharedStorageMoeStore store;
     };
 };
 
-template <int BlockM, int BlockN, int kNum1DBlocksPerGroup = 16>
+template <int BlockM, int BlockN>
 struct SM120BlockScaledScheduler
 {
 
@@ -422,6 +431,7 @@ struct SM120BlockScaledScheduler
     __device__ __forceinline__ void get_swizzle_block_idx(int block_idx)
     {
         // Swizzle for better L2 usages
+        constexpr int kNum1DBlocksPerGroup = 16;
         auto const& num_blocks_per_group = num_m_blocks * kNum1DBlocksPerGroup;
         auto const& group_idx = block_idx / num_blocks_per_group;
         auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
