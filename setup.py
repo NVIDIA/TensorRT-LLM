@@ -747,6 +747,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
+        "modelscope": ["modelscope>=1.20"],
         "openengine": openengine_deps,
         "mx": mx_deps,
         "grpc-smg": grpc_smg_deps,

@@ -5271,8 +5271,7 @@ class BaseLlmArgs(StrictBaseModel):
             if (use_modelscope() and isinstance(load_path, (str, Path))
                     and not Path(load_path).exists()):
                 load_path = download_hf_partial(
-                    str(load_path),
-                    [
+                    str(load_path), [
                         "*.json", "*.jinja", "*.j2", "*.model", "*.py",
                         "*.tiktoken", "*.txt"
                     ],
@@ -5285,12 +5284,10 @@ class BaseLlmArgs(StrictBaseModel):
                 trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
         else:
-            if (use_modelscope()
-                    and isinstance(self.tokenizer, (str, Path))
+            if (use_modelscope() and isinstance(self.tokenizer, (str, Path))
                     and not Path(self.tokenizer).exists()):
                 self.tokenizer = download_hf_partial(
-                    str(self.tokenizer),
-                    [
+                    str(self.tokenizer), [
                         "*.json", "*.jinja", "*.j2", "*.model", "*.py",
                         "*.tiktoken", "*.txt"
                     ],
