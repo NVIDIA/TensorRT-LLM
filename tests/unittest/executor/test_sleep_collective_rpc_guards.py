@@ -58,9 +58,52 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         complete_wakeup_transition=MagicMock(),
         abort_wakeup_transition=MagicMock(),
         fail_sleep_wakeup_transition=MagicMock(),
+        validate_sleep_tags=MagicMock(),
         invalidate_v1_prefix_cache_for_sleep=MagicMock(),
     )
     return w
+
+
+class TestV2KvCacheSleepRejection:
+    @pytest.mark.parametrize(
+        "use_v2,tags,should_raise",
+        [
+            (True, ["kv_cache"], True),
+            (True, ["model", "kv_cache"], True),
+            (True, ["model"], False),
+            (False, ["kv_cache"], False),
+        ],
+    )
+    def test_validation_conditions(self, use_v2, tags, should_raise):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = use_v2
+        parsed_tags = [ExecutorMemoryType(tag) for tag in tags]
+
+        if should_raise:
+            with pytest.raises(
+                ValueError,
+                match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+            ):
+                executor.validate_sleep_tags(parsed_tags)
+        else:
+            executor.validate_sleep_tags(parsed_tags)
+
+    def test_rejected_before_transition_or_mpi_dispatch(self):
+        worker = _make_worker(world_size=2)
+        worker.engine.validate_sleep_tags.side_effect = ValueError(
+            "KV_CACHE sleep is not supported with KVCacheManagerV2"
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+        ):
+            worker.sleep(["kv_cache"])
+
+        worker.engine.begin_sleep_transition.assert_not_called()
 
 
 class TestV1PrefixCacheInvalidation:
