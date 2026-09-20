@@ -27,6 +27,12 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe._symm_preflight import (
     preflight_failed,
 )
 
+# Pure verdict logic over plain Python values: no CUDA, no distributed init, no
+# weights. The marker is also what makes the file reachable on the CPU stages --
+# pytest_ignore_collect in tests/unittest/conftest.py drops every test file whose
+# text does not contain it when the stage runs -m cpu_only.
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize(
     "fields,ep_size,reason",

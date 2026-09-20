@@ -3068,6 +3068,10 @@ String getTestReuseStagePattern(String stageName) {
 def MULTI_GPU_RUN_WITH_SINGLE = [
     // Add stage patterns here, e.g.:
     // "DGX_H100-2_GPUs-*",
+    // !!! TEMPORARY (nvbugs/6713426 investigation) -- REVERT BEFORE MERGE !!!
+    // The stage name carries "44_GPUs", so without this entry it lands in the
+    // multi-GPU dispatch and waits for the 'ci: full pre-merge approved' label.
+    "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge-*",
 ]
 
 @Field
@@ -6648,11 +6652,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         10
     )
     // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
+    // !!! TEMPORARY (nvbugs/6713426 investigation) -- REVERT BEFORE MERGE !!!
+    // Split count is 1 instead of 3 because the test list is pruned to a single
+    // case for this investigation; splits 2 and 3 would be scheduled empty.
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
-        3,
+        1,
         44,
         11
     )
