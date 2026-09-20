@@ -609,6 +609,13 @@ class BaseWorker(GenerationExecutor):
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
 
+    def _invalidate_v1_prefix_cache_for_sleep(
+            self, tags: list[ExecutorMemoryType]) -> None:
+        invalidator = getattr(self.engine,
+                              "invalidate_v1_prefix_cache_for_sleep", None)
+        if invalidator is not None:
+            invalidator(tags)
+
     def _multi_rank_sleep_wakeup(
         self,
         action: Literal["sleep", "wakeup"],
@@ -836,6 +843,7 @@ class BaseWorker(GenerationExecutor):
                             None) if has_mnnvl_resources else None)
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
+                        self._invalidate_v1_prefix_cache_for_sleep(tags)
                         release_with_tag(*tags)
                         torch.cuda.synchronize()
                         gc.collect()
@@ -999,6 +1007,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
+                    self._invalidate_v1_prefix_cache_for_sleep(tags)
                     release_with_tag(*tags)
                     torch.cuda.synchronize()
                     gc.collect()
