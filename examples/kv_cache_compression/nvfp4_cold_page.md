@@ -61,7 +61,7 @@ Attention-visible GPU layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 CSA cache | Supported; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `skip_rope_quantization` is on) and the indexer cache is preserved losslessly |
+| DeepSeek-V4 CSA cache | Supported; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `skip_rope_quantization` is `true`) and the indexer cache is preserved losslessly |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++

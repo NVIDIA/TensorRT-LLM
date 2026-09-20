@@ -301,9 +301,9 @@ contiguous piece into NVFP4 (4-bit values plus one scale per 16 numbers) and
 copies everything before and after that piece unchanged. A compressed buffer
 records the piece as `quantized_range_start` and `quantized_range_elements`.
 
-- `skip_rope_quantization` off: the piece is the whole vector, so every K and V
+- `skip_rope_quantization: false` (default): the piece is the whole vector, so every K and V
   number becomes NVFP4.
-- `skip_rope_quantization` on: the piece is the NoPE part of the K vector, so the
+- `skip_rope_quantization: true`: the piece is the NoPE part of the K vector, so the
   RoPE numbers are copied unchanged into the cold page, right after that buffer's
   scales. The codec finds the RoPE part in the model config: the last
   `qk_rope_head_dim` numbers of the single 576-number vector an MLA layer stores

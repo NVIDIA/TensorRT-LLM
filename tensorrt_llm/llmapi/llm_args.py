@@ -3860,8 +3860,8 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     skip_rope_quantization: bool = Field(
         default=False,
         description=
-        "Off (default): whole K and V vectors become NVFP4 in the compressed "
-        "cache tier. On: the position-encoded (RoPE) part of each K vector is "
+        "False (default): whole K and V vectors become NVFP4 in the compressed "
+        "cache tier. True: the position-encoded (RoPE) part of each K vector is "
         "copied unchanged and the rest becomes NVFP4, at a lower compression "
         "ratio. An option to explore; measure its accuracy effect on your model."
     )

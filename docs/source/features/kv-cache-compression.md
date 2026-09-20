@@ -215,9 +215,9 @@ part): the last 64 numbers of an MLA vector (GLM-5), the first 64 of a Qwen3.5
 head, the last 64 of a DeepSeek-V4 compressed entry. `skip_rope_quantization`
 lets you leave that part out of the NVFP4 conversion:
 
-- Off (default): the whole K vector and the whole V vector become NVFP4. Highest
-  compression ratio.
-- On: the RoPE part of the K vector is copied unchanged and keeps the hot cache's
+- `false` (default): the whole K vector and the whole V vector become NVFP4.
+  Highest compression ratio.
+- `true`: the RoPE part of the K vector is copied unchanged and keeps the hot cache's
   precision; the rest of K and the whole V vector become NVFP4. The compression
   ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
 
@@ -281,7 +281,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `skip_rope_quantization` is on) and the indexer cache is preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `skip_rope_quantization` is `true`) and the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,
