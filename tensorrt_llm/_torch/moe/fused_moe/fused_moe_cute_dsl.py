@@ -460,24 +460,24 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             tile_size = tactic
         else:
             tile_size = 128
-        recv_expert_count = None
-        forward_inputs = inputs
-        if self.use_direct_expert_metadata:
-            recv_expert_count = inputs[-1]
-            forward_inputs = inputs[:-1]
-            num_rows = forward_inputs[0].size(0)
-            if num_rows % self.num_local_experts != 0:
-                raise ValueError(
-                    "Expert-major input rows must be divisible by the number "
-                    "of local experts")
-            deep_ep_expert_capacity = num_rows // self.num_local_experts
-        else:
-            deep_ep_expert_capacity = None
+        if not self.use_direct_expert_metadata:
+            return self.forward_impl(*inputs,
+                                     enable_alltoall=self.enable_alltoall,
+                                     tile_size=tile_size)
+
+        recv_expert_count = inputs[-1]
+        forward_inputs = inputs[:-1]
+        num_rows = forward_inputs[0].size(0)
+        if num_rows % self.num_local_experts != 0:
+            raise ValueError(
+                "Expert-major input rows must be divisible by the number "
+                "of local experts")
+        deep_ep_expert_capacity = num_rows // self.num_local_experts
         # The locality-domain impl does not take the count-native arguments.
         count_native_kwargs = {} if self.use_locality_domain else dict(
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
-            use_count_native_expert_metadata=self.use_direct_expert_metadata)
+            use_count_native_expert_metadata=True)
         return self.forward_impl(*forward_inputs,
                                  enable_alltoall=self.enable_alltoall,
                                  tile_size=tile_size,

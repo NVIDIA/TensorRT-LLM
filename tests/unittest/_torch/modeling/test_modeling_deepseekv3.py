@@ -91,9 +91,11 @@ def test_layerwise_quant_config_preserves_unquantized_router() -> None:
 
 @pytest.mark.parametrize("use_cute_dsl_bf16_gemm", [False, True])
 @pytest.mark.parametrize("attach_lora", [False, True])
-def test_deepseek_small_m_preserves_fused_kernel_without_locality_domains(
+@pytest.mark.parametrize("localized_weights", [False, True])
+def test_deepseek_small_m_selects_kernel_for_localized_weights(
     use_cute_dsl_bf16_gemm: bool,
     attach_lora: bool,
+    localized_weights: bool,
 ) -> None:
     module = modeling_deepseekv3.DeepseekV3Linear(
         16,
@@ -103,17 +105,26 @@ def test_deepseek_small_m_preserves_fused_kernel_without_locality_domains(
         use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
         lora=LoraLayer([LoraModuleType.ATTENTION_Q], [16]) if attach_lora else None,
     )
+    if localized_weights:
+        module._locality_domain_weight_shards = tuple(module.weight.detach().chunk(2))
+        module.weight = torch.nn.Parameter(
+            torch.empty(0, dtype=torch.bfloat16), requires_grad=False
+        )
     inputs = torch.ones(1, 16, dtype=torch.bfloat16)
     expected = torch.ones_like(inputs)
     with (
         patch.object(modeling_deepseekv3, "get_sm_version", return_value=107),
         patch.object(modeling_deepseekv3, "is_sm_100f", return_value=True),
         patch.object(torch.ops.trtllm, "dsv3_fused_a_gemm_op", return_value=expected) as fused,
-        patch.object(linear.Linear, "apply_linear") as fallback,
+        patch.object(linear.Linear, "apply_linear", return_value=expected) as fallback,
     ):
-        assert module.apply_linear(inputs, None) is expected
-    fused.assert_called_once()
-    fallback.assert_not_called()
+        assert module.apply_linear(inputs, None, layer_idx=3) is expected
+    if localized_weights:
+        fallback.assert_called_once_with(inputs, None, None, 3)
+        fused.assert_not_called()
+    else:
+        fused.assert_called_once()
+        fallback.assert_not_called()
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16])
