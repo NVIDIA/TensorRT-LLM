@@ -13,11 +13,93 @@ from tensorrt_llm.llmapi import LlmArgs
 from tensorrt_llm.llmapi.utils import (ApiStatusRegistry,
                                        _set_affinity_all_threads,
                                        configure_cpu_affinity,
+                                       download_hf_model,
+                                       download_hf_partial,
                                        generate_api_docs_as_docstring)
 
 _TASK_DIR = "/proc/self/task"
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _stub_modelscope(monkeypatch, snapshot_download):
+    modelscope = types.ModuleType("modelscope")
+    hub = types.ModuleType("modelscope.hub")
+    snapshot_module = types.ModuleType("modelscope.hub.snapshot_download")
+    snapshot_module.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "modelscope", modelscope)
+    monkeypatch.setitem(sys.modules, "modelscope.hub", hub)
+    monkeypatch.setitem(sys.modules, "modelscope.hub.snapshot_download",
+                        snapshot_module)
+
+
+def test_modelscope_download_maps_snapshot_filters(monkeypatch, tmp_path):
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    _stub_modelscope(monkeypatch, snapshot_download)
+    monkeypatch.setenv("TRTLLM_USE_MODELSCOPE", "true")
+    monkeypatch.setattr(llmapi_utils.huggingface_hub.constants,
+                        "HF_HUB_OFFLINE", True)
+
+    downloaded = download_hf_partial("Qwen/Qwen3-0.6B", ["*.json"],
+                                     revision="v1")
+
+    assert downloaded == tmp_path
+    assert calls == [{
+        "model_id": "Qwen/Qwen3-0.6B",
+        "local_files_only": True,
+        "revision": "v1",
+        "allow_file_pattern": ["*.json"],
+    }]
+
+
+def test_modelscope_download_maps_ignored_files(monkeypatch, tmp_path):
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    _stub_modelscope(monkeypatch, snapshot_download)
+    monkeypatch.setenv("TRTLLM_USE_MODELSCOPE", "1")
+
+    downloaded = download_hf_model("Qwen/Qwen3-0.6B")
+
+    assert downloaded == tmp_path
+    assert calls[0]["ignore_file_pattern"] == ["original/**/*"]
+
+
+def test_hugging_face_download_remains_the_default(monkeypatch, tmp_path):
+    calls = []
+
+    def snapshot_download(model, **kwargs):
+        calls.append((model, kwargs))
+        return str(tmp_path)
+
+    monkeypatch.delenv("TRTLLM_USE_MODELSCOPE", raising=False)
+    monkeypatch.setattr(llmapi_utils, "hf_snapshot_download",
+                        snapshot_download)
+
+    downloaded = download_hf_partial("Qwen/Qwen3-0.6B", ["config.json"])
+
+    assert downloaded == tmp_path
+    assert calls[0][0] == "Qwen/Qwen3-0.6B"
+    assert calls[0][1]["allow_patterns"] == ["config.json"]
+
+
+def test_modelscope_download_requires_optional_dependency(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_MODELSCOPE", "true")
+    monkeypatch.setitem(sys.modules, "modelscope", None)
+    monkeypatch.delitem(sys.modules,
+                        "modelscope.hub.snapshot_download",
+                        raising=False)
+
+    with pytest.raises(ImportError, match="pip install modelscope"):
+        download_hf_model("Qwen/Qwen3-0.6B")
 
 
 def test_api_status_registry():

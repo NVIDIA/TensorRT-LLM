@@ -75,8 +75,9 @@ from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
-                    get_type_repr)
+from .utils import (StrictBaseModel, download_hf_partial,
+                    generate_api_docs_as_docstring, get_type_repr,
+                    use_modelscope)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
 
@@ -5267,6 +5268,15 @@ class BaseLlmArgs(StrictBaseModel):
 
             # Use tokenizer path if specified, otherwise use model path.
             load_path = self.tokenizer if self.tokenizer else self.model
+            if (use_modelscope() and isinstance(load_path, (str, Path))
+                    and not Path(load_path).exists()):
+                load_path = download_hf_partial(
+                    str(load_path),
+                    [
+                        "*.json", "*.jinja", "*.j2", "*.model", "*.py",
+                        "*.tiktoken", "*.txt"
+                    ],
+                    revision=self.tokenizer_revision)
             # The one loader for aliases and import paths; it raises
             # ValueError("Failed to load custom tokenizer ...") on failure.
             self.tokenizer = load_custom_tokenizer(
@@ -5275,6 +5285,16 @@ class BaseLlmArgs(StrictBaseModel):
                 trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
         else:
+            if (use_modelscope()
+                    and isinstance(self.tokenizer, (str, Path))
+                    and not Path(self.tokenizer).exists()):
+                self.tokenizer = download_hf_partial(
+                    str(self.tokenizer),
+                    [
+                        "*.json", "*.jinja", "*.j2", "*.model", "*.py",
+                        "*.tiktoken", "*.txt"
+                    ],
+                    revision=self.tokenizer_revision)
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
                 trust_remote_code=self.trust_remote_code,

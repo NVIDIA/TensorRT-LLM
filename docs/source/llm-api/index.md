@@ -31,6 +31,22 @@ llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
 You can also use [quantized checkpoints](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) (FP4, FP8, etc) of popular models provided by NVIDIA in the same way.
 
+### Using a Model from ModelScope
+
+To resolve remote model IDs through [ModelScope](https://modelscope.cn/)
+instead of the Hugging Face Hub, install the optional client and enable the
+ModelScope download path before starting TensorRT-LLM:
+
+```console
+pip install modelscope
+export TRTLLM_USE_MODELSCOPE=true
+trtllm-serve Qwen/Qwen3-0.6B
+```
+
+The switch also applies to remote tokenizer and speculative-model IDs. Local
+paths are used as-is. Unset `TRTLLM_USE_MODELSCOPE`, or set it to `false`, to
+retain the default Hugging Face behavior.
+
 ### 2. Using a Local Hugging Face Model
 
 To use a model from local storage, first download it manually:

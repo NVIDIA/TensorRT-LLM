@@ -27,7 +27,7 @@ import filelock
 import huggingface_hub
 import psutil
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download as hf_snapshot_download
 from pydantic import BaseModel
 from tqdm.auto import tqdm
 
@@ -231,22 +231,20 @@ class DisabledTqdm(tqdm):
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     ignore_patterns = ["original/**/*"]
-    logger.info(f"Downloading model {model} from HuggingFace")
+    hub_name = "ModelScope" if use_modelscope() else "Hugging Face"
+    logger.info(f"Downloading model {model} from {hub_name}")
     with get_file_lock(model):
-        hf_folder = snapshot_download(
-            model,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-            ignore_patterns=ignore_patterns,
-            revision=revision,
-            tqdm_class=DisabledTqdm)
-    logger.info(f"Finished downloading model {model} from HuggingFace")
-    return Path(hf_folder)
+        model_folder = _snapshot_download(model,
+                                          ignore_patterns=ignore_patterns,
+                                          revision=revision)
+    logger.info(f"Finished downloading model {model} from {hub_name}")
+    return Path(model_folder)
 
 
 def download_hf_partial(model: str,
                         allow_patterns: List[str],
                         revision: Optional[str] = None) -> Path:
-    """Download a partial model from HuggingFace.
+    """Download selected model files from the configured model hub.
 
     Args:
         model: The model name or path.
@@ -257,13 +255,55 @@ def download_hf_partial(model: str,
         The path to the downloaded model.
     """
     with get_file_lock(model):
-        hf_folder = snapshot_download(
-            model,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-            revision=revision,
-            allow_patterns=allow_patterns,
-            tqdm_class=DisabledTqdm)
-    return Path(hf_folder)
+        model_folder = _snapshot_download(model,
+                                          revision=revision,
+                                          allow_patterns=allow_patterns)
+    return Path(model_folder)
+
+
+def use_modelscope() -> bool:
+    """Return whether remote model IDs should resolve through ModelScope."""
+    return os.environ.get("TRTLLM_USE_MODELSCOPE", "false").strip().lower(
+    ) in ("1", "true")
+
+
+def _snapshot_download(model: str,
+                       revision: Optional[str] = None,
+                       ignore_patterns: Optional[List[str]] = None,
+                       allow_patterns: Optional[List[str]] = None) -> str:
+    """Download a snapshot from ModelScope or Hugging Face.
+
+    ModelScope uses different names for its file filters. Keep the optional
+    import in this boundary so standard TensorRT-LLM installations do not need
+    the ``modelscope`` package.
+    """
+    local_files_only = huggingface_hub.constants.HF_HUB_OFFLINE
+    if use_modelscope():
+        try:
+            from modelscope.hub.snapshot_download import snapshot_download
+        except ImportError as error:
+            raise ImportError(
+                "TRTLLM_USE_MODELSCOPE is enabled, but ModelScope is not "
+                "installed. Install it with `pip install modelscope`.") from error
+
+        kwargs = {
+            "model_id": model,
+            "local_files_only": local_files_only,
+            "revision": revision,
+        }
+        if ignore_patterns:
+            kwargs["ignore_file_pattern"] = ignore_patterns
+        if allow_patterns:
+            kwargs["allow_file_pattern"] = allow_patterns
+        return snapshot_download(**kwargs)
+
+    return hf_snapshot_download(
+        model,
+        local_files_only=local_files_only,
+        ignore_patterns=ignore_patterns,
+        allow_patterns=allow_patterns,
+        revision=revision,
+        tqdm_class=DisabledTqdm)
 
 
 def download_hf_pretrained_config(model: str,

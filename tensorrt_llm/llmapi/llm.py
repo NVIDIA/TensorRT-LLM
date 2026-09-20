@@ -1675,6 +1675,8 @@ class BaseLLM:
             assert isinstance(self.args.tokenizer, TokenizerBase)
             return self.args.tokenizer
 
+        model_path = self._hf_model_dir or self.args.model
+
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
         if hasattr(self.args, "backend") and self.args.backend in [
@@ -1689,15 +1691,15 @@ class BaseLLM:
                         trust_remote_code=self.args.trust_remote_code,
                         use_fast=self.args.tokenizer_mode != 'slow')
                     if tokenizer is None:
-                        tokenizer_path = self.args.model
+                        tokenizer_path = model_path
                     else:
                         return tokenizer
                 except Exception:
-                    tokenizer_path = self.args.model
+                    tokenizer_path = model_path
             else:
-                tokenizer_path = self.args.model
+                tokenizer_path = model_path
         else:
-            tokenizer_path = self.args.model
+            tokenizer_path = model_path
         return ModelLoader.load_hf_tokenizer(
             tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
@@ -1716,7 +1718,8 @@ class BaseLLM:
 
     def _try_load_generation_config(
             self) -> Optional[transformers.GenerationConfig]:
-        return ModelLoader.load_hf_generation_config(self.args.model)
+        model_dir = self._hf_model_dir or self.args.model
+        return ModelLoader.load_hf_generation_config(model_dir)
 
     def _try_load_generation_config_explicit_values(self) -> dict[str, Any]:
         if self.args.backend != "pytorch" or self.args.generation_config != "auto":
@@ -1726,8 +1729,9 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
+        model_dir = self._hf_model_dir or self.args.model
         return ModelLoader.load_hf_model_config(
-            self.args.model, trust_remote_code=self.args.trust_remote_code)
+            model_dir, trust_remote_code=self.args.trust_remote_code)
 
     @set_api_status("prototype")
     def start_profile(self,
