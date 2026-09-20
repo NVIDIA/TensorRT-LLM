@@ -44,8 +44,10 @@ finally:
 ```
 
 With no tags, `release()` selects every usable `ExecutorMemoryType` and
-`resume()` restores every tag still parked. You can release or restore a
-specific subset:
+`resume()` reactivates every tag still parked using its configured restore
+mode. Reactivation does not always restore the previous contents: `NONE`
+discards them, while `MEMSET` maps and zeroes new memory. You can release or
+reactivate a specific subset:
 
 ```python
 tags = [
@@ -59,7 +61,7 @@ status = llm.get_memory_status()
 assert status.state == "parked"
 assert status.parked_tags == [ExecutorMemoryType.MODEL_ENGINE_MAIN]
 
-llm.resume()  # Restore the remaining parked tag and reopen request admission.
+llm.resume()  # Reactivate the remaining parked tag and reopen request admission.
 ```
 
 Tags can be enum members or their string values. TensorRT-LLM normalizes them,
