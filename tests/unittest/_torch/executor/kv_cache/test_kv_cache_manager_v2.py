@@ -828,7 +828,7 @@ def test_default_uses_allocator_fallback() -> None:
     assert config.constraints == []
 
 
-def test_avg_seq_len_does_not_require_max_length_warmup() -> None:
+def test_avg_seq_len_builds_context_warmup_constraint() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
         max_batch_size=3,
@@ -841,7 +841,7 @@ def test_avg_seq_len_does_not_require_max_length_warmup() -> None:
         [KVCacheDesc(capacity=2048, history_length=0)]
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
     )
-    assert config.constraints == []
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
@@ -1095,7 +1095,7 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     )
 
     assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
-    assert config.constraints == []
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=258, history_length=0)])]
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:

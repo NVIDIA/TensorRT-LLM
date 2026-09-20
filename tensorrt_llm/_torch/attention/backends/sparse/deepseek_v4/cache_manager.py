@@ -1175,10 +1175,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
-        constraints = []
+        constraints = list(config.constraints)
         if config.initial_pool_ratio is None:
-            # DeepSeek-V4's windowed and compressed pools must support both
-            # the longest decode request and the context warmup workload.
+            # DeepSeek-V4's windowed and compressed pools must also support
+            # the longest decode request alongside the short decode requests.
             min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
             constraints.append(
                 BatchDesc(
@@ -1192,18 +1192,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     * (self.max_batch_size - 1)
                 )
             )
-            if self.max_num_tokens is not None:
-                constraints.append(
-                    BatchDesc(
-                        [
-                            KVCacheDesc(
-                                capacity=self.max_num_tokens + self.num_extra_kv_tokens,
-                                history_length=0,
-                            )
-                        ]
-                    )
-                )
-
         return replace(
             config,
             layers=layers,

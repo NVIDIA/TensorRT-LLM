@@ -2695,6 +2695,7 @@ class KVCacheManagerV2(BaseResourceManager):
             scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
 
         typical_step = None
+        constraints = []
         if kv_cache_config.pool_ratio is None:
             typical_seq_len = self._get_typical_seq_len(kv_cache_config)
             if typical_seq_len is not None and typical_seq_len > self.max_seq_len:
@@ -2722,6 +2723,20 @@ class KVCacheManagerV2(BaseResourceManager):
                     ]
                     * (generation_request_capacity - 1)
                 )
+
+                # General and chunked-prefill warmup uses one fresh context request
+                # at the per-iteration token budget.
+                if self.max_num_tokens is not None:
+                    constraints.append(
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    history_length=0,
+                                )
+                            ]
+                        )
+                    )
 
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -2778,6 +2793,7 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
             layers=layer_configs,
             typical_step=typical_step,
+            constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_partial_reuse=kv_cache_config.enable_partial_reuse,
             # Keep the lookahead evidence and its backoff in the same tree match.
