@@ -5,21 +5,13 @@ and the TRTLLM and CuTeDSL backends."""
 
 from .backend import SOLCuTeDSLAttention, SOLTrtllmAttention
 from .params import SolParams
-from .predictor import (
-    SolPredictorGeometry,
-    SolPredictorOutputs,
-    SolPredictorPlan,
-    SolPredictorPlanKey,
-    SOLSparsePredictor,
-)
+from .predictor import SolPredictorOutputs, predict, support_reason
 
 __all__ = [
     "SOLCuTeDSLAttention",
-    "SOLSparsePredictor",
     "SOLTrtllmAttention",
     "SolParams",
-    "SolPredictorGeometry",
     "SolPredictorOutputs",
-    "SolPredictorPlan",
-    "SolPredictorPlanKey",
+    "predict",
+    "support_reason",
 ]

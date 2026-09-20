@@ -31,8 +31,7 @@ class SolParams(SparseParams):
     """Static SOL policy lowered from the user-facing VisualGen config.
 
     Shared by the TRTLLM (predictor + block-sparse FMHA) and CuTeDSL (fused kernel)
-    backends; ``thresh_type`` selects the CuTeDSL kernel threshold policy, the TRTLLM
-    predictor implements ``diag`` only.
+    backends; ``thresh_type`` selects the block routing threshold policy of both.
     """
 
     algorithm: Literal["sol_attn"] = field(init=False, default="sol_attn")

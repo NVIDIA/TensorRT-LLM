@@ -269,8 +269,8 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
     thresh_type: Literal["diag", "exact"] = PydanticField(
         "diag",
         description=(
-            "Threshold policy of the CUTEDSL kernel (kernel default: 'diag'). "
-            "The TRTLLM predictor implements 'diag' only."
+            "Block routing threshold policy: 'diag' models each key channel "
+            "independently, 'exact' uses the full key covariance."
         ),
     )
     disabled_until_timestep: Optional[float] = PydanticField(

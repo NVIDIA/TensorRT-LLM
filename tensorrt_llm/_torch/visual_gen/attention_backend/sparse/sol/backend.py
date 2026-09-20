@@ -19,9 +19,9 @@ dynamically and corrects the approximation of the blocks it skips. Two backends
 serve one ``SolParams``:
 
 * ``SOLTrtllmAttention`` runs SOL in two stages through the generic TRTLLM
-  sparse lifecycle: a TRT-LLM-owned predictor derives the exact block bitmask
-  and K/V proxy summaries, then the shared PrimTS block-sparse FMHA executes
-  that route.
+  sparse lifecycle: one graph-visible predictor operator derives the exact
+  block bitmask and K/V proxy summaries, then the shared PrimTS block-sparse
+  FMHA executes that route.
 * ``SOLCuTeDSLAttention`` runs the fused kernel vendored from the reference
   implementation (https://github.com/NVlabs/Sana, branch ``sol-engine``, pinned
   in ``cute_dsl_kernels/blackwell/sol_attn/THIRD_PARTY_NOTICES.md``), which
@@ -58,8 +58,9 @@ from tensorrt_llm.logger import logger
 from ...interface import AttentionBackend, AttentionTensorLayout
 from ...trtllm import TrtllmAttention
 from ...vanilla import VanillaAttention
+from . import predictor as sol_predictor
 from .params import SolParams
-from .predictor import BLOCK_SIZE, SOLSparsePredictor
+from .predictor import BLOCK_SIZE
 
 _sol_attn_import_error = None
 try:
@@ -332,7 +333,6 @@ class SOLTrtllmAttention(TrtllmAttention):
             raise TypeError("SOLTrtllmAttention requires SolParams")
         self.sol_params = sparse_params
         super().__init__(sparse_params=None, **kwargs)
-        self.predictor = SOLSparsePredictor()
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
@@ -388,16 +388,17 @@ class SOLTrtllmAttention(TrtllmAttention):
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        unsupported_reason = self.predictor.support_reason(q, k, v)
+        unsupported_reason = sol_predictor.support_reason(q, k, v)
         if unsupported_reason is not None:
             raise ValueError(unsupported_reason)
 
-        outputs = self.predictor.predict(
+        outputs = sol_predictor.predict(
             q,
             k,
             v,
             tau=self.sol_params.tau,
             sm_scale=get_bmm1_scale(self),
+            thresh_type=self.sol_params.thresh_type,
         )
         return BlockSparseForwardInputs(
             q_block_size=BLOCK_SIZE,

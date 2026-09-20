@@ -33,11 +33,11 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.sparse.hooks import prepare_sparse_runtime_params
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as CoreTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import backend as sol_backend
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import predictor as sol_predictor
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend import SOLTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor import (
     SolPredictorOutputs,
-    SOLSparsePredictor,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import (
     TrtllmAttention,
@@ -62,12 +62,7 @@ _REQUIRES_SM100 = pytest.mark.skipif(
 _CPU_ONLY = pytest.mark.cpu_only
 
 
-def _make_backend(
-    params: SolParams,
-    predictor: Mock,
-    *,
-    layer_idx: int = 1,
-) -> SOLTrtllmAttention:
+def _make_backend(params: SolParams, *, layer_idx: int = 1) -> SOLTrtllmAttention:
     backend = object.__new__(SOLTrtllmAttention)
     backend.layer_idx = layer_idx
     backend.num_heads = 2
@@ -81,7 +76,6 @@ def _make_backend(
     backend.metadata = TrtllmAttentionMetadata(
         device=torch.device("cpu"), attention_metadata_state={}
     )
-    backend.predictor = predictor
     return backend
 
 
@@ -178,15 +172,20 @@ def _bshd(seq_len: int = 64, num_heads: int = 2) -> torch.Tensor:
 
 
 def _stub_backend(
+    monkeypatch,
     params: SolParams | None = None,
     *,
     seq_len: int = 64,
     unsupported_reason: str | None = None,
-) -> tuple[SOLTrtllmAttention, Mock]:
-    predictor = Mock(spec=SOLSparsePredictor)
-    predictor.support_reason.return_value = unsupported_reason
-    predictor.predict.return_value = _predictor_outputs(batch_size=1, seq_len=seq_len, num_heads=2)
-    return _make_backend(params or SolParams(tau=1.0), predictor), predictor
+) -> tuple[SOLTrtllmAttention, SimpleNamespace]:
+    """Backend whose predictor functions are recorded mocks."""
+    predictor = SimpleNamespace(
+        support_reason=Mock(return_value=unsupported_reason),
+        predict=Mock(return_value=_predictor_outputs(batch_size=1, seq_len=seq_len, num_heads=2)),
+    )
+    monkeypatch.setattr(sol_predictor, "support_reason", predictor.support_reason)
+    monkeypatch.setattr(sol_predictor, "predict", predictor.predict)
+    return _make_backend(params or SolParams(tau=1.0)), predictor
 
 
 def _dense_reference(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -259,7 +258,9 @@ def _mixed_proxy_reference(
 
 @_CPU_ONLY
 def test_sol_backend_reuses_prepared_timestep_during_cuda_graph_capture(monkeypatch) -> None:
-    backend, _predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
+    backend, _predictor = _stub_backend(
+        monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6)
+    )
     # Per-token timesteps reduce to the largest live value.
     assert backend.resolve_timestep(torch.tensor([0.0, 0.2])) == pytest.approx(0.2)
 
@@ -274,7 +275,7 @@ def test_sol_backend_reuses_prepared_timestep_during_cuda_graph_capture(monkeypa
 @_CPU_ONLY
 def test_sol_backend_warmup_prepares_dense_phase_for_capture(monkeypatch) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
+    backend, predictor = _stub_backend(monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6))
 
     assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(torch.tensor(0.8))) is None
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -285,7 +286,7 @@ def test_sol_backend_warmup_prepares_dense_phase_for_capture(monkeypatch) -> Non
 
 @_CPU_ONLY
 def test_sol_backend_rejects_cutoff_capture_without_warmup(monkeypatch) -> None:
-    backend, predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
+    backend, predictor = _stub_backend(monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
@@ -296,17 +297,19 @@ def test_sol_backend_rejects_cutoff_capture_without_warmup(monkeypatch) -> None:
 
 
 @_CPU_ONLY
-def test_sol_backend_without_timestep_runs_sparse_like_skip_softmax() -> None:
+def test_sol_backend_without_timestep_runs_sparse_like_skip_softmax(monkeypatch) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
+    backend, predictor = _stub_backend(monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6))
 
     assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(None)) is not None
     predictor.predict.assert_called_once()
 
 
 @_CPU_ONLY
-def test_sol_phase_waits_until_all_token_timesteps_are_below_cutoff() -> None:
-    backend, _predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
+def test_sol_phase_waits_until_all_token_timesteps_are_below_cutoff(monkeypatch) -> None:
+    backend, _predictor = _stub_backend(
+        monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6)
+    )
 
     assert not backend.should_use_sparse(backend.resolve_timestep(torch.tensor([0.0, 0.8])))
     assert backend.should_use_sparse(backend.resolve_timestep(torch.tensor([0.0, 0.2])))
@@ -352,7 +355,7 @@ def test_sol_config_lowers_and_factory_initializes_backend(monkeypatch) -> None:
     assert params.dense_layers == frozenset({0, 2, 3, 4})
     assert isinstance(backend, SOLTrtllmAttention)
     assert backend.sol_params is params
-    assert isinstance(backend.predictor, SOLSparsePredictor)
+    assert not hasattr(backend, "predictor")
     assert base_kwargs["sparse_params"] is None
     assert "_enable_sparse_workflow" not in SOLTrtllmAttention.__dict__
     assert "_should_use_sparse_workflow" not in SOLTrtllmAttention.__dict__
@@ -370,14 +373,18 @@ def test_sol_backend_sparse_phase_emits_proxy_bitmask_carrier(monkeypatch) -> No
         seq_len=seq_len,
         num_heads=num_heads,
     )
-    backend, predictor = _stub_backend(SolParams(tau=0.75), seq_len=seq_len)
+    backend, predictor = _stub_backend(monkeypatch, SolParams(tau=0.75), seq_len=seq_len)
     predictor.predict.return_value = predictor_outputs
     monkeypatch.setattr(sol_backend, "get_bmm1_scale", lambda attn: 0.375)
 
     carrier = _predict(backend, q, k, v, timestep=0.2)
 
     predicted_q, predicted_k, predicted_v = predictor.predict.call_args.args
-    assert predictor.predict.call_args.kwargs == {"tau": 0.75, "sm_scale": 0.375}
+    assert predictor.predict.call_args.kwargs == {
+        "tau": 0.75,
+        "sm_scale": 0.375,
+        "thresh_type": "diag",
+    }
     predictor.support_reason.assert_called_once_with(predicted_q, predicted_k, predicted_v)
     for predicted, source in zip((predicted_q, predicted_k, predicted_v), (q, k, v), strict=True):
         assert predicted.shape == (batch_size, seq_len, num_heads, 128)
@@ -411,7 +418,7 @@ def test_sol_wrapper_compacts_separate_qkv_and_predicts_inside_core(monkeypatch)
         seq_len=seq_len,
         num_heads=num_heads,
     )
-    backend, predictor = _stub_backend(SolParams(tau=0.75), seq_len=seq_len)
+    backend, predictor = _stub_backend(monkeypatch, SolParams(tau=0.75), seq_len=seq_len)
     predictor.predict.return_value = predictor_outputs
     monkeypatch.setattr(sol_backend, "get_bmm1_scale", lambda attn: 0.375)
     captured = _stub_core_forward(monkeypatch)
@@ -442,13 +449,14 @@ def test_sol_wrapper_compacts_separate_qkv_and_predicts_inside_core(monkeypatch)
     ),
 )
 def test_sol_backend_rejects_non_sol_sparse_calls(
+    monkeypatch,
     k: torch.Tensor | None,
     v: torch.Tensor | None,
     attention_mask: PredefinedAttentionMask,
     message: str,
 ) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend()
+    backend, predictor = _stub_backend(monkeypatch)
 
     with pytest.raises(ValueError, match=message):
         _predict(backend, q, k, v, attention_mask=attention_mask)
@@ -459,7 +467,7 @@ def test_sol_backend_rejects_non_sol_sparse_calls(
 @_CPU_ONLY
 def test_sol_wrapper_rejects_fused_qkv_before_core(monkeypatch) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend()
+    backend, predictor = _stub_backend(monkeypatch)
     prepare_metadata = Mock(return_value=object())
     monkeypatch.setattr(TrtllmAttention, "_prepare_metadata", prepare_metadata)
 
@@ -471,10 +479,10 @@ def test_sol_wrapper_rejects_fused_qkv_before_core(monkeypatch) -> None:
 
 
 @_CPU_ONLY
-def test_sol_backend_surfaces_predictor_support_reason_before_execution() -> None:
+def test_sol_backend_surfaces_predictor_support_reason_before_execution(monkeypatch) -> None:
     q = _bshd()
     reason = "SOL predictor requires compact BSHD q/k/v"
-    backend, predictor = _stub_backend(unsupported_reason=reason)
+    backend, predictor = _stub_backend(monkeypatch, unsupported_reason=reason)
 
     with pytest.raises(ValueError, match=reason):
         _predict(backend, q, q, q)
@@ -491,12 +499,13 @@ def test_sol_backend_surfaces_predictor_support_reason_before_execution() -> Non
     ),
 )
 def test_sol_dense_policy_returns_no_routes_without_predicting(
+    monkeypatch,
     params: SolParams,
     layer_idx: int,
     timestep: float | None,
 ) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend(params)
+    backend, predictor = _stub_backend(monkeypatch, params)
     backend.layer_idx = layer_idx
 
     assert _predict(backend, q, q, q, timestep=timestep) is None
@@ -505,9 +514,9 @@ def test_sol_dense_policy_returns_no_routes_without_predicting(
 
 
 @_CPU_ONLY
-def test_sol_sparse_phase_without_primts_fails_closed() -> None:
+def test_sol_sparse_phase_without_primts_fails_closed(monkeypatch) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend()
+    backend, predictor = _stub_backend(monkeypatch)
     backend._fmha_manager = SimpleNamespace(fmha_libs=[])
 
     with pytest.raises(RuntimeError, match="requires PrimTS block-sparse FMHA"):
@@ -518,9 +527,9 @@ def test_sol_sparse_phase_without_primts_fails_closed() -> None:
 
 
 @_CPU_ONLY
-def test_sol_sparse_phase_with_quantization_fails_closed() -> None:
+def test_sol_sparse_phase_with_quantization_fails_closed(monkeypatch) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend()
+    backend, predictor = _stub_backend(monkeypatch)
     backend.quant_attention_config = object()
 
     with pytest.raises(ValueError, match="does not support quant_attention_config"):
@@ -554,17 +563,13 @@ def test_sol_public_config_requires_supported_backend() -> None:
 
 
 @_CPU_ONLY
-def test_sol_exact_threshold_needs_cutedsl_backend() -> None:
-    with pytest.raises(ValidationError, match="thresh_type"):
-        AttentionConfig(
-            backend="TRTLLM",
+def test_sol_exact_threshold_lowers_for_both_backends() -> None:
+    for backend in ("TRTLLM", "CUTEDSL"):
+        config = AttentionConfig(
+            backend=backend,
             sparse_attention_config=SolAttentionConfig(thresh_type="exact"),
         )
-    config = AttentionConfig(
-        backend="CUTEDSL",
-        sparse_attention_config=SolAttentionConfig(thresh_type="exact"),
-    )
-    assert config.sparse_attention_config.to_sparse_params().thresh_type == "exact"
+        assert config.sparse_attention_config.to_sparse_params().thresh_type == "exact"
 
 
 @_CPU_ONLY
@@ -684,7 +689,7 @@ def test_sol_attention_rejects_context_parallelism() -> None:
 @_CPU_ONLY
 def test_sol_cuda_graph_phase_is_keyed_without_model_scope(monkeypatch) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
+    backend, predictor = _stub_backend(monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6))
     model = _SolModel((backend,))
     runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
     model.register_cuda_graph_extra_key_fns(runner)
@@ -801,7 +806,6 @@ def test_real_b200_sol_backend_cuda_graph_matches_dense_reference() -> None:
         rtol=2e-2,
         atol=2e-2,
     )
-    assert backend.predictor.num_plans == 1
 
 
 @_REQUIRES_SM100
@@ -842,7 +846,7 @@ def test_real_b200_sol_backend_mixed_proxy_cuda_graph_matches_reference(seq_len:
 
     q, k, v = _inputs()
     eager = backend.forward(q=q, k=k, v=v, batch_size=1, seq_len=seq_len, seq_len_kv=seq_len)
-    predictor_outputs = backend.predictor.predict(
+    predictor_outputs = sol_predictor.predict(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -887,9 +891,18 @@ def test_real_b200_sol_backend_mixed_proxy_cuda_graph_matches_reference(seq_len:
     graph.replay()
     torch.cuda.synchronize()
 
+    # The captured graph re-predicts from the refreshed inputs; the reference
+    # needs the summaries of those inputs too.
+    replayed_outputs = sol_predictor.predict(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        tau=1.0e6,
+        sm_scale=128**-0.5,
+    )
     torch.testing.assert_close(
         captured,
-        _mixed_proxy_reference(q, k, v, predictor_outputs),
+        _mixed_proxy_reference(q, k, v, replayed_outputs),
         rtol=2e-2,
         atol=2e-2,
     )

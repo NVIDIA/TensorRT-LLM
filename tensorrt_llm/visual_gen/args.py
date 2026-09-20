@@ -255,22 +255,6 @@ class AttentionConfig(StrictBaseModel):
             raise ValueError("SOL and quant_attention_config are mutually exclusive.")
         return self
 
-    @model_validator(mode="after")
-    def _validate_sol_thresh_type(self) -> "AttentionConfig":
-        # The TRTLLM predictor implements the diag threshold only; the exact
-        # policy exists in the fused CUTEDSL kernel.
-        sparse_config = self.sparse_attention_config
-        if (
-            isinstance(sparse_config, SolAttentionConfig)
-            and self.backend == "TRTLLM"
-            and sparse_config.thresh_type != "diag"
-        ):
-            raise ValueError(
-                f"TRTLLM SOL supports thresh_type='diag' only, got "
-                f"thresh_type={sparse_config.thresh_type!r}; use backend='CUTEDSL'."
-            )
-        return self
-
 
 class VAEConfig(StrictBaseModel):
     """Configuration for the variational autoencoder."""
@@ -806,21 +790,6 @@ class VisualGenArgs(StrictBaseModel):
         if isinstance(data, dict) and data.get("quant_config", "_sentinel") is None:
             data = {**data, "quant_config": QuantConfig()}
         return data
-
-    @model_validator(mode="after")
-    def _validate_sol_fullgraph(self) -> "VisualGenArgs":
-        sparse_config = self.attention_config.sparse_attention_config
-        if (
-            isinstance(sparse_config, SolAttentionConfig)
-            and self.torch_compile_config.enable
-            and self.torch_compile_config.enable_fullgraph
-        ):
-            raise ValueError(
-                "SOL sparse attention does not support torch.compile fullgraph; "
-                "set torch_compile_config.enable_fullgraph=False or disable "
-                "torch.compile."
-            )
-        return self
 
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:

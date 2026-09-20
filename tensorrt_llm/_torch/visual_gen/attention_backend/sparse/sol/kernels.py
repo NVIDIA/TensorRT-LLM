@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Memory-bound kernels of the two-stage SOL predictor.
 
-The predictor summarises ``[batch, tokens, heads, head_dim]`` activations per token block, derives per
-channel key statistics, and thresholds centroid scores into packed exact-block words. CUDA tensors run
-Triton kernels; other tensors use PyTorch implementations of the same rule. Launch shapes are derived
-from tensor shapes, so no autotuning happens at call time and every launch is CUDA Graph safe. Every
-helper writes into caller-owned storage so a plan can keep graph-stable outputs.
+The predictor summarises ``[batch, tokens, heads, head_dim]`` activations per token block, derives a
+routing threshold per query block from the key block statistics, and thresholds centroid scores into
+packed exact-block words. CUDA tensors run Triton kernels (block pooling, key statistics, thresholds and
+selection); other tensors use PyTorch implementations of the same rule. Launch shapes are derived from
+tensor shapes, so no autotuning happens at call time and every launch is CUDA Graph safe.
 """
 
 from __future__ import annotations
@@ -20,15 +20,17 @@ import triton.language as tl
 
 _POOL_MAX_WIDTH = 1024
 _POOL_TOKENS_PER_LOAD = 8
-_STATS_WIDTH = 128
-_STATS_ROWS_PER_LOAD = 32
 _SELECT_Q_BLOCKS = 64
+_STATS_ROWS = 32
+_STATS_COLS = 64
+_THRESHOLD_Q_BLOCKS = 32
 _WORD_BITS = 32
 _LOG2_E = math.log2(math.e)
 _THRESHOLD_EPSILON = 1.0e-6
 _LOCAL_RADIUS = 1
 
 _Reduce = Literal["mean", "sum"]
+_ThreshType = Literal["diag", "exact"]
 
 
 def _column_launch(row_width: int, max_width: int) -> tuple[int, int]:
@@ -155,90 +157,290 @@ def block_pool(x: torch.Tensor, out: torch.Tensor, *, block_size: int, reduce: _
     )
 
 
-# --------------------------------------------------------------------------- block statistics
+# --------------------------------------------------------------------------- block thresholds
 @triton.jit
 def _block_statistics_kernel(
     x_ptr,
     mean_ptr,
     var_ptr,
+    moment_ptr,
     num_blocks,
-    num_chunks,
-    row_width,
+    num_heads,
     stride_x_batch,
     stride_x_block,
-    stride_out_batch,
+    stride_x_head,
+    stride_s_batch,
+    stride_s_head,
+    stride_m_batch,
+    stride_m_head,
+    EXACT: tl.constexpr,
     ROWS: tl.constexpr,
-    WIDTH: tl.constexpr,
+    COLS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
-    """One program per (batch, column chunk): mean and clamped variance over the block axis."""
-    pid = tl.program_id(0).to(tl.int64)
-    chunk = pid % num_chunks
-    batch = pid // num_chunks
-    columns = chunk * WIDTH + tl.arange(0, WIDTH)
-    in_row = columns < row_width
-    total = tl.zeros([WIDTH], dtype=tl.float32)
-    total_sq = tl.zeros([WIDTH], dtype=tl.float32)
+    """One program per (batch, head, column chunk): key block statistics over the block axis.
+
+    Every program writes the per-channel mean and clamped variance of its columns. With ``EXACT``
+    it also accumulates its columns of the raw second moment ``E[k k^T]`` with tensor-core dots on
+    the 16-bit summaries, whose products are exact in the fp32 accumulator.
+    """
+    chunk = tl.program_id(0)
+    batch_head = tl.program_id(1).to(tl.int64)
+    batch = batch_head // num_heads
+    head = batch_head % num_heads
+    cols = chunk * COLS + tl.arange(0, COLS)
+    dims = tl.arange(0, HEAD_DIM)
+    base = x_ptr + batch * stride_x_batch + head * stride_x_head
+    total = tl.zeros([COLS], dtype=tl.float32)
+    total_sq = tl.zeros([COLS], dtype=tl.float32)
+    if EXACT:
+        moment = tl.zeros([HEAD_DIM, COLS], dtype=tl.float32)
     for start in range(0, num_blocks, ROWS):
         rows = start + tl.arange(0, ROWS)
-        values = tl.load(
-            x_ptr + batch * stride_x_batch + rows[:, None] * stride_x_block + columns[None, :],
-            mask=(rows < num_blocks)[:, None] & in_row[None, :],
+        row_valid = rows < num_blocks
+        tile = tl.load(
+            base + rows[:, None] * stride_x_block + cols[None, :],
+            mask=row_valid[:, None],
             other=0.0,
-        ).to(tl.float32)
+        )
+        values = tile.to(tl.float32)
         total += tl.sum(values, axis=0)
         total_sq += tl.sum(values * values, axis=0)
+        if EXACT:
+            full = tl.load(
+                base + rows[:, None] * stride_x_block + dims[None, :],
+                mask=row_valid[:, None],
+                other=0.0,
+            )
+            moment += tl.dot(tl.trans(full), tile)
     count = num_blocks.to(tl.float32)
     mean = total / count
-    variance = tl.maximum(total_sq / count - mean * mean, 0.0)
-    tl.store(mean_ptr + batch * stride_out_batch + columns, mean, mask=in_row)
-    tl.store(var_ptr + batch * stride_out_batch + columns, variance, mask=in_row)
+    stats = batch * stride_s_batch + head * stride_s_head + cols
+    tl.store(mean_ptr + stats, mean)
+    tl.store(var_ptr + stats, tl.maximum(total_sq / count - mean * mean, 0.0))
+    if EXACT:
+        tl.store(
+            moment_ptr
+            + batch * stride_m_batch
+            + head * stride_m_head
+            + dims[:, None] * HEAD_DIM
+            + cols[None, :],
+            moment / count,
+        )
 
 
-def _block_statistics_torch(x: torch.Tensor, out_mean: torch.Tensor, out_var: torch.Tensor) -> None:
-    values = x.to(torch.float32)
-    mean = values.mean(dim=1)
-    out_mean.copy_(mean)
-    out_var.copy_(torch.clamp(values.square().mean(dim=1) - mean.square(), min=0.0))
+@triton.jit
+def _block_thresholds_kernel(
+    centroid_ptr,
+    mean_ptr,
+    var_ptr,
+    moment_ptr,
+    threshold_ptr,
+    num_q_blocks,
+    num_heads,
+    tau,
+    log2_scale,
+    epsilon,
+    stride_c_batch,
+    stride_c_block,
+    stride_c_head,
+    stride_s_batch,
+    stride_s_head,
+    stride_m_batch,
+    stride_m_head,
+    stride_t_batch,
+    stride_t_head,
+    EXACT: tl.constexpr,
+    Q_BLOCKS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """One program per (batch, head, tile of Q_BLOCKS query blocks): the routing threshold per row.
+
+    ``mean + tau * sqrt(var + epsilon)`` in the log2 score domain, where the variance of the
+    centroid score is either the diagonal projection of the per-channel key variance or the full
+    quadratic form with the key second moment (``EXACT``); the fp32 dot keeps IEEE precision.
+    """
+    tile = tl.program_id(0)
+    batch_head = tl.program_id(1).to(tl.int64)
+    batch = batch_head // num_heads
+    head = batch_head % num_heads
+    q_blocks = tile * Q_BLOCKS + tl.arange(0, Q_BLOCKS)
+    q_valid = q_blocks < num_q_blocks
+    dims = tl.arange(0, HEAD_DIM)
+    centroid = tl.load(
+        centroid_ptr
+        + batch * stride_c_batch
+        + q_blocks[:, None] * stride_c_block
+        + head * stride_c_head
+        + dims[None, :],
+        mask=q_valid[:, None],
+        other=0.0,
+    )
+    stats = batch * stride_s_batch + head * stride_s_head + dims
+    mean = tl.load(mean_ptr + stats)
+    projected_mean = tl.sum(centroid * mean[None, :], axis=1)
+    if EXACT:
+        moment = tl.load(
+            moment_ptr
+            + batch * stride_m_batch
+            + head * stride_m_head
+            + dims[:, None] * HEAD_DIM
+            + dims[None, :]
+        )
+        projected = tl.dot(centroid, moment, input_precision="ieee")
+        projected_var = tl.maximum(
+            tl.sum(projected * centroid, axis=1) - projected_mean * projected_mean, 0.0
+        )
+    else:
+        var = tl.load(var_ptr + stats)
+        projected_var = tl.sum(centroid * centroid * var[None, :], axis=1)
+    threshold = projected_mean * log2_scale + tau * tl.sqrt(
+        projected_var * (log2_scale * log2_scale) + epsilon
+    )
+    tl.store(
+        threshold_ptr + batch * stride_t_batch + head * stride_t_head + q_blocks,
+        threshold,
+        mask=q_valid,
+    )
 
 
-def block_statistics(x: torch.Tensor, out_mean: torch.Tensor, out_var: torch.Tensor) -> None:
-    """Per-channel mean and biased variance of ``x`` over its block axis.
+def _block_thresholds_torch(
+    centroid: torch.Tensor,
+    k_summary: torch.Tensor,
+    *,
+    tau: float,
+    sm_scale: float,
+    thresh_type: _ThreshType,
+) -> torch.Tensor:
+    # float64 keeps this path a precise reference for the kernels; TensorRT-LLM
+    # enables TF32 matmuls, which would perturb the fp32 second moment.
+    log2_scale = float(sm_scale) * _LOG2_E
+    c = centroid.to(torch.float64).permute(0, 2, 1, 3)
+    keys = k_summary.to(torch.float64).permute(0, 2, 1, 3)
+    k_mean = keys.mean(dim=2)
+    mean = torch.einsum("bhqd,bhd->bhq", c, k_mean)
+    if thresh_type == "diag":
+        k_var = torch.clamp(keys.square().mean(dim=2) - k_mean.square(), min=0.0)
+        var = torch.einsum("bhqd,bhd->bhq", c.square(), k_var)
+    else:
+        second_moment = torch.matmul(keys.transpose(-1, -2), keys) / keys.shape[2]
+        var = torch.clamp(
+            torch.einsum("bhqd,bhqd->bhq", torch.matmul(c, second_moment), c) - mean.square(),
+            min=0.0,
+        )
+    threshold = mean * log2_scale + float(tau) * torch.sqrt(
+        var * (log2_scale * log2_scale) + _THRESHOLD_EPSILON
+    )
+    return threshold.to(torch.float32).contiguous()
+
+
+def block_thresholds(
+    centroid: torch.Tensor,
+    k_summary: torch.Tensor,
+    *,
+    tau: float,
+    sm_scale: float,
+    thresh_type: _ThreshType,
+) -> torch.Tensor:
+    """Routing threshold ``mean + tau * sqrt(var + 1e-6)`` of every query block in the log2 score domain.
+
+    The threshold models the score of the query block centroid ``c`` against a key block drawn from the
+    observed key block summaries: ``mean = <c, E[k]>`` with either the diagonal variance
+    ``sum_d c_d^2 Var[k_d]`` (``"diag"``) or the full covariance ``c^T Cov[k] c`` (``"exact"``), both in
+    the ``sm_scale * log2(e)`` scaled domain the selection kernel scores in. CUDA tensors with 16-bit
+    key summaries and a power-of-two head dimension run two Triton kernels, key statistics and then
+    thresholds; other tensors use the float64 PyTorch implementation of the same rule.
 
     Args:
-        x: Contiguous ``[batch, num_blocks, heads, head_dim]`` block summaries.
-        out_mean: Contiguous fp32 ``[batch, heads, head_dim]`` buffer.
-        out_var: Contiguous fp32 ``[batch, heads, head_dim]`` buffer; negative rounding is clamped to zero.
+        centroid: Contiguous fp32 ``[batch, num_q_blocks, heads, head_dim]`` query block means.
+        k_summary: Contiguous ``[batch, num_kv_blocks, heads, head_dim]`` key block means.
+        tau: Threshold slope in standard deviations.
+        sm_scale: Softmax scale of the attention call.
+        thresh_type: ``"diag"`` or ``"exact"``.
+
+    Returns:
+        Contiguous fp32 ``[batch, heads, num_q_blocks]`` thresholds.
     """
-    batch_size, blocks, num_heads, head_dim = x.shape
-    expected = (batch_size, num_heads, head_dim)
-    for name, tensor in (("out_mean", out_mean), ("out_var", out_var)):
-        if (
-            tuple(tensor.shape) != expected
-            or tensor.dtype != torch.float32
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(f"{name} must be a contiguous fp32 tensor of shape {expected}")
-    if not x.is_contiguous():
-        raise ValueError("x must be contiguous")
-    if x.device.type != "cuda":
-        _block_statistics_torch(x, out_mean, out_var)
-        return
-    row_width = num_heads * head_dim
-    width, chunks = _column_launch(row_width, _STATS_WIDTH)
-    _block_statistics_kernel[(batch_size * chunks,)](
-        x,
-        out_mean,
-        out_var,
-        blocks,
-        chunks,
-        row_width,
-        x.stride(0),
-        x.stride(1),
-        out_mean.stride(0),
-        ROWS=_STATS_ROWS_PER_LOAD,
-        WIDTH=width,
+    if thresh_type not in ("diag", "exact"):
+        raise ValueError(f"thresh_type must be 'diag' or 'exact'; got {thresh_type!r}")
+    batch_size, q_blocks, num_heads, head_dim = centroid.shape
+    kv_blocks = k_summary.shape[1]
+    if tuple(k_summary.shape) != (batch_size, kv_blocks, num_heads, head_dim):
+        raise ValueError("k_summary must match centroid in batch, heads, and head_dim")
+    triton_ready = (
+        centroid.device.type == "cuda"
+        and centroid.dtype == torch.float32
+        and centroid.is_contiguous()
+        and k_summary.is_contiguous()
+        and k_summary.dtype in (torch.bfloat16, torch.float16)
+        and head_dim >= _STATS_COLS
+        and head_dim & (head_dim - 1) == 0
+    )
+    if not triton_ready:
+        return _block_thresholds_torch(
+            centroid, k_summary, tau=tau, sm_scale=sm_scale, thresh_type=thresh_type
+        )
+    exact = thresh_type == "exact"
+    mean = torch.empty(
+        (batch_size, num_heads, head_dim), dtype=torch.float32, device=centroid.device
+    )
+    var = torch.empty_like(mean)
+    moment = (
+        torch.empty(
+            (batch_size, num_heads, head_dim, head_dim), dtype=torch.float32, device=centroid.device
+        )
+        if exact
+        else mean
+    )
+    _block_statistics_kernel[(head_dim // _STATS_COLS, batch_size * num_heads)](
+        k_summary,
+        mean,
+        var,
+        moment,
+        kv_blocks,
+        num_heads,
+        k_summary.stride(0),
+        k_summary.stride(1),
+        k_summary.stride(2),
+        mean.stride(0),
+        mean.stride(1),
+        moment.stride(0),
+        moment.stride(1),
+        EXACT=exact,
+        ROWS=_STATS_ROWS,
+        COLS=_STATS_COLS,
+        HEAD_DIM=head_dim,
         num_warps=4,
     )
+    threshold = torch.empty(
+        (batch_size, num_heads, q_blocks), dtype=torch.float32, device=centroid.device
+    )
+    _block_thresholds_kernel[(triton.cdiv(q_blocks, _THRESHOLD_Q_BLOCKS), batch_size * num_heads)](
+        centroid,
+        mean,
+        var,
+        moment,
+        threshold,
+        q_blocks,
+        num_heads,
+        float(tau),
+        float(sm_scale) * _LOG2_E,
+        _THRESHOLD_EPSILON,
+        centroid.stride(0),
+        centroid.stride(1),
+        centroid.stride(2),
+        mean.stride(0),
+        mean.stride(1),
+        moment.stride(0),
+        moment.stride(1),
+        threshold.stride(0),
+        threshold.stride(1),
+        EXACT=exact,
+        Q_BLOCKS=_THRESHOLD_Q_BLOCKS,
+        HEAD_DIM=head_dim,
+        num_warps=4,
+    )
+    return threshold
 
 
 # --------------------------------------------------------------------------- exact-block selection
@@ -246,25 +448,22 @@ def block_statistics(x: torch.Tensor, out_mean: torch.Tensor, out_var: torch.Ten
 def _select_exact_blocks_kernel(
     centroid_ptr,
     keys_ptr,
-    mean_ptr,
-    var_ptr,
+    threshold_ptr,
     bits_ptr,
     num_q_blocks,
     num_kv_blocks,
     num_words,
     num_heads,
     local_radius,
-    tau,
     log2_scale,
-    epsilon,
     stride_c_batch,
     stride_c_block,
     stride_c_head,
     stride_k_batch,
     stride_k_block,
     stride_k_head,
-    stride_s_batch,
-    stride_s_head,
+    stride_t_batch,
+    stride_t_head,
     stride_b_batch,
     stride_b_head,
     stride_b_block,
@@ -293,11 +492,11 @@ def _select_exact_blocks_kernel(
         mask=q_valid[:, None],
         other=0.0,
     )
-    key_mean = tl.load(mean_ptr + batch * stride_s_batch + head * stride_s_head + dims)
-    key_var = tl.load(var_ptr + batch * stride_s_batch + head * stride_s_head + dims)
-    projected_mean = tl.sum(centroid * key_mean[None, :], axis=1) * log2_scale
-    projected_var = tl.sum(centroid * centroid * key_var[None, :], axis=1) * log2_scale * log2_scale
-    threshold = projected_mean + tau * tl.sqrt(tl.maximum(projected_var, 0.0) + epsilon)
+    threshold = tl.load(
+        threshold_ptr + batch * stride_t_batch + head * stride_t_head + q_blocks,
+        mask=q_valid,
+        other=0.0,
+    )
 
     high = centroid.to(keys_ptr.dtype.element_ty)
     rest = centroid - high.to(tl.float32)
@@ -338,25 +537,16 @@ def _select_exact_blocks_kernel(
 def _select_exact_blocks_torch(
     centroid: torch.Tensor,
     k_summary: torch.Tensor,
-    k_mean: torch.Tensor,
-    k_var: torch.Tensor,
+    threshold: torch.Tensor,
     exact_block_bits: torch.Tensor,
     *,
-    tau: float,
     sm_scale: float,
 ) -> None:
     log2_scale = float(sm_scale) * _LOG2_E
     q = centroid.to(torch.float64)
     k = k_summary.to(torch.float64)
-    projected_mean = torch.einsum("bqhd,bhd->bhq", q, k_mean.to(torch.float64)) * log2_scale
-    projected_var = (
-        torch.einsum("bqhd,bhd->bhq", q.square(), k_var.to(torch.float64)) * log2_scale * log2_scale
-    )
-    threshold = projected_mean + float(tau) * torch.sqrt(
-        torch.clamp(projected_var, min=0.0) + _THRESHOLD_EPSILON
-    )
     scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * log2_scale
-    exact = scores > threshold.unsqueeze(-1)
+    exact = scores > threshold.to(torch.float64).unsqueeze(-1)
     num_kv_blocks = k_summary.shape[1]
     ids = torch.arange(num_kv_blocks, device=centroid.device)
     exact |= ((ids[:, None] - ids[None, :]).abs() <= _LOCAL_RADIUS)[None, None]
@@ -372,27 +562,22 @@ def _select_exact_blocks_torch(
 def select_exact_blocks(
     centroid: torch.Tensor,
     k_summary: torch.Tensor,
-    k_mean: torch.Tensor,
-    k_var: torch.Tensor,
+    threshold: torch.Tensor,
     exact_block_bits: torch.Tensor,
     *,
-    tau: float,
     sm_scale: float,
 ) -> None:
     """Pack the SOL exact-block decision of every (query block, key block) pair into ``exact_block_bits``.
 
-    A key block is exact when ``sm_scale * log2(e) * <centroid, k_summary>`` exceeds the row threshold
-    ``mean + tau * sqrt(var + 1e-6)`` projected from the key statistics, or when it lies within one
-    block of the query block. Bit ``r`` of word ``w`` selects key block ``32 * w + r``; padding bits of
-    the final word are zero.
+    A key block is exact when ``sm_scale * log2(e) * <centroid, k_summary>`` exceeds the row's
+    ``threshold`` (see ``block_thresholds``) or when it lies within one block of the query block. Bit
+    ``r`` of word ``w`` selects key block ``32 * w + r``; padding bits of the final word are zero.
 
     Args:
         centroid: Contiguous fp32 ``[batch, num_q_blocks, heads, head_dim]`` query block means.
         k_summary: Contiguous ``[batch, num_kv_blocks, heads, head_dim]`` key block means (bf16 or fp16).
-        k_mean: fp32 ``[batch, heads, head_dim]`` mean of ``k_summary`` over its block axis.
-        k_var: fp32 ``[batch, heads, head_dim]`` variance of ``k_summary`` over its block axis.
+        threshold: Contiguous fp32 ``[batch, heads, num_q_blocks]`` row thresholds.
         exact_block_bits: Contiguous uint32 ``[batch, heads, num_q_blocks, ceil(num_kv_blocks / 32)]``.
-        tau: Threshold slope in standard deviations.
         sm_scale: Softmax scale of the attention call.
     """
     batch_size, q_blocks, num_heads, head_dim = centroid.shape
@@ -402,6 +587,13 @@ def select_exact_blocks(
         raise ValueError(f"exact_block_bits must be uint32 of shape {expected_bits}")
     if tuple(k_summary.shape) != (batch_size, kv_blocks, num_heads, head_dim):
         raise ValueError("k_summary must match centroid in batch, heads, and head_dim")
+    expected_threshold = (batch_size, num_heads, q_blocks)
+    if (
+        tuple(threshold.shape) != expected_threshold
+        or threshold.dtype != torch.float32
+        or not threshold.is_contiguous()
+    ):
+        raise ValueError(f"threshold must be contiguous fp32 of shape {expected_threshold}")
     if (
         centroid.dtype != torch.float32
         or not centroid.is_contiguous()
@@ -412,7 +604,7 @@ def select_exact_blocks(
         raise ValueError("exact_block_bits must be contiguous")
     if centroid.device.type != "cuda":
         _select_exact_blocks_torch(
-            centroid, k_summary, k_mean, k_var, exact_block_bits, tau=tau, sm_scale=sm_scale
+            centroid, k_summary, threshold, exact_block_bits, sm_scale=sm_scale
         )
         return
     bits = exact_block_bits.view(torch.int32)
@@ -420,25 +612,22 @@ def select_exact_blocks(
     _select_exact_blocks_kernel[grid](
         centroid,
         k_summary,
-        k_mean,
-        k_var,
+        threshold,
         bits,
         q_blocks,
         kv_blocks,
         num_words(kv_blocks),
         num_heads,
         _LOCAL_RADIUS,
-        float(tau),
         float(sm_scale) * _LOG2_E,
-        _THRESHOLD_EPSILON,
         centroid.stride(0),
         centroid.stride(1),
         centroid.stride(2),
         k_summary.stride(0),
         k_summary.stride(1),
         k_summary.stride(2),
-        k_mean.stride(0),
-        k_mean.stride(1),
+        threshold.stride(0),
+        threshold.stride(1),
         bits.stride(0),
         bits.stride(1),
         bits.stride(2),
@@ -449,41 +638,40 @@ def select_exact_blocks(
 
 
 # --------------------------------------------------------------------------- graph-visible operator
-@torch.library.custom_op(
-    "trtllm::visual_gen_sol_predictor",
-    mutates_args=(
-        "exact_block_bits",
-        "k_summary",
-        "v_summary",
-        "k_mean",
-        "k_var_diag",
-        "q_centroid",
-    ),
-    device_types="cuda",
-)
+@torch.library.custom_op("trtllm::visual_gen_sol_predictor", mutates_args=(), device_types="cuda")
 def visual_gen_sol_predictor(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    exact_block_bits: torch.Tensor,
-    k_summary: torch.Tensor,
-    v_summary: torch.Tensor,
-    k_mean: torch.Tensor,
-    k_var_diag: torch.Tensor,
-    q_centroid: torch.Tensor,
     block_size: int,
     tau: float,
     sm_scale: float,
-) -> None:
-    """Update caller-owned SOL route and proxy tensors in place."""
+    thresh_type: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(exact_block_bits, k_summary, v_summary)`` for compact BSHD ``q``, ``k`` and ``v``.
 
+    The outputs are fresh tensors of this call. Inside CUDA Graph capture they come from the graph
+    pool and stay valid for every replay; under torch.compile the operator is opaque and shapes come
+    from the fake implementation.
+    """
+
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    blocks = num_blocks(seq_len, block_size)
+    summary_shape = (batch_size, blocks, num_heads, head_dim)
+    q_centroid = torch.empty(summary_shape, dtype=torch.float32, device=q.device)
+    k_summary = torch.empty(summary_shape, dtype=k.dtype, device=k.device)
+    v_summary = torch.empty(summary_shape, dtype=v.dtype, device=v.device)
     block_pool(q, q_centroid, block_size=block_size, reduce="mean")
     block_pool(k, k_summary, block_size=block_size, reduce="mean")
     block_pool(v, v_summary, block_size=block_size, reduce="sum")
-    block_statistics(k_summary, k_mean, k_var_diag)
-    select_exact_blocks(
-        q_centroid, k_summary, k_mean, k_var_diag, exact_block_bits, tau=tau, sm_scale=sm_scale
+    threshold = block_thresholds(
+        q_centroid, k_summary, tau=tau, sm_scale=sm_scale, thresh_type=thresh_type
     )
+    exact_block_bits = torch.empty(
+        (batch_size, num_heads, blocks, num_words(blocks)), dtype=torch.uint32, device=q.device
+    )
+    select_exact_blocks(q_centroid, k_summary, threshold, exact_block_bits, sm_scale=sm_scale)
+    return exact_block_bits, k_summary, v_summary
 
 
 @torch.library.register_fake("trtllm::visual_gen_sol_predictor")
@@ -491,17 +679,19 @@ def _(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    exact_block_bits: torch.Tensor,
-    k_summary: torch.Tensor,
-    v_summary: torch.Tensor,
-    k_mean: torch.Tensor,
-    k_var_diag: torch.Tensor,
-    q_centroid: torch.Tensor,
     block_size: int,
     tau: float,
     sm_scale: float,
-) -> None:
-    return None
+    thresh_type: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    blocks = num_blocks(seq_len, block_size)
+    summary_shape = (batch_size, blocks, num_heads, head_dim)
+    return (
+        q.new_empty((batch_size, num_heads, blocks, num_words(blocks)), dtype=torch.uint32),
+        k.new_empty(summary_shape),
+        v.new_empty(summary_shape),
+    )
 
 
-__all__ = ["block_pool", "block_statistics", "num_blocks", "num_words", "select_exact_blocks"]
+__all__ = ["block_pool", "block_thresholds", "num_blocks", "num_words", "select_exact_blocks"]

@@ -275,7 +275,7 @@ attention_config:
     tau: 1.0                      # routing threshold; higher tau routes more blocks sparse
     disabled_until_timestep: 0.6  # dense while the normalized timestep >= cutoff
     dense_layers: [0, 2, 3, 4]    # optional: layer indices forced dense
-    thresh_type: diag             # CUTEDSL kernel threshold policy; "exact" needs CUTEDSL
+    thresh_type: diag             # block threshold policy: "diag" or "exact"
 ```
 
 - `tau` is the routing threshold in standard deviations above the mean block
@@ -286,22 +286,23 @@ attention_config:
   below it. Use `None` rather than `0.0` to disable the prefix.
 - `dense_layers` lists zero-based layer indices that always use dense
   attention.
-- `thresh_type` selects the threshold policy of the CUTEDSL kernel. The TRTLLM
-  predictor implements `diag` only, and `AttentionConfig` rejects `exact`
-  together with the TRTLLM backend.
+- `thresh_type` selects how the routing threshold models the key blocks:
+  `diag` treats every key channel independently, `exact` uses the full key
+  covariance. Both backends implement both policies from the same per-block
+  statistics.
 
 The TRTLLM envelope is full-mask BF16 self-attention on SM100 or SM103 with 4-D
-BSHD Q/K/V tensors, equal Q/K/V shapes and head dimension 128. The TRTLLM
-backend uses a host-side graph break to prepare and own predictor plans, so
-`torch_compile_config.enable_fullgraph=True` is rejected for SOL; keep the
-default `False` setting.
+BSHD Q/K/V tensors, equal Q/K/V shapes and head dimension 128. The predictor is
+one graph-visible operator that allocates its route and summary tensors per
+call, so it composes with CUDA Graph capture and with torch.compile, including
+`fullgraph`, without keeping any state between calls.
 
 When a cutoff is configured, VisualGen includes the dense-or-sparse phase in
 the CUDA Graph key. The TRTLLM attention metadata reduces the timestep to a host
 value during graph warmup, keeps it in the component attention state and reuses
 it during capture for every timestep-scheduled algorithm (Skip Softmax Attention
-and SOL), while SOL
-predictor route buffers remain stable for replay; the CuTeDSL backends read the
+and SOL), while the SOL predictor's outputs are allocated inside the captured
+graph and replayed with it; the CuTeDSL backends read the
 phase the CUDA Graph runner resolved for the graph key instead of the device
 tensor. Per-token timesteps, such as Wan I2V where the conditioning frame stays
 at timestep zero, reduce to their largest live value, so the schedule stays
