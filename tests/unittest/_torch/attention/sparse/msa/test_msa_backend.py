@@ -781,10 +781,6 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed(
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 (Blackwell) required")
-    from tensorrt_llm._utils import get_sm_version
-
-    if get_sm_version() == 107:
-        pytest.skip("fmha_sm100 (vendored MiniMax-M3 MSA kernel) JIT targets sm_100a only")
 
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         msa_package_available,

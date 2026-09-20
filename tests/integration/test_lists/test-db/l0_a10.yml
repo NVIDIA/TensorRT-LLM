@@ -55,6 +55,7 @@ l0_a10:
   - unittest/_torch/models/test_qwen3next_moe_allreduce_guard.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
+  - unittest/inputs/test_prefix_token_cache.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_lora_manager.py
@@ -139,6 +140,7 @@ l0_a10:
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
+  - unittest/_torch/visual_gen/test_qwen_image_pipeline_config.py
   # llmapi
   - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_llm_args.py

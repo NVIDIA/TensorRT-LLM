@@ -389,6 +389,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_tokenization_cache"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "encode_only"
     },
     {
@@ -896,6 +901,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1278,6 +1284,11 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"
@@ -1640,6 +1651,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",

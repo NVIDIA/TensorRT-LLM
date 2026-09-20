@@ -781,8 +781,8 @@ class DeepseekV4WeightLoader:
                 if o_a_proj_scale is not None:
                     o_a_proj_scale = split_matrix_tp(o_a_proj_scale, tp_size, tp_rank, 0)
 
-            # Skip the BF16 dequant when the destination is FP8 (the cute_dsl
-            # FP8 BMM path on SM100 consumes the native FP8 weight directly).
+            # Skip BF16 dequant when the architecture-specific CuTe DSL BMM
+            # consumes the native FP8 weight directly.
             if o_a_proj_scale is not None and module.o_a_proj.dtype != torch.float8_e4m3fn:
                 o_a_proj = weight_dequant(
                     o_a_proj.reshape(-1, o_a_proj.shape[-1]).contiguous().cuda(),
@@ -1598,6 +1598,7 @@ class DeepseekV4MoE(nn.Module):
             config=model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
+            use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             swiglu_limit=swiglu_limit,
         )
 
@@ -2265,6 +2266,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
             self.h_proj = Linear(
                 config.hidden_size,
@@ -2273,6 +2275,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
         else:
             self.e_proj = Linear(
@@ -2285,6 +2288,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 reduce_output=True,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
             self.h_proj = Linear(
                 config.hidden_size,
@@ -2296,6 +2300,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 reduce_output=True,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
 
         self.shared_head = DeepseekV4MTPHead(model_config)

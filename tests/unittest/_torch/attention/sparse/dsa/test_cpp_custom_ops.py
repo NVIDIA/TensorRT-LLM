@@ -239,6 +239,74 @@ def test_nvfp4_mla_context_kv_cache_gather():
         assert torch.equal(output[compact_row, 0], expected)
 
 
+@skip_pre_blackwell
+@pytest.mark.parametrize("head_dim,residual_dim", [(256, 0), (576, 0), (576, 16), (576, 64)])
+@pytest.mark.parametrize("global_scale_value", [1.0, 0.25, 100.0 / (448 * 6)])
+def test_nvfp4_mla_context_kv_cache_gather_layouts(
+    head_dim: int, residual_dim: int, global_scale_value: float
+) -> None:
+    """Check fixed and generic layouts with paged layer offsets and invalid indices."""
+    pool_tokens = 8
+    residual_start = head_dim - residual_dim
+    row_codes = torch.arange(1, pool_tokens + 1, dtype=torch.uint8, device="cuda")
+    packed = row_codes | (row_codes << 4)
+    data = packed[:, None].expand(-1, (head_dim + residual_dim) // 2).contiguous()
+    scales = torch.full(
+        (pool_tokens, (head_dim + residual_dim) // 16),
+        2.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    for group in range(residual_dim // 16):
+        offset = residual_start // 2 + group * 16
+        data[:, offset + 8 : offset + 16] = 0x11
+        scales[:, residual_start // 16 + group * 2 + 1] = 0.5
+
+    pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    pointers[0, 0, 0] = data.data_ptr()
+    pointers[0, 0, 1] = scales.data_ptr()
+    mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    topk = torch.tensor([[0, 2, -1], [3, 1, 8]], dtype=torch.int32, device="cuda")
+    requests = torch.zeros(2, dtype=torch.int32, device="cuda")
+    block_table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([0, 4], dtype=torch.int64, device="cuda")
+    output = torch.empty((4, 1, head_dim), dtype=torch.float8_e4m3fn, device="cuda")
+    compact = torch.empty_like(topk)
+    global_scale = torch.tensor([global_scale_value], dtype=torch.float32, device="cuda")
+    # Two tokens per block and two layers per physical page. Layer one maps
+    # logical tokens [0, 1, 2, 3] to physical rows [6, 7, 2, 3].
+    torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather(
+        pointers,
+        mapping,
+        topk,
+        requests,
+        block_table,
+        lengths,
+        output,
+        compact,
+        global_scale,
+        0,
+        4,
+        2,
+        4,
+        1,
+        residual_dim,
+        pool_tokens,
+    )
+    expected_compact = torch.tensor([[0, 2, -1], [3, 1, -1]], dtype=torch.int32, device="cuda")
+    assert torch.equal(compact, expected_compact)
+    e2m1 = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device="cuda",
+    )
+    physical_rows = torch.tensor([6, 7, 2, 3], device="cuda")
+    expected = (e2m1[row_codes[physical_rows].long()] * 2).unsqueeze(1).expand(-1, head_dim).clone()
+    if residual_dim:
+        expected[:, residual_start:] += 0.25
+    expected = (expected * global_scale_value).to(torch.float8_e4m3fn)
+    assert torch.equal(output[:, 0], expected)
+
+
 # ===================================================================
 # Test 1: indexer_k_cache_gather_op
 # ===================================================================

@@ -79,7 +79,6 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
-_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
@@ -113,7 +112,8 @@ def Field(default: Any = ...,
             telemetry=TelemetryField.categorical(...) to opt an otherwise unsafe
             categorical branch in with exact allowed values, or telemetry=False
             to opt a type-safe field out.
-        **kwargs: All other arguments passed to the original Pydantic Field
+        **kwargs: All other arguments passed to the original Pydantic Field.
+            json_schema_extra must be a dict when status or telemetry is set.
 
     Returns:
         A Pydantic FieldInfo object with extra metadata added to
@@ -124,7 +124,9 @@ def Field(default: Any = ...,
 
     if status is not None or telemetry_requested or telemetry_explicit_exclude:
         trtllm_schema_extra: dict[str, Any] = {}
-        json_schema_extra = kwargs.get('json_schema_extra', {})
+        json_schema_extra = kwargs.get('json_schema_extra')
+        if json_schema_extra is None:
+            json_schema_extra = {}
         if status is not None:
             trtllm_schema_extra['status'] = status
         if telemetry_explicit_exclude:
@@ -142,35 +144,21 @@ def Field(default: Any = ...,
                 raise TypeError(
                     "telemetry must be bool, dict, or TelemetryField")
             trtllm_schema_extra['telemetry'] = telemetry_metadata
-        if isinstance(json_schema_extra, dict):
-            json_schema_extra = {**json_schema_extra, **trtllm_schema_extra}
-        elif callable(json_schema_extra):
-            original_json_schema_extra = json_schema_extra
-
-            def merged_json_schema_extra(schema: dict[str, Any]) -> None:
-                original_extra = original_json_schema_extra(schema)
-                if isinstance(original_extra, dict):
-                    schema.update(original_extra)
-                schema.update(trtllm_schema_extra)
-
-            setattr(merged_json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR,
-                    trtllm_schema_extra)
-            json_schema_extra = merged_json_schema_extra
-        else:
-            json_schema_extra = trtllm_schema_extra
-        kwargs['json_schema_extra'] = json_schema_extra
+        if not isinstance(json_schema_extra, dict):
+            raise TypeError(
+                "json_schema_extra must be a dict when status or telemetry metadata is set"
+            )
+        kwargs['json_schema_extra'] = {
+            **json_schema_extra,
+            **trtllm_schema_extra
+        }
 
     return PydanticField(default, **kwargs)
 
 
 def _get_trtllm_json_schema_extra(field_info: Any) -> dict[str, Any]:
     json_schema_extra = getattr(field_info, "json_schema_extra", None)
-    if callable(json_schema_extra):
-        json_schema_extra = getattr(json_schema_extra,
-                                    _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
-    if isinstance(json_schema_extra, dict):
-        return json_schema_extra
-    return {}
+    return json_schema_extra if isinstance(json_schema_extra, dict) else {}
 
 
 class BaseCudaGraphConfig(StrictBaseModel):
@@ -858,7 +846,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     algorithm: Literal["minimax_m3"] = "minimax_m3"
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
-        description="Number of index-attention heads (per TP rank's view).",
+        description=
+        "Global checkpoint index-attention head count. Index heads shard with "
+        "their KV-head groups in both separate and fused projections.",
     )
     sparse_index_dim: int = Field(
         default=128,
@@ -898,6 +888,17 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "by the MSA implementation.",
         status="prototype",
     )
+    fuse_qkv_index_projection: bool = Field(
+        default=False,
+        description=
+        "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q "
+        "is sharded with the KV heads and index-K is replicated. MSA batches "
+        "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
+        "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
+        "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
+        "main KV cache.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -932,6 +933,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
             raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
                              "sparse_disable_index_value=True.")
+        if self.fuse_qkv_index_projection and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "the 'msa' implementation.")
+        if self.fuse_qkv_index_projection and self.indexer_kv_dtype != "fp8":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "indexer_kv_dtype='fp8'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -946,6 +955,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
         return MiniMaxM3SparseParams(
             num_index_heads=self.sparse_num_index_heads,
+            global_num_kv_heads=(
+                self.to_sparse_metadata_params(**kwargs).global_num_kv_heads
+                or None),
             sparse_index_dim=self.sparse_index_dim,
             block_size=self.sparse_block_size,
             topk=self.sparse_topk_blocks,
@@ -955,6 +967,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
             indexer_kv_dtype=self.indexer_kv_dtype,
+            fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1419,6 +1432,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description="Target sparsity for prefill and/or decode phases. "
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
+    uses_spcompress: bool = Field(
+        default=False,
+        description="Whether to enable spcompress (context phase, SM107 only).")
 
     @field_validator("target_sparsity")
     @classmethod
@@ -1499,7 +1515,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             is not None else SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 ckpt_sparse_attention_config=ckpt_sparse_attention_config))
-        return SkipSoftmaxParams(scheduler=scheduler)
+        return SkipSoftmaxParams(scheduler=scheduler,
+                                 uses_spcompress=self.uses_spcompress)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1601,8 +1618,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
-_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
-                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
+                      "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
 
 
@@ -1911,7 +1928,8 @@ class CalibConfig(StrictBaseModel):
 class AdvancedSamplingMode(StrEnum):
     """Deploy-time specialization of the one-model advanced sampler.
 
-    FULL    - per-row tensor top_k/top_p (default; mixed per-request sampling).
+    FULL    - per-row tensor top_k/top_p/min_p in one fused kernel (default; mixed
+              per-request sampling). The only mode that accepts min_p.
     NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
     NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
     NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
@@ -1932,6 +1950,11 @@ class AdvancedSamplingMode(StrEnum):
         """Single source of truth: does this mode disable the top_p filter?"""
         return self in (AdvancedSamplingMode.NO_TOPP,
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+    @property
+    def is_fused(self) -> bool:
+        """Whether this mode runs the fused kernel, and so accepts min_p."""
+        return self is AdvancedSamplingMode.FULL
 
 
 class _MTPDraftCheckpointType(StrEnum):
@@ -2045,8 +2068,9 @@ class DecodingBaseConfig(StrictBaseModel):
         default=AdvancedSamplingMode.FULL,
         description=
         "Deploy-time specialization of the one-model advanced sampler that skips disabled "
-        "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
-        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
+        "filter kernels. FULL (default): per-row top_k/top_p/min_p in one fused kernel, the "
+        "only mode accepting min_p. NO_TOPK: skip top_k. NO_TOPP: skip top_p. "
+        "NO_TOPK_NO_TOPP: skip both.")
 
     enable_penalty: bool = Field(
         default=False,
@@ -5775,6 +5799,12 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
+        status="prototype")
+
+    enable_tokenization_cache: bool = Field(
+        default=False,
+        description=
+        "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
         status="prototype")
 
     enable_iter_req_stats: bool = Field(

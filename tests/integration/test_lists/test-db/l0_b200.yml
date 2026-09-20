@@ -31,6 +31,10 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
@@ -119,6 +123,8 @@ l0_b200:
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
+  - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
+  - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
@@ -130,6 +136,11 @@ l0_b200:
   # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  # KDA runtime: host-derived prefill metadata and the bf16 state pool
+  # round-trip. Both are single-device cases that use GPU 0 only.
+  - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
@@ -137,7 +148,6 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
-  - unittest/_torch/modeling/test_kimi_k3_fp8_weight_read_gates.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   # ------------- modules (non-MoE) ---------------
@@ -226,6 +236,10 @@ l0_b200:
   # cuda-availability skipif like the sibling KDA parity tests; relocated
   # from tests/torch/ which test-db cannot list).
   - unittest/_torch/speculative/test_suffix_automaton.py
+  # Fused sampling kernel; its numerics are architecture-dependent (the only
+  # accuracy deviation found so far is Blackwell-only), so it is not
+  # hw-agnostic and needs its own Blackwell run.
+  - unittest/_torch/speculative/test_fused_sampling_op.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -292,6 +306,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
+  - unittest/_torch/visual_gen/test_attention_cute_dsl_sol_attn.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_cudnn.py
@@ -342,7 +357,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[nano-1gpu]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[super-1gpu]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_policy_droid_example TIMEOUT (20)
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example

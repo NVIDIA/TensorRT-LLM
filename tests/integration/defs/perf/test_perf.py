@@ -49,12 +49,17 @@ MAP_BY_SOCKET = None
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 
+# Models served with the Nemotron reasoning/tool parsers, a long max model len
+# and a longer server-start timeout. "nano-v3" and "nemotron-v3" are two
+# registered names for the same reasoning parser, so Lightning belongs here too.
 NEMOTRON_SUPER_MODELS = {
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp",
+    "nemotron_3.5_lightning_30b_bf16_mtp",
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
@@ -64,8 +69,6 @@ QWEN38_MTP_MODELS = {
     "qwen3.8_flash_next_fp4_mtp",
 }
 KIMI_K3_SERVER_ENV = {
-    "KIMI_K3_FP8_WEIGHT_READ": "1",
-    "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING": "1",
 }
 
@@ -83,6 +86,8 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "qwen3.6_35b_a3b_fp4_mtp",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp",
+    "nemotron_3.5_lightning_30b_bf16_mtp",
     "nemotron_nano_12b_v2",
 }
 
@@ -104,6 +109,8 @@ OPENAI_CHAT_BACKEND_MODELS = {
 # Spec-dec models real dataset in serve perf tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
+    "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
 }
 
 # All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
