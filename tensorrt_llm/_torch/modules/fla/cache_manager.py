@@ -200,10 +200,7 @@ def select_gdn_replay_state(
             "GDN cached replay supports at most 8 tokens per generation step; using non-replay path"
         )
         use_replay = False
-    if spec_config is not None and (
-        getattr(spec_config, "eagle_choices", None) is not None
-        or getattr(spec_config, "use_dynamic_tree", False)
-    ):
+    if spec_config is not None and (getattr(spec_config, "use_dynamic_tree", False)):
         logger.info("GDN replay kernel incompatible with tree attention; using legacy MTP path")
         use_replay = False
     if ssm_cache_dtype not in (torch.float32, torch.bfloat16, torch.float16):

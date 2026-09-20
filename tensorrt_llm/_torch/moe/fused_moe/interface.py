@@ -36,8 +36,8 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
 # the same math the attention-DP deployments already run.
 #
 # Lives here rather than next to either reader because both need it: the
-# scheduler decides whether to precompute top-k at all, and TRTLLMGenFusedMoE
-# decides whether its kernel may route again.
+# scheduler decides whether to precompute top-k at all, and
+# TrtllmGenFusedMoEBase decides whether its kernel may route again.
 FORCE_SEPARATED_ROUTING = os.environ.get(
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
@@ -855,6 +855,18 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         from the communication strategy the layer owns, and ``ConfigurableMoE``
         overrides it from ``self.comm``.
         """
+        return False
+
+    def can_use_deep_ep_direct_metadata(
+            self, supports_post_quant_dispatch: bool) -> bool:
+        """Return whether this backend instance can consume DeepEP counts directly.
+
+        ``can_implement`` and ``capabilities`` remain pure construction-time
+        declarations. This query is instance-level because the complete fast
+        path also depends on the selected quantization method, finalize fusion,
+        and rollback controls.
+        """
+        del supports_post_quant_dispatch
         return False
 
     def reducescatter_or_allreduce(

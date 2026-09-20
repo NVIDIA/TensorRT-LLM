@@ -453,8 +453,12 @@ class PythonMambaCacheManager(BaseResourceManager):
                     dtype=torch.float32,
                     device=device,
                 )
-                spec_kwargs["kda_beta_cache"] = torch.zeros(
-                    num_local_layers, max_batch_size, M, nheads, dtype=torch.float32, device=device
+                from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+                    _allocate_kda_beta_cache,
+                )
+
+                spec_kwargs["kda_beta_cache"] = _allocate_kda_beta_cache(
+                    (num_local_layers, max_batch_size, M, nheads), device
                 )
                 ssm_spec_cache = [
                     spec_kwargs["kda_conv_q"],

@@ -39,6 +39,11 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 
+def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
+    """Cache slot index reserved for MRoPE dummy/no-delta requests."""
+    return max_num_tokens * pp_size
+
+
 class KeyType(NamedTuple):
     batch_size: int
     draft_len: int
@@ -812,7 +817,8 @@ class CUDAGraphRunner:
                     "replay() got no mrope_delta_read_seq_slots for a "
                     "use_mrope graph; filling the static buffer with the "
                     "dummy seq slot instead of copying real values.")
-                mrope_dummy_seq_slot = self.config.max_num_tokens * self.config.mapping.pp_size
+                mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
+                    self.config.max_num_tokens, self.config.mapping.pp_size)
                 static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
                     mrope_dummy_seq_slot)
         else:

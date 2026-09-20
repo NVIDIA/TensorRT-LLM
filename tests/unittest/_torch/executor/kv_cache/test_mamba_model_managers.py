@@ -647,7 +647,8 @@ def test_kda_scratch_cost_matches_allocated_slot_buffers():
     state = KDAReplayState(2)
     state.bind(layout, _state_views().all_ssm_states, _state_views().all_conv_states)
     buffers = (*state._layer_replay_buffers(), state.prev_num_accepted_tokens)
-    actual = sum(buffer.numel() * buffer.element_size() for buffer in buffers)
+    # Beta cache rows retain their logical head count but include alignment padding.
+    actual = sum(buffer.untyped_storage().nbytes() for buffer in buffers)
     estimated = sum(state.bytes_per_slot(layout, layer_id) for layer_id in layout.mamba_pp_layers)
     assert actual == estimated * layout.slot_capacity
 

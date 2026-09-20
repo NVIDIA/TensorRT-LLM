@@ -318,6 +318,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._setup_state_pool()
 
+    @override
+    def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
+        # A transferred recurrent state summarizes and overwrites the whole prefix.
+        return (
+            self.local_num_mamba_layers > 0
+            or super()._disagg_transfer_overwrites_whole_cached_prefix()
+        )
+
     def _initialize_model_state(self) -> MambaState | None:
         """Return validated model-owned state before constructing the pool."""
         if self.spec_config is not None:

@@ -18,6 +18,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState, Qwen35HybridCacheManagerV2
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    _KDA_BETA_CACHE_ALIGNMENT_BYTES,
     KDAReplayState,
     KimiK3HybridCacheManagerV2,
 )
@@ -248,10 +249,48 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     assert params.mamba_ssm_cache_dtype is torch.float32
 
 
+def _kimi_kda_hf_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=4,
+        linear_attn_config={
+            "head_dim": 8,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 3],
+            "full_attn_layers": [2, 4],
+        },
+        dtype=torch.bfloat16,
+    )
+
+
+def test_kimi_kda_state_dtype_bf16_is_opt_in() -> None:
+    """kv_cache_config.mamba_ssm_cache_dtype=bfloat16 reaches the state pool.
+
+    The bf16 staging paths in the KDA mixer and the fused decode kernel are
+    only reachable when the explicit request survives cache-param extraction.
+    """
+    params = extract_mamba_kv_cache_params(
+        _kimi_kda_hf_config(),
+        quant_config=SimpleNamespace(mamba_ssm_cache_dtype=torch.bfloat16),
+    )
+
+    assert params.mamba_ssm_cache_dtype is torch.bfloat16
+
+
+def test_kimi_kda_state_dtype_rejects_unsupported_request() -> None:
+    with pytest.raises(ValueError, match="float32 .default. or"):
+        extract_mamba_kv_cache_params(
+            _kimi_kda_hf_config(),
+            quant_config=SimpleNamespace(mamba_ssm_cache_dtype=torch.float16),
+        )
+
+
 def _kimi_model_config() -> SimpleNamespace:
     config = SimpleNamespace(
         architectures=["KimiLinearForCausalLM"],
         model_type="kimi_linear",
+        vocab_size=163840,
         hidden_size=64,
         num_attention_heads=4,
         num_key_value_heads=4,
@@ -335,6 +374,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert kwargs["num_kv_heads"] == 1
     assert kwargs["head_dim"] == 40
     assert kwargs["max_num_tokens"] == 256
+    assert kwargs["vocab_size"] == 163840
     assert "kda_replay_num_spec" not in kwargs
 
 
@@ -408,6 +448,7 @@ def test_kimi_v1_manager_receives_model_identity_for_replay_selection(
         is_draft=False,
     )
     kwargs = captured["kwargs"]
+    assert "vocab_size" not in kwargs
     assert kwargs["model_type"] == "kimi_linear"
     assert "conv_state_layout" not in kwargs
     assert "kda_replay_num_spec" not in kwargs
@@ -484,6 +525,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
 
     pretrained_config = SimpleNamespace(
         architectures=["Qwen3_5MoeForCausalLM"],
+        vocab_size=151936,
         hidden_size=32,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -554,6 +596,8 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert captured_cpp["use_replay_state_update"] is None
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_cpp["max_num_tokens"] == 256
+    assert "vocab_size" not in captured_cpp
+    assert "vocab_size" not in captured_mixed
     assert captured_mixed["use_replay_state_update"] is None
     assert captured_mixed["model_type"] == "qwen3_next"
     assert captured_mixed["max_num_tokens"] == 256
@@ -570,6 +614,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     mgr._speculative_state = mgr._initialize_model_state()
     assert isinstance(mgr._speculative_state, GDNReplayState)
     assert captured_v2["max_num_tokens"] == 256
+    assert captured_v2["vocab_size"] == pretrained_config.vocab_size
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.legacy import (
@@ -588,6 +633,71 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
     assert any("RecordingMixedManager was selected" in log for log in fallback_logs)
     assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
+
+
+@pytest.mark.parametrize(
+    "manager_cls",
+    [CppMambaHybridCacheManager, MixedMambaHybridCacheManager, MambaHybridCacheManagerV2],
+)
+@pytest.mark.parametrize("nested_vocab_size", [False, True])
+def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls, nested_vocab_size):
+    captured = {}
+
+    class RecordingManager(manager_cls):
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="M*",
+        vocab_size=131072,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+    )
+    if nested_vocab_size:
+        config.llm_config = SimpleNamespace(vocab_size=config.vocab_size)
+        config.vocab_size = None
+    mamba_params = MambaKVCacheParams(
+        state_size=8,
+        conv_kernel=4,
+        num_heads=4,
+        n_groups=1,
+        head_dim=8,
+        mamba_layer_mask=[True, False],
+        target_full_attention_layer_mask=[False, True],
+        num_mamba_layers=1,
+        num_draft_layers=0,
+        dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
+        lambda *args, **kwargs: mamba_params,
+    )
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingManager,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=SimpleNamespace(pretrained_config=config, quant_config=None),
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    if manager_cls is MambaHybridCacheManagerV2:
+        assert captured["vocab_size"] == 131072
+    else:
+        assert "vocab_size" not in captured
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
@@ -812,7 +922,7 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
 
 def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
-    from tensorrt_llm._torch.models.modeling_nemotron_nano import NemotronH_Nano_VL_V2
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import NemotronHMultimodalModel
     from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 
@@ -828,7 +938,7 @@ def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
         NemotronHForCausalLM,
         Qwen3NextForCausalLM,
         Qwen3_5VLModel,
-        NemotronH_Nano_VL_V2,
+        NemotronHMultimodalModel,
     ):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
@@ -985,10 +1095,23 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
         py_request_id=123,
     )
 
-    kv_slice = transceiver._create_kv_slice(request)
+    chunk = transceiver._create_chunk(request)
 
     # No mamba layer group → no STATE entries in block_ids
-    assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
+    assert all(ids.size == 0 for ids in chunk.block_ids_per_layer_groups)
+
+
+def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_tokens():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 1
+    # The incoming recurrent state replaces the whole local slot, so nothing survives as a hit.
+    assert manager._disagg_transfer_overwrites_whole_cached_prefix()
+
+
+def test_v2_disagg_gen_init_without_local_mamba_layers_keeps_complete_blocks():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 0
+    assert not manager._disagg_transfer_overwrites_whole_cached_prefix()
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
@@ -1000,7 +1123,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
-    # Provide a mamba layer group so _create_kv_slice places the slot ID
+    # Provide a mamba layer group so _create_chunk places the slot ID
     mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
@@ -1012,10 +1135,10 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         py_request_id=123,
     )
 
-    kv_slice = transceiver._create_kv_slice(request)
+    chunk = transceiver._create_chunk(request)
 
     # Slot index 7 should be in the STATE group's block_ids
-    assert kv_slice.block_ids_per_layer_groups[0][0] == 7
+    assert chunk.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
 
@@ -1023,8 +1146,13 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     "max_beam_width, has_connector, expected",
     [
         (2, False, "max_beam_width > 1"),
-        (1, True, "kv_connector_manager"),
-        (2, True, "kv_connector_manager, max_beam_width > 1"),
+        # A KV connector alone no longer forces a fallback: it is supported
+        # through the pool-layout registration path, so the manager is returned
+        # unchanged and nothing is raised.
+        (1, True, None),
+        # With beam search still incompatible, the connector must not appear in
+        # the reason list -- it is not what makes this configuration unsupported.
+        (2, True, "max_beam_width > 1"),
     ],
 )
 def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
@@ -1042,6 +1170,15 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+
+    if expected is None:
+        assert (
+            creator._validate_or_fallback_kv_cache_manager_v2(
+                MambaHybridCacheManagerV2, model_config, KvCacheConfig()
+            )
+            is MambaHybridCacheManagerV2
+        )
+        return
 
     with pytest.raises(NotImplementedError, match=expected):
         creator._validate_or_fallback_kv_cache_manager_v2(
@@ -2156,7 +2293,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         config = mgr._build_cache_config(base_config)
         runtime_manager = RuntimeKVCacheManager(config)
         try:
-            statistics = _introspection.storage_statistics(runtime_manager)
+            statistics = runtime_manager.get_storage_statistics()
 
             def _slot_sizes(stat):
                 # cpp binding exposes `slot_sizes`; the Python backend `slot_size`.
@@ -2264,6 +2401,7 @@ def _build_v2_hybrid_with_mamba_layer(
     conv_state_layout="x_b_c",
     speculative_state=None,
     mamba_d_conv=4,
+    mamba_num_heads=4,
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
 ):
@@ -2319,7 +2457,7 @@ def _build_v2_hybrid_with_mamba_layer(
     return manager_cls(
         mamba_d_state=8,
         mamba_d_conv=mamba_d_conv,
-        mamba_num_heads=4,
+        mamba_num_heads=mamba_num_heads,
         mamba_n_groups=mamba_n_groups,
         mamba_head_dim=8,
         mamba_num_layers=num_mamba_layers,
@@ -2579,7 +2717,10 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         request_ids = [101, 102, 103, 104]
 
         assert mgr._num_reserved_dummy_slots == 5
-        assert mgr.index_mapper.num_free_slots() == len(request_ids) + 5
+        # The reserved dummy slots sit on top of the admission pool, whose width
+        # depends on the overlap/disagg lease coefficient.
+        initial_free_slots = mgr.index_mapper.num_free_slots()
+        assert initial_free_slots >= len(request_ids) + 5
 
         assert (
             mgr.add_dummy_requests(request_ids, token_nums=[1] * len(request_ids), is_gen=False)
@@ -2602,7 +2743,7 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         all_request_ids = request_ids + cuda_graph_dummy_ids + [ATTENTION_DP_DUMMY_REQUEST_ID]
         state_indices = mgr.get_state_indices(all_request_ids, [False] * len(all_request_ids))
         assert len(set(state_indices)) == len(all_request_ids)
-        assert mgr.index_mapper.num_free_slots() == 0
+        assert mgr.index_mapper.num_free_slots() == initial_free_slots - len(all_request_ids)
     finally:
         mgr.shutdown()
 
@@ -3527,7 +3668,8 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches():
         spec_config=spec_config,
         conv_state_layout="q_k_v",
         mamba_d_conv=5,
-        mamba_n_groups=4,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
         mamba_ssm_cache_dtype=torch.float32,
         speculative_state=policy,
     )
@@ -3540,14 +3682,25 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches():
         assert layer_cache.intermediate_ssm is None
         assert layer_cache.intermediate_conv_window is None
         cache_size = layer_cache.temporal.shape[0]
-        assert layer_cache.kda_conv_q.shape == (cache_size, 32, 6)
-        assert layer_cache.kda_conv_k.shape == (cache_size, 32, 6)
-        assert layer_cache.kda_conv_v.shape == (cache_size, 32, 6)
+        assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_q.dtype is torch.float32
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 32)
-        assert layer_cache.kda_v_cache.shape == (cache_size, 2, 32)
-        assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 4)
+        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 48)
+        assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
+        # Six fp32 heads are 24 bytes, so the row is padded to 32 (stride 8)
+        # to keep every nested per-draft view 16-byte aligned for CuTe.
+        assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
+        assert layer_cache.kda_beta_cache.stride(-2) == 8
+        for layer_idx in range(2):
+            for slot_idx in range(cache_size):
+                for draft_idx in range(2):
+                    assert (
+                        policy.kda_beta_cache[layer_idx, slot_idx, draft_idx].data_ptr()
+                        % _KDA_BETA_CACHE_ALIGNMENT_BYTES
+                        == 0
+                    )
         assert layer_cache.kda_qkg_cache.dtype is torch.float32
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             policy.prev_num_accepted_tokens.data_ptr()
@@ -3840,6 +3993,78 @@ def test_v2_kda_replay_policy_seeds_disaggregated_generation_slots():
             assert policy.prev_num_accepted_tokens[slot] == 0
     assert policy.prev_num_accepted_tokens[0] == 5
     assert policy.prev_num_accepted_tokens[2] == 5
+
+
+def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
+    """The conv half of the KDA state crosses ctx->gen in bf16.
+
+    ``extract_mamba_kv_cache_params`` forces the KDA delta-rule (ssm) pool to
+    fp32 but leaves the short-convolution pool at the model dtype, so what the
+    context rank serializes and the generation rank restores for the conv slot
+    is bf16 while the SA replay caches the generation rank rebuilds from it are
+    fp32. Seeding must widen the restored rows losslessly, keep the logical
+    shape, leave the restored bf16 pool itself untouched so the decode path
+    reuses exactly what was transferred, and clear only the draft scratch of
+    the seeded slots.
+    """
+    torch.manual_seed(0)
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = True
+    mgr.local_num_mamba_layers = 2
+    mgr.conv_state_shape = [6, 4]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr._request_id_to_state_index = {101: 1, 202: 3}
+    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+    # The restored (transferred) conv pool, in the dtype the transceiver moves.
+    mgr.all_conv_states = [(torch.randn(4, 6, 4) * 0.1).to(torch.bfloat16) for _ in range(2)]
+    restored = [conv.clone() for conv in mgr.all_conv_states]
+
+    def dim_contiguous_conv_cache() -> torch.Tensor:
+        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+
+    mgr.kda_conv_q = dim_contiguous_conv_cache()
+    mgr.kda_conv_k = dim_contiguous_conv_cache()
+    mgr.kda_conv_v = dim_contiguous_conv_cache()
+    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
+    mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
+    mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+
+    mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    for layer_offset, conv_state in enumerate(mgr.all_conv_states):
+        assert conv_state.dtype is torch.bfloat16
+        for slot in (1, 3):
+            for replay_buffer, start in (
+                (mgr.kda_conv_q, 0),
+                (mgr.kda_conv_k, 2),
+                (mgr.kda_conv_v, 4),
+            ):
+                # fp32 replay cache, logical shape unchanged by the widening.
+                assert replay_buffer.dtype is torch.float32
+                seeded = replay_buffer[layer_offset, slot, :, :4]
+                assert seeded.shape == (2, 4)
+                # bf16 -> fp32 is lossless, so the restored values must survive
+                # the widening bit for bit.
+                torch.testing.assert_close(
+                    seeded,
+                    conv_state[slot, start : start + 2, :].float(),
+                    rtol=0,
+                    atol=0,
+                )
+                assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
+            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
+            assert mgr.prev_num_accepted_tokens[slot] == 0
+        # Slots no request restored keep their pre-seed contents.
+        for slot in (0, 2):
+            assert (mgr.kda_conv_q[layer_offset, slot] == 7.0).all()
+            assert (mgr.kda_qkg_cache[layer_offset, slot] == 7.0).all()
+        # The restored bf16 pool is read-only here: plain decode (speculation
+        # off) reuses exactly the state the transfer wrote.
+        torch.testing.assert_close(conv_state, restored[layer_offset], rtol=0, atol=0)
+    assert mgr.prev_num_accepted_tokens[0] == 5
+    assert mgr.prev_num_accepted_tokens[2] == 5
 
 
 @skip_no_cuda

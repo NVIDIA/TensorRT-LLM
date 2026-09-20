@@ -42,6 +42,75 @@ namespace
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
+
+TEST(KvCacheManagerV2ConcurrencyTest, LevelStatsAreConservedAcrossConcurrentDrains)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeTieredConfig();
+    config.enableStats = true;
+    auto manager = std::make_shared<KvCacheManager>(config);
+
+    constexpr int kNumWriters = 4;
+    constexpr int kIterations = 1000;
+    CountsByLevel const tokensPerCommit{4, 8};
+    ReusedBlocksByLevel const blocksPerCommit{{1, 2}, {0, 1}};
+    ReusedBlocksByLevelByLifeCycle const reusePerCommit{{LifeCycleId{0}, blocksPerCommit}};
+    std::promise<void> start;
+    auto const ready = start.get_future().share();
+    std::atomic<int> writersRemaining{kNumWriters};
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < kNumWriters; ++writer)
+    {
+        writers.emplace_back(
+            [&]
+            {
+                ready.wait();
+                for (int iteration = 0; iteration < kIterations; ++iteration)
+                {
+                    // Internal recorders use the caller's lock, as in commitPendingStats()/prefetch().
+                    auto const apiLock = manager->lockExclusive();
+                    manager->commitCachedTokensByLevel(tokensPerCommit);
+                    manager->commitReusedBlocksByLevel(reusePerCommit);
+                    manager->recordDiskPrefetchBlocks(2);
+                }
+                --writersRemaining;
+            });
+    }
+
+    CountsByLevel tokens;
+    ReusedBlocksByLevel blocks;
+    int64_t diskBlocks = 0;
+    auto drain = [&]
+    {
+        addCountsByLevel(tokens, manager->getAndResetIterationCachedTokensByLevel());
+        for (auto const& [lifeCycle, byLevel] : manager->getAndResetIterationReusedBlocksByLevel())
+        {
+            EXPECT_EQ(lifeCycle, LifeCycleId{0});
+            blocks.add(byLevel);
+        }
+        diskBlocks += manager->getAndResetIterationDiskPrefetchBlocks();
+    };
+    start.set_value();
+    while (writersRemaining.load() != 0)
+    {
+        drain();
+    }
+    for (auto& writer : writers)
+    {
+        writer.join();
+    }
+    drain();
+
+    constexpr int64_t kCommits = kNumWriters * kIterations;
+    EXPECT_EQ(tokens, (CountsByLevel{4 * kCommits, 8 * kCommits}));
+    EXPECT_EQ(blocks.full, (CountsByLevel{kCommits, 2 * kCommits}));
+    EXPECT_EQ(blocks.partial, (CountsByLevel{0, kCommits}));
+    EXPECT_EQ(diskBlocks, 2 * kCommits);
+    EXPECT_TRUE(manager->getAndResetIterationCachedTokensByLevel().empty());
+    EXPECT_TRUE(manager->getAndResetIterationReusedBlocksByLevel().empty());
+    EXPECT_EQ(manager->getAndResetIterationDiskPrefetchBlocks(), 0);
+}
 
 // Creates `count` roots and proposes all of them for erasure, leaving that many pending entries and
 // an unchanged root map. Returns the number of roots now present.

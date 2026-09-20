@@ -381,10 +381,7 @@ def select_mamba2_state(
     use_replay = spec_config is not None and sm >= 80
     if spec_config is None:
         logger.info("Replay kernel requires speculative decoding; using non-replay path")
-    if spec_config is not None and (
-        getattr(spec_config, "eagle_choices", None) is not None
-        or getattr(spec_config, "use_dynamic_tree", False)
-    ):
+    if spec_config is not None and (getattr(spec_config, "use_dynamic_tree", False)):
         logger.info("Replay kernel incompatible with tree attention; using legacy MTP path")
         use_replay = False
     if stochastic_rounding and ssm_cache_dtype == torch.float16 and (sm < 100 or sm in (120, 121)):

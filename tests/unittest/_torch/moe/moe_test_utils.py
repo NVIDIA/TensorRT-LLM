@@ -20,25 +20,39 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
-from typing import Callable, Optional, Type
+from typing import Callable, Optional
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.moe.fused_moe import (
+    CuteDslFc12FusedMoE,
     CuteDslFusedMoE,
     CutlassFusedMoE,
     MarlinFusedMoE,
-    TRTLLMGenFusedMoE,
+)
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    ACTIVATION_PAYLOAD,
+    SimpleActivation,
+    SiTuActivation,
+    SwigluActivation,
+    SwigluBiasActivation,
+    activation_constant_names,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
+    find_trtllm_gen_leaf,
+    trtllm_gen_leaf,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
+    canonical_activation,
     canonical_quant,
+    normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE
@@ -46,6 +60,7 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDe
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import trtllm_gen_leaves_in_resolution_order
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -61,6 +76,7 @@ class MoeBackendType(str, Enum):
     CUTLASS = "CUTLASS"
     TRTLLM = "TRTLLM"
     CUTEDSL = "CUTEDSL"
+    CUTEDSL_FC12 = "CUTEDSL_FC12"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
     # Keep the two MegaMoE variants explicit.
@@ -70,12 +86,46 @@ class MoeBackendType(str, Enum):
     MARLIN = "MARLIN"
 
 
-def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
-    """Get the MoE backend class for a given backend type."""
+def get_backend_class(
+    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
+) -> type[MoE]:
+    """Get the MoE backend class for a given backend type.
+
+    Raises when TRTLLM-Gen publishes no leaf for the format. Callers enumerating
+    combinations to decide what is worth running want ``find_backend_classes``.
+    """
+    backend_class = find_backend_class(backend_type, quant_algo)
+    if backend_class is None:
+        # Reuse the raising lookup for its message, which lists what *is*
+        # registered rather than only naming what is missing.
+        return trtllm_gen_leaf(quant_algo)
+    return backend_class
+
+
+def find_backend_class(
+    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
+) -> type[MoE] | None:
+    """The MoE backend class, or ``None`` if TRTLLM-Gen has no leaf for the format.
+
+    ``TRTLLM`` is not one class but a set of leaves keyed by (provider, quant), so
+    it needs ``quant_algo``. It prefers the native leaf for that format and
+    falls back to the FlashInfer sibling, which is what "the TRTLLM backend"
+    has to mean for the unquantized format: bf16 has no native leaf, only
+    ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
+    exists and wins, so only bf16 tests are exercising a FlashInfer class.
+
+    Absence is returned rather than raised so that a parameter generator can
+    tell it apart from a real failure: catching the exception instead would let
+    a leaf that got unregistered read as a combination nobody meant to run, and
+    the sweep would go green by shrinking.
+    """
+    if backend_type is MoeBackendType.TRTLLM:
+        return find_trtllm_gen_leaf(quant_algo)
+
     backend_class_map = {
         MoeBackendType.CUTLASS: CutlassFusedMoE,
-        MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
+        MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
@@ -84,6 +134,26 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.MARLIN: MarlinFusedMoE,
     }
     return backend_class_map[backend_type]
+
+
+def find_backend_classes(
+    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
+) -> tuple[type[MoE], ...]:
+    """The classes a resolution walk would try, in its order; empty if none.
+
+    A tuple and not one class because ``TRTLLM`` is a provider pair, and
+    ``IMPL_PRIORITY`` ranks each FlashInfer leaf ahead of its native sibling:
+    resolution falls through to the native one when the FlashInfer leaf
+    rejects -- a missing wheel, an unmet shape -- and not only when it is
+    absent. A caller asking whether a case is *supported* has to ask the same
+    way, or it skips cases the layer under test goes on to serve.
+
+    :func:`find_backend_class` stays for callers that want to name one class.
+    """
+    if backend_type is MoeBackendType.TRTLLM:
+        return trtllm_gen_leaves_in_resolution_order(quant_algo)
+    cls = find_backend_class(backend_type, quant_algo)
+    return () if cls is None else (cls,)
 
 
 # ============================================================================
@@ -337,7 +407,7 @@ def should_skip_trtllm(
     # - MiniMax2 (sigmoid activation, bias-added selection, scaled sum-normalize)
     # - Llama4 (requires top_k=1)
     # - Renormalize / RenormalizeNaive / Default (softmax-based)
-    # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu
+    # See: cpp/tensorrt_llm/kernels/moe/trtllmGen/runner.cu
     if routing_method_cls is not None:
         from tensorrt_llm._torch.moe.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
@@ -626,17 +696,18 @@ def should_skip_cutedsl(
     moe_tp_size: int = 1,
 ) -> Optional[str]:
     """
-    Check CuteDSL backend specific constraints.
+    Check constraints shared by the CuteDSL backends (CUTEDSL, CUTEDSL_FC12).
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.CUTEDSL:
+    if backend_type not in (MoeBackendType.CUTEDSL, MoeBackendType.CUTEDSL_FC12):
         return None
 
     if model_config is None:
         return None
 
+    backend_name = backend_type.value  # "CUTEDSL" or "CUTEDSL_FC12"
     intermediate_size = model_config.intermediate_size
 
     # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
@@ -655,7 +726,7 @@ def should_skip_cutedsl(
     # fused kernel keeping BF16 intermediate precision.
     if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
         return (
-            f"[Design Limitation] CuteDslFusedMoE NVFP4 with large "
+            f"[Design Limitation] {backend_name} NVFP4 with large "
             f"intermediate_size has accuracy issues due to FP4 intermediate "
             f"storage between FC1+SwiGLU and FC2 kernels "
             f"(intermediate_size={intermediate_size} >= 14336, "
@@ -681,7 +752,7 @@ def should_skip_cutedsl(
             and routing_method_cls == Llama4RenormalizeMoeRoutingMethod
         ):
             return (
-                "[Design Limitation] CuteDslFusedMoE NVFP4 with Llama4Renormalize "
+                f"[Design Limitation] {backend_name} NVFP4 with Llama4Renormalize "
                 "routing: FP4 intermediate errors amplified by non-normalized "
                 "sigmoid routing weights (mismatch up to 34.6%)."
             )
@@ -692,7 +763,7 @@ def should_skip_cutedsl(
         per_shard = intermediate_size // moe_tp_size
         if per_shard % 128 != 0:
             return (
-                f"CuteDslFusedMoE NVFP4: per-shard intermediate_size="
+                f"{backend_name} NVFP4: per-shard intermediate_size="
                 f"{per_shard} (= {intermediate_size} / {moe_tp_size}) is not "
                 f"128-aligned. fp4_utils asserts M % 128 == 0."
             )
@@ -1158,6 +1229,44 @@ def supports_autotuner_capture(
     return True
 
 
+def build_test_activation(
+    activation_type: ActivationType,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
+) -> "SimpleActivation | SwigluActivation | SwigluBiasActivation | SiTuActivation":
+    """Package the flat parameters these tests parametrize over as one activation.
+
+    The tests still sweep alpha / beta / limit independently because that is
+    what ``quantize_util.get_swiglu_tensors`` produces for the reference
+    implementation. Presence of alpha or beta means the gpt-oss package, which
+    is the same rule the C++ op applied when it upgraded a bare ``Swiglu`` with
+    constants to ``SwigluBias``.
+
+    Lives here rather than next to the tests that build MoE layers with it
+    because the skip-reason helper below has to package the same sweep the same
+    way: selection reads *which* constants an activation carries, so a second
+    spelling of this rule would let a case be admitted by the parameter
+    generator and rejected by the layer, or the reverse.
+    """
+    kind = ActivationType(activation_type)
+    if kind is ActivationType.SiTu:
+        return SiTuActivation(gate_softcap=swiglu_alpha, linear_softcap=swiglu_beta)
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        return SwigluBiasActivation(
+            gate_sigmoid_scale=swiglu_alpha,
+            linear_offset=swiglu_beta,
+            clamp=swiglu_limit,
+        )
+    if kind in (ActivationType.Swiglu, ActivationType.SwigluBias):
+        return SwigluActivation(clamp=swiglu_limit)
+    # Through the table, not a literal ``SimpleActivation``: the branches above
+    # cover the kinds this sweep supplies constants for, and a kind added to
+    # ``ACTIVATION_PAYLOAD`` with a carrier of its own has to get that carrier.
+    payload = ACTIVATION_PAYLOAD[kind]
+    return SimpleActivation(kind=kind) if payload is SimpleActivation else payload()
+
+
 def get_quick_skip_reason(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
@@ -1166,8 +1275,16 @@ def get_quick_skip_reason(
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
     seq_len: Optional[int] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> Optional[str]:
-    """Return the first reason a test configuration is unsupported."""
+    """Return the first reason a test configuration is unsupported.
+
+    ``activation_type`` is a parameter rather than a constant because it is a
+    selection input: a leaf declares which kinds it reaches, so a caller that
+    parametrizes over Relu2 or SiTu and does not pass it here would prune its
+    sweep against the verdict for SwiGLU. Defaulted because today's callers
+    sweep SwiGLU only, and that is the historical shape of every MoE signature.
+    """
     import logging as _logging
 
     # Suppress logger warnings during parameter generation
@@ -1176,8 +1293,39 @@ def get_quick_skip_reason(
     trtllm_logger.setLevel(_logging.ERROR)
 
     try:
-        backend_cls = get_backend_class(backend_type)
+        # Every candidate a run would try, in resolution's order, because
+        # resolution falls through to the native leaf when the FlashInfer one
+        # rejects. Asking a single pre-picked class would skip cases the layer
+        # under test goes on to serve.
+        candidates = find_backend_classes(backend_type, quant_algo)
+        if not candidates:
+            # No leaf publishes this (provider, quant) pair, which is the same
+            # verdict the single TRTLLM-Gen ``can_implement`` used to return as
+            # QUANT_UNSUPPORTED. Asked as a query, so any other failure in the
+            # lookup still raises instead of being reported as a skip.
+            quant = normalize_quant(canonical_quant(quant_algo))
+            return f"no TRTLLM-Gen implementation for quant={quant}"
         is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
+        # Eligibility reads *which* constants an activation carries, not just
+        # its kind: a backend declaring ``limit=UNSUPPORTED`` serves unclamped
+        # SwiGLU and rejects clamped SwiGLU, and both are
+        # ``ActivationType.Swiglu``. Omit them and the problem claims none,
+        # admitting cases the layer then refuses.
+        #
+        # Only presence is read, and ``swiglu_gptoss_style`` gates alpha, beta
+        # and limit together, so stand-in values suffice. Still routed through
+        # ``build_test_activation`` so the carrier matches the one the tests
+        # build layers with.
+        #
+        # SiTu's soft caps are not part of that package and are required, so
+        # they get their own stand-ins: gating them on ``swiglu_gptoss_style``
+        # would have this query raise from the activation's own validator
+        # instead of answering with a skip reason.
+        if ActivationType(activation_type) is ActivationType.SiTu:
+            activation = build_test_activation(activation_type, 1.0, 1.0)
+        else:
+            present = 1.0 if swiglu_gptoss_style else None
+            activation = build_test_activation(activation_type, present, present, present)
         problem = MoEProblem(
             quant=canonical_quant(quant_algo),
             dtype_act=dtype,
@@ -1187,11 +1335,18 @@ def get_quick_skip_reason(
             top_k=None if model_config is None else model_config.top_k,
             swiglu_gptoss_style=swiglu_gptoss_style,
             bias=swiglu_gptoss_style and not is_minimax_megamoe,
+            # MiniMax on MegaMoE CuteDSL asks for the bias-carrying kind by
+            # name; every other case reads the kind and constants off the
+            # carrier built above.
             activation=(
-                ActivationType.SwigluBias.name if is_minimax_megamoe else ActivationType.Swiglu.name
+                ActivationType.SwigluBias.name
+                if is_minimax_megamoe
+                else canonical_activation(activation_type)
             ),
             activation_constants=(
-                frozenset({"alpha", "beta", "clamp"}) if is_minimax_megamoe else frozenset()
+                frozenset({"alpha", "beta", "clamp"})
+                if is_minimax_megamoe
+                else activation_constant_names(activation)
             ),
         )
         # Multi-rank constraints are checked by the helpers below.
@@ -1203,9 +1358,18 @@ def get_quick_skip_reason(
             num_slots=0 if model_config is None else model_config.num_experts,
             env=collect_moe_environment(),
         )
-        verdict = backend_cls.can_implement(problem, deployment)
-        if not verdict.eligible:
-            return f"{verdict.reject_reason.value}: {verdict.detail}"
+        reason = None
+        for backend_cls in candidates:
+            verdict = backend_cls.can_implement(problem, deployment)
+            if verdict.eligible:
+                reason = None
+                break
+            # The last candidate's reason, not the first: without the opt-in
+            # flag every FlashInfer leaf rejects for the flag alone, which says
+            # nothing about why the case is unsupported.
+            reason = f"{verdict.reject_reason.value}: {verdict.detail}"
+        if reason is not None:
+            return reason
 
         # Chain skip checks: routing method, then per-backend constraints
         skip_checks = [

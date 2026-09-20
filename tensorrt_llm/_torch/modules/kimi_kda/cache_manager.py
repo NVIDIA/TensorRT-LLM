@@ -65,6 +65,24 @@ class KDAReplayLayerCache(SpeculativeMambaLayerCache):
         )
 
 
+_KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
+
+
+def _kda_beta_cache_padded_heads(num_heads: int) -> int:
+    heads_per_alignment = _KDA_BETA_CACHE_ALIGNMENT_BYTES // torch.float32.itemsize
+    return (num_heads + heads_per_alignment - 1) // heads_per_alignment * heads_per_alignment
+
+
+def _allocate_kda_beta_cache(shape: tuple[int, ...], device: torch.device | None) -> torch.Tensor:
+    """Keep logical head count while aligning each physical row for CuTe."""
+    return torch.zeros(
+        *shape[:-1],
+        _kda_beta_cache_padded_heads(shape[-1]),
+        dtype=torch.float32,
+        device=device,
+    )[..., : shape[-1]]
+
+
 def allocate_kda_replay_fields(
     *,
     num_local_layers: int,
@@ -113,13 +131,8 @@ def allocate_kda_replay_fields(
             dtype=torch.float32,
             device=device,
         ),
-        "kda_beta_cache": torch.zeros(
-            num_local_layers,
-            cache_size,
-            num_speculative_tokens,
-            num_heads,
-            dtype=torch.float32,
-            device=device,
+        "kda_beta_cache": _allocate_kda_beta_cache(
+            (num_local_layers, cache_size, num_speculative_tokens, num_heads), device
         ),
     }
     scratch = [
@@ -197,7 +210,7 @@ class KDAReplayState:
             3 * section_dim * extended_window
             + self.num_speculative_tokens * 3 * section_dim
             + self.num_speculative_tokens * section_dim
-            + self.num_speculative_tokens * num_heads
+            + self.num_speculative_tokens * _kda_beta_cache_padded_heads(num_heads)
         )
         shared_bytes = 0
         if layer_id == context.mamba_pp_layers[0]:
@@ -584,8 +597,45 @@ class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
         self.on_state_transfer_complete(request_ids)
 
 
+def resolve_kimi_ssm_cache_dtype(config) -> torch.dtype:
+    """Default KDA state to FP32; BF16 requires an explicit cache configuration.
+
+    BF16 prefill, decode and sequential verify stage state through FP32 and
+    round the committed state back to BF16. Fused MTP verify requires FP32.
+    Checkpoint-declared state dtypes do not override this default.
+    """
+    from tensorrt_llm._torch.pyexecutor.config_utils import resolve_ssm_cache_dtype
+
+    declared = resolve_ssm_cache_dtype(config)
+    if declared is not None and declared != torch.float32:
+        logger.info(
+            "Kimi K3: the checkpoint declares "
+            f"mamba_ssm_cache_dtype={declared}; keeping the fp32 "
+            "recurrent-state pool (kv_cache_config.mamba_ssm_cache_dtype "
+            "opts in to bfloat16)."
+        )
+    return torch.float32
+
+
+def validate_kimi_state_cache_dtype(
+    mamba_ssm_cache_dtype: torch.dtype, mamba_ssm_stochastic_rounding: bool = False
+) -> None:
+    """Reject cache dtypes and rounding modes unsupported by the KDA kernels."""
+    if mamba_ssm_cache_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            "Kimi K3 KDA recurrent-state cache supports float32 (default) or "
+            f"bfloat16; got mamba_ssm_cache_dtype={mamba_ssm_cache_dtype}."
+        )
+    if mamba_ssm_stochastic_rounding and mamba_ssm_cache_dtype != torch.float32:
+        raise ValueError(
+            "Kimi K3 KDA kernels round the committed recurrent state to "
+            "nearest; mamba_ssm_stochastic_rounding is not supported with a "
+            f"{mamba_ssm_cache_dtype} state cache."
+        )
+
+
 def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):
-    """KDA uses equal Q/K/V sections and FP32 recurrent state alongside MLA."""
+    """KDA uses equal Q/K/V sections and defaults to FP32 state alongside MLA."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         build_mamba_kv_cache_params,
         get_kimi_linear_layer_masks,
@@ -606,12 +656,6 @@ def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):
         spec_config=spec_config,
         quant_config=quant_config,
     )
-    if params.mamba_ssm_cache_dtype != torch.float32:
-        logger.info(
-            f"Kimi K3: overriding mamba_ssm_cache_dtype {params.mamba_ssm_cache_dtype} "
-            "-> torch.float32 (KDA recurrent state must be fp32)"
-        )
-        params.mamba_ssm_cache_dtype = torch.float32
     return params
 
 
@@ -622,5 +666,7 @@ __all__ = [
     "allocate_kda_replay_fields",
     "get_kda_replay_num_spec",
     "get_kimi_cache_params",
+    "resolve_kimi_ssm_cache_dtype",
     "select_kda_replay_state",
+    "validate_kimi_state_cache_dtype",
 ]
