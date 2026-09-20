@@ -6287,6 +6287,70 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    def _validate_dflash_ctx_budget(self,
+                                    memory_budget_bytes: Optional[int] = None
+                                    ) -> None:
+        """Fail at config time on DFlash setups that would die late.
+
+        Delegates to ``validate_dflash_ctx_buffer_budget``: the token-budget
+        rule (``max_batch_size * (1 + max_draft_len) <= max_num_tokens``) and
+        the pooled-context K/V buffer fit, both of which otherwise fail only
+        during warmup, after the KV-cache pool has committed.
+
+        The buffer budget estimates what is free AFTER the KV-cache pool
+        commits. The pool is sized as ``free_gpu_memory_fraction`` of the
+        memory free AFTER model load, so the budget subtracts an estimate of
+        the per-rank weight footprint (checkpoint shard bytes on disk divided
+        across TP x PP ranks) before applying ``(1 - fraction)``; budgeting
+        against the device total would bless a max_batch_size that then OOMs
+        in warmup with half the assumed headroom missing. See
+        ``derive_dflash_ctx_memory_budget_bytes`` for the overhead and safety
+        terms. The check is only enforced when the KV pool is sized by
+        fraction (an explicit ``kv_cache_config.max_tokens`` cap can leave
+        more headroom than the fraction implies) and when a CUDA device is
+        visible. ``memory_budget_bytes`` overrides the derivation (tests).
+        """
+        from tensorrt_llm._torch.speculative.dflash import (
+            derive_dflash_ctx_memory_budget_bytes,
+            estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
+
+        spec_cfg = self.speculative_config
+        draft_config = None
+        if spec_cfg.speculative_model is not None:
+            draft_config_path = os.path.join(str(spec_cfg.speculative_model),
+                                             "config.json")
+            if os.path.exists(draft_config_path):
+                with open(draft_config_path) as f:
+                    draft_config = json.load(f)
+
+        if memory_budget_bytes is None:
+            kv_fraction = self.kv_cache_config.free_gpu_memory_fraction
+            if (kv_fraction is not None
+                    and self.kv_cache_config.max_tokens is None
+                    and torch.cuda.is_available()):
+                total = torch.cuda.get_device_properties(0).total_memory
+                per_rank_weight_bytes = None
+                checkpoint_bytes = estimate_checkpoint_weight_bytes(
+                    str(self.model))
+                if checkpoint_bytes is not None:
+                    weight_shards = max(
+                        1,
+                        self.tensor_parallel_size * self.pipeline_parallel_size)
+                    per_rank_weight_bytes = checkpoint_bytes // weight_shards
+                memory_budget_bytes = derive_dflash_ctx_memory_budget_bytes(
+                    total, kv_fraction, per_rank_weight_bytes)
+
+        validate_dflash_ctx_buffer_budget(
+            max_batch_size=self.max_batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_seq_len=self.max_seq_len,
+            max_draft_len=spec_cfg.max_draft_len,
+            attention_backend=spec_cfg.attention_backend,
+            draft_config=draft_config,
+            tp_size=self.tensor_parallel_size,
+            memory_budget_bytes=memory_budget_bytes,
+        )
+
     @model_validator(mode="after")
     def validate_speculative_config(self):
         if self.speculative_config:
@@ -6460,6 +6524,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 # A Hugging Face repo id is not readable yet; CachedModelLoader
                 # calls this again after the drafter is downloaded.
                 self.speculative_config.resolve_from_checkpoint()
+                self._validate_dflash_ctx_budget()
 
             if isinstance(self.speculative_config, DSparkDecodingConfig):
                 spec_cfg = self.speculative_config
