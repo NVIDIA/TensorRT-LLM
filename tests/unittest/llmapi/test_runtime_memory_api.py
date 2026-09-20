@@ -14,11 +14,11 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, AsyncLLM
 from tensorrt_llm.llmapi import ExecutorMemoryType, RuntimeMemoryStatus, SleepConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -29,6 +29,98 @@ def _make_llm() -> LLM:
     llm.args = SimpleNamespace(sleep_config=SleepConfig())
     llm._collective_rpc = MagicMock()
     return llm
+
+
+def _make_async_llm() -> AsyncLLM:
+    llm = object.__new__(AsyncLLM)
+    llm.args = SimpleNamespace(sleep_config=SleepConfig())
+    llm.collective_rpc = AsyncMock()
+    return llm
+
+
+@pytest.mark.asyncio
+async def test_async_release_defaults_to_all_usable_tags():
+    llm = _make_async_llm()
+
+    result = await llm.release()
+
+    expected = [
+        tag.value
+        for tag in ExecutorMemoryType
+        if tag
+        not in (
+            ExecutorMemoryType.INIT_KV_CACHE,
+            ExecutorMemoryType.INIT_EXTRA_RESOURCES,
+        )
+    ]
+    assert result is None
+    llm.collective_rpc.assert_awaited_once_with("sleep", args=(expected,))
+
+
+@pytest.mark.asyncio
+async def test_async_resume_defaults_to_currently_parked_tags():
+    llm = _make_async_llm()
+    reply = {"state": "parked", "parked_tags": ["model", "kv_cache"]}
+    llm.collective_rpc.side_effect = [[reply, reply], None]
+
+    result = await llm.resume()
+
+    assert result is None
+    assert llm.collective_rpc.await_args_list == [
+        call("get_memory_status"),
+        call("wakeup", args=(["model", "kv_cache"],)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_async_resume_is_noop_when_nothing_is_parked():
+    llm = _make_async_llm()
+    llm.collective_rpc.return_value = [{"state": "running", "parked_tags": []}]
+
+    result = await llm.resume()
+
+    assert result is None
+    llm.collective_rpc.assert_awaited_once_with("get_memory_status")
+
+
+@pytest.mark.asyncio
+async def test_async_get_memory_status_reconciles_worker_replies():
+    llm = _make_async_llm()
+    reply = {"state": "parked", "parked_tags": ["model"]}
+    llm.collective_rpc.return_value = [reply, reply]
+
+    status = await llm.get_memory_status()
+
+    assert status == RuntimeMemoryStatus(
+        state="parked",
+        parked_tags=[ExecutorMemoryType.MODEL_ENGINE_MAIN],
+    )
+    llm.collective_rpc.assert_awaited_once_with("get_memory_status")
+
+
+@pytest.mark.asyncio
+async def test_async_get_memory_status_fails_on_worker_divergence():
+    llm = _make_async_llm()
+    llm.collective_rpc.return_value = [
+        {"state": "parked", "parked_tags": ["model"]},
+        {"state": "running", "parked_tags": []},
+    ]
+
+    with pytest.raises(RuntimeError, match="diverged across workers"):
+        await llm.get_memory_status()
+
+    llm.collective_rpc.assert_awaited_once_with("get_memory_status")
+
+
+@pytest.mark.asyncio
+async def test_async_get_memory_status_rejects_empty_replies():
+    llm = _make_async_llm()
+    llm.collective_rpc.return_value = []
+
+    with pytest.raises(RuntimeError, match="No worker returned"):
+        await llm.get_memory_status()
+
+    llm.collective_rpc.assert_awaited_once_with("get_memory_status")
 
 
 def test_release_defaults_to_all_usable_tags():
