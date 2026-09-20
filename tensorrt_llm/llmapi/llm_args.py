@@ -1928,7 +1928,8 @@ class CalibConfig(StrictBaseModel):
 class AdvancedSamplingMode(StrEnum):
     """Deploy-time specialization of the one-model advanced sampler.
 
-    FULL    - per-row tensor top_k/top_p (default; mixed per-request sampling).
+    FULL    - per-row tensor top_k/top_p/min_p in one fused kernel (default; mixed
+              per-request sampling). The only mode that accepts min_p.
     NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
     NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
     NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
@@ -1949,6 +1950,11 @@ class AdvancedSamplingMode(StrEnum):
         """Single source of truth: does this mode disable the top_p filter?"""
         return self in (AdvancedSamplingMode.NO_TOPP,
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+    @property
+    def is_fused(self) -> bool:
+        """Whether this mode runs the fused kernel, and so accepts min_p."""
+        return self is AdvancedSamplingMode.FULL
 
 
 class _MTPDraftCheckpointType(StrEnum):
@@ -2062,8 +2068,9 @@ class DecodingBaseConfig(StrictBaseModel):
         default=AdvancedSamplingMode.FULL,
         description=
         "Deploy-time specialization of the one-model advanced sampler that skips disabled "
-        "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
-        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
+        "filter kernels. FULL (default): per-row top_k/top_p/min_p in one fused kernel, the "
+        "only mode accepting min_p. NO_TOPK: skip top_k. NO_TOPP: skip top_p. "
+        "NO_TOPK_NO_TOPP: skip both.")
 
     enable_penalty: bool = Field(
         default=False,
@@ -5792,6 +5799,12 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
+        status="prototype")
+
+    enable_tokenization_cache: bool = Field(
+        default=False,
+        description=
+        "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
         status="prototype")
 
     enable_iter_req_stats: bool = Field(
