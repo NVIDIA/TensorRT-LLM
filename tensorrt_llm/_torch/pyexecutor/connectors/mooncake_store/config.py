@@ -157,10 +157,10 @@ class MooncakeStoreConnectorConfig:
     tenant_id: Optional[str] = None
     role: StoreRole = StoreRole.BOTH
     cache_prefix: str = DEFAULT_CACHE_PREFIX
-    #: Identity the keys are namespaced by. Two engines only share cache when
-    #: they agree on this, so it defaults to the model directory's basename
-    #: rather than its full path: the same checkpoint is routinely mounted
-    #: somewhere else on another host, which is exactly the case sharing is for.
+    #: Identity the keys are namespaced by. Two engines share cache only when
+    #: they agree on this, and two that disagree about what it names read each
+    #: other's pages, so it is required rather than defaulted. See
+    #: :meth:`resolve_model_key`.
     model_key: Optional[str] = None
     #: How many page keys go into one store call. Bounds the size of a single
     #: RPC without bounding how much a request may transfer.
@@ -262,7 +262,21 @@ class MooncakeStoreConnectorConfig:
         return dataclasses.replace(self, **updates) if updates else self
 
     def resolve_model_key(self, model: Any) -> str:
-        """The model identity to namespace keys by, given the configured model."""
+        """The model identity to namespace keys by.
+
+        Deliberately has no default. Deriving one from the model path would
+        make two checkpoints that happen to share a directory name, such as
+        `org-a/model` and `org-b/model` or two revisions mounted alike, agree
+        on a namespace while disagreeing on what the pages mean, and each would
+        read the other's KV as its own.
+        """
         if self.model_key:
             return self.model_key
-        return os.path.basename(str(model).rstrip("/")) or str(model)
+        raise ValueError(
+            f"The mooncake-store connector needs a model key to namespace its "
+            f"pool keys by, and there is no safe default: set "
+            f"kv_connector_config.mooncake_store.model_key, the model_key field "
+            f"of the Mooncake JSON config, or ${MODEL_KEY_ENV}. Give it a value "
+            f"that separates this checkpoint from any other an engine sharing "
+            f"the pool might load, rather than one derived from {model!r}."
+        )
