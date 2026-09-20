@@ -36,6 +36,19 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   RMSNorm + NVFP4 quantization.
 - ``MUSESPARK_OPEN_FUSED_PREATTN`` (default OFF, opt-in): fused pre-attention.
 - ``MUSESPARK_OPEN_ALLREDUCE`` (default NCCL): all-reduce strategy name.
+- ``MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL`` (default off): shard replicated
+  prefill work across single-node BF16 TP4/EP4 ranks.
+- ``MUSESPARK_OPEN_BF16X3_ROUTER`` (default off): BF16x3 projection for large routers.
+- ``MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES`` (default off): fuse large-batch routing;
+  ``MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER`` preserves Torch's large-batch order.
+- ``MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS`` (default off): use four warps for large
+  expert finalize kernels.
+- ``MUSESPARK_OPEN_LARGE_NORM_GATE`` (default off): fuse H64 attention norm/gate with
+  the reference reduction order at large token counts.
+- ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION`` (default off): overlap two output-projection
+  chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
+- ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
+  instead of outputs in eager sequence-parallel prefills; overlap takes precedence.
 
 Default-on switches read as disabled for the values ``0``/``false``/``no``/
 ``off``.
@@ -63,7 +76,7 @@ from ..attention.backends.interface import (
     RopeParams,
 )
 from ..attention.qk_norm_attention import QKNormRoPEAttention
-from ..distributed import AllReduce
+from ..distributed import AllReduce, AllReduceParams, allgather, reducescatter
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -306,6 +319,7 @@ def _fused_post_expert_norm_combine(
     num_tokens: int,
     top_k: int,
     hidden_size: int,
+    num_warps: int = _FINALIZE_NUM_WARPS,
 ) -> torch.Tensor:
     out = torch.empty((num_tokens, hidden_size), dtype=torch.float32, device=gemm2_output.device)
     _post_expert_norm_combine_kernel[(num_tokens,)](
@@ -321,7 +335,7 @@ def _fused_post_expert_norm_combine(
         HIDDEN=hidden_size,
         BLOCK_K=triton.next_power_of_2(top_k),
         BLOCK_H=triton.next_power_of_2(hidden_size),
-        num_warps=_FINALIZE_NUM_WARPS,
+        num_warps=num_warps,
     )
     return out
 
@@ -336,6 +350,7 @@ def post_expert_norm_combine(
     num_tokens: int,
     top_k: int,
     hidden_size: int,
+    num_warps: int = _FINALIZE_NUM_WARPS,
 ) -> torch.Tensor:
     """Weight-first RMSNorm each selected expert output, then combine, in FP32.
 
@@ -375,6 +390,7 @@ def post_expert_norm_combine(
             num_tokens=num_tokens,
             top_k=top_k,
             hidden_size=hidden_size,
+            num_warps=num_warps,
         )
     normed, _ = post_expert_norm_rows(
         gemm2_output,
@@ -751,7 +767,15 @@ def _router_tensorcore_reduce_kernel(partials, output, scale, SIZE: tl.constexpr
 
 
 @triton.jit
-def _full_routing_kernel(logits, bias, selected, weights, eps, EXPERTS: tl.constexpr):
+def _full_routing_kernel(
+    logits,
+    bias,
+    selected,
+    weights,
+    eps,
+    EXPERTS: tl.constexpr,
+    TORCH_ORDER: tl.constexpr = False,
+):
     # The (255 - expert) tie-break key below underflows past 256 experts; the
     # call site pins EXPERTS to 256, and this keeps the invariant explicit if
     # the kernel is ever generalized.
@@ -767,11 +791,29 @@ def _full_routing_kernel(logits, bias, selected, weights, eps, EXPERTS: tl.const
     keys = (ordered.to(tl.uint64) << 32) | (255 - expert).to(tl.uint64)
     sorted_keys = tl.sort(keys, descending=True)
     ids = 255 - (sorted_keys & 0xFFFFFFFF).to(tl.int32)
-    picked = tl.gather(scores, ids, axis=0)
-    picked = tl.where(expert < 8, picked, 0.0)
-    normalized = tl.div_rn(picked, tl.sum(picked, axis=0) + eps)
-    tl.store(selected + row * 8 + expert, ids, expert < 8)
-    tl.store(weights + row * 8 + expert, normalized, expert < 8)
+    if TORCH_ORDER:
+        # The installed CUDA topk(sorted=False) gathers values above the kth
+        # threshold in expert-ID order, then fills threshold ties in ID order.
+        # Preserve that accumulation order for the experimental large-T path.
+        ranked_picked = tl.gather(ranked, ids, axis=0)
+        threshold = tl.sum(tl.where(expert == 7, ranked_picked, 0.0), axis=0)
+        gather_order = tl.where(
+            expert < 8, ids + tl.where(ranked_picked > threshold, 0, 256), 512 + ids
+        )
+        ids = tl.sort(gather_order, descending=False) % 256
+    if TORCH_ORDER:
+        slots = tl.arange(0, 8)
+        selected_ids = tl.gather(ids, slots, axis=0)
+        picked = tl.gather(scores, selected_ids, axis=0)
+        normalized = tl.div_rn(picked, tl.sum(picked, axis=0) + eps)
+        tl.store(selected + row * 8 + slots, selected_ids)
+        tl.store(weights + row * 8 + slots, normalized)
+    else:
+        picked = tl.gather(scores, ids, axis=0)
+        picked = tl.where(expert < 8, picked, 0.0)
+        normalized = tl.div_rn(picked, tl.sum(picked, axis=0) + eps)
+        tl.store(selected + row * 8 + expert, ids, expert < 8)
+        tl.store(weights + row * 8 + expert, normalized, expert < 8)
 
 
 @triton.jit
@@ -826,6 +868,14 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
         # environment is a forward whose behaviour can change between CUDA-graph
         # capture and replay, and the captured graph is what actually runs.
         self._memo_enabled = _routing_memo_enabled()
+        # Experimental high-concurrency path: selection keeps the fused kernel's
+        # lowest-ID tie policy and sorted accumulation order at larger batches.
+        self._full_routing_all_batches = (
+            os.getenv("MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES", "0") == "1"
+        )
+        self._full_routing_torch_order = (
+            os.getenv("MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER", "0") == "1"
+        )
 
     @property
     def requires_separated_routing(self) -> bool:
@@ -877,7 +927,8 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
             and router_logits.dtype == torch.float32
             and router_logits.ndim == 2
             and router_logits.is_contiguous()
-            and 0 < router_logits.shape[0] <= 128
+            and router_logits.shape[0] > 0
+            and (router_logits.shape[0] <= 128 or self._full_routing_all_batches)
             and router_logits.shape[1] == 256
             and self.top_k == 8
             and self.output_dtype == torch.float32
@@ -894,7 +945,14 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
             )
             weights = torch.empty_like(selected, dtype=torch.float32)
             _full_routing_kernel[(router_logits.shape[0],)](
-                router_logits, bias, selected, weights, self.renorm_eps, EXPERTS=256, num_warps=4
+                router_logits,
+                bias,
+                selected,
+                weights,
+                self.renorm_eps,
+                EXPERTS=256,
+                TORCH_ORDER=self._full_routing_torch_order and router_logits.shape[0] > 128,
+                num_warps=1 if router_logits.shape[0] >= 512 else 4,
             )
             self._routing_memo = (router_logits, version, selected, weights)
             return selected, weights
@@ -1416,6 +1474,8 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         # the fused arm. `apply_output_gate` picks up the fused sigmoid-mul
         # from the same switch.
         self._fuse_qk_norm_rope_gate = _fused_preattention_enabled()
+        self._large_norm_gate_enabled = os.getenv("MUSESPARK_OPEN_LARGE_NORM_GATE", "0") == "1"
+        self._sp_projection_stream: Optional[torch.cuda.Stream] = None
         self.fused_prep_q_scale = self.scale_query_by
         # Weightless post-attention norm applied after o_proj, at the
         # post-norm epsilon.
@@ -1470,7 +1530,20 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             and attention_output.dtype == torch.bfloat16
             and attention_output.ndim == 2
             and attention_output.stride(-1) == 1
-            and 0 < attention_output.shape[0] <= 128
+            and (
+                0 < attention_output.shape[0] <= 128
+                or (
+                    getattr(self, "_large_norm_gate_enabled", False)
+                    and attention_output.shape[0] >= 512
+                    and not torch.compiler.is_compiling()
+                    and attention_output.stride(0) % 8 == 0
+                    and attention_output.data_ptr() % 16 == 0
+                    and gate.ndim in (2, 3)
+                    and gate.data_ptr() % 16 == 0
+                    and gate.stride(0) % 8 == 0
+                    and (gate.ndim != 3 or gate.stride(1) % 8 == 0)
+                )
+            )
             and self.head_dim == 64
             and attention_output.shape[1] % self.head_dim == 0
             and gate.is_cuda
@@ -1481,6 +1554,10 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             and gate.numel() == attention_output.numel()
             and (gate.ndim == 2 or gate.shape[-1] == self.head_dim)
         ):
+            if attention_output.shape[0] >= 512:
+                from ..cute_dsl_kernels.blackwell.rmsnorm_gate import rmsnorm_gate
+
+                return rmsnorm_gate(attention_output, gate, self.o_head_norm.variance_epsilon)
             output = torch.empty_like(attention_output, memory_format=torch.contiguous_format)
             heads = attention_output.shape[1] // self.head_dim
             _attention_norm_gate_kernel[(attention_output.shape[0] * heads,)](
@@ -1501,7 +1578,62 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         )
         return super().apply_output_gate(normed, gate)
 
-    def forward(self, position_ids, hidden_states, attn_metadata, **kwargs):
+    def _pad_sp_output_projection(self, attention_output: torch.Tensor) -> torch.Tensor:
+        """Pad the narrower input, preserving the ordinary projection and reduction."""
+        padded = _pad_sequence_parallel_tokens(attention_output, self.mapping.tp_size)
+        partial = self.o_proj(padded, all_reduce_params=AllReduceParams(enable_allreduce=False))
+        return reducescatter(partial, self.mapping, dim=0)
+
+    def _overlap_sp_output_projection(self, attention_output: torch.Tensor) -> torch.Tensor:
+        """Project two chunks while reducing the preceding chunk to its token owners."""
+        main = torch.cuda.current_stream(attention_output.device)
+        if self._sp_projection_stream is None:
+            self._sp_projection_stream = torch.cuda.Stream(device=attention_output.device)
+        stream = self._sp_projection_stream
+        padded = _pad_sequence_parallel_tokens(attention_output, self.mapping.tp_size)
+        shard = padded.shape[0] // self.mapping.tp_size
+        split = (shard + 1) // 2
+        results = []
+        partials = []
+        for begin, end in ((0, split), (split, shard)):
+            # Each collective must see owner-major rows. Splitting the original
+            # tensor in half would send rows to the wrong rank.
+            packed = torch.cat(
+                [
+                    padded[rank * shard + begin : rank * shard + end]
+                    for rank in range(self.mapping.tp_size)
+                ],
+                dim=0,
+            )
+            partial = self.o_proj(packed, all_reduce_params=AllReduceParams(enable_allreduce=False))
+            stream.wait_stream(main)
+            with torch.cuda.stream(stream):
+                reduced = reducescatter(partial, self.mapping, dim=0)
+            # Keep main-stream allocations alive through the final join. Their
+            # next reuse on main is then ordered after the collective, without
+            # record_stream delaying allocator reuse until CPU event polling.
+            partials.append(partial)
+            results.append(reduced)
+        main.wait_stream(stream)
+        output = torch.cat(results, dim=0)
+        # Results were allocated on stream but consumed by cat on main. Order
+        # their next reuse on their allocating stream after that consumption.
+        stream.wait_stream(main)
+        return output
+
+    def forward(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        overlap_sp_output_projection: bool = False,
+        pad_sp_output_projection: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        if overlap_sp_output_projection:
+            kwargs = dict(kwargs, output_projection=self._overlap_sp_output_projection)
+        elif pad_sp_output_projection:
+            kwargs = dict(kwargs, output_projection=self._pad_sp_output_projection)
         return super().forward(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1510,6 +1642,14 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             attention_window_size=self.attention_window_size,
             **kwargs,
         )
+
+
+def _pad_sequence_parallel_tokens(tensor: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """Pad the token dimension for equal-size TP shards, preserving real rows."""
+    padding = -tensor.shape[0] % tp_size
+    if padding == 0:
+        return tensor
+    return torch.cat((tensor, tensor.new_zeros((padding, *tensor.shape[1:]))), dim=0)
 
 
 class MuseSparkOpenMoE(nn.Module):
@@ -1540,6 +1680,12 @@ class MuseSparkOpenMoE(nn.Module):
         self.top_k = config.moe_topk
         self.metap_multiplier = config.metap_multiplier
         self.mapping = model_config.mapping
+        self._large_finalize_4warps = os.getenv("MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS", "0") == "1"
+        self._bf16x3_router_enabled = (
+            os.getenv("MUSESPARK_OPEN_BF16X3_ROUTER", "0") == "1"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (10, 3)
+        )
         # EP reduces normalized local experts; pure TP must instead reduce
         # each expert's FC2 partials before its nonlinear normalization.
         pure_ep = self.mapping.moe_tp_size == 1 and (
@@ -1678,6 +1824,26 @@ class MuseSparkOpenMoE(nn.Module):
     def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """FP32 router logits, scaled by the metap multiplier before routing."""
         weight = getattr(self.router, "weight", None)
+        if (
+            getattr(self, "_bf16x3_router_enabled", False)
+            and weight is not None
+            and not torch.compiler.is_compiling()
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] > 128
+            and hidden_states.shape[1] == 8192
+            and hidden_states.is_contiguous()
+            and weight.device == hidden_states.device
+            and weight.dtype == torch.float32
+            and weight.shape == (256, 8192)
+            and weight.is_contiguous()
+        ):
+            from ..cute_dsl_kernels.blackwell.bf16x3_router_gemm import bf16x3_router_gemm
+
+            # Split long accumulation chains even when occupancy needs no split.
+            # Weights remain FP32 and are read afresh on every graph replay.
+            return bf16x3_router_gemm(hidden_states, weight, min_split_k=4) * self.metap_multiplier
         tensorcore = hidden_states.ndim == 2 and 16 <= hidden_states.shape[0] <= 128
         if (
             weight is not None
@@ -1854,15 +2020,40 @@ class MuseSparkOpenMoE(nn.Module):
             num_tokens=num_tokens,
             top_k=self.top_k,
             hidden_size=self.expert_hidden_size,
+            num_warps=(
+                4
+                if getattr(self, "_large_finalize_4warps", False)
+                and num_tokens >= 8192
+                and self.expert_hidden_size == 4096
+                and self.top_k == 8
+                else _FINALIZE_NUM_WARPS
+            ),
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        *,
+        sp_num_tokens: Optional[int] = None,
     ) -> torch.Tensor:
-        num_tokens = hidden_states.shape[0]
+        num_tokens = hidden_states.shape[0] if sp_num_tokens is None else sp_num_tokens
         finalize_ar_used = False
         routing_method = self.experts.routing_method
-        router_logits, pooled = self.prepare_moe_inputs(hidden_states)
+        if sp_num_tokens is None:
+            router_logits, pooled = self.prepare_moe_inputs(hidden_states)
+        else:
+            if getattr(self.experts, "comm", None) is not None:
+                raise ValueError("Prefill sequence parallelism requires MoE without external comm")
+            with self.nvtx("router"):
+                router_logits = self.router_logits(hidden_states)
+            with self.nvtx("pool"):
+                pooled = self.pooler(hidden_states)
+                router_logits, pooled = allgather([router_logits, pooled], self.mapping, dim=0)
+                router_logits = router_logits[:num_tokens]
+                # Gather raw BF16 pooled activations before the existing norm +
+                # NVFP4 fusion. Normalizing before gather would add a BF16 round.
+                pooled = self.prepare_expert_input(pooled[:num_tokens])
 
         with self.nvtx("experts"):
             outputs = self.experts(
@@ -1983,7 +2174,14 @@ class MuseSparkOpenMoE(nn.Module):
         # ``modeling_deepseekv3.py:1280``.
         # Pure MoE TP also skips this reduction: finalize returned complete
         # expert results on every rank, so reducing again would multiply them.
-        if (
+        if sp_num_tokens is not None:
+            with self.nvtx("all_reduce"):
+                combined = reducescatter(
+                    _pad_sequence_parallel_tokens(combined, self.mapping.tp_size),
+                    self.mapping,
+                    dim=0,
+                )
+        elif (
             not finalize_ar_used
             and not self.mapping.enable_attention_dp
             and self.mapping.has_tp()
@@ -2005,8 +2203,16 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         super().__init__()
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
+        self.mapping = model_config.mapping
 
         self.self_attn = MuseSparkOpenAttention(model_config, layer_idx)
+        # Projection joins this stream before the next branch/layer. Reusing
+        # the model stream avoids a separate allocator pool for every layer.
+        self.self_attn._sp_projection_stream = aux_stream
+        self._overlap_sp_projection_enabled = (
+            os.getenv("MUSESPARK_OPEN_OVERLAP_SP_PROJECTION", "0") == "1"
+        )
+        self._pad_sp_projection_enabled = os.getenv("MUSESPARK_OPEN_PAD_SP_PROJECTION", "0") == "1"
         self.feed_forward = MuseSparkOpenMoE(model_config, layer_idx, aux_stream)
 
         self.pre_qkv_proj_norm = RMSNorm(
@@ -2058,6 +2264,7 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         precomputed_attn_input: Optional[torch.Tensor] = None,
         next_layer_norm: Optional[RMSNorm] = None,
+        sp_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         # hidden_states is the FP32 residual stream; each branch reads a BF16
@@ -2076,15 +2283,36 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 attn_input = _rmsnorm_fp32_in(hidden_states, self.pre_qkv_proj_norm)
             else:
                 attn_input = self.pre_qkv_proj_norm(hidden_states.to(self.dtype))
-        # The attention row-parallel o_proj all-reduce (bf16) is emitted inside
-        # this range; it is the only collective in it.
+        # The attention projection and its TP reduction stay in this range.
         with self.nvtx("attn"):
+            overlap_projection = (
+                sp_num_tokens is not None
+                and sp_num_tokens >= 8192
+                and self._overlap_sp_projection_enabled
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            pad_projection = (
+                sp_num_tokens is not None
+                and self._pad_sp_projection_enabled
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            if sp_num_tokens is not None:
+                attn_input = allgather(attn_input, self.mapping, dim=0)[:sp_num_tokens]
+                kwargs = dict(kwargs, all_reduce_params=AllReduceParams(enable_allreduce=False))
             attn_out = self.self_attn(
                 position_ids=position_ids,
                 hidden_states=attn_input,
                 attn_metadata=attn_metadata,
+                overlap_sp_output_projection=overlap_projection,
+                pad_sp_output_projection=pad_projection,
                 **kwargs,
             )
+            if sp_num_tokens is not None and not (overlap_projection or pad_projection):
+                attn_out = reducescatter(
+                    _pad_sequence_parallel_tokens(attn_out, self.mapping.tp_size),
+                    self.mapping,
+                    dim=0,
+                )
         # post_attn_norm + add_attn, and post_ffn_norm + add_ffn, each as one
         # kernel: seventeen elementwise launches per layer became two, and the
         # 8192-wide FP32 residual no longer round-trips through HBM between the
@@ -2096,7 +2324,10 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 hidden_states, attn_out, self.post_attn_norm.variance_epsilon, self.pre_ffn_norm
             )
         with self.nvtx("moe"):
-            ffn_out = self.feed_forward(ffn_input, attn_metadata)
+            if sp_num_tokens is None:
+                ffn_out = self.feed_forward(ffn_input, attn_metadata)
+            else:
+                ffn_out = self.feed_forward(ffn_input, attn_metadata, sp_num_tokens=sp_num_tokens)
         with self.nvtx("norm_add_ffn"):
             next_attn_input = None
             if next_layer_norm is not None:
@@ -2177,6 +2408,25 @@ class MuseSparkOpenModel(DecoderModel):
         )
         self._finalize_ar_workspace = None
         mapping = model_config.mapping
+        self._sp_mapping = mapping
+        self._prefill_sp_enabled = os.getenv("MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL", "0") == "1"
+        if self._prefill_sp_enabled:
+            if not (
+                mapping.tp_size == 4
+                and mapping.moe_ep_size == 4
+                and mapping.moe_tp_size == 1
+                and mapping.cp_size == 1
+                and mapping.pp_size == 1
+                and not mapping.enable_attention_dp
+                and len({rank // mapping.gpus_per_node for rank in mapping.tp_group}) == 1
+                and config.torch_dtype == torch.bfloat16
+                and all(
+                    getattr(layer.feed_forward.experts, "comm", None) is None
+                    for layer in self.layers
+                )
+            ):
+                raise ValueError("Prefill sequence parallelism requires single-node BF16 TP4/EP4")
+            logger.info("MuseSparkOpen prefill sequence parallelism enabled for >=4096 tokens")
         if (
             mapping.tp_size == 4
             and mapping.moe_ep_size == 4
@@ -2215,6 +2465,21 @@ class MuseSparkOpenModel(DecoderModel):
         embeds = self.embed_norm(inputs_embeds.to(self.dtype))
         if self.m_emb != 1.0:
             embeds = embeds * self.m_emb
+        sp_num_tokens = None
+        if (
+            self._prefill_sp_enabled
+            and not torch.compiler.is_compiling()
+            and attn_metadata.num_contexts > 0
+            and embeds.shape[0] >= 4096
+            and kwargs.get("spec_metadata") is None
+            and kwargs.get("lora_params") is None
+            and kwargs.get("all_reduce_params") is None
+        ):
+            sp_num_tokens = embeds.shape[0]
+            mapping = self._sp_mapping
+            embeds = _pad_sequence_parallel_tokens(embeds, mapping.tp_size)
+            shard_size = embeds.shape[0] // mapping.tp_size
+            embeds = embeds.narrow(0, mapping.tp_rank * shard_size, shard_size)
         # FP32 residual stream, entered once.
         hidden_states = embeds.to(torch.float32)
 
@@ -2229,13 +2494,17 @@ class MuseSparkOpenModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 precomputed_attn_input=precomputed_attn_input,
                 next_layer_norm=next_norm,
+                sp_num_tokens=sp_num_tokens,
                 **kwargs,
             )
             if next_norm is None:
                 hidden_states = result
             else:
                 hidden_states, precomputed_attn_input = result
-        return self.norm(hidden_states.to(self.dtype))
+        output = self.norm(hidden_states.to(self.dtype))
+        if sp_num_tokens is not None:
+            output = allgather(output, self._sp_mapping, dim=0)[:sp_num_tokens]
+        return output
 
 
 def assert_supported_spec_config(spec_config: Any) -> None:

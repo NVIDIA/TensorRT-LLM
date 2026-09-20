@@ -24,10 +24,13 @@ the norm-before-combine ordering against a golden transcribed from the source
 formula.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_musespark_open import (
+    MuseSparkOpenMoE,
     post_expert_norm_combine,
     post_expert_norm_rows,
 )
@@ -342,6 +345,48 @@ def test_fused_matches_the_reference_at_the_checkpoint_width(num_tokens):
     assert max_abs < 1e-4 * scale
     assert cosine > 1 - 1e-9
     torch.testing.assert_close(fused, reference, rtol=2e-5, atol=2e-5)
+
+
+@cuda_only
+@pytest.mark.parametrize("num_tokens", [512, 8192, 32768])
+@torch.inference_mode()
+def test_large_finalize_launch_variant_mutable_graph(num_tokens):
+    torch.manual_seed(1967)
+    hidden, top_k = 4096, 8
+    gemm2 = torch.randn(num_tokens * 2, hidden, device="cuda", dtype=torch.bfloat16)
+    indices = torch.full((num_tokens, top_k), -1, device="cuda", dtype=torch.int32)
+    slots = torch.randperm(num_tokens * top_k, device="cuda")[: num_tokens * 2]
+    indices.view(-1)[slots] = torch.arange(num_tokens * 2, device="cuda", dtype=torch.int32)
+    routing = torch.rand(num_tokens, top_k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    module = SimpleNamespace(
+        mapping=SimpleNamespace(moe_tp_size=1),
+        _large_finalize_4warps=True,
+        expert_hidden_size=hidden,
+        top_k=top_k,
+        post_expert_norm_weight=torch.randn(hidden, device="cuda") * 0.1,
+        post_expert_norm_eps=1e-8,
+    )
+    MuseSparkOpenMoE.finalize(module, gemm2, indices, routing, num_tokens)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = MuseSparkOpenMoE.finalize(module, gemm2, indices, routing, num_tokens)
+    for _ in range(2):
+        gemm2.normal_()
+        module.post_expert_norm_weight.normal_(0, 0.1)
+        graph.replay()
+        for start in range(0, num_tokens, 256):
+            reference = _reference_combine(
+                gemm2,
+                indices[start : start + 256],
+                routing[start : start + 256],
+                module.post_expert_norm_weight,
+                module.post_expert_norm_eps,
+                num_tokens=min(256, num_tokens - start),
+                top_k=top_k,
+                hidden_size=hidden,
+            )
+            torch.testing.assert_close(actual[start : start + 256], reference, rtol=2e-5, atol=2e-5)
 
 
 @cuda_only

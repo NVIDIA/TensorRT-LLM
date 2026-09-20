@@ -19,7 +19,10 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenRoutingMethod
+from tensorrt_llm._torch.models.modeling_musespark_open import (
+    MuseSparkOpenRoutingMethod,
+    _routing_weights,
+)
 
 
 def _router(bias):
@@ -75,6 +78,37 @@ def test_full_routing_cpu_fallback():
     torch.testing.assert_close(weights, raw / (raw.sum(-1, keepdim=True) + 1e-6))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tokens", [256, 512, 4096, 32768])
+def test_large_batch_routing_mutable_graph(monkeypatch, tokens):
+    monkeypatch.setenv("MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES", "1")
+    bias = torch.zeros(256, device="cuda")
+    logits = torch.zeros(tokens, 256, device="cuda")
+    router = _router(bias)
+    # The setting is resolved at construction and cannot change captured work.
+    monkeypatch.setenv("MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES", "0")
+    router.apply(logits)
+    router.clear_routing_memo()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected, weights = router.apply(logits)
+    for seed in range(4):
+        torch.manual_seed(seed)
+        # Quantized logits create exact ties with well-separated distinct scores.
+        # Stable sorting independently expresses the lowest-ID tie policy.
+        logits.copy_(torch.randint(-512, 513, logits.shape, device="cuda") / 256)
+        if seed == 0:
+            logits.zero_()
+        graph.replay()
+        scores = logits.sigmoid()
+        expected = scores.argsort(dim=-1, descending=True, stable=True)[:, :8]
+        torch.testing.assert_close(selected.long(), expected, rtol=0, atol=0)
+        raw = scores.gather(1, expected)
+        torch.testing.assert_close(
+            weights, raw / (raw.sum(-1, keepdim=True) + 1e-6), rtol=1e-5, atol=1e-6
+        )
+
+
 @triton.jit
 def _reference_argmax_routing_kernel(logits, bias, selected, weights, eps, EXPERTS: tl.constexpr):
     row = tl.program_id(0)
@@ -93,6 +127,41 @@ def _reference_argmax_routing_kernel(logits, bias, selected, weights, eps, EXPER
     values = tl.div_rn(values, tl.sum(values, axis=0) + eps)
     tl.store(selected + row * 8 + slots, ids)
     tl.store(weights + row * 8 + slots, values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tokens", [256, 512, 4096, 32768])
+@torch.inference_mode()
+def test_large_routing_torch_order(monkeypatch, tokens):
+    monkeypatch.setenv("MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES", "1")
+    monkeypatch.setenv("MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER", "1")
+    logits = torch.zeros(tokens, 256, device="cuda")
+    bias = torch.zeros(256, device="cuda")
+    router = _router(bias)
+    router.apply(logits)
+    router.clear_routing_memo()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = router.apply(logits)
+    for seed in range(8):
+        torch.manual_seed(seed)
+        logits.normal_()
+        bias.normal_(0, 0.03)
+        if seed == 0:
+            logits.zero_()
+            bias.zero_()
+        elif seed == 1:
+            logits.copy_(torch.randint(-512, 513, logits.shape, device="cuda") / 256)
+            bias.zero_()
+        elif seed == 2:
+            logits.mul_(1e-6)
+            bias.zero_()
+        graph.replay()
+        scores, ranked = router.get_scores(logits, bias)
+        ids = torch.topk(ranked, 8, sorted=False).indices
+        expected = _routing_weights(scores, ids, 1e-6, torch.float32)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

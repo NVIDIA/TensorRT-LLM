@@ -140,3 +140,28 @@ def test_overlap_tuned_router_reads_mutable_graph_inputs(tokens: int) -> None:
             x.double() @ module.router.weight.double().t() * module.metap_multiplier
         ).float()
         torch.testing.assert_close(output, expected, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tokens", [256, 512, 4096, 8193, 32768])
+@torch.no_grad()
+def test_bf16x3_router_large_batch_mutable_graph(tokens: int) -> None:
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("Validated on GB300")
+    torch.manual_seed(1927)
+    module = _module("cuda")
+    module._bf16x3_router_enabled = True
+    inputs = torch.randn(tokens, 8192, device="cuda", dtype=torch.bfloat16)
+    module.router_logits(inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = module.router_logits(inputs)
+    rows = torch.linspace(0, tokens - 1, min(tokens, 512), device="cuda").long()
+    for factor in (1.0, -0.5, 2.0):
+        inputs.normal_().mul_(factor)
+        module.router.weight.mul_(-0.75)
+        graph.replay()
+        expected = (
+            inputs[rows].double() @ module.router.weight.double().T * module.metap_multiplier
+        ).float()
+        torch.testing.assert_close(output[rows], expected, rtol=2e-5, atol=2e-6)

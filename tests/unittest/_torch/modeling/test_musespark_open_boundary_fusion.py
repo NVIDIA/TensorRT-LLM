@@ -97,6 +97,7 @@ def test_three_layer_boundary_carry_and_graph(tokens):
         torch.nn.Module.__init__(model)
         model.dtype = torch.bfloat16
         model.m_emb = 1.0
+        model._prefill_sp_enabled = False
         model.embed_norm = RMSNorm(
             hidden_size=hidden, eps=1e-5, dtype=torch.bfloat16, has_weights=False
         ).cuda()

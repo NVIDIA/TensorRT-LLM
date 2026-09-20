@@ -3,7 +3,7 @@
 
 import math
 import weakref
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -1124,6 +1124,8 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
+        output_projection: Optional[Callable[[torch.Tensor],
+                                             torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -1139,6 +1141,8 @@ class Attention(nn.Module):
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
             attention_mask_data (Optional[torch.Tensor]): The attention mask data.
+            output_projection: Optional module-owned dense projection. The caller
+                owns its TP/CP and LoRA contracts. It is not a backend argument.
         Returns:
             torch.Tensor: The output tensor.
         """
@@ -1206,6 +1210,9 @@ class Attention(nn.Module):
             )
             if sparse_output is not None:
                 return sparse_output
+
+        if output_projection is not None:
+            return output_projection(attn_output)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
