@@ -327,7 +327,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         batch_size: int,
         seq_len: int,
         kv_seq_len: int,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Separate Q, K, V stay separate - compact each into a contiguous token-major matrix.
         # Slices of a fused QKV projection are strided; the compiled copy keeps them on a
         # vectorized kernel, while already contiguous inputs pass through without a copy.

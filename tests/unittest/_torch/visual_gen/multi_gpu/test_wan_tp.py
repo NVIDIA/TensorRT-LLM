@@ -525,7 +525,9 @@ def _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     ("tp_rank", "expected_head_range"),
     [(0, (0, 8)), (1, (8, 12))],
 )
-def test_wan_vsa_gates_follow_ulysses_aligned_tp_q_shard(monkeypatch, tp_rank, expected_head_range):
+def test_wan_vsa_gates_follow_ulysses_aligned_tp_q_shard(
+    monkeypatch: pytest.MonkeyPatch, tp_rank: int, expected_head_range: tuple[int, int]
+) -> None:
     """VSA gates must select the same TP-local heads as the Q projection."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
     from tensorrt_llm._torch.visual_gen.modules import attention as attention_module

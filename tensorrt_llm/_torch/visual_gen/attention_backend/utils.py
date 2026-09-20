@@ -134,7 +134,7 @@ def create_attention(
     sparse_config = (
         attention_config.sparse_attention_config if attention_config is not None else None
     )
-    sparse_algorithm = getattr(sparse_config, "algorithm", None)
+    sparse_algorithm = sparse_config.algorithm if sparse_config is not None else None
     is_vsa = sparse_algorithm == "vsa"
     is_sol = sparse_algorithm == "sol_attn"
 

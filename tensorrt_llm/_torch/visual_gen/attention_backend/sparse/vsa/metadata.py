@@ -26,7 +26,6 @@ import torch
 # A 4x4x4 cube is one 64-token sparse block for every VSA fine-stage backend.
 VSA_TILE_SIZE: Tuple[int, int, int] = (4, 4, 4)
 VSA_BLOCK_SIZE = VSA_TILE_SIZE[0] * VSA_TILE_SIZE[1] * VSA_TILE_SIZE[2]
-_DEFAULT_MAX_CACHED_SHAPES = 16
 _BITS_PER_WORD = 32
 
 
@@ -118,12 +117,14 @@ class _VSAShapeMetadata(TypedDict):
 
 
 class VSAMetadataBuilder:
-    """Build VSA metadata while caching shape-dependent index tensors."""
+    """Build VSA metadata while caching shape-dependent index tensors.
 
-    def __init__(self, max_cached_shapes: int = _DEFAULT_MAX_CACHED_SHAPES) -> None:
-        if max_cached_shapes <= 0:
-            raise ValueError("max_cached_shapes must be positive")
-        self._max_cached_shapes = max_cached_shapes
+    CUDA Graphs capture the addresses of the cached tensors, so the cache keeps one
+    entry per distinct shape for as long as the graphs that reference it, exactly like
+    the graph set itself; ``clear`` releases both together.
+    """
+
+    def __init__(self) -> None:
         self._cache: dict[Tuple[Tuple[int, int, int], torch.device], _VSAShapeMetadata] = {}
 
     def _build_metadata(
@@ -189,12 +190,6 @@ class VSAMetadataBuilder:
         cache_key = (dit_seq_shape, device)
         shape_metadata = self._cache.get(cache_key)
         if shape_metadata is None:
-            if len(self._cache) >= self._max_cached_shapes:
-                raise RuntimeError(
-                    "VSA metadata cache reached its "
-                    f"{self._max_cached_shapes}-shape limit; restart the pipeline or "
-                    "reuse a configured resolution/frame profile"
-                )
             shape_metadata = self._build_metadata(dit_seq_shape, device)
             self._cache[cache_key] = shape_metadata
 

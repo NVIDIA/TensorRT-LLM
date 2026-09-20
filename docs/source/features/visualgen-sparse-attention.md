@@ -313,7 +313,7 @@ be reused for the sparse phase.
 
 VSA combines a coarse mean-pooled branch with a top-K block-sparse fine branch. Select either `CUTEDSL` for the CuTe DSL kernel or `TRTLLM` for PrimTS block-sparse attention. If the selected sparse kernel is unavailable or the known VSA tensor envelope is not met, the fine branch uses the compact Q/K/V tensors with that backend's dense path. VSA cannot be combined with `quant_attention_config`.
 
-VSA retains shape-dependent metadata and route tensors so CUDA Graph replay can reuse stable addresses. A pipeline instance accepts up to 16 distinct VSA shape profiles; reuse configured resolution/frame profiles or restart the pipeline before serving additional shapes.
+VSA retains shape-dependent metadata and route tensors so CUDA Graph replay can reuse stable addresses. A pipeline instance keeps one set of these tensors per distinct shape profile for as long as the CUDA Graphs that reference them, so their footprint grows with the number of served resolution/frame profiles exactly like the graphs do.
 
 Both VSA backends use the same VisualGen-owned predictor implementation, one
 instance per attention layer, and identical post-processing. The `TRTLLM` path runs the coarse stage before the core

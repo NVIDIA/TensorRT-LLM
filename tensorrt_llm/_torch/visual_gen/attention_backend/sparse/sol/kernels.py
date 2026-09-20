@@ -76,10 +76,13 @@ def _block_pool_kernel(
     first_token = block * BLOCK
     total = tl.zeros([WIDTH], dtype=tl.float32)
     for start in range(0, BLOCK, TOKENS):
-        tokens = first_token + start + tl.arange(0, TOKENS)
+        offsets = start + tl.arange(0, TOKENS)
+        tokens = first_token + offsets
+        # The last load of a block whose size is not a multiple of TOKENS stops at the
+        # block boundary instead of running into the next block.
         values = tl.load(
             x_ptr + batch * stride_x_batch + tokens[:, None] * stride_x_token + columns[None, :],
-            mask=(tokens < seq_len)[:, None] & in_row[None, :],
+            mask=((offsets < BLOCK) & (tokens < seq_len))[:, None] & in_row[None, :],
             other=0.0,
         )
         total += tl.sum(values.to(tl.float32), axis=0)
@@ -122,6 +125,8 @@ def block_pool(x: torch.Tensor, out: torch.Tensor, *, block_size: int, reduce: _
     """
     if reduce not in ("mean", "sum"):
         raise ValueError(f"reduce must be 'mean' or 'sum'; got {reduce!r}")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive; got {block_size}")
     if x.ndim != 4 or x.stride(3) != 1 or x.stride(2) != x.shape[3]:
         raise ValueError(
             "x must be [batch, seq_len, heads, head_dim] with contiguous heads and head_dim"

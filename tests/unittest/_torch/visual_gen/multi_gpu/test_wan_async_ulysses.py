@@ -317,11 +317,17 @@ class TestWanAsyncUlysses:
         run_test_in_distributed(2, _logic_async_vs_sync_parity, backend)
 
 
-def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output():
+def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output() -> None:
     from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 
     class _CaptureAsyncAttention(torch.nn.Module):
-        def forward_async(self, compute_q, compute_k, compute_v, **kwargs):
+        def forward_async(
+            self,
+            compute_q: Callable[[], torch.Tensor],
+            compute_k: Callable[[], torch.Tensor],
+            compute_v: Callable[[], torch.Tensor],
+            **kwargs: object,
+        ) -> torch.Tensor:
             self.q = compute_q()
             self.k = compute_k()
             self.v = compute_v()
@@ -329,7 +335,7 @@ def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output():
             return self.q
 
     class _CaptureOutputProjection(torch.nn.Module):
-        def forward(self, hidden_states):
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             self.input = hidden_states
             return hidden_states
 
@@ -364,6 +370,10 @@ def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output():
     assert attention.attn.v.shape == expected_shape
     assert attention.attn.kwargs["gate_compress"].shape == expected_shape
     assert attention.attn.kwargs["gate_fine"].shape == expected_shape
+    torch.testing.assert_close(
+        attention.attn.kwargs["gate_compress"], gate_compress.view(expected_shape)
+    )
+    torch.testing.assert_close(attention.attn.kwargs["gate_fine"], gate_fine.view(expected_shape))
     assert output_projection.input.shape == (1, 3, 8)
     assert output.shape == (1, 3, 8)
 

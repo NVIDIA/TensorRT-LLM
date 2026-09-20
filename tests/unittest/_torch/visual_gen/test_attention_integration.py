@@ -728,7 +728,7 @@ def test_fast_cross_attention_wan_shapes(
 # ============================================================================
 
 
-def _build_vsa_setup(backend: str, sparsity: float, batch_size: int, seed: int):
+def _build_vsa_setup(backend: str, sparsity: float, batch_size: int, seed: int) -> SimpleNamespace:
     """Build naive + integrated models, VSA metadata, and inputs for a VSA test.
 
     A ragged latent exercises VSA padding and token-mask lowering on both
@@ -786,7 +786,7 @@ def _build_vsa_setup(backend: str, sparsity: float, batch_size: int, seed: int):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
 @pytest.mark.parametrize("backend", ["CUTEDSL", "TRTLLM"])
-def test_vsa_self_attention_equivalence_at_sparsity_zero(backend: str):
+def test_vsa_self_attention_equivalence_at_sparsity_zero(backend: str) -> None:
     """VSA at sparsity=0 with G_c=0 reduces to dense attention (top_k=num_cubes,
     output=O_f); must match the naive SDPA reference modulo bf16 rounding."""
     from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import set_vsa_forward_context
@@ -816,8 +816,11 @@ def test_vsa_self_attention_equivalence_at_sparsity_zero(backend: str):
     not isSM100Family(),
     reason="CuTe DSL and PrimTS block-sparse parity requires SM100 or SM103",
 )
-def test_vsa_sparse_backends_match_on_ragged_input():
+def test_vsa_sparse_backends_match_on_ragged_input(monkeypatch: pytest.MonkeyPatch) -> None:
     """CuTeDSL and TRTLLM implement the same sparse VSA fine-stage semantics."""
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import (
+        PrimsTSBlockSparseFmha,
+    )
     from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import set_vsa_forward_context
 
     sparsity = 0.5
@@ -837,14 +840,15 @@ def test_vsa_sparse_backends_match_on_ragged_input():
 
             setup.integrated.attn._execute_sparse_fine = checked_execute
         else:
-            original_predict = setup.integrated.attn.block_sparse_attn_predict
+            # Only the block-sparse FMHA library consumes predicted routes, so its
+            # forward running proves TRTLLM executed the sparse fine stage.
+            original_forward = PrimsTSBlockSparseFmha.forward
 
-            def checked_predict(*args, _original=original_predict, **kwargs):
-                result = _original(*args, **kwargs)
-                sparse_fine_executed["TRTLLM"] = result is not None
-                return result
+            def checked_forward(*args, _original=original_forward, **kwargs):
+                sparse_fine_executed["TRTLLM"] = True
+                return _original(*args, **kwargs)
 
-            setup.integrated.attn.block_sparse_attn_predict = checked_predict
+            monkeypatch.setattr(PrimsTSBlockSparseFmha, "forward", checked_forward)
 
     outputs = {}
     for backend, setup in setups.items():
@@ -871,7 +875,7 @@ def test_vsa_sparse_backends_match_on_ragged_input():
     not isSM100Family(),
     reason="PrimTS block-sparse CUDA Graph replay requires SM100 or SM103",
 )
-def test_vsa_trtllm_cuda_graph_replays_live_routes():
+def test_vsa_trtllm_cuda_graph_replays_live_routes() -> None:
     """Captured VSA recomputes routes when graph-stable Q/K/V storage changes."""
     from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import set_vsa_forward_context
 

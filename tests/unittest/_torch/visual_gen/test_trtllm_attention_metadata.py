@@ -12,8 +12,17 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     SparseBackendForwardArgs,
     SparseRuntimeParams,
 )
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
+    SkipSoftmaxParams,
+    SkipSoftmaxScheduler,
+)
 from tensorrt_llm._torch.visual_gen.attention_backend import trtllm as visual_trtllm
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+
+_REQUIRES_SM100 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the VisualGen TRTLLM FMHA path is exercised on SM100 or SM103",
+)
 
 
 class _FakeBaseTrtllmAttentionMetadata:
@@ -501,3 +510,45 @@ def test_forward_reaches_core_fmha_with_module_predicted_routes(
     assert isinstance(runtime_params, SparseRuntimeParams)
     assert runtime_params.block_sparse_inputs is carrier
     assert runtime_params.sparse_attn_indices_block_size == 0
+
+
+@_REQUIRES_SM100
+def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> None:
+    """The wrapper prepares the timestep during warmup so capture never reads the tensor."""
+    params = SkipSoftmaxParams(
+        scheduler=SkipSoftmaxScheduler(
+            threshold_scale_factor_prefill=5000.0, disabled_until_timestep=0.6
+        )
+    )
+    attention = visual_trtllm.TrtllmAttention(
+        layer_idx=0,
+        num_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        attention_metadata_state=create_attention_metadata_state(),
+        sparse_params=params,
+    )
+    batch_size, seq_len = 1, 256
+    q = torch.randn(batch_size, seq_len, 2, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    timestep = torch.tensor([0.8], device="cuda")
+
+    def forward() -> torch.Tensor:
+        return attention.forward(q, k, v, batch_size=batch_size, seq_len=seq_len, timestep=timestep)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            eager = forward()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured, eager)

@@ -58,6 +58,8 @@ def test_block_pool_rejects_mismatched_output() -> None:
         block_pool(x, torch.empty((1, 3, 1, 4)), block_size=BLOCK, reduce="mean")
     with pytest.raises(ValueError, match="reduce"):
         block_pool(x, torch.empty(_pooled_shape(x, BLOCK)), block_size=BLOCK, reduce="max")
+    with pytest.raises(ValueError, match="block_size"):
+        block_pool(x, torch.empty(_pooled_shape(x, BLOCK)), block_size=0, reduce="mean")
 
 
 @_CPU_ONLY
@@ -136,14 +138,18 @@ def test_block_thresholds_exact_exceeds_diag_for_correlated_keys() -> None:
 @_REQUIRES_CUDA
 @pytest.mark.parametrize("seq_len", [64, 257, 4097])
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
-def test_block_pool_matches_torch_fallback(seq_len: int, out_dtype: torch.dtype) -> None:
+# Block sizes below, not a multiple of, and equal to the tokens loaded per step.
+@pytest.mark.parametrize("block_size", [4, 9, BLOCK])
+def test_block_pool_matches_torch_fallback(
+    seq_len: int, out_dtype: torch.dtype, block_size: int
+) -> None:
     torch.manual_seed(0)
     x = torch.randn((2, seq_len, 3, 128), device="cuda", dtype=torch.bfloat16)
     for reduce in ("mean", "sum"):
-        out = torch.empty(_pooled_shape(x, BLOCK), dtype=out_dtype, device="cuda")
-        block_pool(x, out, block_size=BLOCK, reduce=reduce)
+        out = torch.empty(_pooled_shape(x, block_size), dtype=out_dtype, device="cuda")
+        block_pool(x, out, block_size=block_size, reduce=reduce)
         expected = torch.empty_like(out)
-        _block_pool_torch(x, expected, block_size=BLOCK, reduce=reduce)
+        _block_pool_torch(x, expected, block_size=block_size, reduce=reduce)
         tolerance = (
             {"rtol": 1e-5, "atol": 1e-5}
             if out_dtype == torch.float32

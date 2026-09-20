@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.sparse.hooks import prepare_sparse_runtime_params
+from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForwardInputs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as CoreTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import backend as sol_backend
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import predictor as sol_predictor
@@ -99,7 +100,7 @@ def _predict(
     *,
     attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
     timestep: object = None,
-):
+) -> BlockSparseForwardInputs | None:
     """Invoke the core prediction hook the way the core forward does."""
 
     return backend.block_sparse_attn_predict(

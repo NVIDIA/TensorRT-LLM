@@ -24,12 +24,7 @@ import torch
 from .....attention.backends.interface import PredefinedAttentionMask
 from .....attention.backends.sparse.params import BlockSparseForwardInputs
 from .kernels import blend_coarse_fine, sort_last_dim, tile_and_pool_cubes
-from .metadata import (
-    _DEFAULT_MAX_CACHED_SHAPES,
-    VSA_BLOCK_SIZE,
-    VSAMetadata,
-    get_vsa_forward_context,
-)
+from .metadata import VSA_BLOCK_SIZE, VSAMetadata, get_vsa_forward_context
 
 _SIGNED_INT32_MAX = torch.iinfo(torch.int32).max
 
@@ -75,10 +70,7 @@ class VSAForwardInputs:
 class _VSARouteBuilder:
     """Lower fixed-width VSA top-K tables into graph-stable BSR routes."""
 
-    def __init__(self, max_cached_shapes: int = _DEFAULT_MAX_CACHED_SHAPES) -> None:
-        if max_cached_shapes <= 0:
-            raise ValueError("max_cached_shapes must be positive")
-        self._max_cached_shapes = max_cached_shapes
+    def __init__(self) -> None:
         self._indptr_cache: dict[tuple[torch.device, int, int, int, int], torch.Tensor] = {}
 
     def from_selected_blocks(
@@ -117,12 +109,6 @@ class _VSARouteBuilder:
         num_q_blocks: int,
         blocks_per_row: int,
     ) -> torch.Tensor:
-        if len(self._indptr_cache) >= self._max_cached_shapes:
-            raise RuntimeError(
-                "VSA route cache reached its "
-                f"{self._max_cached_shapes}-shape limit; restart the pipeline or "
-                "reuse a configured resolution/frame profile"
-            )
         if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "VSA route cache miss during CUDA Graph capture; "
@@ -141,12 +127,7 @@ class _VSARouteBuilder:
 class VSAPredictor:
     """Produce the complete per-call VSA block-attention input envelope."""
 
-    def __init__(
-        self,
-        num_heads: int,
-        num_kv_heads: Optional[int] = None,
-        max_cached_shapes: int = _DEFAULT_MAX_CACHED_SHAPES,
-    ) -> None:
+    def __init__(self, num_heads: int, num_kv_heads: Optional[int] = None) -> None:
         resolved_num_kv_heads = num_kv_heads or num_heads
         if resolved_num_kv_heads != num_heads:
             raise ValueError(
@@ -154,7 +135,7 @@ class VSAPredictor:
                 f"got num_kv_heads={resolved_num_kv_heads}, num_heads={num_heads}. "
                 "GQA/MQA is not supported."
             )
-        self._route_builder = _VSARouteBuilder(max_cached_shapes=max_cached_shapes)
+        self._route_builder = _VSARouteBuilder()
 
     @torch.compiler.disable
     def get_metadata(self) -> VSAMetadata:

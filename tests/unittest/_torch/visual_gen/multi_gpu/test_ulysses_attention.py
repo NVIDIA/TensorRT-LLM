@@ -111,13 +111,15 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     )
 
 
-def test_forward_async_redistributes_vsa_gates(monkeypatch):
+def test_forward_async_redistributes_vsa_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     import tensorrt_llm._torch.visual_gen.attention_backend.parallel as parallel_backend
 
     class _CaptureBackend:
         preferred_layout = AttentionTensorLayout.NHD
 
-        def forward(self, q, k, v, **kwargs):
+        def forward(
+            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: object
+        ) -> torch.Tensor:
             self.kwargs = kwargs
             return q
 
@@ -131,7 +133,7 @@ def test_forward_async_redistributes_vsa_gates(monkeypatch):
     attention._output_a2a = lambda output, batch_size, seq_len: output
     redistributed = []
 
-    def _fake_all_to_all(tensor, **kwargs):
+    def _fake_all_to_all(tensor: torch.Tensor, **kwargs: object) -> torch.Tensor:
         redistributed.append((tensor, kwargs))
         return tensor + 1
 

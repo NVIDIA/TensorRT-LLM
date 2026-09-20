@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -554,7 +554,7 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """
         Call attention backend with appropriate tensor layout.
@@ -621,7 +621,7 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         # hidden_states may be [B, S, H] or an Fp4QuantizedTensor from an upstream
         # fused norm+quant kernel; downstream Linear accepts either.
@@ -671,7 +671,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
         each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the

@@ -16,12 +16,15 @@
 
 import fnmatch
 from types import SimpleNamespace
-from typing import Any, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 from pydantic import Field as PydanticField
 from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -308,7 +311,7 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
                 raise ValueError(f"dense_layers contains a negative layer index: {index}")
         return sorted(set(layers))
 
-    def to_sparse_params(self, **kwargs):
+    def to_sparse_params(self, **kwargs: Any) -> "SolParams":
         """Lower the public recipe into the SOL parameters shared by both backends."""
         del kwargs
         from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
