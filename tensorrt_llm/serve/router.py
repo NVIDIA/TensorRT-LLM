@@ -1759,6 +1759,21 @@ class CoordinatorDelegatingRouter(Router):
     def _on_servers_updated(self, old_servers, new_servers):
         pass
 
+    async def sync_servers(self, servers: list[str]) -> None:
+        """Mirror the coordinator server list without preparing worker state."""
+        async with self._local._lock:
+            old_servers = self._local._servers.copy()
+            if old_servers == servers:
+                return
+            self._local._servers = list(servers)
+            self._local._on_servers_updated(old_servers, self._local._servers)
+            self._local._prepared_ready_servers.intersection_update(servers)
+            self._local._server_info = {
+                server: info
+                for server, info in self._local._server_info.items()
+                if server in servers
+            }
+
     def _request_id(self,
                     request: OpenAIRequest,
                     req_id: Optional[int] = None) -> int:

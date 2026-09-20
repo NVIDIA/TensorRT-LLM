@@ -135,6 +135,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         server_start_timeout_secs: int = 180,
         health_check_interval_secs: int = 3,
         reservation_timeout_secs: Optional[float] = None,
+        request_timeout_secs: Optional[float] = None,
     ):
         self._config = config
         self._client_factory = client_factory
@@ -168,10 +169,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
         )
         self._server_start_timeout_secs = server_start_timeout_secs
         self._health_check_interval_secs = health_check_interval_secs
-        self._reservation_timeout_secs = (
+        configured_reservation_timeout = (
             coordinator_reservation_timeout()
             if reservation_timeout_secs is None
             else reservation_timeout_secs
+        )
+        self._reservation_timeout_secs = max(
+            configured_reservation_timeout,
+            request_timeout_secs or 0,
         )
         self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
 
@@ -610,7 +615,7 @@ class CoordinatorClient(DisaggCoordinator):
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
         self._is_ready = info.get("is_ready", False)
         self._sync_delegating_router_configs(info)
-        await self._sync_stateless_routers(info)
+        await self._sync_router_server_lists(info)
 
     def _sync_delegating_router_configs(self, info: Dict[str, Any]) -> None:
         configs = info.get("routing_key_configs", {})
@@ -620,7 +625,7 @@ class CoordinatorClient(DisaggCoordinator):
             if config is not None and isinstance(local, KvCacheAwareRouter):
                 local.set_routing_key_config(config)
 
-    async def _sync_stateless_routers(self, info: Dict[str, Any]) -> None:
+    async def _sync_router_server_lists(self, info: Dict[str, Any]) -> None:
         server_lists = info.get("server_lists")
         if server_lists is None:
             return
@@ -630,6 +635,7 @@ class CoordinatorClient(DisaggCoordinator):
         )
         for router, servers in router_servers:
             if isinstance(router, CoordinatorDelegatingRouter):
+                await router.sync_servers(servers)
                 continue
             desired = set(servers)
             for server in desired - set(router.servers):
