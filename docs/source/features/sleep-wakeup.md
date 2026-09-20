@@ -234,7 +234,15 @@ b"trtllm-runtime-control-v1\n"
 
 The route path has one leading slash, no trailing slash, and excludes any
 deployment root path and query string. Sign an empty byte string for a GET or a
-body-less POST. This Python example signs and sends matching bytes:
+body-less POST.
+
+The server accepts timestamps up to five minutes old or five minutes in the
+future and accepts each nonce only once. It retains accepted nonces through
+their complete validity period. If the bounded replay cache fills with live
+entries, authentication fails closed until an entry expires. A retried control
+request therefore needs a new timestamp, nonce, and signature.
+
+This Python example signs and sends matching bytes:
 
 ```python
 import hashlib
