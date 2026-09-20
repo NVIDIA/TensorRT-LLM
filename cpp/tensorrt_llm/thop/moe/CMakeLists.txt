@@ -16,5 +16,5 @@
 # torch.ops.trtllm MoE ops, grouped like kernels/moe/ (marlin/ is thop-only). No
 # target of its own: everything here compiles into th_common, defined in
 # ../CMakeLists.txt. moeOp.cpp holds the primary TORCH_LIBRARY(trtllm) block.
-file(GLOB_RECURSE SRC_CPP *.cpp)
+file(GLOB_RECURSE SRC_CPP CONFIGURE_DEPENDS *.cpp)
 target_sources(th_common PRIVATE ${SRC_CPP})
