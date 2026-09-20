@@ -39,7 +39,10 @@ from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor impor
     SolPredictorOutputs,
     SOLSparsePredictor,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import (
+    TrtllmAttention,
+    TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -75,8 +78,9 @@ def _make_backend(
     backend.sparse_params = None
     backend._fmha_manager = SimpleNamespace(fmha_libs=[object.__new__(PrimsTSBlockSparseFmha)])
     backend.sol_params = params
-    backend._prepared_timestep = None
-    backend._timestep_prepared = False
+    backend.metadata = TrtllmAttentionMetadata(
+        device=torch.device("cpu"), attention_metadata_state={}
+    )
     backend.predictor = predictor
     return backend
 

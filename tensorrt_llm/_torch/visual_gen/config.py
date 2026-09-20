@@ -83,9 +83,10 @@ def create_attention_metadata_state() -> Dict[str, Any]:
     """Create state shared by attention layers in one model component.
 
     The state outlives individual forwards and CUDA Graph captures. It owns the
-    shape-keyed TRTLLM metadata cache and the FMHA state the TRTLLM attention
-    layers of the component share, so one static block-sparse profile is planned
-    once per component instead of once per layer. Each model component receives
+    shape-keyed TRTLLM metadata cache, the FMHA state the TRTLLM attention layers
+    of the component share, so one static block-sparse profile is planned once per
+    component instead of once per layer, and the host value of the denoising
+    timestep prepared for CUDA Graph capture. Each model component receives
     a distinct state and must not execute concurrent forwards.
     """
     return {"metadata_cache": {}}

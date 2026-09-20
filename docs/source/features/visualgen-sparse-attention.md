@@ -297,9 +297,10 @@ backend uses a host-side graph break to prepare and own predictor plans, so
 default `False` setting.
 
 When a cutoff is configured, VisualGen includes the dense-or-sparse phase in
-the CUDA Graph key. The TRTLLM attention wrapper reduces the timestep to a host
-value during graph warmup and reuses it during capture for every
-timestep-scheduled algorithm (Skip Softmax Attention and SOL), while SOL
+the CUDA Graph key. The TRTLLM attention metadata reduces the timestep to a host
+value during graph warmup, keeps it in the component attention state and reuses
+it during capture for every timestep-scheduled algorithm (Skip Softmax Attention
+and SOL), while SOL
 predictor route buffers remain stable for replay; the CuTeDSL backends read the
 phase the CUDA Graph runner resolved for the graph key instead of the device
 tensor. Per-token timesteps, such as Wan I2V where the conditioning frame stays

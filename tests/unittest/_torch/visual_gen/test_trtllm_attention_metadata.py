@@ -71,8 +71,9 @@ def _make_wrapper(cls=visual_trtllm.TrtllmAttention, *, quant_attention_config=N
     attention.quant_attention_config = quant_attention_config
     attention.layer_idx = 0
     attention.sparse_params = None
-    attention._prepared_timestep = None
-    attention._timestep_prepared = False
+    attention.metadata = visual_trtllm.TrtllmAttentionMetadata(
+        device=torch.device("cpu"), attention_metadata_state={}
+    )
     return attention
 
 
@@ -262,6 +263,27 @@ def test_wrapper_prepares_timestep_for_cuda_graph_capture(monkeypatch):
     assert attention.resolve_timestep(torch.tensor([0.0, 0.8])) == pytest.approx(0.8)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     assert attention.resolve_timestep(torch.tensor([0.2])) == pytest.approx(0.8)
+
+
+def test_trtllm_attention_metadata_prepares_timestep_for_capture(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    state = {}
+    metadata = visual_trtllm.TrtllmAttentionMetadata(
+        device=torch.device("cpu"), attention_metadata_state=state
+    )
+    with pytest.raises(RuntimeError, match="prepared before CUDA Graph capture"):
+        metadata.prepare_timestep(torch.tensor([0.8]))
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert metadata.prepare_timestep(torch.tensor([0.0, 0.8])) == pytest.approx(0.8)
+    assert state["timestep"] == pytest.approx(0.8)
+    assert metadata.prepare_timestep(None) is None
+    assert state["timestep"] is None
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    state["timestep"] = 0.4
+    assert metadata.prepare_timestep(torch.tensor([0.9])) == pytest.approx(0.4)
 
 
 def test_forward_hands_the_prepared_timestep_to_the_core(monkeypatch):

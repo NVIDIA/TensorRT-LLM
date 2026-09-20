@@ -132,6 +132,26 @@ class TrtllmAttentionMetadata:
         self._prepared = cached["prepared"]
         self._cached_seq_lens = cached["seq_lens"]
 
+    def prepare_timestep(self, timestep: object) -> Optional[float]:
+        """Reduce ``timestep`` to a host scalar and keep it for CUDA Graph capture.
+
+        Timestep-scheduled sparse algorithms read the timestep on the host,
+        which CUDA Graph capture cannot do for a device tensor. Eager calls,
+        including the warmup that precedes capture, reduce the tensor and store
+        the value in the component state; capture returns the stored value.
+        """
+
+        state = self._metadata_state
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if "timestep" not in state:
+                raise RuntimeError(
+                    "sparse attention timestep must be prepared before CUDA Graph capture"
+                )
+            return state["timestep"]
+        value = timestep_to_float(timestep)
+        state["timestep"] = value
+        return value
+
     def prepare(
         self,
         batch_size: int,
@@ -234,8 +254,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
-        self._prepared_timestep: Optional[float] = None
-        self._timestep_prepared = False
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
@@ -244,26 +262,17 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return getattr(self.sparse_params, "disabled_until_timestep", None)
 
     def resolve_timestep(self, timestep: object) -> object:
-        """Reduce ``timestep`` to a host scalar once per eager call.
+        """Return the host timestep the sparse schedule consumes.
 
-        Timestep-scheduled sparse algorithms read the timestep on the host,
-        which CUDA Graph capture cannot do for a device tensor. Eager calls,
-        including the warmup that precedes capture, remember the reduced value
-        and capture reuses it. Without a cutoff the timestep passes through
+        Layers with a timestep cutoff hand the tensor to the metadata adapter,
+        which reduces it during eager calls and reuses the prepared value under
+        CUDA Graph capture. Without a cutoff the timestep passes through
         untouched.
         """
 
         if self.timestep_cutoff is None:
             return timestep
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            if not self._timestep_prepared:
-                raise RuntimeError(
-                    "sparse attention timestep must be prepared before CUDA Graph capture"
-                )
-            return self._prepared_timestep
-        self._prepared_timestep = timestep_to_float(timestep)
-        self._timestep_prepared = True
-        return self._prepared_timestep
+        return self.metadata.prepare_timestep(timestep)
 
     @property
     def dense_layers(self) -> frozenset[int]:
