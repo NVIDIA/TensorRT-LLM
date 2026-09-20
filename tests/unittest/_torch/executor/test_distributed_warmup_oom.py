@@ -207,6 +207,27 @@ class TestAllRanksCrashedProbe:
             assert hang_detector.all_ranks_crashed(4) is False
             mpi_comm.assert_called_once_with()
 
+    def test_disabled_hard_kill_skips_the_barrier(self) -> None:
+        # With the kill disabled (grace is None) no kill follows a False
+        # verdict, so posting Ibarrier would leak it into a surviving world.
+        # The probe must return False without posting the barrier.
+        from mpi4py import MPI
+
+        from tensorrt_llm._torch.pyexecutor import hang_detector
+
+        comm = mock.Mock()
+        comm.Get_size.return_value = 4
+        with (
+            mock.patch.object(hang_detector, "mpi_disabled", return_value=False),
+            mock.patch.object(MPI, "Is_initialized", return_value=True),
+            mock.patch.object(MPI, "Query_thread", return_value=MPI.THREAD_MULTIPLE),
+            mock.patch.object(hang_detector, "ENABLE_MULTI_DEVICE", True),
+            mock.patch.object(hang_detector, "mpi_comm", return_value=comm),
+            mock.patch.object(hang_detector, "_rank_crash_kill_grace", return_value=None),
+        ):
+            assert hang_detector.all_ranks_crashed(4) is False
+            comm.Ibarrier.assert_not_called()
+
 
 @pytest.mark.parametrize(
     "world_size,dwdp_size,has_batch,expected",

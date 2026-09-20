@@ -177,9 +177,9 @@ def all_ranks_crashed(world_size: int, timeout: Optional[float] = None) -> bool:
 
     Returns True only on a proven symmetric crash. Every uncertain state --
     single rank, MPI unavailable or not thread-safe to call from here, a
-    communicator that does not span ``world_size``, a probe error, a timeout
-    -- returns False, so the failure mode of the probe itself is "kill as
-    before", never "leave stranded peers unkilled".
+    communicator that does not span ``world_size``, the hard kill disabled, a
+    probe error, a timeout -- returns False, so the failure mode of the probe
+    itself is "kill as before", never "leave stranded peers unkilled".
 
     On timeout the barrier request is left outstanding: the caller is about
     to arm the hard kill, and the world it would desynchronize is being torn
@@ -202,10 +202,15 @@ def all_ranks_crashed(world_size: int, timeout: Optional[float] = None) -> bool:
             # Peers outside this communicator (e.g. DWDP ranks counted via
             # COMM_WORLD) cannot be probed here; stay on the kill path.
             return False
+        grace = _rank_crash_kill_grace()
+        if grace is None:
+            # The hard kill is disabled, so no kill follows a False verdict to
+            # tear the world down. Posting Ibarrier here would leave it
+            # outstanding in a surviving world (start_rank_crash_kill_watchdog
+            # likewise declines), desynchronizing later collectives -- so skip
+            # the probe entirely and stay on the (disabled) kill path.
+            return False
         if timeout is None:
-            grace = _rank_crash_kill_grace()
-            if grace is None:
-                grace = _RANK_CRASH_KILL_GRACE_DEFAULT
             timeout = grace / 2.0
         request = comm.Ibarrier()
         deadline = time.monotonic() + timeout
